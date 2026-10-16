@@ -1,0 +1,34 @@
+{
+  "response": {
+    "game_count": 3,
+    "games": [
+      {
+        "appid": 212680,
+        "name": "FTL: Faster Than Light",
+        "playtime_forever": 5390,
+        "playtime_2weeks": 120,
+        "playtime_mac_forever": 4500,
+        "rtime_last_played": 1668898503,
+        "img_icon_url": "6f982210fe9a377f"
+      },
+      {
+        "appid": 1062090,
+        "name": "Timberborn",
+        "playtime_forever": 2840,
+        "playtime_2weeks": 60,
+        "playtime_mac_forever": 2840,
+        "rtime_last_played": 1698898503,
+        "img_icon_url": "360236e555049f20"
+      },
+      {
+        "appid": 2764460,
+        "name": "Balatro",
+        "playtime_forever": 8920,
+        "playtime_2weeks": 480,
+        "playtime_mac_forever": 8920,
+        "rtime_last_played": 1718898503,
+        "img_icon_url": "e9dee7e306087ce8"
+      }
+    ]
+  }
+}

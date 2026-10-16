@@ -1,0 +1,26 @@
+"libraryfolders"
+{
+	"0"
+	{
+		"path"		"/Users/testuser/Library/Application Support/Steam"
+		"label"		""
+		"contentid"		"1302427560412547390"
+		"totalsize"		"0"
+		"apps"
+		{
+			"212680"		"284228511"
+			"1062090"		"2188484858"
+		}
+	}
+	"1"
+	{
+		"path"		"/Volumes/ExternalStorage/SteamLibrary"
+		"label"		"ExternalSSD"
+		"contentid"		"2402427560412547111"
+		"totalsize"		"1000000000000"
+		"apps"
+		{
+			"2764460"		"616021685"
+		}
+	}
+}

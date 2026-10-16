@@ -1,0 +1,29 @@
+{
+  "playerstats": {
+    "steamID": "76561197985203987",
+    "gameName": "FTL: Faster Than Light",
+    "achievements": [
+      {
+        "apiname": "ACH_WIN_EASY",
+        "achieved": 1,
+        "unlocktime": 1668898500
+      },
+      {
+        "apiname": "ACH_WIN_NORMAL",
+        "achieved": 1,
+        "unlocktime": 1668902000
+      },
+      {
+        "apiname": "ACH_SECTOR_8",
+        "achieved": 1,
+        "unlocktime": 1668895000
+      },
+      {
+        "apiname": "ACH_NO_CLOAK",
+        "achieved": 0,
+        "unlocktime": 0
+      }
+    ],
+    "success": true
+  }
+}

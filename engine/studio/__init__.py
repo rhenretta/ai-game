@@ -1,0 +1,106 @@
+"""engine/studio/__init__.py
+Autonomous Game Engine & Studio Harness — Live Gemini Multi-Agent Swarm.
+Exports all specialist agents, epistemic schemas, DAG coordinator, and multimodal generators.
+Zero occurrences of legacy branding tokens.
+"""
+from engine.studio.models import (
+    BaseEpistemicModel,
+    StudioBuildState,
+    StudioOrchestratorConfig,
+    AgentPlan,
+    ToolInvocationRecord,
+    AgentExecutionRecord,
+    AgentVerificationRecord,
+    GenesisWorldSpec,
+    UpdateWorldSpec,
+    CartridgeCompilationResult,
+    CharacterSheet,
+    CutsceneBeat,
+    CutsceneScript,
+    DialogueChoice,
+    DialogueNode,
+    DialogueTreeSpec,
+    DialogueBarkSpec,
+    NarrativeBible,
+    AudioSynthesisResult,
+    TelemetryProbeDesignSpec,
+    TelemetryArchitecturePlan,
+    InstrumentationResult,
+    HypothesisEvidence,
+    PlayerPreferenceHypothesis,
+    EvolutionHypothesisReport,
+    BoundedAdaptationSpec,
+)
+from engine.studio.orchestrator import (
+    StudioOrchestrator,
+    StudioAgentDAG,
+    CircularDependencyError,
+    InvalidStateTransitionError,
+    BuildVerificationExhaustedError,
+)
+from engine.studio.director import CreativeDirectorWorldbuilderAgent
+from engine.studio.narrative import NarrativeCharacterWriterAgent, validate_dialogue_tree
+from engine.studio.audio import (
+    VoiceActingAudioProducerAgent,
+    VoiceSynthesisError,
+    create_wav_header,
+    validate_wav_file,
+    escape_ssml,
+    AudioSynthesisBackend,
+    OfflineMockAudioBackend,
+)
+from engine.studio.visual import (
+    VisualArtSpriteDesignerAgent,
+    ProceduralSpriteRenderer,
+)
+from engine.studio.swe import LeadGameplaySWEAgent, CodeVerificationError
+from engine.studio.telemetry_architect import TelemetryArchitectAgent
+
+__all__ = [
+    "BaseEpistemicModel",
+    "StudioBuildState",
+    "StudioOrchestratorConfig",
+    "AgentPlan",
+    "ToolInvocationRecord",
+    "AgentExecutionRecord",
+    "AgentVerificationRecord",
+    "GenesisWorldSpec",
+    "UpdateWorldSpec",
+    "CartridgeCompilationResult",
+    "CharacterSheet",
+    "CutsceneBeat",
+    "CutsceneScript",
+    "DialogueChoice",
+    "DialogueNode",
+    "DialogueTreeSpec",
+    "DialogueBarkSpec",
+    "NarrativeBible",
+    "AudioSynthesisResult",
+    "TelemetryProbeDesignSpec",
+    "TelemetryArchitecturePlan",
+    "InstrumentationResult",
+    "HypothesisEvidence",
+    "PlayerPreferenceHypothesis",
+    "EvolutionHypothesisReport",
+    "BoundedAdaptationSpec",
+    "StudioOrchestrator",
+    "StudioAgentDAG",
+    "CircularDependencyError",
+    "InvalidStateTransitionError",
+    "BuildVerificationExhaustedError",
+    "CreativeDirectorWorldbuilderAgent",
+    "NarrativeCharacterWriterAgent",
+    "validate_dialogue_tree",
+    "VoiceActingAudioProducerAgent",
+    "VoiceSynthesisError",
+    "create_wav_header",
+    "validate_wav_file",
+    "escape_ssml",
+    "AudioSynthesisBackend",
+    "OfflineMockAudioBackend",
+    "VisualArtSpriteDesignerAgent",
+    "ProceduralSpriteRenderer",
+    "LeadGameplaySWEAgent",
+    "CodeVerificationError",
+    "TelemetryArchitectAgent",
+]

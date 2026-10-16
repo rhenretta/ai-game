@@ -1,0 +1,29 @@
+{
+  "1062090": {
+    "success": true,
+    "data": {
+      "type": "game",
+      "name": "Timberborn",
+      "steam_appid": 1062090,
+      "required_age": 0,
+      "is_free": false,
+      "short_description": "Humans are long gone. Will your lumberpunk beavers do any better?",
+      "header_image": "https://cdn.akamai.steamstatic.com/steam/apps/1062090/header.jpg",
+      "developers": ["Mechanistry"],
+      "publishers": ["Mechanistry"],
+      "categories": [
+        {"id": 2, "description": "Single-player"},
+        {"id": 23, "description": "Steam Cloud"}
+      ],
+      "genres": [
+        {"id": "23", "description": "Indie"},
+        {"id": "28", "description": "Simulation"},
+        {"id": "2", "description": "Strategy"}
+      ],
+      "release_date": {
+        "coming_soon": false,
+        "date": "15 Sep, 2021"
+      }
+    }
+  }
+}

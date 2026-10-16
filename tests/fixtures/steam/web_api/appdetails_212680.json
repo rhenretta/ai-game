@@ -1,0 +1,31 @@
+{
+  "212680": {
+    "success": true,
+    "data": {
+      "type": "game",
+      "name": "FTL: Faster Than Light",
+      "steam_appid": 212680,
+      "required_age": 0,
+      "is_free": false,
+      "short_description": "In FTL you experience the atmosphere of running a spaceship trying to save the galaxy.",
+      "header_image": "https://cdn.akamai.steamstatic.com/steam/apps/212680/header.jpg",
+      "developers": ["Subset Games"],
+      "publishers": ["Subset Games"],
+      "categories": [
+        {"id": 2, "description": "Single-player"},
+        {"id": 22, "description": "Steam Achievements"},
+        {"id": 23, "description": "Steam Cloud"}
+      ],
+      "genres": [
+        {"id": "23", "description": "Indie"},
+        {"id": "28", "description": "Simulation"},
+        {"id": "2", "description": "Strategy"},
+        {"id": "70", "description": "Roguelike"}
+      ],
+      "release_date": {
+        "coming_soon": false,
+        "date": "14 Sep, 2012"
+      }
+    }
+  }
+}

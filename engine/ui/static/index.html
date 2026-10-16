@@ -1,0 +1,1724 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mission Control</title>
+  <style>
+    :root {
+      /* 16-color Style Bible palette & theme colors */
+      --bg: #000000;
+      --navy: #1D2B53;
+      --panel: #0d1630;
+      --border: #29ADFF;
+      --crimson: #7E2553;
+      --slate: #5F574F;
+      --light-gray: #C2C3C7;
+      --white: #FFF1E8;
+      --neon-red: #FF004D;
+      --amber: #FFA300;
+      --yellow: #FFEC27;
+      --green: #00E436;
+      --cyan: #29ADFF;
+      --purple: #83769C;
+      --pink: #FF77A8;
+      --peach: #FFCCAA;
+
+      /* 5-State Lifecycle Colors */
+      --state-idle: #5F574F;
+      --state-analyzing: #FFA300;
+      --state-synthesizing: #29ADFF;
+      --state-verifying: #FF77A8;
+      --state-promoted: #00E436;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg);
+      color: var(--white);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", monospace;
+      line-height: 1.4;
+      padding: 16px;
+      font-size: 13px;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 20px;
+      background: var(--navy);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      margin-bottom: 16px;
+    }
+
+    h1 {
+      font-size: 18px;
+      letter-spacing: 0.5px;
+      color: var(--cyan);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .header-controls {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .badge-status {
+      font-size: 11px;
+      padding: 4px 10px;
+      background: rgba(0, 228, 54, 0.2);
+      border: 1px solid var(--green);
+      color: var(--green);
+      border-radius: 4px;
+      text-transform: uppercase;
+      font-weight: bold;
+      letter-spacing: 0.5px;
+      transition: all 0.3s ease;
+    }
+
+    .badge-status.status-connecting,
+    .badge-status.status-reconnecting {
+      background: rgba(255, 163, 0, 0.2);
+      border-color: var(--amber);
+      color: var(--amber);
+      animation: blinkText 1.2s infinite;
+    }
+
+    .badge-status.status-disconnected,
+    .badge-status.status-offline {
+      background: rgba(255, 0, 77, 0.2);
+      border-color: var(--neon-red);
+      color: var(--neon-red);
+    }
+
+    .offline-banner {
+      display: none;
+      background: rgba(255, 0, 77, 0.15);
+      border: 1px solid var(--neon-red);
+      color: var(--neon-red);
+      padding: 8px 16px;
+      border-radius: 4px;
+      margin-bottom: 16px;
+      font-weight: bold;
+      text-align: center;
+    }
+
+    .grid-container {
+      display: grid;
+      grid-template-columns: minmax(780px, 820px) 1fr;
+      gap: 16px;
+    }
+
+    @media (max-width: 1440px) {
+      .grid-container {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--navy);
+      border-radius: 6px;
+      padding: 14px;
+      position: relative;
+    }
+
+    .panel-title {
+      font-size: 13px;
+      font-weight: bold;
+      color: var(--cyan);
+      margin-bottom: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--navy);
+      padding-bottom: 6px;
+    }
+
+    /* SVG DAG Canvas & Nodes */
+    #agent-dag-canvas {
+      display: block;
+      width: 100%;
+      height: 400px;
+      background: #02050e;
+      border: 1px solid var(--navy);
+      border-radius: 4px;
+    }
+
+    .dag-node {
+      cursor: pointer;
+      transition: filter 0.15s ease;
+    }
+    .dag-node:hover {
+      filter: brightness(1.25) drop-shadow(0 0 6px rgba(41, 173, 255, 0.45));
+    }
+    .dag-node:hover .node-box {
+      stroke: var(--cyan);
+    }
+
+    .node-box {
+      rx: 5px;
+      ry: 5px;
+      transition: all 0.3s ease;
+    }
+
+    /* 5 Lifecycle States */
+    .dag-node.state-idle .node-box {
+      stroke: var(--state-idle);
+      stroke-width: 1.5;
+      fill: #0d1630;
+    }
+    .dag-node.state-idle .status-dot { fill: var(--state-idle); }
+
+    .dag-node.state-analyzing .node-box {
+      stroke: var(--state-analyzing);
+      stroke-width: 2.5;
+      fill: #151e38;
+      animation: pulseAnalyzing 1.5s infinite;
+    }
+    .dag-node.state-analyzing .status-dot {
+      fill: var(--state-analyzing);
+      animation: blinkDot 1s infinite;
+    }
+
+    .dag-node.state-synthesizing .node-box {
+      stroke: var(--state-synthesizing);
+      stroke-width: 2.5;
+      fill: #102345;
+      animation: pulseSynthesizing 1.2s infinite;
+    }
+    .dag-node.state-synthesizing .status-dot {
+      fill: var(--state-synthesizing);
+      animation: blinkDot 0.8s infinite;
+    }
+
+    .dag-node.state-verifying .node-box {
+      stroke: var(--state-verifying);
+      stroke-width: 2.5;
+      fill: #241432;
+      animation: pulseVerifying 1s infinite;
+    }
+    .dag-node.state-verifying .status-dot {
+      fill: var(--state-verifying);
+      animation: blinkDot 0.6s infinite;
+    }
+
+    .dag-node.state-promoted .node-box {
+      stroke: var(--state-promoted);
+      stroke-width: 3;
+      fill: #0d2820;
+      animation: pulsePromoted 2s infinite;
+    }
+    .dag-node.state-promoted .status-dot { fill: var(--state-promoted); }
+
+    /* SVG Edges */
+    .dag-edge {
+      stroke: #1D2B53;
+      stroke-width: 2;
+      fill: none;
+      transition: stroke 0.3s ease;
+    }
+    .dag-edge.edge-active {
+      stroke: var(--cyan);
+      stroke-dasharray: 6 3;
+      animation: edgeFlow 0.8s linear infinite;
+    }
+    .dag-edge.edge-repair {
+      stroke: var(--neon-red);
+      stroke-dasharray: 4 4;
+      animation: edgeFlow 0.5s linear infinite;
+    }
+
+    @keyframes edgeFlow {
+      from { stroke-dashoffset: 18; }
+      to { stroke-dashoffset: 0; }
+    }
+    @keyframes pulseAnalyzing {
+      0%, 100% { filter: drop-shadow(0 0 2px rgba(255, 163, 0, 0.4)); }
+      50% { filter: drop-shadow(0 0 8px rgba(255, 163, 0, 0.9)); }
+    }
+    @keyframes pulseSynthesizing {
+      0%, 100% { filter: drop-shadow(0 0 3px rgba(41, 173, 255, 0.4)); }
+      50% { filter: drop-shadow(0 0 10px rgba(41, 173, 255, 0.9)); }
+    }
+    @keyframes pulseVerifying {
+      0%, 100% { filter: drop-shadow(0 0 3px rgba(255, 119, 168, 0.4)); }
+      50% { filter: drop-shadow(0 0 10px rgba(255, 119, 168, 0.9)); }
+    }
+    @keyframes pulsePromoted {
+      0%, 100% { filter: drop-shadow(0 0 4px rgba(0, 228, 54, 0.5)); }
+      50% { filter: drop-shadow(0 0 14px rgba(0, 228, 54, 1.0)); }
+    }
+    @keyframes blinkDot {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.2; }
+    }
+    @keyframes blinkText {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    /* Terminal Controls & Deliberation Stream */
+    .stream-controls-bar {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 6px;
+      flex-wrap: wrap;
+    }
+
+    .stream-input, .stream-select {
+      background: #040814;
+      border: 1px solid var(--navy);
+      color: var(--white);
+      font-size: 11px;
+      padding: 4px 8px;
+      border-radius: 4px;
+      outline: none;
+    }
+    .stream-input:focus, .stream-select:focus {
+      border-color: var(--cyan);
+    }
+    .stream-input { flex: 1; min-width: 140px; }
+
+    .terminal-log {
+      background: #02050e;
+      border: 1px solid var(--navy);
+      color: var(--green);
+      font-family: "SF Mono", Monaco, "Courier New", monospace;
+      font-size: 11px;
+      padding: 10px;
+      height: 240px;
+      overflow-y: auto;
+      border-radius: 4px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .stream-entry {
+      border-left: 2px solid var(--cyan);
+      padding: 4px 8px;
+      background: rgba(41, 173, 255, 0.04);
+      border-radius: 0 4px 4px 0;
+    }
+    .stream-entry.event-tool_invocation,
+    .stream-entry.event-tool_call {
+      border-left-color: var(--amber);
+      background: rgba(255, 163, 0, 0.04);
+    }
+    .stream-entry.event-qa_gate_result {
+      border-left-color: var(--pink);
+      background: rgba(255, 119, 168, 0.04);
+    }
+    .stream-entry.event-cartridge_promoted {
+      border-left-color: var(--green);
+      background: rgba(0, 228, 54, 0.06);
+    }
+
+    .entry-header {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      font-size: 10px;
+      margin-bottom: 2px;
+    }
+    .entry-time { color: var(--slate); }
+    .agent-badge {
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-weight: bold;
+      background: rgba(41, 173, 255, 0.2);
+      color: var(--cyan);
+    }
+    .event-tag {
+      padding: 1px 4px;
+      border-radius: 2px;
+      font-size: 9px;
+      text-transform: uppercase;
+      background: rgba(255, 255, 255, 0.1);
+      color: var(--light-gray);
+    }
+
+    .deliberation-content {
+      color: var(--white);
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.35;
+    }
+    .deliberation-label {
+      color: var(--green);
+      font-weight: bold;
+      margin-right: 4px;
+    }
+
+    /* Tool Invocations List & Cards */
+    #tool-invocations-list {
+      list-style: none;
+      height: 200px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .tool-card {
+      background: rgba(41, 173, 255, 0.06);
+      border: 1px solid var(--navy);
+      border-left: 3px solid var(--cyan);
+      border-radius: 4px;
+      padding: 8px;
+      font-family: monospace;
+      font-size: 11px;
+    }
+    .tool-card.status-failed {
+      border-left-color: var(--neon-red);
+      background: rgba(255, 0, 77, 0.06);
+    }
+
+    .tool-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 4px;
+    }
+    .tool-name { font-weight: bold; color: var(--yellow); }
+    .tool-agent { color: var(--cyan); font-size: 10px; margin-left: 6px; }
+    .tool-meta { display: flex; gap: 6px; align-items: center; }
+    .tool-duration { color: var(--light-gray); font-size: 10px; }
+    .status-pill {
+      font-size: 9px;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-weight: bold;
+      text-transform: uppercase;
+    }
+    .status-pill.status-success { background: rgba(0, 228, 54, 0.2); color: var(--green); }
+    .status-pill.status-failed { background: rgba(255, 0, 77, 0.2); color: var(--neon-red); }
+
+    .tool-pev-status {
+      font-size: 10px;
+      color: var(--purple);
+      margin-bottom: 4px;
+      display: flex;
+      gap: 8px;
+    }
+
+    .tool-details summary {
+      cursor: pointer;
+      color: var(--cyan);
+      font-size: 10px;
+      outline: none;
+      user-select: none;
+    }
+    .tool-io-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 6px;
+    }
+    .io-col h6 { color: var(--light-gray); font-size: 9px; margin-bottom: 2px; }
+    .json-dump {
+      background: #02050e;
+      border: 1px solid var(--navy);
+      padding: 4px 6px;
+      border-radius: 3px;
+      font-size: 10px;
+      max-height: 80px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      color: var(--light-gray);
+    }
+    .error-stack-box {
+      margin-top: 6px;
+      background: rgba(255, 0, 77, 0.1);
+      border: 1px solid var(--neon-red);
+      padding: 6px;
+      border-radius: 3px;
+      color: var(--neon-red);
+      font-size: 10px;
+      white-space: pre-wrap;
+      max-height: 90px;
+      overflow-y: auto;
+    }
+
+    /* Buttons */
+    .btn-primary {
+      background: var(--crimson);
+      color: var(--white);
+      border: 1px solid var(--pink);
+      padding: 8px 16px;
+      font-size: 12px;
+      font-weight: bold;
+      border-radius: 4px;
+      cursor: pointer;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      transition: background 0.15s ease;
+    }
+    .btn-primary:hover {
+      background: var(--pink);
+    }
+
+    /* Heatmap Canvas */
+    #telemetry-heatmap {
+      display: block;
+      width: 100%;
+      height: 360px;
+      background: #02050e;
+      border: 1px solid var(--navy);
+      border-radius: 4px;
+    }
+
+    .heatmap-controls {
+      display: flex;
+      gap: 12px;
+      margin-top: 8px;
+      font-size: 11px;
+      align-items: center;
+    }
+    .heatmap-controls label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+      color: var(--light-gray);
+    }
+
+    /* Audio Player & Asset Inspector */
+    #voice-preview-player {
+      width: 100%;
+      margin-top: 6px;
+      border-radius: 4px;
+      filter: invert(1) hue-rotate(180deg);
+    }
+
+    /* 16-Color Palette Grid */
+    .palette-grid {
+      display: grid;
+      grid-template-columns: repeat(8, 1fr);
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .palette-chip {
+      height: 32px;
+      border-radius: 4px;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 9px;
+      font-weight: bold;
+      color: #000;
+      cursor: pointer;
+      text-shadow: 0 0 2px rgba(255,255,255,0.8);
+      position: relative;
+    }
+    .palette-chip:hover {
+      transform: scale(1.08);
+      z-index: 10;
+      border-color: #fff;
+    }
+
+    /* Diff Viewer */
+    .diff-viewer {
+      background: #02050e;
+      border: 1px solid var(--navy);
+      padding: 10px;
+      border-radius: 4px;
+      font-family: "SF Mono", Monaco, "Courier New", monospace;
+      font-size: 11px;
+      height: 180px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      color: var(--light-gray);
+      line-height: 1.4;
+    }
+    .diff-line-add { color: var(--green); }
+    .diff-line-del { color: var(--neon-red); }
+    .diff-line-hdr { color: var(--cyan); font-weight: bold; }
+
+    /* Steam DNA & Game Blueprint Cards */
+    .dna-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .dna-metric-box {
+      background: #02050e;
+      border: 1px solid var(--navy);
+      border-radius: 4px;
+      padding: 6px 10px;
+      display: flex;
+      flex-direction: column;
+    }
+    .dna-metric-val {
+      font-size: 14px;
+      font-weight: bold;
+      color: var(--yellow);
+    }
+    .dna-metric-lbl {
+      font-size: 9px;
+      color: var(--light-gray);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .dna-genres-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+    .genre-chip {
+      background: rgba(41, 173, 255, 0.12);
+      border: 1px solid var(--navy);
+      border-radius: 3px;
+      padding: 2px 6px;
+      font-size: 10px;
+      color: var(--cyan);
+    }
+    .blueprint-box {
+      background: #040814;
+      border: 1px solid var(--navy);
+      border-radius: 4px;
+      padding: 10px;
+      margin-top: 8px;
+    }
+    .blueprint-empty {
+      color: var(--slate);
+      font-style: italic;
+      font-size: 11px;
+      text-align: center;
+      padding: 12px;
+    }
+    .blueprint-field {
+      font-size: 11px;
+      margin-bottom: 4px;
+      line-height: 1.4;
+    }
+    .blueprint-field-label {
+      color: var(--pink);
+      font-weight: bold;
+      margin-right: 6px;
+    }
+
+    /* Telemetry Probes & Hypotheses */
+    .probes-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 10px;
+      margin-top: 8px;
+    }
+    .probes-table th {
+      text-align: left;
+      color: var(--cyan);
+      border-bottom: 1px solid var(--navy);
+      padding: 4px;
+    }
+    .probes-table td {
+      padding: 4px;
+      border-bottom: 1px solid rgba(29, 43, 83, 0.4);
+      color: var(--light-gray);
+    }
+    .probe-category-tag {
+      font-size: 9px;
+      padding: 1px 4px;
+      border-radius: 2px;
+      background: rgba(255, 163, 0, 0.15);
+      color: var(--amber);
+      font-weight: bold;
+    }
+    .hypothesis-card {
+      background: rgba(0, 228, 54, 0.05);
+      border-left: 2px solid var(--green);
+      padding: 6px 8px;
+      border-radius: 0 4px 4px 0;
+      margin-top: 6px;
+      font-size: 11px;
+      color: var(--white);
+    }
+    .hypothesis-target {
+      color: var(--green);
+      font-weight: bold;
+      font-size: 10px;
+    }
+
+    /* Sprites and Artifacts */
+    .sprites-gallery {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .sprite-chip {
+      background: #02050e;
+      border: 1px solid var(--navy);
+      border-radius: 3px;
+      padding: 4px 8px;
+      font-size: 10px;
+      color: var(--cyan);
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Autonomous Game Studio — Mission Control</h1>
+    <div class="header-controls">
+      <span id="studio-status-badge" class="badge-status">ONLINE</span>
+      <button id="btn-trigger-genesis" class="btn-primary">Genesis Build</button>
+    </div>
+  </header>
+
+  <div id="offline-banner" class="offline-banner">
+    Mission Control Disconnected from Studio Daemon. Reconnecting in background with exponential backoff...
+  </div>
+
+  <div class="grid-container">
+    <!-- Left Column: Agent Swarm DAG and Telemetry Heatmap -->
+    <div style="display: flex; flex-direction: column; gap: 16px;">
+      <div class="panel">
+        <div class="panel-title">
+          <span>Live Multi-Agent Swarm DAG</span>
+          <span style="font-size: 11px; color: var(--light-gray);">PEV Orchestration Engine (9 Agents)</span>
+        </div>
+        <svg id="agent-dag-canvas" width="800" height="400" viewBox="0 0 800 400">
+          <defs>
+            <marker id="arrow" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#29ADFF" />
+            </marker>
+            <marker id="arrow-red" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#FF004D" />
+            </marker>
+          </defs>
+
+          <!-- Directed Topological Edges -->
+          <line id="edge-analyst-director" class="dag-edge" x1="150" y1="200" x2="180" y2="200" marker-end="url(#arrow)" />
+          <path id="edge-director-writer" class="dag-edge" d="M 320 185 C 335 185, 335 125, 350 125" marker-end="url(#arrow)" />
+          <path id="edge-director-swe" class="dag-edge" d="M 320 215 C 335 215, 335 270, 350 270" marker-end="url(#arrow)" />
+          <path id="edge-writer-voice" class="dag-edge" d="M 485 110 C 500 110, 500 100, 515 100" marker-end="url(#arrow)" />
+          <path id="edge-writer-visual" class="dag-edge" d="M 485 130 C 500 130, 500 165, 515 165" marker-end="url(#arrow)" />
+          <line id="edge-swe-telemetry" class="dag-edge" x1="485" y1="272" x2="515" y2="272" marker-end="url(#arrow)" />
+          <path id="edge-voice-supervisor" class="dag-edge" d="M 645 100 C 660 100, 660 185, 675 185" marker-end="url(#arrow)" />
+          <path id="edge-visual-supervisor" class="dag-edge" d="M 645 165 C 660 165, 660 195, 675 195" marker-end="url(#arrow)" />
+          <path id="edge-swe-supervisor" class="dag-edge" d="M 485 285 C 570 285, 620 205, 675 205" marker-end="url(#arrow)" />
+          <path id="edge-telemetry-supervisor" class="dag-edge" d="M 645 272 C 660 272, 660 215, 675 215" marker-end="url(#arrow)" />
+          <!-- Closed-Loop Repair Feedback Arc (Supervisor -> GameplaySWE) -->
+          <path id="edge-repair-loop" class="dag-edge edge-repair" d="M 732 235 C 732 350, 480 350, 417 300" stroke-dasharray="4 4" marker-end="url(#arrow-red)" />
+
+          <!-- Supervisory dashed links from StudioOrchestrator -->
+          <line class="dag-edge" stroke-dasharray="2 3" stroke="#5F574F" x1="400" y1="63" x2="250" y2="170" />
+          <line class="dag-edge" stroke-dasharray="2 3" stroke="#5F574F" x1="400" y1="63" x2="417" y2="95" />
+          <line class="dag-edge" stroke-dasharray="2 3" stroke="#5F574F" x1="400" y1="63" x2="417" y2="245" />
+          <line class="dag-edge" stroke-dasharray="2 3" stroke="#5F574F" x1="400" y1="63" x2="732" y2="160" />
+
+          <!-- 9 Agent Persona Nodes -->
+          <!-- Node 1: StudioOrchestrator -->
+          <g id="node-StudioOrchestrator" data-agent="StudioOrchestrator" class="dag-node state-idle" transform="translate(330, 15)">
+            <rect class="node-box" width="140" height="48" />
+            <circle class="status-dot" cx="15" cy="24" r="4" />
+            <text x="75" y="22" text-anchor="middle" fill="#FFF1E8" font-size="11" font-weight="bold">Studio Orchestrator</text>
+            <text class="node-status-text" x="75" y="38" text-anchor="middle" fill="#29ADFF" font-size="9">METANODE / PEV</text>
+          </g>
+
+          <!-- Node 2: SteamAndTelemetryAnalystAgent -->
+          <g id="node-SteamAndTelemetryAnalystAgent" data-agent="SteamAndTelemetryAnalystAgent" class="dag-node state-idle" transform="translate(20, 170)">
+            <rect class="node-box" width="130" height="60" />
+            <circle class="status-dot" cx="14" cy="30" r="4" />
+            <text x="70" y="27" text-anchor="middle" fill="#FFF1E8" font-size="11" font-weight="bold">Steam Analyst</text>
+            <text class="node-status-text" x="70" y="44" text-anchor="middle" fill="#FFA300" font-size="9">DNA Profiler</text>
+          </g>
+
+          <!-- Node 3: CreativeDirectorWorldbuilderAgent -->
+          <g id="node-CreativeDirectorWorldbuilderAgent" data-agent="CreativeDirectorWorldbuilderAgent" class="dag-node state-idle" transform="translate(180, 170)">
+            <rect class="node-box" width="140" height="60" />
+            <circle class="status-dot" cx="14" cy="30" r="4" />
+            <text x="75" y="27" text-anchor="middle" fill="#FFF1E8" font-size="11" font-weight="bold">Creative Director</text>
+            <text class="node-status-text" x="75" y="44" text-anchor="middle" fill="#FF77A8" font-size="9">World &amp; Lore</text>
+          </g>
+
+          <!-- Node 4: NarrativeCharacterWriterAgent -->
+          <g id="node-NarrativeCharacterWriterAgent" data-agent="NarrativeCharacterWriterAgent" class="dag-node state-idle" transform="translate(350, 95)">
+            <rect class="node-box" width="135" height="55" />
+            <circle class="status-dot" cx="14" cy="28" r="4" />
+            <text x="72" y="26" text-anchor="middle" fill="#FFF1E8" font-size="11" font-weight="bold">Narrative Writer</text>
+            <text class="node-status-text" x="72" y="42" text-anchor="middle" fill="#83769C" font-size="9">Characters &amp; Trees</text>
+          </g>
+
+          <!-- Node 5: VoiceActingAudioProducerAgent -->
+          <g id="node-VoiceActingAudioProducerAgent" data-agent="VoiceActingAudioProducerAgent" class="dag-node state-idle" transform="translate(515, 75)">
+            <rect class="node-box" width="130" height="50" />
+            <circle class="status-dot" cx="14" cy="25" r="4" />
+            <text x="70" y="24" text-anchor="middle" fill="#FFF1E8" font-size="11" font-weight="bold">Voice Audio</text>
+            <text class="node-status-text" x="70" y="39" text-anchor="middle" fill="#FFEC27" font-size="9">Gemini TTS</text>
+          </g>
+
+          <!-- Node 6: VisualArtSpriteDesignerAgent -->
+          <g id="node-VisualArtSpriteDesignerAgent" data-agent="VisualArtSpriteDesignerAgent" class="dag-node state-idle" transform="translate(515, 140)">
+            <rect class="node-box" width="130" height="50" />
+            <circle class="status-dot" cx="14" cy="25" r="4" />
+            <text x="70" y="24" text-anchor="middle" fill="#FFF1E8" font-size="11" font-weight="bold">Visual Sprites</text>
+            <text class="node-status-text" x="70" y="39" text-anchor="middle" fill="#FF77A8" font-size="9">16-Color Palette</text>
+          </g>
+
+          <!-- Node 7: LeadGameplaySWEAgent -->
+          <g id="node-LeadGameplaySWEAgent" data-agent="LeadGameplaySWEAgent" class="dag-node state-idle" transform="translate(350, 245)">
+            <rect class="node-box" width="135" height="55" />
+            <circle class="status-dot" cx="14" cy="28" r="4" />
+            <text x="72" y="26" text-anchor="middle" fill="#FFF1E8" font-size="11" font-weight="bold">Gameplay SWE</text>
+            <text class="node-status-text" x="72" y="42" text-anchor="middle" fill="#00E436" font-size="9">Python Mechanics</text>
+          </g>
+
+          <!-- Node 8: TelemetryArchitectAgent -->
+          <g id="node-TelemetryArchitectAgent" data-agent="TelemetryArchitectAgent" class="dag-node state-idle" transform="translate(515, 250)">
+            <rect class="node-box" width="130" height="50" />
+            <circle class="status-dot" cx="14" cy="25" r="4" />
+            <text x="70" y="24" text-anchor="middle" fill="#FFF1E8" font-size="11" font-weight="bold">Telemetry Architect</text>
+            <text class="node-status-text" x="70" y="39" text-anchor="middle" fill="#FFA300" font-size="9">Custom Probes</text>
+          </g>
+
+          <!-- Node 9: QAPlaytesterBuildSupervisor -->
+          <g id="node-QAPlaytesterBuildSupervisor" data-agent="QAPlaytesterBuildSupervisor" class="dag-node state-idle" transform="translate(675, 160)">
+            <rect class="node-box" width="115" height="75" />
+            <circle class="status-dot" cx="14" cy="38" r="4" />
+            <text x="62" y="32" text-anchor="middle" fill="#FFF1E8" font-size="11" font-weight="bold">Supervisor</text>
+            <text x="62" y="48" text-anchor="middle" fill="#FF004D" font-size="9">5 Quality Gates</text>
+            <text class="node-status-text" x="62" y="64" text-anchor="middle" fill="#00E436" font-size="8">Self-Healing</text>
+          </g>
+        </svg>
+      </div>
+
+      <!-- Panel 1: Steam Player DNA & Game Blueprint Panel -->
+      <div class="panel">
+        <div class="panel-title">
+          <span>Steam Player DNA & Game Blueprint</span>
+          <span id="game-blueprint-status" style="font-size: 11px; color: var(--light-gray);">Library Profile</span>
+        </div>
+        <div class="dna-grid">
+          <div class="dna-metric-box">
+            <span class="dna-metric-val" id="dna-playtime">0.0h</span>
+            <span class="dna-metric-lbl">Total Playtime</span>
+          </div>
+          <div class="dna-metric-box">
+            <span class="dna-metric-val" id="dna-games-count">0</span>
+            <span class="dna-metric-lbl">Games Analyzed</span>
+          </div>
+          <div class="dna-metric-box">
+            <span class="dna-metric-val" id="dna-pacing">balanced</span>
+            <span class="dna-metric-lbl">Pacing Profile</span>
+          </div>
+          <div class="dna-metric-box">
+            <span class="dna-metric-val" id="dna-challenge">0.50</span>
+            <span class="dna-metric-lbl">Challenge Tolerance</span>
+          </div>
+        </div>
+        <div class="dna-genres-bar" id="dna-genres-list">
+          <!-- Populated dynamically via /api/steam/dna -->
+        </div>
+        <div id="dna-top-games" style="display:flex; flex-wrap:wrap; gap:4px; margin-bottom:8px; font-size:10px; color:var(--slate);">
+          <!-- Populated dynamically with top Steam games & playtime hours via /api/steam/dna -->
+        </div>
+        <div id="game-blueprint-content" class="blueprint-box">
+          <div class="blueprint-empty">No Active Game Built Yet — Commission Genesis Build</div>
+        </div>
+      </div>
+
+      <!-- Panel 2: Dynamic Agent-Designed Telemetry & Hypotheses Panel -->
+      <div class="panel">
+        <div class="panel-title">
+          <span>Dynamic Agent-Designed Telemetry & Hypotheses</span>
+          <span id="telemetry-probe-summary" style="font-size: 11px; color: var(--amber);">Agent Probes</span>
+        </div>
+        <canvas id="telemetry-heatmap" width="640" height="360"></canvas>
+        <div class="heatmap-controls">
+          <label><input type="checkbox" id="layer-density" checked /> Event Density</label>
+          <label><input type="checkbox" id="layer-categories" checked /> Probe Categories</label>
+          <label><input type="checkbox" id="layer-hypotheses" checked /> Hypotheses Overlay</label>
+          <button id="btn-refresh-heatmap" style="margin-left:auto; background:none; border:1px solid var(--navy); color:var(--cyan); padding:2px 8px; border-radius:3px; cursor:pointer;">Refresh</button>
+        </div>
+        <div id="telemetry-hypotheses-container" style="margin-top: 8px;">
+          <!-- Populated dynamically via /api/telemetry/dashboard -->
+        </div>
+        <div id="probes-catalog-container" style="max-height: 140px; overflow-y: auto; margin-top: 8px;">
+          <!-- Populated dynamically via /api/telemetry/dashboard -->
+        </div>
+      </div>
+    </div>
+
+    <!-- Right Column: Streams, Audio, Code Diff, Palette -->
+    <div style="display: flex; flex-direction: column; gap: 16px;">
+      <div class="panel">
+        <div class="panel-title">
+          <span>Rationale-First Deliberation Stream</span>
+          <span style="font-size: 11px; color: var(--green);">Rule 4 Epistemic Observability</span>
+        </div>
+        <div class="stream-controls-bar">
+          <input id="stream-search" class="stream-input" type="text" placeholder="Search deliberation tokens..." />
+          <select id="agent-filter" class="stream-select">
+            <option value="">All Personas</option>
+            <option value="StudioOrchestrator">StudioOrchestrator</option>
+            <option value="SteamAndTelemetryAnalystAgent">SteamAnalyst</option>
+            <option value="CreativeDirectorWorldbuilderAgent">CreativeDirector</option>
+            <option value="NarrativeCharacterWriterAgent">NarrativeWriter</option>
+            <option value="VoiceActingAudioProducerAgent">VoiceAudio</option>
+            <option value="VisualArtSpriteDesignerAgent">VisualArt</option>
+            <option value="LeadGameplaySWEAgent">GameplaySWE</option>
+            <option value="TelemetryArchitectAgent">TelemetryArchitect</option>
+            <option value="QAPlaytesterBuildSupervisor">BuildSupervisor</option>
+          </select>
+          <select id="event-type-filter" class="stream-select">
+            <option value="">All Events</option>
+            <option value="AGENT_STREAM">Deliberations</option>
+            <option value="TOOL_INVOCATION">Tool Calls</option>
+            <option value="QA_GATE_RESULT">QA Gates</option>
+            <option value="CARTRIDGE_PROMOTED">Promotions</option>
+          </select>
+        </div>
+        <div id="deliberation-stream" class="terminal-log">[Observability Engine Initialized] Subscribed to live deliberation bus.</div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">
+          <span>Active Tool Invocations</span>
+          <span style="font-size: 11px; color: var(--light-gray);">PEV Execution Cycle Cards</span>
+        </div>
+        <ul id="tool-invocations-list">
+          <li class="tool-card status-success">
+            <div class="tool-card-header">
+              <div class="tool-info">
+                <span class="status-pill status-success">READY</span>
+                <span class="tool-name">Swarm Observation Listener</span>
+              </div>
+              <div class="tool-meta">
+                <span class="tool-duration">0.0ms</span>
+              </div>
+            </div>
+            <div class="tool-pev-status">Listening for tool execution telemetry...</div>
+          </li>
+        </ul>
+      </div>
+
+      <!-- Panel 3: Dynamic Multimodal Artifact & Code Explorer -->
+      <div class="panel">
+        <div class="panel-title">
+          <span>Multimodal Voice Clip Preview</span>
+          <select id="audio-track-selector" class="stream-select" style="font-size: 10px;">
+            <option value="">Awaiting audio synthesis...</option>
+          </select>
+        </div>
+        <audio id="voice-preview-player" controls preload="auto"></audio>
+        <div id="sprites-gallery-container" class="sprites-gallery"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">
+          <span>Style Bible Color Palette</span>
+          <span id="palette-selected-role" style="font-size: 11px; color: var(--peach);">Adaptive Palette</span>
+        </div>
+        <div id="palette-grid" class="palette-grid">
+          <!-- Populated dynamically via /api/assets/palette -->
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">
+          <span>Agent Code Diff Viewer</span>
+          <select id="diff-module-selector" class="stream-select" style="font-size: 10px;">
+            <option value="mechanics.py">mechanics.py</option>
+            <option value="entities.py">entities.py</option>
+            <option value="abilities.py">abilities.py</option>
+            <option value="manifest.json">manifest.json</option>
+          </select>
+        </div>
+        <div id="code-diff-container" class="diff-viewer">--- Active Cartridge Code Diff ---
+No candidate diff pending. Current cartridge code is synchronized with latest Genesis build.</div>
+        <div id="artifacts-inventory-summary" style="margin-top: 6px; font-size: 10px; color: var(--light-gray);"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // =========================================================================
+    // Pure ES6 WebSocket Client & Mission Control UI Controller (Zero Build)
+    // =========================================================================
+
+    const deliberationStream = document.getElementById('deliberation-stream');
+    const toolList = document.getElementById('tool-invocations-list');
+    const btnGenesis = document.getElementById('btn-trigger-genesis');
+    const heatmapCanvas = document.getElementById('telemetry-heatmap');
+    const ctx = heatmapCanvas.getContext('2d');
+    const streamSearch = document.getElementById('stream-search');
+    const agentFilter = document.getElementById('agent-filter');
+    const eventTypeFilter = document.getElementById('event-type-filter');
+    const statusBadge = document.getElementById('studio-status-badge');
+    const offlineBanner = document.getElementById('offline-banner');
+    const audioPlayer = document.getElementById('voice-preview-player');
+    const audioSelector = document.getElementById('audio-track-selector');
+    const diffContainer = document.getElementById('code-diff-container');
+    const diffSelector = document.getElementById('diff-module-selector');
+    const paletteGrid = document.getElementById('palette-grid');
+
+    const MAX_EVENTS = 500;
+    const eventBuffer = [];
+    let isAutoScrollEnabled = true;
+    let latestHeatmapData = null;
+
+    deliberationStream.addEventListener('scroll', () => {
+      const threshold = 30;
+      const distanceFromBottom = deliberationStream.scrollHeight - (deliberationStream.scrollTop + deliberationStream.clientHeight);
+      isAutoScrollEnabled = distanceFromBottom < threshold;
+    });
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
+    function renderStreamEntry(entry) {
+      const div = document.createElement('div');
+      div.className = `stream-entry event-${(entry.event_type || 'stream').toLowerCase()}`;
+      div.dataset.agent = entry.agent_name || '';
+      div.dataset.type = entry.event_type || '';
+
+      const timeStr = entry.time || new Date().toLocaleTimeString();
+      const agentName = escapeHtml(entry.agent_name || 'StudioSwarm');
+      const eventType = escapeHtml(entry.event_type || 'DELIBERATION');
+      const delibText = escapeHtml(entry.deliberation || entry.message || '');
+
+      div.innerHTML = `
+        <div class="entry-header">
+          <span class="entry-time">[${timeStr}]</span>
+          <span class="agent-badge">${agentName}</span>
+          <span class="event-tag">${eventType}</span>
+        </div>
+        <div class="deliberation-content">
+          <span class="deliberation-label">&gt; Rationale:</span>${delibText}
+        </div>
+      `;
+      return div;
+    }
+
+    function addDeliberation(data) {
+      const entry = {
+        deliberation: data.deliberation || data.message || '',
+        agent_name: data.agent_name || 'StudioOrchestrator',
+        event_type: data.event_type || 'AGENT_STREAM',
+        time: new Date().toLocaleTimeString(),
+        raw: data
+      };
+
+      eventBuffer.push(entry);
+      if (eventBuffer.length > MAX_EVENTS) eventBuffer.shift();
+
+      if (matchesFilter(entry)) {
+        const el = renderStreamEntry(entry);
+        deliberationStream.appendChild(el);
+        if (isAutoScrollEnabled) {
+          deliberationStream.scrollTop = deliberationStream.scrollHeight;
+        }
+      }
+    }
+
+    function matchesFilter(entry) {
+      const q = (streamSearch.value || '').toLowerCase().trim();
+      const selAgent = agentFilter.value;
+      const selType = eventTypeFilter.value;
+
+      if (selAgent && entry.agent_name !== selAgent) return false;
+      if (selType && entry.event_type !== selType) return false;
+      if (q) {
+        const text = `${entry.deliberation} ${entry.agent_name} ${entry.event_type}`.toLowerCase();
+        if (!text.includes(q)) return false;
+      }
+      return true;
+    }
+
+    function applyStreamFilters() {
+      deliberationStream.innerHTML = '';
+      eventBuffer.forEach(entry => {
+        if (matchesFilter(entry)) {
+          deliberationStream.appendChild(renderStreamEntry(entry));
+        }
+      });
+      deliberationStream.scrollTop = deliberationStream.scrollHeight;
+    }
+
+    streamSearch.addEventListener('input', applyStreamFilters);
+    agentFilter.addEventListener('change', applyStreamFilters);
+    eventTypeFilter.addEventListener('change', applyStreamFilters);
+
+    function addToolCard(toolData) {
+      const li = document.createElement('li');
+      const isFailed = (toolData.status === 'failed' || toolData.error_message || toolData.error_stack);
+      li.className = `tool-card ${isFailed ? 'status-failed' : 'status-success'}`;
+
+      const toolName = escapeHtml(toolData.tool_name || toolData.tool || 'generic_tool');
+      const agentName = escapeHtml(toolData.agent_name || 'StudioAgent');
+      const duration = (toolData.duration_ms !== undefined && toolData.duration_ms !== null)
+        ? `${Number(toolData.duration_ms).toFixed(1)}ms` : '0.0ms';
+      const statusText = isFailed ? 'FAILED' : 'SUCCESS';
+      const pevAttempt = toolData.pev_attempt || 1;
+      const pevMax = toolData.pev_max_retries || 3;
+
+      let ioHtml = '';
+      if (toolData.inputs || toolData.arguments || toolData.outputs) {
+        const inStr = escapeHtml(JSON.stringify(toolData.inputs || toolData.arguments || {}, null, 2));
+        const outStr = escapeHtml(JSON.stringify(toolData.outputs || {}, null, 2));
+        ioHtml = `
+          <details class="tool-details">
+            <summary>Inspect I/O Parameters</summary>
+            <div class="tool-io-grid">
+              <div class="io-col">
+                <h6>Inputs</h6>
+                <pre class="json-dump"><code>${inStr}</code></pre>
+              </div>
+              <div class="io-col">
+                <h6>Outputs</h6>
+                <pre class="json-dump"><code>${outStr}</code></pre>
+              </div>
+            </div>
+          </details>
+        `;
+      }
+
+      let errorHtml = '';
+      if (isFailed) {
+        const err = escapeHtml(toolData.error_stack || toolData.error_message || 'Tool execution encountered an exception.');
+        errorHtml = `
+          <div class="error-stack-box">
+            <strong>Error / Gate Diagnostic:</strong>
+            <pre><code>${err}</code></pre>
+          </div>
+        `;
+      }
+
+      li.innerHTML = `
+        <div class="tool-card-header">
+          <div class="tool-info">
+            <span class="tool-name">${toolName}</span>
+            <span class="tool-agent">${agentName}</span>
+          </div>
+          <div class="tool-meta">
+            <span class="tool-duration">${duration}</span>
+            <span class="status-pill ${isFailed ? 'status-failed' : 'status-success'}">${statusText}</span>
+          </div>
+        </div>
+        <div class="tool-pev-status">
+          <span>PEV Cycle: Attempt ${pevAttempt}/${pevMax}</span>
+          <span>Status: ${statusText}</span>
+        </div>
+        ${ioHtml}
+        ${errorHtml}
+      `;
+
+      toolList.prepend(li);
+      while (toolList.children.length > 50) {
+        toolList.removeChild(toolList.lastChild);
+      }
+    }
+
+    function updateAgentLifecycleState(agentName, state) {
+      if (!agentName) return;
+      const node = document.querySelector(`[data-agent="${agentName}"]`) || document.getElementById(`node-${agentName}`);
+      if (!node) return;
+
+      const validStates = ['idle', 'analyzing', 'synthesizing', 'verifying', 'promoted'];
+      validStates.forEach(s => node.classList.remove(`state-${s}`));
+
+      const normalized = (state || 'idle').toLowerCase();
+      node.classList.add(`state-${normalized}`);
+
+      const statusText = node.querySelector('.node-status-text');
+      if (statusText) {
+        statusText.textContent = state.toUpperCase();
+      }
+
+      const edge = document.querySelector(`.dag-edge[id*="${agentName.toLowerCase()}"]`);
+      if (edge) {
+        if (normalized === 'synthesizing') {
+          edge.classList.add('edge-active');
+        } else {
+          edge.classList.remove('edge-active');
+        }
+      }
+    }
+
+    // =========================================================================
+    // Resilient WebSocket Client with Exponential Backoff
+    // =========================================================================
+    class ResilientWebSocketClient {
+      constructor() {
+        this.endpoints = ['/ws/stream', '/ws/swarm'];
+        this.endpointIdx = 0;
+        this.ws = null;
+        this.retryCount = 0;
+        this.initialDelay = 1000;
+        this.maxDelay = 16000;
+        this.multiplier = 1.5;
+        this.reconnectTimer = null;
+        this.pollTimer = null;
+      }
+
+      connect() {
+        clearTimeout(this.reconnectTimer);
+        const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const host = window.location.host || 'localhost:8000';
+        const activeEndpoint = this.endpoints[this.endpointIdx];
+        const url = `${proto}//${host}${activeEndpoint}`;
+
+        this.setUIStatus('CONNECTING', 'CONNECTING...');
+
+        try {
+          this.ws = new WebSocket(url);
+        } catch (e) {
+          this.scheduleReconnect();
+          return;
+        }
+
+        this.ws.onopen = () => {
+          this.retryCount = 0;
+          this.setUIStatus('ONLINE', 'ONLINE');
+          this.stopPolling();
+          if (offlineBanner) offlineBanner.style.display = 'none';
+
+          addDeliberation({
+            deliberation: `Connected to studio observability bus via ${activeEndpoint}. Streaming active.`,
+            event_type: 'connected',
+            agent_name: 'MissionControlGateway'
+          });
+          loadSteamDNA();
+          loadHeatmap();
+          loadArtifacts();
+          loadDiff();
+        };
+
+        this.ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.deliberation) {
+              addDeliberation(data);
+            }
+            if (data.event_type === 'TOOL_INVOCATION' || data.event_type === 'tool_call' || (data.payload && data.payload.tool)) {
+              addToolCard({
+                tool_name: data.payload.tool || data.payload.tool_name || 'generic_tool',
+                agent_name: data.agent_name || 'StudioAgent',
+                status: data.payload.status || 'success',
+                duration_ms: data.payload.duration_ms,
+                inputs: data.payload.inputs || data.payload.arguments,
+                outputs: data.payload.outputs,
+                error_stack: data.payload.error_stack || data.payload.error_message,
+                pev_attempt: data.payload.pev_attempt,
+                pev_max_retries: data.payload.pev_max_retries
+              });
+            }
+            if (data.event_type === 'state_change' || (data.payload && data.payload.lifecycle_state)) {
+              const targetAgent = data.agent_name || data.payload.agent_name;
+              const newState = data.payload.lifecycle_state || data.payload.state;
+              updateAgentLifecycleState(targetAgent, newState);
+              if (newState === 'DONE' || newState === 'COMPLETED' || newState === 'PROMOTED') {
+                loadSteamDNA();
+                loadHeatmap();
+                loadArtifacts();
+                loadDiff();
+              }
+            }
+            if (data.event_type === 'AGENT_STREAM' || data.event_type === 'CARTRIDGE_PROMOTED') {
+              if (data.event_type === 'CARTRIDGE_PROMOTED') {
+                updateAgentLifecycleState('QAPlaytesterBuildSupervisor', 'PROMOTED');
+              }
+              loadSteamDNA();
+              loadHeatmap();
+              loadArtifacts();
+              loadDiff();
+            }
+          } catch (e) {
+            addDeliberation({ deliberation: event.data, event_type: 'raw_packet' });
+          }
+        };
+
+        this.ws.onclose = () => {
+          this.setUIStatus('DISCONNECTED', 'OFFLINE');
+          if (offlineBanner) offlineBanner.style.display = 'block';
+          this.scheduleReconnect();
+          this.startPolling();
+        };
+
+        this.ws.onerror = () => {
+          if (this.ws) this.ws.close();
+        };
+      }
+
+      scheduleReconnect() {
+        this.retryCount++;
+        this.endpointIdx = (this.endpointIdx + 1) % this.endpoints.length;
+
+        const base = Math.min(this.maxDelay, this.initialDelay * Math.pow(this.multiplier, this.retryCount - 1));
+        const jitter = base * (Math.random() * 0.4 - 0.2);
+        const delay = Math.max(500, Math.round(base + jitter));
+
+        this.setUIStatus('RECONNECTING', `RECONNECTING (${Math.round(delay/1000)}s)`);
+        this.reconnectTimer = setTimeout(() => this.connect(), delay);
+      }
+
+      setUIStatus(state, label) {
+        if (!statusBadge) return;
+        statusBadge.className = `badge-status status-${state.toLowerCase()}`;
+        statusBadge.textContent = label;
+      }
+
+      startPolling() {
+        if (this.pollTimer) return;
+        this.pollTimer = setInterval(async () => {
+          try {
+            const res = await fetch('/api/status');
+            if (res.ok) {
+              const data = await res.json();
+              if (data.agent_state) {
+                Object.entries(data.agent_state).forEach(([agent, st]) => {
+                  updateAgentLifecycleState(agent, st);
+                });
+              }
+            }
+          } catch (e) {
+            // Still offline
+          }
+        }, 5000);
+      }
+
+      stopPolling() {
+        if (this.pollTimer) {
+          clearInterval(this.pollTimer);
+          this.pollTimer = null;
+        }
+      }
+    }
+
+    const wsClient = new ResilientWebSocketClient();
+    wsClient.connect();
+
+    // Genesis Trigger Button Handler
+    btnGenesis.addEventListener('click', async () => {
+      addDeliberation({
+        deliberation: "Initiating operator-requested Genesis Build cycle...",
+        agent_name: "MissionControlGateway",
+        event_type: "genesis_triggered"
+      });
+      try {
+        const res = await fetch('/api/genesis/trigger', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ profile_tag: 'default', deliberation: 'Operator dispatch from Mission Control' })
+        });
+        const data = await res.json();
+        addDeliberation({
+          deliberation: `Genesis Job Dispatched: ${data.job_id} | Status: ${data.status}`,
+          agent_name: "StudioOrchestrator",
+          event_type: "genesis_triggered"
+        });
+      } catch (err) {
+        addDeliberation({
+          deliberation: `Genesis Trigger Failed: ${err.message}`,
+          agent_name: "MissionControlGateway",
+          event_type: "error"
+        });
+      }
+    });
+
+    // =========================================================================
+    // Steam Player DNA & Telemetry Dashboard Loaders
+    // =========================================================================
+    async function loadSteamDNA() {
+      try {
+        const res = await fetch('/api/steam/dna');
+        if (!res.ok) return;
+        const data = await res.json();
+        const pt = document.getElementById('dna-playtime');
+        const gc = document.getElementById('dna-games-count');
+        const pp = document.getElementById('dna-pacing');
+        const ct = document.getElementById('dna-challenge');
+        const gl = document.getElementById('dna-genres-list');
+        const tg = document.getElementById('dna-top-games');
+        if (pt) pt.textContent = `${(data.total_playtime_hours || 0).toFixed(1)}h`;
+        if (gc) gc.textContent = String(data.total_games_analyzed || 0);
+        if (pp) {
+          const sign = (data.pacing_score || 0) >= 0 ? '+' : '';
+          pp.textContent = `${data.pacing_preference || 'balanced'} (${sign}${(data.pacing_score || 0).toFixed(2)})`;
+        }
+        if (ct) ct.textContent = (data.challenge_tolerance || 0.5).toFixed(2);
+        if (gl && data.top_genres) {
+          gl.innerHTML = '';
+          data.top_genres.forEach(g => {
+            const chip = document.createElement('span');
+            chip.className = 'genre-chip';
+            const weight = data.genre_weights && data.genre_weights[g] ? ` (${Math.round(data.genre_weights[g] * 100)}%)` : '';
+            chip.textContent = `${g}${weight}`;
+            gl.appendChild(chip);
+          });
+        }
+        if (tg && Array.isArray(data.top_games) && data.top_games.length > 0) {
+          tg.innerHTML = '<span style="color:var(--amber); font-weight:700; margin-right:4px;">Top Played:</span>';
+          data.top_games.slice(0, 8).forEach(game => {
+            const span = document.createElement('span');
+            span.style.cssText = 'background:rgba(41,173,255,0.08); border:1px solid var(--navy); padding:1px 6px; border-radius:3px; color:var(--white);';
+            const hrs = typeof game.playtime_hours === 'number' ? ` (${game.playtime_hours.toFixed(1)}h)` : '';
+            span.textContent = `${game.name || game.appid}${hrs}`;
+            tg.appendChild(span);
+          });
+        }
+      } catch (e) {
+        // Backend not ready
+      }
+    }
+
+    async function loadHeatmap() {
+      try {
+        const res = await fetch('/api/telemetry/dashboard');
+        if (!res.ok) return;
+        const data = await res.json();
+        latestHeatmapData = data;
+
+        // Update Game Blueprint
+        const bpContent = document.getElementById('game-blueprint-content');
+        const bpStatus = document.getElementById('game-blueprint-status');
+        if (bpContent) {
+          if (data.has_active_game && (data.game_title || data.manifest)) {
+            if (bpStatus) bpStatus.textContent = 'Active Cartridge';
+            let html = `<div class="blueprint-field"><span class="blueprint-field-label">Title:</span><strong>${escapeHtml(data.game_title || 'Untitled')}</strong></div>`;
+            html += `<div class="blueprint-field"><span class="blueprint-field-label">Genre:</span><span>${escapeHtml(data.genre || 'Autonomous')}</span></div>`;
+            if (data.manifest && data.manifest.creative_direction) {
+              const cd = data.manifest.creative_direction;
+              if (cd.narrative_premise) html += `<div class="blueprint-field"><span class="blueprint-field-label">Premise:</span><span>${escapeHtml(cd.narrative_premise)}</span></div>`;
+              if (cd.core_rules) {
+                const rulesStr = Array.isArray(cd.core_rules) ? cd.core_rules.join(' • ') : cd.core_rules;
+                html += `<div class="blueprint-field"><span class="blueprint-field-label">Rules:</span><span>${escapeHtml(rulesStr)}</span></div>`;
+              }
+              if (cd.aesthetic_style) html += `<div class="blueprint-field"><span class="blueprint-field-label">Aesthetic:</span><span>${escapeHtml(cd.aesthetic_style)}</span></div>`;
+            } else if (data.manifest && data.manifest.narrative_premise) {
+              html += `<div class="blueprint-field"><span class="blueprint-field-label">Premise:</span><span>${escapeHtml(data.manifest.narrative_premise)}</span></div>`;
+            } else if (data.manifest && data.manifest.description) {
+              html += `<div class="blueprint-field"><span class="blueprint-field-label">Description:</span><span>${escapeHtml(data.manifest.description)}</span></div>`;
+            }
+            bpContent.innerHTML = html;
+          } else {
+            if (bpStatus) bpStatus.textContent = 'No Active Build';
+            bpContent.innerHTML = '<div class="blueprint-empty">No Active Game Built Yet — Commission Genesis Build</div>';
+          }
+        }
+
+        // Update Probes Catalog
+        const probeContainer = document.getElementById('probes-catalog-container');
+        const probeSummary = document.getElementById('telemetry-probe-summary');
+        const probeList = data.probes || [];
+        if (probeSummary) probeSummary.textContent = `${probeList.length} Registered Probes`;
+        if (probeContainer) {
+          if (probeList.length > 0) {
+            let table = '<table class="probes-table"><thead><tr><th>Probe</th><th>Category</th><th>Target Hypothesis</th></tr></thead><tbody>';
+            probeList.forEach(p => {
+              table += `<tr><td><strong>${escapeHtml(p.probe_name)}</strong></td><td><span class="probe-category-tag">${escapeHtml(p.category)}</span></td><td>${escapeHtml(p.hypothesis_target || '')}</td></tr>`;
+            });
+            table += '</tbody></table>';
+            probeContainer.innerHTML = table;
+          } else {
+            probeContainer.innerHTML = '<div style="color:var(--slate); font-size:10px; padding:6px;">Awaiting custom telemetry probe injection from TelemetryArchitect...</div>';
+          }
+        }
+
+        // Update Hypotheses List
+        const hypContainer = document.getElementById('telemetry-hypotheses-container');
+        const hypList = data.hypotheses || [];
+        if (hypContainer) {
+          hypContainer.innerHTML = '';
+          if (hypList.length > 0) {
+            hypList.forEach(h => {
+              const card = document.createElement('div');
+              card.className = 'hypothesis-card';
+              if (typeof h === 'string') {
+                card.innerHTML = `<span class="hypothesis-target">Hypothesis:</span> ${escapeHtml(h)}`;
+              } else {
+                card.innerHTML = `<div class="hypothesis-target">${escapeHtml(h.category || 'Hypothesis')}: ${escapeHtml(h.hypothesis || '')}</div><div>${escapeHtml(h.recommendation || '')}</div>`;
+              }
+              hypContainer.appendChild(card);
+            });
+          }
+        }
+
+        renderHeatmap();
+      } catch (e) {
+        // Skip if backend not ready
+      }
+    }
+
+    function renderHeatmap() {
+      const data = latestHeatmapData || {};
+      const width = heatmapCanvas.width;
+      const height = heatmapCanvas.height;
+
+      ctx.fillStyle = '#02050e';
+      ctx.fillRect(0, 0, width, height);
+
+      // Background cyber grid lines
+      ctx.strokeStyle = '#0d1630';
+      ctx.lineWidth = 1;
+      const stepX = width / 16;
+      const stepY = height / 10;
+      for (let x = 0; x <= width; x += stepX) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, height);
+        ctx.stroke();
+      }
+      for (let y = 0; y <= height; y += stepY) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(width, y);
+        ctx.stroke();
+      }
+
+      const showDensity = document.getElementById('layer-density')?.checked ?? true;
+      const showCategories = document.getElementById('layer-categories')?.checked ?? true;
+      const showHypotheses = document.getElementById('layer-hypotheses')?.checked ?? true;
+
+      const events = data.recent_custom_events || [];
+      const probes = data.probes || [];
+
+      if (events.length === 0 && probes.length === 0) {
+        ctx.fillStyle = '#3F5978';
+        ctx.font = '12px "SF Mono", monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('Autonomous Telemetry Engine — Awaiting Custom Probe Invocations', width / 2, height / 2 - 10);
+        ctx.font = '10px "SF Mono", monospace';
+        ctx.fillStyle = '#1D2B53';
+        ctx.fillText('Registered probes will render dynamic category distributions & behavioral metrics.', width / 2, height / 2 + 14);
+        return;
+      }
+
+      // Draw Category Distribution Bars if showCategories
+      if (showCategories && (probes.length > 0 || events.length > 0)) {
+        const catCounts = {};
+        probes.forEach(p => {
+          const cat = p.category || 'general';
+          catCounts[cat] = (catCounts[cat] || 0) + 1;
+        });
+        events.forEach(e => {
+          const cat = e.category || 'general';
+          catCounts[cat] = (catCounts[cat] || 0) + 1;
+        });
+
+        const catNames = Object.keys(catCounts);
+        let maxCount = 1;
+        catNames.forEach(c => { if (catCounts[c] > maxCount) maxCount = catCounts[c]; });
+
+        const barHeight = Math.min(24, Math.max(14, (height - 80) / Math.max(1, catNames.length)));
+        const paletteColors = ['#29ADFF', '#00E436', '#FFCC00', '#FF77A8', '#FFA300', '#FF004D'];
+
+        catNames.forEach((cat, idx) => {
+          const y = 25 + idx * (barHeight + 8);
+          const count = catCounts[cat];
+          const barW = Math.max(8, ((width - 240) * (count / maxCount)));
+          const color = paletteColors[idx % paletteColors.length];
+
+          // Label
+          ctx.font = '10px "SF Mono", monospace';
+          ctx.textAlign = 'left';
+          ctx.fillStyle = '#C2C3C7';
+          ctx.fillText(cat.toUpperCase(), 20, y + barHeight - 4);
+
+          // Bar background
+          ctx.fillStyle = 'rgba(29, 43, 83, 0.4)';
+          ctx.fillRect(140, y, width - 230, barHeight);
+
+          // Bar fill
+          ctx.fillStyle = color;
+          ctx.fillRect(140, y, barW, barHeight);
+
+          // Count text
+          ctx.fillStyle = '#FFF1E8';
+          ctx.font = 'bold 10px "SF Mono", monospace';
+          ctx.fillText(`${count} registered/emitted`, 150 + barW, y + barHeight - 4);
+        });
+      }
+
+      // Draw Event Density Spark Points if showDensity
+      if (showDensity && events.length > 0) {
+        ctx.fillStyle = 'rgba(41, 173, 255, 0.6)';
+        events.forEach((ev, i) => {
+          const px = ((i + 1) / (events.length + 1)) * (width - 40) + 20;
+          const py = height - 25;
+          ctx.beginPath();
+          ctx.arc(px, py, 3, 0, Math.PI * 2);
+          ctx.fill();
+        });
+      }
+
+      // Draw Hypotheses Indicator if showHypotheses
+      if (showHypotheses && data.hypotheses && data.hypotheses.length > 0) {
+        ctx.strokeStyle = '#00E436';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(10, height - 36, width - 20, 26);
+        ctx.fillStyle = '#00E436';
+        ctx.font = '10px "SF Mono", monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText(`HYPOTHESES ACTIVE: ${data.hypotheses.length} preference targets formulated by Analyst`, 20, height - 19);
+      }
+    }
+
+    document.getElementById('layer-density')?.addEventListener('change', renderHeatmap);
+    document.getElementById('layer-categories')?.addEventListener('change', renderHeatmap);
+    document.getElementById('layer-hypotheses')?.addEventListener('change', renderHeatmap);
+    document.getElementById('btn-refresh-heatmap')?.addEventListener('click', loadHeatmap);
+
+    // =========================================================================
+    // Multimodal Artifacts, Audio Player & Palette Chips
+    // =========================================================================
+    async function loadArtifacts() {
+      try {
+        const res = await fetch('/api/artifacts');
+        if (!res.ok) return;
+        const data = await res.json();
+
+        // Audio Clips
+        audioSelector.innerHTML = '';
+        if (data.audio_clips && data.audio_clips.length > 0) {
+          data.audio_clips.forEach(clip => {
+            const opt = document.createElement('option');
+            opt.value = clip.filename;
+            opt.textContent = `${clip.filename} (${(clip.size_bytes / 1024).toFixed(1)} KB)`;
+            audioSelector.appendChild(opt);
+          });
+          audioPlayer.src = `/api/artifacts/audio/${data.audio_clips[0].filename}`;
+        } else {
+          const opt = document.createElement('option');
+          opt.value = '';
+          opt.textContent = 'No voice clips generated yet';
+          audioSelector.appendChild(opt);
+          audioPlayer.removeAttribute('src');
+        }
+
+        // Code Modules in diffSelector
+        if (data.code_modules && data.code_modules.length > 0) {
+          diffSelector.innerHTML = '';
+          data.code_modules.forEach(mod => {
+            const opt = document.createElement('option');
+            opt.value = mod;
+            opt.textContent = mod;
+            diffSelector.appendChild(opt);
+          });
+        }
+
+        // Sprites Gallery
+        const spritesGallery = document.getElementById('sprites-gallery-container');
+        if (spritesGallery) {
+          spritesGallery.innerHTML = '';
+          if (data.sprites && data.sprites.length > 0) {
+            data.sprites.forEach(s => {
+              const chip = document.createElement('span');
+              chip.className = 'sprite-chip';
+              chip.textContent = s.filename;
+              spritesGallery.appendChild(chip);
+            });
+          }
+        }
+
+        // Artifacts Summary
+        const summaryEl = document.getElementById('artifacts-inventory-summary');
+        if (summaryEl) {
+          const status = data.exists ? 'Active Cartridge' : 'Uninitialized';
+          summaryEl.textContent = `Status: ${status} | Audio: ${data.audio_clips?.length || 0} | Sprites: ${data.sprites?.length || 0} | Modules: ${data.code_modules?.length || 0}`;
+        }
+      } catch (e) {
+        // Backend not ready
+      }
+    }
+
+    audioSelector.addEventListener('change', () => {
+      const track = audioSelector.value;
+      if (track) {
+        audioPlayer.src = `/api/artifacts/audio/${track}`;
+        audioPlayer.load();
+      }
+    });
+
+    async function loadPalette() {
+      try {
+        const res = await fetch('/api/assets/palette');
+        if (!res.ok) return;
+        const data = await res.json();
+        paletteGrid.innerHTML = '';
+        data.colors.forEach(c => {
+          const chip = document.createElement('div');
+          chip.className = 'palette-chip';
+          chip.style.backgroundColor = c.hex;
+          chip.title = `${c.name} (${c.hex})\nRole: index ${c.index}`;
+          chip.textContent = c.index;
+          // Set contrasting text color for dark colors
+          const rgbSum = c.rgb[0] + c.rgb[1] + c.rgb[2];
+          chip.style.color = rgbSum > 380 ? '#000000' : '#FFF1E8';
+          chip.addEventListener('click', () => {
+            const roleEl = document.getElementById('palette-selected-role');
+            if (roleEl) roleEl.textContent = `${c.name.toUpperCase()} (${c.hex})`;
+          });
+          paletteGrid.appendChild(chip);
+        });
+      } catch (e) {
+        // Skip if backend not ready
+      }
+    }
+
+    // =========================================================================
+    // Interactive Code Diff Viewer
+    // =========================================================================
+    async function loadDiff() {
+      const moduleName = diffSelector.value;
+      if (!moduleName) return;
+      try {
+        const res = await fetch(`/api/diff?module=${moduleName}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.diff) {
+          const lines = data.diff.split('\n');
+          diffContainer.innerHTML = '';
+          lines.forEach(line => {
+            const div = document.createElement('div');
+            if (line.startsWith('+++') || line.startsWith('---')) {
+              div.className = 'diff-line-hdr';
+            } else if (line.startsWith('+')) {
+              div.className = 'diff-line-add';
+            } else if (line.startsWith('-')) {
+              div.className = 'diff-line-del';
+            } else if (line.startsWith('@@')) {
+              div.className = 'diff-line-hdr';
+            }
+            div.textContent = line;
+            diffContainer.appendChild(div);
+          });
+        } else {
+          diffContainer.textContent = `No active code diff available for ${moduleName}.`;
+        }
+      } catch (e) {
+        // Skip if backend not ready
+      }
+    }
+
+    diffSelector.addEventListener('change', loadDiff);
+
+    // Initialize UI components
+    loadSteamDNA();
+    loadHeatmap();
+    loadPalette();
+    loadArtifacts();
+    loadDiff();
+  </script>
+</body>
+</html>

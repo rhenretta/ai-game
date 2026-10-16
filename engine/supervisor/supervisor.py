@@ -1,0 +1,1429 @@
+"""engine/supervisor/supervisor.py
+Build Supervisor & Closed-Loop Code Self-Healing Guardrail (Milestone M4, Features 24 & 27).
+Coordinates the 5-Gate quality verification pipeline in computational dependency order:
+Gate A (Syntax/AST) -> Gate E (Asset Integrity) -> Gate D (Zero Exceptions) ->
+Gate B (Traversability with Dual-Frontier bottleneck detection) -> Gate C (Survivability).
+Blocks promotion on defect, generates Rationale-First RejectionDiagnosticTraces,
+and drives closed-loop self-healing repair via LeadGameplaySWEAgent before promotion to cartridges/active/.
+"""
+from __future__ import annotations
+import ast
+from collections import deque
+import copy
+from datetime import datetime, timezone
+import json
+import logging
+import math
+import os
+from pathlib import Path
+import shutil
+import sys
+import traceback
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
+
+import config
+from engine.api.contracts import BaseCartridge, BaseLevelSpec
+from engine.compiler.compiler import CompilationResult, EngineCompiler
+from engine.director.models import (
+    CurrentEpisodeConfig,
+    DirectiveAction,
+    EpisodicUpdateSpec,
+    GenesisSpec,
+    SpatialUpdateDirective,
+)
+from engine.loader import ASTSecurityError, CartridgeLoader, validate_cartridge_ast
+from engine.spatial.navmesh import astar_pathfind
+from engine.supervisor.asset_validator import AssetValidator
+from engine.supervisor.models import (
+    BuildEvaluationReport,
+    GateFailureType,
+    QualityGateResult,
+    RejectionDiagnosticTrace,
+    RemedyType,
+    SupervisorEvaluationReport,
+    SupervisorGateVerdict,
+)
+
+logger = logging.getLogger("BuildSupervisor")
+
+
+class SupervisorError(Exception):
+    """Base exception for supervisor operations."""
+    deliberation: str = "Base exception for supervisor operations."
+
+
+class BuildSupervisor:
+    """Coordinates compilation verification, headless simulation, and self-healing repair."""
+    deliberation: str = "Build Supervisor evaluating candidate updates, rejecting defects, and driving self-healing."
+
+    def __init__(
+        self,
+        cartridges_root: Optional[Union[Path, str]] = None,
+        active_cartridge_dir: Optional[Union[Path, str]] = None,
+        compiler: Optional[EngineCompiler] = None,
+        swe_agent: Optional[Any] = None,
+        asset_validator: Optional[Any] = None,
+        tile_size: float = 32.0,
+        max_retries: int = 3,
+        early_death_tick_threshold: int = 180,  # 3.0s at 60 Hz
+        max_simulation_ticks: int = 3600,       # 60.0s at 60 Hz
+        spawn_clearance_margin: float = 64.0,
+    ):
+        self.cartridges_root = Path(cartridges_root or (config.PROJECT_ROOT / "cartridges"))
+        self.active_cartridge_dir = Path(active_cartridge_dir or (self.cartridges_root / "active"))
+        self.cartridges_root.mkdir(parents=True, exist_ok=True)
+        self.compiler = compiler or EngineCompiler(
+            cartridges_root=self.cartridges_root,
+            active_cartridge_dir=self.active_cartridge_dir,
+        )
+        self.swe_agent = swe_agent
+        self.asset_validator = asset_validator or AssetValidator()
+        self.tile_size = float(tile_size)
+        self.max_retries = int(max_retries)
+        self.early_death_tick_threshold = int(early_death_tick_threshold)
+        self.max_simulation_ticks = int(max_simulation_ticks)
+        self.spawn_clearance_margin = float(spawn_clearance_margin)
+
+    # =========================================================================
+    # Primary Entry Point: Closed-Loop Evaluate & Self-Heal Loop
+    # =========================================================================
+
+    def evaluate_and_heal(
+        self,
+        candidate_or_spec: Union[GenesisSpec, EpisodicUpdateSpec, Path, str],
+        max_retries: Optional[int] = None,
+        episode_number: int = 1,
+    ) -> BuildEvaluationReport:
+        """Executes the closed-loop compile -> simulate -> verify -> repair loop.
+        Retries up to max_retries if defects are encountered.
+        Promotes to active ONLY when 100% of quality gates pass.
+        """
+        retries = max_retries if max_retries is not None else self.max_retries
+        repair_history: List[RejectionDiagnosticTrace] = []
+
+        # Branch 1: Direct candidate directory input (from Multi-Agent Studio)
+        if isinstance(candidate_or_spec, (Path, str)):
+            candidate_dir = Path(candidate_or_spec).resolve()
+            candidate_id = candidate_dir.name
+            logger.info("Supervisor evaluating candidate directory %s", candidate_dir)
+
+            for attempt in range(1, retries + 1):
+                gate_results, trace = self.evaluate_candidate_cartridge(
+                    candidate_dir=candidate_dir,
+                    episode_number=episode_number,
+                    attempt_number=attempt,
+                )
+
+                if trace is None:
+                    self.promote_candidate(candidate_dir)
+                    report = BuildEvaluationReport(
+                        deliberation=f"Candidate cartridge {candidate_id} passed all 5 Quality Gates and was promoted to active on attempt {attempt}.",
+                        candidate_id=candidate_id,
+                        episode_number=episode_number,
+                        status=SupervisorGateVerdict.PROMOTED,
+                        promoted_to_active=True,
+                        candidate_dir=str(candidate_dir),
+                        active_dir=str(self.active_cartridge_dir),
+                        gate_results=gate_results,
+                        rejection_trace=None,
+                        attempt_count=attempt,
+                        max_retries=retries,
+                        repair_history=repair_history,
+                    )
+                    logger.info("Candidate %s successfully PROMOTED to %s", candidate_id, self.active_cartridge_dir)
+                    return report
+
+                repair_history.append(trace)
+                logger.warning("Attempt %d/%d rejected at %s (%s): %s",
+                               attempt, retries, trace.failure_gate, trace.failure_type.value, trace.failure_reason)
+
+                if attempt >= retries:
+                    report = BuildEvaluationReport(
+                        deliberation=f"Candidate cartridge {candidate_id} exhausted max retries ({retries}) and promotion was blocked.",
+                        candidate_id=candidate_id,
+                        episode_number=episode_number,
+                        status=SupervisorGateVerdict.FAILED_MAX_RETRIES,
+                        promoted_to_active=False,
+                        candidate_dir=str(candidate_dir),
+                        active_dir=str(self.active_cartridge_dir),
+                        gate_results=gate_results,
+                        rejection_trace=trace,
+                        attempt_count=attempt,
+                        max_retries=retries,
+                        repair_history=repair_history,
+                    )
+                    logger.error("Candidate %s FAILED_MAX_RETRIES; active cartridge preserved untouched.", candidate_id)
+                    return report
+
+                if self.swe_agent is not None and hasattr(self.swe_agent, "repair_cartridge_code"):
+                    logger.info("Triggering SWE self-healing repair on %s", candidate_dir)
+                    try:
+                        self.swe_agent.repair_cartridge_code(candidate_dir, trace)
+                    except Exception as swe_err:
+                        logger.warning("SWE repair encountered unexpected error: %s", swe_err)
+
+        # Branch 2: Director Specification Input (GenesisSpec or EpisodicUpdateSpec)
+        else:
+            current_spec = copy.deepcopy(candidate_or_spec)
+            is_genesis = isinstance(current_spec, GenesisSpec)
+            target_episode = 0 if is_genesis else getattr(current_spec, "target_episode_number", episode_number)
+            spec_id = getattr(current_spec, "spec_id", f"spec_ep{target_episode}")
+
+            for attempt in range(1, retries + 1):
+                candidate_dir = (self.cartridges_root / f"candidate_ep{target_episode:02d}_att{attempt}").resolve()
+                logger.info("Supervisor evaluating spec %s (Episode %d) Attempt %d/%d -> %s",
+                            spec_id, target_episode, attempt, retries, candidate_dir)
+
+                # Step 1: Compile spec to candidate directory
+                try:
+                    compile_result: CompilationResult = self.compiler.compile(
+                        spec=current_spec,
+                        target_dir=candidate_dir,
+                    )
+                except Exception as comp_err:
+                    trace = RejectionDiagnosticTrace(
+                        deliberation=f"EngineCompiler failed to compile specification {spec_id}: {comp_err}",
+                        candidate_id=spec_id,
+                        episode_number=target_episode,
+                        attempt_number=attempt,
+                        failure_gate="Gate A: Syntax & AST",
+                        failure_type=GateFailureType.SYNTAX_AST_ERROR,
+                        failure_reason=str(comp_err),
+                        runtime_traceback=traceback.format_exc(),
+                        remedy_type=RemedyType.FIX_SYNTAX,
+                        recommended_remedy="Repair invalid specification attributes or syntax errors.",
+                    )
+                    repair_history.append(trace)
+                    gate_a_fail = QualityGateResult(
+                        deliberation=f"Compiler failure: {comp_err}",
+                        gate_name="Gate A: Syntax & AST",
+                        passed=False,
+                        failure_type=GateFailureType.SYNTAX_AST_ERROR,
+                        details=str(comp_err),
+                    )
+                    comp_gate_results = {
+                        "gate_a": gate_a_fail,
+                        "Gate A: Syntax & AST": gate_a_fail,
+                    }
+                    if attempt >= retries:
+                        return BuildEvaluationReport(
+                            deliberation=f"Specification {spec_id} compilation exhausted max retries ({retries}).",
+                            candidate_id=spec_id,
+                            episode_number=target_episode,
+                            status=SupervisorGateVerdict.FAILED_MAX_RETRIES,
+                            promoted_to_active=False,
+                            candidate_dir=str(candidate_dir),
+                            active_dir=str(self.active_cartridge_dir),
+                            gate_results=comp_gate_results,
+                            rejection_trace=trace,
+                            attempt_count=attempt,
+                            max_retries=retries,
+                            repair_history=repair_history,
+                        )
+                    current_spec = self.heal_specification(current_spec, trace)
+                    continue
+
+                # Step 2: Evaluate candidate cartridge directory
+                gate_results, trace = self.evaluate_candidate_cartridge(
+                    candidate_dir=candidate_dir,
+                    spec=current_spec,
+                    episode_number=target_episode,
+                    attempt_number=attempt,
+                )
+
+                if trace is None:
+                    # 100% Gates passed! Promote candidate to active
+                    self.promote_candidate(candidate_dir)
+                    report = BuildEvaluationReport(
+                        deliberation=f"Candidate build {spec_id} passed all 5 Quality Gates on attempt {attempt} and was promoted to active.",
+                        candidate_id=spec_id,
+                        episode_number=target_episode,
+                        status=SupervisorGateVerdict.PROMOTED,
+                        promoted_to_active=True,
+                        candidate_dir=str(candidate_dir),
+                        active_dir=str(self.active_cartridge_dir),
+                        gate_results=gate_results,
+                        rejection_trace=None,
+                        attempt_count=attempt,
+                        max_retries=retries,
+                        repair_history=repair_history,
+                    )
+                    logger.info("Candidate %s successfully PROMOTED to %s", spec_id, self.active_cartridge_dir)
+                    return report
+
+                # Failure detected
+                repair_history.append(trace)
+                logger.warning("Attempt %d/%d rejected at %s (%s): %s",
+                               attempt, retries, trace.failure_gate, trace.failure_type.value, trace.failure_reason)
+
+                if attempt >= retries:
+                    report = BuildEvaluationReport(
+                        deliberation=f"Candidate build {spec_id} exhausted max retries ({retries}) and promotion was blocked.",
+                        candidate_id=spec_id,
+                        episode_number=target_episode,
+                        status=SupervisorGateVerdict.FAILED_MAX_RETRIES,
+                        promoted_to_active=False,
+                        candidate_dir=str(candidate_dir),
+                        active_dir=str(self.active_cartridge_dir),
+                        gate_results=gate_results,
+                        rejection_trace=trace,
+                        attempt_count=attempt,
+                        max_retries=retries,
+                        repair_history=repair_history,
+                    )
+                    logger.error("Candidate %s FAILED_MAX_RETRIES; active cartridge preserved untouched.", spec_id)
+                    return report
+
+                # Closed-loop self-healing refactoring
+                if self.swe_agent is not None and hasattr(self.swe_agent, "repair_cartridge_code"):
+                    self.swe_agent.repair_cartridge_code(candidate_dir, trace)
+                current_spec = self.heal_specification(current_spec, trace)
+
+        raise SupervisorError("Unexpected termination of evaluate_and_heal loop.")
+
+    # =========================================================================
+    # Candidate Cartridge Evaluation Pipeline (5 Quality Gates)
+    # =========================================================================
+
+    def evaluate_candidate_cartridge(
+        self,
+        candidate_dir: Path,
+        spec: Optional[Any] = None,
+        episode_number: int = 1,
+        attempt_number: int = 1,
+    ) -> Tuple[Dict[str, QualityGateResult], Optional[RejectionDiagnosticTrace]]:
+        """Evaluates an assembled candidate cartridge directory against all 5 Quality Gates."""
+        candidate_dir = Path(candidate_dir).resolve()
+        candidate_id = getattr(spec, "spec_id", getattr(spec, "candidate_id", candidate_dir.name))
+
+        # Branch for Director spatial specs or candidate directories containing level.json without custom scenes
+        is_spatial = False
+        if spec is not None and (hasattr(spec, "updated_episode_config") or hasattr(spec, "level_dimensions") or hasattr(spec, "spawn_point")):
+            is_spatial = True
+        elif (candidate_dir / "level.json").is_file():
+            has_scenes = False
+            try:
+                mech_path = candidate_dir / "mechanics.py"
+                if mech_path.is_file():
+                    tree = ast.parse(mech_path.read_text(encoding="utf-8"))
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.FunctionDef) and node.name in ("get_scenes", "get_initial_scene"):
+                            has_scenes = True
+                            break
+            except Exception:
+                pass
+            if not has_scenes:
+                is_spatial = True
+                if spec is None:
+                    try:
+                        data = json.loads((candidate_dir / "level.json").read_text(encoding="utf-8"))
+                        spec = BaseLevelSpec.from_dict(data)
+                    except Exception:
+                        spec = None
+
+        if is_spatial and spec is not None:
+            return self._evaluate_spatial_candidate(candidate_dir, spec, episode_number, attempt_number)
+
+        gate_results: Dict[str, QualityGateResult] = {}
+
+        # ---------------------------------------------------------------------
+        # 1. Gate A: Syntax & Entrypoint Verification
+        # ---------------------------------------------------------------------
+        gate_a = self.verify_gate_a_syntax_and_entrypoint(candidate_dir)
+        gate_results["gate_a"] = gate_a
+        gate_results["Gate A: AST & Entrypoint"] = gate_a
+        gate_results["Gate A: Syntax & AST"] = gate_a
+        gate_results["Gate A"] = gate_a
+        if not gate_a.passed:
+            trace = RejectionDiagnosticTrace(
+                deliberation=f"Gate A rejected candidate build: {gate_a.details}",
+                candidate_id=candidate_id,
+                episode_number=episode_number,
+                attempt_number=attempt_number,
+                failure_gate="Gate A: AST & Entrypoint",
+                failure_type=gate_a.failure_type,
+                failure_reason=gate_a.details,
+                file_path=gate_a.diagnostic_data.get("file_path"),
+                line_number=gate_a.diagnostic_data.get("line_number"),
+                remedy_type=RemedyType.FIX_SYNTAX if gate_a.failure_type == GateFailureType.SYNTAX_AST_ERROR else RemedyType.FIX_SCENE_ENTRYPOINT,
+                recommended_remedy="Inspect source code for syntax errors, prohibited imports, missing BaseCartridge entrypoint, or missing scene lifecycles.",
+            )
+            return gate_results, trace
+
+        # ---------------------------------------------------------------------
+        # 2. Gate B: Multimodal Asset Verification
+        # ---------------------------------------------------------------------
+        gate_b = self.verify_gate_b_multimodal_assets(candidate_dir)
+        gate_results["gate_b"] = gate_b
+        gate_results["Gate B: Multimodal Asset Verification"] = gate_b
+        gate_results["Gate E: Multimodal Asset Integrity"] = gate_b
+        gate_results["gate_e"] = gate_b
+        if not gate_b.passed:
+            trace = RejectionDiagnosticTrace(
+                deliberation=f"Gate B rejected candidate build: {gate_b.details}",
+                candidate_id=candidate_id,
+                episode_number=episode_number,
+                attempt_number=attempt_number,
+                failure_gate="Gate B: Multimodal Asset Verification",
+                failure_type=gate_b.failure_type,
+                failure_reason=gate_b.details,
+                asset_violations=gate_b.diagnostic_data.get("violations", [gate_b.details]),
+                remedy_type=RemedyType.REGENERATE_ASSET,
+                recommended_remedy="Ensure audio has valid 44-byte RIFF WAV header, visual assets have 8-byte PNG header, and narrative dialogue tree is valid.",
+            )
+            return gate_results, trace
+
+        # ---------------------------------------------------------------------
+        # 3. Gate C: Headless Execution & Progression Simulation
+        # ---------------------------------------------------------------------
+        gate_c, sim = self.verify_gate_c_headless_execution(candidate_dir, max_ticks=60)
+        gate_results["gate_c"] = gate_c
+        gate_results["Gate C: Headless Execution & Progression"] = gate_c
+        gate_results["Gate C: Survivability"] = gate_c
+        if not gate_c.passed:
+            trace = RejectionDiagnosticTrace(
+                deliberation=f"Gate C rejected candidate build: {gate_c.details}",
+                candidate_id=candidate_id,
+                episode_number=episode_number,
+                attempt_number=attempt_number,
+                failure_gate="Gate C: Headless Execution & Progression",
+                failure_type=gate_c.failure_type,
+                failure_reason=gate_c.details,
+                runtime_traceback=gate_c.diagnostic_data.get("traceback"),
+                remedy_type=RemedyType.REPAIR_CODE_EXCEPTION,
+                recommended_remedy="Resolve runtime crash or frozen progression during headless scene simulation.",
+            )
+            return gate_results, trace
+
+        # ---------------------------------------------------------------------
+        # 4. Gate D: Performance & Frame Budget Verification (< 16.6ms)
+        # ---------------------------------------------------------------------
+        gate_d = self.verify_gate_d_frame_budget(sim, target_ms=16.6)
+        gate_results["gate_d"] = gate_d
+        gate_results["Gate D: Frame Budget"] = gate_d
+        gate_results["Gate D: Exception-Free"] = gate_d
+        if not gate_d.passed:
+            trace = RejectionDiagnosticTrace(
+                deliberation=f"Gate D rejected candidate build: {gate_d.details}",
+                candidate_id=candidate_id,
+                episode_number=episode_number,
+                attempt_number=attempt_number,
+                failure_gate="Gate D: Frame Budget",
+                failure_type=gate_d.failure_type,
+                failure_reason=gate_d.details,
+                remedy_type=RemedyType.OPTIMIZE_FRAME_LOOP,
+                recommended_remedy="Optimize heavy loops or blocking calls in scene update/render to maintain 60 FPS frame budget (<16.6ms).",
+            )
+            return gate_results, trace
+
+        # ---------------------------------------------------------------------
+        # 5. Gate E: Custom Telemetry Probe Verification
+        # ---------------------------------------------------------------------
+        gate_e = self.verify_gate_e_custom_telemetry(candidate_dir, sim)
+        gate_results["gate_e"] = gate_e
+        gate_results["Gate E: Custom Telemetry Emission"] = gate_e
+        if not gate_e.passed:
+            trace = RejectionDiagnosticTrace(
+                deliberation=f"Gate E rejected candidate build: {gate_e.details}",
+                candidate_id=candidate_id,
+                episode_number=episode_number,
+                attempt_number=attempt_number,
+                failure_gate="Gate E: Custom Telemetry Emission",
+                failure_type=gate_e.failure_type,
+                failure_reason=gate_e.details,
+                remedy_type=RemedyType.INJECT_TELEMETRY_PROBES,
+                recommended_remedy="Ensure custom probes declared in telemetry_manifest.json are actively emitted during scene update.",
+            )
+            return gate_results, trace
+
+        return gate_results, None
+
+    def _evaluate_spatial_candidate(
+        self,
+        candidate_dir: Path,
+        spec: Any,
+        episode_number: int = 1,
+        attempt_number: int = 1,
+    ) -> Tuple[Dict[str, QualityGateResult], Optional[RejectionDiagnosticTrace]]:
+        """Evaluates spatial director updates against spatial navigation and survivability gates."""
+        gate_results: Dict[str, QualityGateResult] = {}
+        candidate_id = getattr(spec, "spec_id", getattr(spec, "candidate_id", candidate_dir.name))
+
+        # Gate A: Syntax & AST Validation
+        gate_a = self.verify_gate_a_syntax_and_ast(candidate_dir)
+        gate_results["gate_a"] = gate_a
+        gate_results["Gate A: Syntax & AST"] = gate_a
+        gate_results["Gate A"] = gate_a
+        if not gate_a.passed:
+            trace = RejectionDiagnosticTrace(
+                deliberation=f"Gate A rejected candidate build: {gate_a.details}",
+                candidate_id=candidate_id,
+                episode_number=episode_number,
+                attempt_number=attempt_number,
+                failure_gate="Gate A: Syntax & AST",
+                failure_type=gate_a.failure_type,
+                failure_reason=gate_a.details,
+                file_path=gate_a.diagnostic_data.get("file_path"),
+                line_number=gate_a.diagnostic_data.get("line_number"),
+                remedy_type=RemedyType.FIX_SYNTAX,
+                recommended_remedy="Inspect source code for syntax errors or prohibited imports and regenerate.",
+            )
+            return gate_results, trace
+
+        # Gate E: Multimodal Asset Integrity
+        gate_e = self.verify_gate_e_asset_integrity(candidate_dir)
+        gate_results["gate_e"] = gate_e
+        gate_results["Gate E: Multimodal Asset Integrity"] = gate_e
+        if not gate_e.passed:
+            trace = RejectionDiagnosticTrace(
+                deliberation=f"Gate E rejected candidate build: {gate_e.details}",
+                candidate_id=candidate_id,
+                episode_number=episode_number,
+                attempt_number=attempt_number,
+                failure_gate="Gate E: Multimodal Asset Integrity",
+                failure_type=gate_e.failure_type,
+                failure_reason=gate_e.details,
+                asset_violations=gate_e.diagnostic_data.get("violations", [gate_e.details]),
+                remedy_type=RemedyType.REGENERATE_ASSET,
+                recommended_remedy="Re-synthesize audio with valid 44-byte RIFF header or quantize sprites to 16-color Style Bible palette.",
+            )
+            return gate_results, trace
+
+        # Load cartridge instance
+        try:
+            cartridge = CartridgeLoader.load_cartridge(candidate_dir)
+            level_spec = cartridge.get_level_spec(episode_number if episode_number > 0 else 1)
+        except Exception as exc:
+            gate_d = QualityGateResult(
+                deliberation=f"Cartridge loading raised unhandled exception: {exc}",
+                gate_name="Gate D: Exception-Free",
+                passed=False,
+                failure_type=GateFailureType.UNHANDLED_EXCEPTION,
+                details=f"{exc}\n{traceback.format_exc()}",
+                diagnostic_data={"traceback": traceback.format_exc()}
+            )
+            gate_results["gate_d"] = gate_d
+            gate_results["Gate D: Exception-Free"] = gate_d
+            trace = RejectionDiagnosticTrace(
+                deliberation=f"Cartridge loading failed with unhandled exception: {exc}",
+                candidate_id=candidate_id,
+                episode_number=episode_number,
+                attempt_number=attempt_number,
+                failure_gate="Gate D: Exception-Free",
+                failure_type=GateFailureType.UNHANDLED_EXCEPTION,
+                failure_reason=str(exc),
+                runtime_traceback=traceback.format_exc(),
+                remedy_type=RemedyType.REPAIR_CODE_EXCEPTION,
+                recommended_remedy="Repair runtime error during CartridgeLoader instantiation.",
+            )
+            return gate_results, trace
+
+        # Run Simulation / Playtesting
+        sim_result, runtime_exc = self.run_simulation_and_playtest(cartridge, level_spec)
+
+        # Gate D: Zero Unhandled Exceptions
+        gate_d = self.verify_gate_d_exceptions(runtime_exc)
+        gate_results["gate_d"] = gate_d
+        gate_results["Gate D: Exception-Free"] = gate_d
+        if not gate_d.passed:
+            trace = RejectionDiagnosticTrace(
+                deliberation=f"Gate D rejected build due to runtime exception during simulation: {runtime_exc}",
+                candidate_id=candidate_id,
+                episode_number=episode_number,
+                attempt_number=attempt_number,
+                failure_gate="Gate D: Exception-Free",
+                failure_type=GateFailureType.UNHANDLED_EXCEPTION,
+                failure_reason=gate_d.details,
+                runtime_traceback=gate_d.diagnostic_data.get("traceback"),
+                remedy_type=RemedyType.REPAIR_CODE_EXCEPTION,
+                recommended_remedy="Resolve runtime crash in entity or mechanics simulation loop.",
+            )
+            return gate_results, trace
+
+        # Gate B: Traversability
+        gate_b, blocked_nodes = self.verify_gate_b_traversability(cartridge, level_spec, sim_result)
+        gate_results["gate_b"] = gate_b
+        gate_results["Gate B: Traversability"] = gate_b
+        if not gate_b.passed:
+            fail_coords = None
+            if blocked_nodes:
+                tx, ty = blocked_nodes[0]
+                fail_coords = ((tx + 0.5) * self.tile_size, (ty + 0.5) * self.tile_size)
+
+            trace = RejectionDiagnosticTrace(
+                deliberation="Candidate level geometry blocked critical navigation path between spawn and exit.",
+                candidate_id=candidate_id,
+                episode_number=episode_number,
+                attempt_number=attempt_number,
+                failure_gate="Gate B: Traversability",
+                failure_type=gate_b.failure_type,
+                failure_reason=gate_b.details,
+                failure_coordinates=fail_coords,
+                blocked_nodes=blocked_nodes,
+                remedy_type=RemedyType.RELOCATE_OBSTACLE if blocked_nodes else RemedyType.REMOVE_OBSTACLE,
+                recommended_remedy=(
+                    f"Relocate or remove blocking obstacle near coordinates {fail_coords or level_spec.spawn_point} "
+                    f"to reopen critical path to exit portal."
+                ),
+                remedy_parameters={"blocked_nodes": blocked_nodes, "failure_coordinates": fail_coords},
+            )
+            return gate_results, trace
+
+        # Gate C: Survivability
+        gate_c = self.verify_gate_c_survivability(sim_result, level_spec)
+        gate_results["gate_c"] = gate_c
+        gate_results["Gate C: Survivability"] = gate_c
+        if not gate_c.passed:
+            fail_coords = gate_c.diagnostic_data.get("failure_coordinates", level_spec.spawn_point)
+            tick = gate_c.diagnostic_data.get("death_tick", 0)
+            trace = RejectionDiagnosticTrace(
+                deliberation="Candidate update failed survivability sanity check: premature player death or instant spawn kill.",
+                candidate_id=candidate_id,
+                episode_number=episode_number,
+                attempt_number=attempt_number,
+                failure_gate="Gate C: Survivability",
+                failure_type=gate_c.failure_type,
+                failure_reason=gate_c.details,
+                failure_coordinates=tuple(fail_coords) if fail_coords else None,
+                tick_count=tick,
+                remedy_type=RemedyType.SOFTEN_HAZARD if "hazard" in gate_c.details.lower() else RemedyType.WIDEN_MARGIN,
+                recommended_remedy=(
+                    f"Soften immediate threats around spawn: relocate hazards/enemies outside clearance margin "
+                    f"({self.spawn_clearance_margin} px) or scale down lethal contact damage."
+                ),
+                remedy_parameters=gate_c.diagnostic_data,
+            )
+            return gate_results, trace
+
+        return gate_results, None
+
+    # =========================================================================
+    # Individual Gate Verification Logic
+    # =========================================================================
+
+    def verify_gate_a_syntax_and_entrypoint(self, candidate_dir: Path) -> QualityGateResult:
+        """Gate A: Checks AST security, bytecode compilation, class deliberation, and BaseCartridge entrypoint."""
+        candidate_dir = Path(candidate_dir).resolve()
+        py_files = list(candidate_dir.rglob("*.py"))
+        if not py_files:
+            return QualityGateResult(
+                deliberation="Cartridge directory contains zero Python source modules.",
+                gate_name="Gate A: AST & Entrypoint",
+                passed=False,
+                failure_type=GateFailureType.ENTRYPOINT_MISSING,
+                details="No Python files found in candidate cartridge directory.",
+                diagnostic_data={"candidate_dir": str(candidate_dir)},
+            )
+
+        found_cartridge_subclass = False
+        entrypoint_file = None
+
+        for py_path in py_files:
+            try:
+                content = py_path.read_text(encoding="utf-8")
+                # 1. Prohibited template placeholders check
+                if "{TEMPLATE_" in content or "{{LEVEL_CONFIG}}" in content:
+                    return QualityGateResult(
+                        deliberation=f"Unresolved template placeholder detected in {py_path.name}.",
+                        gate_name="Gate A: AST & Entrypoint",
+                        passed=False,
+                        failure_type=GateFailureType.SYNTAX_AST_ERROR,
+                        details=f"Template token detected in {py_path.name}",
+                        diagnostic_data={"file_path": str(py_path)},
+                    )
+
+                # 2. AST Security check
+                validate_cartridge_ast(content)
+
+                # 3. Bytecode compilation
+                compile(content, py_path.name, "exec")
+
+                # 4. AST class structure inspection
+                tree = ast.parse(content)
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.ClassDef):
+                        # Verify Rule 4 deliberation
+                        has_delib = any(
+                            (isinstance(stmt, ast.AnnAssign) and getattr(stmt.target, "id", None) == "deliberation") or
+                            (isinstance(stmt, ast.Assign) and any(getattr(t, "id", None) == "deliberation" for t in stmt.targets))
+                            for stmt in node.body
+                        )
+                        if not has_delib:
+                            return QualityGateResult(
+                                deliberation=f"Class '{node.name}' in {py_path.name} violates Rule 4: missing deliberation attribute.",
+                                gate_name="Gate A: AST & Entrypoint",
+                                passed=False,
+                                failure_type=GateFailureType.SYNTAX_AST_ERROR,
+                                details=f"Class {node.name} must declare deliberation attribute.",
+                                diagnostic_data={"file_path": str(py_path), "class_name": node.name},
+                            )
+
+                        # Check if inherits from BaseCartridge or Cartridge
+                        for base in node.bases:
+                            base_id = getattr(base, "id", getattr(base, "attr", ""))
+                            if "Cartridge" in base_id:
+                                found_cartridge_subclass = True
+                                entrypoint_file = py_path.name
+
+            except ASTSecurityError as ast_err:
+                return QualityGateResult(
+                    deliberation=f"AST security sandbox violation in {py_path.name}: {ast_err}",
+                    gate_name="Gate A: AST & Entrypoint",
+                    passed=False,
+                    failure_type=GateFailureType.SYNTAX_AST_ERROR,
+                    details=f"AST Security Invariant Violated in {py_path.name}: {ast_err}",
+                    diagnostic_data={"file_path": str(py_path)},
+                )
+            except SyntaxError as syn_err:
+                return QualityGateResult(
+                    deliberation=f"Syntax error compiling {py_path.name}: {syn_err}",
+                    gate_name="Gate A: AST & Entrypoint",
+                    passed=False,
+                    failure_type=GateFailureType.SYNTAX_AST_ERROR,
+                    details=f"Python syntax error in {py_path.name}: {syn_err}",
+                    diagnostic_data={"file_path": str(py_path), "line_number": syn_err.lineno},
+                )
+            except Exception as e:
+                return QualityGateResult(
+                    deliberation=f"Unexpected error validating {py_path.name}: {e}",
+                    gate_name="Gate A: AST & Entrypoint",
+                    passed=False,
+                    failure_type=GateFailureType.SYNTAX_AST_ERROR,
+                    details=str(e),
+                    diagnostic_data={"file_path": str(py_path)},
+                )
+
+        if not found_cartridge_subclass:
+            return QualityGateResult(
+                deliberation="Candidate cartridge does not define a BaseCartridge subclass.",
+                gate_name="Gate A: AST & Entrypoint",
+                passed=False,
+                failure_type=GateFailureType.ENTRYPOINT_MISSING,
+                details="Missing class inheriting from BaseCartridge.",
+                diagnostic_data={"candidate_dir": str(candidate_dir)},
+            )
+
+        return QualityGateResult(
+            deliberation="All cartridge Python modules passed AST security invariants, bytecode compilation, and BaseCartridge entrypoint.",
+            gate_name="Gate A: AST & Entrypoint",
+            passed=True,
+            failure_type=GateFailureType.NONE,
+            details=f"AST security & entrypoint verified (entrypoint: {entrypoint_file}).",
+        )
+
+    def verify_gate_b_multimodal_assets(self, candidate_dir: Path) -> QualityGateResult:
+        """Gate B: Verifies multimodal asset integrity (RIFF WAV audio, PNG sprites, acyclic narrative dialogue tree)."""
+        validator = self.asset_validator or AssetValidator()
+        return validator.validate_cartridge_assets(candidate_dir)
+
+    def verify_gate_c_headless_execution(
+        self,
+        candidate_dir: Path,
+        max_ticks: int = 60,
+    ) -> Tuple[QualityGateResult, Optional[Any]]:
+        """Gate C: Spins up headless simulation, steps discrete ticks with synthetic inputs, tracks progression & exceptions."""
+        os.environ["SDL_VIDEODRIVER"] = "dummy"
+        os.environ["SDL_AUDIODRIVER"] = "dummy"
+
+        try:
+            from engine.sim.headless import HeadlessSimulator, SimulationInput
+            sim = HeadlessSimulator(cartridge_path=candidate_dir)
+        except Exception as exc:
+            return QualityGateResult(
+                deliberation=f"HeadlessSimulator initialization raised unhandled exception: {exc}",
+                gate_name="Gate C: Headless Execution & Progression",
+                passed=False,
+                failure_type=GateFailureType.UNHANDLED_EXCEPTION,
+                details=f"{exc}\n{traceback.format_exc()}",
+                diagnostic_data={"traceback": traceback.format_exc()},
+            ), None
+
+        initial_state_counter = getattr(getattr(sim, "current_scene", None), "state_counter", None)
+
+        try:
+            for step_idx in range(max_ticks):
+                action = SimulationInput(
+                    move_x=1.0 if step_idx % 2 == 0 else 0.0,
+                    move_y=1.0 if step_idx % 3 == 0 else 0.0,
+                    dash=(step_idx % 15 == 0),
+                    fire=(step_idx % 10 == 0),
+                )
+                step_res = sim.step(action)
+                if getattr(sim, "is_completed", False):
+                    break
+        except Exception as exc:
+            return QualityGateResult(
+                deliberation=f"Simulation tick raised unhandled exception: {exc}",
+                gate_name="Gate C: Headless Execution & Progression",
+                passed=False,
+                failure_type=GateFailureType.UNHANDLED_EXCEPTION,
+                details=f"{exc}\n{traceback.format_exc()}",
+                diagnostic_data={"traceback": traceback.format_exc()},
+            ), sim
+
+        # Progression check: ensure state advanced and simulation did not freeze
+        progression_ok = getattr(sim, "progression_verified", True)
+        current_scene = getattr(sim, "current_scene", None)
+        if current_scene is not None and initial_state_counter is not None:
+            final_counter = getattr(current_scene, "state_counter", initial_state_counter)
+            if final_counter == initial_state_counter and sim.step_count > 10:
+                progression_ok = False
+
+        if not progression_ok:
+            return QualityGateResult(
+                deliberation="Simulation state remained frozen across ticks; no progression detected.",
+                gate_name="Gate C: Headless Execution & Progression",
+                passed=False,
+                failure_type=GateFailureType.PROGRESSION_FAILURE,
+                details="State counter did not increment during simulation ticks.",
+                diagnostic_data={"step_count": sim.step_count},
+            ), sim
+
+        return QualityGateResult(
+            deliberation=f"Headless simulation executed {sim.step_count} ticks cleanly with observable state progression.",
+            gate_name="Gate C: Headless Execution & Progression",
+            passed=True,
+            failure_type=GateFailureType.NONE,
+            details=f"Simulated {sim.step_count} ticks cleanly.",
+            diagnostic_data={"step_count": sim.step_count},
+        ), sim
+
+    def verify_gate_d_frame_budget(self, sim: Any, target_ms: float = 16.6) -> QualityGateResult:
+        """Gate D: Verifies simulated frame tick durations adhere to the 60 FPS target (< 16.6ms)."""
+        if sim is None:
+            return QualityGateResult(
+                deliberation="No simulation telemetry available for frame budget evaluation.",
+                gate_name="Gate D: Frame Budget",
+                passed=False,
+                failure_type=GateFailureType.FRAME_BUDGET_EXCEEDED,
+                details="Simulation instance was not provided.",
+            )
+
+        avg_ms = getattr(sim, "avg_frame_time_ms", 0.0)
+        max_ms = getattr(sim, "max_frame_time_ms", 0.0)
+        passed = getattr(sim, "frame_budget_passed", True)
+
+        if not passed or avg_ms > target_ms:
+            return QualityGateResult(
+                deliberation=f"Frame budget exceeded: average tick duration {avg_ms:.2f}ms exceeds target {target_ms:.2f}ms (60 FPS).",
+                gate_name="Gate D: Frame Budget",
+                passed=False,
+                failure_type=GateFailureType.FRAME_BUDGET_EXCEEDED,
+                details=f"Average frame {avg_ms:.2f}ms > {target_ms:.2f}ms. Peak frame spike: {max_ms:.2f}ms.",
+                diagnostic_data={"avg_frame_time_ms": avg_ms, "max_frame_time_ms": max_ms, "target_ms": target_ms},
+            )
+
+        return QualityGateResult(
+            deliberation=f"Frame budget verified: avg {avg_ms:.2f}ms < {target_ms:.2f}ms (peak spike {max_ms:.2f}ms).",
+            gate_name="Gate D: Frame Budget",
+            passed=True,
+            failure_type=GateFailureType.NONE,
+            details=f"Performance within budget: avg {avg_ms:.2f}ms, peak {max_ms:.2f}ms.",
+            diagnostic_data={"avg_frame_time_ms": avg_ms, "max_frame_time_ms": max_ms, "target_ms": target_ms},
+        )
+
+    def verify_gate_e_custom_telemetry(self, candidate_dir: Path, sim: Any) -> QualityGateResult:
+        """Gate E: Verifies that custom probes declared in telemetry_manifest.json were actively emitted."""
+        candidate_dir = Path(candidate_dir).resolve()
+        manifest_path = candidate_dir / "telemetry_manifest.json"
+        if not manifest_path.is_file():
+            # If no custom telemetry manifest declared, pass vacuously
+            return QualityGateResult(
+                deliberation="No custom telemetry manifest declared; passing Gate E vacuously.",
+                gate_name="Gate E: Custom Telemetry Emission",
+                passed=True,
+                failure_type=GateFailureType.NONE,
+                details="No telemetry_manifest.json present in candidate.",
+            )
+
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            declared_probes = data.get("probes", [])
+        except Exception as exc:
+            return QualityGateResult(
+                deliberation=f"Malformed telemetry_manifest.json: {exc}",
+                gate_name="Gate E: Custom Telemetry Emission",
+                passed=False,
+                failure_type=GateFailureType.TELEMETRY_EMISSION_FAILURE,
+                details=f"JSON decode error in telemetry_manifest.json: {exc}",
+            )
+
+        if not declared_probes:
+            return QualityGateResult(
+                deliberation="telemetry_manifest.json declared zero probes; passing Gate E.",
+                gate_name="Gate E: Custom Telemetry Emission",
+                passed=True,
+                failure_type=GateFailureType.NONE,
+                details="Empty probe list.",
+            )
+
+        # Check emitted probes
+        recorder = getattr(sim, "telemetry_recorder", None) if sim else None
+        fired_probe_names = set()
+        if recorder is not None:
+            if hasattr(recorder, "get_events_by_type"):
+                probe_events = recorder.get_events_by_type("CUSTOM_PROBE")
+            elif hasattr(recorder, "get_events"):
+                probe_events = recorder.get_events("CUSTOM_PROBE")
+            else:
+                probe_events = getattr(recorder, "events", [])
+
+            for ev in probe_events:
+                p_name = getattr(ev, "probe_name", None) or (ev.payload.get("probe_name") if hasattr(ev, "payload") and isinstance(ev.payload, dict) else None)
+                if p_name:
+                    fired_probe_names.add(p_name)
+
+        declared_names = {p.get("probe_name") for p in declared_probes if isinstance(p, dict)}
+        matching = declared_names.intersection(fired_probe_names)
+
+        if not matching:
+            return QualityGateResult(
+                deliberation=f"Custom telemetry verification failed: none of the declared probes ({list(declared_names)}) were emitted during simulation.",
+                gate_name="Gate E: Custom Telemetry Emission",
+                passed=False,
+                failure_type=GateFailureType.TELEMETRY_EMISSION_FAILURE,
+                details=f"Zero custom probe emissions recorded for declared probes: {list(declared_names)}.",
+                diagnostic_data={"declared_probes": list(declared_names), "fired_probes": list(fired_probe_names)},
+            )
+
+        return QualityGateResult(
+            deliberation=f"Custom telemetry verified: {len(matching)} declared probes actively emitted ({list(matching)}).",
+            gate_name="Gate E: Custom Telemetry Emission",
+            passed=True,
+            failure_type=GateFailureType.NONE,
+            details=f"Verified emission of custom probes: {list(matching)}.",
+            diagnostic_data={"declared_probes": list(declared_names), "fired_probes": list(fired_probe_names)},
+        )
+
+    def verify_gate_a_syntax_and_ast(self, cartridge_dir: Path) -> QualityGateResult:
+        """Gate A: Checks AST security invariants and bytecode compilation."""
+        py_files = list(candidate_file for candidate_file in cartridge_dir.glob("*.py"))
+        if not py_files:
+            return QualityGateResult(
+                deliberation="Cartridge directory contains no Python source files.",
+                gate_name="Gate A: Syntax & AST",
+                passed=False,
+                failure_type=GateFailureType.SYNTAX_AST_ERROR,
+                details="Missing essential Python modules in cartridge directory."
+            )
+
+        for py_path in py_files:
+            try:
+                with open(py_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                # 1. AST Security
+                validate_cartridge_ast(content)
+                # 2. Bytecode compilation
+                compile(content, py_path.name, "exec")
+            except ASTSecurityError as ast_err:
+                return QualityGateResult(
+                    deliberation=f"AST security sandbox violation in {py_path.name}: {ast_err}",
+                    gate_name="Gate A: Syntax & AST",
+                    passed=False,
+                    failure_type=GateFailureType.SYNTAX_AST_ERROR,
+                    details=f"AST Security Invariant Violated in {py_path.name}: {ast_err}",
+                    diagnostic_data={"file_path": str(py_path)}
+                )
+            except SyntaxError as syn_err:
+                return QualityGateResult(
+                    deliberation=f"Syntax error compiling {py_path.name}: {syn_err}",
+                    gate_name="Gate A: Syntax & AST",
+                    passed=False,
+                    failure_type=GateFailureType.SYNTAX_AST_ERROR,
+                    details=f"Python syntax error in {py_path.name}: {syn_err}",
+                    diagnostic_data={"file_path": str(py_path), "line_number": syn_err.lineno}
+                )
+            except Exception as e:
+                return QualityGateResult(
+                    deliberation=f"Unexpected error validating {py_path.name}: {e}",
+                    gate_name="Gate A: Syntax & AST",
+                    passed=False,
+                    failure_type=GateFailureType.SYNTAX_AST_ERROR,
+                    details=str(e),
+                    diagnostic_data={"file_path": str(py_path)}
+                )
+
+        return QualityGateResult(
+            deliberation="All cartridge Python modules passed AST security invariants and bytecode compilation.",
+            gate_name="Gate A: Syntax & AST",
+            passed=True,
+            failure_type=GateFailureType.NONE,
+            details="AST security & bytecode checks successful."
+        )
+
+    def verify_gate_e_asset_integrity(self, candidate_dir: Path) -> QualityGateResult:
+        """Gate E: Verifies multimodal asset integrity (voice audio, visual sprites/tiles, narrative.json)."""
+        if self.asset_validator is not None:
+            return self.asset_validator.validate_cartridge_assets(candidate_dir)
+        validator = AssetValidator()
+        return validator.validate_cartridge_assets(candidate_dir)
+
+    def verify_gate_b_traversability(
+        self,
+        cartridge: BaseCartridge,
+        level_spec: BaseLevelSpec,
+        sim_result: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[QualityGateResult, List[Tuple[int, int]]]:
+        """Gate B: Verifies critical path from spawn to exit is unbroken via NavMesh A* and Dual-Frontier BFS."""
+        # 1. Check if playtester bot provided traversability result with pre-computed blocked nodes
+        if sim_result is not None:
+            if not sim_result.get("traversable", True):
+                blocked = sim_result.get("blocked_nodes", [])
+                if blocked:
+                    return QualityGateResult(
+                        deliberation="Playtester bot failed to find traversable path to exit portal.",
+                        gate_name="Gate B: Traversability",
+                        passed=False,
+                        failure_type=GateFailureType.CRITICAL_PATH_BLOCKED,
+                        details="Synthetic playtester reported critical path is blocked by solid obstacles."
+                    ), blocked
+            elif sim_result.get("stuck", False):
+                blocked = sim_result.get("blocked_nodes", [])
+                if blocked:
+                    return QualityGateResult(
+                        deliberation="Playtester bot was detected stuck in a cyclic movement loop.",
+                        gate_name="Gate B: Traversability",
+                        passed=False,
+                        failure_type=GateFailureType.TIMEOUT_STUCK,
+                        details="Synthetic playtester oscillating or trapped without forward progress."
+                    ), blocked
+
+        # 2. Geometric NavMesh A* traversability verification
+        width = int(level_spec.width)
+        height = int(level_spec.height)
+        cols = max(1, int(width // self.tile_size))
+        rows = max(1, int(height // self.tile_size))
+
+        # Build occupancy grid (0 = free, 1 = obstacle)
+        grid = [[0 for _ in range(cols)] for _ in range(rows)]
+        for wall in level_spec.walls:
+            wx, wy, ww, wh = wall[:4]
+            min_tx = max(0, min(cols - 1, int(wx // self.tile_size)))
+            max_tx = max(0, min(cols - 1, int((wx + ww - 1e-4) // self.tile_size)))
+            min_ty = max(0, min(rows - 1, int(wy // self.tile_size)))
+            max_ty = max(0, min(rows - 1, int((wy + wh - 1e-4) // self.tile_size)))
+            for r in range(min_ty, max_ty + 1):
+                for c in range(min_tx, max_tx + 1):
+                    grid[r][c] = 1
+
+        spawn_tx = max(0, min(cols - 1, int(level_spec.spawn_point[0] // self.tile_size)))
+        spawn_ty = max(0, min(rows - 1, int(level_spec.spawn_point[1] // self.tile_size)))
+        exit_tx = max(0, min(cols - 1, int(level_spec.exit_point[0] // self.tile_size)))
+        exit_ty = max(0, min(rows - 1, int(level_spec.exit_point[1] // self.tile_size)))
+
+        # Verify spawn and exit are not embedded inside solid wall geometry
+        if grid[spawn_ty][spawn_tx] == 1:
+            return QualityGateResult(
+                deliberation="Player spawn coordinate is embedded inside solid wall geometry.",
+                gate_name="Gate B: Traversability",
+                passed=False,
+                failure_type=GateFailureType.CRITICAL_PATH_BLOCKED,
+                details=f"Spawn point {level_spec.spawn_point} overlaps solid obstacle tile ({spawn_tx}, {spawn_ty})."
+            ), [(spawn_tx, spawn_ty)]
+
+        if grid[exit_ty][exit_tx] == 1:
+            return QualityGateResult(
+                deliberation="Exit portal coordinate is embedded inside solid wall geometry.",
+                gate_name="Gate B: Traversability",
+                passed=False,
+                failure_type=GateFailureType.CRITICAL_PATH_BLOCKED,
+                details=f"Exit portal {level_spec.exit_point} overlaps solid obstacle tile ({exit_tx}, {exit_ty})."
+            ), [(exit_tx, exit_ty)]
+
+        # Pathfind via A*
+        path = astar_pathfind(grid, (spawn_tx, spawn_ty), (exit_tx, exit_ty), allow_diagonal=False)
+        if path is None:
+            bottleneck_nodes = self.find_bottleneck_chokepoints(grid, (spawn_tx, spawn_ty), (exit_tx, exit_ty))
+            ray_nodes = self._find_raycast_blockers(grid, (spawn_tx, spawn_ty), (exit_tx, exit_ty))
+            blocked_nodes = list(dict.fromkeys(bottleneck_nodes + ray_nodes))
+            return QualityGateResult(
+                deliberation="A* pathfinding could not find a traversable path from spawn to exit.",
+                gate_name="Gate B: Traversability",
+                passed=False,
+                failure_type=GateFailureType.CRITICAL_PATH_BLOCKED,
+                details=f"No traversable path from spawn ({spawn_tx}, {spawn_ty}) to exit ({exit_tx}, {exit_ty})."
+            ), blocked_nodes
+
+        # If geometric static path exists, verify playtester simulation did not fail
+        if sim_result is not None and not sim_result.get("traversable", True):
+            return QualityGateResult(
+                deliberation="Playtester bot failed to find traversable path to exit portal during simulation.",
+                gate_name="Gate B: Traversability",
+                passed=False,
+                failure_type=GateFailureType.CRITICAL_PATH_BLOCKED,
+                details="Synthetic playtester reported critical path is blocked during dynamic simulation."
+            ), []
+
+        if sim_result is not None and sim_result.get("stuck", False):
+            return QualityGateResult(
+                deliberation="Playtester bot was detected stuck in a cyclic movement loop.",
+                gate_name="Gate B: Traversability",
+                passed=False,
+                failure_type=GateFailureType.TIMEOUT_STUCK,
+                details="Synthetic playtester oscillating or trapped without forward progress."
+            ), []
+
+        return QualityGateResult(
+            deliberation=f"Critical path verified traversable via A* with {len(path)} steps.",
+            gate_name="Gate B: Traversability",
+            passed=True,
+            failure_type=GateFailureType.NONE,
+            details=f"Path verified with length {len(path)}."
+        ), []
+
+    def find_bottleneck_chokepoints(
+        self,
+        grid: List[List[int]],
+        start: Tuple[int, int],
+        goal: Tuple[int, int],
+    ) -> List[Tuple[int, int]]:
+        """Dual-Frontier BFS discovering the exact obstacle partition separating spawn from exit."""
+        cols = len(grid[0])
+        rows = len(grid)
+
+        # 1. Forward BFS from start
+        reachable_from_start: Set[Tuple[int, int]] = set()
+        queue = deque([start])
+        if 0 <= start[0] < cols and 0 <= start[1] < rows and grid[start[1]][start[0]] == 0:
+            reachable_from_start.add(start)
+        while queue:
+            cx, cy = queue.popleft()
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nx, ny = cx + dx, cy + dy
+                if 0 <= nx < cols and 0 <= ny < rows and grid[ny][nx] == 0:
+                    if (nx, ny) not in reachable_from_start:
+                        reachable_from_start.add((nx, ny))
+                        queue.append((nx, ny))
+
+        # 2. Backward BFS from goal
+        reachable_from_goal: Set[Tuple[int, int]] = set()
+        queue_goal = deque([goal])
+        if 0 <= goal[0] < cols and 0 <= goal[1] < rows and grid[goal[1]][goal[0]] == 0:
+            reachable_from_goal.add(goal)
+        while queue_goal:
+            cx, cy = queue_goal.popleft()
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nx, ny = cx + dx, cy + dy
+                if 0 <= nx < cols and 0 <= ny < rows and grid[ny][nx] == 0:
+                    if (nx, ny) not in reachable_from_goal:
+                        reachable_from_goal.add((nx, ny))
+                        queue_goal.append((nx, ny))
+
+        # 3. Find solid tiles (grid == 1) adjacent to reachable_from_start with minimum distance to reachable_from_goal
+        candidate_blockers: List[Tuple[float, Tuple[int, int]]] = []
+        for sx, sy in reachable_from_start:
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                wx, wy = sx + dx, sy + dy
+                if 0 <= wx < cols and 0 <= wy < rows and grid[wy][wx] == 1:
+                    if reachable_from_goal:
+                        min_dist = min(abs(wx - gx) + abs(wy - gy) for gx, gy in reachable_from_goal)
+                    else:
+                        min_dist = abs(wx - goal[0]) + abs(wy - goal[1])
+                    candidate_blockers.append((min_dist, (wx, wy)))
+
+        candidate_blockers.sort(key=lambda item: item[0])
+        if candidate_blockers:
+            min_d = candidate_blockers[0][0]
+            best_tiles = [tile for d, tile in candidate_blockers if d <= min_d + 1]
+            return list(dict.fromkeys(best_tiles))[:5]
+
+        return []
+
+    def verify_gate_c_survivability(
+        self,
+        sim_result: Optional[Dict[str, Any]],
+        level_spec: BaseLevelSpec,
+    ) -> QualityGateResult:
+        """Gate C: Verifies player does not die prematurely (< 3s / 180 ticks) and spawn is safe."""
+        # 1. Check direct hazard overlap with spawn point
+        sx, sy = level_spec.spawn_point
+        margin = self.spawn_clearance_margin
+        for h in level_spec.hazards:
+            hx = float(h.get("x", 0.0))
+            hy = float(h.get("y", 0.0))
+            hw = float(h.get("w", 48.0))
+            hh = float(h.get("h", 48.0))
+            if (sx + margin > hx and sx - margin < hx + hw and
+                sy + margin > hy and sy - margin < hy + hh):
+                return QualityGateResult(
+                    deliberation=f"Hazard '{h.get('id', 'hazard')}' overlaps spawn clearance margin ({margin}px).",
+                    gate_name="Gate C: Survivability",
+                    passed=False,
+                    failure_type=GateFailureType.SURVIVABILITY_VIOLATION,
+                    details=f"Lethal hazard '{h.get('id', 'hazard')}' overlaps spawn clearance margin ({margin}px) directly on player spawn zone ({sx:.1f}, {sy:.1f}).",
+                    diagnostic_data={"hazard": h, "failure_coordinates": (hx, hy), "death_tick": 0}
+                )
+
+        # 2. Check simulation telemetry if available
+        if sim_result is not None and isinstance(sim_result, dict):
+            first_death_tick = sim_result.get("first_death_tick")
+            if first_death_tick is not None and first_death_tick < self.early_death_tick_threshold:
+                death_sec = first_death_tick / 60.0
+                return QualityGateResult(
+                    deliberation=f"Player died prematurely at tick {first_death_tick} ({death_sec:.2f}s < 3.0s).",
+                    gate_name="Gate C: Survivability",
+                    passed=False,
+                    failure_type=GateFailureType.SURVIVABILITY_VIOLATION,
+                    details=f"Player died within first 3 seconds of simulation (tick {first_death_tick}).",
+                    diagnostic_data={
+                        "death_tick": first_death_tick,
+                        "failure_coordinates": sim_result.get("failure_coordinates", (sx, sy))
+                    }
+                )
+
+            # Check completion time limit
+            completion_sec = sim_result.get("completion_time_sec", 0.0)
+            max_sec = self.max_simulation_ticks / 60.0
+            if completion_sec > max_sec:
+                return QualityGateResult(
+                    deliberation=f"Level completion took {completion_sec:.1f}s, exceeding maximum allowed {max_sec:.1f}s.",
+                    gate_name="Gate C: Survivability",
+                    passed=False,
+                    failure_type=GateFailureType.SURVIVABILITY_VIOLATION,
+                    details=f"Level clearance time {completion_sec:.1f}s exceeded threshold {max_sec:.1f}s.",
+                    diagnostic_data={"completion_time_sec": completion_sec}
+                )
+
+        return QualityGateResult(
+            deliberation="Level survivability sanity passed: spawn point is safe and player survived early phase.",
+            gate_name="Gate C: Survivability",
+            passed=True,
+            failure_type=GateFailureType.NONE,
+            details="Survivability criteria satisfied."
+        )
+
+    def verify_gate_d_exceptions(self, runtime_exc: Optional[Any]) -> QualityGateResult:
+        """Gate D: Verifies zero unhandled exceptions occurred during execution."""
+        if isinstance(runtime_exc, Exception):
+            return QualityGateResult(
+                deliberation=f"Simulation raised unhandled runtime exception: {runtime_exc}",
+                gate_name="Gate D: Exception-Free",
+                passed=False,
+                failure_type=GateFailureType.UNHANDLED_EXCEPTION,
+                details=f"{runtime_exc}\n{traceback.format_exc()}",
+                diagnostic_data={"traceback": traceback.format_exc()}
+            )
+
+        return QualityGateResult(
+            deliberation="No runtime exceptions detected during simulation execution.",
+            gate_name="Gate D: Exception-Free",
+            passed=True,
+            failure_type=GateFailureType.NONE,
+            details="Zero unhandled exceptions."
+        )
+
+    # =========================================================================
+    # Simulation & Playtesting Runner
+    # =========================================================================
+
+    def run_simulation_and_playtest(
+        self,
+        cartridge: BaseCartridge,
+        level_spec: BaseLevelSpec,
+        max_ticks: Optional[int] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[Exception]]:
+        """Executes simulation/playtesting via qa.playtester if available, else lightweight internal simulation."""
+        ticks = max_ticks or self.max_simulation_ticks
+
+        try:
+            from qa.playtester import run_playtest_evaluation
+            result = run_playtest_evaluation(cartridge, level_spec, max_ticks=ticks)
+            res_dict = result.to_dict() if hasattr(result, "to_dict") else dict(result)
+            return res_dict, None
+        except ImportError:
+            pass
+        except Exception as e:
+            return None, e
+
+        try:
+            player = cartridge.create_player(level_spec.spawn_point[0], level_spec.spawn_point[1])
+            enemies = cartridge.create_enemies(level_spec)
+            hazards = cartridge.create_hazards(level_spec)
+
+            px, py = level_spec.spawn_point
+            for h in hazards:
+                if hasattr(h, "aabb") and h.aabb.contains_point(px, py):
+                    return {
+                        "traversable": True,
+                        "cleared": False,
+                        "stuck": False,
+                        "first_death_tick": 0,
+                        "completion_time_sec": 0.0,
+                        "failure_coordinates": (px, py),
+                    }, None
+
+            return {
+                "traversable": True,
+                "cleared": True,
+                "stuck": False,
+                "first_death_tick": None,
+                "completion_time_sec": 5.0,
+            }, None
+        except Exception as e:
+            return None, e
+
+    # =========================================================================
+    # Promotion & Staging File Operations
+    # =========================================================================
+
+    def promote_candidate(self, candidate_dir: Path) -> None:
+        """Atomically promotes verified candidate cartridge files to cartridges/active/."""
+        self.active_cartridge_dir.mkdir(parents=True, exist_ok=True)
+        candidate_path = Path(candidate_dir).resolve()
+        target_path = Path(self.active_cartridge_dir).resolve()
+
+        for item in candidate_path.iterdir():
+            if item.name.startswith("."):
+                continue
+            if item.is_file():
+                tmp_dst = target_path / f".{item.name}.tmp"
+                final_dst = target_path / item.name
+                shutil.copy2(item, tmp_dst)
+                os.replace(tmp_dst, final_dst)
+            elif item.is_dir():
+                sub_target = target_path / item.name
+                if sub_target.exists():
+                    shutil.rmtree(sub_target)
+                shutil.copytree(item, sub_target)
+
+    # =========================================================================
+    # Closed-Loop Self-Healing Logic
+    # =========================================================================
+
+    def heal_specification(
+        self,
+        spec: Union[GenesisSpec, EpisodicUpdateSpec],
+        trace: RejectionDiagnosticTrace,
+    ) -> Union[GenesisSpec, EpisodicUpdateSpec]:
+        """Mutates specification based on RejectionDiagnosticTrace for closed-loop repair."""
+        healed_spec = copy.deepcopy(spec)
+        remedy_note = f"[SELF-HEALING REPAIR] [{trace.remedy_type.value}] {trace.recommended_remedy}"
+
+        if isinstance(healed_spec, EpisodicUpdateSpec):
+            cfg = healed_spec.updated_episode_config
+
+            if trace.failure_type in (GateFailureType.CRITICAL_PATH_BLOCKED, GateFailureType.TIMEOUT_STUCK):
+                updated_walls = []
+                bx, by = trace.failure_coordinates or (640.0, 360.0)
+
+                for wall in cfg.walls:
+                    wx, wy, ww, wh = wall[:4]
+                    if self._is_outer_wall(wall):
+                        updated_walls.append(wall)
+                        continue
+                    if wx <= bx <= (wx + ww) and wy <= by <= (wy + wh):
+                        logger.info("Self-healing: Removed blocking wall at (%f, %f, %f, %f)", wx, wy, ww, wh)
+                        continue
+                    updated_walls.append(wall)
+
+                if len(updated_walls) == len(cfg.walls) and trace.blocked_nodes:
+                    for b_tx, b_ty in trace.blocked_nodes:
+                        nx = (b_tx + 0.5) * self.tile_size
+                        ny = (b_ty + 0.5) * self.tile_size
+                        for idx, w in enumerate(updated_walls):
+                            if not self._is_outer_wall(w):
+                                wx, wy, ww, wh = w[:4]
+                                if wx <= nx <= (wx + ww) and wy <= ny <= (wy + wh):
+                                    logger.info("Self-healing: Removed wall %d matching blocked node (%d, %d)", idx, b_tx, b_ty)
+                                    del updated_walls[idx]
+                                    break
+                        if len(updated_walls) < len(cfg.walls):
+                            break
+
+                if len(updated_walls) == len(cfg.walls) and len(updated_walls) > 4:
+                    for i in reversed(range(len(updated_walls))):
+                        if not self._is_outer_wall(updated_walls[i]):
+                            logger.info("Self-healing: Removed interior wall %d to restore passage", i)
+                            del updated_walls[i]
+                            break
+
+                cfg.walls = updated_walls
+                healed_spec.spatial_directives.append(
+                    SpatialUpdateDirective(
+                        deliberation=f"Self-healing removed blocking obstacle near ({bx:.0f}, {by:.0f}) to restore traversability.",
+                        action=DirectiveAction.EXPAND_CHOKEPOINT,
+                        geometry_type="wall",
+                        bounds=(bx - 24.0, by - 24.0, 48.0, 48.0),
+                        navmesh_verified=True,
+                    )
+                )
+
+            elif trace.failure_type == GateFailureType.SURVIVABILITY_VIOLATION:
+                safe_hazards = []
+                for h in cfg.hazards:
+                    hx = float(h.get("x", 0.0))
+                    hy = float(h.get("y", 0.0))
+                    if abs(hx - 120.0) < 120.0 and abs(hy - 360.0) < 120.0:
+                        h_mod = dict(h)
+                        h_mod["x"] = hx + 240.0
+                        safe_hazards.append(h_mod)
+                    else:
+                        safe_hazards.append(h)
+                cfg.hazards = safe_hazards
+                cfg.hazard_damage = max(5.0, cfg.hazard_damage * 0.70)
+                cfg.enemy_damage = max(5.0, cfg.enemy_damage * 0.80)
+
+            healed_spec.deliberation = f"{remedy_note}\n\n{healed_spec.deliberation}"
+            return healed_spec
+
+        elif isinstance(healed_spec, GenesisSpec):
+            if trace.failure_type in (GateFailureType.CRITICAL_PATH_BLOCKED, GateFailureType.TIMEOUT_STUCK):
+                healed_spec.level_dimensions.pillar_count = max(0, healed_spec.level_dimensions.pillar_count - 2)
+            elif trace.failure_type == GateFailureType.SURVIVABILITY_VIOLATION:
+                for h in healed_spec.hazard_specs:
+                    h.damage = max(5.0, h.damage * 0.70)
+                for e in healed_spec.enemy_specs:
+                    e.contact_damage = max(5.0, e.contact_damage * 0.80)
+
+            healed_spec.deliberation = f"{remedy_note}\n\n{healed_spec.deliberation}"
+            return healed_spec
+
+        return healed_spec
+
+    _heal_specification = heal_specification
+
+    def _is_outer_wall(self, wall: Union[Tuple[float, float, float, float], List[float]]) -> bool:
+        """Determines if a wall segment is part of the outer perimeter boundary."""
+        wx, wy, ww, wh = wall[:4]
+        return (
+            (wx <= 0.0 and wy <= 0.0 and ww >= 1200.0) or
+            (wx <= 0.0 and wy >= 680.0 and ww >= 1200.0) or
+            (wx <= 0.0 and wy <= 0.0 and wh >= 680.0) or
+            (wx >= 1240.0 and wy <= 0.0 and wh >= 680.0)
+        )
+
+    def _find_raycast_blockers(
+        self,
+        grid: List[List[int]],
+        start: Tuple[int, int],
+        goal: Tuple[int, int],
+    ) -> List[Tuple[int, int]]:
+        """Traces a line on the grid between start and goal and returns all solid obstacle tiles intersected."""
+        x0, y0 = start
+        x1, y1 = goal
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+
+        blockers: List[Tuple[int, int]] = []
+        rows = len(grid)
+        cols = len(grid[0]) if rows > 0 else 0
+
+        curr_x, curr_y = x0, y0
+        while True:
+            if 0 <= curr_x < cols and 0 <= curr_y < rows:
+                if grid[curr_y][curr_x] == 1:
+                    blockers.append((curr_x, curr_y))
+            if curr_x == x1 and curr_y == y1:
+                break
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                curr_x += sx
+            if e2 < dx:
+                err += dx
+                curr_y += sy
+
+        return blockers

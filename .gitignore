@@ -1,0 +1,35 @@
+# Python & Virtual Environment
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets & Environment Variables
+.env
+.env.local
+
+# Studio Runtime Locks, Telemetry Databases & Caches
+studio.lock
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.json
+data/specs/
+
+# Dynamically Synthesized Game Cartridges (Studio Output)
+cartridges/active/
+cartridges/candidate_*/
+cartridges/episode_*/
+cartridges/genesis/
+
+# Agent Workspace & OS Metadata
+.agents/
+.DS_Store
