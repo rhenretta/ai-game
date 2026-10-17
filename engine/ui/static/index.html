@@ -890,7 +890,7 @@
           <span style="font-size: 11px; color: var(--light-gray);">PEV Execution Cycle Cards</span>
         </div>
         <ul id="tool-invocations-list">
-          <li class="tool-card status-success">
+          <li class="tool-card status-success tool-placeholder-card">
             <div class="tool-card-header">
               <div class="tool-info">
                 <span class="status-pill status-success">READY</span>
@@ -1123,9 +1123,52 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         ${errorHtml}
       `;
 
+      const placeholder = toolList.querySelector('.tool-placeholder-card');
+      if (placeholder) {
+        placeholder.remove();
+      }
       toolList.prepend(li);
       while (toolList.children.length > 50) {
         toolList.removeChild(toolList.lastChild);
+      }
+    }
+
+    let historyHydrated = false;
+    async function loadEventHistory() {
+      if (historyHydrated) return;
+      try {
+        const res = await fetch('/api/events/history');
+        if (!res.ok) return;
+        const data = await res.json();
+        historyHydrated = true;
+        if (data.agent_lifecycle_states) {
+          Object.entries(data.agent_lifecycle_states).forEach(([agent, st]) => {
+            updateAgentLifecycleState(agent, st);
+          });
+        }
+        if (Array.isArray(data.events) && data.events.length > 0) {
+          data.events.forEach(ev => {
+            if (ev.deliberation && ev.event_type !== 'TOOL_INVOCATION') {
+              addDeliberation(ev);
+            }
+            if (ev.event_type === 'TOOL_INVOCATION' || ev.event_type === 'tool_call' || (ev.payload && ev.payload.tool)) {
+              const p = ev.payload || {};
+              addToolCard({
+                tool_name: p.tool || p.tool_name || 'generic_tool',
+                agent_name: ev.agent_name || 'StudioAgent',
+                status: p.status || 'success',
+                duration_ms: p.duration_ms,
+                inputs: p.inputs || p.arguments,
+                outputs: p.outputs,
+                error_stack: p.error_stack || p.error_message,
+                pev_attempt: p.pev_attempt,
+                pev_max_retries: p.pev_max_retries
+              });
+            }
+          });
+        }
+      } catch (e) {
+        // Ignore if history endpoint unavailable
       }
     }
 
@@ -1198,6 +1241,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             event_type: 'connected',
             agent_name: 'MissionControlGateway'
           });
+          loadEventHistory();
           loadSteamDNA();
           loadHeatmap();
           loadArtifacts();

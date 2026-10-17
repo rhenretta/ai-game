@@ -159,6 +159,13 @@ class TelemetryWriterThread(threading.Thread):
             if batch:
                 self._conn.executemany(self._event_insert_sql, batch)
             if custom_batch:
+                for crow in custom_batch:
+                    p_name = str(crow[3])
+                    p_cat = str(crow[4])
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO telemetry_probes (probe_id, probe_name, category, description, hypothesis_target, schema_json) VALUES (?, ?, ?, ?, ?, '{}');",
+                        (f"prb_{p_name}", p_name, p_cat, f"Runtime probe {p_name}", f"Behavioral telemetry for {p_name}"),
+                    )
                 self._conn.executemany(self._custom_event_insert_sql, custom_batch)
             self._conn.execute("COMMIT;")
         except Exception as err:
