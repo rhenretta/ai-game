@@ -109,6 +109,11 @@ class HeadlessSimulator:
 
         # Determine mode: Scene Mode (Open-Genre) vs Spatial Mode (Backward Compatibility)
         has_custom_scenes = False
+        overrides_get_scenes = (
+            self.cartridge is not None
+            and hasattr(self.cartridge, "get_scenes")
+            and getattr(type(self.cartridge), "get_scenes", None) is not BaseCartridge.get_scenes
+        )
         if self.cartridge is not None and hasattr(self.cartridge, "get_scenes"):
             try:
                 from engine.core.engine import Engine
@@ -119,29 +124,37 @@ class HeadlessSimulator:
                 if scenes:
                     has_custom_scenes = True
                     self.scenes = scenes
-                    for sc in scenes.values():
+                    for sc_name, sc in scenes.items():
                         if getattr(sc, "engine", None) is None:
                             setattr(sc, "engine", self.engine)
                         if getattr(sc, "telemetry_recorder", None) is None:
                             setattr(sc, "telemetry_recorder", self.telemetry_recorder)
+                        self.engine.scene_manager.register_scene(sc_name, sc)
                     initial = self.cartridge.get_initial_scene(self.engine)
+                    initial_key = "main"
                     if isinstance(initial, str) and initial in scenes:
                         self.current_scene = scenes[initial]
+                        initial_key = initial
                     elif initial is not None and hasattr(initial, "update"):
                         self.current_scene = initial
+                        initial_key = "cartridge_initial"
+                        self.engine.scene_manager.register_scene(initial_key, initial)
                     else:
-                        self.current_scene = next(iter(scenes.values()))
+                        first_key = next(iter(scenes.keys()))
+                        self.current_scene = scenes[first_key]
+                        initial_key = first_key
                     if getattr(self.current_scene, "engine", None) is None:
                         setattr(self.current_scene, "engine", self.engine)
                     if getattr(self.current_scene, "telemetry_recorder", None) is None:
                         setattr(self.current_scene, "telemetry_recorder", self.telemetry_recorder)
-                    self.current_scene_name = getattr(self.current_scene, "scene_name", "main")
+                    self.current_scene_name = getattr(self.current_scene, "scene_name", initial_key)
                     self.scene_history = [self.current_scene_name]
                     if hasattr(self.cartridge, "setup"):
                         self.cartridge.setup(self.engine)
-                    if hasattr(self.current_scene, "on_enter"):
-                        self.current_scene.on_enter()
+                    self.engine.scene_manager.switch_to(initial_key)
             except Exception as e:
+                if overrides_get_scenes:
+                    raise
                 logger.warning("Could not initialize scene mode on cartridge: %s", e)
                 has_custom_scenes = False
 
