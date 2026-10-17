@@ -14,17 +14,14 @@ class Scene(ABC):
         self.engine = engine
         self.is_active: bool = False
 
-    @abstractmethod
-    def on_enter(self, context: Dict[str, Any]) -> None:
+    def on_enter(self, context: Optional[Dict[str, Any]] = None) -> None:
         """Invoked when scene becomes active."""
         pass
 
-    @abstractmethod
     def on_exit(self) -> Dict[str, Any]:
         """Invoked when scene is transitioning out."""
-        pass
+        return {}
 
-    @abstractmethod
     def handle_event(self, event: pygame.event.Event) -> None:
         """Handle an SDL event."""
         pass
@@ -59,19 +56,26 @@ class SceneManager:
             raise KeyError(f"Scene '{name}' is not registered.")
 
         exit_data = {}
-        if self.current_scene is not None:
-            exit_data = self.current_scene.on_exit() or {}
+        if self.current_scene is not None and hasattr(self.current_scene, "on_exit"):
+            try:
+                exit_data = self.current_scene.on_exit() or {}
+            except TypeError:
+                exit_data = {}
             self.current_scene.is_active = False
 
         combined_context = {**exit_data, **context}
         self.current_scene_name = name
         self.current_scene = self.scenes[name]
         self.current_scene.is_active = True
-        self.current_scene.on_enter(combined_context)
+        if hasattr(self.current_scene, "on_enter"):
+            try:
+                self.current_scene.on_enter(combined_context)
+            except TypeError:
+                self.current_scene.on_enter()
 
     def handle_event(self, event: pygame.event.Event) -> None:
         """Forward event to current active scene."""
-        if self.current_scene is not None:
+        if self.current_scene is not None and hasattr(self.current_scene, "handle_event"):
             self.current_scene.handle_event(event)
 
     def update(self, dt: float) -> None:

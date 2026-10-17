@@ -460,11 +460,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             if hasattr(cartridge, "get_initial_scene"):
                 try:
                     init_scene = cartridge.get_initial_scene(engine)
-                    if init_scene is not None:
+                    if isinstance(init_scene, str) and init_scene in engine.scene_manager.scenes:
+                        initial_scene_name = init_scene
+                    elif init_scene is not None and hasattr(init_scene, "update"):
                         engine.scene_manager.register_scene("cartridge_initial", init_scene)
                         initial_scene_name = "cartridge_initial"
                 except Exception as exc:
                     logger.warning("[Boot] Failed to resolve cartridge initial scene: %s", exc)
+            elif "main" in engine.scene_manager.scenes:
+                initial_scene_name = "main"
 
             if hasattr(cartridge, "setup"):
                 try:
@@ -478,8 +482,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         engine.scene_manager.switch_to(initial_scene_name)
 
-        # 7. Run 60 FPS Event Loop or Headless Tick Count
-        if args.headless and args.ticks is not None:
+        # 7. Run 60 FPS Event Loop or Bounded Tick Count
+        if args.ticks is not None:
             engine.is_running = True
             for tick in range(args.ticks):
                 if not engine.is_running:
