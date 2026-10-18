@@ -46,6 +46,7 @@ from engine.ui.models import (
     DeathClusterPoint,
     GenesisTriggerRequest,
     GenesisTriggerResponse,
+    GreenlightRequest,
     HeatmapResponse,
     PaletteColorItem,
     PaletteInfoResponse,
@@ -54,6 +55,7 @@ from engine.ui.models import (
     RequirementsSpecPayload,
     RequirementStatusPayload,
     SteamDNAResponse,
+    StudioSettingsUpdateRequest,
     StudioStatusResponse,
     SwarmEventType,
     SwarmStreamEvent,
@@ -83,6 +85,9 @@ class SwarmEventBus:
         self._task_records: Dict[str, Dict[str, Any]] = {}
         self._task_order: List[str] = []
         self._requirements_spec: Optional[Dict[str, Any]] = None
+        self._game_bible: Optional[Dict[str, Any]] = None
+        self._pause_for_greenlight: bool = False
+        self._active_orchestrator: Optional[Any] = None
         self._log_path = log_path or (config.DATA_DIR / "studio_events.jsonl")
         if db_path is not None:
             self._db_path = Path(db_path)
@@ -180,6 +185,92 @@ class SwarmEventBus:
                     elif passed and r.get("status") in ("in_progress", "pending"):
                         r["status"] = "completed"
 
+        elif etype in (SwarmEventType.GAME_BIBLE_UPDATED.value, "GAME_BIBLE_UPDATED", "game_bible_updated"):
+            if payload:
+                if isinstance(self._game_bible, dict) and "writers_room_transcript" not in payload:
+                    merged = dict(self._game_bible)
+                    merged.update(payload)
+                    self._game_bible = merged
+                else:
+                    self._game_bible = dict(payload)
+
+    def reset_for_new_genesis_build(self, build_id: str, creative_prompt: str = "") -> Dict[str, Any]:
+        """Resets in-memory task/requirement/bible state for a fresh Genesis build from scratch."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        initial_bible: Dict[str, Any] = {
+            "deliberation": (
+                f"Convening Multi-Agent Creative Writers' Room for new Genesis build '{build_id}'."
+                + (f" Creative seed: {creative_prompt}" if creative_prompt else "")
+            ),
+            "bible_id": f"bible_{build_id}",
+            "cartridge_id": build_id,
+            "target_episode": 0,
+            "status": "brainstorming",
+            "game_title": "Convening Writers' Room...",
+            "core_genre": "Brainstorming Concept",
+            "elevator_pitch": creative_prompt or "Specialists are analyzing player DNA and pitching the initial experience...",
+            "creative_vision_summary": creative_prompt or "Specialists are analyzing player DNA and pitching the initial experience...",
+            "core_fantasy": "",
+            "first_60_seconds_hook": "",
+            "diegetic_ui_philosophy": "",
+            "gameplay_pillars": [],
+            "experience_storyboard": [],
+            "concept_evolution": [],
+            "visual_mockups": [],
+            "visual_style_guide": "",
+            "audio_direction_guide": "",
+            "writers_room_transcript": [],
+            "world_spec": None,
+            "narrative_bible": None,
+            "updated_at_utc": now_iso,
+        }
+        with self._thread_lock:
+            self._active_build_id = str(build_id)
+            self._task_records.clear()
+            self._task_order.clear()
+            self._requirements_spec = None
+            self._game_bible = initial_bible
+            if self._db_path:
+                try:
+                    from engine.telemetry.db import TelemetryDB
+                    db = TelemetryDB(self._db_path)
+                    db.record_studio_build(
+                        build_id=str(build_id),
+                        build_type="genesis",
+                        game_title="Convening Writers' Room...",
+                        status="STARTED",
+                        started_at_utc=now_iso,
+                        deliberation=initial_bible["deliberation"],
+                    )
+                    db.upsert_game_bible(
+                        bible_id=initial_bible["bible_id"],
+                        cartridge_id=str(build_id),
+                        status="BRAINSTORMING",
+                        bible_dict=initial_bible,
+                        build_id=str(build_id),
+                    )
+                except Exception as exc:
+                    logger.debug("reset_for_new_genesis_build DB init warning: %s", exc)
+        return initial_bible
+
+    def get_game_bible(self, build_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Returns the latest Living Game Bible dictionary from SQLite WAL or memory."""
+        with self._thread_lock:
+            if self._db_path and self._db_path.exists():
+                try:
+                    from engine.telemetry.db import TelemetryDB
+                    db = TelemetryDB(self._db_path)
+                    target_bid = build_id or self.get_active_build_id()
+                    rec = db.get_latest_game_bible(build_id=target_bid)
+                    if not rec and target_bid:
+                        rec = db.get_latest_game_bible(build_id=None)
+                    if rec and isinstance(rec.get("bible"), dict):
+                        return rec["bible"]
+                except Exception as exc:
+                    logger.debug("Failed querying studio_game_bibles from DB: %s", exc)
+            self._sync_from_disk()
+            return self._game_bible
+
     def _sync_from_disk(self) -> None:
         """Incrementally syncs new events written to data/studio_events.jsonl from disk (e.g. from Genesis / CLI)."""
         if self._db_path and self._db_path.exists():
@@ -275,6 +366,15 @@ class SwarmEventBus:
                                 db.update_studio_requirement_status(build_id=bid, requirement_id=rid, status=st)
                     elif etype in (SwarmEventType.CARTRIDGE_PROMOTED.value, "CARTRIDGE_PROMOTED"):
                         db.update_studio_build(build_id=bid, status="PROMOTED")
+                    elif etype in (SwarmEventType.GAME_BIBLE_UPDATED.value, "GAME_BIBLE_UPDATED", "game_bible_updated"):
+                        if isinstance(payload, dict) and payload:
+                            db.upsert_game_bible(
+                                bible_id=str(payload.get("bible_id") or f"bible_{bid}"),
+                                cartridge_id=str(payload.get("cartridge_id") or bid),
+                                status=str(payload.get("status") or "brainstorming").upper(),
+                                bible_dict=payload,
+                                build_id=bid,
+                            )
                 except Exception as exc:
                     logger.debug("SwarmEventBus SQLite recording error (handled): %s", exc)
 
@@ -2045,6 +2145,20 @@ def create_app(
             )
         return cart_dir, None
 
+    def _candidate_search_roots(cart_dir: Path, sanitized_cart: Optional[Path]) -> List[Path]:
+        roots = [cart_dir, target_cartridges / "active"]
+        if sanitized_cart is None and target_cartridges.exists():
+            try:
+                cands = sorted(
+                    [d for d in target_cartridges.glob("candidate_*") if d.is_dir()],
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                roots.extend(cands)
+            except OSError:
+                pass
+        return roots
+
     async def assets_audio_handler(request):
         """GET /api/assets/audio/{filename}: Serves audio with directory traversal defense."""
         filename = request.path_params.get("filename", "")
@@ -2057,7 +2171,7 @@ def create_app(
             return err_resp
 
         cart_dir = sanitized_cart if sanitized_cart else target_active
-        search_roots = [cart_dir, target_cartridges / "active"]
+        search_roots = _candidate_search_roots(cart_dir, sanitized_cart)
 
         resolved = resolve_asset_safe(filename, ["audio"], search_roots)
         if not resolved:
@@ -2078,11 +2192,32 @@ def create_app(
             return err_resp
 
         cart_dir = sanitized_cart if sanitized_cart else target_active
-        search_roots = [cart_dir, target_cartridges / "active"]
+        search_roots = _candidate_search_roots(cart_dir, sanitized_cart)
 
-        resolved = resolve_asset_safe(filename, ["sprites", "portrait"], search_roots)
+        resolved = resolve_asset_safe(filename, ["sprites", "portrait", "mockups"], search_roots)
         if not resolved:
             return JSONResponse({"error": f"Sprite asset '{filename}' not found"}, status_code=404)
+
+        media_type = "image/png" if resolved.suffix.lower() == ".png" else "image/jpeg"
+        return FileResponse(str(resolved), media_type=media_type)
+
+    async def assets_mockups_handler(request):
+        """GET /api/assets/mockups/{filename}: Serves 16:9 concept art & diegetic UI mockup boards."""
+        filename = request.path_params.get("filename", "")
+        if not filename or len(filename) > 255 or "\0" in filename or ".." in filename or "/" in filename or "\\" in filename or filename.startswith("."):
+            return JSONResponse({"error": f"Invalid mockup asset filename: '{filename}'"}, status_code=400)
+
+        cart_override = request.query_params.get("cartridge")
+        sanitized_cart, err_resp = _sanitize_cartridge_override(cart_override)
+        if err_resp is not None:
+            return err_resp
+
+        cart_dir = sanitized_cart if sanitized_cart else target_active
+        search_roots = _candidate_search_roots(cart_dir, sanitized_cart)
+
+        resolved = resolve_asset_safe(filename, ["mockups", "sprites"], search_roots)
+        if not resolved:
+            return JSONResponse({"error": f"Mockup asset '{filename}' not found"}, status_code=404)
 
         media_type = "image/png" if resolved.suffix.lower() == ".png" else "image/jpeg"
         return FileResponse(str(resolved), media_type=media_type)
@@ -2100,7 +2235,7 @@ def create_app(
             return err_resp
 
         cart_dir = sanitized_cart if sanitized_cart else target_active
-        search_roots = [cart_dir, target_cartridges / "active"]
+        search_roots = _candidate_search_roots(cart_dir, sanitized_cart)
 
         resolved = resolve_asset_safe(filename, [asset_type], search_roots)
         if not resolved:
@@ -2306,7 +2441,7 @@ def create_app(
         return JSONResponse(resp.model_dump())
 
     async def genesis_trigger_handler(request):
-        """R4: REST endpoint triggering Genesis build."""
+        """R4: REST endpoint triggering a new Genesis build from scratch."""
         body = {}
         if request.method == "POST":
             try:
@@ -2314,15 +2449,62 @@ def create_app(
             except Exception:
                 body = {}
 
-        profile_tag = body.get("profile_tag", "default")
+        if not isinstance(body, dict):
+            body = {}
+
+        profile_tag = str(body.get("profile_tag", "default") or "default")
+        creative_prompt = str(body.get("creative_prompt", "") or "").strip()
+        pause_for_greenlight = body.get("pause_for_greenlight")
+        reset_active = bool(body.get("reset_active", False))
         job_id = f"gen_{uuid.uuid4().hex[:8]}"
+        build_id = f"build_{job_id}"
+
+        if pause_for_greenlight is not None:
+            target_bus._pause_for_greenlight = bool(pause_for_greenlight)
+            if target_bus is not swarm_bus:
+                swarm_bus._pause_for_greenlight = bool(pause_for_greenlight)
+
+        # Initialize a clean brainstorming session when starting a new game from scratch
+        if reset_active and "PYTEST_CURRENT_TEST" not in os.environ:
+            try:
+                old_cp_meta = target_active / "checkpoint_metadata.json"
+                if old_cp_meta.is_file():
+                    old_cp_meta.unlink()
+            except Exception:
+                pass
+
+        if reset_active or creative_prompt or "PYTEST_CURRENT_TEST" not in os.environ:
+            initial_bible = target_bus.reset_for_new_genesis_build(
+                build_id=build_id,
+                creative_prompt=creative_prompt,
+            )
+            if target_bus is not swarm_bus:
+                swarm_bus.reset_for_new_genesis_build(
+                    build_id=build_id,
+                    creative_prompt=creative_prompt,
+                )
+            await target_bus.broadcast({
+                "deliberation": initial_bible["deliberation"],
+                "event_type": SwarmEventType.GAME_BIBLE_UPDATED.value,
+                "agent_name": "CreativeWritersRoom",
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "payload": initial_bible,
+            })
 
         event = {
-            "deliberation": f"Autonomous Genesis build dispatched for Steam profile: '{profile_tag}'.",
+            "deliberation": (
+                f"Autonomous Genesis build dispatched for Steam profile '{profile_tag}'"
+                + (f" with creative seed: '{creative_prompt[:80]}'." if creative_prompt else ".")
+            ),
             "event_type": "genesis_triggered",
             "agent_name": "StudioOrchestrator",
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "payload": {"job_id": job_id, "profile_tag": profile_tag},
+            "payload": {
+                "job_id": job_id,
+                "build_id": build_id,
+                "profile_tag": profile_tag,
+                "creative_prompt": creative_prompt,
+            },
         }
         await target_bus.broadcast(event)
         if target_bus is not swarm_bus:
@@ -2349,6 +2531,7 @@ def create_app(
                             cartridges_root=target_cartridges,
                             active_cartridge_dir=target_active,
                             db_path=target_db,
+                            creative_prompt=creative_prompt or None,
                         )
                         daemon_inst = StudioDaemon(config_obj=cfg, event_bus=target_bus)
                         daemon_inst.run_genesis_cycle()
@@ -2793,7 +2976,12 @@ def create_app(
     async def events_history_handler(request):
         """GET /api/events/history: Returns buffered swarm events and hydrates deliberations/tool cards from active cartridge."""
         bid = request.query_params.get("build_id")
-        recent = [ev for ev in target_bus.get_recent_events(build_id=bid) if isinstance(ev, dict)]
+        recent = [
+            ev for ev in target_bus.get_recent_events(build_id=bid)
+            if isinstance(ev, dict)
+            and ev.get("event_type") != "BACKGROUND_THREAD_EVENT"
+            and ev.get("agent_name") != "WorkerThread"
+        ]
         cart_dir = target_active
         has_active = cart_dir.exists() and cart_dir.is_dir()
         if not has_active and target_db == config.DB_PATH and target_cartridges.exists():
@@ -3416,10 +3604,12 @@ def create_app(
             search_dirs = [
                 target_dir,
                 target_dir / "assets" / "sprites",
+                target_dir / "assets" / "mockups",
                 target_dir / "assets" / "audio",
                 target_dir / "assets" / "tiles",
                 c_root / "active",
                 c_root / "active" / "assets" / "sprites",
+                c_root / "active" / "assets" / "mockups",
                 c_root / "active" / "assets" / "audio",
                 c_root / "active" / "assets" / "tiles",
             ]
@@ -3480,11 +3670,324 @@ def create_app(
                 "mime_type": "text/plain",
             })
 
+    async def game_bible_handler(request):
+        """GET /api/studio/game-bible: Returns the latest Living Game Bible (transcript, concept evolution, mockups, storyboard, characters)."""
+        cart_override = request.query_params.get("cartridge")
+        sanitized_cart, err_resp = _sanitize_cartridge_override(cart_override)
+        if err_resp is not None:
+            return err_resp
+
+        bid = request.query_params.get("build_id")
+        bible_data: Optional[Dict[str, Any]] = None
+
+        # 1. Check explicit cartridge override first if provided
+        cart_dir = sanitized_cart if sanitized_cart else target_active
+        if not cart_dir.exists() and not sanitized_cart and target_cartridges.exists():
+            candidates = sorted(
+                [d for d in target_cartridges.glob("candidate_*") if d.is_dir()],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if candidates:
+                cart_dir = candidates[0]
+
+        if sanitized_cart and (sanitized_cart / "game_bible.json").is_file():
+            try:
+                bible_data = json.loads((sanitized_cart / "game_bible.json").read_text(encoding="utf-8"))
+            except Exception:
+                bible_data = None
+
+        # 2. Check TelemetryDB or SwarmEventBus in-memory state
+        if bible_data is None:
+            bible_data = target_bus.get_game_bible(build_id=bid)
+            if bible_data is None and target_db and target_db.exists():
+                try:
+                    tdb = TelemetryDB(target_db)
+                    rec = tdb.get_latest_game_bible(build_id=bid)
+                    if not rec and bid:
+                        rec = tdb.get_latest_game_bible(build_id=None)
+                    if rec and isinstance(rec.get("bible"), dict):
+                        bible_data = rec["bible"]
+                except Exception as exc:
+                    logger.debug("TelemetryDB game_bible lookup error: %s", exc)
+
+        # 3. Check candidate_* and active cartridge directories for game_bible.json
+        if bible_data is None:
+            search_dirs = [cart_dir, target_active]
+            if target_cartridges.exists():
+                try:
+                    search_dirs.extend(
+                        sorted(
+                            [d for d in target_cartridges.glob("candidate_*") if d.is_dir()],
+                            key=lambda p: p.stat().st_mtime,
+                            reverse=True,
+                        )
+                    )
+                except OSError:
+                    pass
+            for sdir in search_dirs:
+                gb_file = sdir / "game_bible.json"
+                if gb_file.is_file():
+                    try:
+                        bible_data = json.loads(gb_file.read_text(encoding="utf-8"))
+                        break
+                    except Exception:
+                        continue
+
+        # 4. Hydrate from world_spec.json + narrative_bible.json if inspecting a cartridge built before game_bible.json
+        if bible_data is None and cart_dir.exists():
+            ws_file = cart_dir / "world_spec.json"
+            nb_file = cart_dir / "narrative_bible.json"
+            if ws_file.is_file() or nb_file.is_file():
+                ws = {}
+                nb = {}
+                try:
+                    if ws_file.is_file():
+                        ws = json.loads(ws_file.read_text(encoding="utf-8"))
+                except Exception:
+                    ws = {}
+                try:
+                    if nb_file.is_file():
+                        nb = json.loads(nb_file.read_text(encoding="utf-8"))
+                except Exception:
+                    nb = {}
+                title = ws.get("game_title") or nb.get("world_title") or cart_dir.name
+                genre = ws.get("core_genre") or "Interactive Experience"
+                now_iso = datetime.now(timezone.utc).isoformat()
+                transcript = []
+                if ws.get("deliberation"):
+                    transcript.append({
+                        "deliberation": ws.get("deliberation"),
+                        "utterance_id": "utt_hydrated_director",
+                        "turn_index": 1,
+                        "speaker_role": "CreativeDirector",
+                        "message": f"Establishing core vision for '{title}' ({genre}): {ws.get('narrative_hook') or ws.get('deliberation')}",
+                        "referenced_roles": ["GameplayDesigner", "StoryWorldArchitect"],
+                        "artifact_emitted": None,
+                        "timestamp_utc": now_iso,
+                    })
+                if nb.get("deliberation"):
+                    transcript.append({
+                        "deliberation": nb.get("deliberation"),
+                        "utterance_id": "utt_hydrated_writer",
+                        "turn_index": 2,
+                        "speaker_role": "CharacterDesigner",
+                        "message": f"Synthesized world lore and {len(nb.get('characters', []))} characters for '{title}'.",
+                        "referenced_roles": ["CreativeDirector", "AudioAtmosphereDesigner"],
+                        "artifact_emitted": None,
+                        "timestamp_utc": now_iso,
+                    })
+                bible_data = {
+                    "deliberation": ws.get("deliberation") or nb.get("deliberation") or f"Hydrated Living Game Bible for '{title}'.",
+                    "bible_id": f"bible_{cart_dir.name}",
+                    "cartridge_id": cart_dir.name,
+                    "status": "locked",
+                    "game_title": title,
+                    "core_genre": genre,
+                    "creative_vision_summary": ws.get("narrative_hook") or nb.get("lore_premise") or "",
+                    "first_60_seconds_hook": ws.get("win_condition") or "",
+                    "diegetic_ui_philosophy": "Diegetic in-world feedback and environmental storytelling.",
+                    "concept_evolution_log": [
+                        {
+                            "deliberation": ws.get("deliberation") or "Initial concept synthesis.",
+                            "version": 1,
+                            "turn_index": 1,
+                            "author_role": "CreativeDirector",
+                            "hypothesis": f"{title} ({genre})",
+                            "critique_or_pivot_reason": "Foundational cartridge concept.",
+                            "timestamp_utc": now_iso,
+                        }
+                    ],
+                    "writers_room_transcript": transcript,
+                    "experience_storyboard": [],
+                    "visual_mockups": [],
+                    "gameplay_pillars": list(ws.get("secondary_mechanics", {}).keys()) if isinstance(ws.get("secondary_mechanics"), dict) else [],
+                    "visual_style_guide": {
+                        "aesthetic_mood": ws.get("aesthetic_mood", ""),
+                        "camera_perspective": ws.get("camera_perspective", ""),
+                    },
+                    "audio_direction_guide": {},
+                    "world_spec": ws or None,
+                    "narrative_bible": nb or None,
+                    "updated_at_utc": now_iso,
+                }
+
+        orch = getattr(target_bus, "_active_orchestrator", None)
+        orch_state = getattr(getattr(orch, "state", None), "value", "IDLE") if orch else "IDLE"
+        pause_greenlight = bool(
+            getattr(target_bus, "_pause_for_greenlight", False)
+            or (orch and getattr(getattr(orch, "config", None), "pause_for_greenlight", False))
+        )
+
+        if bible_data:
+            resp_payload = dict(bible_data)
+            resp_payload.setdefault("deliberation", f"Retrieved Living Game Bible for '{resp_payload.get('game_title', 'Active Game')}'.")
+            resp_payload["has_bible"] = True
+            resp_payload["pause_for_greenlight"] = pause_greenlight
+            resp_payload["orchestrator_state"] = orch_state
+            return JSONResponse(resp_payload)
+
+        return JSONResponse({
+            "deliberation": "No Living Game Bible generated yet. Trigger a Genesis build to convene the Multi-Agent Writers' Room.",
+            "has_bible": False,
+            "bible_id": None,
+            "cartridge_id": cart_dir.name if cart_dir else "active",
+            "status": "idle",
+            "game_title": "",
+            "core_genre": "",
+            "creative_vision_summary": "",
+            "first_60_seconds_hook": "",
+            "diegetic_ui_philosophy": "",
+            "concept_evolution_log": [],
+            "writers_room_transcript": [],
+            "experience_storyboard": [],
+            "visual_mockups": [],
+            "gameplay_pillars": [],
+            "visual_style_guide": {},
+            "audio_direction_guide": {},
+            "world_spec": None,
+            "narrative_bible": None,
+            "pause_for_greenlight": pause_greenlight,
+            "orchestrator_state": orch_state,
+        })
+
+    async def studio_greenlight_handler(request):
+        """POST /api/studio/greenlight: Approves the Living Game Bible or injects Executive Producer steering feedback."""
+        try:
+            raw_body = await request.json()
+        except Exception:
+            return JSONResponse(
+                {"deliberation": "Rejected malformed JSON request body.", "error": "Invalid JSON body"},
+                status_code=400,
+            )
+
+        if not isinstance(raw_body, dict):
+            return JSONResponse(
+                {"deliberation": "Rejected non-object JSON payload.", "error": "JSON body must be an object"},
+                status_code=400,
+            )
+
+        raw_body.setdefault("deliberation", "Executive Producer greenlight / steering decision from Mission Control.")
+        try:
+            req = GreenlightRequest.model_validate(raw_body)
+        except Exception as val_err:
+            return JSONResponse(
+                {"deliberation": "Validation failed for GreenlightRequest.", "error": str(val_err)},
+                status_code=422,
+            )
+
+        orch = getattr(target_bus, "_active_orchestrator", None)
+        orch_result = None
+        if orch is not None and hasattr(orch, "submit_greenlight_decision"):
+            orch_result = orch.submit_greenlight_decision(approved=req.approved, feedback=req.feedback)
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        bible_data = target_bus.get_game_bible()
+
+        if req.feedback:
+            utt = {
+                "deliberation": req.deliberation,
+                "utterance_id": f"utt_exec_{uuid.uuid4().hex[:8]}",
+                "turn_index": (len(bible_data.get("writers_room_transcript", [])) + 1) if isinstance(bible_data, dict) else 1,
+                "speaker_role": "ExecutiveProducer",
+                "speaker_display_name": "Executive Producer (You)",
+                "spoken_dialogue": req.feedback,
+                "message": req.feedback,
+                "addressed_to": ["CreativeDirector", "GameplayDesigner", "UXExperienceDesigner"],
+                "referenced_roles": ["CreativeDirector"],
+                "bible_updates_summary": ["Executive Producer creative direction injected"],
+                "artifact_emitted": None,
+                "timestamp_utc": now_iso,
+            }
+            target_bus.publish_threadsafe({
+                "deliberation": req.deliberation,
+                "event_type": SwarmEventType.WRITERS_ROOM_UTTERANCE.value,
+                "agent_name": "ExecutiveProducer",
+                "timestamp_utc": now_iso,
+                "payload": utt,
+            })
+            if isinstance(bible_data, dict):
+                bible_data.setdefault("writers_room_transcript", []).append(utt)
+
+        if isinstance(bible_data, dict):
+            bible_data["status"] = "locked" if req.approved else "brainstorming"
+            bible_data["updated_at_utc"] = now_iso
+            target_bus.publish_threadsafe({
+                "deliberation": f"Executive Producer {'approved and locked' if req.approved else 'steered'} Living Game Bible '{bible_data.get('game_title', '')}'.",
+                "event_type": SwarmEventType.GAME_BIBLE_UPDATED.value,
+                "agent_name": "ExecutiveProducer",
+                "timestamp_utc": now_iso,
+                "payload": bible_data,
+            })
+            if target_db and target_db.exists():
+                try:
+                    tdb = TelemetryDB(target_db)
+                    tdb.upsert_game_bible(
+                        bible_id=str(bible_data.get("bible_id") or "bible_live"),
+                        cartridge_id=str(bible_data.get("cartridge_id") or "active"),
+                        status="GREENLIT" if req.approved else "BRAINSTORMING",
+                        bible_dict=bible_data,
+                        build_id=target_bus.get_active_build_id(),
+                    )
+                except Exception as db_exc:
+                    logger.debug("Failed updating game_bible in DB on greenlight: %s", db_exc)
+
+        return JSONResponse({
+            "deliberation": f"Recorded Executive Producer decision (approved={req.approved}, feedback_len={len(req.feedback)}).",
+            "status": "greenlit" if req.approved else "steering_injected",
+            "approved": req.approved,
+            "feedback": req.feedback,
+            "orchestrator": orch_result,
+        })
+
+    async def studio_settings_handler(request):
+        """GET/POST /api/studio/settings: Reads or updates studio orchestration settings such as pause_for_greenlight."""
+        orch = getattr(target_bus, "_active_orchestrator", None)
+        if request.method == "POST":
+            try:
+                raw_body = await request.json()
+            except Exception:
+                return JSONResponse(
+                    {"deliberation": "Rejected malformed JSON request body.", "error": "Invalid JSON body"},
+                    status_code=400,
+                )
+            if not isinstance(raw_body, dict):
+                return JSONResponse(
+                    {"deliberation": "Rejected non-object JSON payload.", "error": "JSON body must be an object"},
+                    status_code=400,
+                )
+            raw_body.setdefault("deliberation", "Updated studio settings from Mission Control UI.")
+            try:
+                req = StudioSettingsUpdateRequest.model_validate(raw_body)
+            except Exception as val_err:
+                return JSONResponse(
+                    {"deliberation": "Validation failed for StudioSettingsUpdateRequest.", "error": str(val_err)},
+                    status_code=422,
+                )
+            target_bus._pause_for_greenlight = bool(req.pause_for_greenlight)
+            if swarm_bus is not target_bus:
+                swarm_bus._pause_for_greenlight = bool(req.pause_for_greenlight)
+            if orch is not None and hasattr(orch, "config"):
+                orch.config.pause_for_greenlight = bool(req.pause_for_greenlight)
+
+        pause_val = bool(
+            getattr(target_bus, "_pause_for_greenlight", False)
+            or (orch and getattr(getattr(orch, "config", None), "pause_for_greenlight", False))
+        )
+        return JSONResponse({
+            "deliberation": f"Studio orchestration configuration: pause_for_greenlight={pause_val}.",
+            "pause_for_greenlight": pause_val,
+        })
+
     routes = [
         Route("/", endpoint=index_handler, methods=["GET"]),
         Route("/health", endpoint=health_handler, methods=["GET"]),
         Route("/api/status", endpoint=status_handler, methods=["GET"]),
         Route("/api/studio/status", endpoint=studio_status_handler, methods=["GET"]),
+        Route("/api/studio/game-bible", endpoint=game_bible_handler, methods=["GET"]),
+        Route("/api/game-bible", endpoint=game_bible_handler, methods=["GET"]),
+        Route("/api/studio/greenlight", endpoint=studio_greenlight_handler, methods=["POST"]),
+        Route("/api/studio/settings", endpoint=studio_settings_handler, methods=["GET", "POST"]),
         Route("/api/events/history", endpoint=events_history_handler, methods=["GET"]),
         Route("/api/events", endpoint=events_history_handler, methods=["GET"]),
         Route("/api/agents/history", endpoint=agents_history_handler, methods=["GET"]),
@@ -3504,6 +4007,7 @@ def create_app(
         Route("/api/telemetry/heatmap", endpoint=heatmap_handler, methods=["GET"]),
         Route("/api/assets/audio/{filename}", endpoint=assets_audio_handler, methods=["GET"]),
         Route("/api/assets/sprites/{filename}", endpoint=assets_sprites_handler, methods=["GET"]),
+        Route("/api/assets/mockups/{filename}", endpoint=assets_mockups_handler, methods=["GET"]),
         Route("/api/assets/palette", endpoint=palette_handler, methods=["GET"]),
         Route("/api/assets/{type}/{filename}", endpoint=assets_generic_handler, methods=["GET"]),
         Route("/api/assets/{type}", endpoint=assets_default_handler, methods=["GET"]),
