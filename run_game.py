@@ -6,15 +6,29 @@ Enforces graceful shutdown and SQLite WAL checkpointing.
 from __future__ import annotations
 import os
 from pathlib import Path
+import random
 import signal
+import subprocess
 import sys
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
-if __name__ == "__main__":
-    _venv_py = Path(__file__).resolve().parent / ".venv" / "bin" / "python"
-    if _venv_py.is_file() and Path(sys.prefix).resolve() != _venv_py.parent.parent.resolve():
-        os.execv(str(_venv_py), [str(_venv_py), *sys.argv])
+# Active Godot 4 child process tracking for signal cleanup
+_ACTIVE_GODOT_PROC: Optional[subprocess.Popen] = None
+
+# Tier 1 Early Signal Interception & Unmasking: Active immediately at line 1 of script execution
+def _early_signal_handler(signum: int, frame: Any) -> None:
+    print(f"\n[Engine] Signal {signum} received during early bootstrap. Shutting down cleanly...", flush=True)
+    os._exit(0)
+
+try:
+    signal.signal(signal.SIGINT, _early_signal_handler)
+    signal.signal(signal.SIGTERM, _early_signal_handler)
+    if hasattr(signal, "pthread_sigmask"):
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT, signal.SIGTERM})
+except (ValueError, AttributeError, OSError):
+    pass
 
 # Active subsystem registry for unified signal lifecycle management across all startup & runtime phases
 _ACTIVE_SUBSYSTEMS: Dict[str, Any] = {
@@ -75,17 +89,26 @@ def handle_signal(signum: int, frame: Any) -> None:
                         telemetry.end_session()
                     except Exception:
                         pass
-            if hasattr(telemetry, "writer_thread") and telemetry.writer_thread is not None:
+            writer_th = getattr(telemetry, "writer_thread", None)
+            if writer_th is not None:
                 try:
-                    # Fast drain and bulk commit takes ~25ms; allocate 0.5s safety budget
-                    telemetry.writer_thread.stop(timeout=0.5)
-                    if telemetry.writer_thread.is_alive():
-                        if hasattr(telemetry.writer_thread, "abort"):
-                            telemetry.writer_thread.abort()
-                        telemetry.writer_thread.join(timeout=0.1)
+                    # Drain and bulk commit takes ~25ms; allocate 0.20s safety budget
+                    writer_th.stop(timeout=0.20)
+                    if writer_th.is_alive():
+                        if hasattr(writer_th, "abort"):
+                            writer_th.abort()
+                        writer_th.join(timeout=0.05)
                 except Exception:
                     pass
                 finally:
+                    # Explicitly ensure writer_thread._conn is closed to release all SQLite locks
+                    conn = getattr(writer_th, "_conn", None)
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        writer_th._conn = None
                     telemetry.writer_thread = None
         except Exception:
             pass
@@ -105,14 +128,17 @@ def handle_signal(signum: int, frame: Any) -> None:
             wal_path = str(db_path) + "-wal"
             start_checkpoint = time.perf_counter()
             elapsed_so_far = start_checkpoint - teardown_t0
-            checkpoint_deadline = max(0.8, min(1.15, 1.70 - elapsed_so_far))
+            checkpoint_deadline = max(1.0, min(3.5, 4.0 - elapsed_so_far))
             checkpoint_success = False
+            retry_count = 0
 
             while time.perf_counter() - start_checkpoint < checkpoint_deadline:
                 conn = None
                 try:
-                    conn = sqlite3.connect(db_path, timeout=0.1, isolation_level=None)
-                    conn.execute("PRAGMA busy_timeout = 100;")
+                    rem = checkpoint_deadline - (time.perf_counter() - start_checkpoint)
+                    busy_ms = max(200, min(1000, int(rem * 1000)))
+                    conn = sqlite3.connect(db_path, timeout=rem, isolation_level=None)
+                    conn.execute(f"PRAGMA busy_timeout = {busy_ms};")
                     cur = conn.cursor()
                     cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                     res = cur.fetchone()
@@ -131,7 +157,10 @@ def handle_signal(signum: int, frame: Any) -> None:
                             conn.close()
                         except Exception:
                             pass
-                time.sleep(0.01)
+                retry_count += 1
+                # Exponential backoff with jitter (20ms to 50ms) allowing concurrent readers to yield shared locks
+                sleep_sec = min(0.05, 0.02 + retry_count * 0.003 + (random.random() * 0.008))
+                time.sleep(sleep_sec)
 
             if not checkpoint_success and os.path.exists(wal_path):
                 wal_size = os.stat(wal_path).st_size if os.path.exists(wal_path) else 0
@@ -142,6 +171,17 @@ def handle_signal(signum: int, frame: Any) -> None:
                     )
     except Exception:
         pass
+
+    global _ACTIVE_GODOT_PROC
+    if _ACTIVE_GODOT_PROC is not None:
+        try:
+            _ACTIVE_GODOT_PROC.terminate()
+            _ACTIVE_GODOT_PROC.wait(timeout=0.2)
+        except Exception:
+            try:
+                _ACTIVE_GODOT_PROC.kill()
+            except Exception:
+                pass
 
     print("Game and telemetry shutdown completed cleanly.", flush=True)
     try:
@@ -162,6 +202,20 @@ try:
 except (ValueError, AttributeError):
     # Only the main thread of the main interpreter can register signal handlers
     pass
+
+# Strict Dependency Verification & Clean Guidance (Rule 5 compliance)
+try:
+    import pygame
+except ImportError:
+    sys.stderr.write(
+        "\n[EngineError] Required dependency 'pygame-ce' is not installed in the active Python environment.\n"
+        f"Active interpreter: {sys.executable}\n"
+        "Please run via the single-command launcher:\n"
+        "    ./run_game.sh\n"
+        "Or activate the virtual environment:\n"
+        "    source .venv/bin/activate\n\n"
+    )
+    sys.exit(1)
 
 import argparse
 import json
@@ -202,6 +256,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=str,
         default=None,
         help="Path to the game cartridge directory to boot (default: cartridges/active)",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path or identifier of a verified cartridge checkpoint to boot (e.g. candidate_genesis_8993a2_R1)",
+    )
+    parser.add_argument(
+        "--latest-checkpoint",
+        action="store_true",
+        default=False,
+        help="Boot the latest verified cartridge checkpoint from cartridges/checkpoints/",
     )
     parser.add_argument(
         "--headless",
@@ -293,30 +359,195 @@ NO_ACTIVE_GAME_BANNER = (
 )
 
 
+def run_godot_cartridge(
+    cartridge_dir: Path,
+    headless: bool = False,
+    ticks: Optional[int] = None,
+    telemetry: Optional[Any] = None,
+) -> int:
+    """Launches Godot 4 binary on target cartridge directory with continuous telemetry streaming."""
+    global _ACTIVE_GODOT_PROC
+    from engine.godot_runtime import ensure_godot_binary
+    godot_bin = ensure_godot_binary()
+
+    cmd = [str(godot_bin), "--path", str(cartridge_dir)]
+    if headless:
+        cmd.append("--headless")
+        from engine.sim.godot_verifier import HARNESS_SCRIPT_PATH
+        cmd.extend(["-s", str(HARNESS_SCRIPT_PATH)])
+        if ticks:
+            cmd.extend(["--max-ticks", str(ticks)])
+    elif ticks:
+        from engine.sim.godot_verifier import HARNESS_SCRIPT_PATH
+        cmd.extend(["-s", str(HARNESS_SCRIPT_PATH), "--max-ticks", str(ticks)])
+
+    print(f"[Godot] Booting Godot 4 cartridge from: {cartridge_dir}", flush=True)
+    print(f"[Godot] Command: {' '.join(cmd)}", flush=True)
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(cartridge_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    _ACTIVE_GODOT_PROC = proc
+
+    # Stream stdout telemetry into telemetry recorder
+    def _read_stdout():
+        if proc.stdout:
+            for line in proc.stdout:
+                line_str = line.strip()
+                print(f"[Godot stdout] {line_str}", flush=True)
+                if "[TELEMETRY_EVENT]" in line_str or "[TELEMETRY]" in line_str:
+                    tag = "[TELEMETRY_EVENT]" if "[TELEMETRY_EVENT]" in line_str else "[TELEMETRY]"
+                    try:
+                        raw_json = line_str.split(tag, 1)[1].strip()
+                        ev = json.loads(raw_json)
+                        pname = ev.get("probe_name") or ev.get("name", "custom_probe")
+                        pcat = ev.get("category", "general")
+                        pdata = ev.get("payload") or ev.get("data", {})
+                        if telemetry is not None and hasattr(telemetry, "emit_custom_probe"):
+                            telemetry.emit_custom_probe(
+                                probe_name=pname,
+                                category=pcat,
+                                data=pdata,
+                            )
+                    except Exception as err:
+                        logger.debug("Failed parsing telemetry event: %s", err)
+
+    out_th = threading.Thread(target=_read_stdout, daemon=True)
+    out_th.start()
+
+    # Stream stderr
+    def _read_stderr():
+        if proc.stderr:
+            for line in proc.stderr:
+                print(f"[Godot stderr] {line.strip()}", file=sys.stderr, flush=True)
+
+    err_th = threading.Thread(target=_read_stderr, daemon=True)
+    err_th.start()
+
+    try:
+        ret = proc.wait()
+    except KeyboardInterrupt:
+        print("\n[Godot] KeyboardInterrupt received. Terminating Godot process...", flush=True)
+        proc.terminate()
+        try:
+            ret = proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            ret = proc.wait()
+    finally:
+        _ACTIVE_GODOT_PROC = None
+        if out_th is not None and out_th.is_alive():
+            out_th.join(timeout=2.0)
+        if err_th is not None and err_th.is_alive():
+            err_th.join(timeout=2.0)
+        if proc.stdout:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+        if proc.stderr:
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+        if telemetry is not None:
+            if hasattr(telemetry, "flush"):
+                try:
+                    telemetry.flush()
+                except Exception:
+                    pass
+            if hasattr(telemetry, "close"):
+                try:
+                    telemetry.close()
+                except Exception:
+                    pass
+
+    return ret
+
+
 def resolve_and_load_cartridge(
     engine: Engine,
     requested_cartridge: Optional[str] = None,
+    requested_checkpoint: Optional[str] = None,
+    use_latest_checkpoint: bool = False,
 ) -> Optional[Path]:
-    """Dynamically resolves and loads the active cartridge into the engine.
+    """Dynamically resolves and loads the active cartridge or checkpoint into the engine.
     Strictly completes in <150ms without blocking on external processes.
 
-    When requested_cartridge is explicitly passed, enforces Strict Configuration
-    Fidelity (Rule 5) and fail-fast behavior: validates directory existence,
-    pre-validates manifest.json, and loads without fallback, letting any
-    exceptions propagate directly to the caller.
+    When requested_cartridge or requested_checkpoint is explicitly passed, enforces
+    Strict Configuration Fidelity (Rule 5) and fail-fast behavior.
 
-    When no cartridge is requested and cartridges/active does not exist or fails,
-    cleanly prints the guidance banner and returns None without falling back to seed.
+    When no cartridge is requested and cartridges/active does not exist, automatically
+    falls back to the latest verified checkpoint from cartridges/checkpoints/ if one exists.
+    If neither exists, prints the guidance banner and returns None.
     """
-    active_dir = config.PROJECT_ROOT / "cartridges" / "active"
+    checkpoints_dir = config.PROJECT_ROOT / "cartridges" / "checkpoints"
 
-    # 1. Explicit CLI override — Strict Configuration Fidelity (Rule 5): NEVER fall back
+    # 1. Explicit checkpoint request — Strict Configuration Fidelity (Rule 5)
+    if requested_checkpoint:
+        target = Path(requested_checkpoint)
+        if not target.is_absolute():
+            candidate = checkpoints_dir / requested_checkpoint
+            if candidate.is_dir():
+                target = candidate
+            else:
+                target = target.resolve()
+        if not target.exists() or not target.is_dir():
+            raise FileNotFoundError(f"Requested checkpoint directory not found: {requested_checkpoint}")
+        if (target / "project.godot").is_file():
+            logger.info("[Boot] Loaded explicitly requested Godot checkpoint: %s", target.name)
+            return target
+        engine.load_cartridge(target)
+        logger.info("[Boot] Loaded explicitly requested checkpoint: %s", target.name)
+        return target
+
+    # 2. Latest checkpoint request
+    if use_latest_checkpoint:
+        checkpoints = []
+        if checkpoints_dir.exists():
+            checkpoints = [
+                p for p in checkpoints_dir.iterdir()
+                if p.is_dir() and not p.name.startswith(".") and ((p / "project.godot").is_file() or (p / "mechanics.py").is_file())
+            ]
+        # Automatic fallback: scan cartridges/candidate_* with completed tracks if checkpoints/ not populated yet
+        if not checkpoints:
+            cartridges_root = config.PROJECT_ROOT / "cartridges"
+            for cand in cartridges_root.glob("candidate*"):
+                if cand.is_dir() and not cand.name.startswith(".") and ((cand / "project.godot").is_file() or (cand / "mechanics.py").is_file()):
+                    req_file = cand / "requirements_spec.json"
+                    if req_file.is_file():
+                        try:
+                            req_data = json.loads(req_file.read_text(encoding="utf-8"))
+                            completed = [r for r in req_data.get("requirements", []) if r.get("status") == "completed"]
+                            if completed:
+                                checkpoints.append(cand)
+                        except Exception:
+                            pass
+        if not checkpoints:
+            raise FileNotFoundError("No verified checkpoints found in cartridges/checkpoints/ or cartridges/candidate_*/")
+        latest = max(checkpoints, key=lambda p: p.stat().st_mtime)
+        if (latest / "project.godot").is_file():
+            logger.info("[Boot] Loaded latest verified Godot checkpoint: %s", latest.name)
+            return latest
+        engine.load_cartridge(latest)
+        logger.info("[Boot] Loaded latest verified checkpoint: %s", latest.name)
+        return latest
+
+    # 3. Explicit CLI cartridge override — Strict Configuration Fidelity (Rule 5): NEVER fall back
     if requested_cartridge:
         target = Path(requested_cartridge).resolve()
         if not target.exists() or not target.is_dir():
             raise FileNotFoundError(f"Requested cartridge directory not found: {target}")
 
-        # Pre-validate manifest.json if present to catch malformed JSON early
+        if (target / "project.godot").is_file():
+            logger.info("[Boot] Loaded explicitly requested Godot cartridge: %s", target.name)
+            return target
+
         manifest_path = target / "manifest.json"
         if manifest_path.exists():
             with open(manifest_path, "r", encoding="utf-8") as f:
@@ -326,12 +557,17 @@ def resolve_and_load_cartridge(
         logger.info("[Boot] Loaded explicitly requested cartridge: %s", target.name)
         return target
 
-    # 2. Primary: cartridges/active (only when no explicit CLI cartridge is passed)
+    # 4. Primary: cartridges/active (only when no explicit CLI cartridge is passed)
+    active_dir = config.PROJECT_ROOT / "cartridges" / "active"
     if active_dir.exists() and (
-        (active_dir / "manifest.json").exists()
+        (active_dir / "project.godot").exists()
+        or (active_dir / "manifest.json").exists()
         or (active_dir / "level.json").exists()
         or (active_dir / "mechanics.py").exists()
     ):
+        if (active_dir / "project.godot").is_file():
+            logger.info("[Boot] Successfully booted active promoted Godot cartridge: %s", active_dir)
+            return active_dir
         try:
             engine.load_cartridge(active_dir)
             logger.info("[Boot] Successfully booted active promoted cartridge: %s", active_dir)
@@ -341,9 +577,80 @@ def resolve_and_load_cartridge(
             print(NO_ACTIVE_GAME_BANNER)
             return None
 
-    # 3. No active cartridge found: clean user guidance without seed fallback
+    # 5. Live In-Progress Progression Fallback:
+    # If cartridges/active does not exist yet during a build, check if a verified checkpoint is playable
+    candidate_checkpoints = []
+    if checkpoints_dir.exists():
+        candidate_checkpoints = [
+            p for p in checkpoints_dir.iterdir()
+            if p.is_dir() and not p.name.startswith(".") and ((p / "project.godot").is_file() or (p / "mechanics.py").is_file())
+        ]
+    if candidate_checkpoints:
+        latest = max(candidate_checkpoints, key=lambda p: p.stat().st_mtime)
+        if (latest / "project.godot").is_file():
+            logger.info("[Boot] No cartridges/active found; automatically booted latest verified Godot checkpoint: %s", latest.name)
+            print(f"[Engine] Playing latest verified checkpoint: {latest.name}")
+            return latest
+        try:
+            engine.load_cartridge(latest)
+            logger.info("[Boot] No cartridges/active found; automatically booted latest verified checkpoint: %s", latest.name)
+            print(f"[Engine] Playing latest verified checkpoint: {latest.name}")
+            return latest
+        except Exception as e:
+            logger.warning("[Boot] Failed to load latest checkpoint '%s': %s", latest, e)
+
+    # 6. No active cartridge or checkpoint found: clean user guidance without seed fallback
     print(NO_ACTIVE_GAME_BANNER)
     return None
+
+
+def catalog_cartridge_probes(telemetry_recorder: Optional[TelemetryRecorder], cartridge_dir: Path) -> int:
+    """Catalogs custom telemetry probes declared in cartridge's telemetry_manifest.json.
+
+    Ensures foreign key referential integrity during client boot without slow row-by-row
+    rescue fallbacks. Executes non-blockingly in sub-millisecond time.
+    """
+    if telemetry_recorder is None or not hasattr(telemetry_recorder, "register_probe"):
+        return 0
+    manifest_path = Path(cartridge_dir) / "telemetry_manifest.json"
+    if not manifest_path.is_file():
+        return 0
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest_data = json.load(f)
+        count = 0
+        for p in manifest_data.get("probes", []):
+            if isinstance(p, dict) and p.get("probe_name"):
+                telemetry_recorder.register_probe(
+                    probe_id=str(p.get("probe_id") or f"prb_{p['probe_name']}"),
+                    probe_name=str(p["probe_name"]),
+                    category=str(p.get("category", "general")),
+                    description=str(p.get("description", "")),
+                    hypothesis_target=str(p.get("hypothesis_target", "")),
+                    schema_json=p.get("payload_schema", {}),
+                )
+                count += 1
+        # Ensure standard built-in engine probes are registered
+        telemetry_recorder.register_probe(
+            probe_id="probe_dialogue_bark_played",
+            probe_name="dialogue_bark_played",
+            category="dialogue",
+            description="Reactive dialogue bark played in PlayingScene",
+            hypothesis_target="H_DIALOGUE_ENGAGEMENT",
+            schema_json={},
+        )
+        telemetry_recorder.register_probe(
+            probe_id="probe_cartridge_hot_reload_triggered",
+            probe_name="cartridge_hot_reload_triggered",
+            category="system",
+            description="In-game cartridge hot-reload event",
+            hypothesis_target="H_HOT_RELOAD",
+            schema_json={},
+        )
+        return count
+    except Exception as exc:
+        logger.warning("[Boot] Failed to catalog cartridge probes from %s: %s", manifest_path, exc)
+        return 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -382,6 +689,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             db_path=config.DB_PATH,
             batch_size=config.TELEMETRY_BATCH_SIZE,
             flush_interval_sec=config.TELEMETRY_FLUSH_INTERVAL,
+            auto_register_probes=True,
         )
         _ACTIVE_SUBSYSTEMS["telemetry"] = telemetry
         telemetry.start_session(
@@ -412,7 +720,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         # 5. Resolve & Dynamically Load Game Cartridge (<150ms total boot)
         booted_path: Optional[Path] = None
         try:
-            booted_path = resolve_and_load_cartridge(engine, args.cartridge)
+            booted_path = resolve_and_load_cartridge(
+                engine,
+                requested_cartridge=args.cartridge,
+                requested_checkpoint=getattr(args, "checkpoint", None),
+                use_latest_checkpoint=getattr(args, "latest_checkpoint", False),
+            )
         except (ASTSecurityError, FileNotFoundError, json.JSONDecodeError, CartridgeError, Exception) as e:
             logger.critical("[Boot] Fatal error loading cartridge: %s: %s", type(e).__name__, e)
             sys.stderr.write(f"Error: {type(e).__name__}: {e}\n")
@@ -437,7 +750,25 @@ def main(argv: Optional[List[str]] = None) -> int:
             # Clean exit when no game has been built yet
             return 0
 
+        if (booted_path / "project.godot").is_file():
+            print(f"[Engine] Detected Godot 4 cartridge in '{booted_path.name}'. Launching Godot 4.3 runtime...")
+            if engine:
+                try:
+                    engine.telemetry_recorder = None
+                    engine.quit()
+                    _ACTIVE_SUBSYSTEMS["engine"] = None
+                except Exception:
+                    pass
+            catalog_cartridge_probes(telemetry, booted_path)
+            return run_godot_cartridge(
+                booted_path,
+                headless=args.headless,
+                ticks=getattr(args, "ticks", None),
+                telemetry=telemetry,
+            )
+
         engine.booted_cartridge_path = booted_path
+        catalog_cartridge_probes(telemetry, booted_path)
 
         # 6. Register Scene State Machine
         engine.scene_manager.register_scene("title", TitleScene(engine))

@@ -22,13 +22,21 @@ data/*.db
 data/*.db-shm
 data/*.db-wal
 data/*.json
+data/*.jsonl
 data/specs/
 
-# Dynamically Synthesized Game Cartridges (Studio Output)
+# Dynamically Synthesized Game Cartridges & Checkpoints (Studio Output)
 cartridges/active/
 cartridges/candidate_*/
+cartridges/checkpoints/
+cartridges/backup_*/
 cartridges/episode_*/
 cartridges/genesis/
+cartridges/.no_cold_boot
+
+# Godot 4 Portable Runtime & Engine Cache
+.godot_runtime/
+.godot/
 
 # Agent Workspace & OS Metadata
 .agents/

@@ -208,7 +208,7 @@ class TestGeminiOpenAPISchemaCompliance:
         props = list(schema.get("properties", {}).keys())
         assert props[0] == "deliberation", f"First property is {props[0]}, expected 'deliberation'"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_awaitable_studio_swarm_plan(self):
         """AwaitableStudioSwarmPlan must be awaitable in async contexts and sync accessible."""
         plan = AwaitableStudioSwarmPlan(

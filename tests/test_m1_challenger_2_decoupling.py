@@ -233,7 +233,7 @@ class TestGenericCartridgeDecoupling:
 class TestRunGameShellScript:
     """Empirical challenge for run_game.sh behavior when cartridges/active is absent."""
 
-    def test_run_game_sh_when_active_cartridge_absent(self):
+    def test_run_game_sh_when_active_cartridge_absent(self, stash_active_cartridge):
         """
         Challenge 3.1:
         Execute run_game.sh when cartridges/active is absent.
@@ -391,23 +391,22 @@ class TestAdversarialDecouplingEdgeCases:
 
         assert current_scene.cards_played == 10
 
-    def test_resolve_cartridge_corrupted_active_directory_behavior(self, tmp_path: Path):
+    def test_resolve_cartridge_corrupted_active_directory_behavior(self, tmp_path: Path, monkeypatch, capsys):
         """Verify resolve_and_load_cartridge handles corrupted active directory safely with banner and returns None."""
         from run_game import resolve_and_load_cartridge, NO_ACTIVE_GAME_BANNER
         engine = Engine(headless=True)
 
-        # Temporarily create corrupted cartridges/active
-        active_dir = config.PROJECT_ROOT / "cartridges" / "active"
-        existed_before = active_dir.exists()
+        # Hermetic test isolation: create corrupted cartridge in an isolated temp directory
+        fake_root = tmp_path / "corrupted_workspace"
+        active_dir = fake_root / "cartridges" / "active"
         active_dir.mkdir(parents=True, exist_ok=True)
         corrupted_manifest = active_dir / "manifest.json"
         corrupted_manifest.write_text("CORRUPTED JSON {{{{", encoding="utf-8")
 
-        try:
-            booted = resolve_and_load_cartridge(engine)
-            assert booted is None, f"Expected None on corrupted active cartridge, got {booted}"
-        finally:
-            if not existed_before and active_dir.exists():
-                import shutil
-                shutil.rmtree(active_dir, ignore_errors=True)
+        monkeypatch.setattr(config, "PROJECT_ROOT", fake_root)
+
+        booted = resolve_and_load_cartridge(engine)
+        assert booted is None, f"Expected None on corrupted active cartridge, got {booted}"
+        out, _ = capsys.readouterr()
+        assert "No Active Game Cartridge Found in cartridges/active/" in out
 

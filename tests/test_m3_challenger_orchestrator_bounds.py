@@ -4,6 +4,7 @@ Challenger 1: Orchestrator Resilience, AST Security & Multimodal Bounds.
 Zero occurrences of legacy branding tokens.
 """
 from __future__ import annotations
+import asyncio
 import ast
 import io
 import json
@@ -29,12 +30,15 @@ from engine.studio.audio import (
     validate_wav_file,
 )
 from engine.studio.models import (
+    AcceptanceCriterion,
     AgentPlan,
     AgentVerificationRecord,
     CharacterSheet,
     DialogueBarkSpec,
+    GameRequirementsSpec,
     GenesisWorldSpec,
     NarrativeBible,
+    RequirementTrack,
     StudioBuildState,
     StudioSwarmPlan,
     TelemetryArchitecturePlan,
@@ -50,6 +54,8 @@ from engine.studio.orchestrator import (
 )
 from engine.studio.swe import LeadGameplaySWEAgent
 from engine.studio.visual import VisualArtSpriteDesignerAgent
+from engine.ui.models import SwarmEventType
+from engine.ui.server import SwarmEventBus
 from tests.conftest import MockGeminiClient
 
 
@@ -1308,4 +1314,671 @@ class TestExecuteSwarmPlanTopologiesAndArtifactsStress:
 
         assert report.promoted_to_active is False
         assert orch.state == StudioBuildState.SYNTHESIZING, "Must re-enter SYNTHESIZING on rejected build"
+
+
+# ===========================================================================
+# 8. Milestone 3 Empirical Challenger 1 Stress Harness
+# ===========================================================================
+
+class TestMilestone3Challenger1EmpiricalStress:
+    """Empirical verification of Milestone 3 requirements:
+    1. DAG topological ordering via Kahn's algorithm guarantees Visual & Voice strictly before SWE.
+    2. Ad-hoc voice gating omits voice synthesis when Voice role is omitted from plan.
+    3. Iterative SWE loop status transitions (pending -> in_progress -> completed/rejected).
+    4. Epistemic deliberation ordering (field index 0) across all emitted swarm events.
+    5. Immediate fail-fast halting upon track failure (AST, syntax, headless simulation).
+    """
+    deliberation: str = "Empirical stress testing for Milestone 3 DAG ordering, voice gating, and iterative SWE loop."
+
+    def test_dag_kahn_topological_sort_places_visual_and_voice_strictly_before_swe(self) -> None:
+        """Kahn's topological sort on DEFAULT_EDGES invariant: Visual and Voice must strictly precede SWE."""
+        dag = StudioAgentDAG()
+        order = dag.topological_sort()
+
+        # Invariant 1: Visual and Voice strictly precede SWE in linear topological sort
+        assert "Visual" in order
+        assert "Voice" in order
+        assert "SWE" in order
+
+        visual_idx = order.index("Visual")
+        voice_idx = order.index("Voice")
+        swe_idx = order.index("SWE")
+        director_idx = order.index("Director")
+        writer_idx = order.index("Writer")
+
+        assert visual_idx < swe_idx, f"Visual (index {visual_idx}) must precede SWE (index {swe_idx})"
+        assert voice_idx < swe_idx, f"Voice (index {voice_idx}) must precede SWE (index {swe_idx})"
+        assert director_idx < visual_idx, f"Director (index {director_idx}) must precede Visual (index {visual_idx})"
+        assert writer_idx < voice_idx, f"Writer (index {writer_idx}) must precede Voice (index {voice_idx})"
+        assert writer_idx < visual_idx, f"Writer (index {writer_idx}) must precede Visual (index {visual_idx})"
+
+        # Permutation stress test: 100 randomized edge orderings must all produce Visual & Voice before SWE
+        rng = random.Random(42)
+        edges_copy = list(StudioAgentDAG.DEFAULT_EDGES)
+        for trial in range(100):
+            rng.shuffle(edges_copy)
+            trial_dag = StudioAgentDAG(edges=edges_copy)
+            trial_order = trial_dag.topological_sort()
+            t_vis = trial_order.index("Visual")
+            t_vox = trial_order.index("Voice")
+            t_swe = trial_order.index("SWE")
+            assert t_vis < t_swe, f"Trial {trial}: Visual must precede SWE"
+            assert t_vox < t_swe, f"Trial {trial}: Voice must precede SWE"
+
+        # Tier wave partitioning test: Visual and Voice must be partitioned into an earlier wave tier than SWE
+        orch = StudioOrchestrator()
+        all_roles = [
+            "Analyst", "Director", "Writer", "Visual", "Voice", "SWE", "TelemetryArchitect", "Supervisor"
+        ]
+        tiers = orch._compute_execution_tiers(StudioAgentDAG.DEFAULT_EDGES, all_roles)
+
+        role_tier_map = {}
+        for tier_idx, wave in enumerate(tiers):
+            for role in wave:
+                role_tier_map[role] = tier_idx
+
+        assert role_tier_map["Visual"] < role_tier_map["SWE"], "Visual tier must be strictly earlier than SWE tier"
+        assert role_tier_map["Voice"] < role_tier_map["SWE"], "Voice tier must be strictly earlier than SWE tier"
+        assert role_tier_map["Director"] < role_tier_map["Visual"], "Director must precede Visual tier"
+        assert role_tier_map["Writer"] < role_tier_map["Voice"], "Writer must precede Voice tier"
+
+        # Subsets of roles: verify invariant holds even when optional roles are omitted
+        subset_a = ["Director", "Visual", "Voice", "SWE"]
+        tiers_a = orch._compute_execution_tiers(StudioAgentDAG.DEFAULT_EDGES, subset_a)
+        tier_map_a = {r: idx for idx, wave in enumerate(tiers_a) for r in wave}
+        assert tier_map_a["Visual"] < tier_map_a["SWE"]
+        assert tier_map_a["Voice"] < tier_map_a["SWE"]
+
+        subset_b = ["Visual", "SWE"]
+        tiers_b = orch._compute_execution_tiers(StudioAgentDAG.DEFAULT_EDGES, subset_b)
+        tier_map_b = {r: idx for idx, wave in enumerate(tiers_b) for r in wave}
+        assert tier_map_b["Visual"] < tier_map_b["SWE"]
+
+    @pytest.mark.anyio
+    async def test_ad_hoc_voice_gating_when_voice_omitted_vs_included(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """When plan.specialist_agent_roles excludes Voice, zero voice synthesis calls occur.
+        When Voice is included, voice synthesis executes properly."""
+        mock_client = MockGeminiClient()
+        director_dict = TestExecuteSwarmPlanTopologiesAndArtifactsStress._get_world_spec_dict(0)
+        writer_dict = TestExecuteSwarmPlanTopologiesAndArtifactsStress._get_narrative_bible_dict()
+        swe_bundle_dict = TestExecuteSwarmPlanTopologiesAndArtifactsStress._get_cartridge_bundle_dict(0)
+
+        # 1. PLAN WITHOUT VOICE
+        mock_client.set_json_response(director_dict)
+        mock_client.set_json_response(writer_dict)
+        mock_client.set_json_response(swe_bundle_dict)
+
+        orch = StudioOrchestrator(client=mock_client)
+
+        # Mock supervisor so promotion succeeds
+        mock_sup = MagicMock()
+        mock_report = MagicMock()
+        mock_report.promoted_to_active = True
+        mock_report.deliberation = "Passed all QA gates"
+        mock_report.attempt_count = 1
+        mock_sup.evaluate_and_heal.return_value = mock_report
+        orch.agents["QAPlaytesterBuildSupervisor"] = mock_sup
+
+        # Spy on voice agent
+        voice_agent = orch.agents["VoiceActingAudioProducerAgent"]
+        voice_spy = MagicMock(wraps=voice_agent.synthesize_voice_line)
+        voice_agent.synthesize_voice_line = voice_spy
+
+        plan_no_voice = StudioSwarmPlan(
+            deliberation="Swarm plan explicitly excluding Voice specialist.",
+            plan_id="plan_no_voice_001",
+            game_title="Voice Gating Test",
+            genre_verdict="Action Roguelike",
+            specialist_agent_roles=["Director", "Writer", "SWE"],
+            dag_edges=[("Director", "Writer"), ("Writer", "SWE")],
+            task_manifest={},
+            target_episode=0,
+        )
+
+        staging_dir_no_voice = tmp_path / "staging_no_voice"
+        report = await orch.execute_swarm_plan(plan_no_voice, staging_dir_no_voice)
+
+        assert report.promoted_to_active is True
+        # VERIFY ZERO VOICE CALLS
+        assert voice_spy.call_count == 0, "No voice synthesis calls should occur when Voice is omitted"
+        audio_dir = staging_dir_no_voice / "assets" / "audio"
+        if audio_dir.exists():
+            wav_files = list(audio_dir.glob("*.wav"))
+            assert len(wav_files) == 0, "No WAV files should be generated when Voice is omitted"
+
+        # 2. PLAN WITH VOICE (Using role slug "Voice")
+        mock_client_with_voice = MockGeminiClient()
+        mock_client_with_voice.set_json_response(director_dict)
+        mock_client_with_voice.set_json_response(writer_dict)
+        mock_client_with_voice.set_audio_response(
+            TestExecuteSwarmPlanTopologiesAndArtifactsStress._get_test_wav_bytes(duration_sec=1.5)
+        )
+        mock_client_with_voice.set_json_response(swe_bundle_dict)
+
+        orch_voice = StudioOrchestrator(client=mock_client_with_voice)
+        orch_voice.agents["QAPlaytesterBuildSupervisor"] = mock_sup
+
+        voice_agent_2 = orch_voice.agents["VoiceActingAudioProducerAgent"]
+        voice_spy_2 = MagicMock(wraps=voice_agent_2.synthesize_voice_line)
+        voice_agent_2.synthesize_voice_line = voice_spy_2
+
+        plan_with_voice = StudioSwarmPlan(
+            deliberation="Swarm plan including Voice specialist via canonical alias.",
+            plan_id="plan_with_voice_001",
+            game_title="Voice Gating Test",
+            genre_verdict="Action Roguelike",
+            specialist_agent_roles=["Director", "Writer", "Voice", "SWE"],
+            dag_edges=[
+                ("Director", "Writer"),
+                ("Writer", "Voice"),
+                ("Voice", "SWE"),
+                ("Director", "SWE"),
+            ],
+            task_manifest={},
+            target_episode=0,
+        )
+
+        staging_dir_with_voice = tmp_path / "staging_with_voice"
+        report_voice = await orch_voice.execute_swarm_plan(plan_with_voice, staging_dir_with_voice)
+
+        assert report_voice.promoted_to_active is True
+        assert voice_spy_2.call_count > 0, "Voice synthesis must be executed when Voice role is included"
+        audio_dir_voice = staging_dir_with_voice / "assets" / "audio"
+        assert audio_dir_voice.exists()
+        assert len(list(audio_dir_voice.glob("*.wav"))) > 0
+
+    @pytest.mark.anyio
+    async def test_iterative_swe_loop_multi_track_status_sequence_and_deliberation_index_zero(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Stress tests iterative SWE loop across 3 tracks:
+        - Sequence: R1(in_progress) -> R1(completed) -> R2(in_progress) -> R2(completed) -> R3(in_progress) -> R3(completed).
+        - Rule 4 Invariance: 'deliberation' is strictly key index 0 in event and payload.
+        - Persisted requirements_spec.json contains all tracks completed.
+        """
+        import json as _json
+
+        client = MockGeminiClient()
+        cartridge_bundle_data = {
+            "deliberation": "Initial bundle for multi-track test.",
+            "manifest_data": {
+                "title": "Multi-Track Cartridge",
+                "genre": "Action Roguelike",
+                "version": "1.0.0",
+                "entrypoint": "mechanics.py",
+            },
+            "mechanics_code": (
+                '"""mechanics.py"""\n'
+                'from engine.api.contracts import BaseCartridge, BaseScene\n'
+                'class MultiScene(BaseScene):\n'
+                '    deliberation: str = "Multi-track scene."\n'
+                '    def __init__(self, engine=None):\n'
+                '        super().__init__(engine)\n'
+                '        self.counter = 0\n'
+                '    def update(self, dt):\n'
+                '        self.counter += 1\n'
+                '    def render(self, surface):\n'
+                '        pass\n'
+                'class MultiCartridge(BaseCartridge):\n'
+                '    deliberation: str = "Multi-track cartridge."\n'
+                '    def get_scenes(self, engine):\n'
+                '        return {"main": MultiScene(engine)}\n'
+                '    def get_initial_scene(self, engine):\n'
+                '        return self.get_scenes(engine)["main"]\n'
+            ),
+            "scenes_code": None,
+            "entities_code": None,
+            "abilities_code": None,
+            "level_data": None,
+        }
+        client.set_json_response(cartridge_bundle_data)
+        client.set_json_response(cartridge_bundle_data)
+        client.set_json_response(cartridge_bundle_data)
+
+        event_log = tmp_path / "multi_track_events.jsonl"
+        bus = SwarmEventBus(log_path=event_log)
+        orch = StudioOrchestrator(client=client, event_bus=bus)
+
+        staging_dir = tmp_path / "staging_multi_track"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+
+        req_spec = GameRequirementsSpec(
+            deliberation="Epistemic decomposition into 3 distinct requirement tracks.",
+            game_title="Multi-Track Cartridge",
+            genre_paradigm="Action Roguelike",
+            target_audience_summary="Fast kinetic testing",
+            target_episode=0,
+            requirements=[
+                RequirementTrack(
+                    deliberation="Track 1: Core simulation",
+                    id="R1",
+                    title="Core Engine",
+                    description="Base mechanics",
+                    responsible_agents=["LeadGameplaySWEAgent"],
+                    acceptance_criteria=[
+                        AcceptanceCriterion(
+                            deliberation="AC1: Sim step",
+                            id="AC1.1",
+                            description="Headless steps",
+                            verification_method="headless_playtest",
+                        )
+                    ],
+                    status="pending",
+                ),
+                RequirementTrack(
+                    deliberation="Track 2: Combat subsystem",
+                    id="R2",
+                    title="Combat System",
+                    description="Projectiles",
+                    responsible_agents=["LeadGameplaySWEAgent"],
+                    acceptance_criteria=[
+                        AcceptanceCriterion(
+                            deliberation="AC2: AST check",
+                            id="AC2.1",
+                            description="No banned modules",
+                            verification_method="ast_inspection",
+                        )
+                    ],
+                    status="pending",
+                ),
+                RequirementTrack(
+                    deliberation="Track 3: UI and scoring",
+                    id="R3",
+                    title="Scoring Subsystem",
+                    description="Score tracker",
+                    responsible_agents=["LeadGameplaySWEAgent"],
+                    acceptance_criteria=[
+                        AcceptanceCriterion(
+                            deliberation="AC3: Metric validation",
+                            id="AC3.1",
+                            description="Score tracking",
+                            verification_method="runtime_telemetry",
+                        )
+                    ],
+                    status="pending",
+                ),
+            ],
+            asset_manifest=[],
+        )
+
+        (staging_dir / "requirements_spec.json").write_text(
+            req_spec.model_dump_json(indent=2), encoding="utf-8"
+        )
+
+        swe = orch.agents["LeadGameplaySWEAgent"]
+        world_spec = GenesisWorldSpec(
+            deliberation="World spec for multi-track test",
+            game_title="Multi-Track Cartridge",
+            core_genre="Action Roguelike",
+            thematic_premise="Grid testing",
+            world_lore="Lore",
+            conflict_tone="tense",
+            conflict_narrative="combat",
+            aesthetic_style="retro_arcade",
+            palette_mood="retro_arcade",
+            gameplay_pacing="fast",
+            pacing_score=0.5,
+            target_difficulty=1.0,
+        )
+
+        results = await orch._execute_iterative_swe_loop(
+            agent=swe,
+            world_spec=world_spec,
+            narrative_bible=None,
+            req_spec=req_spec,
+            staging_dir=staging_dir,
+        )
+
+        assert len(results) >= 1
+        assert all(t.status == "completed" for t in req_spec.requirements)
+
+        # Allow async event tasks to flush to disk
+        await asyncio.sleep(0.1)
+
+        # Verify disk persistence
+        on_disk = GameRequirementsSpec.model_validate_json(
+            (staging_dir / "requirements_spec.json").read_text(encoding="utf-8")
+        )
+        assert all(t.status == "completed" for t in on_disk.requirements)
+
+        # Inspect all emitted events in JSONL log or bus
+        events = bus.get_recent_events()
+        assert len(events) >= 6
+
+        status_events = []
+        for ev in events:
+            # Rule 4: Deliberation MUST be field index 0 in raw event JSON
+            first_key = list(ev.keys())[0]
+            assert first_key == "deliberation", f"Event must place 'deliberation' at index 0, got '{first_key}'"
+            assert isinstance(ev["deliberation"], str) and len(ev["deliberation"]) > 0
+
+            # Rule 4: Deliberation MUST be field index 0 in payload
+            if "payload" in ev and isinstance(ev["payload"], dict) and "deliberation" in ev["payload"]:
+                payload_first_key = list(ev["payload"].keys())[0]
+                assert payload_first_key == "deliberation", f"Payload must place 'deliberation' at index 0, got '{payload_first_key}'"
+
+            if ev.get("event_type") == SwarmEventType.REQUIREMENT_STATUS_UPDATE.value:
+                status_events.append((ev["payload"]["requirement_id"], ev["payload"]["status"]))
+
+        # Verify exact sequence across all 3 tracks:
+        expected_sequence = [
+            ("R1", "in_progress"),
+            ("R1", "completed"),
+            ("R2", "in_progress"),
+            ("R2", "completed"),
+            ("R3", "in_progress"),
+            ("R3", "completed"),
+        ]
+        assert status_events == expected_sequence, f"Status events sequence mismatch: {status_events}"
+
+    @pytest.mark.anyio
+    async def test_iterative_swe_loop_halts_immediately_on_track_failure(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """When an intermediate track fails, the loop halts immediately:
+        - Failing track marked 'rejected'
+        - Subsequent tracks remain 'pending' (never executed)
+        - Event log ends with 'rejected' for failing track
+        - StudioSwarmExecutionError raised
+        """
+        import json as _json
+
+        client = MagicMock(spec=[])
+        event_log = tmp_path / "fail_fast_events.jsonl"
+        bus = SwarmEventBus(log_path=event_log)
+        orch = StudioOrchestrator(client=client, event_bus=bus)
+
+        staging_dir = tmp_path / "staging_fail_fast"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+
+        req_spec = GameRequirementsSpec(
+            deliberation="4-track specification to test immediate loop halting upon track failure.",
+            game_title="Fail Fast Test",
+            genre_paradigm="Action Roguelike",
+            target_audience_summary="Pacing index 0.5",
+            target_episode=0,
+            requirements=[
+                RequirementTrack(
+                    deliberation="Track 1: Initial mechanics",
+                    id="R1",
+                    title="Track 1 Valid",
+                    description="Initial mechanics",
+                    responsible_agents=["LeadGameplaySWEAgent"],
+                    status="pending",
+                ),
+                RequirementTrack(
+                    deliberation="Track 2: Broken requirement",
+                    id="R2",
+                    title="Track 2 Broken",
+                    description="Synthesizes broken python file",
+                    responsible_agents=["LeadGameplaySWEAgent"],
+                    status="pending",
+                ),
+                RequirementTrack(
+                    deliberation="Track 3: Should never execute",
+                    id="R3",
+                    title="Track 3 Unreachable",
+                    description="Unreachable track",
+                    responsible_agents=["LeadGameplaySWEAgent"],
+                    status="pending",
+                ),
+                RequirementTrack(
+                    deliberation="Track 4: Should never execute",
+                    id="R4",
+                    title="Track 4 Unreachable",
+                    description="Unreachable track",
+                    responsible_agents=["LeadGameplaySWEAgent"],
+                    status="pending",
+                ),
+            ],
+            asset_manifest=[],
+        )
+
+        (staging_dir / "requirements_spec.json").write_text(
+            req_spec.model_dump_json(indent=2), encoding="utf-8"
+        )
+
+        # Write valid initial mechanics
+        (staging_dir / "mechanics.py").write_text(
+            '"""mechanics.py"""\n'
+            'from engine.api.contracts import BaseCartridge, BaseScene\n'
+            'class S(BaseScene):\n'
+            '    deliberation: str = "Scene."\n'
+            '    def __init__(self, engine=None):\n'
+            '        super().__init__(engine)\n'
+            '        self.counter = 0\n'
+            '    def update(self, dt):\n'
+            '        self.counter += 1\n'
+            '    def render(self, s):\n'
+            '        pass\n'
+            'class C(BaseCartridge):\n'
+            '    deliberation: str = "Cart."\n'
+            '    def get_scenes(self, e):\n'
+            '        return {"main": S(e)}\n'
+            '    def get_initial_scene(self, e):\n'
+            '        return self.get_scenes(e)["main"]\n',
+            encoding="utf-8",
+        )
+
+        swe = orch.agents["LeadGameplaySWEAgent"]
+        swe.client = MagicMock(spec=[])
+
+        # Mock implement_requirement_track so track 2 injects a broken python file
+        def mock_implement(track, staging_dir, **kwargs):
+            if track.id == "R2":
+                (staging_dir / "broken_module.py").write_text("def broken(:\n    pass\n", encoding="utf-8")
+            return {"mechanics.py": staging_dir / "mechanics.py"}
+
+        swe.implement_requirement_track = MagicMock(side_effect=mock_implement)
+
+        world_spec = GenesisWorldSpec(
+            deliberation="World spec",
+            game_title="Fail Fast Test",
+            core_genre="Action Roguelike",
+            thematic_premise="Premise",
+            world_lore="Lore",
+            conflict_tone="tense",
+            conflict_narrative="combat",
+            aesthetic_style="retro_arcade",
+            palette_mood="retro_arcade",
+            gameplay_pacing="fast",
+            pacing_score=0.5,
+            target_difficulty=1.0,
+        )
+
+        with pytest.raises(StudioSwarmExecutionError) as exc_info:
+            await orch._execute_iterative_swe_loop(
+                agent=swe,
+                world_spec=world_spec,
+                narrative_bible=None,
+                req_spec=req_spec,
+                staging_dir=staging_dir,
+            )
+
+        assert "Requirement R2 ('Track 2 Broken') failed verification" in str(exc_info.value)
+
+        # Track status assertions
+        assert req_spec.requirements[0].status == "completed", "Track R1 should be completed"
+        assert req_spec.requirements[1].status == "rejected", "Track R2 should be rejected"
+        assert req_spec.requirements[2].status == "pending", "Track R3 must remain pending"
+        assert req_spec.requirements[3].status == "pending", "Track R4 must remain pending"
+
+        # On-disk requirements_spec.json assertion
+        disk_spec = GameRequirementsSpec.model_validate_json(
+            (staging_dir / "requirements_spec.json").read_text(encoding="utf-8")
+        )
+        assert disk_spec.requirements[0].status == "completed"
+        assert disk_spec.requirements[1].status == "rejected"
+        assert disk_spec.requirements[2].status == "pending"
+        assert disk_spec.requirements[3].status == "pending"
+
+        # Event log assertion: R3 and R4 must NOT appear
+        await asyncio.sleep(0.1)
+        events = bus.get_recent_events()
+        status_pairs = []
+        for ev in events:
+            if ev.get("event_type") == SwarmEventType.REQUIREMENT_STATUS_UPDATE.value:
+                status_pairs.append((ev["payload"]["requirement_id"], ev["payload"]["status"]))
+
+        assert status_pairs == [
+            ("R1", "in_progress"),
+            ("R1", "completed"),
+            ("R2", "in_progress"),
+            ("R2", "rejected"),
+        ]
+
+    @pytest.mark.anyio
+    async def test_iterative_swe_loop_halts_on_ast_security_violation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """AST security violations (e.g. prohibited subprocess/os import) halt the loop immediately."""
+        client = MockGeminiClient()
+        orch = StudioOrchestrator(client=client)
+
+        staging_dir = tmp_path / "staging_ast_violation"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+
+        req_spec = GameRequirementsSpec(
+            deliberation="Spec for AST security test",
+            game_title="AST Violation Test",
+            genre_paradigm="Action Roguelike",
+            target_audience_summary="Pacing 0.5",
+            target_episode=0,
+            requirements=[
+                RequirementTrack(
+                    deliberation="Track 1: Injects forbidden import",
+                    id="R1",
+                    title="Malicious Import Track",
+                    description="Imports forbidden module",
+                    responsible_agents=["LeadGameplaySWEAgent"],
+                    status="pending",
+                )
+            ],
+            asset_manifest=[],
+        )
+
+        # Inject forbidden import
+        (staging_dir / "entities.py").write_text(
+            'deliberation = "Entities."\nimport subprocess\n',
+            encoding="utf-8",
+        )
+
+        swe = orch.agents["LeadGameplaySWEAgent"]
+        swe.synthesize_cartridge_code = MagicMock(return_value={"entities.py": staging_dir / "entities.py"})
+
+        world_spec = GenesisWorldSpec(
+            deliberation="World spec",
+            game_title="AST Violation Test",
+            core_genre="Action Roguelike",
+            thematic_premise="Premise",
+            world_lore="Lore",
+            conflict_tone="tense",
+            conflict_narrative="combat",
+            aesthetic_style="retro_arcade",
+            palette_mood="retro_arcade",
+            gameplay_pacing="fast",
+            pacing_score=0.5,
+            target_difficulty=1.0,
+        )
+
+        with pytest.raises(StudioSwarmExecutionError) as exc_info:
+            await orch._execute_iterative_swe_loop(
+                agent=swe,
+                world_spec=world_spec,
+                narrative_bible=None,
+                req_spec=req_spec,
+                staging_dir=staging_dir,
+            )
+
+        assert "AST" in str(exc_info.value)
+        assert "subprocess" in str(exc_info.value)
+        assert req_spec.requirements[0].status == "rejected"
+
+    @pytest.mark.anyio
+    async def test_iterative_swe_loop_halts_on_headless_runtime_exception(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Headless simulation crash during the 10-frame smoke check halts the loop immediately."""
+        client = MockGeminiClient()
+        orch = StudioOrchestrator(client=client)
+
+        staging_dir = tmp_path / "staging_headless_crash"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write mechanics code that passes AST but crashes during headless step
+        (staging_dir / "mechanics.py").write_text(
+            '"""mechanics.py"""\n'
+            'from engine.api.contracts import BaseCartridge, BaseScene\n'
+            'class CrashScene(BaseScene):\n'
+            '    deliberation: str = "Crashing scene."\n'
+            '    def __init__(self, engine=None):\n'
+            '        super().__init__(engine)\n'
+            '    def update(self, dt):\n'
+            '        # Deliberate runtime exception during step\n'
+            '        x = 1 / 0\n'
+            '    def render(self, surface):\n'
+            '        pass\n'
+            'class CrashCartridge(BaseCartridge):\n'
+            '    deliberation: str = "Crash cartridge."\n'
+            '    def get_scenes(self, engine):\n'
+            '        return {"main": CrashScene(engine)}\n'
+            '    def get_initial_scene(self, engine):\n'
+            '        return self.get_scenes(engine)["main"]\n',
+            encoding="utf-8",
+        )
+
+        req_spec = GameRequirementsSpec(
+            deliberation="Spec for headless crash testing",
+            game_title="Crash Test",
+            genre_paradigm="Action Roguelike",
+            target_audience_summary="Pacing 0.5",
+            target_episode=0,
+            requirements=[
+                RequirementTrack(
+                    deliberation="Track 1: Runtime crash in update()",
+                    id="R1",
+                    title="Crashing Track",
+                    description="Crashes on update",
+                    responsible_agents=["LeadGameplaySWEAgent"],
+                    status="pending",
+                )
+            ],
+            asset_manifest=[],
+        )
+
+        swe = orch.agents["LeadGameplaySWEAgent"]
+        world_spec = GenesisWorldSpec(
+            deliberation="World spec",
+            game_title="Crash Test",
+            core_genre="Action Roguelike",
+            thematic_premise="Premise",
+            world_lore="Lore",
+            conflict_tone="tense",
+            conflict_narrative="combat",
+            aesthetic_style="retro_arcade",
+            palette_mood="retro_arcade",
+            gameplay_pacing="fast",
+            pacing_score=0.5,
+            target_difficulty=1.0,
+        )
+
+        with pytest.raises(StudioSwarmExecutionError) as exc_info:
+            await orch._execute_iterative_swe_loop(
+                agent=swe,
+                world_spec=world_spec,
+                narrative_bible=None,
+                req_spec=req_spec,
+                staging_dir=staging_dir,
+            )
+
+        assert "Headless smoke check runtime exception" in str(exc_info.value)
+        assert req_spec.requirements[0].status == "rejected"
+
 

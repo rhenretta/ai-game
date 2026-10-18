@@ -162,7 +162,7 @@ class StudioOrchestratorConfig(BaseEpistemicModel):
     tts_model_name: str = Field(default="gemini-3.8-flash-tts", description="Model for voice synthesis")
     image_model_name: str = Field(default="gemini-3.1-flash-lite-image", description="Model for image generation")
     max_retries: int = Field(default=3, description="Maximum self-healing repair iterations")
-    timeout_seconds: float = Field(default=120.0, description="Per-agent inference timeout")
+    timeout_seconds: float = Field(default=300.0, description="Per-agent inference timeout")
 
 
 class AgentPlan(BaseEpistemicModel):
@@ -230,9 +230,9 @@ class GenesisWorldSpec(BaseEpistemicModel):
     gameplay_pacing: str = Field(..., description="'kinetic_high_mobility' | 'tactical_methodical' | 'balanced'.")
     pacing_score: float = Field(..., description="Continuous kinetic-tactical metric [-1.0, 1.0].")
     target_difficulty: float = Field(..., description="Normalized baseline difficulty in [0.5, 1.5].")
-    camera_style: str = Field(default="arena_framing", description="'arena_framing' | 'tight_follow'.")
+    camera_style: str = Field(default="agent_directed", description="Presentation or camera perspective determined by game concept (e.g. 'follow_player', 'static_view', 'scrolling', 'isometric', 'arena_framing', 'agent_directed').")
     mechanics_guidelines: List[str] = Field(default_factory=list, description="Directives for Gameplay SWE agent.")
-    arena_layout_directive: str = Field(default="open_arena", description="'open_arena' | 'tactical_corridors' | 'wide_expanse'.")
+    arena_layout_directive: str = Field(default="agent_directed", description="Spatial layout or environment structure determined by game concept (e.g. 'open_field', 'procedural_grid', 'modular_rooms', 'boundless', 'open_arena', 'agent_directed').")
     created_at_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -374,7 +374,7 @@ class NarrativeBible(BaseEpistemicModel):
     bible_id: str = Field(default_factory=lambda: f"bible_{uuid.uuid4().hex[:8]}")
     world_title: str = Field(...)
     setting_summary: str = Field(...)
-    characters: List[CharacterSheet] = Field(...)
+    characters: List[CharacterSheet] = Field(default_factory=list, description="Character sheets (can be empty for abstract/character-less games).")
     cutscenes: List[CutsceneScript] = Field(default_factory=list)
     dialogue_trees: List[DialogueTreeSpec] = Field(default_factory=list)
     dialogue_barks: List[DialogueBarkSpec] = Field(default_factory=list)
@@ -383,9 +383,9 @@ class NarrativeBible(BaseEpistemicModel):
     @field_validator("characters")
     @classmethod
     def validate_characters_present(cls, v: List[CharacterSheet]) -> List[CharacterSheet]:
-        if not v:
-            raise ValueError("NarrativeBible requires at least one character")
-        return v
+        # Rule 1: Pure Generalizability — abstract, puzzle, simulation, or character-less games
+        # with 0 characters (len(characters) == 0) are valid.
+        return v if v is not None else []
 
     def to_cartridge_narrative_dict(self) -> Dict[str, Any]:
         """Converts Bible to narrative.json format consumed by PlayingScene."""
@@ -461,7 +461,7 @@ class TelemetryProbeDesignSpec(BaseEpistemicModel):
         description="JSON Schema (Draft-07 compliant) defining the expected keys in data payload."
     )
     target_module: str = Field(
-        default="mechanics.py",
+        default="mechanics.gd",
         description="Filename of the module being instrumented."
     )
     target_class: str = Field(
@@ -502,6 +502,9 @@ class TelemetryArchitecturePlan(BaseEpistemicModel):
 
     def to_dict(self) -> Dict[str, Any]:
         return self.model_dump()
+
+
+TelemetryPlan = TelemetryArchitecturePlan
 
 
 class InstrumentationResult(BaseEpistemicModel):
@@ -694,8 +697,298 @@ class StudioSwarmPlan(BaseEpistemicModel):
         return self.model_dump()
 
 
+class AcceptanceCriterion(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Explicit, verifiable criterion for satisfying a requirement track.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST: Epistemic justification for this acceptance criterion.")
+    id: str = Field(default="", description="Unique criterion identifier, e.g. 'AC-R1.1' or 'AC1.1'")
+    criterion_id: str = Field(default="", description="Unique criterion identifier alias")
+    description: str = Field(..., description="Explicit, verifiable description of expected behavior.")
+    verification_method: str = Field(
+        default="headless_playtest",
+        description="'ast_inspection' | 'runtime_telemetry' | 'headless_playtest' | 'multi_modal' | 'design_critic' | 'asset_presence'"
+    )
+    verification_type: Optional[str] = Field(default=None, description="Verification method alias")
+    passed: bool = Field(default=False, description="Verification status.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_criterion_data(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            out = dict(data)
+            cid = out.get("id") or out.get("criterion_id") or f"AC_{uuid.uuid4().hex[:6]}"
+            out["id"] = cid
+            out["criterion_id"] = cid
+            vm = out.get("verification_method") or out.get("verification_type") or "headless_playtest"
+            out["verification_method"] = vm
+            out["verification_type"] = vm
+            return out
+        return data
+
+
+class AssetRequirement(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Dynamic multimodal visual or audio asset required by the conceived game.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST: Rationale explaining why this asset is required.")
+    name: str = Field(default="", description="Asset filename, e.g. 'hero_ship.png'")
+    asset_id: str = Field(default="", description="Identifier slug, e.g. 'sprite_resource_ore' or 'bark_start'")
+    asset_type: str = Field(default="sprite", description="'sprite' | 'tile' | 'portrait' | 'audio_bark' | 'sfx'")
+    target_path: str = Field(default="", description="Relative destination, e.g. 'assets/sprites/ore.png'")
+    description: str = Field(default="", description="Asset description or visual prompt")
+    visual_prompt_or_text: str = Field(default="", description="Prompt or spoken text used for generation.")
+    dimensions: Optional[Tuple[int, int]] = Field(default=(32, 32), description="Image dimensions (width, height) if visual asset.")
+    geometry_directive: Optional[str] = Field(default=None, description="Geometry directive for procedural rendering")
+    status: str = Field(default="pending", description="'pending' | 'generated' | 'failed'")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_asset_data(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            out = dict(data)
+            atype = out.get("asset_type") or "sprite"
+            out["asset_type"] = atype
+            # Sync name, asset_id, target_path
+            name = out.get("name")
+            aid = out.get("asset_id")
+            tpath = out.get("target_path")
+            if not name and tpath:
+                name = Path(tpath).name
+            if not name and aid:
+                ext = ".png" if atype in ("sprite", "tile", "portrait") else ".wav"
+                name = f"{aid}{ext}" if not aid.endswith((".png", ".wav")) else aid
+            if not aid and name:
+                aid = name.replace(".png", "").replace(".wav", "")
+            if not name and not aid:
+                aid = f"asset_{uuid.uuid4().hex[:6]}"
+                ext = ".png" if atype in ("sprite", "tile", "portrait") else ".wav"
+                name = f"{aid}{ext}"
+            if not tpath:
+                subfolder = "sprites" if atype in ("sprite", "tile", "portrait") else "audio"
+                tpath = f"assets/{subfolder}/{name}"
+            out["name"] = name
+            out["asset_id"] = aid
+            out["target_path"] = tpath
+
+            # Sync description and visual_prompt_or_text
+            desc = out.get("description")
+            vprompt = out.get("visual_prompt_or_text")
+            final_text = desc or vprompt or f"Asset {aid}"
+            out["description"] = final_text
+            out["visual_prompt_or_text"] = final_text
+            return out
+        return data
+
+
+class AssetManifestSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Specification of all dynamic multimodal assets required by the cartridge.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST: Epistemic rationale justifying required asset catalog.")
+    manifest_id: str = Field(default_factory=lambda: f"manifest_{uuid.uuid4().hex[:8]}", description="Unique manifest ID")
+    game_title: str = Field(default="", description="Associated game title")
+    assets: List[AssetRequirement] = Field(default_factory=list, description="List of required assets")
+    created_at_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class RequirementTrack(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Discrete, ordered implementation track decomposing game systems into verifiable steps.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST: Epistemic rationale detailing feature architecture and dependencies.")
+    id: str = Field(default="", description="Track identifier: 'R1', 'R2', ...")
+    track_id: str = Field(default="", description="Track identifier alias: 'R1', 'R2', ...")
+    title: str = Field(..., description="Concise feature track title.")
+    description: str = Field(..., description="Detailed architectural and behavioral requirements.")
+    responsible_agents: List[str] = Field(
+        default_factory=lambda: ["LeadGameplaySWEAgent"],
+        description="Specialist agents responsible for implementing this requirement."
+    )
+    target_modules: List[str] = Field(default_factory=lambda: ["mechanics.gd"], description="Target code/asset modules.")
+    acceptance_criteria: List[AcceptanceCriterion] = Field(default_factory=list, description="Explicit verifiable criteria.")
+    status: str = Field(default="pending", description="'pending' | 'in_progress' | 'completed' | 'satisfied' | 'rejected'")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_track_data(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            out = dict(data)
+            tid = out.get("id") or out.get("track_id") or f"R{uuid.uuid4().hex[:4]}"
+            out["id"] = tid
+            out["track_id"] = tid
+            if "responsible_agent" in out and "responsible_agents" not in out:
+                agent = out["responsible_agent"]
+                out["responsible_agents"] = [agent] if isinstance(agent, str) else agent
+            if "target_modules" in out and isinstance(out["target_modules"], list):
+                sanitized = []
+                for m in out["target_modules"]:
+                    if isinstance(m, str):
+                        s = m.replace(".py", ".gd")
+                        sanitized.append(s)
+                    else:
+                        sanitized.append(m)
+                out["target_modules"] = sanitized
+            return out
+        return data
+
+
+class GameRequirementsSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Agent-authored comprehensive game requirements and verifiable backlog derived from player DNA.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST: Deep deliberation on player Steam DNA / telemetry hypotheses translating into core game requirements."
+    )
+    spec_id: str = Field(default_factory=lambda: f"req_{uuid.uuid4().hex[:8]}", description="Requirements specification ID")
+    game_title: str = Field(..., description="Game title conceived by agents")
+    genre_paradigm: str = Field(default="action_roguelike", description="Genre classification or blend")
+    target_audience_summary: str = Field(default="", description="Summary of target player DNA alignment")
+    high_concept_summary: Optional[str] = Field(default=None, description="High-concept summary of game mechanics and loops")
+    target_episode: int = Field(default=0, description="Target episode number (0 = Genesis)")
+    requirements: List[RequirementTrack] = Field(default_factory=list, description="Ordered implementation tracks R1, R2, ...")
+    asset_manifest: List[AssetRequirement] = Field(default_factory=list, description="Dynamic multimodal asset requirements")
+    created_at_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_spec_data(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            out = dict(data)
+            if "genre_verdict" in out and "genre_paradigm" not in out:
+                out["genre_paradigm"] = out["genre_verdict"]
+            elif "genre_paradigm" in out and "genre_verdict" not in out:
+                out["genre_verdict"] = out["genre_paradigm"]
+            return out
+        return data
+
+    @property
+    def genre_verdict(self) -> str:
+        return self.genre_paradigm
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class ModuleFileSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Represents an individual synthesized file in the cartridge directory.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Epistemic rationale explaining the file's architectural role, node hierarchy, and API contracts."
+    )
+    filename: str = Field(
+        ...,
+        description="Relative file path within cartridge (e.g. 'main.gd', 'mechanics.gd', 'entities.gd', 'scenes.gd', 'ui_hud.gd', 'project.godot', 'main.tscn')."
+    )
+    content: str = Field(
+        ...,
+        description="Complete, syntactically valid source code or configuration for this module."
+    )
+
+
+class TrackCodeSynthesisPayload(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Payload returned by LeadGameplaySWEAgent for full synthesis or requirement track implementation.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Epistemic rationale explaining the architectural decisions, Godot 4 node composition, and track requirement fulfillment."
+    )
+    files: List[ModuleFileSpec] = Field(
+        default_factory=list,
+        description="Collection of cartridge files to create or update."
+    )
+    manifest_data: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="manifest.json content with metadata, genre, version, entrypoint."
+    )
+
+    def assemble_cartridge_directory(
+        self,
+        target_dir: Path,
+        swe_agent: Optional[Any] = None,
+    ) -> Dict[str, Path]:
+        """Assembles, verifies, and writes modular cartridge files to target_dir.
+        Returns dictionary mapping filename -> Path.
+        """
+        target_dir.mkdir(parents=True, exist_ok=True)
+        results: Dict[str, Path] = {}
+
+        # 1. Ensure minimal main.tscn exists
+        main_tscn = target_dir / "main.tscn"
+        if not main_tscn.is_file():
+            main_tscn.write_text(
+                '[gd_scene load_steps=2 format=3]\n\n'
+                '[ext_resource type="Script" path="res://main.gd" id="1_main"]\n\n'
+                '[node name="Main" type="Node2D"]\n'
+                'script = ExtResource("1_main")\n',
+                encoding="utf-8"
+            )
+            results["main.tscn"] = main_tscn
+
+        # 2. Ensure project.godot exists
+        project_godot = target_dir / "project.godot"
+        if not project_godot.is_file():
+            project_godot.write_text(
+                'config_version=5\n\n'
+                '[application]\n'
+                'config/name="Game Cartridge"\n'
+                'run/main_scene="res://main.tscn"\n'
+                'config/features=PackedStringArray("4.3", "Forward Plus")\n\n'
+                '[display]\n'
+                'window/size/viewport_width=1280\n'
+                'window/size/viewport_height=720\n'
+                'window/stretch/mode="canvas_items"\n'
+                'window/stretch/aspect="keep"\n\n'
+                '[rendering]\n'
+                'textures/canvas_textures/default_texture_filter=0\n',
+                encoding="utf-8"
+            )
+            results["project.godot"] = project_godot
+
+        # 3. Write synthesized module files
+        for fspec in self.files:
+            file_path = target_dir / fspec.filename
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(fspec.content, encoding="utf-8")
+            results[fspec.filename] = file_path
+
+        # 4. Write manifest.json
+        if self.manifest_data:
+            manifest_path = target_dir / "manifest.json"
+            manifest_path.write_text(json.dumps(self.manifest_data, indent=2), encoding="utf-8")
+            results["manifest.json"] = manifest_path
+
+        return results
+
+
+class CodeRepairSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Targeted self-healing repair payload for a broken GDScript or project file.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Epistemic rationale diagnosing the error and detailing the self-healing modifications."
+    )
+    filename: str = Field(
+        ...,
+        description="Name of the file being repaired (e.g. 'main.gd', 'mechanics.gd')."
+    )
+    repaired_content: str = Field(
+        ...,
+        description="Complete, syntactically valid repaired source code."
+    )
+
+
 def __getattr__(name: str) -> Any:
     if name == "OpenGenreCartridgeBundle":
         from engine.studio.swe import OpenGenreCartridgeBundle
         return OpenGenreCartridgeBundle
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+

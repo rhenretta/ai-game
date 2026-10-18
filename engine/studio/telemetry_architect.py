@@ -10,6 +10,7 @@ import ast
 import json
 import logging
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 import uuid
 
@@ -45,10 +46,11 @@ class TelemetryArchitectAgent:
         db_path: Union[str, Path] = DB_PATH,
         gemini_client: Optional[Any] = None,
         model_name: str = "gemini-3.8-flash",
+        client: Optional[Any] = None,
     ):
         self.db_path = Path(db_path)
         self.db = TelemetryDB(db_path)
-        self.gemini_client = gemini_client
+        self.gemini_client = gemini_client or client
         self.model_name = model_name
 
     def inspect_code_and_plan(
@@ -121,6 +123,17 @@ class TelemetryArchitectAgent:
             probes_by_mod.setdefault(p.target_module, []).append(p)
 
         for mod_name, source in code_modules.items():
+            if mod_name.endswith(".gd"):
+                mod_probes = probes_by_mod.get(mod_name, [])
+                if not mod_probes and plan.probes:
+                    mod_probes = [plan.probes[0]]
+                if not mod_probes:
+                    instrumented[mod_name] = source
+                    continue
+                modified_source = self._inject_gdscript_probes(source, mod_probes)
+                instrumented[mod_name] = modified_source
+                continue
+
             mod_probes = probes_by_mod.get(mod_name, [])
             if not mod_probes and plan.probes and "def update(" in source:
                 mod_probes = [plan.probes[0]]
@@ -150,9 +163,117 @@ class TelemetryArchitectAgent:
     # Internal AST Target Analysis & Injection
     # -----------------------------------------------------------------------
 
+    def _extract_gdscript_targets(self, mod_name: str, src: str) -> List[Dict[str, Any]]:
+        targets: List[Dict[str, Any]] = []
+        cls_name = Path(mod_name).stem
+        for line in src.splitlines():
+            line_str = line.strip()
+            if line_str.startswith("func "):
+                m = re.match(r"func\s+([a-zA-Z0-9_]+)\s*\((.*?)\)", line_str)
+                if m:
+                    fn_name = m.group(1)
+                    if not fn_name.startswith("__"):
+                        raw_args = m.group(2)
+                        args = [a.split(":")[0].strip() for a in raw_args.split(",") if a.strip()]
+                        targets.append({
+                            "module": mod_name,
+                            "class": cls_name,
+                            "method": fn_name,
+                            "args": args,
+                        })
+        return targets
+
+    def _get_func_body_indent(self, lines: List[str], func_idx: int, uses_tabs: bool) -> str:
+        func_line = lines[func_idx]
+        func_lead = func_line[:len(func_line) - len(func_line.lstrip())]
+        default_indent = func_lead + ("\t" if uses_tabs else "    ")
+        for j in range(func_idx + 1, min(len(lines), func_idx + 15)):
+            cand = lines[j]
+            stripped = cand.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            lead = cand[:len(cand) - len(cand.lstrip())]
+            if len(lead) > len(func_lead):
+                return lead
+            break
+        return default_indent
+
+    def _inject_gdscript_probes(
+        self,
+        source: str,
+        probes: List[TelemetryProbeDesignSpec],
+    ) -> str:
+        lines = source.splitlines()
+        uses_tabs = sum(1 for line in lines if line.startswith("\t")) >= sum(1 for line in lines if line.startswith("  "))
+        injected_any = False
+        injected_process = False
+
+        for probe in probes:
+            target_fn = probe.target_method
+            target_idx = -1
+            indent_str = "\t" if uses_tabs else "    "
+            for idx, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped.startswith(f"func {target_fn}(") or (
+                    target_fn in ("update", "_process", "_physics_process") and (stripped.startswith("func _process(") or stripped.startswith("func _physics_process("))
+                ):
+                    target_idx = idx + 1
+                    indent_str = self._get_func_body_indent(lines, idx, uses_tabs)
+                    if stripped.startswith("func _process(") or stripped.startswith("func _physics_process("):
+                        injected_process = True
+                    break
+            if target_idx != -1 and target_idx <= len(lines):
+                probe_stmt = (
+                    f'{indent_str}print("[TELEMETRY_EVENT] " + JSON.stringify({{'
+                    f'"probe_name": "{probe.probe_name}", "category": "{probe.category}", '
+                    f'"payload": get_state_snapshot() if has_method("get_state_snapshot") else {{"probe_name": "{probe.probe_name}", "frame": Engine.get_process_frames()}}'
+                    f'}}))'
+                )
+                if f'"probe_name": "{probe.probe_name}"' not in "\n".join(lines):
+                    lines.insert(target_idx, probe_stmt)
+                    injected_any = True
+
+        # Ensure active emission during simulation: if the module has _process or _physics_process
+        # but no probe was hooked directly to it, hook probes[0] so ticks actively emit telemetry
+        if not injected_process and probes:
+            for idx, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped.startswith("func _process(") or stripped.startswith("func _physics_process("):
+                    target_idx = idx + 1
+                    indent_str = self._get_func_body_indent(lines, idx, uses_tabs)
+                    probe_stmt = (
+                        f'{indent_str}print("[TELEMETRY_EVENT] " + JSON.stringify({{'
+                        f'"probe_name": "{probes[0].probe_name}", "category": "{probes[0].category}", '
+                        f'"payload": get_state_snapshot() if has_method("get_state_snapshot") else {{"probe_name": "{probes[0].probe_name}", "frame": Engine.get_process_frames()}}'
+                        f'}}))'
+                    )
+                    if not any(f'"probe_name": "{probes[0].probe_name}"' in l for l in lines[target_idx:min(len(lines), target_idx + 5)]):
+                        lines.insert(target_idx, probe_stmt)
+                        injected_any = True
+                        injected_process = True
+                    break
+
+        if not injected_any and probes:
+            for idx, line in enumerate(lines):
+                if line.strip().startswith("func "):
+                    indent_str = self._get_func_body_indent(lines, idx, uses_tabs)
+                    probe_stmt = (
+                        f'{indent_str}print("[TELEMETRY_EVENT] " + JSON.stringify({{'
+                        f'"probe_name": "{probes[0].probe_name}", "category": "{probes[0].category}", '
+                        f'"payload": get_state_snapshot() if has_method("get_state_snapshot") else {{"probe_name": "{probes[0].probe_name}", "frame": Engine.get_process_frames()}}'
+                        f'}}))'
+                    )
+                    if probe_stmt.strip() not in [l.strip() for l in lines]:
+                        lines.insert(idx + 1, probe_stmt)
+                    break
+        return "\n".join(lines)
+
     def _extract_ast_targets(self, modules: Dict[str, str]) -> List[Dict[str, Any]]:
         targets: List[Dict[str, Any]] = []
         for mod_name, src in modules.items():
+            if mod_name.endswith(".gd"):
+                targets.extend(self._extract_gdscript_targets(mod_name, src))
+                continue
             try:
                 tree = ast.parse(src)
             except SyntaxError:

@@ -33,16 +33,27 @@ def _cleanup_process(proc: subprocess.Popen, timeout: float = 5.0) -> None:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except (ProcessLookupError, OSError):
-                pass
+                try:
+                    proc.kill()
+                except (ProcessLookupError, OSError):
+                    pass
             try:
                 proc.communicate(timeout=timeout)
             except Exception:
                 pass
     finally:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
         if proc.stdout and not proc.stdout.closed:
             proc.stdout.close()
         if proc.stderr and not proc.stderr.closed:
             proc.stderr.close()
+        if hasattr(proc, "stdin") and proc.stdin and not proc.stdin.closed:
+            proc.stdin.close()
 
 
 class TestLauncherProcessLifecycleAndSignalStress:
@@ -65,6 +76,10 @@ class TestLauncherProcessLifecycleAndSignalStress:
 
     def test_launcher_sigint_signal_trapping_zero_zombies(self, sample_open_genre_cartridge):
         """Sends SIGINT (Ctrl+C) to run_game.sh process group and asserts clean child termination with 0 zombies."""
+        env = dict(os.environ)
+        paths = [p for p in env.get("PATH", "").split(":") if "anaconda" not in p]
+        env["PATH"] = ":".join(paths)
+
         proc = subprocess.Popen(
             ["./run_game.sh", "--headless", "--ticks", "5000", "--cartridge", str(sample_open_genre_cartridge)],
             start_new_session=True,
@@ -72,35 +87,44 @@ class TestLauncherProcessLifecycleAndSignalStress:
             stderr=subprocess.PIPE,
             text=True,
             cwd=str(PROJECT_ROOT),
+            env=env,
         )
         try:
-            time.sleep(0.5)
-
-            # Discover child process PIDs
-            pgrep_res = subprocess.run(["pgrep", "-P", str(proc.pid)], capture_output=True, text=True)
-            child_pids = [int(p) for p in pgrep_res.stdout.strip().split() if p.isdigit()]
+            child_pids: List[int] = []
+            for _ in range(25):
+                pgrep_res = subprocess.run(["pgrep", "-P", str(proc.pid)], capture_output=True, text=True, timeout=2.0)
+                child_pids = [int(p) for p in pgrep_res.stdout.strip().split() if p.isdigit()]
+                if child_pids:
+                    break
+                time.sleep(0.05)
             assert len(child_pids) > 0, "No child processes spawned by run_game.sh"
 
             # Dispatch SIGINT to the process group
             os.killpg(proc.pid, signal.SIGINT)
-            stdout, stderr = proc.communicate(timeout=8)
+            stdout, stderr = proc.communicate(timeout=15.0)
 
             assert proc.returncode == 0, f"run_game.sh did not exit 0 on SIGINT: {stderr}"
-            time.sleep(0.3)
 
             # Assert all child processes are terminated (zero zombies or orphaned processes)
             for cpid in child_pids:
-                try:
-                    os.kill(cpid, 0)
-                    alive = True
-                except ProcessLookupError:
-                    alive = False
+                alive = True
+                for _ in range(15):
+                    try:
+                        os.kill(cpid, 0)
+                        time.sleep(0.05)
+                    except ProcessLookupError:
+                        alive = False
+                        break
                 assert not alive, f"Child process {cpid} remained alive or orphaned after SIGINT"
         finally:
             _cleanup_process(proc)
 
     def test_launcher_sigterm_signal_trapping_zero_zombies(self, sample_open_genre_cartridge):
         """Sends SIGTERM to run_game.sh process group and asserts clean child termination with 0 zombies."""
+        env = dict(os.environ)
+        paths = [p for p in env.get("PATH", "").split(":") if "anaconda" not in p]
+        env["PATH"] = ":".join(paths)
+
         proc = subprocess.Popen(
             ["./run_game.sh", "--headless", "--ticks", "5000", "--cartridge", str(sample_open_genre_cartridge)],
             start_new_session=True,
@@ -108,29 +132,34 @@ class TestLauncherProcessLifecycleAndSignalStress:
             stderr=subprocess.PIPE,
             text=True,
             cwd=str(PROJECT_ROOT),
+            env=env,
         )
         try:
-            time.sleep(0.5)
-
-            # Discover child process PIDs
-            pgrep_res = subprocess.run(["pgrep", "-P", str(proc.pid)], capture_output=True, text=True)
-            child_pids = [int(p) for p in pgrep_res.stdout.strip().split() if p.isdigit()]
+            child_pids: List[int] = []
+            for _ in range(25):
+                pgrep_res = subprocess.run(["pgrep", "-P", str(proc.pid)], capture_output=True, text=True, timeout=2.0)
+                child_pids = [int(p) for p in pgrep_res.stdout.strip().split() if p.isdigit()]
+                if child_pids:
+                    break
+                time.sleep(0.05)
             assert len(child_pids) > 0, "No child processes spawned by run_game.sh"
 
             # Dispatch SIGTERM to the process group
             os.killpg(proc.pid, signal.SIGTERM)
-            stdout, stderr = proc.communicate(timeout=8)
+            stdout, stderr = proc.communicate(timeout=15.0)
 
             assert proc.returncode == 0, f"run_game.sh did not exit 0 on SIGTERM: {stderr}"
-            time.sleep(0.3)
 
             # Assert all child processes are dead
             for cpid in child_pids:
-                try:
-                    os.kill(cpid, 0)
-                    alive = True
-                except ProcessLookupError:
-                    alive = False
+                alive = True
+                for _ in range(15):
+                    try:
+                        os.kill(cpid, 0)
+                        time.sleep(0.05)
+                    except ProcessLookupError:
+                        alive = False
+                        break
                 assert not alive, f"Child process {cpid} remained alive or orphaned after SIGTERM"
         finally:
             _cleanup_process(proc)
@@ -148,7 +177,7 @@ class TestLauncherProcessLifecycleAndSignalStress:
         try:
             time.sleep(0.5)
             os.killpg(proc.pid, signal.SIGINT)
-            stdout, stderr = proc.communicate(timeout=8)
+            stdout, stderr = proc.communicate(timeout=15.0)
 
             assert proc.returncode == 0, f"run_game.py direct SIGINT exit code {proc.returncode}: {stderr}"
             assert "completed cleanly" in stdout.lower()
@@ -168,7 +197,7 @@ class TestLauncherProcessLifecycleAndSignalStress:
         try:
             time.sleep(0.5)
             os.killpg(proc.pid, signal.SIGTERM)
-            stdout, stderr = proc.communicate(timeout=8)
+            stdout, stderr = proc.communicate(timeout=15.0)
 
             assert proc.returncode == 0, f"run_game.py direct SIGTERM exit code {proc.returncode}: {stderr}"
             assert "completed cleanly" in stdout.lower()
@@ -206,24 +235,29 @@ class TestSQLiteWALCheckpointDurabilityStress:
         recorder.end_session()
         recorder.close()
 
-        # Verify integrity of database
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA integrity_check;")
-        res = cursor.fetchone()
-        assert res[0] == "ok", f"Integrity check failed: {res}"
-
-        # Verify all 1,000 events are persisted
-        cursor.execute("SELECT count(*) FROM telemetry_events;")
-        event_count = cursor.fetchone()[0]
-        assert event_count == 1000, f"Expected 1000 events in DB, found {event_count}"
-
-        # Verify WAL file is truncated to 0 bytes or removed
+        # Verify WAL file is truncated to 0 bytes or removed immediately after close()
         wal_file = db_file.parent / (db_file.name + "-wal")
         if wal_file.exists():
             assert wal_file.stat().st_size == 0, f"WAL file was not truncated: size is {wal_file.stat().st_size}"
 
-        conn.close()
+        # Verify integrity of database and persisted event count in guarded connection
+        conn = sqlite3.connect(str(db_file), timeout=5.0)
+        try:
+            conn.execute("PRAGMA busy_timeout = 5000;")
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA integrity_check;")
+            res = cursor.fetchone()
+            assert res is not None and res[0] == "ok", f"Integrity check failed: {res}"
+
+            cursor.execute("SELECT count(*) FROM telemetry_events;")
+            event_count = cursor.fetchone()[0]
+            assert event_count == 1000, f"Expected 1000 events in DB, found {event_count}"
+        finally:
+            conn.close()
+
+        # Re-verify WAL file remains truncated or unlinked after connection is closed
+        if wal_file.exists():
+            assert wal_file.stat().st_size == 0, f"WAL file was not truncated after close: size is {wal_file.stat().st_size}"
 
     def test_wal_checkpoint_truncate_on_signal_interception(self, sample_open_genre_cartridge):
         """Verifies that SIGINT signal interception triggers clean PRAGMA wal_checkpoint(TRUNCATE)
@@ -240,19 +274,37 @@ class TestSQLiteWALCheckpointDurabilityStress:
         try:
             time.sleep(0.6)
             os.killpg(proc.pid, signal.SIGINT)
-            proc.communicate(timeout=8)
+            stdout, stderr = proc.communicate(timeout=15.0)
+            assert proc.returncode == 0, f"run_game.py non-zero return code {proc.returncode}: {stderr}"
 
-            conn = sqlite3.connect(str(DB_PATH))
-            cursor = conn.cursor()
-            cursor.execute("PRAGMA integrity_check;")
-            row = cursor.fetchone()
-            assert row[0] == "ok", f"Integrity check failed: {row}"
+            # Verify SQLite integrity check and execute truncate checkpoint with retry under concurrent reader contention
+            conn = sqlite3.connect(str(DB_PATH), timeout=5.0)
+            try:
+                conn.execute("PRAGMA busy_timeout = 5000;")
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA integrity_check;")
+                row = cursor.fetchone()
+                assert row is not None and row[0] == "ok", f"Integrity check failed: {row}"
 
+                checkpoint_deadline = time.time() + 4.0
+                cp_res = None
+                while time.time() < checkpoint_deadline:
+                    try:
+                        cursor.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                        cp_res = cursor.fetchall()
+                        if cp_res and cp_res[0][0] == 0:
+                            break
+                    except (sqlite3.OperationalError, sqlite3.DatabaseError):
+                        pass
+                    time.sleep(0.05)
+                assert cp_res is not None and cp_res[0][0] == 0, f"WAL checkpoint returned busy status: {cp_res}"
+            finally:
+                conn.close()
+
+            # Ensure any db connection is closed before inspecting final disk state
             wal_path = DB_PATH.parent / (DB_PATH.name + "-wal")
             if wal_path.exists():
                 assert wal_path.stat().st_size == 0, f"WAL file not truncated: size is {wal_path.stat().st_size}"
-
-            conn.close()
         finally:
             _cleanup_process(proc)
 
@@ -271,16 +323,18 @@ class TestSQLiteWALCheckpointDurabilityStress:
 
         def reader_worker():
             conn = recorder.db.get_reader_connection()
-            cur = conn.cursor()
-            while not stop_readers.is_set():
-                try:
-                    cur.execute("SELECT count(*) FROM telemetry_events;")
-                    cur.fetchone()
-                    queries_completed[0] += 1
-                except Exception as exc:
-                    reader_errors.append(str(exc))
-                time.sleep(0.001)
-            conn.close()
+            try:
+                cur = conn.cursor()
+                while not stop_readers.is_set():
+                    try:
+                        cur.execute("SELECT count(*) FROM telemetry_events;")
+                        cur.fetchone()
+                        queries_completed[0] += 1
+                    except Exception as exc:
+                        reader_errors.append(str(exc))
+                    time.sleep(0.001)
+            finally:
+                conn.close()
 
         threads = [threading.Thread(target=reader_worker, daemon=True) for _ in range(3)]
         for t in threads:

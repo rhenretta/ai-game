@@ -30,6 +30,11 @@
       --state-synthesizing: #29ADFF;
       --state-verifying: #FF77A8;
       --state-promoted: #00E436;
+
+      /* Drawer and Overlay Constants */
+      --drawer-width: 680px;
+      --z-overlay: 1100;
+      --z-drawer: 1200;
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -666,12 +671,625 @@
       font-size: 10px;
       color: var(--cyan);
     }
+
+    /* =========================================================================
+       Task & Handoff History Drawer & Backlog Board Styles (Requirement R5)
+       ========================================================================= */
+    .drawer-backdrop {
+      display: none;
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      background: rgba(0, 0, 0, 0.65);
+      z-index: var(--z-overlay);
+      backdrop-filter: blur(2px);
+    }
+    .drawer-backdrop.active {
+      display: block;
+    }
+
+    .task-history-drawer {
+      position: fixed;
+      top: 0;
+      right: 0;
+      width: min(var(--drawer-width), 95vw);
+      height: 100vh;
+      background: #080f24;
+      border-left: 2px solid var(--border);
+      box-shadow: -12px 0 32px rgba(0, 0, 0, 0.85);
+      z-index: var(--z-drawer);
+      display: flex;
+      flex-direction: column;
+      transform: translateX(100%);
+      transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+      box-sizing: border-box;
+    }
+    .task-history-drawer.open {
+      transform: translateX(0);
+    }
+
+    .drawer-header {
+      padding: 14px 18px;
+      background: var(--navy);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-shrink: 0;
+    }
+    .drawer-title-group {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .drawer-title {
+      font-size: 14px;
+      font-weight: bold;
+      color: var(--cyan);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .drawer-metrics {
+      font-size: 11px;
+      color: var(--light-gray);
+    }
+    .drawer-close-btn {
+      background: transparent;
+      border: 1px solid var(--slate);
+      color: var(--light-gray);
+      font-size: 16px;
+      width: 30px;
+      height: 30px;
+      border-radius: 4px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s;
+    }
+    .drawer-close-btn:hover {
+      border-color: var(--neon-red);
+      color: var(--neon-red);
+    }
+
+    .agent-inspector-strip {
+      padding: 8px 16px;
+      background: #0b142b;
+      border-bottom: 1px solid rgba(41, 173, 255, 0.2);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+    .inspector-badge {
+      font-size: 9px;
+      font-weight: bold;
+      padding: 2px 6px;
+      background: rgba(255, 236, 39, 0.2);
+      border: 1px solid var(--yellow);
+      color: var(--yellow);
+      border-radius: 3px;
+      letter-spacing: 0.5px;
+    }
+    .inspector-content {
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+    }
+
+    .drawer-tabs {
+      display: flex;
+      background: #0d1630;
+      border-bottom: 1px solid rgba(41, 173, 255, 0.3);
+      flex-shrink: 0;
+    }
+    .drawer-tab {
+      flex: 1;
+      padding: 10px 14px;
+      background: transparent;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: var(--light-gray);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      text-align: center;
+      transition: all 0.2s;
+    }
+    .drawer-tab.active {
+      color: var(--cyan);
+      border-bottom-color: var(--cyan);
+      background: rgba(41, 173, 255, 0.08);
+    }
+
+    .drawer-filter-bar {
+      padding: 10px 14px;
+      background: #0b142b;
+      border-bottom: 1px solid rgba(41, 173, 255, 0.2);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      flex-shrink: 0;
+    }
+    .filter-input {
+      background: #050b1a;
+      border: 1px solid var(--slate);
+      color: var(--white);
+      padding: 6px 10px;
+      font-size: 11px;
+      border-radius: 4px;
+      outline: none;
+      flex: 1;
+      min-width: 140px;
+    }
+    .filter-input:focus {
+      border-color: var(--cyan);
+    }
+    .filter-select {
+      background: #050b1a;
+      border: 1px solid var(--slate);
+      color: var(--white);
+      padding: 6px 8px;
+      font-size: 11px;
+      border-radius: 4px;
+      outline: none;
+      cursor: pointer;
+    }
+    .filter-select:focus {
+      border-color: var(--cyan);
+    }
+    .btn-reset {
+      background: rgba(95, 87, 79, 0.3);
+      border: 1px solid var(--slate);
+      color: var(--light-gray);
+      padding: 5px 10px;
+      font-size: 11px;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-reset:hover {
+      border-color: var(--amber);
+      color: var(--amber);
+    }
+
+    .drawer-content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .drawer-view {
+      display: none;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .drawer-view.active {
+      display: flex;
+    }
+
+    /* Task Cards */
+    .task-cards-container {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .task-card {
+      background: #0b142b;
+      border: 1px solid rgba(41, 173, 255, 0.25);
+      border-radius: 6px;
+      overflow: hidden;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    .task-card:hover {
+      border-color: var(--cyan);
+    }
+    .task-card.rejected {
+      border-color: var(--neon-red);
+      box-shadow: 0 0 10px rgba(255, 0, 77, 0.25);
+    }
+    .task-card-header {
+      padding: 10px 14px;
+      background: #0f1c3d;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      cursor: pointer;
+      user-select: none;
+      gap: 8px;
+    }
+    .task-card-title-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 1;
+      min-width: 0;
+    }
+    .task-badge-role {
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 3px;
+      background: rgba(41, 173, 255, 0.2);
+      color: var(--cyan);
+      font-weight: bold;
+      white-space: nowrap;
+    }
+    .task-badge-req {
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 3px;
+      background: rgba(255, 236, 39, 0.2);
+      color: var(--yellow);
+      font-weight: bold;
+      white-space: nowrap;
+    }
+    .task-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--white);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .task-meta-right {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    .task-status-pill {
+      font-size: 10px;
+      font-weight: bold;
+      padding: 2px 8px;
+      border-radius: 3px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .task-status-completed {
+      background: rgba(0, 228, 54, 0.2);
+      border: 1px solid var(--green);
+      color: var(--green);
+    }
+    .task-status-rejected {
+      background: rgba(255, 0, 77, 0.2);
+      border: 1px solid var(--neon-red);
+      color: var(--neon-red);
+      animation: blinkText 1.5s infinite;
+    }
+    .task-status-in_progress, .task-status-synthesizing {
+      background: rgba(255, 163, 0, 0.2);
+      border: 1px solid var(--amber);
+      color: var(--amber);
+    }
+    .task-status-verifying {
+      background: rgba(255, 119, 168, 0.2);
+      border: 1px solid var(--pink);
+      color: var(--pink);
+    }
+    .task-duration {
+      font-size: 10px;
+      color: var(--light-gray);
+      white-space: nowrap;
+    }
+    .task-chevron {
+      font-size: 10px;
+      color: var(--light-gray);
+      transition: transform 0.2s;
+    }
+    .task-card.expanded .task-chevron {
+      transform: rotate(180deg);
+    }
+    .task-card-body {
+      display: none;
+      padding: 14px;
+      flex-direction: column;
+      gap: 12px;
+      border-top: 1px solid rgba(41, 173, 255, 0.15);
+      background: #080f24;
+    }
+    .task-card.expanded .task-card-body {
+      display: flex;
+    }
+
+    /* Section 1: EPISTEMIC REASONING (Strictly Index 0) */
+    .deliberation-block {
+      background: rgba(13, 22, 48, 0.95);
+      border-left: 3px solid var(--amber);
+      padding: 10px 12px;
+      border-radius: 0 4px 4px 0;
+      font-family: inherit;
+      font-size: 12px;
+      line-height: 1.5;
+      color: var(--white);
+    }
+    .deliberation-block-label {
+      font-size: 10px;
+      font-weight: bold;
+      color: var(--amber);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 4px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    /* Section 2: CRYPTOGRAPHIC HANDOFF ENVELOPE */
+    .envelope-box {
+      background: #0d1630;
+      border: 1px solid rgba(41, 173, 255, 0.25);
+      border-radius: 4px;
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 11px;
+    }
+    .envelope-box-header {
+      font-weight: bold;
+      color: var(--cyan);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .crypto-badge {
+      font-family: monospace;
+      font-size: 10px;
+      padding: 2px 6px;
+      background: rgba(0, 228, 54, 0.15);
+      border: 1px solid var(--green);
+      color: var(--green);
+      border-radius: 3px;
+    }
+    .hash-line {
+      font-family: monospace;
+      font-size: 10px;
+      color: var(--light-gray);
+      word-break: break-all;
+    }
+    .file-chip-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 4px;
+    }
+    .file-chip {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--slate);
+      padding: 2px 8px;
+      border-radius: 3px;
+      font-family: monospace;
+      font-size: 10px;
+      color: var(--white);
+    }
+
+    /* Section 3: DIAGNOSTIC TRACE (Rule 5 Zero Silent Fallbacks) */
+    .diagnostic-trace-box {
+      background: rgba(126, 37, 83, 0.25);
+      border: 1px solid var(--neon-red);
+      border-radius: 4px;
+      padding: 10px;
+      color: var(--white);
+      font-size: 11px;
+    }
+    .diagnostic-trace-box pre {
+      font-family: monospace;
+      font-size: 10px;
+      background: #000;
+      padding: 8px;
+      border-radius: 3px;
+      overflow-x: auto;
+      max-height: 160px;
+      color: var(--peach);
+      margin-top: 6px;
+    }
+
+    /* Handoff Viewer Summary Strip */
+    .handoff-viewer-summary {
+      background: #0d1630;
+      border: 1px solid rgba(41, 173, 255, 0.25);
+      border-radius: 6px;
+      padding: 10px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 11px;
+    }
+    .handoff-viewer-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .handoff-viewer-body {
+      color: var(--light-gray);
+      line-height: 1.4;
+    }
+
+    /* Backlog Board Layout */
+    .requirements-backlog-container {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .backlog-overview-card {
+      background: #0d1630;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .backlog-progress-bar-container {
+      width: 100%;
+      height: 8px;
+      background: #050b1a;
+      border-radius: 4px;
+      overflow: hidden;
+      margin-top: 4px;
+    }
+    .backlog-progress-bar-fill {
+      height: 100%;
+      background: var(--green);
+      transition: width 0.4s ease;
+    }
+    .requirement-track-card {
+      background: #0b142b;
+      border: 1px solid rgba(41, 173, 255, 0.25);
+      border-radius: 6px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .track-criteria-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-top: 6px;
+    }
+    .criterion-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 6px 10px;
+      background: rgba(0, 0, 0, 0.2);
+      border-radius: 4px;
+      font-size: 11px;
+    }
+    .criterion-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .criterion-badge {
+      font-size: 9px;
+      padding: 1px 5px;
+      border-radius: 3px;
+      background: rgba(131, 118, 156, 0.3);
+      color: var(--purple);
+    }
+    .btn-inspect-track-tasks {
+      align-self: flex-start;
+      margin-top: 6px;
+      background: transparent;
+      border: 1px solid var(--cyan);
+      color: var(--cyan);
+      font-size: 11px;
+      padding: 4px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-inspect-track-tasks:hover {
+      background: rgba(41, 173, 255, 0.15);
+    }
+
+    .activity-beacon {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 6px var(--green);
+      animation: pulseBeacon 2s infinite;
+    }
+    @keyframes pulseBeacon {
+      0% { opacity: 0.4; transform: scale(0.9); }
+      50% { opacity: 1; transform: scale(1.2); }
+      100% { opacity: 0.4; transform: scale(0.9); }
+    }
+
+    /* Selected DAG Node Halo */
+    .dag-node.selected .node-box {
+      stroke: var(--yellow) !important;
+      stroke-width: 3px !important;
+      filter: drop-shadow(0 0 8px rgba(255, 236, 39, 0.7));
+    }
+
+    /* Feature 20: Verified Checkpoints Styling */
+    .checkpoint-card {
+      background: var(--panel-elevated);
+      border: 1px solid var(--border-subtle);
+      border-radius: 6px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      transition: all 0.2s ease;
+    }
+    .checkpoint-card.active {
+      border: 1px solid var(--green);
+      box-shadow: 0 0 10px rgba(0, 228, 54, 0.2);
+    }
+    .checkpoint-badge-active {
+      font-size: 9px;
+      padding: 2px 6px;
+      border-radius: 3px;
+      background: rgba(0, 228, 54, 0.2);
+      color: var(--green);
+      border: 1px solid var(--green);
+      font-weight: bold;
+      text-transform: uppercase;
+    }
+    .btn-activate-checkpoint {
+      background: rgba(0, 228, 54, 0.15);
+      border: 1px solid var(--green);
+      color: var(--green);
+      font-size: 11px;
+      padding: 5px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: bold;
+      transition: all 0.2s;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .btn-activate-checkpoint:hover {
+      background: rgba(0, 228, 54, 0.3);
+    }
+    .btn-activate-checkpoint:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .header-checkpoint-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(0, 228, 54, 0.15);
+      border: 1px solid var(--green);
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-size: 11px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .header-checkpoint-badge:hover {
+      background: rgba(0, 228, 54, 0.25);
+    }
   </style>
 </head>
 <body>
   <header>
     <h1>Autonomous Game Studio — Mission Control</h1>
     <div class="header-controls">
+      <div id="last-checkpoint-badge" class="header-checkpoint-badge" style="display: none;" title="Click to view verified checkpoints in drawer">
+        <span style="color: var(--green); font-weight: bold;">🎮 Checkpoint:</span>
+        <span id="header-checkpoint-id" style="color: var(--white); font-weight: bold;">None</span>
+        <span id="header-checkpoint-track" style="color: var(--light-gray); font-size: 10px;"></span>
+      </div>
+      <button id="btn-toggle-task-history" class="btn-primary" style="background: rgba(41, 173, 255, 0.15); border: 1px solid var(--cyan); color: var(--cyan); display: flex; align-items: center; gap: 8px;">
+        <span class="activity-beacon"></span>
+        <span>Tasks & Handoffs</span>
+        <span id="header-task-count" style="background: var(--navy); padding: 1px 6px; border-radius: 10px; font-size: 10px;">0</span>
+      </button>
       <span id="studio-status-badge" class="badge-status">ONLINE</span>
       <button id="btn-trigger-genesis" class="btn-primary">Genesis Build</button>
     </div>
@@ -931,9 +1549,11 @@
         <div class="panel-title">
           <span>Agent Code Diff Viewer</span>
           <select id="diff-module-selector" class="stream-select" style="font-size: 10px;">
+            <option value="main.gd">main.gd</option>
+            <option value="mechanics.gd">mechanics.gd</option>
+            <option value="main.tscn">main.tscn</option>
+            <option value="project.godot">project.godot</option>
             <option value="mechanics.py">mechanics.py</option>
-            <option value="entities.py">entities.py</option>
-            <option value="abilities.py">abilities.py</option>
             <option value="manifest.json">manifest.json</option>
           </select>
         </div>
@@ -943,6 +1563,123 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       </div>
     </div>
   </div>
+
+  <!-- Dedicated Task & Handoff History Drawer & Backdrop (Requirement R5) -->
+  <div id="drawer-backdrop" class="drawer-backdrop"></div>
+  <aside id="task-history-drawer" class="task-history-drawer" aria-label="Task and Handoff History">
+    <div class="drawer-header">
+      <div class="drawer-title-group">
+        <div class="drawer-title">
+          <span class="activity-beacon"></span>
+          <span>Agent Task & Handoff History</span>
+        </div>
+        <div class="drawer-metrics" id="drawer-metrics-summary">
+          Total Tasks: <span id="metric-total-tasks">0</span> | Completed/Promoted: <span id="metric-promoted-tasks">0</span>
+        </div>
+      </div>
+      <button id="drawer-close-btn" class="drawer-close-btn" title="Close Drawer (Esc)">✕</button>
+    </div>
+
+    <!-- Agent Node Inspector Strip -->
+    <div id="agent-inspector" class="agent-inspector-strip">
+      <div class="inspector-badge">INSPECTOR</div>
+      <div class="inspector-content">
+        <span id="inspector-agent-name" style="font-weight: bold; color: var(--cyan); font-size: 11px;">All Agents</span>
+        <span id="inspector-agent-role" style="color: var(--light-gray); font-size: 10px;">Select an agent node on the DAG or use filters below</span>
+      </div>
+      <button id="inspector-clear-btn" class="btn-reset" style="display: none;">Clear</button>
+    </div>
+
+    <!-- Tab Switcher -->
+    <div class="drawer-tabs">
+      <button id="tab-btn-tasks" class="drawer-tab active" data-tab="tasks">
+        Task Timeline (<span id="tab-count-tasks">0</span>)
+      </button>
+      <button id="tab-btn-backlog" class="drawer-tab" data-tab="backlog">
+        Requirements Backlog (<span id="tab-count-backlog">0</span>)
+      </button>
+      <button id="tab-btn-checkpoints" class="drawer-tab" data-tab="checkpoints">
+        Verified Checkpoints (<span id="tab-count-checkpoints">0</span>)
+      </button>
+    </div>
+
+    <!-- Filter & Control Bar -->
+    <div class="drawer-filter-bar" id="task-filters-bar">
+      <input type="text" id="task-search-input" data-alias="drawer-search-input" class="filter-input" placeholder="Search tasks, deliberation, files, SHA-256..." />
+      <select id="task-agent-filter" data-alias="drawer-agent-filter" class="filter-select">
+        <option value="">All Agents</option>
+        <option value="StudioOrchestrator">StudioOrchestrator</option>
+        <option value="SteamAndTelemetryAnalystAgent">SteamAndTelemetryAnalystAgent</option>
+        <option value="CreativeDirectorWorldbuilderAgent">CreativeDirectorWorldbuilderAgent</option>
+        <option value="NarrativeCharacterWriterAgent">NarrativeCharacterWriterAgent</option>
+        <option value="VoiceActingAudioProducerAgent">VoiceActingAudioProducerAgent</option>
+        <option value="VisualArtSpriteDesignerAgent">VisualArtSpriteDesignerAgent</option>
+        <option value="LeadGameplaySWEAgent">LeadGameplaySWEAgent</option>
+        <option value="TelemetryArchitectAgent">TelemetryArchitectAgent</option>
+        <option value="QAPlaytesterBuildSupervisor">QAPlaytesterBuildSupervisor</option>
+      </select>
+      <select id="task-req-filter" data-alias="drawer-req-filter" class="filter-select">
+        <option value="">All Requirements</option>
+        <option value="R1">R1</option>
+        <option value="R2">R2</option>
+        <option value="R3">R3</option>
+        <option value="R4">R4</option>
+        <option value="R5">R5</option>
+      </select>
+      <select id="task-status-filter" data-alias="drawer-status-filter" class="filter-select">
+        <option value="">All Statuses</option>
+        <option value="completed">Completed / Promoted</option>
+        <option value="synthesizing">Synthesizing / In Progress</option>
+        <option value="verifying">Verifying</option>
+        <option value="rejected">Rejected / Failed</option>
+      </select>
+      <button id="drawer-btn-reset-filters" class="btn-reset">Reset</button>
+    </div>
+
+    <!-- Drawer Content Views -->
+    <div class="drawer-content">
+      <!-- Tab 1: Task & Handoff Timeline -->
+      <div id="view-tasks-timeline" class="drawer-view active">
+        <!-- Cryptographic Handoff Viewer Summary -->
+        <div id="handoff-viewer" class="handoff-viewer-summary">
+          <div class="handoff-viewer-header">
+            <span style="font-weight: bold; color: var(--cyan);">Cryptographic Handoff Integrity</span>
+            <span class="crypto-badge" id="handoff-summary-badge">SHA-256 ENVELOPES</span>
+          </div>
+          <div class="handoff-viewer-body" id="handoff-viewer-body">
+            Sealed artifact verification active. Click a task card below to inspect cryptographic signatures and payload integrity.
+          </div>
+        </div>
+
+        <div id="task-cards-list" class="task-cards-container">
+          <!-- Dynamically populated task cards -->
+          <div class="empty-state-notice" style="color: var(--light-gray); font-size: 11px; text-align: center; padding: 24px;">
+            No agent tasks recorded yet. Launch a Genesis Build or load an active cartridge.
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab 2: Requirements Backlog Board -->
+      <div id="view-requirements-backlog" class="drawer-view">
+        <div id="requirements-backlog-container" class="requirements-backlog-container">
+          <!-- Dynamically populated backlog tracks & overview -->
+          <div class="empty-state-notice" style="color: var(--light-gray); font-size: 11px; text-align: center; padding: 24px;">
+            No active requirements specification found.
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab 3: Verified Checkpoints Timeline -->
+      <div id="view-checkpoints" class="drawer-view">
+        <div id="checkpoints-timeline-container" class="checkpoints-timeline-container" style="display: flex; flex-direction: column; gap: 12px; padding: 16px;">
+          <!-- Dynamically populated verified checkpoints -->
+          <div class="empty-state-notice" style="color: var(--light-gray); font-size: 11px; text-align: center; padding: 24px;">
+            No verified checkpoints recorded yet. Checkpoints are automatically generated as each requirement track passes verification.
+          </div>
+        </div>
+      </div>
+    </div>
+  </aside>
 
   <script>
     // =========================================================================
@@ -1010,12 +1747,25 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       return div;
     }
 
+    const seenDeliberationKeys = new Set();
+    const seenToolCardKeys = new Set();
+
     function addDeliberation(data) {
+      const dedupKey = data.event_id
+        ? String(data.event_id)
+        : (data.timestamp_utc
+            ? `${data.timestamp_utc}|${data.agent_name || ''}|${data.event_type || ''}|${(data.deliberation || data.message || '').slice(0, 120)}`
+            : null);
+      if (dedupKey) {
+        if (seenDeliberationKeys.has(dedupKey)) return;
+        seenDeliberationKeys.add(dedupKey);
+      }
+
       const entry = {
         deliberation: data.deliberation || data.message || '',
         agent_name: data.agent_name || 'StudioOrchestrator',
         event_type: data.event_type || 'AGENT_STREAM',
-        time: new Date().toLocaleTimeString(),
+        time: data.timestamp_utc ? new Date(data.timestamp_utc).toLocaleTimeString() : (data.time || new Date().toLocaleTimeString()),
         raw: data
       };
 
@@ -1060,6 +1810,16 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     eventTypeFilter.addEventListener('change', applyStreamFilters);
 
     function addToolCard(toolData) {
+      const toolDedupKey = toolData.event_id
+        ? String(toolData.event_id)
+        : (toolData.timestamp_utc
+            ? `${toolData.timestamp_utc}|${toolData.tool_name || toolData.tool || ''}|${toolData.agent_name || ''}|${toolData.status || ''}`
+            : null);
+      if (toolDedupKey) {
+        if (seenToolCardKeys.has(toolDedupKey)) return;
+        seenToolCardKeys.add(toolDedupKey);
+      }
+
       const li = document.createElement('li');
       const isFailed = (toolData.status === 'failed' || toolData.error_message || toolData.error_stack);
       li.className = `tool-card ${isFailed ? 'status-failed' : 'status-success'}`;
@@ -1135,7 +1895,6 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
 
     let historyHydrated = false;
     async function loadEventHistory() {
-      if (historyHydrated) return;
       try {
         const res = await fetch('/api/events/history');
         if (!res.ok) return;
@@ -1154,6 +1913,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             if (ev.event_type === 'TOOL_INVOCATION' || ev.event_type === 'tool_call' || (ev.payload && ev.payload.tool)) {
               const p = ev.payload || {};
               addToolCard({
+                event_id: ev.event_id,
+                timestamp_utc: ev.timestamp_utc,
                 tool_name: p.tool || p.tool_name || 'generic_tool',
                 agent_name: ev.agent_name || 'StudioAgent',
                 status: p.status || 'success',
@@ -1199,7 +1960,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     }
 
     // =========================================================================
-    // Resilient WebSocket Client with Exponential Backoff
+    // Resilient WebSocket Client with Exponential Backoff & Live Sync
     // =========================================================================
     class ResilientWebSocketClient {
       constructor() {
@@ -1233,7 +1994,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         this.ws.onopen = () => {
           this.retryCount = 0;
           this.setUIStatus('ONLINE', 'ONLINE');
-          this.stopPolling();
+          this.startPolling(2500);
           if (offlineBanner) offlineBanner.style.display = 'none';
 
           addDeliberation({
@@ -1256,6 +2017,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             }
             if (data.event_type === 'TOOL_INVOCATION' || data.event_type === 'tool_call' || (data.payload && data.payload.tool)) {
               addToolCard({
+                event_id: data.event_id,
+                timestamp_utc: data.timestamp_utc,
                 tool_name: data.payload.tool || data.payload.tool_name || 'generic_tool',
                 agent_name: data.agent_name || 'StudioAgent',
                 status: data.payload.status || 'success',
@@ -1287,6 +2050,28 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
               loadArtifacts();
               loadDiff();
             }
+            if (data.event_type === 'AGENT_TASK_RECORD' || (data.payload && data.payload.task_id)) {
+              if (typeof handleIncomingTaskRecord === 'function') {
+                handleIncomingTaskRecord(data.payload && data.payload.task_id ? data.payload : (data.task || data));
+              }
+              if (typeof fetchTaskHistory === 'function') fetchTaskHistory();
+            }
+            if (
+              data.event_type === 'REQUIREMENTS_SPEC_GENERATED' ||
+              data.event_type === 'REQUIREMENT_STATUS_UPDATE' ||
+              data.event_type === 'QA_GATE_RESULT' ||
+              data.event_type === 'CHALLENGER_GATE_VERDICT'
+            ) {
+              if (typeof fetchRequirementsBacklog === 'function') fetchRequirementsBacklog();
+              if (typeof fetchTaskHistory === 'function') fetchTaskHistory();
+              if (typeof fetchCheckpoints === 'function') fetchCheckpoints();
+            }
+            if (data.event_type === 'CHECKPOINT_VERIFIED') {
+              if (typeof fetchCheckpoints === 'function') fetchCheckpoints();
+              if (typeof fetchRequirementsBacklog === 'function') fetchRequirementsBacklog();
+              if (typeof fetchTaskHistory === 'function') fetchTaskHistory();
+              loadArtifacts();
+            }
           } catch (e) {
             addDeliberation({ deliberation: event.data, event_type: 'raw_packet' });
           }
@@ -1296,7 +2081,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           this.setUIStatus('DISCONNECTED', 'OFFLINE');
           if (offlineBanner) offlineBanner.style.display = 'block';
           this.scheduleReconnect();
-          this.startPolling();
+          this.startPolling(3000);
         };
 
         this.ws.onerror = () => {
@@ -1322,23 +2107,18 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         statusBadge.textContent = label;
       }
 
-      startPolling() {
-        if (this.pollTimer) return;
+      startPolling(intervalMs = 2500) {
+        this.stopPolling();
         this.pollTimer = setInterval(async () => {
           try {
-            const res = await fetch('/api/status');
-            if (res.ok) {
-              const data = await res.json();
-              if (data.agent_state) {
-                Object.entries(data.agent_state).forEach(([agent, st]) => {
-                  updateAgentLifecycleState(agent, st);
-                });
-              }
-            }
+            await loadEventHistory();
+            if (typeof fetchTaskHistory === 'function') fetchTaskHistory();
+            if (typeof fetchRequirementsBacklog === 'function') fetchRequirementsBacklog();
+            if (typeof fetchCheckpoints === 'function') fetchCheckpoints();
           } catch (e) {
-            // Still offline
+            // Ignore transient fetch errors
           }
-        }, 5000);
+        }, intervalMs);
       }
 
       stopPolling() {
@@ -1757,12 +2537,870 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
 
     diffSelector.addEventListener('change', loadDiff);
 
+    // =========================================================================
+    // Requirement R5: Agent Task History & Handoff Observability Controller
+    // =========================================================================
+
+    const taskHistoryDrawer = document.getElementById('task-history-drawer');
+    const drawerBackdrop = document.getElementById('drawer-backdrop');
+    const btnToggleTaskHistory = document.getElementById('btn-toggle-task-history');
+    const drawerCloseBtn = document.getElementById('drawer-close-btn');
+    const tabBtnTasks = document.getElementById('tab-btn-tasks');
+    const tabBtnBacklog = document.getElementById('tab-btn-backlog');
+    const tabBtnCheckpoints = document.getElementById('tab-btn-checkpoints');
+    const viewTasksTimeline = document.getElementById('view-tasks-timeline');
+    const viewRequirementsBacklog = document.getElementById('view-requirements-backlog');
+    const viewCheckpoints = document.getElementById('view-checkpoints');
+    const checkpointsTimelineContainer = document.getElementById('checkpoints-timeline-container');
+    const tabCountCheckpoints = document.getElementById('tab-count-checkpoints');
+    const lastCheckpointBadge = document.getElementById('last-checkpoint-badge');
+    const headerCheckpointId = document.getElementById('header-checkpoint-id');
+    const headerCheckpointTrack = document.getElementById('header-checkpoint-track');
+    const taskSearchInput = document.getElementById('task-search-input');
+    const taskAgentFilter = document.getElementById('task-agent-filter');
+    const taskReqFilter = document.getElementById('task-req-filter');
+    const taskStatusFilter = document.getElementById('task-status-filter');
+    const drawerBtnResetFilters = document.getElementById('drawer-btn-reset-filters');
+    const taskCardsList = document.getElementById('task-cards-list');
+    const requirementsBacklogContainer = document.getElementById('requirements-backlog-container');
+    const agentInspector = document.getElementById('agent-inspector');
+    const inspectorAgentName = document.getElementById('inspector-agent-name');
+    const inspectorAgentRole = document.getElementById('inspector-agent-role');
+    const inspectorClearBtn = document.getElementById('inspector-clear-btn');
+    const metricTotalTasks = document.getElementById('metric-total-tasks');
+    const metricPromotedTasks = document.getElementById('metric-promoted-tasks');
+    const headerTaskCount = document.getElementById('header-task-count');
+    const tabCountTasks = document.getElementById('tab-count-tasks');
+    const tabCountBacklog = document.getElementById('tab-count-backlog');
+    const handoffViewer = document.getElementById('handoff-viewer');
+
+    const OBSERVABILITY_STORAGE_KEY = 'studio_observability_state_v1';
+    let observabilityState = {
+      version: 1,
+      drawerOpen: false,
+      activeTab: 'tasks',
+      selectedAgent: null,
+      filters: {
+        agent: '',
+        requirementId: '',
+        status: '',
+        searchQuery: ''
+      },
+      expandedCardIds: [],
+      cachedRequirementsSpec: null,
+      cachedTasks: [],
+      lastUpdatedUtc: new Date().toISOString()
+    };
+
+    function saveObservabilityState() {
+      try {
+        observabilityState.lastUpdatedUtc = new Date().toISOString();
+        localStorage.setItem(OBSERVABILITY_STORAGE_KEY, JSON.stringify(observabilityState));
+      } catch (e) {
+        // LocalStorage quota or access exception handled gracefully
+      }
+    }
+
+    function restoreObservabilityState() {
+      try {
+        const raw = localStorage.getItem(OBSERVABILITY_STORAGE_KEY);
+        if (!raw) return;
+        const parsed = JSON.parse(raw);
+        if (parsed && parsed.version === 1) {
+          observabilityState = { ...observabilityState, ...parsed };
+          if (observabilityState.filters) {
+            if (taskSearchInput && observabilityState.filters.searchQuery) {
+              taskSearchInput.value = observabilityState.filters.searchQuery;
+            }
+            if (taskAgentFilter && observabilityState.filters.agent) {
+              taskAgentFilter.value = observabilityState.filters.agent;
+            }
+            if (taskReqFilter && observabilityState.filters.requirementId) {
+              taskReqFilter.value = observabilityState.filters.requirementId;
+            }
+            if (taskStatusFilter && observabilityState.filters.status) {
+              taskStatusFilter.value = observabilityState.filters.status;
+            }
+          }
+          if (observabilityState.selectedAgent) {
+            highlightDagNode(observabilityState.selectedAgent);
+          }
+          if (observabilityState.drawerOpen) {
+            openDrawer(false);
+          }
+          if (observabilityState.activeTab) {
+            switchDrawerTab(observabilityState.activeTab, false);
+          }
+          if (observabilityState.cachedTasks && observabilityState.cachedTasks.length > 0) {
+            updateTaskMetrics(observabilityState.cachedTasks);
+            renderTaskCards(observabilityState.cachedTasks);
+          }
+          if (observabilityState.cachedRequirementsSpec) {
+            renderBacklog(observabilityState.cachedRequirementsSpec);
+          }
+        }
+      } catch (e) {
+        console.warn('Failed to restore studio observability state:', e);
+      }
+    }
+
+    function openDrawer(persist = true) {
+      if (!taskHistoryDrawer) return;
+      taskHistoryDrawer.classList.add('open');
+      if (drawerBackdrop) drawerBackdrop.classList.add('active');
+      observabilityState.drawerOpen = true;
+      if (persist) saveObservabilityState();
+    }
+
+    function closeDrawer(persist = true) {
+      if (!taskHistoryDrawer) return;
+      taskHistoryDrawer.classList.remove('open');
+      if (drawerBackdrop) drawerBackdrop.classList.remove('active');
+      observabilityState.drawerOpen = false;
+      if (persist) saveObservabilityState();
+    }
+
+    function toggleDrawer() {
+      if (taskHistoryDrawer && taskHistoryDrawer.classList.contains('open')) {
+        closeDrawer();
+      } else {
+        openDrawer();
+      }
+    }
+
+    function switchDrawerTab(tabName, persist = true) {
+      observabilityState.activeTab = tabName;
+      if (tabBtnTasks) tabBtnTasks.classList.toggle('active', tabName === 'tasks');
+      if (tabBtnBacklog) tabBtnBacklog.classList.toggle('active', tabName === 'backlog');
+      if (tabBtnCheckpoints) tabBtnCheckpoints.classList.toggle('active', tabName === 'checkpoints');
+
+      if (viewTasksTimeline) viewTasksTimeline.classList.toggle('active', tabName === 'tasks');
+      if (viewRequirementsBacklog) viewRequirementsBacklog.classList.toggle('active', tabName === 'backlog');
+      if (viewCheckpoints) viewCheckpoints.classList.toggle('active', tabName === 'checkpoints');
+
+      const filtersBar = document.getElementById('task-filters-bar');
+      if (filtersBar) {
+        filtersBar.style.display = (tabName === 'tasks') ? 'flex' : 'none';
+      }
+
+      if (tabName === 'checkpoints') {
+        fetchCheckpoints();
+      } else if (tabName === 'backlog') {
+        fetchRequirementsBacklog();
+      }
+
+      if (persist) saveObservabilityState();
+    }
+
+    function highlightDagNode(agentName) {
+      document.querySelectorAll('.dag-node').forEach(node => {
+        const nodeAgent = node.getAttribute('data-agent') || node.id.replace('node-', '');
+        if (agentName && (nodeAgent === agentName || node.id === `node-${agentName}`)) {
+          node.classList.add('selected');
+        } else {
+          node.classList.remove('selected');
+        }
+      });
+      if (inspectorAgentName) inspectorAgentName.textContent = agentName || 'All Agents';
+      if (inspectorAgentRole) {
+        inspectorAgentRole.textContent = agentName ? `Filtering tasks executed by ${agentName}` : 'Select an agent node on the DAG or use filters below';
+      }
+      if (inspectorClearBtn) {
+        inspectorClearBtn.style.display = agentName ? 'inline-block' : 'none';
+      }
+    }
+
+    function selectAgent(agentName) {
+      observabilityState.selectedAgent = agentName;
+      observabilityState.filters.agent = agentName;
+      if (taskAgentFilter) taskAgentFilter.value = agentName;
+      highlightDagNode(agentName);
+      openDrawer();
+      switchDrawerTab('tasks');
+      applyTaskFilters();
+      saveObservabilityState();
+    }
+
+    function clearAgentSelection() {
+      observabilityState.selectedAgent = null;
+      observabilityState.filters.agent = '';
+      if (taskAgentFilter) taskAgentFilter.value = '';
+      highlightDagNode(null);
+      applyTaskFilters();
+      saveObservabilityState();
+    }
+
+    async function fetchTaskHistory() {
+      try {
+        const res = await fetch('/api/agents/history');
+        if (!res.ok) return;
+        const data = await res.json();
+        const tasks = data.tasks || [];
+        observabilityState.cachedTasks = tasks;
+        updateTaskMetrics(tasks);
+        applyTaskFilters();
+        saveObservabilityState();
+      } catch (e) {
+        // Backend offline or loading
+      }
+    }
+
+    function handleIncomingTaskRecord(taskRecord) {
+      if (!taskRecord || !taskRecord.task_id) return;
+      const tasks = observabilityState.cachedTasks || [];
+      const idx = tasks.findIndex(t => t.task_id === taskRecord.task_id);
+      if (idx >= 0) {
+        tasks[idx] = taskRecord;
+      } else {
+        tasks.unshift(taskRecord);
+      }
+      observabilityState.cachedTasks = tasks;
+      updateTaskMetrics(tasks);
+      applyTaskFilters();
+      saveObservabilityState();
+    }
+
+    function updateTaskMetrics(tasks) {
+      const total = tasks.length;
+      const promoted = tasks.filter(t => (t.status || '').toLowerCase() === 'completed').length;
+      if (metricTotalTasks) metricTotalTasks.textContent = total;
+      if (metricPromotedTasks) metricPromotedTasks.textContent = promoted;
+      if (headerTaskCount) headerTaskCount.textContent = total;
+      if (tabCountTasks) tabCountTasks.textContent = total;
+    }
+
+    function applyTaskFilters() {
+      const query = (taskSearchInput ? taskSearchInput.value : '').trim().toLowerCase();
+      const agent = taskAgentFilter ? taskAgentFilter.value : '';
+      const reqId = taskReqFilter ? taskReqFilter.value : '';
+      const status = (taskStatusFilter ? taskStatusFilter.value : '').toLowerCase();
+
+      observabilityState.filters.searchQuery = query;
+      observabilityState.filters.agent = agent;
+      observabilityState.filters.requirementId = reqId;
+      observabilityState.filters.status = status;
+
+      let filtered = observabilityState.cachedTasks || [];
+
+      if (agent) {
+        filtered = filtered.filter(t => (t.agent_name === agent || t.agent_role === agent));
+      }
+      if (reqId) {
+        filtered = filtered.filter(t => (t.requirement_id || '').toUpperCase() === reqId.toUpperCase());
+      }
+      if (status) {
+        filtered = filtered.filter(t => {
+          const st = (t.status || '').toLowerCase();
+          if (status === 'completed') return st === 'completed' || st === 'promoted';
+          if (status === 'synthesizing') return st === 'synthesizing' || st === 'in_progress';
+          if (status === 'verifying') return st === 'verifying';
+          if (status === 'rejected') return st === 'rejected' || st === 'failed';
+          return st === status;
+        });
+      }
+      if (query) {
+        filtered = filtered.filter(t => {
+          const delib = (t.deliberation || '').toLowerCase();
+          const title = (t.title || t.track_title || '').toLowerCase();
+          const aid = (t.agent_name || t.agent_role || '').toLowerCase();
+          const tid = (t.task_id || '').toLowerCase();
+          const rid = (t.requirement_id || '').toLowerCase();
+          const outs = JSON.stringify(t.outputs || t.output_artifacts || {}).toLowerCase();
+          const env = JSON.stringify(t.envelope || {}).toLowerCase();
+          return delib.includes(query) || title.includes(query) || aid.includes(query) || tid.includes(query) || rid.includes(query) || outs.includes(query) || env.includes(query);
+        });
+      }
+
+      renderTaskCards(filtered);
+    }
+
+    function formatBytes(bytes) {
+      if (!bytes || bytes <= 0) return '0 B';
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+      return (bytes / 1048576).toFixed(1) + ' MB';
+    }
+
+    window.loadArtifactPreview = async function(detailsElem, taskId, filename, filePath) {
+      if (!detailsElem.open) return;
+      const body = detailsElem.querySelector('.artifact-content-body');
+      if (!body || body.getAttribute('data-loaded') === 'true') return;
+      body.innerHTML = '<span style="color: var(--light-gray); font-style: italic;">Loading artifact content...</span>';
+      try {
+        const queryParams = new URLSearchParams({
+          filename: filename || '',
+          path: filePath || '',
+          task_id: taskId || '',
+        });
+        const res = await fetch(`/api/artifacts/content?${queryParams.toString()}`);
+        if (!res.ok) {
+          body.innerHTML = `<span style="color: var(--neon-red);">Preview unavailable (HTTP ${res.status})</span>`;
+          return;
+        }
+        const data = await res.json();
+        body.setAttribute('data-loaded', 'true');
+        if (data.is_image) {
+          body.innerHTML = `
+            <div style="text-align: center; padding: 6px; background: #070b14; border-radius: 4px; border: 1px solid rgba(255,255,255,0.08);">
+              <img src="${escapeHtml(data.url)}" alt="${escapeHtml(filename)}" style="max-height: 180px; image-rendering: pixelated; border-radius: 4px; border: 1px solid var(--slate);" />
+              <div style="margin-top: 4px; font-size: 10px; color: var(--light-gray);">${escapeHtml(filename)} (${formatBytes(data.size_bytes || 0)})</div>
+            </div>
+          `;
+        } else if (data.is_audio) {
+          body.innerHTML = `
+            <div style="padding: 6px; background: #070b14; border-radius: 4px; border: 1px solid rgba(255,255,255,0.08);">
+              <audio controls style="width: 100%; height: 32px;" src="${escapeHtml(data.url)}"></audio>
+              <div style="margin-top: 4px; font-size: 10px; color: var(--light-gray);">${escapeHtml(filename)} (${formatBytes(data.size_bytes || 0)})</div>
+            </div>
+          `;
+        } else if (data.content !== undefined) {
+          body.innerHTML = `
+            <pre style="margin: 0; padding: 8px; font-size: 10px; max-height: 250px; overflow: auto; background: #050811; border-radius: 4px; border: 1px solid rgba(41, 173, 255, 0.25); color: #cbd5e0; white-space: pre-wrap; word-break: break-all; font-family: monospace;">${escapeHtml(data.content)}</pre>
+          `;
+        } else {
+          body.innerHTML = `<span style="color: var(--light-gray);">Empty or binary artifact.</span>`;
+        }
+      } catch (err) {
+        body.innerHTML = `<span style="color: var(--neon-red);">Failed loading preview: ${escapeHtml(err.message)}</span>`;
+      }
+    };
+
+    function renderTaskCards(tasks) {
+      if (!taskCardsList) return;
+      if (!tasks || tasks.length === 0) {
+        taskCardsList.innerHTML = `
+          <div class="empty-state-notice" style="color: var(--light-gray); font-size: 11px; text-align: center; padding: 24px;">
+            No agent tasks match the active criteria.
+          </div>
+        `;
+        return;
+      }
+
+      taskCardsList.innerHTML = '';
+      tasks.forEach(task => {
+        const card = document.createElement('div');
+        const isExpanded = observabilityState.expandedCardIds.includes(task.task_id);
+        const status = (task.status || 'completed').toLowerCase();
+        const isRejected = status === 'rejected' || status === 'failed';
+
+        card.className = `task-card ${isRejected ? 'rejected' : ''} ${isExpanded ? 'expanded' : ''}`;
+        card.id = `card-${task.task_id}`;
+
+        const agentRole = escapeHtml(task.agent_role || task.agent_name || 'Agent');
+        const title = escapeHtml(task.title || task.track_title || task.task_type || task.task_id);
+        const reqBadge = task.requirement_id ? `<span class="task-badge-req">${escapeHtml(task.requirement_id)}</span>` : '';
+        const duration = task.duration_ms ? `${Math.round(task.duration_ms)}ms` : '';
+        const statusClass = `task-status-${status.replace(/[^a-z0-9]/g, '_')}`;
+
+        // 1. EPISTEMIC REASONING (Rule 4: Strictly Field Index 0)
+        const delibHtml = `
+          <div class="deliberation-block">
+            <div class="deliberation-block-label">
+              <span>🧠 Epistemic Deliberation (Index 0)</span>
+            </div>
+            <div>${escapeHtml(task.deliberation)}</div>
+          </div>
+        `;
+
+        // 2. CRYPTOGRAPHIC HANDOFF ENVELOPE (ArtifactMetadataEnvelope)
+        let envelopeHtml = '';
+        const env = task.envelope || null;
+        const outputs = task.output_artifacts || task.outputs || [];
+
+        if (env || (Array.isArray(outputs) && outputs.length > 0) || (typeof outputs === 'object' && Object.keys(outputs).length > 0)) {
+          let outputHashesHtml = '';
+          if (env) {
+            outputHashesHtml += `
+              <div style="margin-top: 4px;">
+                <span style="color: var(--light-gray);">Artifact ID:</span> <span class="hash-line">${escapeHtml(env.artifact_id || '')}</span>
+              </div>
+              <div>
+                <span style="color: var(--light-gray);">Type:</span> <span class="task-badge-role">${escapeHtml(env.artifact_type || '')}</span>
+                <span style="color: var(--light-gray); margin-left: 8px;">Source:</span> <span>${escapeHtml(env.source_agent || '')}</span>
+              </div>
+              <div class="hash-line" style="margin-top: 4px;">
+                <strong>Output SHA-256:</strong> ${escapeHtml(env.output_sha256 || env.sha256_hash || 'Verified')}
+              </div>
+            `;
+          }
+
+          let outputCardsHtml = '';
+          if (Array.isArray(outputs) && outputs.length > 0) {
+            outputs.forEach((item, idx) => {
+              const name = escapeHtml(item.artifact_name || item.filename || item.name || (typeof item === 'string' ? item : 'artifact'));
+              const hash = escapeHtml(item.sha256_hash || item.output_sha256 || item.sha256 || 'Verified');
+              const shortHash = hash.length > 12 ? hash.substring(0, 10) + '...' : hash;
+              const type = escapeHtml(item.artifact_type || (name.endsWith('.gd') ? 'gdscript' : name.endsWith('.tscn') ? 'scene' : name === 'project.godot' ? 'config' : name.endsWith('.py') ? 'code' : name.endsWith('.json') ? 'spec' : name.endsWith('.png') ? 'sprite' : name.endsWith('.wav') ? 'audio' : 'artifact'));
+              const source = escapeHtml(item.source_agent || task.agent_role || 'Specialist');
+              const target = escapeHtml(item.target_agent || 'Downstream Swarm');
+              const size = item.byte_size || (item.metadata_summary && item.metadata_summary.size) || 0;
+              const sizeStr = formatBytes(size);
+              const delib = item.deliberation ? escapeHtml(item.deliberation) : '';
+              const rawFilePath = item.file_path || '';
+              const icon = type.includes('sprite') || name.endsWith('.png') ? '🖼️' : (type.includes('audio') || name.endsWith('.wav') ? '🔊' : (name.endsWith('.gd') ? '🤖' : name.endsWith('.tscn') ? '🎮' : name === 'project.godot' ? '⚙️' : (name.endsWith('.py') ? '🐍' : '📄')));
+
+              outputCardsHtml += `
+                <div class="artifact-handoff-card" style="background: rgba(13, 22, 48, 0.7); border: 1px solid rgba(41, 173, 255, 0.3); border-radius: 4px; padding: 8px 10px; margin-top: 6px;">
+                  <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 4px;">
+                    <span style="font-weight: bold; color: var(--white); font-family: monospace; font-size: 11px;">${icon} ${name}</span>
+                    <div style="display: flex; gap: 6px; align-items: center;">
+                      <span class="task-badge-role" style="font-size: 9px; padding: 1px 5px;">${type.toUpperCase()}</span>
+                      <span style="color: var(--light-gray); font-size: 10px;">${sizeStr}</span>
+                    </div>
+                  </div>
+                  <div style="font-size: 10px; color: var(--cyan); margin-top: 4px;">
+                    <span style="color: var(--light-gray);">Handoff Route:</span> <strong>${source}</strong> ➔ <strong>${target}</strong>
+                  </div>
+                  ${delib ? `<div style="font-size: 10px; color: #a0aec0; margin-top: 3px;"><em>${delib}</em></div>` : ''}
+                  <div class="hash-line" style="margin-top: 3px; font-size: 9px;">
+                    <strong style="color: var(--light-gray);">SHA-256:</strong> <span title="${hash}">${shortHash}</span>
+                  </div>
+                  <details class="handoff-doc-details" style="margin-top: 6px;" ontoggle="loadArtifactPreview(this, '${escapeHtml(task.task_id)}', '${name}', '${escapeHtml(rawFilePath)}')">
+                    <summary style="cursor: pointer; color: var(--yellow); font-size: 10px; font-weight: bold; outline: none; user-select: none;">
+                      📄 View Handoff Document / Artifact Content
+                    </summary>
+                    <div class="artifact-content-body" style="margin-top: 6px; font-size: 10px;"></div>
+                  </details>
+                </div>
+              `;
+            });
+          } else if (typeof outputs === 'object' && Object.keys(outputs).length > 0) {
+            Object.keys(outputs).forEach(k => {
+              outputCardsHtml += `<div class="file-chip" style="margin-top: 4px;">📄 ${escapeHtml(k)}: ${escapeHtml(String(outputs[k]))}</div>`;
+            });
+          }
+
+          envelopeHtml = `
+            <div class="envelope-box">
+              <div class="envelope-box-header">
+                <span>Cryptographic Handoff Envelope</span>
+                <span class="crypto-badge">[✓ Sealed & Verified]</span>
+              </div>
+              ${outputHashesHtml}
+              ${outputCardsHtml}
+            </div>
+          `;
+        }
+
+        // 3. VERIFICATION VERDICT & QUALITY GATES
+        let verdictHtml = '';
+        const verdict = task.verification_verdict || task.gate_results || null;
+        if (verdict) {
+          let verdictItems = '';
+          if (Array.isArray(verdict)) {
+            verdict.forEach(g => {
+              const pass = g.passed !== false;
+              verdictItems += `<div>${pass ? '✅' : '❌'} ${escapeHtml(g.gate_name || g.name || 'Gate')}: ${escapeHtml(g.details || (pass ? 'Passed' : 'Failed'))}</div>`;
+            });
+          } else if (typeof verdict === 'object') {
+            Object.keys(verdict).forEach(k => {
+              const pass = verdict[k] !== false;
+              verdictItems += `<div>${pass ? '✅' : '❌'} ${escapeHtml(k)}: ${escapeHtml(String(verdict[k]))}</div>`;
+            });
+          }
+          if (verdictItems) {
+            verdictHtml = `
+              <div style="background: rgba(0, 228, 54, 0.05); border: 1px solid rgba(0, 228, 54, 0.2); border-radius: 4px; padding: 8px 10px; font-size: 11px;">
+                <div style="font-weight: bold; color: var(--green); margin-bottom: 4px;">Verification Verdict</div>
+                ${verdictItems}
+              </div>
+            `;
+          }
+        }
+
+        // 4. DIAGNOSTIC TRACE (Rule 5 Zero Silent Fallbacks)
+        let diagHtml = '';
+        const diag = task.diagnostic_trace;
+        if (diag && (isRejected || diag.error || diag.traceback || diag.failure_gate)) {
+          diagHtml = `
+            <div class="diagnostic-trace-box">
+              <div style="font-weight: bold; color: var(--neon-red); margin-bottom: 4px;">
+                ⚠️ Diagnostic Trace (Failure Visibility)
+              </div>
+              ${diag.failure_gate ? `<div><strong>Failure Gate:</strong> ${escapeHtml(diag.failure_gate)}</div>` : ''}
+              ${diag.failure_type ? `<div><strong>Failure Type:</strong> ${escapeHtml(diag.failure_type)}</div>` : ''}
+              ${diag.error ? `<div><strong>Error:</strong> ${escapeHtml(diag.error)}</div>` : ''}
+              ${diag.traceback ? `<pre>${escapeHtml(diag.traceback)}</pre>` : ''}
+            </div>
+          `;
+        }
+
+        card.innerHTML = `
+          <div class="task-card-header">
+            <div class="task-card-title-group">
+              <span class="task-badge-role">${agentRole}</span>
+              ${reqBadge}
+              <span class="task-title" title="${title}">${title}</span>
+            </div>
+            <div class="task-meta-right">
+              <span class="task-status-pill ${statusClass}">${escapeHtml(status)}</span>
+              ${duration ? `<span class="task-duration">${escapeHtml(duration)}</span>` : ''}
+              <span class="task-chevron">▼</span>
+            </div>
+          </div>
+          <div class="task-card-body">
+            ${delibHtml}
+            ${envelopeHtml}
+            ${verdictHtml}
+            ${diagHtml}
+          </div>
+        `;
+
+        card.querySelector('.task-card-header').addEventListener('click', () => {
+          card.classList.toggle('expanded');
+          const expanded = card.classList.contains('expanded');
+          if (expanded) {
+            if (!observabilityState.expandedCardIds.includes(task.task_id)) {
+              observabilityState.expandedCardIds.push(task.task_id);
+            }
+          } else {
+            observabilityState.expandedCardIds = observabilityState.expandedCardIds.filter(id => id !== task.task_id);
+          }
+          saveObservabilityState();
+        });
+
+        taskCardsList.appendChild(card);
+      });
+    }
+
+    async function fetchRequirementsBacklog() {
+      try {
+        const res = await fetch('/api/requirements');
+        if (!res.ok) return;
+        const data = await res.json();
+        observabilityState.cachedRequirementsSpec = data;
+        renderBacklog(data);
+        saveObservabilityState();
+      } catch (e) {
+        // Backend offline or loading
+      }
+    }
+
+    function renderBacklog(spec) {
+      if (!requirementsBacklogContainer) return;
+      const hasSpec = spec && (spec.has_active_spec || spec.has_spec) && spec.requirements_spec;
+      const specData = hasSpec ? spec.requirements_spec : (spec && spec.requirements ? spec : null);
+
+      if (!specData || !specData.requirements || specData.requirements.length === 0) {
+        requirementsBacklogContainer.innerHTML = `
+          <div class="empty-state-notice" style="color: var(--light-gray); font-size: 11px; text-align: center; padding: 24px;">
+            No active requirements specification found. Launch a Genesis Build to synthesize requirements.
+          </div>
+        `;
+        if (tabCountBacklog) tabCountBacklog.textContent = '0';
+        return;
+      }
+
+      const tracks = specData.requirements || [];
+      if (tabCountBacklog) tabCountBacklog.textContent = tracks.length;
+
+      let totalCriteria = 0;
+      let passedCriteria = 0;
+      tracks.forEach(t => {
+        (t.acceptance_criteria || []).forEach(ac => {
+          totalCriteria++;
+          if (ac.passed) passedCriteria++;
+        });
+      });
+      const pct = totalCriteria > 0 ? Math.round((passedCriteria / totalCriteria) * 100) : 0;
+
+      let overviewHtml = `
+        <div class="backlog-overview-card">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <span style="font-size: 14px; font-weight: bold; color: var(--cyan);">${escapeHtml(specData.game_title || 'Game Project')}</span>
+            <span class="task-badge-req">${escapeHtml(specData.spec_id || 'REQ_SPEC')}</span>
+          </div>
+          ${specData.genre_paradigm ? `<div><span style="color: var(--light-gray);">Genre:</span> <strong>${escapeHtml(specData.genre_paradigm)}</strong></div>` : ''}
+          <div style="display: flex; justify-content: space-between; font-size: 11px; color: var(--light-gray); margin-top: 4px;">
+            <span>Acceptance Criteria Progress</span>
+            <span>${passedCriteria} / ${totalCriteria} (${pct}%)</span>
+          </div>
+          <div class="backlog-progress-bar-container">
+            <div class="backlog-progress-bar-fill" style="width: ${pct}%;"></div>
+          </div>
+        </div>
+      `;
+
+      let tracksHtml = '';
+      tracks.forEach(track => {
+        const status = (track.status || 'pending').toLowerCase();
+        let statusClass = 'task-status-completed';
+        if (status === 'pending') statusClass = 'task-status-verifying';
+        else if (status === 'in_progress') statusClass = 'task-status-in_progress';
+        else if (status === 'rejected') statusClass = 'task-status-rejected';
+
+        let criteriaHtml = '';
+        (track.acceptance_criteria || []).forEach(ac => {
+          const isPass = ac.passed === true;
+          const badgeMethod = ac.verification_method || 'ast_inspection';
+          criteriaHtml += `
+            <div class="criterion-item">
+              <div class="criterion-left">
+                <span>${isPass ? '✅' : '⚪'}</span>
+                <strong>${escapeHtml(ac.id)}:</strong>
+                <span>${escapeHtml(ac.description)}</span>
+              </div>
+              <span class="criterion-badge">${escapeHtml(badgeMethod)}</span>
+            </div>
+          `;
+        });
+
+        tracksHtml += `
+          <div class="requirement-track-card" id="track-card-${escapeHtml(track.id)}">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <span class="task-badge-req">${escapeHtml(track.id)}</span>
+                <span style="font-weight: bold; font-size: 13px; color: var(--white);">${escapeHtml(track.title)}</span>
+              </div>
+              <span class="task-status-pill ${statusClass}">${escapeHtml(status)}</span>
+            </div>
+            ${track.deliberation ? `
+              <div class="deliberation-block" style="padding: 8px 10px; font-size: 11px;">
+                <div class="deliberation-block-label" style="font-size: 9px;">Track Deliberation</div>
+                <div>${escapeHtml(track.deliberation)}</div>
+              </div>
+            ` : ''}
+            <div class="track-criteria-list">
+              <div style="font-size: 10px; font-weight: bold; color: var(--light-gray); text-transform: uppercase;">Acceptance Criteria</div>
+              ${criteriaHtml || '<div style="color: var(--slate); font-size: 10px;">No explicit acceptance criteria specified.</div>'}
+            </div>
+            <button class="btn-inspect-track-tasks" data-track-id="${escapeHtml(track.id)}">
+              🔍 Inspect Handoff Tasks for ${escapeHtml(track.id)}
+            </button>
+          </div>
+        `;
+      });
+
+      requirementsBacklogContainer.innerHTML = overviewHtml + tracksHtml;
+
+      requirementsBacklogContainer.querySelectorAll('.btn-inspect-track-tasks').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const trackId = btn.getAttribute('data-track-id');
+          if (taskReqFilter) taskReqFilter.value = trackId;
+          observabilityState.filters.requirementId = trackId;
+          switchDrawerTab('tasks');
+          applyTaskFilters();
+          saveObservabilityState();
+        });
+      });
+    }
+
+    async function fetchCheckpoints() {
+      try {
+        const res = await fetch('/api/checkpoints');
+        if (!res.ok) return;
+        const data = await res.json();
+        renderCheckpoints(data);
+      } catch (err) {
+        console.warn('Failed to fetch checkpoints:', err);
+      }
+    }
+
+    function renderCheckpoints(data) {
+      if (!checkpointsTimelineContainer) return;
+      const checkpoints = data.checkpoints || [];
+      if (tabCountCheckpoints) tabCountCheckpoints.textContent = checkpoints.length;
+
+      // Update header badge
+      if (lastCheckpointBadge && headerCheckpointId) {
+        if (checkpoints.length > 0) {
+          const latest = checkpoints[checkpoints.length - 1];
+          lastCheckpointBadge.style.display = 'inline-flex';
+          headerCheckpointId.textContent = latest.requirement_id || latest.checkpoint_id;
+          if (headerCheckpointTrack) {
+            headerCheckpointTrack.textContent = latest.track_title ? `— ${latest.track_title}` : '';
+          }
+        } else {
+          lastCheckpointBadge.style.display = 'none';
+        }
+      }
+
+      if (checkpoints.length === 0) {
+        checkpointsTimelineContainer.innerHTML = `
+          <div class="empty-state-notice" style="color: var(--light-gray); font-size: 11px; text-align: center; padding: 24px;">
+            No verified checkpoints recorded yet. Checkpoints are automatically generated as each requirement track passes verification.
+          </div>
+        `;
+        return;
+      }
+
+      let html = '';
+      const reversed = [...checkpoints].reverse();
+      reversed.forEach((cp) => {
+        const isActive = cp.is_active === true;
+        const verifiedTracksList = (cp.verified_tracks || []).join(', ') || cp.requirement_id;
+        const fileCount = (cp.files || []).length;
+        const shaCount = Object.keys(cp.sha256_manifest || {}).length;
+
+        html += `
+          <div class="checkpoint-card ${isActive ? 'active' : ''}" id="checkpoint-card-${escapeHtml(cp.checkpoint_id)}">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <span class="task-badge-req">${escapeHtml(cp.requirement_id || 'CP')}</span>
+                <span style="font-weight: bold; font-size: 13px; color: var(--white);">${escapeHtml(cp.track_title || cp.checkpoint_id)}</span>
+              </div>
+              ${isActive ? `<span class="checkpoint-badge-active">ACTIVE PLAYABLE</span>` : `<span class="task-status-pill task-status-completed">VERIFIED</span>`}
+            </div>
+
+            <!-- Rationale-First Epistemic Ordering (Rule 4) -->
+            ${cp.deliberation ? `
+              <div class="deliberation-block" style="padding: 8px 10px; font-size: 11px;">
+                <div class="deliberation-block-label" style="font-size: 9px;">Checkpoint Deliberation</div>
+                <div>${escapeHtml(cp.deliberation)}</div>
+              </div>
+            ` : ''}
+
+            <div style="display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--light-gray);">
+              <div><strong style="color: var(--cyan);">Checkpoint ID:</strong> <code>${escapeHtml(cp.checkpoint_id)}</code></div>
+              <div><strong style="color: var(--cyan);">Verified Tracks:</strong> <span>${escapeHtml(verifiedTracksList)}</span></div>
+              <div style="display: flex; justify-content: space-between;">
+                <span>Files: <strong>${fileCount}</strong> (${shaCount} SHA-256 digests)</span>
+                <span style="font-size: 10px; color: var(--slate);">${escapeHtml(new Date(cp.created_at_utc).toLocaleString())}</span>
+              </div>
+            </div>
+
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 6px; padding-top: 8px; border-top: 1px solid var(--border-subtle);">
+              <div style="font-size: 10px; color: var(--slate); font-family: monospace;">
+                python3 run_game.py --checkpoint ${escapeHtml(cp.checkpoint_id)}
+              </div>
+              <button class="btn-activate-checkpoint" data-cp-id="${escapeHtml(cp.checkpoint_id)}" ${isActive ? 'disabled' : ''}>
+                ${isActive ? '✓ Currently Active' : '▶ Activate & Play'}
+              </button>
+            </div>
+          </div>
+        `;
+      });
+
+      checkpointsTimelineContainer.innerHTML = html;
+
+      checkpointsTimelineContainer.querySelectorAll('.btn-activate-checkpoint').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const cpId = btn.getAttribute('data-cp-id');
+          if (!cpId) return;
+          btn.disabled = true;
+          btn.textContent = 'Activating...';
+          try {
+            const res = await fetch(`/api/checkpoints/${encodeURIComponent(cpId)}/activate`, {
+              method: 'POST'
+            });
+            const result = await res.json();
+            if (res.ok) {
+              addDeliberation({
+                deliberation: result.deliberation || `Activated verified checkpoint ${cpId}`,
+                agent_name: 'MissionControlGateway',
+                event_type: 'CHECKPOINT_ACTIVATED'
+              });
+              await fetchCheckpoints();
+              loadArtifacts();
+            } else {
+              alert(`Failed to activate checkpoint: ${result.error || result.deliberation}`);
+              btn.disabled = false;
+              btn.textContent = '▶ Activate & Play';
+            }
+          } catch (err) {
+            alert(`Network error activating checkpoint: ${err.message}`);
+            btn.disabled = false;
+            btn.textContent = '▶ Activate & Play';
+          }
+        });
+      });
+    }
+
+    function initTaskObservability() {
+      if (btnToggleTaskHistory) {
+        btnToggleTaskHistory.addEventListener('click', toggleDrawer);
+      }
+      if (drawerCloseBtn) {
+        drawerCloseBtn.addEventListener('click', () => closeDrawer());
+      }
+      if (drawerBackdrop) {
+        drawerBackdrop.addEventListener('click', () => closeDrawer());
+      }
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && observabilityState.drawerOpen) {
+          closeDrawer();
+        }
+      });
+
+      if (tabBtnTasks) {
+        tabBtnTasks.addEventListener('click', () => switchDrawerTab('tasks'));
+      }
+      if (tabBtnBacklog) {
+        tabBtnBacklog.addEventListener('click', () => switchDrawerTab('backlog'));
+      }
+      if (tabBtnCheckpoints) {
+        tabBtnCheckpoints.addEventListener('click', () => switchDrawerTab('checkpoints'));
+      }
+      if (lastCheckpointBadge) {
+        lastCheckpointBadge.addEventListener('click', () => {
+          openDrawer();
+          switchDrawerTab('checkpoints');
+        });
+      }
+
+      if (taskSearchInput) {
+        taskSearchInput.addEventListener('input', applyTaskFilters);
+      }
+      if (taskAgentFilter) {
+        taskAgentFilter.addEventListener('change', () => {
+          observabilityState.selectedAgent = taskAgentFilter.value || null;
+          highlightDagNode(observabilityState.selectedAgent);
+          applyTaskFilters();
+          saveObservabilityState();
+        });
+      }
+      if (taskReqFilter) {
+        taskReqFilter.addEventListener('change', () => {
+          applyTaskFilters();
+          saveObservabilityState();
+        });
+      }
+      if (taskStatusFilter) {
+        taskStatusFilter.addEventListener('change', () => {
+          applyTaskFilters();
+          saveObservabilityState();
+        });
+      }
+      if (drawerBtnResetFilters) {
+        drawerBtnResetFilters.addEventListener('click', () => {
+          if (taskSearchInput) taskSearchInput.value = '';
+          if (taskAgentFilter) taskAgentFilter.value = '';
+          if (taskReqFilter) taskReqFilter.value = '';
+          if (taskStatusFilter) taskStatusFilter.value = '';
+          clearAgentSelection();
+        });
+      }
+      if (inspectorClearBtn) {
+        inspectorClearBtn.addEventListener('click', clearAgentSelection);
+      }
+
+      // Bind click handlers to DAG nodes
+      document.querySelectorAll('.dag-node').forEach(node => {
+        node.style.cursor = 'pointer';
+        node.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const agentName = node.getAttribute('data-agent') || node.id.replace('node-', '');
+          if (observabilityState.selectedAgent === agentName) {
+            clearAgentSelection();
+          } else {
+            selectAgent(agentName);
+          }
+        });
+      });
+
+      restoreObservabilityState();
+      fetchTaskHistory();
+      fetchRequirementsBacklog();
+      fetchCheckpoints();
+    }
+
     // Initialize UI components
     loadSteamDNA();
     loadHeatmap();
     loadPalette();
     loadArtifacts();
     loadDiff();
+    initTaskObservability();
   </script>
 </body>
 </html>

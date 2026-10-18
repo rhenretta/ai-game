@@ -92,14 +92,17 @@ class NarrativeCharacterWriterAgent:
             from google.genai import types
             prompt = (
                 f"You are the Lead Narrative Writer AI.\n"
-                f"Write a full narrative bible for:\n"
+                f"Write a cohesive narrative bible for:\n"
                 f"- Title: {world_spec.game_title}\n"
                 f"- Genre: {world_spec.core_genre}\n"
                 f"- World lore: {world_spec.world_lore}\n"
                 f"- Tone: {world_spec.conflict_tone}\n"
-                f"Create character sheets (hero, rival/companion, boss), reactive dialogue barks "
-                f"for combat/low-health/boss encounters, and cutscenes. "
-                f"You MUST provide deliberation first."
+                f"Design character sheets, cutscene scripts, dialogue trees, and reactive dialogue barks "
+                f"appropriate to this specific game concept, genre, and setting.\n"
+                f"Generalizability Mandate (Rule 1): Do NOT force combat or boss archetypes if the game is non-combat, "
+                f"abstract, puzzle, simulation, or character-less. Characters and dialogue may be empty or minimal "
+                f"if appropriate for the concept. Reactive dialogue barks should match the actual gameplay triggers of this game.\n"
+                f"You MUST provide deliberation first before any decision fields (Rule 4)."
             )
             response = self.client.models.generate_content(
                 model=self.model_name,

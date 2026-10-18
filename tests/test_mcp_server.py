@@ -335,14 +335,25 @@ class SpatialCartridge(BaseCartridge):
         assert "point_valid" in result
         assert isinstance(result["point_valid"], bool)
 
-    def test_mcp_query_spatial_map_missing_cartridge_returns_clean_error(self, mcp_server: LocalMCPServer):
+    def test_mcp_query_spatial_map_missing_cartridge_returns_clean_error(self, mcp_server: LocalMCPServer, stash_active_cartridge, tmp_path: Path):
         """Verifies missing active cartridge returns clean non-traversable error without seed fallback."""
+        # 1. Test implicit default when cartridges/active is absent
         result = mcp_server.call_tool(
             "query_spatial_map",
             arguments={},
             deliberation="Checking missing active cartridge behavior."
         )
         assert result["is_traversable"] is False
+        assert "error" in result
+
+        # 2. Test explicit non-existent cartridge path argument
+        result_explicit = mcp_server.call_tool(
+            "query_spatial_map",
+            arguments={"cartridge_path": str(tmp_path / "nonexistent_cartridge")},
+            deliberation="Checking explicit nonexistent cartridge path."
+        )
+        assert result_explicit["is_traversable"] is False
+        assert "error" in result_explicit
 
 
 # ============================================================================

@@ -20,6 +20,7 @@ import shutil
 import sys
 import traceback
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
+import uuid
 
 import config
 from engine.api.contracts import BaseCartridge, BaseLevelSpec
@@ -63,11 +64,14 @@ class BuildSupervisor:
         compiler: Optional[EngineCompiler] = None,
         swe_agent: Optional[Any] = None,
         asset_validator: Optional[Any] = None,
+        challenger_gate: Optional[Any] = None,
+        gemini_client: Optional[Any] = None,
         tile_size: float = 32.0,
         max_retries: int = 3,
         early_death_tick_threshold: int = 180,  # 3.0s at 60 Hz
         max_simulation_ticks: int = 3600,       # 60.0s at 60 Hz
         spawn_clearance_margin: float = 64.0,
+        event_bus: Optional[Any] = None,
     ):
         self.cartridges_root = Path(cartridges_root or (config.PROJECT_ROOT / "cartridges"))
         self.active_cartridge_dir = Path(active_cartridge_dir or (self.cartridges_root / "active"))
@@ -78,11 +82,68 @@ class BuildSupervisor:
         )
         self.swe_agent = swe_agent
         self.asset_validator = asset_validator or AssetValidator()
+        self.challenger_gate = challenger_gate
+        self.gemini_client = gemini_client
         self.tile_size = float(tile_size)
         self.max_retries = int(max_retries)
         self.early_death_tick_threshold = int(early_death_tick_threshold)
         self.max_simulation_ticks = int(max_simulation_ticks)
         self.spawn_clearance_margin = float(spawn_clearance_margin)
+        if event_bus is None:
+            try:
+                from engine.ui.server import swarm_bus
+                self.event_bus = swarm_bus
+            except Exception:
+                self.event_bus = None
+        else:
+            self.event_bus = event_bus
+
+    def _emit_gate_event(self, gate_name: str, result: QualityGateResult, attempt: int = 1) -> None:
+        if self.event_bus is None:
+            return
+        try:
+            status_str = "PASSED" if result.passed else "FAILED"
+            msg = f"[{gate_name}] attempt {attempt}: {status_str} — {result.details or result.deliberation}"
+            if hasattr(self.event_bus, "publish_agent_stream"):
+                self.event_bus.publish_agent_stream(
+                    agent_name="QAPlaytesterBuildSupervisor",
+                    message=msg,
+                    deliberation=result.deliberation,
+                    log_level="INFO" if result.passed else "WARNING",
+                    category="GATE_CHECK",
+                )
+            if hasattr(self.event_bus, "publish_challenger_verdict"):
+                self.event_bus.publish_challenger_verdict(
+                    passed=result.passed,
+                    deliberation=result.deliberation,
+                    agent_name="QAPlaytesterBuildSupervisor",
+                    details={"gate": gate_name, "details": result.details, "attempt": attempt},
+                )
+        except Exception as e:
+            logger.debug("Failed emitting gate event: %s", e)
+
+    def _emit_promoted_event(self, candidate_dir: Path) -> None:
+        if self.event_bus is None:
+            return
+        try:
+            if hasattr(self.event_bus, "publish_agent_stream"):
+                self.event_bus.publish_agent_stream(
+                    agent_name="QAPlaytesterBuildSupervisor",
+                    message=f"Candidate cartridge {candidate_dir.name} successfully certified and promoted to active.",
+                    deliberation="All quality gates passed. Promoting candidate cartridge to active.",
+                    category="PROMOTION",
+                )
+            event = {
+                "deliberation": f"Candidate cartridge {candidate_dir.name} promoted to active.",
+                "event_type": "PROMOTED",
+                "agent_name": "QAPlaytesterBuildSupervisor",
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "payload": {"candidate_dir": str(candidate_dir), "active_dir": str(self.active_cartridge_dir)},
+            }
+            if hasattr(self.event_bus, "publish_threadsafe"):
+                self.event_bus.publish_threadsafe(event)
+        except Exception as e:
+            logger.debug("Failed emitting promoted event: %s", e)
 
     # =========================================================================
     # Primary Entry Point: Closed-Loop Evaluate & Self-Heal Loop
@@ -116,6 +177,7 @@ class BuildSupervisor:
 
                 if trace is None:
                     self.promote_candidate(candidate_dir)
+                    self._emit_promoted_event(candidate_dir)
                     report = BuildEvaluationReport(
                         deliberation=f"Candidate cartridge {candidate_id} passed all 5 Quality Gates and was promoted to active on attempt {attempt}.",
                         candidate_id=candidate_id,
@@ -130,16 +192,54 @@ class BuildSupervisor:
                         max_retries=retries,
                         repair_history=repair_history,
                     )
+                    if self.event_bus is not None and hasattr(self.event_bus, "publish_agent_task_record"):
+                        self.event_bus.publish_agent_task_record({
+                            "deliberation": report.deliberation,
+                            "task_id": "task_qa_supervisor_verification",
+                            "agent_role": "QAPlaytesterBuildSupervisor",
+                            "agent_name": "BuildSupervisor",
+                            "requirement_id": None,
+                            "track_title": "Quality Gates & Challenger Verification",
+                            "task_type": "QA_VERIFICATION",
+                            "status": "COMPLETED",
+                            "verification_verdict": {"passed": True, "gates_passed": list(gate_results.keys())},
+                            "diagnostic_trace": None,
+                            "summary": f"Candidate {candidate_id} passed all quality gates and was promoted to active.",
+                        })
                     logger.info("Candidate %s successfully PROMOTED to %s", candidate_id, self.active_cartridge_dir)
                     return report
 
                 repair_history.append(trace)
+                fail_type_str = trace.failure_type.value if hasattr(trace.failure_type, "value") else str(trace.failure_type)
                 logger.warning("Attempt %d/%d rejected at %s (%s): %s",
-                               attempt, retries, trace.failure_gate, trace.failure_type.value, trace.failure_reason)
+                               attempt, retries, trace.failure_gate, fail_type_str, trace.failure_reason)
+
+                if self.event_bus is not None:
+                    qa_event = {
+                        "event_type": "QA_GATE_RESULT",
+                        "agent_name": "QAPlaytesterBuildSupervisor",
+                        "deliberation": f"Gate {trace.failure_gate} ({fail_type_str}) failed on attempt {attempt}/{retries}: {trace.failure_reason} — Challenger Rationale: {trace.deliberation}",
+                        "payload": {
+                            "attempt": attempt,
+                            "max_retries": retries,
+                            "failure_gate": trace.failure_gate,
+                            "failure_type": fail_type_str,
+                            "failure_reason": trace.failure_reason,
+                            "deliberation": trace.deliberation,
+                            "unfulfilled_requirements": getattr(trace, "unfulfilled_requirements", []),
+                            "remedy_directive": getattr(trace, "remedy_directive", ""),
+                            "gate_results": gate_results,
+                            "promoted": False,
+                        },
+                    }
+                    if hasattr(self.event_bus, "publish_threadsafe"):
+                        self.event_bus.publish_threadsafe(qa_event)
+                    elif hasattr(self.event_bus, "publish_event"):
+                        self.event_bus.publish_event(qa_event)
 
                 if attempt >= retries:
                     report = BuildEvaluationReport(
-                        deliberation=f"Candidate cartridge {candidate_id} exhausted max retries ({retries}) and promotion was blocked.",
+                        deliberation=f"Candidate cartridge {candidate_id} rejected at {trace.failure_gate} ({fail_type_str}) after {retries} attempts: {trace.failure_reason} — Challenger Rationale: {trace.deliberation}",
                         candidate_id=candidate_id,
                         episode_number=episode_number,
                         status=SupervisorGateVerdict.FAILED_MAX_RETRIES,
@@ -152,11 +252,42 @@ class BuildSupervisor:
                         max_retries=retries,
                         repair_history=repair_history,
                     )
+                    if self.event_bus is not None and hasattr(self.event_bus, "publish_agent_task_record"):
+                        self.event_bus.publish_agent_task_record({
+                            "deliberation": report.deliberation,
+                            "task_id": f"task_qa_supervisor_{uuid.uuid4().hex[:8]}",
+                            "agent_role": "QAPlaytesterBuildSupervisor",
+                            "agent_name": "BuildSupervisor",
+                            "requirement_id": None,
+                            "track_title": "Quality Gates & Challenger Verification",
+                            "task_type": "QA_VERIFICATION",
+                            "status": "REJECTED",
+                            "verification_verdict": {"passed": False},
+                            "diagnostic_trace": trace.model_dump() if hasattr(trace, "model_dump") else str(trace),
+                            "summary": f"Gate {trace.failure_gate} rejected candidate build: {trace.failure_reason}",
+                        })
                     logger.error("Candidate %s FAILED_MAX_RETRIES; active cartridge preserved untouched.", candidate_id)
                     return report
 
                 if self.swe_agent is not None and hasattr(self.swe_agent, "repair_cartridge_code"):
                     logger.info("Triggering SWE self-healing repair on %s", candidate_dir)
+                    if self.event_bus is not None:
+                        remedy = getattr(trace, "remedy_directive", "")
+                        stream_event = {
+                            "event_type": "AGENT_STREAM",
+                            "agent_name": "LeadGameplaySWEAgent",
+                            "deliberation": f"Initiating automated self-healing repair on {candidate_dir.name} in response to {trace.failure_gate} failure: {remedy}",
+                            "payload": {
+                                "phase": "REPAIR",
+                                "target_dir": str(candidate_dir),
+                                "failure_gate": trace.failure_gate,
+                                "remedy_directive": remedy,
+                            },
+                        }
+                        if hasattr(self.event_bus, "publish_threadsafe"):
+                            self.event_bus.publish_threadsafe(stream_event)
+                        elif hasattr(self.event_bus, "publish_event"):
+                            self.event_bus.publish_event(stream_event)
                     try:
                         self.swe_agent.repair_cartridge_code(candidate_dir, trace)
                     except Exception as swe_err:
@@ -253,12 +384,36 @@ class BuildSupervisor:
 
                 # Failure detected
                 repair_history.append(trace)
+                fail_type_str = trace.failure_type.value if hasattr(trace.failure_type, "value") else str(trace.failure_type)
                 logger.warning("Attempt %d/%d rejected at %s (%s): %s",
-                               attempt, retries, trace.failure_gate, trace.failure_type.value, trace.failure_reason)
+                               attempt, retries, trace.failure_gate, fail_type_str, trace.failure_reason)
+
+                if self.event_bus is not None:
+                    qa_event = {
+                        "event_type": "QA_GATE_RESULT",
+                        "agent_name": "QAPlaytesterBuildSupervisor",
+                        "deliberation": f"Gate {trace.failure_gate} ({fail_type_str}) failed on attempt {attempt}/{retries}: {trace.failure_reason} — Challenger Rationale: {trace.deliberation}",
+                        "payload": {
+                            "attempt": attempt,
+                            "max_retries": retries,
+                            "failure_gate": trace.failure_gate,
+                            "failure_type": fail_type_str,
+                            "failure_reason": trace.failure_reason,
+                            "deliberation": trace.deliberation,
+                            "unfulfilled_requirements": getattr(trace, "unfulfilled_requirements", []),
+                            "remedy_directive": getattr(trace, "remedy_directive", ""),
+                            "gate_results": gate_results,
+                            "promoted": False,
+                        },
+                    }
+                    if hasattr(self.event_bus, "publish_threadsafe"):
+                        self.event_bus.publish_threadsafe(qa_event)
+                    elif hasattr(self.event_bus, "publish_event"):
+                        self.event_bus.publish_event(qa_event)
 
                 if attempt >= retries:
                     report = BuildEvaluationReport(
-                        deliberation=f"Candidate build {spec_id} exhausted max retries ({retries}) and promotion was blocked.",
+                        deliberation=f"Candidate build {spec_id} rejected at {trace.failure_gate} ({fail_type_str}) after {retries} attempts: {trace.failure_reason} — Challenger Rationale: {trace.deliberation}",
                         candidate_id=spec_id,
                         episode_number=target_episode,
                         status=SupervisorGateVerdict.FAILED_MAX_RETRIES,
@@ -291,6 +446,7 @@ class BuildSupervisor:
         spec: Optional[Any] = None,
         episode_number: int = 1,
         attempt_number: int = 1,
+        requirements_spec: Optional[Any] = None,
     ) -> Tuple[Dict[str, QualityGateResult], Optional[RejectionDiagnosticTrace]]:
         """Evaluates an assembled candidate cartridge directory against all 5 Quality Gates."""
         candidate_dir = Path(candidate_dir).resolve()
@@ -322,7 +478,13 @@ class BuildSupervisor:
                         spec = None
 
         if is_spatial and spec is not None:
-            return self._evaluate_spatial_candidate(candidate_dir, spec, episode_number, attempt_number)
+            return self._evaluate_spatial_candidate(
+                candidate_dir,
+                spec,
+                episode_number,
+                attempt_number,
+                requirements_spec=requirements_spec,
+            )
 
         gate_results: Dict[str, QualityGateResult] = {}
 
@@ -376,7 +538,7 @@ class BuildSupervisor:
         # ---------------------------------------------------------------------
         # 3. Gate C: Headless Execution & Progression Simulation
         # ---------------------------------------------------------------------
-        gate_c, sim = self.verify_gate_c_headless_execution(candidate_dir, max_ticks=60)
+        gate_c, sim = self.verify_gate_c_headless_execution(candidate_dir, max_ticks=120)
         gate_results["gate_c"] = gate_c
         gate_results["Gate C: Headless Execution & Progression"] = gate_c
         gate_results["Gate C: Survivability"] = gate_c
@@ -436,7 +598,165 @@ class BuildSupervisor:
             )
             return gate_results, trace
 
+        # ---------------------------------------------------------------------
+        # 6. Gate F: Independent Challenger Gate & Acceptance Criteria Audit
+        # ---------------------------------------------------------------------
+        gate_f, challenger_trace = self.verify_gate_f_challenger(
+            candidate_dir=candidate_dir,
+            sim=sim,
+            spec=spec,
+            requirements_spec=requirements_spec,
+            episode_number=episode_number,
+            attempt_number=attempt_number,
+        )
+        gate_results["gate_f"] = gate_f
+        gate_results["Gate F: Challenger Gate"] = gate_f
+        gate_results["Gate F: Adversarial Design Critic"] = gate_f
+        gate_results["Gate F"] = gate_f
+        if not gate_f.passed:
+            trace = challenger_trace or RejectionDiagnosticTrace(
+                deliberation=f"Gate F rejected candidate build: {gate_f.details}",
+                candidate_id=candidate_id,
+                episode_number=episode_number,
+                attempt_number=attempt_number,
+                failure_gate="Gate F: Challenger Gate",
+                failure_type=GateFailureType.REQUIREMENT_UNFULFILLED,
+                failure_reason=gate_f.details,
+                remedy_type=RemedyType.IMPLEMENT_REQUIREMENT,
+                recommended_remedy="Satisfy 100% of agent-authored acceptance criteria in requirements_spec.json.",
+                unfulfilled_requirements=gate_f.diagnostic_data.get("unfulfilled_requirements", []),
+                failing_criteria=gate_f.diagnostic_data.get("failing_criteria", []),
+            )
+            return gate_results, trace
+
         return gate_results, None
+
+    verify_candidate = evaluate_candidate_cartridge
+
+    def verify_gate_f_challenger(
+        self,
+        candidate_dir: Path,
+        sim: Optional[Any] = None,
+        spec: Optional[Any] = None,
+        requirements_spec: Optional[Any] = None,
+        episode_number: int = 1,
+        attempt_number: int = 1,
+    ) -> Tuple[QualityGateResult, Optional[RejectionDiagnosticTrace]]:
+        """Gate F: Independent Adversarial Design Critic auditing candidate against 100% of acceptance criteria.
+        Passes vacuously with a logged diagnostic note if requirements_spec.json is absent.
+        """
+        candidate_dir = Path(candidate_dir).resolve()
+        candidate_id = getattr(spec, "spec_id", getattr(spec, "candidate_id", candidate_dir.name))
+
+        # 1. Resolve requirements_spec
+        resolved_spec = requirements_spec
+        if resolved_spec is None:
+            if spec is not None and hasattr(spec, "requirements"):
+                resolved_spec = spec
+            else:
+                spec_path = candidate_dir / "requirements_spec.json"
+                if spec_path.is_file():
+                    try:
+                        from engine.studio.models import GameRequirementsSpec
+                        data = json.loads(spec_path.read_text(encoding="utf-8"))
+                        resolved_spec = GameRequirementsSpec(**data)
+                    except Exception as e:
+                        logger.warning("Could not parse requirements_spec.json in %s: %s", candidate_dir, e)
+
+        # 2. Vacuous pass if no GameRequirementsSpec or no requirements
+        if resolved_spec is None or not getattr(resolved_spec, "requirements", None):
+            res = QualityGateResult(
+                deliberation="No GameRequirementsSpec provided; skipping acceptance criteria audit.",
+                gate_name="Gate F: Adversarial Design Critic",
+                passed=True,
+                failure_type=GateFailureType.NONE,
+                details="No requirements_spec.json present; Gate F passed vacuously.",
+                diagnostic_data={"skipped": True, "vacuous_pass": True},
+            )
+            return res, None
+
+        # 3. Instantiate challenger gate lazily if needed
+        if self.challenger_gate is None:
+            client = self.gemini_client
+            if client is None:
+                try:
+                    from engine.studio.orchestrator import StudioOrchestrator
+                    key = StudioOrchestrator._resolve_api_key(None, None)
+                    if key:
+                        from google import genai
+                        client = genai.Client(api_key=key, http_options={"timeout": 120000})
+                        self.gemini_client = client
+                except Exception:
+                    pass
+            from engine.supervisor.challenger import ChallengerGate
+            self.challenger_gate = ChallengerGate(client=client)
+
+        # 4. Execute Challenger Gate evaluation
+        try:
+            evaluation = self.challenger_gate.evaluate(
+                candidate_dir=candidate_dir,
+                requirements_spec=resolved_spec,
+                sim=sim,
+                episode_number=episode_number,
+                attempt_number=attempt_number,
+            )
+        except Exception as exc:
+            logger.error("ChallengerGate execution raised exception: %s", exc)
+            raise
+
+        # 5. Process verdict
+        if evaluation.overall_verdict:
+            res = QualityGateResult(
+                deliberation=evaluation.deliberation,
+                gate_name="Gate F: Adversarial Design Critic",
+                passed=True,
+                failure_type=GateFailureType.NONE,
+                details="Candidate cartridge satisfied 100% of agent-authored acceptance criteria.",
+                diagnostic_data={
+                    "candidate_id": evaluation.candidate_id,
+                    "evaluated_requirements": [r.model_dump() for r in evaluation.evaluated_requirements],
+                },
+            )
+            return res, None
+        else:
+            unfulfilled = [r.requirement_id for r in evaluation.evaluated_requirements if not r.fulfilled]
+            failing_crit: List[str] = []
+            for r in evaluation.evaluated_requirements:
+                if not r.fulfilled and getattr(r, "failing_criteria", None):
+                    failing_crit.extend(r.failing_criteria)
+
+            trace = evaluation.rejection_trace or RejectionDiagnosticTrace(
+                deliberation=evaluation.deliberation,
+                candidate_id=evaluation.candidate_id or candidate_id,
+                episode_number=episode_number,
+                attempt_number=attempt_number,
+                failure_gate="Gate F: Challenger Gate",
+                failure_type=GateFailureType.REQUIREMENT_UNFULFILLED,
+                failure_reason=f"Challenger Gate rejected candidate build. Unfulfilled requirements: {unfulfilled}",
+                remedy_type=RemedyType.IMPLEMENT_REQUIREMENT,
+                recommended_remedy="Implement genuine interactive mechanics meeting all criteria in requirements_spec.json.",
+                unfulfilled_requirements=unfulfilled,
+                failing_criteria=failing_crit,
+                remedy_parameters={
+                    "unfulfilled_requirements": unfulfilled,
+                    "failing_criteria": failing_crit,
+                },
+            )
+
+            res = QualityGateResult(
+                deliberation=evaluation.deliberation,
+                gate_name="Gate F: Adversarial Design Critic",
+                passed=False,
+                failure_type=GateFailureType.REQUIREMENT_UNFULFILLED,
+                details=trace.failure_reason,
+                diagnostic_data={
+                    "candidate_id": evaluation.candidate_id,
+                    "unfulfilled_requirements": unfulfilled,
+                    "failing_criteria": failing_crit,
+                    "evaluated_requirements": [r.model_dump() for r in evaluation.evaluated_requirements],
+                },
+            )
+            return res, trace
 
     def _evaluate_spatial_candidate(
         self,
@@ -444,6 +764,7 @@ class BuildSupervisor:
         spec: Any,
         episode_number: int = 1,
         attempt_number: int = 1,
+        requirements_spec: Optional[Any] = None,
     ) -> Tuple[Dict[str, QualityGateResult], Optional[RejectionDiagnosticTrace]]:
         """Evaluates spatial director updates against spatial navigation and survivability gates."""
         gate_results: Dict[str, QualityGateResult] = {}
@@ -595,6 +916,45 @@ class BuildSupervisor:
             )
             return gate_results, trace
 
+        # ---------------------------------------------------------------------
+        # Gate F: Independent Challenger Gate & Acceptance Criteria Audit
+        # ---------------------------------------------------------------------
+        spatial_sim = None
+        try:
+            from engine.sim.headless import HeadlessSimulator
+            spatial_sim = HeadlessSimulator(cartridge_path=candidate_dir)
+            spatial_sim.step()
+        except Exception:
+            spatial_sim = None
+
+        gate_f, challenger_trace = self.verify_gate_f_challenger(
+            candidate_dir=candidate_dir,
+            sim=spatial_sim,
+            spec=spec,
+            requirements_spec=requirements_spec,
+            episode_number=episode_number,
+            attempt_number=attempt_number,
+        )
+        gate_results["gate_f"] = gate_f
+        gate_results["Gate F: Challenger Gate"] = gate_f
+        gate_results["Gate F: Adversarial Design Critic"] = gate_f
+        gate_results["Gate F"] = gate_f
+        if not gate_f.passed:
+            trace = challenger_trace or RejectionDiagnosticTrace(
+                deliberation=f"Gate F rejected candidate build: {gate_f.details}",
+                candidate_id=candidate_id,
+                episode_number=episode_number,
+                attempt_number=attempt_number,
+                failure_gate="Gate F: Challenger Gate",
+                failure_type=GateFailureType.REQUIREMENT_UNFULFILLED,
+                failure_reason=gate_f.details,
+                remedy_type=RemedyType.IMPLEMENT_REQUIREMENT,
+                recommended_remedy="Satisfy 100% of agent-authored acceptance criteria in requirements_spec.json.",
+                unfulfilled_requirements=gate_f.diagnostic_data.get("unfulfilled_requirements", []),
+                failing_criteria=gate_f.diagnostic_data.get("failing_criteria", []),
+            )
+            return gate_results, trace
+
         return gate_results, None
 
     # =========================================================================
@@ -604,6 +964,52 @@ class BuildSupervisor:
     def verify_gate_a_syntax_and_entrypoint(self, candidate_dir: Path) -> QualityGateResult:
         """Gate A: Checks AST security, bytecode compilation, class deliberation, and BaseCartridge entrypoint."""
         candidate_dir = Path(candidate_dir).resolve()
+
+        # Branch for Godot 4 cartridges
+        if (candidate_dir / "project.godot").is_file():
+            from engine.sim.godot_verifier import verify_godot_cartridge_syntax
+            if not (candidate_dir / "main.tscn").is_file():
+                return QualityGateResult(
+                    deliberation="Godot 4 cartridge is missing required root scene main.tscn.",
+                    gate_name="Gate A: AST & Entrypoint",
+                    passed=False,
+                    failure_type=GateFailureType.ENTRYPOINT_MISSING,
+                    details="Missing main.tscn root scene.",
+                    diagnostic_data={"candidate_dir": str(candidate_dir)},
+                )
+            if not (candidate_dir / "main.gd").is_file():
+                return QualityGateResult(
+                    deliberation="Godot 4 cartridge is missing required root script main.gd.",
+                    gate_name="Gate A: AST & Entrypoint",
+                    passed=False,
+                    failure_type=GateFailureType.ENTRYPOINT_MISSING,
+                    details="Missing main.gd root script.",
+                    diagnostic_data={"candidate_dir": str(candidate_dir)},
+                )
+            is_valid, diagnostics = verify_godot_cartridge_syntax(candidate_dir)
+            if not is_valid:
+                diag = diagnostics[0] if diagnostics else None
+                return QualityGateResult(
+                    deliberation=f"Godot syntax verification failed: {diag.error_message if diag else 'compiler error'}",
+                    gate_name="Gate A: AST & Entrypoint",
+                    passed=False,
+                    failure_type=GateFailureType.SYNTAX_AST_ERROR,
+                    details=f"GDScript syntax/compile error: {diag.error_message if diag else 'unknown'}",
+                    diagnostic_data={
+                        "file_path": str(diag.file_path) if diag else str(candidate_dir),
+                        "line_number": diag.line_number if diag else 1,
+                        "raw_line": diag.raw_line if diag else "",
+                    },
+                )
+            return QualityGateResult(
+                deliberation="Godot 4 cartridge passed syntax verification and root scene validation.",
+                gate_name="Gate A: AST & Entrypoint",
+                passed=True,
+                failure_type=GateFailureType.NONE,
+                details="Godot 4 cartridge passed headless syntax and entrypoint checks.",
+                diagnostic_data={"godot": True, "entrypoint": "main.tscn"},
+            )
+
         py_files = list(candidate_dir.rglob("*.py"))
         if not py_files:
             return QualityGateResult(
@@ -719,9 +1125,33 @@ class BuildSupervisor:
     def verify_gate_c_headless_execution(
         self,
         candidate_dir: Path,
-        max_ticks: int = 60,
+        max_ticks: int = 120,
     ) -> Tuple[QualityGateResult, Optional[Any]]:
         """Gate C: Spins up headless simulation, steps discrete ticks with synthetic inputs, tracks progression & exceptions."""
+        candidate_dir = Path(candidate_dir).resolve()
+        if (candidate_dir / "project.godot").is_file():
+            from engine.sim.godot_verifier import GodotHeadlessSimulator
+            sim = GodotHeadlessSimulator(cartridge_path=candidate_dir, max_ticks=max_ticks, telemetry_mode="in_memory")
+            try:
+                sim.run_until_complete(max_steps=max_ticks)
+                return QualityGateResult(
+                    deliberation="Headless Godot simulation executed without errors.",
+                    gate_name="Gate C: Headless Execution & Progression",
+                    passed=True,
+                    failure_type=GateFailureType.NONE,
+                    details=f"Godot headless simulation completed {sim.ticks_executed} ticks.",
+                    diagnostic_data={"godot": True, "ticks": sim.ticks_executed},
+                ), sim
+            except Exception as exc:
+                return QualityGateResult(
+                    deliberation=f"Godot headless simulation error: {exc}",
+                    gate_name="Gate C: Headless Execution & Progression",
+                    passed=False,
+                    failure_type=GateFailureType.UNHANDLED_EXCEPTION,
+                    details=str(exc),
+                    diagnostic_data={"traceback": str(exc)},
+                ), None
+
         os.environ["SDL_VIDEODRIVER"] = "dummy"
         os.environ["SDL_AUDIODRIVER"] = "dummy"
 
@@ -897,6 +1327,32 @@ class BuildSupervisor:
 
     def verify_gate_a_syntax_and_ast(self, cartridge_dir: Path) -> QualityGateResult:
         """Gate A: Checks AST security invariants and bytecode compilation."""
+        cartridge_dir = Path(cartridge_dir).resolve()
+        if (cartridge_dir / "project.godot").is_file():
+            from engine.sim.godot_verifier import verify_godot_cartridge_syntax
+            is_valid, diagnostics = verify_godot_cartridge_syntax(cartridge_dir)
+            if not is_valid:
+                diag = diagnostics[0] if diagnostics else None
+                return QualityGateResult(
+                    deliberation=f"Godot syntax verification failed: {diag.error_message if diag else 'compiler error'}",
+                    gate_name="Gate A: Syntax & AST",
+                    passed=False,
+                    failure_type=GateFailureType.SYNTAX_AST_ERROR,
+                    details=f"GDScript error: {diag.error_message if diag else 'compiler error'}",
+                    diagnostic_data={
+                        "file_path": str(diag.file_path) if diag else str(cartridge_dir),
+                        "line_number": diag.line_number if diag else 1,
+                    },
+                )
+            return QualityGateResult(
+                deliberation="Godot 4 cartridge passed syntax verification.",
+                gate_name="Gate A: Syntax & AST",
+                passed=True,
+                failure_type=GateFailureType.NONE,
+                details="Godot 4 cartridge passed headless syntax and AST checks.",
+                diagnostic_data={"godot": True},
+            )
+
         py_files = list(candidate_file for candidate_file in cartridge_dir.glob("*.py"))
         if not py_files:
             return QualityGateResult(
@@ -1285,6 +1741,25 @@ class BuildSupervisor:
                 if sub_target.exists():
                     shutil.rmtree(sub_target)
                 shutil.copytree(item, sub_target)
+
+        # Also sync the latest matching checkpoint snapshot in cartridges/checkpoints/ if present
+        checkpoints_root = self.cartridges_root / "checkpoints"
+        if checkpoints_root.is_dir():
+            matching_ckpts = sorted(
+                [p for p in checkpoints_root.iterdir() if p.is_dir() and p.name.startswith(candidate_path.name)]
+            )
+            if matching_ckpts:
+                latest_ckpt = matching_ckpts[-1]
+                for item in candidate_path.iterdir():
+                    if item.name.startswith(".") or item.name == "checkpoint_metadata.json":
+                        continue
+                    if item.is_file():
+                        shutil.copy2(item, latest_ckpt / item.name)
+                    elif item.is_dir():
+                        sub_dst = latest_ckpt / item.name
+                        if sub_dst.exists():
+                            shutil.rmtree(sub_dst)
+                        shutil.copytree(item, sub_dst)
 
     # =========================================================================
     # Closed-Loop Self-Healing Logic

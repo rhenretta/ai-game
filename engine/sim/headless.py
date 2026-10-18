@@ -190,17 +190,33 @@ class SimulationInput:
         fire: bool = False,
         aim_x: float = 0.0,
         aim_y: float = 0.0,
+        **kwargs: Any,
     ):
         self.deliberation = deliberation
+        if kwargs.get("right"):
+            move_x = 1.0
+        elif kwargs.get("left"):
+            move_x = -1.0
+        if kwargs.get("down"):
+            move_y = 1.0
+        elif kwargs.get("up"):
+            move_y = -1.0
+        if kwargs.get("action_1"):
+            fire = True
+        if kwargs.get("space"):
+            dash = True
+
         self.move_x = float(move_x)
         self.move_y = float(move_y)
         self.dash = bool(dash)
         self.fire = bool(fire)
         self.aim_x = float(aim_x)
         self.aim_y = float(aim_y)
+        for k, v in kwargs.items():
+            setattr(self, k, v)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "deliberation": self.deliberation,
             "move_x": self.move_x,
             "move_y": self.move_y,
@@ -209,6 +225,10 @@ class SimulationInput:
             "aim_x": self.aim_x,
             "aim_y": self.aim_y,
         }
+        for k, v in self.__dict__.items():
+            if k not in d:
+                d[k] = v
+        return d
 
 
 class SimulationStepResult:

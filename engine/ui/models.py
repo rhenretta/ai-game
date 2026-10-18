@@ -3,8 +3,11 @@ Epistemic data contracts and response models for Studio Observability UI.
 Strictly declares deliberation first across all models (field index 0).
 """
 from __future__ import annotations
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from pathlib import Path
+from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
+import uuid
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -25,6 +28,11 @@ class SwarmEventType(str, Enum):
     CONNECTED = "connected"
     ECHO = "echo"
     GENESIS_TRIGGERED = "genesis_triggered"
+    REQUIREMENTS_SPEC_GENERATED = "REQUIREMENTS_SPEC_GENERATED"
+    REQUIREMENT_STATUS_UPDATE = "REQUIREMENT_STATUS_UPDATE"
+    CHALLENGER_GATE_VERDICT = "CHALLENGER_GATE_VERDICT"
+    AGENT_TASK_RECORD = "AGENT_TASK_RECORD"
+    CHECKPOINT_VERIFIED = "CHECKPOINT_VERIFIED"
 
 
 class PEVCycleInfo(BaseModel):
@@ -308,5 +316,344 @@ class SteamDNAResponse(BaseModel):
 TelemetryDashboardResponse.model_rebuild()
 ArtifactInventoryResponse.model_rebuild()
 SteamDNAResponse.model_rebuild()
+
+
+class RequirementsSpecPayload(BaseModel):
+    """Payload for REQUIREMENTS_SPEC_GENERATED swarm events."""
+    deliberation: str = Field(..., min_length=1, description="Epistemic rationale on generated requirements specification")
+
+    @field_validator("deliberation")
+    @classmethod
+    def validate_deliberation(cls, v: str) -> str:
+        return _validate_deliberation(v)
+
+    spec: Dict[str, Any] = Field(default_factory=dict, description="Full serialized GameRequirementsSpec dictionary")
+    spec_id: Optional[str] = Field(default=None, description="Requirements specification ID")
+    game_title: Optional[str] = Field(default=None, description="Title of the conceived game")
+    total_requirements: int = Field(default=0, description="Total count of requirement tracks")
+
+
+class RequirementStatusPayload(BaseModel):
+    """Payload for REQUIREMENT_STATUS_UPDATE swarm events."""
+    deliberation: str = Field(..., min_length=1, description="Epistemic rationale on requirement track execution state")
+
+    @field_validator("deliberation")
+    @classmethod
+    def validate_deliberation(cls, v: str) -> str:
+        return _validate_deliberation(v)
+
+    requirement_id: str = Field(default="", description="Requirement identifier, e.g. R1")
+    status: str = Field(default="pending", description="Requirement status (pending, in_progress, completed, rejected)")
+    metrics: Dict[str, Any] = Field(default_factory=dict, description="Execution and verification metrics")
+    track_title: Optional[str] = Field(default=None, description="Title of the requirement track")
+
+
+class ChallengerGateVerdictPayload(BaseModel):
+    """Payload for CHALLENGER_GATE_VERDICT swarm events."""
+    deliberation: str = Field(..., min_length=1, description="Epistemic rationale on challenger gate design critic verdict")
+
+    @field_validator("deliberation")
+    @classmethod
+    def validate_deliberation(cls, v: str) -> str:
+        return _validate_deliberation(v)
+
+    candidate_id: str = Field(default="", description="Candidate build identifier")
+    passed: bool = Field(default=False, description="True if candidate satisfied 100% of requirements")
+    details: Dict[str, Any] = Field(default_factory=dict, description="Detailed critique and verification records")
+    rejection_trace: Optional[Dict[str, Any]] = Field(default=None, description="Rejection diagnostic trace if rejected")
+
+
+RequirementsSpecPayload.model_rebuild()
+RequirementStatusPayload.model_rebuild()
+ChallengerGateVerdictPayload.model_rebuild()
+
+
+class ArtifactMetadataEnvelope(BaseModel):
+    """Structured cryptographic envelope and handoff documentation for artifacts.
+    Enforces Rule 4: deliberation declared strictly first (field index 0).
+    """
+    deliberation: str = Field(..., min_length=1, description="Epistemic rationale explaining why this artifact was produced")
+
+    class _DualSealMethod:
+        deliberation: str = "Helper descriptor for dual seal invocation."
+
+        def __get__(self, instance, owner):
+            if instance is None:
+                def class_seal(*args, **kwargs):
+                    return owner._class_seal(*args, **kwargs)
+                return class_seal
+            else:
+                def instance_seal(*args, **kwargs):
+                    return instance._instance_seal(*args, **kwargs)
+                return instance_seal
+
+    @field_validator("deliberation")
+    @classmethod
+    def validate_deliberation(cls, v: str) -> str:
+        return _validate_deliberation(v)
+
+    artifact_id: str = Field(default_factory=lambda: str(uuid.uuid4()), description="Unique artifact identifier UUID")
+    artifact_name: str = Field(default="artifact", description="Canonical filename or artifact label, e.g. 'mechanics.py', 'hero.png'")
+    artifact_type: str = Field(default="code", description="Categorical artifact type: 'code', 'sprite', 'audio', 'json', 'spec', 'report'")
+    file_path: Optional[str] = Field(default=None, description="Relative or absolute filesystem path to artifact")
+    payload_path: Optional[str] = Field(default=None, description="Path to external disk file holding raw payload")
+    sha256_hash: str = Field(default="", description="Cryptographic SHA256 hex digest (64 chars) of payload or file")
+    output_sha256: Optional[str] = Field(default=None, description="Provenance tracking: SHA256 of the output artifact")
+    input_sha256: Optional[str] = Field(default=None, description="Provenance tracking: SHA256 of the predecessor input")
+    byte_size: int = Field(default=0, ge=0, description="Size of artifact in bytes")
+    created_at_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat(), description="ISO 8601 UTC timestamp")
+    sealed_at_utc: Optional[str] = Field(default=None, description="ISO 8601 UTC sealing timestamp")
+    source_agent: str = Field(default="", description="Producing specialist agent role")
+    target_agent: Optional[str] = Field(default=None, description="Intended consumer agent role")
+    metadata_summary: Dict[str, Any] = Field(default_factory=dict, description="Structured metadata summary (e.g. lines, ast_nodes, duration_s, sample_rate)")
+
+    @classmethod
+    def compute_sha256_bytes(cls, data: bytes) -> str:
+        import hashlib
+        return hashlib.sha256(data).hexdigest()
+
+    @classmethod
+    def compute_file_sha256(cls, file_path: Union[str, Path]) -> str:
+        import hashlib
+        p = Path(file_path)
+        if not p.is_file():
+            raise FileNotFoundError(f"File not found: {p}")
+        hasher = hashlib.sha256()
+        with open(p, "rb") as f:
+            while chunk := f.read(65536):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    def _instance_seal(self, file_path: Optional[Union[str, Path]] = None, artifact_name: Optional[str] = None) -> "ArtifactMetadataEnvelope":
+        target = file_path or self.file_path or self.payload_path
+        if target:
+            p = Path(target)
+            self.file_path = str(p)
+            self.payload_path = str(p)
+            if artifact_name:
+                self.artifact_name = artifact_name
+            elif not self.artifact_name or self.artifact_name == "artifact":
+                self.artifact_name = p.name
+            if p.is_file():
+                self.byte_size = p.stat().st_size
+                h = self.compute_file_sha256(p)
+                self.sha256_hash = h
+                self.output_sha256 = h
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self.created_at_utc = now_iso
+        self.sealed_at_utc = now_iso
+        return self
+
+    @classmethod
+    def _class_seal(
+        cls,
+        deliberation: str,
+        artifact_name: Optional[str] = None,
+        artifact_type: str = "code",
+        file_path: Optional[Union[str, Path]] = None,
+        payload_path: Optional[Union[str, Path]] = None,
+        payload_bytes: Optional[bytes] = None,
+        source_agent: str = "",
+        target_agent: Optional[str] = None,
+        metadata_summary: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> ArtifactMetadataEnvelope:
+        import hashlib
+        target_file = file_path or payload_path or kwargs.get("target_file")
+        calculated_hash = ""
+        byte_size = 0
+        resolved_path = None
+        if target_file:
+            p = Path(target_file)
+            resolved_path = str(p)
+            if p.is_file():
+                byte_size = p.stat().st_size
+                calculated_hash = cls.compute_file_sha256(p)
+        elif payload_bytes is not None:
+            byte_size = len(payload_bytes)
+            calculated_hash = cls.compute_sha256_bytes(payload_bytes)
+        else:
+            calculated_hash = hashlib.sha256(b"").hexdigest()
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        return cls(
+            deliberation=deliberation,
+            artifact_name=artifact_name or (Path(resolved_path).name if resolved_path else "artifact"),
+            artifact_type=str(artifact_type),
+            file_path=resolved_path,
+            payload_path=resolved_path,
+            sha256_hash=calculated_hash,
+            output_sha256=calculated_hash,
+            byte_size=byte_size,
+            created_at_utc=now_iso,
+            sealed_at_utc=now_iso,
+            source_agent=source_agent,
+            target_agent=target_agent,
+            metadata_summary=metadata_summary or {},
+        )
+
+    seal: ClassVar[Any] = _DualSealMethod()
+
+    def verify_integrity(self, file_path: Optional[Union[str, Path]] = None) -> bool:
+        target = file_path or self.file_path or self.payload_path
+        h = self.output_sha256 or self.sha256_hash
+        if not h or len(h) != 64:
+            return False
+        if target:
+            p = Path(target)
+            if not p.is_file():
+                return False
+            return self.compute_file_sha256(p) == h
+        return True
+
+
+class AgentTaskRecord(BaseModel):
+    """Structured record of an agent or subagent task, reasoning, and handoff documentation.
+    Strictly declares deliberation as field index 0 (Rule 4).
+    """
+    deliberation: str = Field(..., min_length=1, description="Epistemic rationale and reasoning executed during this task")
+
+    @field_validator("deliberation")
+    @classmethod
+    def validate_deliberation(cls, v: str) -> str:
+        return _validate_deliberation(v)
+
+    task_id: str = Field(default_factory=lambda: f"task_{uuid.uuid4().hex[:8]}", description="Unique task execution identifier (e.g. 'task_swe_r1_1a2b3c4d')")
+    agent_role: str = Field(default="StudioAgent", description="Canonical agent persona identifier (e.g. 'LeadGameplaySWEAgent')")
+    agent_name: str = Field(default="", description="Human-readable or short alias (e.g. 'GameplaySWE')")
+    requirement_id: Optional[str] = Field(default=None, description="Associated requirement track ID if applicable (e.g. 'R1')")
+    track_title: Optional[str] = Field(default=None, description="Associated requirement track title")
+    task_type: str = Field(
+        default="EXECUTION",
+        description="Categorical task type: 'PLANNING', 'SPECIFICATION', 'ASSET_SYNTHESIS', 'CODE_IMPLEMENTATION', 'INSTRUMENTATION', 'QA_VERIFICATION', 'CHALLENGER_CRITIC'",
+    )
+    status: str = Field(default="COMPLETED", description="Task lifecycle status: 'PENDING', 'IN_PROGRESS', 'COMPLETED', 'REJECTED', 'FAILED'")
+    start_time_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat(), description="ISO 8601 UTC task initiation timestamp")
+    end_time_utc: Optional[str] = Field(default=None, description="ISO 8601 UTC task completion timestamp")
+    duration_ms: Optional[float] = Field(default=None, description="Execution duration in milliseconds")
+    input_artifacts: List[Union[ArtifactMetadataEnvelope, Dict[str, Any], str]] = Field(default_factory=list, description="Handoff input artifacts consumed by this task")
+    output_artifacts: List[Union[ArtifactMetadataEnvelope, Dict[str, Any], str]] = Field(default_factory=list, description="Handoff output artifacts produced and sealed by this task")
+    verification_verdict: Optional[Dict[str, Any]] = Field(default=None, description="Verification outcome or QA gate check results")
+    diagnostic_trace: Optional[Dict[str, Any]] = Field(default=None, description="Rejection diagnostic trace or error stack if failed/rejected")
+    summary: Optional[str] = Field(default=None, description="Human-readable concise summary of task accomplishments")
+
+
+class AgentTaskHistoryResponse(BaseModel):
+    """Chronological history of agent and subagent tasks with reasoning and handoffs.
+    Strictly declares deliberation as field index 0 (Rule 4).
+    """
+    deliberation: str = Field(..., min_length=1, description="Epistemic analysis of queried agent task history")
+
+    @field_validator("deliberation")
+    @classmethod
+    def validate_deliberation(cls, v: str) -> str:
+        return _validate_deliberation(v)
+
+    total_tasks: int = Field(default=0, description="Total matching tasks in store")
+    total_count: int = Field(default=0, description="Compatibility alias for total_tasks")
+    limit: int = Field(default=50, description="Applied query limit")
+    offset: int = Field(default=0, description="Applied query offset")
+    tasks: List[AgentTaskRecord] = Field(default_factory=list, description="List of chronologically ordered task records")
+    summary: Dict[str, Any] = Field(default_factory=dict, description="Summary metrics (completed, in_progress, failed, active_agents counts)")
+
+
+class RequirementsBacklogResponse(BaseModel):
+    """Live requirements backlog and per-track implementation and verification status.
+    Strictly declares deliberation as field index 0 (Rule 4).
+    """
+    deliberation: str = Field(..., min_length=1, description="Epistemic rationale on requirements specification and backlog status")
+
+    @field_validator("deliberation")
+    @classmethod
+    def validate_deliberation(cls, v: str) -> str:
+        return _validate_deliberation(v)
+
+    has_active_spec: bool = Field(default=False, description="True if a valid GameRequirementsSpec exists")
+    has_spec: bool = Field(default=False, description="Compatibility alias for has_active_spec")
+    spec_id: Optional[str] = Field(default=None, description="Unique requirements spec ID")
+    game_title: str = Field(default="", description="Title of the conceived game")
+    genre_paradigm: str = Field(default="", description="Genre classification or blend")
+    target_episode: int = Field(default=0, description="Target build episode")
+    total_tracks: int = Field(default=0, description="Total requirement tracks")
+    total_requirements: int = Field(default=0, description="Compatibility alias for total_tracks")
+    completed_tracks: int = Field(default=0, description="Tracks with status 'completed' or 'satisfied'")
+    completed_requirements: int = Field(default=0, description="Compatibility alias for completed_tracks")
+    in_progress_tracks: int = Field(default=0, description="Tracks currently 'in_progress'")
+    pending_tracks: int = Field(default=0, description="Tracks awaiting implementation")
+    rejected_tracks: int = Field(default=0, description="Tracks rejected by Challenger gate")
+    progress_percentage: float = Field(default=0.0, description="Percentage of tracks satisfied (0.0 to 100.0)")
+    requirements: List[Dict[str, Any]] = Field(default_factory=list, description="Serialized RequirementTrack objects")
+    requirements_spec: Optional[Dict[str, Any]] = Field(default=None, description="Complete serialized GameRequirementsSpec object")
+    asset_manifest: List[Dict[str, Any]] = Field(default_factory=list, description="Serialized AssetRequirement objects")
+    last_updated_utc: Optional[str] = Field(default=None, description="Timestamp of latest status update")
+
+
+class AgentTaskDetailResponse(BaseModel):
+    """Detailed view of an individual agent task, full reasoning, and handoff documentation.
+    Strictly declares deliberation as field index 0 (Rule 4).
+    """
+    deliberation: str = Field(..., min_length=1, description="Epistemic evaluation of task execution and handoff validity")
+
+    @field_validator("deliberation")
+    @classmethod
+    def validate_deliberation(cls, v: str) -> str:
+        return _validate_deliberation(v)
+
+    task: Optional[AgentTaskRecord] = Field(default=None, description="Complete task execution record")
+    task_id: Optional[str] = Field(default=None, description="Direct task_id for top-level convenience")
+    handoff_documentation: Dict[str, Any] = Field(default_factory=dict, description="Detailed handoff documentation package")
+
+
+ArtifactMetadataEnvelope.model_rebuild()
+AgentTaskRecord.model_rebuild()
+AgentTaskHistoryResponse.model_rebuild()
+RequirementsBacklogResponse.model_rebuild()
+AgentTaskDetailResponse.model_rebuild()
+
+
+class VerifiedCheckpointRecord(BaseModel):
+    """Immutable metadata record for a verified incremental cartridge checkpoint.
+    Strictly declares deliberation as field index 0 (Rule 4).
+    """
+    deliberation: str = Field(..., min_length=1, description="Epistemic rationale describing the verified checkpoint")
+
+    @field_validator("deliberation")
+    @classmethod
+    def validate_deliberation(cls, v: str) -> str:
+        return _validate_deliberation(v)
+
+    checkpoint_id: str = Field(default="checkpoint_default", description="Unique checkpoint ID (e.g. candidate_genesis_8993a2_R1)")
+    candidate_id: str = Field(default="candidate_default", description="Candidate build ID")
+    requirement_id: str = Field(default="R1", description="Requirement track ID verified (e.g. R1)")
+    track_title: str = Field(default="", description="Title of the verified requirement track")
+    created_at_utc: str = Field(default="2026-10-17T00:00:00Z", description="ISO 8601 UTC creation timestamp")
+    verified_tracks: List[str] = Field(default_factory=list, description="All requirement IDs verified up to this checkpoint")
+    cartridge_path: str = Field(default="", description="Filesystem path to checkpoint cartridge directory")
+    is_active: bool = Field(default=False, description="Whether this checkpoint is currently mirrored to cartridges/active/")
+    files: List[str] = Field(default_factory=list, description="List of filenames contained in checkpoint")
+    sha256_manifest: Dict[str, str] = Field(default_factory=dict, description="Cryptographic SHA256 hashes of all checkpoint files")
+
+
+class CheckpointsResponse(BaseModel):
+    """List of all verified checkpoints available for live play.
+    Strictly declares deliberation as field index 0 (Rule 4).
+    """
+    deliberation: str = Field(..., min_length=1, description="Epistemic summary of available verified checkpoints")
+
+    @field_validator("deliberation")
+    @classmethod
+    def validate_deliberation(cls, v: str) -> str:
+        return _validate_deliberation(v)
+
+    total_checkpoints: int = Field(default=0, description="Total verified checkpoints available")
+    latest_checkpoint_id: Optional[str] = Field(default=None, description="Identifier of latest verified checkpoint")
+    checkpoints: List[VerifiedCheckpointRecord] = Field(default_factory=list, description="Chronological list of verified checkpoints")
+
+
+VerifiedCheckpointRecord.model_rebuild()
+CheckpointsResponse.model_rebuild()
+
+
+
 
 

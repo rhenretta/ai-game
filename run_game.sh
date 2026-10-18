@@ -76,9 +76,11 @@ cleanup() {
         wait "$GAME_PID" 2>/dev/null || true
     fi
 
-    # Explicit SQLite WAL flush if sqlite3 is installed and telemetry database exists
-    if command -v sqlite3 >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/data/telemetry.db" ]; then
-        sqlite3 "$SCRIPT_DIR/data/telemetry.db" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
+    # Explicit SQLite WAL flush using the verified virtualenv Python interpreter and telemetry database
+    if [ -n "${VENV_PYTHON:-}" ] && [ -x "$VENV_PYTHON" ] && [ -f "$SCRIPT_DIR/data/telemetry.db" ]; then
+        "$VENV_PYTHON" -c "import sqlite3; conn = sqlite3.connect('$SCRIPT_DIR/data/telemetry.db', timeout=1.0); conn.execute('PRAGMA wal_checkpoint(TRUNCATE);'); conn.close()" 2>/dev/null || true
+    elif [ -x /usr/bin/sqlite3 ] && [ -f "$SCRIPT_DIR/data/telemetry.db" ]; then
+        /usr/bin/sqlite3 "$SCRIPT_DIR/data/telemetry.db" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
     fi
 
     # Restore terminal state in case keyboard raw mode or curses was active

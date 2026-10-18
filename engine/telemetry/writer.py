@@ -2,6 +2,7 @@
 Background daemon thread for batched, non-blocking SQLite WAL telemetry writes.
 """
 from __future__ import annotations
+from datetime import datetime, timezone
 import logging
 import queue
 import sqlite3
@@ -34,15 +35,19 @@ class TelemetryWriterThread(threading.Thread):
         telemetry_queue: queue.Queue,
         batch_size: int = 50,
         flush_interval_sec: float = 0.1,
+        auto_register_probes: bool = False,
     ):
         super().__init__(name="TelemetryWriterThread", daemon=True)
         self.db = db
         self.queue = telemetry_queue
         self.batch_size = batch_size
         self.flush_interval_sec = flush_interval_sec
+        self.auto_register_probes = auto_register_probes
 
         self._stop_event = threading.Event()
         self._flush_event = threading.Event()
+        self.discarded_row_count: int = 0
+        self.discarded_errors: List[str] = []
         self._conn: Optional[sqlite3.Connection] = None
         self._event_insert_sql = """
             INSERT INTO telemetry_events (
@@ -85,12 +90,12 @@ class TelemetryWriterThread(threading.Thread):
                             self._drain_and_commit(batch_events, custom_batch_events)
                             break
                         elif isinstance(item, tuple) and item[0] == "REGISTER_PROBE":
+                            self._process_register_probe_command(item[1])
                             if batch_events or custom_batch_events:
                                 self._commit_batch(batch_events, custom_batch_events)
                                 batch_events.clear()
                                 custom_batch_events.clear()
                                 last_flush_time = time.perf_counter()
-                            self._process_register_probe_command(item[1])
                         elif isinstance(item, tuple) and item[0] in ("SESSION_START", "SESSION_END", "EPISODE_START", "EPISODE_END"):
                             if batch_events or custom_batch_events:
                                 self._commit_batch(batch_events, custom_batch_events)
@@ -156,16 +161,35 @@ class TelemetryWriterThread(threading.Thread):
             return
         try:
             self._conn.execute("BEGIN TRANSACTION;")
+            if custom_batch:
+                # Ensure all probe_names exist in telemetry_probes to satisfy foreign key constraint if auto_register enabled
+                if self.auto_register_probes:
+                    probes_to_ensure = {}
+                    for crow in custom_batch:
+                        p_name = crow[3]
+                        p_cat = crow[4]
+                        p_created = crow[7] if len(crow) > 7 and crow[7] else datetime.now(timezone.utc).isoformat()
+                        if p_name and p_name not in probes_to_ensure:
+                            probes_to_ensure[p_name] = (
+                                f"prb_{p_name}",
+                                p_name,
+                                p_cat or "gameplay",
+                                f"Auto-registered probe {p_name}",
+                                "H_AUTO_REGISTERED",
+                                p_created,
+                            )
+                    if probes_to_ensure:
+                        self._conn.executemany(
+                            """
+                            INSERT OR IGNORE INTO telemetry_probes (
+                                probe_id, probe_name, category, description, hypothesis_target, schema_json, created_at
+                            ) VALUES (?, ?, ?, ?, ?, '{}', ?)
+                            """,
+                            list(probes_to_ensure.values()),
+                        )
             if batch:
                 self._conn.executemany(self._event_insert_sql, batch)
             if custom_batch:
-                for crow in custom_batch:
-                    p_name = str(crow[3])
-                    p_cat = str(crow[4])
-                    self._conn.execute(
-                        "INSERT OR IGNORE INTO telemetry_probes (probe_id, probe_name, category, description, hypothesis_target, schema_json) VALUES (?, ?, ?, ?, ?, '{}');",
-                        (f"prb_{p_name}", p_name, p_cat, f"Runtime probe {p_name}", f"Behavioral telemetry for {p_name}"),
-                    )
                 self._conn.executemany(self._custom_event_insert_sql, custom_batch)
             self._conn.execute("COMMIT;")
         except Exception as err:
@@ -182,12 +206,35 @@ class TelemetryWriterThread(threading.Thread):
                         try:
                             self._conn.execute(self._event_insert_sql, row)
                         except Exception as row_err:
+                            self.discarded_row_count += 1
+                            self.discarded_errors.append(f"telemetry_events: {row_err}")
                             logger.error("Discarding single corrupted telemetry row: %s (error: %s)", row, row_err)
                 if custom_batch:
                     for crow in custom_batch:
                         try:
+                            if self.auto_register_probes:
+                                p_name = crow[3]
+                                p_cat = crow[4]
+                                p_created = crow[7] if len(crow) > 7 and crow[7] else datetime.now(timezone.utc).isoformat()
+                                self._conn.execute(
+                                    """
+                                    INSERT OR IGNORE INTO telemetry_probes (
+                                        probe_id, probe_name, category, description, hypothesis_target, schema_json, created_at
+                                    ) VALUES (?, ?, ?, ?, ?, '{}', ?)
+                                    """,
+                                    (
+                                        f"prb_{p_name}",
+                                        p_name,
+                                        p_cat or "gameplay",
+                                        f"Auto-registered probe {p_name}",
+                                        "H_AUTO_REGISTERED",
+                                        p_created,
+                                    ),
+                                )
                             self._conn.execute(self._custom_event_insert_sql, crow)
                         except Exception as crow_err:
+                            self.discarded_row_count += 1
+                            self.discarded_errors.append(f"custom_telemetry_events: {crow_err}")
                             logger.error("Discarding single corrupted custom telemetry row: %s (error: %s)", crow, crow_err)
                 self._conn.execute("COMMIT;")
             except Exception as rescue_err:
@@ -330,11 +377,11 @@ class TelemetryWriterThread(threading.Thread):
                     elif cmd == "STOP":
                         pass
                     elif cmd == "REGISTER_PROBE":
+                        self._process_register_probe_command(item[1])
                         if batch_events or custom_batch_events:
                             self._commit_batch(batch_events, custom_batch_events)
                             batch_events.clear()
                             custom_batch_events.clear()
-                        self._process_register_probe_command(item[1])
                     elif cmd in ("SESSION_START", "SESSION_END", "EPISODE_START", "EPISODE_END"):
                         if batch_events or custom_batch_events:
                             self._commit_batch(batch_events, custom_batch_events)
@@ -410,8 +457,8 @@ class TelemetryWriterThread(threading.Thread):
             logger.warning("TelemetryWriterThread did not exit within %.2fs timeout. Invoking abort.", timeout)
             self.abort()
             self.join(timeout=0.1)
-        # Defensive safeguard: ensure connection is closed if thread hung
-        if self.is_alive() and self._conn is not None:
+        # Defensive safeguard: ensure connection is closed if thread hung or connection remains open
+        if self._conn is not None:
             try:
                 self._conn.close()
             except Exception:

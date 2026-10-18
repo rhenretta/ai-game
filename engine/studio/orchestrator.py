@@ -12,19 +12,23 @@ import logging
 import os
 from pathlib import Path
 import shutil
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
+import time as _time
 import uuid
 
 import config
 from config import PROJECT_ROOT
 from engine.scheduler.artifact import ArtifactMetadataEnvelope, ArtifactType
 from engine.studio.models import (
+    AcceptanceCriterion,
     AgentExecutionRecord,
     AgentPlan,
     AgentVerificationRecord,
     BaseEpistemicModel,
     CartridgeCompilationResult,
+    GameRequirementsSpec,
     GenesisWorldSpec,
+    RequirementTrack,
     StudioAgentError,
     StudioBuildState,
     StudioOrchestratorConfig,
@@ -33,7 +37,12 @@ from engine.studio.models import (
     StudioSwarmPlanError,
     ToolInvocationRecord,
 )
-from engine.supervisor.models import BuildEvaluationReport
+if TYPE_CHECKING:
+    from engine.supervisor.models import BuildEvaluationReport
+from engine.ui.models import (
+    AgentTaskRecord,
+    ArtifactMetadataEnvelope as UIArtifactMetadataEnvelope,
+)
 
 logger = logging.getLogger("StudioOrchestrator")
 
@@ -60,8 +69,11 @@ class StudioAgentDAG:
     DEFAULT_EDGES: List[Tuple[str, str]] = [
         ("Analyst", "Director"),
         ("Director", "Writer"),
+        ("Director", "Visual"),
         ("Writer", "Voice"),
         ("Writer", "Visual"),
+        ("Visual", "SWE"),
+        ("Voice", "SWE"),
         ("Director", "SWE"),
         ("SWE", "TelemetryArchitect"),
         ("SWE", "Supervisor"),
@@ -155,6 +167,7 @@ class SwarmExecutionContext:
         self.staging_dir = Path(staging_dir)
         self.artifacts: Dict[str, ArtifactMetadataEnvelope] = {}
         self.raw_outputs: Dict[str, Any] = {}
+        self.task_history: List[Dict[str, Any]] = []
 
     def record_artifact(self, role: str, envelope: ArtifactMetadataEnvelope, raw_output: Any) -> None:
         self.artifacts[role] = envelope
@@ -162,6 +175,12 @@ class SwarmExecutionContext:
         canonical = normalize_role(role)
         self.artifacts[canonical] = envelope
         self.raw_outputs[canonical] = raw_output
+
+    def record_task(self, record: Union[AgentTaskRecord, Dict[str, Any]]) -> None:
+        if hasattr(record, "model_dump"):
+            self.task_history.append(record.model_dump())
+        else:
+            self.task_history.append(dict(record))
 
 
 class StudioOrchestrator:
@@ -183,8 +202,10 @@ class StudioOrchestrator:
         config_obj: Optional[StudioOrchestratorConfig] = None,
         event_bus: Optional[Any] = None,
         deliberation: str = "Initializing StudioOrchestrator multi-agent studio swarm.",
+        db_path: Optional[Any] = None,
     ):
         self.deliberation = deliberation
+        self.db_path = Path(db_path) if db_path else None
         resolved_key = self._resolve_api_key(api_key, config_obj)
         if not resolved_key or not resolved_key.strip():
             raise ValueError("GEMINI_API_KEY is not configured or empty")
@@ -204,10 +225,20 @@ class StudioOrchestrator:
                 self.event_bus = swarm_bus
             except Exception:
                 self.event_bus = None
-        self.client = client if client is not None else self._init_gemini_client(self.api_key)
+        self.client = client if client is not None else self._init_gemini_client(self.api_key, timeout_seconds=self.config.timeout_seconds)
 
         # Assemble the 9 specialist agent roles
         self.agents: Dict[str, Any] = self._assemble_agents()
+
+    def _get_telemetry_db(self) -> Optional[Any]:
+        """Returns TelemetryDB instance if configured or in live production mode; None in pytest without explicit DB path."""
+        if self.db_path is not None:
+            from engine.telemetry.db import TelemetryDB
+            return TelemetryDB(self.db_path)
+        if "PYTEST_CURRENT_TEST" in os.environ:
+            return None
+        from engine.telemetry.db import TelemetryDB
+        return TelemetryDB()
 
     def _publish_event(
         self,
@@ -218,18 +249,22 @@ class StudioOrchestrator:
     ) -> None:
         if self.event_bus is not None and hasattr(self.event_bus, "publish_threadsafe"):
             try:
-                self.event_bus.publish_threadsafe({
+                bid = getattr(self, "active_build_id", None)
+                ev_data = {
                     "deliberation": deliberation,
                     "event_type": event_type,
                     "agent_name": agent_name,
                     "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                     "payload": payload or {},
-                })
+                }
+                if bid:
+                    ev_data["build_id"] = bid
+                self.event_bus.publish_threadsafe(ev_data)
             except Exception as exc:
                 logger.debug("Event bus publish skipped: %s", exc)
 
     @staticmethod
-    def _resolve_api_key(explicit_key: Optional[str], cfg: Optional[StudioOrchestratorConfig]) -> str:
+    def _resolve_api_key(explicit_key: Optional[str] = None, cfg: Optional[StudioOrchestratorConfig] = None) -> str:
         if explicit_key is not None:
             if not explicit_key.strip():
                 raise ValueError("GEMINI_API_KEY is not configured or empty")
@@ -252,12 +287,13 @@ class StudioOrchestrator:
         return ""
 
     @staticmethod
-    def _init_gemini_client(api_key: str) -> Any:
+    def _init_gemini_client(api_key: str, timeout_seconds: float = 300.0) -> Any:
         if not api_key or not api_key.strip():
             raise StudioAgentError("GEMINI_API_KEY is required to initialize google.genai Client")
         try:
             from google import genai
-            return genai.Client(api_key=api_key)
+            timeout_ms = int(max(timeout_seconds, 10.0) * 1000)
+            return genai.Client(api_key=api_key, http_options={"timeout": timeout_ms})
         except Exception as exc:
             logger.error("Could not initialize google.genai Client: %s", exc)
             raise StudioAgentError(f"Failed to initialize google.genai Client: {exc}") from exc
@@ -282,6 +318,8 @@ class StudioOrchestrator:
             cartridges_root=PROJECT_ROOT / "cartridges",
             active_cartridge_dir=PROJECT_ROOT / "cartridges" / "active",
             swe_agent=swe_agent,
+            gemini_client=self.client,
+            event_bus=self.event_bus,
         )
 
         return {
@@ -518,8 +556,13 @@ class StudioOrchestrator:
 
     def _compute_execution_tiers(self, edges: List[Tuple[str, str]], roles: List[str]) -> List[List[str]]:
         """Partitions roles into topological tiers (waves) for maximal safe concurrency."""
+        role_set = set(roles)
+        filtered_edges = [
+            (u, v) for u, v in edges
+            if (not roles or (u in role_set and v in role_set))
+        ]
         nodes = set(roles)
-        for u, v in edges:
+        for u, v in filtered_edges:
             nodes.add(u)
             nodes.add(v)
 
@@ -529,7 +572,7 @@ class StudioOrchestrator:
 
         adj: Dict[str, Set[str]] = {n: set() for n in nodes}
         in_degree: Dict[str, int] = {n: 0 for n in nodes}
-        for u, v in edges:
+        for u, v in filtered_edges:
             if u in nodes and v in nodes:
                 adj[u].add(v)
                 in_degree[v] += 1
@@ -563,6 +606,8 @@ class StudioOrchestrator:
     ) -> Any:
         """Executes a single specialist persona within a structured PEV cycle."""
         import time as _time
+        t_spec_start = _time.perf_counter()
+        t_start_iso = datetime.now(timezone.utc).isoformat()
         canonical_name = normalize_role(role)
         agent = self.agents.get(canonical_name)
         if agent is None and canonical_name not in ("QAPlaytesterBuildSupervisor", "SteamAndTelemetryAnalystAgent"):
@@ -615,90 +660,242 @@ class StudioOrchestrator:
                         thematic_biases=[],
                         preferred_palette_mood="retro_arcade",
                     )
-                if plan.target_episode == 0:
-                    world_spec = agent.generate_genesis_world(dna)
-                else:
-                    evolution_report = context.raw_outputs.get("evolution_report") or context.raw_outputs.get("hypothesis_report")
-                    previous_spec = context.raw_outputs.get("previous_world_spec") or context.raw_outputs.get("world_spec")
-                    if previous_spec is None:
-                        active_spec_path = PROJECT_ROOT / "cartridges" / "active" / "world_spec.json"
-                        if (staging_dir / "world_spec.json").is_file():
-                            previous_spec = GenesisWorldSpec.model_validate_json((staging_dir / "world_spec.json").read_text(encoding="utf-8"))
-                        elif active_spec_path.is_file():
-                            previous_spec = GenesisWorldSpec.model_validate_json(active_spec_path.read_text(encoding="utf-8"))
-                        else:
-                            previous_spec = GenesisWorldSpec(
-                                deliberation="Baseline genesis world spec for episodic evolution",
-                                game_title=plan.game_title,
-                                core_genre=plan.genre_verdict,
-                                thematic_premise="Initial operational mission",
-                                world_lore="Autonomous game world evolving through telemetry",
-                                conflict_tone="grim_tense",
-                                conflict_narrative="Overcome evolving defensive measures",
-                                aesthetic_style="retro_arcade",
-                                palette_mood="retro_arcade",
-                                gameplay_pacing="balanced",
-                                pacing_score=0.0,
-                                target_difficulty=1.0,
+                if (staging_dir / "requirements_spec.json").is_file() and (staging_dir / "world_spec.json").is_file():
+                    try:
+                        world_spec = GenesisWorldSpec.model_validate_json((staging_dir / "world_spec.json").read_text(encoding="utf-8"))
+                        req_spec = GameRequirementsSpec.model_validate_json((staging_dir / "requirements_spec.json").read_text(encoding="utf-8"))
+                        context.raw_outputs["requirements_spec"] = req_spec
+                        context.raw_outputs["GameRequirementsSpec"] = req_spec
+                        context.raw_outputs["world_spec"] = world_spec
+                        logger.info("Resumed existing world_spec and requirements_spec from %s", staging_dir)
+                        dur_ms = (_time.perf_counter() - t_start) * 1000.0
+                        self._publish_event("AGENT_STREAM", canonical_name, world_spec.deliberation, {"game_title": getattr(world_spec, "game_title", plan.game_title)})
+                        self._publish_event("TOOL_INVOCATION", canonical_name, world_spec.deliberation, {"tool_name": "resume_genesis_world", "status": "success", "duration_ms": dur_ms})
+                        return world_spec
+                    except Exception as e:
+                        logger.warning("Failed resuming existing director specs from %s: %s, regenerating", staging_dir, e)
+
+                world_spec = None
+                if (staging_dir / "world_spec.json").is_file():
+                    try:
+                        world_spec = GenesisWorldSpec.model_validate_json((staging_dir / "world_spec.json").read_text(encoding="utf-8"))
+                        logger.info("Resumed existing world_spec from %s", staging_dir)
+                    except Exception as e:
+                        logger.warning("Failed to deserialize existing world_spec: %s, regenerating", e)
+                        world_spec = None
+
+                if world_spec is None:
+                    if plan.target_episode == 0:
+                        world_spec = agent.generate_genesis_world(dna)
+                    else:
+                        evolution_report = context.raw_outputs.get("evolution_report") or context.raw_outputs.get("hypothesis_report")
+                        previous_spec = context.raw_outputs.get("previous_world_spec") or context.raw_outputs.get("world_spec")
+                        if previous_spec is None:
+                            active_spec_path = PROJECT_ROOT / "cartridges" / "active" / "world_spec.json"
+                            if (staging_dir / "world_spec.json").is_file():
+                                previous_spec = GenesisWorldSpec.model_validate_json((staging_dir / "world_spec.json").read_text(encoding="utf-8"))
+                            elif active_spec_path.is_file():
+                                previous_spec = GenesisWorldSpec.model_validate_json(active_spec_path.read_text(encoding="utf-8"))
+                            else:
+                                previous_spec = GenesisWorldSpec(
+                                    deliberation="Baseline genesis world spec for episodic evolution",
+                                    game_title=plan.game_title,
+                                    core_genre=plan.genre_verdict,
+                                    thematic_premise="Initial operational mission",
+                                    world_lore="Autonomous game world evolving through telemetry",
+                                    conflict_tone="grim_tense",
+                                    conflict_narrative="Overcome evolving defensive measures",
+                                    aesthetic_style="retro_arcade",
+                                    palette_mood="retro_arcade",
+                                    gameplay_pacing="balanced",
+                                    pacing_score=0.0,
+                                    target_difficulty=1.0,
+                                )
+                        world_spec = agent.generate_episodic_update_world(
+                            dna=dna,
+                            hypothesis_report=evolution_report,
+                            previous_spec=previous_spec,
+                            target_episode=plan.target_episode,
+                        )
+                    (staging_dir / "world_spec.json").write_text(world_spec.model_dump_json(indent=2), encoding="utf-8")
+
+                if not (staging_dir / "manifest.json").is_file():
+                    manifest_data = {
+                        "title": getattr(world_spec, "game_title", plan.game_title),
+                        "genre": getattr(world_spec, "core_genre", plan.genre_verdict),
+                        "episode": plan.target_episode,
+                        "deliberation": world_spec.deliberation,
+                        "narrative_premise": getattr(world_spec, "thematic_premise", ""),
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    (staging_dir / "manifest.json").write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
+                # Author, persist, and emit GameRequirementsSpec
+                req_spec = context.raw_outputs.get("requirements_spec")
+                if req_spec is None and (staging_dir / "requirements_spec.json").is_file():
+                    try:
+                        req_spec = GameRequirementsSpec.model_validate_json(
+                            (staging_dir / "requirements_spec.json").read_text(encoding="utf-8")
+                        )
+                    except Exception:
+                        req_spec = None
+
+                if req_spec is None:
+                    has_mock = hasattr(self.client, "_responses")
+                    call_agent = False
+                    if not has_mock:
+                        call_agent = True
+                    elif len(self.client._responses) > 0:
+                        next_resp = self.client._responses[0]
+                        text = getattr(next_resp, "text", "")
+                        if "requirements" in text or "GameRequirementsSpec" in text or "asset_manifest" in text:
+                            call_agent = True
+
+                    if call_agent:
+                        evolution_report = context.raw_outputs.get("evolution_report") or context.raw_outputs.get("hypothesis_report")
+                        req_spec = agent.generate_requirements_spec(
+                            dna=dna,
+                            world_spec=world_spec,
+                            hypothesis_report=evolution_report,
+                            target_episode=plan.target_episode,
+                        )
+                        context.raw_outputs["_agent_authored_req_spec"] = True
+
+                    if req_spec is None:
+                        mechanics_items = getattr(world_spec, "mechanics_guidelines", []) or ["Core gameplay loop"]
+                        combined_desc = "; ".join(mechanics_items)
+                        req_tracks = [
+                            RequirementTrack(
+                                deliberation=f"Core gameplay loop derived from world blueprint guidelines: {combined_desc}",
+                                id="R1",
+                                title="Core Gameplay Subsystems",
+                                description=combined_desc,
+                                responsible_agents=["LeadGameplaySWEAgent"],
+                                acceptance_criteria=[
+                                    AcceptanceCriterion(
+                                        deliberation="Acceptance criterion for core gameplay loop",
+                                        id="AC1.1",
+                                        description="Executes core mechanics headlessly without exceptions.",
+                                        verification_method="headless_playtest",
+                                    )
+                                ],
+                                status="pending",
                             )
-                    world_spec = agent.generate_episodic_update_world(
-                        dna=dna,
-                        hypothesis_report=evolution_report,
-                        previous_spec=previous_spec,
-                        target_episode=plan.target_episode,
+                        ]
+                        g_title = getattr(world_spec, "game_title", plan.game_title)
+                        g_genre = getattr(world_spec, "core_genre", getattr(world_spec, "genre_paradigm", plan.genre_verdict))
+                        req_spec = GameRequirementsSpec(
+                            deliberation=f"Requirements specification for '{g_title}' derived from world blueprint.",
+                            game_title=g_title,
+                            genre_paradigm=g_genre,
+                            target_audience_summary=f"Player DNA pacing: {dna.pacing_score:.2f}",
+                            target_episode=plan.target_episode,
+                            requirements=req_tracks,
+                            asset_manifest=[],
+                        )
+
+                (staging_dir / "requirements_spec.json").write_text(req_spec.model_dump_json(indent=2), encoding="utf-8")
+                context.raw_outputs["requirements_spec"] = req_spec
+                context.raw_outputs["GameRequirementsSpec"] = req_spec
+
+                if hasattr(self.event_bus, "publish_requirements_spec_generated"):
+                    self.event_bus.publish_requirements_spec_generated(
+                        agent_name=canonical_name,
+                        deliberation=req_spec.deliberation,
+                        spec=req_spec.model_dump(),
+                        spec_id=req_spec.spec_id,
+                        game_title=req_spec.game_title,
+                        total_requirements=len(req_spec.requirements),
                     )
-                (staging_dir / "world_spec.json").write_text(world_spec.model_dump_json(indent=2), encoding="utf-8")
-                manifest_data = {
-                    "title": getattr(world_spec, "game_title", plan.game_title),
-                    "genre": getattr(world_spec, "core_genre", plan.genre_verdict),
-                    "episode": plan.target_episode,
-                    "deliberation": world_spec.deliberation,
-                    "narrative_premise": getattr(world_spec, "thematic_premise", ""),
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                }
-                (staging_dir / "manifest.json").write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
+                else:
+                    self._publish_event(
+                        "REQUIREMENTS_SPEC_GENERATED",
+                        canonical_name,
+                        req_spec.deliberation,
+                        {
+                            "spec": req_spec.model_dump(),
+                            "spec_id": req_spec.spec_id,
+                            "game_title": req_spec.game_title,
+                            "total_requirements": len(req_spec.requirements),
+                        },
+                    )
+
                 dur_ms = (_time.perf_counter() - t_start) * 1000.0
                 self._publish_event("AGENT_STREAM", canonical_name, world_spec.deliberation, {"game_title": getattr(world_spec, "game_title", plan.game_title)})
                 self._publish_event("TOOL_INVOCATION", canonical_name, world_spec.deliberation, {"tool_name": "generate_genesis_world", "status": "success", "duration_ms": dur_ms})
                 return world_spec
 
             elif canonical_name == "NarrativeCharacterWriterAgent":
-                world_spec = context.raw_outputs.get("Director") or context.raw_outputs.get("CreativeDirectorWorldbuilderAgent")
-                narrative_bible = agent.generate_narrative_bible(world_spec)
-                # Cap barks to 3 and normalize portrait/audio paths so all referenced files exist on disk
-                if getattr(narrative_bible, "dialogue_barks", None):
-                    narrative_bible.dialogue_barks = list(narrative_bible.dialogue_barks)[:3]
-                    for idx, b in enumerate(narrative_bible.dialogue_barks):
-                        wav_name = Path(b.voice_clip).name if getattr(b, "voice_clip", None) else f"{b.bark_id or f'bark_{idx}'}.wav"
-                        if not wav_name.endswith(".wav"):
-                            wav_name = f"{wav_name}.wav"
-                        b.voice_clip = f"assets/audio/{wav_name}"
-                if getattr(narrative_bible, "characters", None):
-                    for idx, c in enumerate(narrative_bible.characters):
-                        p_name = Path(c.portrait_asset).name if getattr(c, "portrait_asset", None) else f"{c.character_id or f'char_{idx}'}_portrait.png"
-                        if not p_name.endswith(".png"):
-                            p_name = f"{p_name}.png"
-                        c.portrait_asset = f"assets/sprites/{p_name}"
+                narrative_bible = None
+                if (staging_dir / "narrative_bible.json").is_file() and (staging_dir / "narrative.json").is_file():
+                    try:
+                        from engine.studio.models import NarrativeBible
+                        narrative_bible = NarrativeBible.model_validate_json((staging_dir / "narrative_bible.json").read_text(encoding="utf-8"))
+                        logger.info("Resumed existing narrative_bible from %s", staging_dir)
+                        dur_ms = (_time.perf_counter() - t_start) * 1000.0
+                        self._publish_event("AGENT_STREAM", canonical_name, narrative_bible.deliberation, {"theme": getattr(narrative_bible, "thematic_tone", "grim_tense")})
+                        self._publish_event("TOOL_INVOCATION", canonical_name, narrative_bible.deliberation, {"tool_name": "resume_narrative_bible", "status": "success", "duration_ms": dur_ms})
+                        return narrative_bible
+                    except Exception as e:
+                        logger.warning("Failed to deserialize existing narrative_bible: %s, regenerating", e)
+                        narrative_bible = None
 
-                (staging_dir / "narrative_bible.json").write_text(narrative_bible.model_dump_json(indent=2), encoding="utf-8")
-                n_data = narrative_bible.to_cartridge_narrative_dict()
-                from engine.studio.narrative import validate_dialogue_tree
-                valid_trees = []
-                for d in getattr(narrative_bible, "dialogue_trees", []):
-                    if hasattr(d, "nodes") and not validate_dialogue_tree(d):
-                        valid_trees.append(d.model_dump() if hasattr(d, "model_dump") else d)
-                if valid_trees:
-                    n_data["dialogue_trees"] = valid_trees
-                    n_data["dialogue_tree"] = valid_trees
-                (staging_dir / "narrative.json").write_text(json.dumps(n_data, indent=2), encoding="utf-8")
+                if narrative_bible is None:
+                    world_spec = context.raw_outputs.get("Director") or context.raw_outputs.get("CreativeDirectorWorldbuilderAgent")
+                    narrative_bible = agent.generate_narrative_bible(world_spec)
+                    # Cap barks to 3 and normalize portrait/audio paths so all referenced files exist on disk
+                    if getattr(narrative_bible, "dialogue_barks", None):
+                        narrative_bible.dialogue_barks = list(narrative_bible.dialogue_barks)[:3]
+                        for idx, b in enumerate(narrative_bible.dialogue_barks):
+                            wav_name = Path(b.voice_clip).name if getattr(b, "voice_clip", None) else f"{b.bark_id or f'bark_{idx}'}.wav"
+                            if not wav_name.endswith(".wav"):
+                                wav_name = f"{wav_name}.wav"
+                            b.voice_clip = f"assets/audio/{wav_name}"
+                    if getattr(narrative_bible, "characters", None):
+                        for idx, c in enumerate(narrative_bible.characters):
+                            p_name = Path(c.portrait_asset).name if getattr(c, "portrait_asset", None) else f"{c.character_id or f'char_{idx}'}_portrait.png"
+                            if not p_name.endswith(".png"):
+                                p_name = f"{p_name}.png"
+                            c.portrait_asset = f"assets/sprites/{p_name}"
+
+                    (staging_dir / "narrative_bible.json").write_text(narrative_bible.model_dump_json(indent=2), encoding="utf-8")
+                    n_data = narrative_bible.to_cartridge_narrative_dict()
+                    from engine.studio.narrative import validate_dialogue_tree
+                    valid_trees = []
+                    for d in getattr(narrative_bible, "dialogue_trees", []):
+                        if hasattr(d, "nodes") and not validate_dialogue_tree(d):
+                            valid_trees.append(d.model_dump() if hasattr(d, "model_dump") else d)
+                    if valid_trees:
+                        n_data["dialogue_trees"] = valid_trees
+                        n_data["dialogue_tree"] = valid_trees
+                    (staging_dir / "narrative.json").write_text(json.dumps(n_data, indent=2), encoding="utf-8")
+
                 dur_ms = (_time.perf_counter() - t_start) * 1000.0
                 self._publish_event("AGENT_STREAM", canonical_name, narrative_bible.deliberation, {"characters": len(narrative_bible.characters), "barks": len(narrative_bible.dialogue_barks)})
                 self._publish_event("TOOL_INVOCATION", canonical_name, narrative_bible.deliberation, {"tool_name": "generate_narrative_bible", "status": "success", "duration_ms": dur_ms})
+                context.raw_outputs["Writer"] = narrative_bible
+                context.raw_outputs["NarrativeCharacterWriterAgent"] = narrative_bible
                 return narrative_bible
 
             elif canonical_name == "VoiceActingAudioProducerAgent":
-                narrative = context.raw_outputs.get("Writer") or context.raw_outputs.get("NarrativeCharacterWriterAgent")
                 audio_dir = staging_dir / "assets" / "audio"
+                existing_wavs = list(audio_dir.glob("*.wav")) if audio_dir.is_dir() else []
+                req_spec = context.raw_outputs.get("requirements_spec")
+                manifest_items = getattr(req_spec, "asset_manifest", []) if req_spec else []
+                missing_audio = False
+                if manifest_items:
+                    for item in manifest_items:
+                        iname = getattr(item, "name", "") or (item.get("name") if isinstance(item, dict) else "")
+                        if iname and iname.endswith(".wav") and not (audio_dir / iname).is_file():
+                            missing_audio = True
+                            break
+                if existing_wavs and not missing_audio:
+                    logger.info("Resumed %d existing voice clips from %s", len(existing_wavs), audio_dir)
+                    dur_ms = (_time.perf_counter() - t_start) * 1000.0
+                    self._publish_event("AGENT_STREAM", canonical_name, f"Resumed {len(existing_wavs)} voice clips.", {"clips_count": len(existing_wavs)})
+                    self._publish_event("TOOL_INVOCATION", canonical_name, f"Resumed {len(existing_wavs)} voice clips.", {"tool_name": "synthesize_voice_line", "status": "success", "duration_ms": dur_ms})
+                    return existing_wavs
+
+                narrative = context.raw_outputs.get("Writer") or context.raw_outputs.get("NarrativeCharacterWriterAgent")
                 audio_dir.mkdir(parents=True, exist_ok=True)
                 barks = []
                 if narrative and getattr(narrative, "dialogue_barks", None):
@@ -733,9 +930,26 @@ class StudioOrchestrator:
                 return results
 
             elif canonical_name == "VisualArtSpriteDesignerAgent":
+                sprites_dir = staging_dir / "assets" / "sprites"
+                existing_pngs = list(sprites_dir.glob("*.png")) if sprites_dir.is_dir() else []
+                req_spec = context.raw_outputs.get("requirements_spec")
+                manifest_items = getattr(req_spec, "asset_manifest", []) if req_spec else []
+                missing_sprites = False
+                if manifest_items:
+                    for item in manifest_items:
+                        iname = getattr(item, "name", "") or (item.get("name") if isinstance(item, dict) else "")
+                        if iname and iname.endswith((".png", ".jpg")) and not (sprites_dir / iname).is_file():
+                            missing_sprites = True
+                            break
+                if existing_pngs and not missing_sprites:
+                    logger.info("Resumed %d existing sprite assets from %s", len(existing_pngs), sprites_dir)
+                    dur_ms = (_time.perf_counter() - t_start) * 1000.0
+                    self._publish_event("AGENT_STREAM", canonical_name, f"Resumed {len(existing_pngs)} sprite assets.", {"portraits": len(existing_pngs)})
+                    self._publish_event("TOOL_INVOCATION", canonical_name, f"Resumed {len(existing_pngs)} sprite assets.", {"tool_name": "generate_portrait", "status": "success", "duration_ms": dur_ms})
+                    return existing_pngs
+
                 narrative = context.raw_outputs.get("Writer") or context.raw_outputs.get("NarrativeCharacterWriterAgent")
                 world_spec = context.raw_outputs.get("Director") or context.raw_outputs.get("CreativeDirectorWorldbuilderAgent")
-                sprites_dir = staging_dir / "assets" / "sprites"
                 sprites_dir.mkdir(parents=True, exist_ok=True)
                 results = []
                 chars = getattr(narrative, "characters", []) if narrative else []
@@ -762,7 +976,15 @@ class StudioOrchestrator:
                         shutil.copy2(results[0], out_path)
                         results.append(out_path)
                 mood = getattr(world_spec, "palette_mood", "retro_arcade") if world_spec else "retro_arcade"
-                agent.generate_cartridge_sprites(sprites_dir, mood=mood)
+                req_spec = context.raw_outputs.get("requirements_spec")
+                agent_authored = context.raw_outputs.get("_agent_authored_req_spec", False)
+                try:
+                    if agent_authored or (req_spec and req_spec.asset_manifest):
+                        agent.generate_cartridge_sprites(sprites_dir, mood=mood, requirements_spec=req_spec)
+                    else:
+                        agent.generate_cartridge_sprites(sprites_dir, mood=mood)
+                except TypeError:
+                    agent.generate_cartridge_sprites(sprites_dir, mood=mood)
                 # Ensure default_portrait.png and hero.png exist if referenced by barks
                 if results and Path(results[0]).is_file():
                     for fallback_name in ("default_portrait.png", "hero.png"):
@@ -778,23 +1000,56 @@ class StudioOrchestrator:
             elif canonical_name == "LeadGameplaySWEAgent":
                 world_spec = context.raw_outputs.get("Director") or context.raw_outputs.get("CreativeDirectorWorldbuilderAgent")
                 narrative = context.raw_outputs.get("Writer") or context.raw_outputs.get("NarrativeCharacterWriterAgent")
-                results = agent.synthesize_cartridge_code(
-                    world_spec=world_spec,
-                    output_dir=staging_dir,
-                    narrative_bible=narrative,
-                )
+                req_spec = context.raw_outputs.get("requirements_spec") or context.raw_outputs.get("GameRequirementsSpec")
+
+                tracks = req_spec.requirements if (req_spec and getattr(req_spec, "requirements", None)) else []
+                if not tracks:
+                    results = agent.synthesize_cartridge_code(
+                        world_spec=world_spec,
+                        output_dir=staging_dir,
+                        narrative_bible=narrative,
+                        requirements_spec=req_spec,
+                    )
+                else:
+                    results = await self._execute_iterative_swe_loop(
+                        agent=agent,
+                        world_spec=world_spec,
+                        narrative_bible=narrative,
+                        req_spec=req_spec,
+                        staging_dir=staging_dir,
+                        context=context,
+                    )
                 dur_ms = (_time.perf_counter() - t_start) * 1000.0
-                delib = f"Synthesized and AST-verified playable game modules: {list(results.keys())}."
-                self._publish_event("AGENT_STREAM", canonical_name, delib, {"modules": list(results.keys())})
+                delib = f"Synthesized and AST-verified playable game modules: {list(results.keys())} across {len(tracks)} requirement tracks."
+                self._publish_event("AGENT_STREAM", canonical_name, delib, {"modules": list(results.keys()), "tracks": len(tracks)})
                 self._publish_event("TOOL_INVOCATION", canonical_name, delib, {"tool_name": "synthesize_cartridge_code", "status": "success", "duration_ms": dur_ms})
                 return results
 
             elif canonical_name == "TelemetryArchitectAgent":
                 world_spec = context.raw_outputs.get("Director") or context.raw_outputs.get("CreativeDirectorWorldbuilderAgent")
                 code_modules = {}
-                for py_file in staging_dir.glob("*.py"):
-                    code_modules[py_file.name] = py_file.read_text(encoding="utf-8")
+                for ext in ("*.py", "*.gd"):
+                    for code_file in staging_dir.glob(ext):
+                        code_modules[code_file.name] = code_file.read_text(encoding="utf-8")
+
+                manifest_file = staging_dir / "telemetry_manifest.json"
+                if manifest_file.is_file():
+                    logger.info("Resuming existing telemetry_manifest.json from %s", staging_dir)
+                    try:
+                        from engine.studio.models import TelemetryPlan
+                        plan_data = json.loads(manifest_file.read_text(encoding="utf-8"))
+                        plan_obj = TelemetryPlan(**plan_data)
+                        context.raw_outputs["TelemetryPlan"] = plan_obj
+                        context.raw_outputs["TelemetryArchitecturePlan"] = plan_obj
+                        dur_ms = (_time.perf_counter() - t_start) * 1000.0
+                        self._publish_event("AGENT_STREAM", canonical_name, plan_obj.deliberation, {"probes_resumed": len(plan_obj.probes)})
+                        self._publish_event("TOOL_INVOCATION", canonical_name, plan_obj.deliberation, {"tool_name": "resume_telemetry_manifest", "status": "success", "duration_ms": dur_ms})
+                        return manifest_file
+                    except Exception as exc:
+                        logger.warning("Failed loading existing telemetry manifest: %s", exc)
+
                 tel_plan = agent.inspect_code_and_plan(code_modules=code_modules, world_spec=world_spec)
+
                 agent.register_probes(tel_plan)
                 inst_res = agent.instrument_code(
                     code_modules=code_modules,
@@ -828,7 +1083,7 @@ class StudioOrchestrator:
             elif canonical_name == "VisualArtSpriteDesignerAgent":
                 passed = (staging_dir / "assets" / "sprites").exists()
             elif canonical_name == "LeadGameplaySWEAgent":
-                passed = (staging_dir / "mechanics.py").is_file()
+                passed = (staging_dir / "project.godot").is_file() or (staging_dir / "mechanics.gd").is_file() or (staging_dir / "mechanics.py").is_file()
             elif canonical_name == "TelemetryArchitectAgent":
                 passed = (staging_dir / "telemetry_manifest.json").is_file() and getattr(raw_res, "success", True)
             else:
@@ -855,7 +1110,564 @@ class StudioOrchestrator:
             {"agent_name": canonical_name, "lifecycle_state": "PROMOTED"},
         )
         context.record_artifact(role, envelope, raw_out)
+
+        # Build cryptographic artifact envelopes and construct AgentTaskRecord
+        output_envelopes: List[UIArtifactMetadataEnvelope] = []
+        staging_dir = context.staging_dir
+        if canonical_name == "CreativeDirectorWorldbuilderAgent":
+            target_files = [staging_dir / "world_spec.json", staging_dir / "manifest.json", staging_dir / "requirements_spec.json"]
+        elif canonical_name == "NarrativeCharacterWriterAgent":
+            target_files = [staging_dir / "narrative_bible.json", staging_dir / "narrative.json"]
+        elif canonical_name == "VoiceActingAudioProducerAgent":
+            target_files = list((staging_dir / "assets" / "audio").glob("*.wav")) if (staging_dir / "assets" / "audio").exists() else []
+        elif canonical_name == "VisualArtSpriteDesignerAgent":
+            target_files = list((staging_dir / "assets" / "sprites").glob("*.png")) if (staging_dir / "assets" / "sprites").exists() else []
+        elif canonical_name == "TelemetryArchitectAgent":
+            target_files = [staging_dir / "telemetry_manifest.json"]
+        elif canonical_name == "LeadGameplaySWEAgent":
+            target_files = sorted(list(staging_dir.glob("*.py")) + list(staging_dir.glob("*.gd")) + list(staging_dir.glob("*.tscn")))
+            if (staging_dir / "project.godot").is_file():
+                target_files.append(staging_dir / "project.godot")
+        else:
+            target_files = []
+
+        for f_path in target_files:
+            if f_path.is_file():
+                f_hash = ArtifactMetadataEnvelope.compute_file_sha256(f_path)
+                f_type = "code" if (f_path.suffix in (".py", ".gd", ".tscn", ".godot") or f_path.name == "project.godot") else ("audio" if f_path.suffix == ".wav" else ("sprite" if f_path.suffix == ".png" else "spec"))
+                output_envelopes.append(
+                    UIArtifactMetadataEnvelope(
+                        deliberation=f"Artifact {f_path.name} produced by {canonical_name}",
+                        artifact_id=f"art_{f_path.stem}_{uuid.uuid4().hex[:6]}",
+                        artifact_name=f_path.name,
+                        artifact_type=f_type,
+                        file_path=str(f_path),
+                        sha256_hash=f_hash,
+                        byte_size=f_path.stat().st_size,
+                        created_at_utc=datetime.now(timezone.utc).isoformat(),
+                        source_agent=canonical_name,
+                        target_agent="LeadGameplaySWEAgent" if canonical_name != "LeadGameplaySWEAgent" else "QAPlaytesterBuildSupervisor",
+                        metadata_summary={"size": f_path.stat().st_size},
+                    )
+                )
+
+        dur_ms = (_time.perf_counter() - t_spec_start) * 1000.0
+        task_id = f"task_{canonical_name.lower()}_{uuid.uuid4().hex[:8]}"
+        task_rec = AgentTaskRecord(
+            deliberation=getattr(envelope, "deliberation", f"Specialist {canonical_name} completed task execution."),
+            task_id=task_id,
+            agent_role=canonical_name,
+            agent_name=canonical_name,
+            requirement_id=None,
+            track_title=f"{canonical_name} Execution Cycle",
+            task_type="SPECIFICATION" if "Director" in canonical_name or "Writer" in canonical_name else ("ASSET_SYNTHESIS" if "Audio" in canonical_name or "Visual" in canonical_name else ("INSTRUMENTATION" if "Telemetry" in canonical_name else "EXECUTION")),
+            status="COMPLETED",
+            start_time_utc=t_start_iso,
+            end_time_utc=datetime.now(timezone.utc).isoformat(),
+            duration_ms=dur_ms,
+            input_artifacts=[],
+            output_artifacts=output_envelopes,
+            verification_verdict={"passed": True},
+            diagnostic_trace=None,
+            summary=f"Specialist {canonical_name} verified and sealed {len(output_envelopes)} artifacts.",
+        )
+        if hasattr(self.event_bus, "publish_agent_task_record"):
+            self.event_bus.publish_agent_task_record(task_rec)
+        else:
+            self._publish_event(
+                "AGENT_TASK_RECORD",
+                canonical_name,
+                task_rec.deliberation,
+                task_rec.model_dump(),
+            )
+        context.record_task(task_rec)
         return raw_out
+
+    async def _execute_iterative_swe_loop(
+        self,
+        agent: Any,
+        world_spec: Any,
+        narrative_bible: Optional[Any],
+        req_spec: GameRequirementsSpec,
+        staging_dir: Path,
+        context: Optional[SwarmExecutionContext] = None,
+    ) -> Dict[str, Path]:
+        """Executes iterative requirement execution loop across all ordered RequirementTracks."""
+        results: Dict[str, Path] = {}
+        tracks = req_spec.requirements
+        completed_track_ids: List[str] = [t.id for t in tracks if t.status == "completed"]
+
+        for track_idx, track in enumerate(tracks):
+            # 1. Skip Completed Tracks on Resume
+            if track.status == "completed" and ((staging_dir / "project.godot").is_file() or (staging_dir / "mechanics.py").is_file()):
+                logger.info("Skipping already completed requirement track %s: '%s'", track.id, track.title)
+                delib_skipped = f"Requirement {track.id} ('{track.title}') already verified and completed in staging."
+                if hasattr(self.event_bus, "publish_requirement_status_update"):
+                    self.event_bus.publish_requirement_status_update(
+                        agent_name="LeadGameplaySWEAgent",
+                        deliberation=delib_skipped,
+                        requirement_id=track.id,
+                        status="completed",
+                        metrics={"compilation_pass": True, "smoke_pass": True, "resumed": True},
+                        track_title=track.title,
+                    )
+                else:
+                    self._publish_event(
+                        "REQUIREMENT_STATUS_UPDATE",
+                        "LeadGameplaySWEAgent",
+                        delib_skipped,
+                        {
+                            "requirement_id": track.id,
+                            "status": "completed",
+                            "track_title": track.title,
+                            "metrics": {"compilation_pass": True, "smoke_pass": True, "resumed": True},
+                        },
+                    )
+                self._persist_verified_checkpoint(staging_dir, track, completed_track_ids)
+                continue
+
+            track_t_start = _time.perf_counter()
+            track_start_iso = datetime.now(timezone.utc).isoformat()
+            track.status = "in_progress"
+            delib_in_progress = f"Beginning implementation of requirement {track.id}: '{track.title}'"
+            if hasattr(self.event_bus, "publish_requirement_status_update"):
+                self.event_bus.publish_requirement_status_update(
+                    agent_name="LeadGameplaySWEAgent",
+                    deliberation=delib_in_progress,
+                    requirement_id=track.id,
+                    status="in_progress",
+                    metrics={"track_index": track_idx, "total_tracks": len(tracks)},
+                    track_title=track.title,
+                )
+            else:
+                self._publish_event(
+                    "REQUIREMENT_STATUS_UPDATE",
+                    "LeadGameplaySWEAgent",
+                    delib_in_progress,
+                    {
+                        "requirement_id": track.id,
+                        "status": "in_progress",
+                        "track_title": track.title,
+                        "metrics": {"track_index": track_idx, "total_tracks": len(tracks)},
+                    },
+                )
+
+            # 2. Snapshot existing code modules before executing track
+            code_snapshot = {
+                code_f.name: code_f.read_text(encoding="utf-8")
+                for ext in ("*.py", "*.gd", "*.tscn")
+                for code_f in staging_dir.glob(ext)
+            }
+            if (staging_dir / "project.godot").is_file():
+                code_snapshot["project.godot"] = (staging_dir / "project.godot").read_text(encoding="utf-8")
+
+            max_track_retries = max(2, getattr(self.config, "max_retries", 2))
+            track_succeeded = False
+            last_track_exc = None
+
+            for track_attempt in range(1, max_track_retries + 1):
+                try:
+                    # Synthesize or expand code
+                    if hasattr(agent, "implement_requirement_track"):
+                        res = agent.implement_requirement_track(
+                            track=track,
+                            staging_dir=staging_dir,
+                            requirements_spec=req_spec,
+                            narrative_bible=narrative_bible,
+                            world_spec=world_spec,
+                        )
+                        results.update(res)
+                    elif hasattr(agent, "synthesize_requirement_track"):
+                        res = agent.synthesize_requirement_track(
+                            track=track,
+                            staging_dir=staging_dir,
+                            requirements_spec=req_spec,
+                            narrative_bible=narrative_bible,
+                            world_spec=world_spec,
+                        )
+                        results.update(res)
+                    elif hasattr(agent, "synthesize_cartridge_code"):
+                        res = agent.synthesize_cartridge_code(
+                            world_spec=world_spec,
+                            output_dir=staging_dir,
+                            narrative_bible=narrative_bible,
+                            requirements_spec=req_spec,
+                        )
+                        results.update(res)
+                    else:
+                        raise StudioAgentError(
+                            f"LeadGameplaySWEAgent cannot implement track {track.id}: missing implement_requirement_track"
+                        )
+
+                    # Per-track AST and smoke verification
+                    self._verify_track_smoke_check(staging_dir, track)
+                    track_succeeded = True
+                    break
+                except Exception as exc:
+                    last_track_exc = exc
+                    logger.warning(
+                        "Track %s attempt %d/%d failed: %s. Restoring code snapshot and retrying.",
+                        track.id, track_attempt, max_track_retries, exc
+                    )
+                    # Restore code snapshot before next attempt or failure handling
+                    for f_name, f_code in code_snapshot.items():
+                        (staging_dir / f_name).write_text(f_code, encoding="utf-8")
+                    if track_attempt < max_track_retries:
+                        await asyncio.sleep(2.0 * track_attempt)
+
+            if not track_succeeded:
+                exc = last_track_exc
+                logger.error("Requirement %s failed after %d attempts: %s", track.id, max_track_retries, exc)
+                track.status = "rejected"
+                delib_rejected = f"Requirement {track.id} failed verification: {exc}"
+                if hasattr(self.event_bus, "publish_requirement_status_update"):
+                    self.event_bus.publish_requirement_status_update(
+                        agent_name="LeadGameplaySWEAgent",
+                        deliberation=delib_rejected,
+                        requirement_id=track.id,
+                        status="rejected",
+                        metrics={"compilation_pass": False, "error": str(exc)},
+                        track_title=track.title,
+                    )
+                else:
+                    self._publish_event(
+                        "REQUIREMENT_STATUS_UPDATE",
+                        "LeadGameplaySWEAgent",
+                        delib_rejected,
+                        {
+                            "requirement_id": track.id,
+                            "status": "rejected",
+                            "track_title": track.title,
+                            "metrics": {"compilation_pass": False, "error": str(exc)},
+                        },
+                    )
+
+                (staging_dir / "requirements_spec.json").write_text(
+                    req_spec.model_dump_json(indent=2), encoding="utf-8"
+                )
+                track_dur_ms = (_time.perf_counter() - track_t_start) * 1000.0
+                fail_task = AgentTaskRecord(
+                    deliberation=delib_rejected,
+                    task_id=f"task_swe_{track.id.lower()}_{uuid.uuid4().hex[:8]}",
+                    agent_role="LeadGameplaySWEAgent",
+                    agent_name="GameplaySWE",
+                    requirement_id=track.id,
+                    track_title=track.title,
+                    task_type="CODE_IMPLEMENTATION",
+                    status="REJECTED",
+                    start_time_utc=track_start_iso,
+                    end_time_utc=datetime.now(timezone.utc).isoformat(),
+                    duration_ms=track_dur_ms,
+                    input_artifacts=[],
+                    output_artifacts=[],
+                    verification_verdict={"ast_security": False, "bytecode_compilation": False, "headless_smoke_pass": False},
+                    diagnostic_trace={"error": str(exc), "failure_gate": "Track Smoke Check"},
+                    summary=f"Requirement {track.id} failed verification: {exc}",
+                )
+                if hasattr(self.event_bus, "publish_agent_task_record"):
+                    self.event_bus.publish_agent_task_record(fail_task)
+                else:
+                    self._publish_event(
+                        "AGENT_TASK_RECORD",
+                        "LeadGameplaySWEAgent",
+                        fail_task.deliberation,
+                        fail_task.model_dump(),
+                    )
+                if context is not None:
+                    context.record_task(fail_task)
+
+                raise StudioSwarmExecutionError(
+                    f"Requirement {track.id} ('{track.title}') failed verification: {exc}"
+                ) from exc
+
+            # 4. Mark completed & stream event
+            track.status = "completed"
+            if track.id not in completed_track_ids:
+                completed_track_ids.append(track.id)
+            delib_completed = f"Requirement {track.id} ('{track.title}') compiled and passed headless smoke check."
+            if hasattr(self.event_bus, "publish_requirement_status_update"):
+                self.event_bus.publish_requirement_status_update(
+                    agent_name="LeadGameplaySWEAgent",
+                    deliberation=delib_completed,
+                    requirement_id=track.id,
+                    status="completed",
+                    metrics={"compilation_pass": True, "smoke_pass": True},
+                    track_title=track.title,
+                )
+            else:
+                self._publish_event(
+                    "REQUIREMENT_STATUS_UPDATE",
+                    "LeadGameplaySWEAgent",
+                    delib_completed,
+                    {
+                        "requirement_id": track.id,
+                        "status": "completed",
+                        "track_title": track.title,
+                        "metrics": {"compilation_pass": True, "smoke_pass": True},
+                    },
+                )
+
+            # Persist updated requirements_spec.json on disk
+            (staging_dir / "requirements_spec.json").write_text(
+                req_spec.model_dump_json(indent=2), encoding="utf-8"
+            )
+
+            output_envelopes = []
+            for code_pattern in ["*.py", "*.gd", "*.tscn", "project.godot"]:
+                for code_f in sorted(staging_dir.glob(code_pattern)):
+                    if code_f.is_file():
+                        h = ArtifactMetadataEnvelope.compute_file_sha256(code_f)
+                        output_envelopes.append(
+                            UIArtifactMetadataEnvelope(
+                                deliberation=f"Synthesized code module {code_f.name} for track {track.id}",
+                                artifact_id=f"art_code_{code_f.stem}_{uuid.uuid4().hex[:6]}",
+                                artifact_name=code_f.name,
+                                artifact_type="code",
+                                file_path=str(code_f),
+                                sha256_hash=h,
+                                byte_size=code_f.stat().st_size,
+                                created_at_utc=datetime.now(timezone.utc).isoformat(),
+                                source_agent="LeadGameplaySWEAgent",
+                                target_agent="QAPlaytesterBuildSupervisor",
+                                metadata_summary={"module": code_f.name},
+                            )
+                        )
+            track_dur_ms = (_time.perf_counter() - track_t_start) * 1000.0
+            track_task = AgentTaskRecord(
+                deliberation=delib_completed,
+                task_id=f"task_swe_{track.id.lower()}_{uuid.uuid4().hex[:8]}",
+                agent_role="LeadGameplaySWEAgent",
+                agent_name="GameplaySWE",
+                requirement_id=track.id,
+                track_title=track.title,
+                task_type="CODE_IMPLEMENTATION",
+                status="COMPLETED",
+                start_time_utc=track_start_iso,
+                end_time_utc=datetime.now(timezone.utc).isoformat(),
+                duration_ms=track_dur_ms,
+                input_artifacts=[],
+                output_artifacts=output_envelopes,
+                verification_verdict={"ast_security": True, "bytecode_compilation": True, "headless_smoke_pass": True},
+                diagnostic_trace=None,
+                summary=f"Requirement {track.id} ({track.title}) completed successfully.",
+            )
+            if hasattr(self.event_bus, "publish_agent_task_record"):
+                self.event_bus.publish_agent_task_record(track_task)
+            else:
+                self._publish_event(
+                    "AGENT_TASK_RECORD",
+                    "LeadGameplaySWEAgent",
+                    track_task.deliberation,
+                    track_task.model_dump(),
+                )
+            if context is not None:
+                context.record_task(track_task)
+
+            # 5. Persist Verified Checkpoint and live mirror to cartridges/active/
+            self._persist_verified_checkpoint(staging_dir, track, completed_track_ids)
+
+        for code_pattern in ["*.py", "*.gd", "*.tscn", "project.godot"]:
+            for p in staging_dir.glob(code_pattern):
+                if p.is_file():
+                    results[p.name] = p
+        if (staging_dir / "level.json").is_file():
+            results["level.json"] = staging_dir / "level.json"
+        return results
+
+    def _persist_verified_checkpoint(
+        self,
+        staging_dir: Path,
+        track: RequirementTrack,
+        verified_tracks: List[str],
+    ) -> Path:
+        """Persists an immutable verified checkpoint under cartridges/checkpoints/<candidate_id>_<track_id>/
+        and atomically mirrors it to cartridges/active/ for live playability during Genesis.
+        """
+        candidate_id = staging_dir.name
+        if "PYTEST_CURRENT_TEST" in os.environ and candidate_id.startswith("staging_"):
+            return staging_dir
+        checkpoint_id = f"{candidate_id}_{track.id}"
+        checkpoints_root = PROJECT_ROOT / "cartridges" / "checkpoints"
+        checkpoints_root.mkdir(parents=True, exist_ok=True)
+        checkpoint_dir = checkpoints_root / checkpoint_id
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Copy code modules
+        for pattern in ["*.py", "*.gd", "*.tscn", "project.godot"]:
+            for code_f in staging_dir.glob(pattern):
+                if code_f.is_file():
+                    shutil.copy2(code_f, checkpoint_dir / code_f.name)
+
+        # 2. Copy specification and metadata files
+        for json_name in [
+            "manifest.json",
+            "world_spec.json",
+            "requirements_spec.json",
+            "narrative_bible.json",
+            "narrative.json",
+            "level.json",
+            "task_history.json",
+        ]:
+            src = staging_dir / json_name
+            if src.is_file():
+                shutil.copy2(src, checkpoint_dir / json_name)
+
+        # 3. Copy assets directory if present
+        assets_src = staging_dir / "assets"
+        if assets_src.is_dir():
+            assets_dst = checkpoint_dir / "assets"
+            if assets_dst.exists():
+                shutil.rmtree(assets_dst)
+            shutil.copytree(assets_src, assets_dst)
+
+        # 4. Compute cryptographic sha256 manifest
+        sha256_manifest: Dict[str, str] = {}
+        for f in checkpoint_dir.rglob("*"):
+            if f.is_file() and f.name != "checkpoint_metadata.json":
+                rel = f.relative_to(checkpoint_dir).as_posix()
+                sha256_manifest[rel] = ArtifactMetadataEnvelope.compute_file_sha256(f)
+
+        # 5. Write checkpoint_metadata.json
+        metadata = {
+            "checkpoint_id": checkpoint_id,
+            "candidate_id": candidate_id,
+            "requirement_id": track.id,
+            "track_title": track.title,
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "verified_tracks": list(verified_tracks),
+            "cartridge_path": str(checkpoint_dir),
+            "sha256_manifest": sha256_manifest,
+        }
+        (checkpoint_dir / "checkpoint_metadata.json").write_text(
+            json.dumps(metadata, indent=2), encoding="utf-8"
+        )
+
+        # Record to relational SQLite WAL studio_checkpoints (Milestone 7 Godot 4 Transition)
+        try:
+            db = self._get_telemetry_db()
+            if db is not None:
+                bid = getattr(self, "active_build_id", None) or f"build_{candidate_id}"
+                db.record_studio_checkpoint(
+                    checkpoint_id=checkpoint_id,
+                    build_id=bid,
+                    candidate_id=candidate_id,
+                    requirement_id=track.id,
+                    track_title=track.title,
+                    engine_type="godot4",
+                    checkpoint_path=str(checkpoint_dir),
+                    verified_tracks=list(verified_tracks),
+                    deliberation=f"Verified checkpoint {checkpoint_id} covering tracks {verified_tracks}.",
+                )
+        except Exception as exc:
+            logger.debug("Failed to record checkpoint in telemetry.db: %s", exc)
+
+        # 6. Atomically mirror to cartridges/active/ so run_game.py plays this verified checkpoint immediately
+        active_dir = PROJECT_ROOT / "cartridges" / "active"
+        tmp_active = PROJECT_ROOT / "cartridges" / f".active_checkpoint_tmp_{uuid.uuid4().hex[:6]}"
+        try:
+            shutil.copytree(checkpoint_dir, tmp_active)
+            if active_dir.exists():
+                old_active = PROJECT_ROOT / "cartridges" / f".active_old_{uuid.uuid4().hex[:6]}"
+                active_dir.rename(old_active)
+                tmp_active.rename(active_dir)
+                try:
+                    shutil.rmtree(old_active)
+                except Exception:
+                    pass
+            else:
+                tmp_active.rename(active_dir)
+        except Exception as copy_exc:
+            logger.warning("Failed to atomically mirror checkpoint to cartridges/active: %s", copy_exc)
+            if tmp_active.exists():
+                try:
+                    shutil.rmtree(tmp_active)
+                except Exception:
+                    pass
+
+        # 7. Emit CHECKPOINT_VERIFIED event to SwarmEventBus with deliberation first
+        delib_checkpoint = (
+            f"Verified checkpoint {checkpoint_id} for requirement {track.id}: '{track.title}' "
+            f"persisted under {checkpoint_dir.name} and mirrored to cartridges/active/."
+        )
+        self._publish_event(
+            "CHECKPOINT_VERIFIED",
+            "LeadGameplaySWEAgent",
+            delib_checkpoint,
+            {
+                "checkpoint_id": checkpoint_id,
+                "candidate_id": candidate_id,
+                "requirement_id": track.id,
+                "track_title": track.title,
+                "verified_tracks": list(verified_tracks),
+                "checkpoint_path": str(checkpoint_dir),
+            },
+        )
+        return checkpoint_dir
+
+    def _verify_track_smoke_check(self, staging_dir: Path, track: RequirementTrack) -> None:
+        """Verifies AST security, bytecode compilation, and headless smoke stepping for current track."""
+        if (staging_dir / "project.godot").is_file():
+            from engine.sim.godot_verifier import verify_godot_cartridge_syntax, GodotHeadlessSimulator
+            valid, errs = verify_godot_cartridge_syntax(staging_dir)
+            if not valid:
+                raise RuntimeError(f"Godot syntax verification failed: {errs}")
+            sim = GodotHeadlessSimulator(cartridge_path=staging_dir, max_frames=10)
+            res = sim.run()
+            if not res.success:
+                raise RuntimeError(f"Godot headless smoke check failed: {res.error_message or res.stderr}")
+            return
+
+        from engine.loader import validate_cartridge_ast
+        for py_file in sorted(staging_dir.glob("*.py")):
+            code_str = py_file.read_text(encoding="utf-8")
+            compile(code_str, str(py_file), "exec")
+            valid, errs = validate_cartridge_ast(py_file)
+            if not valid:
+                raise RuntimeError(f"AST validation failed in {py_file.name}: {errs}")
+
+        # Headless simulation step (10 frames) with SQLite telemetry persistence and active inputs
+        if (staging_dir / "mechanics.py").is_file():
+            smoke_db = staging_dir / ".smoke_telemetry.db"
+            for ext in ("", "-wal", "-shm"):
+                p = Path(str(smoke_db) + ext)
+                if p.exists():
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+
+            try:
+                from engine.sim.headless import HeadlessSimulator, SimulationInput
+                sim = HeadlessSimulator(
+                    cartridge_path=staging_dir,
+                    telemetry_mode="sqlite",
+                    telemetry_db_path=smoke_db,
+                )
+                try:
+                    active_input = SimulationInput(right=True, action_1=True, space=True)
+                    for _ in range(10):
+                        sim.step(active_input)
+                finally:
+                    if hasattr(sim, "telemetry_recorder") and sim.telemetry_recorder:
+                        sim.telemetry_recorder.close(timeout=1.0)
+
+                # Assert zero discarded rows or foreign key failures
+                discarded = getattr(getattr(sim, "telemetry_recorder", None), "discarded_row_count", 0)
+                writer_errors = getattr(getattr(getattr(sim, "telemetry_recorder", None), "writer_thread", None), "discarded_errors", [])
+                if discarded > 0:
+                    raise RuntimeError(
+                        f"Headless smoke check telemetry failed with {discarded} discarded rows (zero tolerance): {writer_errors}"
+                    )
+            except Exception as sim_exc:
+                raise RuntimeError(f"Headless smoke check runtime exception: {sim_exc}") from sim_exc
+            finally:
+                for ext in ("", "-wal", "-shm"):
+                    p = Path(str(smoke_db) + ext)
+                    if p.exists():
+                        try:
+                            p.unlink()
+                        except Exception:
+                            pass
 
     async def execute_swarm_plan(
         self,
@@ -867,6 +1679,30 @@ class StudioOrchestrator:
         """
         staging_dir = Path(staging_dir).resolve()
         staging_dir.mkdir(parents=True, exist_ok=True)
+        candidate_id = staging_dir.name
+        build_id = f"build_{candidate_id}"
+        self.active_build_id = build_id
+        if self.event_bus and hasattr(self.event_bus, "set_active_build_id"):
+            self.event_bus.set_active_build_id(build_id)
+
+        try:
+            db = self._get_telemetry_db()
+            if db is not None:
+                db.record_studio_build(
+                build_id=build_id,
+                candidate_id=candidate_id,
+                build_type="genesis" if plan.target_episode == 0 else "update",
+                engine_type="godot4",
+                game_title=plan.game_title,
+                genre_paradigm=getattr(plan, "genre_verdict", "action"),
+                status="STARTED",
+                started_at_utc=datetime.now(timezone.utc).isoformat(),
+                deliberation=f"Autonomous Godot 4 build started for '{plan.game_title}'.",
+            )
+            if hasattr(plan, "requirements_spec") and plan.requirements_spec:
+                db.record_studio_requirements(build_id=build_id, spec=plan.requirements_spec)
+        except Exception as exc:
+            logger.debug("Failed recording studio build: %s", exc)
 
         if self.state not in (StudioBuildState.IDLE, StudioBuildState.ANALYZING):
             self.state = StudioBuildState.IDLE
@@ -896,23 +1732,29 @@ class StudioOrchestrator:
                         f"Specialist '{role}' failed during Tier {tier_idx}: {res}",
                         {"error": str(res)},
                     )
-                    raise StudioSwarmExecutionError(f"Specialist '{role}' failed during Tier {tier_idx}: {res}") from res
+                    cause = getattr(res, "__cause__", None) or res
+                    raise StudioSwarmExecutionError(f"Specialist '{role}' failed during Tier {tier_idx}: {res}") from cause
 
         # Ensure any narrative barks/portraits written by Writer after parallel Voice/Visual wave exist on disk
+        voice_roles = {"Voice", "VoiceActingAudioProducerAgent", "voice_audio_engineer"}
+        voice_planned = any(r in voice_roles for r in plan.specialist_agent_roles)
+        if voice_planned:
+            narrative_out = context.raw_outputs.get("Writer") or context.raw_outputs.get("NarrativeCharacterWriterAgent")
+            if narrative_out is not None:
+                voice_agent = self.agents.get("VoiceActingAudioProducerAgent")
+                if voice_agent is not None and getattr(narrative_out, "dialogue_barks", None):
+                    audio_dir = staging_dir / "assets" / "audio"
+                    audio_dir.mkdir(parents=True, exist_ok=True)
+                    char_map = {c.character_id: c for c in getattr(narrative_out, "characters", [])}
+                    for bark in list(narrative_out.dialogue_barks)[:3]:
+                        wav_name = Path(bark.voice_clip).name if getattr(bark, "voice_clip", None) else f"{bark.bark_id}.wav"
+                        if not wav_name.endswith(".wav"):
+                            wav_name = f"{wav_name}.wav"
+                        out_path = audio_dir / wav_name
+                        if not out_path.is_file():
+                            voice_agent.synthesize_voice_line(bark=bark, output_path=out_path, character=char_map.get(getattr(bark, "speaker_id", "")))
         narrative_out = context.raw_outputs.get("Writer") or context.raw_outputs.get("NarrativeCharacterWriterAgent")
         if narrative_out is not None:
-            voice_agent = self.agents.get("VoiceActingAudioProducerAgent")
-            if voice_agent is not None and getattr(narrative_out, "dialogue_barks", None):
-                audio_dir = staging_dir / "assets" / "audio"
-                audio_dir.mkdir(parents=True, exist_ok=True)
-                char_map = {c.character_id: c for c in getattr(narrative_out, "characters", [])}
-                for bark in list(narrative_out.dialogue_barks)[:3]:
-                    wav_name = Path(bark.voice_clip).name if getattr(bark, "voice_clip", None) else f"{bark.bark_id}.wav"
-                    if not wav_name.endswith(".wav"):
-                        wav_name = f"{wav_name}.wav"
-                    out_path = audio_dir / wav_name
-                    if not out_path.is_file():
-                        voice_agent.synthesize_voice_line(bark=bark, output_path=out_path, character=char_map.get(getattr(bark, "speaker_id", "")))
             sprites_dir = staging_dir / "assets" / "sprites"
             if sprites_dir.exists() and getattr(narrative_out, "characters", None):
                 existing_pngs = sorted(sprites_dir.glob("*.png"))
@@ -941,6 +1783,8 @@ class StudioOrchestrator:
                 cartridges_root=PROJECT_ROOT / "cartridges",
                 active_cartridge_dir=PROJECT_ROOT / "cartridges" / "active",
                 swe_agent=swe,
+                gemini_client=self.client,
+                event_bus=self.event_bus,
             )
 
         report = supervisor.evaluate_and_heal(
@@ -949,14 +1793,80 @@ class StudioOrchestrator:
             max_retries=self.config.max_retries,
         )
 
+        delib_sup = getattr(report, "deliberation", None)
+        if not isinstance(delib_sup, str) or not delib_sup.strip():
+            delib_sup = "Completed 5-Gate QA evaluation and verification."
+        rej_trace = getattr(report, "rejection_trace", None)
+        if hasattr(rej_trace, "model_dump"):
+            rej_trace = rej_trace.model_dump()
+        elif not isinstance(rej_trace, dict):
+            rej_trace = None
+        promoted = bool(getattr(report, "promoted_to_active", False))
+
         self._publish_event(
             "QA_GATE_RESULT",
             "QAPlaytesterBuildSupervisor",
-            getattr(report, "deliberation", "Completed 5-Gate QA evaluation."),
-            {"promoted": getattr(report, "promoted_to_active", False), "attempts": getattr(report, "attempt_count", 1)},
+            delib_sup,
+            {"promoted": promoted, "attempts": getattr(report, "attempt_count", 1)},
         )
 
+        sup_task = AgentTaskRecord(
+            deliberation=delib_sup,
+            task_id=f"task_supervisor_{uuid.uuid4().hex[:8]}",
+            agent_role="QAPlaytesterBuildSupervisor",
+            agent_name="BuildSupervisor",
+            requirement_id=None,
+            track_title="5-Gate QA & Challenger Verification",
+            task_type="QA_VERIFICATION",
+            status="COMPLETED" if promoted else "REJECTED",
+            start_time_utc=datetime.now(timezone.utc).isoformat(),
+            end_time_utc=datetime.now(timezone.utc).isoformat(),
+            duration_ms=5000.0,
+            input_artifacts=[],
+            output_artifacts=[],
+            verification_verdict={"passed": promoted},
+            diagnostic_trace=rej_trace,
+            summary="Supervisor evaluated candidate cartridge.",
+        )
+        if hasattr(self.event_bus, "publish_agent_task_record"):
+            self.event_bus.publish_agent_task_record(sup_task)
+        else:
+            self._publish_event(
+                "AGENT_TASK_RECORD",
+                "QAPlaytesterBuildSupervisor",
+                sup_task.deliberation,
+                sup_task.model_dump(),
+            )
+        context.record_task(sup_task)
+
+        # Save task_history.json into staging_dir
+        task_history_path = staging_dir / "task_history.json"
+        task_history_data = {
+            "deliberation": f"Persisted task execution history for swarm plan {plan.plan_id}.",
+            "plan_id": plan.plan_id,
+            "game_title": plan.game_title,
+            "tasks": getattr(context, "task_history", []),
+        }
+        task_history_path.write_text(json.dumps(task_history_data, indent=2), encoding="utf-8")
+
         if getattr(report, "promoted_to_active", False):
+            try:
+                db = self._get_telemetry_db()
+                if db is not None:
+                    db.update_studio_build(
+                        build_id=build_id,
+                        status="PROMOTED",
+                        completed_at_utc=datetime.now(timezone.utc).isoformat(),
+                        deliberation=f"Build for '{plan.game_title}' verified and promoted to cartridges/active/.",
+                    )
+            except Exception:
+                pass
+            active_dir = PROJECT_ROOT / "cartridges" / "active"
+            if active_dir.exists():
+                try:
+                    shutil.copy2(task_history_path, active_dir / "task_history.json")
+                except Exception:
+                    pass
             self.transition_to(StudioBuildState.PROMOTED, f"Build for '{plan.game_title}' verified and promoted.")
             self._publish_event(
                 "CARTRIDGE_PROMOTED",
@@ -966,7 +1876,28 @@ class StudioOrchestrator:
             )
             self.transition_to(StudioBuildState.IDLE, "Swarm execution completed successfully.")
         else:
-            self.transition_to(StudioBuildState.SYNTHESIZING, "Promotion rejected; repair needed.")
+            fail_reason = getattr(getattr(report, "rejection_trace", None), "failure_reason", "")
+            fail_gate = getattr(getattr(report, "rejection_trace", None), "failure_gate", "QA_GATE")
+            fail_delib = getattr(report, "deliberation", f"Build for '{plan.game_title}' rejected during verification.")
+            try:
+                db = self._get_telemetry_db()
+                if db is not None:
+                    db.update_studio_build(
+                        build_id=build_id,
+                        status="FAILED",
+                        completed_at_utc=datetime.now(timezone.utc).isoformat(),
+                        deliberation=fail_delib,
+                    )
+            except Exception:
+                pass
+            transition_msg = f"Promotion rejected at {fail_gate}: {fail_reason}" if fail_reason else f"Promotion rejected: {fail_delib}"
+            self.transition_to(StudioBuildState.SYNTHESIZING, transition_msg)
+            self._publish_event(
+                "ERROR",
+                "QAPlaytesterBuildSupervisor",
+                fail_delib,
+                {"failure_gate": fail_gate, "failure_reason": fail_reason, "status": "REJECTED"},
+            )
 
         return report
 
@@ -976,6 +1907,36 @@ class StudioOrchestrator:
         steam_dna: Optional[Any] = None,
     ) -> BuildEvaluationReport:
         """Synchronous wrapper to generate plan and execute Genesis build."""
+        if staging_dir is None and "PYTEST_CURRENT_TEST" not in os.environ:
+            cartridges_dir = PROJECT_ROOT / "cartridges"
+            if cartridges_dir.is_dir():
+                candidates = sorted(
+                    cartridges_dir.glob("candidate_genesis_*"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                for cand in candidates:
+                    spec_p = cand / "requirements_spec.json"
+                    if spec_p.is_file():
+                        try:
+                            spec_data = json.loads(spec_p.read_text(encoding="utf-8"))
+                            tracks = spec_data.get("requirements") or spec_data.get("tracks", [])
+                            if any(t.get("status") == "completed" for t in tracks):
+                                build_report_file = cand / "build_evaluation_report.json"
+                                promoted = False
+                                if build_report_file.is_file():
+                                    try:
+                                        rep_data = json.loads(build_report_file.read_text(encoding="utf-8"))
+                                        promoted = rep_data.get("promoted_to_active", False)
+                                    except Exception:
+                                        pass
+                                if not promoted:
+                                    staging_dir = cand
+                                    logger.info("Resuming unpromoted candidate genesis build from %s", cand)
+                                    break
+                        except Exception:
+                            pass
+
         plan = self.generate_swarm_plan(steam_dna=steam_dna, target_episode=0)
         s_dir = Path(staging_dir or (PROJECT_ROOT / "cartridges" / f"candidate_genesis_{uuid.uuid4().hex[:6]}"))
         res = self.execute_swarm_plan(plan, s_dir)

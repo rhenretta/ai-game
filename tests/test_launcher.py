@@ -106,9 +106,9 @@ class TestPythonEntrypointCLI:
         assert res.returncode == 0, f"Custom cartridge boot failed: {res.stderr}"
         assert cart_dir.name in res.stdout
 
-    def test_run_game_py_no_active_cartridge_reports_guidance(self):
+    def test_run_game_py_no_active_cartridge_reports_guidance(self, stash_active_cartridge):
         """Verifies run_game.py prints guidance to run run_studio.py when no active cartridge exists."""
-        cmd = [sys.executable, "run_game.py", "--headless"]
+        cmd = [sys.executable, "run_game.py", "--headless", "--ticks", "1"]
         res = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=15)
         assert res.returncode == 0
         assert "No Active Game Cartridge Found" in res.stdout

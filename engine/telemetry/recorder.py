@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 import queue
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 import uuid
 
 from engine.telemetry.db import TelemetryDB
@@ -34,14 +34,17 @@ class TelemetryRecorder:
         db_path: str | Path = "data/telemetry.db",
         batch_size: int = 50,
         flush_interval_sec: float = 0.1,
+        auto_register_probes: bool = False,
     ):
         self.db = TelemetryDB(db_path)
         self.queue: queue.Queue = queue.Queue(maxsize=0)
+        self.auto_register_probes = auto_register_probes
         self.writer_thread = TelemetryWriterThread(
             db=self.db,
             telemetry_queue=self.queue,
             batch_size=batch_size,
             flush_interval_sec=flush_interval_sec,
+            auto_register_probes=auto_register_probes,
         )
         self.writer_thread.start()
 
@@ -57,6 +60,8 @@ class TelemetryRecorder:
         self._shots_fired_accum: int = 0
         self._score_accum: int = 0
 
+        self._registered_probes: Set[str] = set()
+        self.events: List[TelemetryEventRecord] = []
         self._closed = False
         atexit.register(self.close)
 
@@ -204,10 +209,18 @@ class TelemetryRecorder:
             probe_name=probe_name,
         )
 
+        self.events.append(record)
         try:
             self.queue.put_nowait(record)
         except Exception as e:
             logger.error("Failed to enqueue event: %s", e)
+
+    def get_events_by_type(self, event_type: str | TelemetryEventType) -> List[TelemetryEventRecord]:
+        target = event_type.value if isinstance(event_type, TelemetryEventType) else str(event_type)
+        return [e for e in self.events if e.event_type == target]
+
+    def get_events(self, event_type: str | TelemetryEventType) -> List[TelemetryEventRecord]:
+        return self.get_events_by_type(event_type)
 
     def emit_custom_probe(
         self,
@@ -222,6 +235,21 @@ class TelemetryRecorder:
         Sub-microsecond (< 2 µs) non-blocking emission of CUSTOM_PROBE event.
         Encapsulates arbitrary agent-designed domain payloads under payload_json.
         """
+        if self.auto_register_probes and probe_name not in self._registered_probes:
+            self._registered_probes.add(probe_name)
+            record = ProbeCatalogRecord(
+                probe_id=f"prb_{probe_name}",
+                probe_name=probe_name,
+                category=category,
+                description=f"Auto-registered custom probe {probe_name}",
+                hypothesis_target="H_AUTO_REGISTERED",
+                schema_json={},
+            )
+            try:
+                self.queue.put_nowait(("REGISTER_PROBE", record))
+            except Exception as e:
+                logger.error("Failed to enqueue auto-registered probe: %s", e)
+
         payload = {"category": category, **(data or {})}
         self.emit_event(
             event_type=TelemetryEventType.CUSTOM_PROBE,
@@ -244,6 +272,7 @@ class TelemetryRecorder:
         """
         Registers probe metadata via background writer queue (non-blocking).
         """
+        self._registered_probes.add(probe_name)
         record = ProbeCatalogRecord(
             probe_id=probe_id,
             probe_name=probe_name,
@@ -253,6 +282,10 @@ class TelemetryRecorder:
             schema_json=schema_json,
         )
         self.queue.put_nowait(("REGISTER_PROBE", record))
+
+    @property
+    def discarded_row_count(self) -> int:
+        return getattr(self.writer_thread, "discarded_row_count", 0)
 
     def tick_frame(self) -> None:
         self.frame_index += 1

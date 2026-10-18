@@ -12,9 +12,18 @@ import logging
 import math
 from pathlib import Path
 import struct
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from engine.studio.models import AudioSynthesisResult, CharacterSheet, DialogueBarkSpec, StudioAgentError
+from engine.studio.models import (
+    AssetManifestSpec,
+    AssetRequirement,
+    AudioSynthesisResult,
+    CharacterSheet,
+    DialogueBarkSpec,
+    GameRequirementsSpec,
+    StudioAgentError,
+)
 
 logger = logging.getLogger("VoiceActingAudioProducerAgent")
 
@@ -125,59 +134,74 @@ class GeminiAudioBackend(AudioSynthesisBackend):
     ) -> AudioSynthesisResult:
         escaped_text = escape_ssml(text)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            from google.genai import types
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=escaped_text,
-                config=types.GenerateContentConfig(
-                    response_modalities=["AUDIO"],
-                    speech_config=types.SpeechConfig(
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)
-                        )
+        max_retries = 3
+        audio_bytes = None
+        last_exc = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                from google.genai import types
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=escaped_text,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["AUDIO"],
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)
+                            )
+                        ),
                     ),
-                ),
+                )
+                if response.candidates:
+                    for candidate in response.candidates:
+                        if candidate.content and candidate.content.parts:
+                            for part in candidate.content.parts:
+                                if hasattr(part, "inline_data") and part.inline_data:
+                                    data = getattr(part.inline_data, "data", None)
+                                    if isinstance(data, (bytes, bytearray)):
+                                        audio_bytes = bytes(data)
+                                        break
+                if audio_bytes and len(audio_bytes) > 0:
+                    break
+                logger.warning("Attempt %d: No audio bytes returned for bark '%s', retrying...", attempt, bark_id)
+                time.sleep(1.0)
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("Attempt %d failed for audio bark '%s': %s", attempt, bark_id, exc)
+                time.sleep(1.0)
+
+        if audio_bytes is None or len(audio_bytes) == 0:
+            if last_exc:
+                raise VoiceSynthesisError(f"Gemini TTS failed for bark '{bark_id}' after {max_retries} attempts: {last_exc}") from last_exc
+            raise VoiceSynthesisError(f"No audio bytes returned from Gemini TTS for bark '{bark_id}' after {max_retries} attempts")
+
+        # Check if raw PCM or contains WAV header
+        if audio_bytes[:4] == b"RIFF":
+            full_wav = audio_bytes
+        else:
+            header = create_wav_header(len(audio_bytes), sample_rate=sample_rate, channels=1, bits_per_sample=16)
+            full_wav = header + audio_bytes
+
+        if not isinstance(full_wav, (bytes, bytearray)):
+            raise VoiceSynthesisError(
+                f"Synthesized audio must be bytes or bytearray, got {type(full_wav).__name__} for bark '{bark_id}'"
             )
-            # Find audio part
-            audio_bytes = None
-            if response.candidates:
-                for candidate in response.candidates:
-                    if candidate.content and candidate.content.parts:
-                        for part in candidate.content.parts:
-                            if hasattr(part, "inline_data") and part.inline_data:
-                                audio_bytes = part.inline_data.data
-                                break
 
-            if not audio_bytes:
-                raise VoiceSynthesisError(f"No audio bytes returned from Gemini TTS for bark '{bark_id}'")
+        output_path.write_bytes(full_wav)
+        valid, err, duration = validate_wav_file(output_path)
+        if not valid:
+            raise VoiceSynthesisError(f"Synthesized WAV validation failed: {err}")
 
-            # Check if raw PCM or contains WAV header
-            if audio_bytes[:4] == b"RIFF":
-                full_wav = audio_bytes
-            else:
-                header = create_wav_header(len(audio_bytes), sample_rate=sample_rate, channels=1, bits_per_sample=16)
-                full_wav = header + audio_bytes
-
-            output_path.write_bytes(full_wav)
-            valid, err, duration = validate_wav_file(output_path)
-            if not valid:
-                raise VoiceSynthesisError(f"Synthesized WAV validation failed: {err}")
-
-            sha256 = hashlib.sha256(full_wav).hexdigest()
-            return AudioSynthesisResult(
-                deliberation=f"Synthesized speech via Gemini TTS '{self.model_name}' for voice '{voice_name}'.",
-                bark_id=bark_id,
-                file_path=str(output_path),
-                sample_rate=sample_rate,
-                duration_seconds=duration,
-                file_size_bytes=len(full_wav),
-                sha256_hash=sha256,
-            )
-        except Exception as exc:
-            if isinstance(exc, VoiceSynthesisError):
-                raise
-            raise VoiceSynthesisError(f"Gemini TTS generation failed for bark '{bark_id}': {exc}") from exc
+        sha256 = hashlib.sha256(full_wav).hexdigest()
+        return AudioSynthesisResult(
+            deliberation=f"Synthesized speech via Gemini TTS '{self.model_name}' for voice '{voice_name}'.",
+            bark_id=bark_id,
+            file_path=str(output_path),
+            sample_rate=sample_rate,
+            duration_seconds=duration,
+            file_size_bytes=len(full_wav),
+            sha256_hash=sha256,
+        )
 
 
 class OfflineMockAudioBackend(AudioSynthesisBackend):
@@ -232,6 +256,9 @@ class OfflineMockAudioBackend(AudioSynthesisBackend):
         )
 
 
+GEMINI_TTS_VOICES: Tuple[str, ...] = ("Aoede", "Charon", "Fenrir", "Kore", "Puck")
+
+
 class VoiceActingAudioProducerAgent:
     """Specialist Agent producing spoken dialogue voice acting lines (.wav)."""
     deliberation: str = "Voice acting audio producer synthesizing speech lines via Gemini TTS."
@@ -241,8 +268,10 @@ class VoiceActingAudioProducerAgent:
         client: Optional[Any] = None,
         backend: Optional[AudioSynthesisBackend] = None,
         model_name: str = "gemini-3.8-flash-tts",
+        voice_map: Optional[Dict[str, str]] = None,
     ):
         self.model_name = model_name
+        self.character_voices: Dict[str, str] = dict(voice_map or {})
         if backend is not None:
             self.backend = backend
         elif client is not None:
@@ -252,42 +281,245 @@ class VoiceActingAudioProducerAgent:
                 "VoiceActingAudioProducerAgent requires an active google.genai Client or explicit backend (Rule 5: Zero Silent Fallbacks)"
             )
 
+    def register_character_voice(self, speaker_id: str, voice_name: str) -> None:
+        """Dynamically registers or overrides voice selection for a speaker."""
+        self.character_voices[speaker_id] = voice_name
+        self.character_voices[speaker_id.lower()] = voice_name
+
+    def resolve_voice_name(
+        self,
+        speaker_id: str,
+        character: Optional[CharacterSheet] = None,
+        bark: Optional[Any] = None,
+    ) -> str:
+        """Dynamically resolves prebuilt TTS voice name for any speaker,
+        supporting custom character names from narrative bible or asset manifest without
+        hardcoding to fixed archetypes.
+        """
+        def _match_timbre(timbre_str: str) -> Optional[str]:
+            t = timbre_str.lower().strip()
+            if any(k in t for k in ("deep", "heavy", "dark", "resonant", "bass", "gruff", "low")):
+                return "Fenrir"
+            if any(k in t for k in ("grave", "menacing", "grim", "sinister", "whisper", "raspy")):
+                return "Charon"
+            if any(k in t for k in ("bright", "light", "cheerful", "playful", "high", "airy")):
+                return "Kore"
+            if any(k in t for k in ("focused", "sharp", "swift", "clear", "crisp")):
+                return "Aoede"
+            return None
+
+        # 1. Direct character specification
+        if character is not None:
+            c_voice = getattr(character, "gemini_voice_name", None)
+            c_timbre = getattr(character, "voice_timbre", None)
+            if hasattr(character, "model_fields_set"):
+                fields_set = character.model_fields_set
+            elif hasattr(character, "__fields_set__"):
+                fields_set = character.__fields_set__
+            else:
+                fields_set = set()
+
+            if c_voice and str(c_voice).strip():
+                voice_str = str(c_voice).strip()
+                # If explicit non-default voice was configured, honor it immediately
+                if voice_str != "Aoede":
+                    return voice_str
+
+                # When gemini_voice_name is the default 'Aoede' and voice_timbre is provided,
+                # evaluate voice_timbre keywords first before falling back to the 'Aoede' default
+                timbre_provided = ("voice_timbre" in fields_set) or (c_timbre and c_timbre != "focused")
+                if timbre_provided and c_timbre:
+                    matched = _match_timbre(str(c_timbre))
+                    if matched:
+                        return matched
+
+                # If gemini_voice_name was explicitly set by caller, return 'Aoede'
+                if "gemini_voice_name" in fields_set:
+                    return "Aoede"
+
+        # 2. Registered dynamic character voices
+        if speaker_id in self.character_voices:
+            return self.character_voices[speaker_id]
+        if speaker_id.lower() in self.character_voices:
+            return self.character_voices[speaker_id.lower()]
+
+        if character is not None:
+            c_name = getattr(character, "name", "")
+            if c_name in self.character_voices:
+                return self.character_voices[c_name]
+            if c_name.lower() in self.character_voices:
+                return self.character_voices[c_name.lower()]
+
+        # 3. Known archetype defaults for backward compatibility
+        norm_speaker = speaker_id.lower().strip()
+        legacy_archetypes = {
+            "hero": "Aoede",
+            "protagonist": "Aoede",
+            "boss": "Fenrir",
+            "antagonist": "Fenrir",
+            "rival": "Charon",
+            "npc": "Puck",
+            "companion": "Puck",
+            "drone": "Puck",
+            "narrator": "Kore",
+            "system": "Kore",
+        }
+        if norm_speaker in legacy_archetypes:
+            return legacy_archetypes[norm_speaker]
+
+        # 4. Character personality or timbre hints
+        if character is not None:
+            timbre = getattr(character, "voice_timbre", "")
+            if timbre and isinstance(timbre, str):
+                matched = _match_timbre(timbre)
+                if matched:
+                    return matched
+            # Fallback to default 'Aoede' if character specified it
+            c_voice = getattr(character, "gemini_voice_name", None)
+            if c_voice and str(c_voice).strip() == "Aoede":
+                return "Aoede"
+
+        # 5. Dynamic deterministic assignment from speaker_id hash
+        digest = hashlib.sha256(speaker_id.encode("utf-8")).hexdigest()
+        voice_idx = int(digest[:6], 16) % len(GEMINI_TTS_VOICES)
+        return GEMINI_TTS_VOICES[voice_idx]
+
     def synthesize_voice_line(
         self,
-        bark: DialogueBarkSpec,
-        output_path: Path,
+        bark: Union[DialogueBarkSpec, AssetRequirement, Dict[str, Any]],
+        output_path: Union[Path, str],
         character: Optional[CharacterSheet] = None,
+        voice_name: Optional[str] = None,
         sample_rate: int = 44100,
     ) -> AudioSynthesisResult:
         """Synthesizes a voice line bark and writes .wav to output_path."""
-        if not bark.text or not bark.text.strip():
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Normalize bark input
+        if isinstance(bark, dict):
+            bark_id = bark.get("bark_id") or bark.get("asset_id") or "bark"
+            text = bark.get("text") or bark.get("visual_prompt_or_text") or bark.get("description", "")
+            speaker_id = bark.get("speaker_id") or bark.get("name") or "speaker"
+        elif hasattr(bark, "visual_prompt_or_text") and not getattr(bark, "text", None):
+            bark_id = getattr(bark, "asset_id", "bark") or Path(getattr(bark, "target_path", "bark.wav")).stem
+            text = getattr(bark, "visual_prompt_or_text", "") or getattr(bark, "description", "")
+            speaker_id = getattr(bark, "asset_id", "speaker")
+        else:
+            bark_id = getattr(bark, "bark_id", "bark")
+            text = getattr(bark, "text", "")
+            speaker_id = getattr(bark, "speaker_id", "speaker")
+
+        if not text or not str(text).strip():
             raise ValueError("TTS text cannot be empty")
 
         # Select character voice dynamically
-        if character is not None and getattr(character, "gemini_voice_name", None):
-            voice_name = character.gemini_voice_name
-        else:
-            voice_map = {
-                "hero": "Aoede",
-                "boss": "Fenrir",
-                "npc": "Puck",
-                "companion": "Puck",
-                "rival": "Charon",
-            }
-            voice_name = voice_map.get(bark.speaker_id, "Aoede")
+        if not voice_name:
+            voice_name = self.resolve_voice_name(speaker_id=str(speaker_id), character=character, bark=bark)
 
         result = self.backend.synthesize_speech(
-            text=bark.text,
+            text=str(text).strip(),
             voice_name=voice_name,
             output_path=output_path,
             sample_rate=sample_rate,
-            bark_id=bark.bark_id,
+            bark_id=str(bark_id),
         )
 
         # Enforce duration bounds [0.1s, 30.0s]
         if result.duration_seconds < 0.1 or result.duration_seconds > 30.0:
             raise VoiceSynthesisError(
-                f"Voice line duration {result.duration_seconds:.2f}s out of acceptable bounds [0.1s, 30.0s] for '{bark.bark_id}'"
+                f"Voice line duration {result.duration_seconds:.2f}s out of acceptable bounds [0.1s, 30.0s] for '{bark_id}'"
             )
 
         return result
+
+    def generate_character_barks(
+        self,
+        barks: Optional[List[DialogueBarkSpec]] = None,
+        output_dir: Optional[Union[Path, str]] = None,
+        characters: Optional[List[CharacterSheet]] = None,
+        manifest: Optional[Union[List[Any], AssetManifestSpec]] = None,
+        requirements_spec: Optional[Any] = None,
+        sample_rate: int = 44100,
+    ) -> List[AudioSynthesisResult]:
+        """Synthesizes dialogue barks and audio assets from list, manifest, or requirements_spec.
+
+        Dynamically derives speaker names, audio cues, and voice mappings with zero hardcoded constraints.
+        For games with 0 dialogue characters (e.g. abstract/automation sims), returns an empty list cleanly.
+        """
+        results: List[AudioSynthesisResult] = []
+        out_d = Path(output_dir) if output_dir else None
+        if out_d:
+            out_d.mkdir(parents=True, exist_ok=True)
+
+        char_map: Dict[str, CharacterSheet] = {}
+        if characters:
+            for c in characters:
+                if getattr(c, "character_id", None):
+                    char_map[c.character_id] = c
+                if getattr(c, "name", None):
+                    char_map[c.name] = c
+
+        # 1. Synthesize explicit barks if provided
+        if barks:
+            for bark in barks:
+                wav_name = Path(bark.voice_clip).name if getattr(bark, "voice_clip", None) else f"{bark.bark_id}.wav"
+                if not wav_name.endswith(".wav"):
+                    wav_name = f"{wav_name}.wav"
+                target_path = (out_d / wav_name) if out_d else Path(bark.voice_clip)
+                char_obj = char_map.get(getattr(bark, "speaker_id", "")) or char_map.get(getattr(bark, "speaker_name", ""))
+                res = self.synthesize_voice_line(bark=bark, output_path=target_path, character=char_obj, sample_rate=sample_rate)
+                results.append(res)
+
+        # 2. Synthesize audio assets declared in manifest or requirements_spec
+        manifest_items = None
+        if manifest is not None:
+            if hasattr(manifest, "assets"):
+                manifest_items = manifest.assets
+            elif isinstance(manifest, list):
+                manifest_items = manifest
+        elif requirements_spec is not None:
+            if hasattr(requirements_spec, "asset_manifest"):
+                manifest_items = requirements_spec.asset_manifest
+            elif isinstance(requirements_spec, dict) and "asset_manifest" in requirements_spec:
+                manifest_items = requirements_spec["asset_manifest"]
+
+        if manifest_items:
+            for item in manifest_items:
+                if isinstance(item, dict):
+                    atype = item.get("asset_type", "")
+                    aid = item.get("asset_id", "")
+                    tpath = item.get("target_path", "")
+                    text = item.get("visual_prompt_or_text") or item.get("description", "")
+                    name = item.get("name") or aid
+                else:
+                    atype = getattr(item, "asset_type", "")
+                    aid = getattr(item, "asset_id", "")
+                    tpath = getattr(item, "target_path", "")
+                    text = getattr(item, "visual_prompt_or_text", "") or getattr(item, "description", "")
+                    name = getattr(item, "name", "") or aid
+
+                # Filter audio assets
+                if atype not in ("audio", "audio_bark", "sfx", "voice") and not str(tpath).endswith(".wav"):
+                    continue
+
+                wav_name = Path(tpath).name if tpath else f"{aid}.wav"
+                if not wav_name.endswith(".wav"):
+                    wav_name = f"{wav_name}.wav"
+                target_path = (out_d / wav_name) if out_d else (Path(tpath) if tpath else Path(wav_name))
+
+                bark_spec = DialogueBarkSpec(
+                    deliberation=f"Dynamic manifest audio asset '{aid}'",
+                    bark_id=aid or wav_name.replace(".wav", ""),
+                    speaker_id=aid or "narrator",
+                    speaker_name=name or "Speaker",
+                    trigger_type="manifest_event",
+                    text=text or f"Audio alert {aid}",
+                    voice_clip=str(target_path),
+                )
+                char_obj = char_map.get(aid) or char_map.get(name)
+                res = self.synthesize_voice_line(bark=bark_spec, output_path=target_path, character=char_obj, sample_rate=sample_rate)
+                results.append(res)
+
+        return results
+

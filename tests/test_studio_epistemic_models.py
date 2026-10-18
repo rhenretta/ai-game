@@ -180,15 +180,15 @@ class TestStudioEpistemicModels:
                 steps=[],
             )
 
-    def test_narrative_bible_rejects_empty_characters(self) -> None:
-        """NarrativeBible requires at least one character in characters list."""
-        with pytest.raises(ValidationError):
-            NarrativeBible(
-                deliberation="Bible without characters",
-                world_title="Empty World",
-                setting_summary="Deserted void",
-                characters=[],
-            )
+    def test_narrative_bible_allows_empty_characters(self) -> None:
+        """NarrativeBible allows empty characters list for abstract/systems games (Rule 1: Pure Generalizability)."""
+        bible = NarrativeBible(
+            deliberation="Bible without characters for abstract system game",
+            world_title="Empty World",
+            setting_summary="Deserted void",
+            characters=[],
+        )
+        assert len(bible.characters) == 0
 
     def test_nested_models_preserve_rationale_first(self) -> None:
         """Nested sub-models (e.g. CutsceneBeat, DialogueChoice, HypothesisEvidence) also declare deliberation first."""

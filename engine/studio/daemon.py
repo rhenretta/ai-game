@@ -203,6 +203,15 @@ class StudioDaemon:
 
     def is_cold_boot_required(self) -> bool:
         """Returns True if cartridges/active/ has no valid cartridge manifest or mechanics."""
+        if (
+            (self.config.cartridges_root / ".no_cold_boot").exists()
+            or os.environ.get("STUDIO_NO_COLD_BOOT") == "1"
+            or (
+                "PYTEST_CURRENT_TEST" in os.environ
+                and self.config.cartridges_root.resolve() == (PROJECT_ROOT / "cartridges").resolve()
+            )
+        ):
+            return False
         active = self.config.active_cartridge_dir
         if not active.exists():
             return True
@@ -344,8 +353,9 @@ class StudioDaemon:
             return False
 
         try:
-            conn = sqlite3.connect(f"file:{self.config.db_path.resolve()}?mode=ro", uri=True, timeout=2.0)
+            conn = sqlite3.connect(str(self.config.db_path), timeout=5.0)
             conn.execute("PRAGMA query_only = ON;")
+            conn.execute("PRAGMA busy_timeout = 5000;")
             cur = conn.cursor()
 
             cur.execute(

@@ -90,7 +90,7 @@ class HeadlessSimulator:
         self.telemetry_mode = telemetry_mode.lower()
         if self.telemetry_mode == "sqlite":
             db_path = telemetry_db_path or config.DB_PATH
-            self.telemetry_recorder: Any = TelemetryRecorder(db_path=db_path)
+            self.telemetry_recorder: Any = TelemetryRecorder(db_path=db_path, auto_register_probes=True)
         elif self.telemetry_mode == "null":
             self.telemetry_recorder = NullTelemetryRecorder()
         else:
@@ -98,6 +98,8 @@ class HeadlessSimulator:
         self.frame_times: List[float] = []
 
         # Load Cartridge & Spec
+        self.is_godot = False
+        self._godot_sim = None
         self.cartridge: Optional[BaseCartridge] = None
         if cartridge is not None:
             self.cartridge = cartridge
@@ -105,7 +107,18 @@ class HeadlessSimulator:
             cpath = Path(cartridge_path)
             if not cpath.exists():
                 raise FileNotFoundError(f"Cartridge directory not found: {cpath}")
-            self.cartridge = CartridgeLoader.load_cartridge(cpath)
+            if (cpath / "project.godot").is_file():
+                from engine.sim.godot_verifier import GodotHeadlessSimulator
+                self.is_godot = True
+                self._godot_sim = GodotHeadlessSimulator(
+                    cartridge_path=cpath,
+                    telemetry_mode=self.telemetry_mode,
+                    telemetry_db_path=telemetry_db_path,
+                    max_ticks=self.max_steps or 60,
+                )
+                self.cartridge = None
+            else:
+                self.cartridge = CartridgeLoader.load_cartridge(cpath)
 
         # Determine mode: Scene Mode (Open-Genre) vs Spatial Mode (Backward Compatibility)
         has_custom_scenes = False
@@ -114,12 +127,15 @@ class HeadlessSimulator:
             and hasattr(self.cartridge, "get_scenes")
             and getattr(type(self.cartridge), "get_scenes", None) is not BaseCartridge.get_scenes
         )
-        if self.cartridge is not None and hasattr(self.cartridge, "get_scenes"):
+        if not self.is_godot and self.cartridge is not None and hasattr(self.cartridge, "get_scenes"):
             try:
                 from engine.core.engine import Engine
                 self.engine = Engine(headless=True)
+                self.engine.active_cartridge = self.cartridge
+                self.engine.booted_cartridge_path = getattr(self.cartridge, "cartridge_dir", None) or (Path(cartridge_path).resolve() if cartridge_path else None)
                 self.engine.set_telemetry_recorder(self.telemetry_recorder)
                 self.engine.telemetry_recorder = self.telemetry_recorder
+                self.engine._catalog_cartridge_probes()
                 scenes = self.cartridge.get_scenes(self.engine)
                 if scenes:
                     has_custom_scenes = True
@@ -158,7 +174,7 @@ class HeadlessSimulator:
                 logger.warning("Could not initialize scene mode on cartridge: %s", e)
                 has_custom_scenes = False
 
-        if has_custom_scenes:
+        if self.is_godot or has_custom_scenes:
             self.mode = "scene"
             self._init_dummy_spatial_properties()
         else:
@@ -406,9 +422,49 @@ class HeadlessSimulator:
 
         dt = self.dt
 
+        # Godot Mode Execution
+        if getattr(self, "is_godot", False) and self._godot_sim is not None:
+            state = self._godot_sim.step(cmd)
+            self.step_count = self._godot_sim.step_count
+            self.elapsed_time = self._godot_sim.elapsed_time
+            self.is_completed = self._godot_sim.is_completed
+            self.outcome = self._godot_sim.outcome
+            return SimulationStepResult(
+                deliberation="Godot headless simulation step",
+                state=state,
+                reward=0.0,
+                done=self.is_completed,
+                info={"godot": True},
+            )
+
         # Scene Mode Execution
         if getattr(self, "mode", "spatial") == "scene":
             import pygame
+            # Synthesize headless key state for pygame.key.get_pressed()
+            pressed_keys = set()
+            if cmd.move_y < 0 or getattr(cmd, "up", False):
+                pressed_keys.update([pygame.K_w, pygame.K_UP])
+            elif cmd.move_y > 0 or getattr(cmd, "down", False):
+                pressed_keys.update([pygame.K_s, pygame.K_DOWN])
+            if cmd.move_x < 0 or getattr(cmd, "left", False):
+                pressed_keys.update([pygame.K_a, pygame.K_LEFT])
+            elif cmd.move_x > 0 or getattr(cmd, "right", False):
+                pressed_keys.update([pygame.K_d, pygame.K_RIGHT])
+            if cmd.fire or getattr(cmd, "action_1", False):
+                pressed_keys.update([pygame.K_SPACE, pygame.K_RETURN, pygame.K_e, pygame.K_f])
+            if cmd.dash or getattr(cmd, "space", False):
+                pressed_keys.update([pygame.K_LSHIFT, pygame.K_RSHIFT, pygame.K_q, pygame.K_SPACE])
+
+            class _HeadlessKeyState:
+                def __init__(self, keys_set):
+                    self._keys = keys_set
+                def __getitem__(self, k):
+                    return k in self._keys
+                def __contains__(self, k):
+                    return k in self._keys
+
+            pygame.key.get_pressed = lambda: _HeadlessKeyState(pressed_keys)
+
             if hasattr(self.current_scene, "handle_event"):
                 if cmd.fire:
                     ev = pygame.event.Event(pygame.KEYDOWN, key=pygame.K_SPACE)
@@ -425,6 +481,9 @@ class HeadlessSimulator:
                 else:
                     ev = pygame.event.Event(pygame.NOEVENT)
                 self.current_scene.handle_event(ev)
+                if hasattr(self, "engine") and getattr(self.engine, "scene_manager", None) is not None:
+                    if self.engine.scene_manager.current_scene is not None and self.engine.scene_manager.current_scene is not self.current_scene:
+                        self.current_scene = self.engine.scene_manager.current_scene
 
             if hasattr(self.current_scene, "update"):
                 self.current_scene.update(dt)
@@ -621,6 +680,14 @@ class HeadlessSimulator:
     ) -> SimulationSummary:
         """Runs the simulation loop continuously until completion or timeout."""
         limit = min(max_steps, self.max_steps or max_steps)
+        if getattr(self, "is_godot", False) and self._godot_sim is not None:
+            self._godot_sim.run_until_complete(max_steps=limit)
+            self.is_completed = self._godot_sim.is_completed
+            self.outcome = self._godot_sim.outcome
+            self.step_count = self._godot_sim.step_count
+            self.elapsed_time = self._godot_sim.elapsed_time
+            return self.get_summary()
+
         while not self.is_completed and self.step_count < limit:
             if policy_fn is not None:
                 action = policy_fn(self.get_state())
@@ -640,6 +707,8 @@ class HeadlessSimulator:
     # ------------------------------------------------------------------------
     def get_state(self) -> SimulationState:
         """Returns snapshot of current simulation state."""
+        if getattr(self, "is_godot", False) and self._godot_sim is not None:
+            return self._godot_sim.get_state()
         return SimulationState(
             deliberation="Simulation state snapshot.",
             step_count=self.step_count,
@@ -723,6 +792,8 @@ class HeadlessSimulator:
 
     def close(self) -> None:
         """Flushes and closes telemetry recorder."""
+        if getattr(self, "is_godot", False) and self._godot_sim is not None:
+            self._godot_sim.close()
         if hasattr(self.telemetry_recorder, "close"):
             self.telemetry_recorder.close()
 

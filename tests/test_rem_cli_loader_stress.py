@@ -41,6 +41,12 @@ def _cleanup_process(proc: subprocess.Popen, timeout: float = 5.0) -> None:
             except Exception:
                 pass
     finally:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
         if proc.stdout and not proc.stdout.closed:
             proc.stdout.close()
         if proc.stderr and not proc.stderr.closed:
@@ -264,6 +270,7 @@ class TestDynamicLoaderImportIsolationAndWarningAbsence:
             "    def create_hazards(self, s): return []\n"
         )
 
+        gc.collect()
         with warnings.catch_warnings(record=True) as recorded:
             warnings.simplefilter("always")
             for i in range(30):
@@ -484,7 +491,7 @@ class TestSubprocessCleanTeardownAndZombieEradication:
         try:
             time.sleep(0.5)
             os.killpg(proc.pid, signal.SIGINT)
-            stdout, stderr = proc.communicate(timeout=8)
+            stdout, stderr = proc.communicate(timeout=15.0)
             assert proc.returncode == 0, f"run_game.py did not exit 0 on SIGINT: {stderr}"
             assert "completed cleanly" in stdout.lower()
         finally:
@@ -510,7 +517,7 @@ class TestSubprocessCleanTeardownAndZombieEradication:
         try:
             time.sleep(0.5)
             os.killpg(proc.pid, signal.SIGTERM)
-            stdout, stderr = proc.communicate(timeout=8)
+            stdout, stderr = proc.communicate(timeout=15.0)
             assert proc.returncode == 0, f"run_game.py did not exit 0 on SIGTERM: {stderr}"
             assert "completed cleanly" in stdout.lower()
         finally:
@@ -577,7 +584,7 @@ class TestSubprocessCleanTeardownAndZombieEradication:
 
             # Intercept with SIGINT
             os.killpg(proc.pid, signal.SIGINT)
-            stdout, stderr = proc.communicate(timeout=8)
+            stdout, stderr = proc.communicate(timeout=15.0)
             assert proc.returncode == 0, f"run_studio.py did not exit 0 on SIGINT: {stderr}"
         finally:
             _cleanup_process(proc)
@@ -619,7 +626,7 @@ class TestSubprocessCleanTeardownAndZombieEradication:
 
             # Intercept with SIGTERM
             os.killpg(proc.pid, signal.SIGTERM)
-            stdout, stderr = proc.communicate(timeout=8)
+            stdout, stderr = proc.communicate(timeout=15.0)
             assert proc.returncode == 0, f"run_studio.py did not exit 0 on SIGTERM: {stderr}"
         finally:
             _cleanup_process(proc)

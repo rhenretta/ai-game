@@ -375,15 +375,78 @@ def sample_open_genre_cartridge(tmp_path_factory):
 
 @pytest.fixture(scope="session", autouse=True)
 def clean_stale_telemetry_db():
-    """Removes stale telemetry database from previous test runs to prevent unindexed bloat."""
-    from pathlib import Path
+    """Removes stale telemetry database state without unlinking open inodes.
+
+    Preserves open file handles and inodes for live processes (e.g. run_studio.py
+    server PID 34772) to prevent POSIX lock divergence, WAL mapping corruption,
+    and sqlite3.OperationalError('disk I/O error').
+    """
+    import sqlite3
     import config
-    for p in [config.DB_PATH, Path(str(config.DB_PATH) + "-wal"), Path(str(config.DB_PATH) + "-shm")]:
-        if p.exists():
+
+    db_path = config.DB_PATH
+    if not db_path.exists():
+        return
+
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            conn.execute("PRAGMA busy_timeout = 5000;")
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
+            tables = [row[0] for row in cur.fetchall()]
+            if tables:
+                conn.execute("PRAGMA foreign_keys = OFF;")
+                for tbl in ["custom_telemetry_events", "telemetry_events", "telemetry_episodes", "telemetry_sessions", "telemetry_probes"]:
+                    if tbl in tables:
+                        conn.execute(f"DELETE FROM {tbl};")
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sqlite_sequence';")
+                if cur.fetchone():
+                    conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('telemetry_events', 'custom_telemetry_events');")
+                conn.commit()
+                conn.execute("PRAGMA foreign_keys = ON;")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+
+            # Re-seed built-in engine probes for referential integrity
             try:
-                p.unlink()
-            except OSError:
+                conn.execute("""
+                    INSERT INTO telemetry_probes (probe_id, probe_name, category, description, hypothesis_target, schema_json)
+                    VALUES 
+                        ('probe_dialogue_bark_played', 'dialogue_bark_played', 'dialogue', 'Reactive dialogue bark played in PlayingScene', 'H_DIALOGUE_ENGAGEMENT', '{}'),
+                        ('probe_cartridge_hot_reload_triggered', 'cartridge_hot_reload_triggered', 'system', 'In-game cartridge hot-reload event', 'H_HOT_RELOAD', '{}')
+                    ON CONFLICT(probe_name) DO NOTHING;
+                """)
+            except Exception:
                 pass
+
+            # Re-seed active cartridge probes from telemetry_manifest.json
+            active_manifest = config.PROJECT_ROOT / "cartridges" / "active" / "telemetry_manifest.json"
+            if active_manifest.is_file():
+                try:
+                    import json
+                    m_data = json.loads(active_manifest.read_text(encoding="utf-8"))
+                    for p in m_data.get("probes", []):
+                        if isinstance(p, dict) and p.get("probe_name"):
+                            conn.execute("""
+                                INSERT INTO telemetry_probes (probe_id, probe_name, category, description, hypothesis_target, schema_json)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                                ON CONFLICT(probe_name) DO NOTHING;
+                            """, (
+                                str(p.get("probe_id") or f"prb_{p['probe_name']}"),
+                                str(p["probe_name"]),
+                                str(p.get("category", "general")),
+                                str(p.get("description", "")),
+                                str(p.get("hypothesis_target", "")),
+                                json.dumps(p.get("payload_schema", {})),
+                            ))
+                except Exception:
+                    pass
+
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
 
 
 @pytest.fixture(autouse=True)
@@ -396,5 +459,94 @@ def isolate_studio_daemon_in_run_studio_tests(request, monkeypatch):
             orig_init(self, *args, **kwargs)
             self.orchestrator = None
         monkeypatch.setattr(StudioDaemon, "__init__", mocked_init)
+
+
+@pytest.fixture
+def stash_active_cartridge():
+    """Hermetically stashes cartridges/active for tests verifying absent active cartridge behavior.
+
+    Moves cartridges/active to cartridges/.active_stash during the test, ensuring
+    subprocesses and in-process code observe no active cartridge. Touches
+    cartridges/.no_cold_boot to prevent background studio daemon cold boots.
+    Guarantees atomic restoration of the original active cartridge upon test completion.
+    """
+    import shutil
+    from pathlib import Path
+    import config
+
+    cartridges_dir = config.PROJECT_ROOT / "cartridges"
+    active_dir = cartridges_dir / "active"
+    stash_dir = cartridges_dir / ".active_stash"
+    checkpoints_dir = cartridges_dir / "checkpoints"
+    cp_stash_dir = cartridges_dir / ".checkpoints_stash"
+    no_cold_boot = cartridges_dir / ".no_cold_boot"
+    created_no_cold_boot = False
+    stashed = False
+    stashed_cp = False
+
+    # Prevent studio daemon cold boot while stashed
+    if not no_cold_boot.exists():
+        try:
+            no_cold_boot.touch(exist_ok=True)
+            created_no_cold_boot = True
+        except OSError:
+            pass
+
+    if active_dir.exists():
+        if stash_dir.exists():
+            shutil.rmtree(stash_dir, ignore_errors=True)
+        try:
+            active_dir.rename(stash_dir)
+            stashed = True
+        except OSError:
+            shutil.move(str(active_dir), str(stash_dir))
+            stashed = True
+
+    if checkpoints_dir.exists():
+        if cp_stash_dir.exists():
+            shutil.rmtree(cp_stash_dir, ignore_errors=True)
+        try:
+            checkpoints_dir.rename(cp_stash_dir)
+            stashed_cp = True
+        except OSError:
+            shutil.move(str(checkpoints_dir), str(cp_stash_dir))
+            stashed_cp = True
+
+    try:
+        yield active_dir
+    finally:
+        if stashed:
+            if active_dir.exists():
+                shutil.rmtree(active_dir, ignore_errors=True)
+            if stash_dir.exists():
+                try:
+                    stash_dir.rename(active_dir)
+                except OSError:
+                    shutil.move(str(stash_dir), str(active_dir))
+        elif stash_dir.exists() and not active_dir.exists():
+            try:
+                stash_dir.rename(active_dir)
+            except OSError:
+                shutil.move(str(stash_dir), str(active_dir))
+
+        if stashed_cp:
+            if checkpoints_dir.exists():
+                shutil.rmtree(checkpoints_dir, ignore_errors=True)
+            if cp_stash_dir.exists():
+                try:
+                    cp_stash_dir.rename(checkpoints_dir)
+                except OSError:
+                    shutil.move(str(cp_stash_dir), str(checkpoints_dir))
+        elif cp_stash_dir.exists() and not checkpoints_dir.exists():
+            try:
+                cp_stash_dir.rename(checkpoints_dir)
+            except OSError:
+                shutil.move(str(cp_stash_dir), str(checkpoints_dir))
+
+        if created_no_cold_boot and no_cold_boot.exists():
+            try:
+                no_cold_boot.unlink()
+            except OSError:
+                pass
 
 

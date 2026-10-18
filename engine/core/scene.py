@@ -10,7 +10,7 @@ import pygame
 class Scene(ABC):
     """Abstract base class for all game scenes."""
 
-    def __init__(self, engine: Any):
+    def __init__(self, engine: Any = None):
         self.engine = engine
         self.is_active: bool = False
 
