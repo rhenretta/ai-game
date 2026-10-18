@@ -1997,11 +1997,6 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           this.startPolling(2500);
           if (offlineBanner) offlineBanner.style.display = 'none';
 
-          addDeliberation({
-            deliberation: `Connected to studio observability bus via ${activeEndpoint}. Streaming active.`,
-            event_type: 'connected',
-            agent_name: 'MissionControlGateway'
-          });
           loadEventHistory();
           loadSteamDNA();
           loadHeatmap();
@@ -2012,6 +2007,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         this.ws.onmessage = (event) => {
           try {
             const data = JSON.parse(event.data);
+            if (data.event_type === 'connected' || data.event_type === 'echo') {
+              return;
+            }
             if (data.deliberation) {
               addDeliberation(data);
             }

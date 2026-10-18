@@ -323,6 +323,10 @@ class SwarmEventBus:
                     db = TelemetryDB(self._db_path)
                     target_bid = build_id or self.get_active_build_id()
                     db_events = db.get_studio_events(build_id=target_bid, limit=limit)
+                    if not db_events and target_bid and not str(target_bid).startswith("build_"):
+                        db_events = db.get_studio_events(build_id=f"build_{target_bid}", limit=limit)
+                    if not db_events and build_id is None:
+                        db_events = db.get_studio_events(build_id=None, limit=limit)
                     if db_events:
                         return db_events
                 except Exception as e:
@@ -2816,7 +2820,19 @@ def create_app(
 
         hydrated_events: List[Dict[str, Any]] = []
         if has_active and not has_build_events and target_db:
-            now_iso = datetime.now(timezone.utc).isoformat()
+            now_iso = None
+            manifest_file = cart_dir / "manifest.json"
+            if manifest_file.is_file():
+                try:
+                    m_obj = json.loads(manifest_file.read_text(encoding="utf-8"))
+                    now_iso = m_obj.get("created_at_utc") or m_obj.get("timestamp_utc")
+                except Exception:
+                    pass
+            if not now_iso:
+                try:
+                    now_iso = datetime.fromtimestamp(cart_dir.stat().st_mtime, tz=timezone.utc).isoformat()
+                except Exception:
+                    now_iso = "2026-01-01T00:00:00+00:00"
             try:
                 repo = SteamDNAPersistence(db_path=target_db)
                 dna = repo.get_latest_dna()
