@@ -370,6 +370,13 @@ def run_godot_cartridge(
     from engine.godot_runtime import ensure_godot_binary
     godot_bin = ensure_godot_binary()
 
+    if not headless and (cartridge_dir / "project.godot").is_file():
+        try:
+            from engine.studio.models import enforce_hidpi_project_godot
+            enforce_hidpi_project_godot(cartridge_dir / "project.godot")
+        except Exception as exc:
+            logger.debug("Could not enforce HiDPI settings on project.godot: %s", exc)
+
     cmd = [str(godot_bin), "--path", str(cartridge_dir)]
     if headless:
         cmd.append("--headless")

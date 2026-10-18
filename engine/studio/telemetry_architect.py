@@ -226,7 +226,7 @@ class TelemetryArchitectAgent:
                 probe_stmt = (
                     f'{indent_str}print("[TELEMETRY_EVENT] " + JSON.stringify({{'
                     f'"probe_name": "{probe.probe_name}", "category": "{probe.category}", '
-                    f'"payload": get_state_snapshot() if has_method("get_state_snapshot") else {{"probe_name": "{probe.probe_name}", "frame": Engine.get_process_frames()}}'
+                    f'"payload": call("get_state_snapshot") if has_method("get_state_snapshot") else {{"probe_name": "{probe.probe_name}", "frame": Engine.get_process_frames()}}'
                     f'}}))'
                 )
                 if f'"probe_name": "{probe.probe_name}"' not in "\n".join(lines):
@@ -244,7 +244,7 @@ class TelemetryArchitectAgent:
                     probe_stmt = (
                         f'{indent_str}print("[TELEMETRY_EVENT] " + JSON.stringify({{'
                         f'"probe_name": "{probes[0].probe_name}", "category": "{probes[0].category}", '
-                        f'"payload": get_state_snapshot() if has_method("get_state_snapshot") else {{"probe_name": "{probes[0].probe_name}", "frame": Engine.get_process_frames()}}'
+                        f'"payload": call("get_state_snapshot") if has_method("get_state_snapshot") else {{"probe_name": "{probes[0].probe_name}", "frame": Engine.get_process_frames()}}'
                         f'}}))'
                     )
                     if not any(f'"probe_name": "{probes[0].probe_name}"' in l for l in lines[target_idx:min(len(lines), target_idx + 5)]):
@@ -260,7 +260,7 @@ class TelemetryArchitectAgent:
                     probe_stmt = (
                         f'{indent_str}print("[TELEMETRY_EVENT] " + JSON.stringify({{'
                         f'"probe_name": "{probes[0].probe_name}", "category": "{probes[0].category}", '
-                        f'"payload": get_state_snapshot() if has_method("get_state_snapshot") else {{"probe_name": "{probes[0].probe_name}", "frame": Engine.get_process_frames()}}'
+                        f'"payload": call("get_state_snapshot") if has_method("get_state_snapshot") else {{"probe_name": "{probes[0].probe_name}", "frame": Engine.get_process_frames()}}'
                         f'}}))'
                     )
                     if probe_stmt.strip() not in [l.strip() for l in lines]:

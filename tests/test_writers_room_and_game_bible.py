@@ -1,0 +1,698 @@
+"""tests/test_writers_room_and_game_bible.py
+Verification suite for the Multi-Agent Creative Writers' Room & Living Game Bible:
+- Rationale-First (Rule 4) schema validation for all Writers' Room and Game Bible models
+- Open-ended conversational turn-taking (WritersRoomListenCheck -> WritersRoomTurnProposal -> DirectorConvergenceCheck)
+- Mid-conversation 16:9 concept & diegetic UI mockup synthesis (VisualArtisanAgent.generate_concept_mockup)
+- SQLite WAL studio_game_bibles persistence & Mission Control REST endpoints (/api/studio/game-bible, /api/studio/greenlight, /api/studio/settings)
+- Downstream grounding in GameConceptDirectorAgent, LeadGameplaySWEAgent, and ChallengerGate
+- Rule 1 domain-agnostic verification (zero hardcoded game titles/entities in prompts)
+"""
+from __future__ import annotations
+
+import io
+import json
+from pathlib import Path
+from typing import Any, List
+import pytest
+from PIL import Image
+from starlette.testclient import TestClient
+
+from engine.steam.models import SteamPlayerDNA
+from engine.studio.director import GameConceptDirectorAgent
+from engine.studio.models import (
+    CharacterSheet,
+    ConceptEvolutionEntry,
+    CutsceneBeat,
+    CutsceneScript,
+    DialogueNode,
+    DialogueTreeSpec,
+    DirectorConvergenceCheck,
+    ExperienceStoryboardBeat,
+    GameBibleSpec,
+    GameRequirementsSpec,
+    GenesisWorldSpec,
+    NarrativeBible,
+    StudioBuildState,
+    WritersRoomListenCheck,
+    WritersRoomTurnProposal,
+    WritersRoomUtterance,
+    VisualMockupArtifact,
+)
+from engine.studio.orchestrator import StudioOrchestrator
+from engine.studio.swe import LeadGameplaySWEAgent
+from engine.studio.visual import VisualArtisanAgent
+from engine.studio.writers_room import CreativeWritersRoom
+from engine.supervisor.challenger import ChallengerGate
+from engine.telemetry.db import TelemetryDB
+from engine.ui.models import GreenlightRequest, StudioSettingsUpdateRequest
+from engine.ui.server import SwarmEventBus, create_app
+
+
+class _FakeGeminiResponse:
+    def __init__(self, payload: Any):
+        if isinstance(payload, str):
+            self.text = payload
+        elif hasattr(payload, "model_dump_json"):
+            self.text = payload.model_dump_json()
+        else:
+            self.text = json.dumps(payload)
+
+
+class _SchemaDispatchGeminiModels:
+    """Fake Gemini models endpoint that inspects response_schema to return valid structured JSON."""
+
+    def __init__(self):
+        self.calls: List[dict] = []
+        self.listen_call_count = 0
+        self.turn_call_count = 0
+        self.convergence_call_count = 0
+
+    def generate_content(self, model: str, contents: Any, config: Any = None) -> Any:
+        schema = getattr(config, "response_schema", None) if config else None
+        modalities = getattr(config, "response_modalities", None) if config else None
+        self.calls.append({"model": model, "schema": schema, "modalities": modalities})
+
+        # Multimodal image generation call (16:9 mockup or sprite)
+        if modalities and "IMAGE" in modalities:
+            img = Image.new("RGBA", (320, 180), (29, 43, 83, 255))
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            png_bytes = buf.getvalue()
+
+            class _InlineData:
+                data = png_bytes
+
+            class _Part:
+                inline_data = _InlineData()
+
+            class _Content:
+                parts = [_Part()]
+
+            class _Candidate:
+                content = _Content()
+
+            class _ImgResp:
+                candidates = [_Candidate()]
+
+            return _ImgResp()
+
+        schema_name = getattr(schema, "__name__", "") if schema else ""
+
+        if schema_name == "WritersRoomListenCheck":
+            self.listen_call_count += 1
+            should_speak = self.listen_call_count in (1, 3, 5)
+            urgency = 0.95 if self.listen_call_count == 1 else (0.85 if should_speak else 0.2)
+            return _FakeGeminiResponse(
+                WritersRoomListenCheck(
+                    deliberation=f"Evaluating conversation relevance on listen check #{self.listen_call_count}.",
+                    should_interject=should_speak,
+                    urgency_score=urgency,
+                    intended_contribution_summary="Proposing diegetic world hook and 16:9 visual mockup.",
+                )
+            )
+
+        if schema_name == "WritersRoomTurnProposal":
+            self.turn_call_count += 1
+            if self.turn_call_count == 1:
+                return _FakeGeminiResponse(
+                    WritersRoomTurnProposal(
+                        deliberation="Opening pitch: establishing a kinetic atmospheric world with zero static HUD text.",
+                        spoken_dialogue="Let's build 'Chrono Canopy', an atmospheric momentum-based canopy glider where wind currents and lantern glow communicate speed and danger directly in the world.",
+                        addressed_to=["GameplayDesigner", "UXExperienceDesigner", "VisualArtDirector"],
+                        updated_game_title="Chrono Canopy",
+                        updated_elevator_pitch="An atmospheric momentum-based canopy glider where wind currents and lantern glow communicate speed and danger directly in the world.",
+                        updated_core_fantasy="Glide through bioluminescent wind canyons using rhythmic wing-tuck dives and thermal updrafts.",
+                        updated_first_60_seconds_hook="Player wakes on a crumbling wind-spire as a storm wall approaches; diving off the ledge immediately catches an updraft.",
+                        updated_diegetic_ui_philosophy="Scarf trail length and lantern color shift indicate stamina and altitude; zero on-screen text instructions.",
+                        concept_evolution_milestone=ConceptEvolutionEntry(
+                            deliberation="Initial pitch establishing momentum-driven canopy glider with diegetic scarf & lantern telemetry.",
+                            author_role="CreativeDirector",
+                            previous_premise="Untitled Concept",
+                            evolved_premise="v1: Momentum-driven canopy glider with diegetic scarf & lantern telemetry.",
+                            pivot_reason="Initial pitch replacing generic platforming with tactile wind physics.",
+                        ),
+                        added_or_updated_storyboard_beats=[
+                            ExperienceStoryboardBeat(
+                                deliberation="Beat 1 teaches diving without text prompts.",
+                                beat_index=1,
+                                phase_title="Opening Hook",
+                                player_emotional_state="Vertigo transforming into exhilarating flight.",
+                                sensory_and_camera_staging="Wide 16:9 pan revealing the storm wall behind the spire.",
+                                diegetic_teaching_moment="Wind chimes and glowing thermal ribbons pull the camera downward.",
+                                narrative_integration="Leap from the crumbling wind-spire into the canyon updraft as the storm rises.",
+                            ),
+                            ExperienceStoryboardBeat(
+                                deliberation="Beat 2 introduces thermal charging.",
+                                beat_index=2,
+                                phase_title="First Discovery",
+                                player_emotional_state="Wonder and harmonic flow.",
+                                sensory_and_camera_staging="Warm amber rim-lighting contrasting against deep indigo clouds.",
+                                diegetic_teaching_moment="Chime-towers emit expanding light rings when approached.",
+                                narrative_integration="Skim across ancient chime-towers to resonantly charge the glider cape.",
+                            ),
+                        ],
+                        gameplay_pillars_additions=[
+                            "Momentum-conserving dive-and-soar flight physics",
+                            "Diegetic scarf and lantern feedback (zero HUD text manuals)",
+                            "Resonant chime-tower harmonic chain reactions",
+                        ],
+                    )
+                )
+            return _FakeGeminiResponse(
+                WritersRoomTurnProposal(
+                    deliberation="VisualArtDirector & Narrative synthesis: adding 16:9 gameplay mockup, protagonist Lyra, and intro cutscene.",
+                    spoken_dialogue="I'm generating a 16:9 gameplay mockup showing the spire leap, glowing thermal ribbons, and scarf-trail stamina indicator, alongside Lyra's character sheet and opening spire cutscene.",
+                    addressed_to=["CreativeDirector", "UXExperienceDesigner"],
+                    concept_evolution_milestone=ConceptEvolutionEntry(
+                        deliberation="Grounded the flight loop in visible thermal ribbons and diegetic cape glow.",
+                        author_role="VisualArtDirector",
+                        previous_premise="v1: Momentum-driven canopy glider",
+                        evolved_premise="v2: Added harmonic chime-tower resonance, Lyra character arc, and 16:9 visual mockup board.",
+                        pivot_reason="Grounded the flight loop in visible thermal ribbons and diegetic cape glow.",
+                    ),
+                    mockup_to_generate=VisualMockupArtifact(
+                        deliberation="16:9 widescreen gameplay mockup demonstrating diegetic scarf stamina and thermal ribbons.",
+                        mockup_id="spire_leap",
+                        title="Spire Leap & Thermal Ribbons 16:9 Mockup",
+                        scene_description="16:9 widescreen indie game screenshot of a glider leaping off a stone wind-spire into glowing cyan thermal ribbons, scarf glowing amber, zero text HUD.",
+                        image_path="assets/mockups/mockup_1_spire_leap.png",
+                        ui_callout_notes=["Scarf length and glow intensity show boost charge directly on the character."],
+                    ),
+                    added_or_updated_characters=[
+                        CharacterSheet(
+                            deliberation="Protagonist wind-weaver with expressive scarf silhouette.",
+                            character_id="lyra",
+                            name="Lyra",
+                            role="protagonist",
+                            personality_traits=["daring", "observant"],
+                            backstory="Last apprentice of the High Spire.",
+                            voice_timbre="Warm contralto with breathless urgency",
+                            gemini_voice_name="Kore",
+                        )
+                    ],
+                    added_or_updated_cutscenes=[
+                        CutsceneScript(
+                            deliberation="Opening spire awakening cutscene.",
+                            cutscene_id="intro_spire",
+                            title="The Storm Wall Rises",
+                            trigger="episode_start",
+                            beats=[
+                                CutsceneBeat(
+                                    deliberation="Opening beat alerting player to the storm.",
+                                    beat_number=1,
+                                    action_description="Storm lightning shatters the upper spire chimes.",
+                                    speaker_id="lyra",
+                                    dialogue_line="The upper chimes have shattered... I have to catch the canyon draft now!",
+                                )
+                            ],
+                        )
+                    ],
+                    added_or_updated_dialogue_trees=[
+                        DialogueTreeSpec(
+                            deliberation="Root dialogue tree at the first beacon.",
+                            root_node_id="beacon_1",
+                            nodes={
+                                "beacon_1": DialogueNode(
+                                    deliberation="Root node at the first beacon.",
+                                    node_id="beacon_1",
+                                    speaker_id="lyra",
+                                    text="The resonance core is still warm.",
+                                    choices=[],
+                                )
+                            },
+                        )
+                    ],
+                    visual_style_guide_update="Cyber-neon bioluminescent wind canyons with side-scrolling pan camera.",
+                    audio_direction_update="Aeolian harp swells synchronized with airspeed.",
+                )
+            )
+
+        if schema_name == "DirectorConvergenceCheck":
+            self.convergence_call_count += 1
+            ready = self.convergence_call_count >= 1
+            return _FakeGeminiResponse(
+                DirectorConvergenceCheck(
+                    deliberation="All experience pillars, storyboard beats, and 16:9 visual mockups are concrete and cohesive.",
+                    is_ready_to_lock_bible=ready,
+                    experience_cohesion_score=0.94,
+                    missing_or_weak_elements=[],
+                    director_steering_prompt="",
+                )
+            )
+
+        if schema_name == "GenesisWorldSpec":
+            return _FakeGeminiResponse(
+                GenesisWorldSpec(
+                    deliberation="Translating locked Chrono Canopy Game Bible into GenesisWorldSpec.",
+                    game_title="Chrono Canopy",
+                    core_genre="Atmospheric Momentum Glider",
+                    thematic_premise="Outrun the storm wall across the resonant wind canyons.",
+                    world_lore="An ancient sky-archipelago where wind-weavers keep the storm at bay.",
+                    conflict_tone="heroic_hopeful",
+                    conflict_narrative="Lyra must ignite the three canyon beacon spires before the storm swallows the High Spire.",
+                    aesthetic_style="Bioluminescent wind canyons with expressive scarf trails and glowing thermal ribbons.",
+                    palette_mood="neon_cyberpunk",
+                    gameplay_pacing="kinetic_high_mobility",
+                    pacing_score=0.6,
+                    target_difficulty=0.8,
+                    camera_style="scrolling",
+                    mechanics_guidelines=[
+                        "Dive to build speed, pull up into cyan thermal ribbons to soar.",
+                        "Scarf length and glow communicate boost stamina diegetically.",
+                    ],
+                )
+            )
+
+        if schema_name == "GameRequirementsSpec":
+            return _FakeGeminiResponse(
+                {
+                    "deliberation": "Derived verifiable tracks from Living Game Bible.",
+                    "spec_id": "spec_chrono_01",
+                    "game_title": "Chrono Canopy",
+                    "genre_paradigm": "Atmospheric Momentum Glider",
+                    "target_episode": 0,
+                    "requirements": [
+                        {
+                            "deliberation": "Core momentum flight track.",
+                            "id": "R1",
+                            "title": "Momentum Glider Physics & Diegetic Scarf",
+                            "description": "Implement dive-and-soar physics and scarf trail telemetry.",
+                            "assigned_agent": "LeadGameplaySWEAgent",
+                            "acceptance_criteria": [
+                                {
+                                    "deliberation": "Verify player glider physics.",
+                                    "id": "AC1.1",
+                                    "description": "Player glider responds to dive and updraft forces.",
+                                    "verification_method": "headless_playtest",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+
+        raise ValueError(f"Unexpected schema in test fake: {schema_name}")
+
+
+class _FakeGeminiClient:
+    def __init__(self):
+        self.models = _SchemaDispatchGeminiModels()
+
+
+def _sample_dna() -> SteamPlayerDNA:
+    return SteamPlayerDNA(
+        deliberation="Player enjoys atmospheric movement and expressive indie action games.",
+        player_id="test_player",
+        total_games_analyzed=12,
+        total_playtime_hours=420.0,
+        top_genres=["Action", "Indie", "Adventure"],
+        genre_weights={"Action": 0.5, "Indie": 0.3, "Adventure": 0.2},
+        pacing_score=0.4,
+        challenge_tolerance=0.6,
+        thematic_biases=["atmospheric", "flight"],
+        preferred_palette_mood="cyber_neon",
+    )
+
+
+def test_writers_room_models_enforce_rationale_first_index_zero():
+    """Rule 4: Verify all new Writers' Room and Game Bible Pydantic models declare 'deliberation' at field index 0."""
+    models_to_check = [
+        WritersRoomListenCheck,
+        ConceptEvolutionEntry,
+        ExperienceStoryboardBeat,
+        VisualMockupArtifact,
+        WritersRoomUtterance,
+        WritersRoomTurnProposal,
+        DirectorConvergenceCheck,
+        GameBibleSpec,
+        GreenlightRequest,
+        StudioSettingsUpdateRequest,
+    ]
+    for model_cls in models_to_check:
+        field_names = list(model_cls.model_fields.keys())
+        assert field_names[0] == "deliberation", f"{model_cls.__name__} must have 'deliberation' at field index 0, got {field_names}"
+
+
+def test_visual_artisan_generate_concept_mockup_writes_16_9_png(tmp_path: Path):
+    """Verify VisualArtisanAgent.generate_concept_mockup synthesizes a 16:9 PNG under assets/mockups/."""
+    fake_client = _FakeGeminiClient()
+    visual_agent = VisualArtisanAgent(client=fake_client)
+    mockup = VisualMockupArtifact(
+        deliberation="16:9 concept art board showing spire leap and thermal ribbons.",
+        mockup_id="spire_leap",
+        title="Spire Leap 16:9 Mockup",
+        scene_description="Glider diving into cyan thermal ribbons",
+        image_path="assets/mockups/spire_leap.png",
+        ui_callout_notes=["Scarf glow shows stamina"],
+    )
+    out_path = visual_agent.generate_concept_mockup(
+        mockup=mockup,
+        output_path=tmp_path / "assets" / "mockups" / "spire_leap.png",
+        style_guide="cyber_neon",
+        dimensions=(640, 360),
+    )
+    assert out_path.is_file()
+    assert out_path.parent.name == "mockups"
+    with Image.open(out_path) as img:
+        assert img.size == (640, 360)
+
+
+def test_creative_writers_room_runs_open_ended_conversation_and_persists_bible(tmp_path: Path):
+    """Verify CreativeWritersRoom runs open-ended multi-agent brainstorming, logs concept evolution,
+    synthesizes 16:9 mockups, and persists game_bible.json + SQLite studio_game_bibles.
+    """
+    db_path = tmp_path / "telemetry.db"
+    tdb = TelemetryDB(db_path)
+    fake_client = _FakeGeminiClient()
+    visual_agent = VisualArtisanAgent(client=fake_client)
+    emitted_events: List[tuple] = []
+
+    room = CreativeWritersRoom(
+        client=fake_client,
+        visual_agent=visual_agent,
+        telemetry_db=tdb,
+        event_callback=lambda etype, payload: emitted_events.append((etype, payload)),
+        max_turns=4,
+        min_turns_before_convergence=1,
+    )
+
+    candidate_dir = tmp_path / "candidate_genesis_test"
+    bible = room.run_writers_room(
+        dna=_sample_dna(),
+        candidate_dir=candidate_dir,
+        target_episode=0,
+        cartridge_id="candidate_genesis_test",
+    )
+
+    assert isinstance(bible, GameBibleSpec)
+    assert bible.status == "locked"
+    assert bible.game_title == "Chrono Canopy"
+    assert len(bible.writers_room_transcript) >= 2
+    assert len(bible.concept_evolution) >= 2
+    assert len(bible.experience_storyboard) >= 2
+    assert len(bible.visual_mockups) >= 1
+    assert bible.world_spec is not None
+    assert bible.narrative_bible is not None
+
+    # Verify game_bible.json, world_spec.json, and narrative_bible.json on disk
+    assert (candidate_dir / "game_bible.json").is_file()
+    assert (candidate_dir / "world_spec.json").is_file()
+    assert (candidate_dir / "narrative_bible.json").is_file()
+
+    # Verify SQLite studio_game_bibles persistence
+    db_rec = tdb.get_latest_game_bible()
+    assert db_rec is not None
+    assert db_rec["game_title"] == "Chrono Canopy"
+    assert db_rec["status"] == "locked"
+
+    # Verify emitted real-time events
+    event_types = [e[0] for e in emitted_events]
+    assert "writers_room_utterance" in event_types
+    assert "concept_evolution_logged" in event_types
+    assert "bible_mockup_generated" in event_types
+    assert "game_bible_updated" in event_types
+
+    # Test Executive Producer steering injection
+    updated_bible = room.inject_user_steering_and_continue(
+        game_bible=bible,
+        user_feedback="Add a co-op wind-tether mechanic between two gliders.",
+        dna=_sample_dna(),
+        candidate_dir=candidate_dir,
+        additional_turns=1,
+    )
+    assert any(u.speaker_role == "UserSteering" for u in updated_bible.writers_room_transcript)
+
+
+def test_downstream_director_swe_and_challenger_grounding_in_game_bible(tmp_path: Path):
+    """Verify GameConceptDirectorAgent, LeadGameplaySWEAgent, and ChallengerGate consume game_bible.json and 16:9 mockups,
+    and verify Rule 1 compliance (zero hardcoded Tellurium/Geocore/Tar-Phage strings in swe.py).
+    """
+    fake_client = _FakeGeminiClient()
+    visual_agent = VisualArtisanAgent(client=fake_client)
+    room = CreativeWritersRoom(client=fake_client, visual_agent=visual_agent, max_turns=2, min_turns_before_convergence=1)
+    candidate_dir = tmp_path / "candidate_grounding"
+    bible = room.run_writers_room(dna=_sample_dna(), candidate_dir=candidate_dir)
+
+    # 1. Director generate_requirements_spec with game_bible
+    director = GameConceptDirectorAgent(client=fake_client)
+    req_spec = director.generate_requirements_spec(
+        dna=_sample_dna(),
+        world_spec=bible.world_spec,
+        narrative_bible=bible.narrative_bible,
+        game_bible=bible,
+    )
+    assert isinstance(req_spec, GameRequirementsSpec)
+    assert req_spec.game_title == "Chrono Canopy"
+
+    # 2. LeadGameplaySWEAgent._build_bible_and_narrative_context includes game_bible, cutscenes, dialogue trees, and mockup parts
+    swe = LeadGameplaySWEAgent(client=fake_client)
+    narrative_ctx, mockup_parts = swe._build_bible_and_narrative_context(candidate_dir)
+    assert "LIVING GAME BIBLE" in narrative_ctx
+    assert "Diegetic UI & Onboarding Philosophy" in narrative_ctx
+    assert "The Storm Wall Rises" in narrative_ctx
+    assert len(mockup_parts) >= 1
+
+    # Verify Rule 1 compliance: no hardcoded domain strings in engine/studio/swe.py
+    swe_source = Path(swe.__class__.__module__.replace(".", "/") + ".py")
+    if swe_source.is_file():
+        text = swe_source.read_text(encoding="utf-8")
+        for forbidden in ("Tellurium", "Geocore", "Tar-Phage", "MissionOnboardingPanel"):
+            assert forbidden not in text, f"Rule 1 violation: forbidden hardcoded term '{forbidden}' found in swe.py"
+
+    # 3. ChallengerGate._collect_asset_grounding and _build_evaluation_prompt load game_bible.json and 16:9 mockups
+    challenger = ChallengerGate(client=fake_client)
+    asset_grounding = challenger._collect_asset_grounding(candidate_dir, req_spec)
+    assert len(asset_grounding["mockups_found"]) >= 1
+    eval_prompt = challenger._build_evaluation_prompt(
+        candidate_id="candidate_grounding",
+        spec=req_spec,
+        ast_grounding={},
+        telemetry_grounding={},
+        visual_grounding={},
+        asset_grounding=asset_grounding,
+        candidate_dir=candidate_dir,
+    )
+    assert "LIVING GAME BIBLE" in eval_prompt
+    assert "Scarf trail length and lantern color shift" in eval_prompt
+
+
+def test_mission_control_game_bible_and_greenlight_endpoints(tmp_path: Path):
+    """Verify /api/studio/game-bible, /api/studio/greenlight, /api/studio/settings, and /api/assets/mockups/{filename}."""
+    db_path = tmp_path / "telemetry.db"
+    cartridges_root = tmp_path / "cartridges"
+    active_dir = cartridges_root / "active"
+    active_dir.mkdir(parents=True, exist_ok=True)
+
+    tdb = TelemetryDB(db_path)
+    bus = SwarmEventBus(db_path=db_path, log_path=tmp_path / "events.jsonl")
+    fake_client = _FakeGeminiClient()
+    visual_agent = VisualArtisanAgent(client=fake_client)
+    room = CreativeWritersRoom(
+        client=fake_client,
+        visual_agent=visual_agent,
+        telemetry_db=tdb,
+        max_turns=2,
+        min_turns_before_convergence=1,
+    )
+    bible = room.run_writers_room(dna=_sample_dna(), candidate_dir=active_dir, cartridge_id="active")
+
+    app = create_app(
+        db_path=db_path,
+        cartridges_root=cartridges_root,
+        active_cartridge_dir=active_dir,
+        event_bus=bus,
+    )
+    client = TestClient(app)
+
+    # 1. GET /api/studio/game-bible
+    res = client.get("/api/studio/game-bible")
+    assert res.status_code == 200
+    data = res.json()
+    assert list(data.keys())[0] == "deliberation"
+    assert data["has_bible"] is True
+    assert data["game_title"] == "Chrono Canopy"
+    assert len(data["writers_room_transcript"]) >= 2
+    assert len(data["visual_mockups"]) >= 1
+
+    # 2. GET /api/assets/mockups/{filename}
+    mockup_fname = Path(bible.visual_mockups[0].image_path).name
+    m_res = client.get(f"/api/assets/mockups/{mockup_fname}")
+    assert m_res.status_code == 200
+    assert m_res.headers["content-type"] == "image/png"
+
+    # 3. POST /api/studio/settings (toggle pause_for_greenlight)
+    s_res = client.post(
+        "/api/studio/settings",
+        json={"deliberation": "Enable greenlight pause before coding", "pause_for_greenlight": True},
+    )
+    assert s_res.status_code == 200
+    assert s_res.json()["pause_for_greenlight"] is True
+
+    # 4. POST /api/studio/greenlight (inject steering feedback, then approve)
+    g_res = client.post(
+        "/api/studio/greenlight",
+        json={
+            "deliberation": "Executive Producer steering note",
+            "approved": False,
+            "feedback": "Emphasize harmonic wind chimes during high-speed dives.",
+        },
+    )
+    assert g_res.status_code == 200
+    assert g_res.json()["status"] == "steering_injected"
+
+    g_approve = client.post(
+        "/api/studio/greenlight",
+        json={"deliberation": "Approve Living Game Bible for production", "approved": True, "feedback": ""},
+    )
+    assert g_approve.status_code == 200
+    assert g_approve.json()["status"] == "greenlit"
+
+    # 5. Verify index.html contains the Writers' Room & Living Game Bible workspace, native <dialog closedby="any">, and scroll-preserving poll updates
+    idx_res = client.get("/")
+    assert idx_res.status_code == 200
+    html = idx_res.text
+    assert 'id="workspace-game-bible"' in html
+    assert 'id="writers-room-transcript-list"' in html
+    assert 'id="bible-mockup-lightbox" closedby="any"' in html
+    assert 'id="new-game-modal" closedby="any"' in html
+    assert "'closedBy' in HTMLDialogElement.prototype" in html
+    assert "function setHtmlIfChanged(" in html
+    assert "isWritersRoomAutoScroll" in html
+    assert "openUtteranceDelibIds" in html
+
+    # 6. Verify reset_for_new_genesis_build clears old cartridge bible and initializes fresh brainstorming state
+    fresh_bible = bus.reset_for_new_genesis_build(
+        build_id="build_scratch_01",
+        creative_prompt="A cozy botanical clockwork observatory mystery",
+    )
+    assert fresh_bible["status"] == "brainstorming"
+    assert fresh_bible["writers_room_transcript"] == []
+    assert "A cozy botanical clockwork observatory mystery" in fresh_bible["creative_vision_summary"]
+
+    res_after_reset = client.get("/api/studio/game-bible")
+    assert res_after_reset.status_code == 200
+    after_data = res_after_reset.json()
+    assert after_data["status"] == "brainstorming"
+    assert after_data["writers_room_transcript"] == []
+
+
+def test_character_deduplication_and_portrait_serving(tmp_path: Path):
+    """Verify consolidate_character_list merges character revisions with differing character_ids or
+    expanded names while keeping distinct characters separate, and /api/assets/sprites/ serves assets/portraits/.
+    """
+    from engine.studio.models import CharacterSheet
+    from engine.studio.writers_room import consolidate_character_list
+
+    c1 = CharacterSheet(
+        deliberation="Initial contact character sheet.",
+        character_id="npc_navigator_kestrel",
+        name="Navigator Kestrel",
+        role="companion",
+        backstory="First draft backstory.",
+        portrait_asset="assets/portraits/navigator_kestrel.png",
+    )
+    c2 = CharacterSheet(
+        deliberation="Expanded full name on subsequent turn.",
+        character_id="navigator_kestrel",
+        name="Navigator Lyra Kestrel",
+        role="companion",
+        backstory="Expanded backstory with starlight cartography.",
+        portrait_asset="assets/portraits/navigator_kestrel.png",
+    )
+    c3 = CharacterSheet(
+        deliberation="Third refinement with full name in ID.",
+        character_id="navigator_lyra_kestrel",
+        name="Navigator Lyra Kestrel",
+        role="companion",
+        backstory="Final backstory with voice cadence.",
+        portrait_asset="assets/portraits/navigator_kestrel.png",
+    )
+    distinct_rival = CharacterSheet(
+        deliberation="Distinct rival character.",
+        character_id="archivist_thorne",
+        name="Archivist Thorne",
+        role="rival",
+        backstory="Keeper of the brass astrolabe.",
+        portrait_asset="assets/portraits/archivist_thorne.png",
+    )
+
+    merged, alias_map = consolidate_character_list([c1], [c2, c3, distinct_rival])
+    assert len(merged) == 2
+    assert merged[0].character_id == "npc_navigator_kestrel"
+    assert merged[0].name == "Navigator Lyra Kestrel"
+    assert merged[0].backstory == "Final backstory with voice cadence."
+    assert merged[1].character_id == "archivist_thorne"
+    assert alias_map["navigator_kestrel"] == "npc_navigator_kestrel"
+    assert alias_map["navigator_lyra_kestrel"] == "npc_navigator_kestrel"
+
+
+def test_game_blueprint_dashboard_synchronizes_with_latest_writers_room_bible(tmp_path: Path):
+    """Verify GET /api/telemetry/dashboard (Game Blueprint panel) and GET /api/studio/game-bible
+    always reflect the latest Writers' Room Living Game Bible in TelemetryDB rather than a stale
+    active cartridge.
+    """
+    db_path = tmp_path / "telemetry.db"
+    cartridges_root = tmp_path / "cartridges"
+    active_dir = cartridges_root / "active"
+    active_dir.mkdir(parents=True, exist_ok=True)
+
+    # Seed an older active cartridge on disk
+    (active_dir / "world_spec.json").write_text(
+        json.dumps(
+            {
+                "deliberation": "Old cartridge world spec.",
+                "game_title": "Legacy Cartridge Title",
+                "core_genre": "Legacy Genre",
+                "thematic_premise": "Old premise from previous cartridge.",
+                "world_lore": "Old lore.",
+                "aesthetic_style": "Old style",
+                "palette_mood": "dark_gritty",
+                "mechanics_guidelines": ["Old rule 1"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tdb = TelemetryDB(db_path)
+    bus = SwarmEventBus(db_path=db_path, log_path=tmp_path / "events.jsonl")
+    bus.reset_for_new_genesis_build(build_id="build_genesis_new", creative_prompt="New Writers Room pitch")
+
+    # Simulate Writers' Room locking a new Game Bible into candidate_genesis_new
+    cand_dir = cartridges_root / "candidate_genesis_new"
+    fake_client = _FakeGeminiClient()
+    visual_agent = VisualArtisanAgent(client=fake_client)
+    room = CreativeWritersRoom(
+        client=fake_client,
+        visual_agent=visual_agent,
+        telemetry_db=tdb,
+        max_turns=2,
+        min_turns_before_convergence=1,
+    )
+    room.run_writers_room(
+        dna=_sample_dna(),
+        candidate_dir=cand_dir,
+        cartridge_id="candidate_genesis_new",
+    )
+
+    app = create_app(
+        db_path=db_path,
+        cartridges_root=cartridges_root,
+        active_cartridge_dir=active_dir,
+        event_bus=bus,
+    )
+    client = TestClient(app)
+
+    bible_res = client.get("/api/studio/game-bible")
+    assert bible_res.status_code == 200
+    assert bible_res.json()["game_title"] == "Chrono Canopy"
+
+    dash_res = client.get("/api/telemetry/dashboard")
+    assert dash_res.status_code == 200
+    dash_data = dash_res.json()
+    assert dash_data["game_title"] == "Chrono Canopy"
+    assert dash_data["genre"] == "Atmospheric Momentum Glider"
+    cd = dash_data["manifest"]["creative_direction"]
+    assert "canopy glider" in cd["narrative_premise"].lower()
+
+
+

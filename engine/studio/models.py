@@ -38,6 +38,8 @@ class StudioBuildState(str, Enum):
     """Authoritative State Machine States for Studio Orchestrator."""
     IDLE = "IDLE"
     ANALYZING = "ANALYZING"
+    BRAINSTORMING = "BRAINSTORMING"
+    AWAITING_GREENLIGHT = "AWAITING_GREENLIGHT"
     SYNTHESIZING = "SYNTHESIZING"
     VERIFYING = "VERIFYING"
     PROMOTED = "PROMOTED"
@@ -163,6 +165,10 @@ class StudioOrchestratorConfig(BaseEpistemicModel):
     image_model_name: str = Field(default="gemini-3.1-flash-lite-image", description="Model for image generation")
     max_retries: int = Field(default=3, description="Maximum self-healing repair iterations")
     timeout_seconds: float = Field(default=300.0, description="Per-agent inference timeout")
+    pause_for_greenlight: bool = Field(
+        default=False,
+        description="When True, pause at AWAITING_GREENLIGHT after the Writers' Room locks the Game Bible.",
+    )
 
 
 class AgentPlan(BaseEpistemicModel):
@@ -397,6 +403,8 @@ class NarrativeBible(BaseEpistemicModel):
                 "portrait": c.portrait_asset or "assets/sprites/default_portrait.png",
                 "voice_timbre": c.voice_timbre,
                 "gemini_voice": c.gemini_voice_name,
+                "personality_traits": list(c.personality_traits),
+                "backstory": c.backstory,
             }
         barks_list = []
         for b in self.dialogue_barks:
@@ -412,11 +420,15 @@ class NarrativeBible(BaseEpistemicModel):
                 "priority": b.priority,
                 "duration": b.duration,
             })
+        cutscenes_list = [cs.model_dump() for cs in self.cutscenes]
+        trees_list = [dt.model_dump() for dt in self.dialogue_trees]
         return {
             "deliberation": self.deliberation,
             "world_title": self.world_title,
             "setting_summary": self.setting_summary,
             "characters": chars_dict,
+            "cutscenes": cutscenes_list,
+            "dialogue_trees": trees_list,
             "dialogue_barks": barks_list,
         }
 
@@ -727,18 +739,88 @@ class AcceptanceCriterion(BaseEpistemicModel):
         return data
 
 
+class AnimationStateSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Defines an agent-authored animation state or pose sequence for a sprite sheet / animated asset.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST: Rationale for why this animation state is needed for gameplay/visual feedback.")
+    state_name: str = Field(..., description="Animation state identifier (e.g. 'idle', 'move', 'jump', 'interact', 'active', 'damaged').")
+    frame_count: int = Field(default=4, ge=1, le=12, description="Number of frames in this animation state.")
+    fps: float = Field(default=8.0, description="Playback rate in frames per second.")
+    loop: bool = Field(default=True, description="Whether this animation loops continuously.")
+    pose_progression_prompt: str = Field(
+        default="",
+        description="Detailed visual description of how the silhouette, limbs, or mechanism progress across frames."
+    )
+
+
+class ArticulatedPartSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Defines an independently movable/rotatable component of a multi-part 2D rig.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST: Rationale for separating this part for procedural articulation in Godot.")
+    part_id: str = Field(..., description="Unique part identifier within the rig (e.g. 'body', 'arm_tool', 'wing_left', 'rotor_blade').")
+    visual_prompt: str = Field(..., description="Visual prompt for this isolated component grounded in the concept art.")
+    parent_part_id: Optional[str] = Field(default=None, description="Parent part_id in the rig hierarchy, or None for the root part.")
+    pivot_normalized: Tuple[float, float] = Field(
+        default=(0.5, 0.5),
+        description="Normalized rotation pivot (u, v) in [0.0, 1.0] within this part's texture."
+    )
+    attach_offset_px: Tuple[float, float] = Field(
+        default=(0.0, 0.0),
+        description="(x, y) pixel offset where this part attaches to its parent part."
+    )
+    z_index_offset: int = Field(default=0, description="Relative z-order offset compared to the root part.")
+    dimensions: Tuple[int, int] = Field(default=(48, 48), description="Target world-space pixel dimensions (width, height) for this part.")
+
+
+class VisualSceneLayerSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Decomposes a 16:9 Writers' Room concept mockup into constructible depth layers for Godot 4 scenes.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST: Artistic and spatial rationale for this depth layer.")
+    layer_id: str = Field(..., description="Identifier such as 'sky_backdrop', 'parallax_midground', 'primary_terrain', 'interactive_props', 'lighting_fx'.")
+    depth_order: int = Field(default=0, description="Depth ordering from 0 (furthest background) to foreground.")
+    scroll_parallax_factor: Tuple[float, float] = Field(default=(1.0, 1.0), description="Relative camera scroll parallax multiplier (x, y).")
+    visual_description: str = Field(..., description="Detailed visual composition, geometry, textures, and colors of this layer.")
+    associated_asset_ids: List[str] = Field(default_factory=list, description="Asset IDs from the Asset Library used on this layer.")
+
+
 class AssetRequirement(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
-    Dynamic multimodal visual or audio asset required by the conceived game.
+    Dynamic multimodal visual or audio asset required by the conceived game and fabricated into the Cartridge Asset Library.
     """
-    deliberation: str = Field(..., description="MANDATORY FIRST: Rationale explaining why this asset is required.")
-    name: str = Field(default="", description="Asset filename, e.g. 'hero_ship.png'")
-    asset_id: str = Field(default="", description="Identifier slug, e.g. 'sprite_resource_ore' or 'bark_start'")
-    asset_type: str = Field(default="sprite", description="'sprite' | 'tile' | 'portrait' | 'audio_bark' | 'sfx'")
-    target_path: str = Field(default="", description="Relative destination, e.g. 'assets/sprites/ore.png'")
+    deliberation: str = Field(..., description="MANDATORY FIRST: Rationale explaining why this purpose-built asset is required.")
+    name: str = Field(default="", description="Asset filename, e.g. 'hero_sheet.png' or 'vesper_portrait.png'")
+    asset_id: str = Field(default="", description="Identifier slug, e.g. 'hero', 'conduit_pylon', 'vesper_portrait', 'bark_intro'")
+    asset_type: str = Field(
+        default="sprite",
+        description="'sprite' | 'sprite_sheet' | 'articulated_rig' | 'prop' | 'tile' | 'backdrop' | 'portrait' | 'diegetic_ui' | 'audio_bark' | 'sfx' | 'ambient_loop'"
+    )
+    fabrication_mode: str = Field(
+        default="static_sprite",
+        description="'static_sprite' | 'sprite_sheet' | 'articulated_parts' | 'tile_surface' | 'parallax_layer' | 'portrait' | 'diegetic_ui' | 'audio_bark' | 'sfx' | 'ambient_loop'"
+    )
+    purpose: str = Field(default="", description="Exact functional purpose in gameplay, scene staging, or UI.")
+    concept_reference_id: Optional[str] = Field(
+        default=None,
+        description="Optional character_id or mockup_id from GameBibleSpec to condition visual generation."
+    )
+    target_path: str = Field(default="", description="Relative destination, e.g. 'assets/sprites/hero.png' or 'assets/portraits/vesper_portrait.png'")
     description: str = Field(default="", description="Asset description or visual prompt")
     visual_prompt_or_text: str = Field(default="", description="Prompt or spoken text used for generation.")
-    dimensions: Optional[Tuple[int, int]] = Field(default=(32, 32), description="Image dimensions (width, height) if visual asset.")
+    dimensions: Optional[Tuple[int, int]] = Field(
+        default=(64, 64),
+        description="Target world-space display dimensions (width, height) in pixels if visual asset."
+    )
+    animation_states: List[AnimationStateSpec] = Field(
+        default_factory=list,
+        description="Optional multi-pose animation states when fabricating an animated sprite sheet."
+    )
+    articulated_parts: List[ArticulatedPartSpec] = Field(
+        default_factory=list,
+        description="Optional multi-part rig breakdown when fabricating articulated components."
+    )
     geometry_directive: Optional[str] = Field(default=None, description="Geometry directive for procedural rendering")
     status: str = Field(default="pending", description="'pending' | 'generated' | 'failed'")
 
@@ -747,38 +829,145 @@ class AssetRequirement(BaseEpistemicModel):
     def _normalize_asset_data(cls, data: Any) -> Any:
         if isinstance(data, dict):
             out = dict(data)
-            atype = out.get("asset_type") or "sprite"
+            atype = str(out.get("asset_type") or out.get("category") or "sprite").lower().strip()
+            fmode = str(out.get("fabrication_mode") or "").lower().strip()
+
+            # Infer fabrication_mode and asset_type consistently
+            if not fmode:
+                if out.get("animation_states") or atype in ("sprite_sheet", "animated_sprite", "animation"):
+                    fmode = "sprite_sheet"
+                elif out.get("articulated_parts") or atype in ("articulated_rig", "articulated_parts", "rig"):
+                    fmode = "articulated_parts"
+                elif atype == "portrait":
+                    fmode = "portrait"
+                elif atype in ("tile", "tile_surface", "terrain"):
+                    fmode = "tile_surface"
+                elif atype in ("backdrop", "parallax_layer", "background"):
+                    fmode = "parallax_layer"
+                elif atype in ("diegetic_ui", "ui"):
+                    fmode = "diegetic_ui"
+                elif atype in ("audio_bark", "voice_bark", "voice", "bark"):
+                    fmode = "audio_bark"
+                    atype = "audio_bark"
+                elif atype in ("sfx", "sound_effect", "audio"):
+                    fmode = "sfx"
+                    atype = "sfx"
+                elif atype in ("ambient_loop", "ambience", "music"):
+                    fmode = "ambient_loop"
+                    atype = "ambient_loop"
+                else:
+                    fmode = "static_sprite"
+
+            if fmode == "portrait":
+                atype = "portrait"
+            elif fmode == "sprite_sheet" and atype == "sprite":
+                atype = "sprite_sheet"
+            elif fmode == "articulated_parts" and atype == "sprite":
+                atype = "articulated_rig"
+
             out["asset_type"] = atype
-            # Sync name, asset_id, target_path
+            out["fabrication_mode"] = fmode
+
+            is_audio = atype in ("audio_bark", "sfx", "ambient_loop") or fmode in ("audio_bark", "sfx", "ambient_loop")
+            is_portrait = atype == "portrait" or fmode == "portrait"
+
             name = out.get("name")
             aid = out.get("asset_id")
             tpath = out.get("target_path")
+
             if not name and tpath:
-                name = Path(tpath).name
+                name = Path(str(tpath)).name
             if not name and aid:
-                ext = ".png" if atype in ("sprite", "tile", "portrait") else ".wav"
-                name = f"{aid}{ext}" if not aid.endswith((".png", ".wav")) else aid
+                ext = ".wav" if is_audio else ".png"
+                name = f"{aid}{ext}" if not str(aid).endswith((".png", ".wav")) else str(aid)
             if not aid and name:
-                aid = name.replace(".png", "").replace(".wav", "")
+                aid = str(name).replace(".png", "").replace(".wav", "")
             if not name and not aid:
                 aid = f"asset_{uuid.uuid4().hex[:6]}"
-                ext = ".png" if atype in ("sprite", "tile", "portrait") else ".wav"
+                ext = ".wav" if is_audio else ".png"
                 name = f"{aid}{ext}"
-            if not tpath:
-                subfolder = "sprites" if atype in ("sprite", "tile", "portrait") else "audio"
-                tpath = f"assets/{subfolder}/{name}"
+
+            # Enforce strict directory separation: portraits NEVER go into assets/sprites/
+            if is_portrait:
+                fname = Path(str(name)).name
+                if not fname.endswith(".png"):
+                    fname = f"{fname}.png"
+                if not tpath or str(tpath).startswith("assets/sprites/"):
+                    tpath = f"assets/portraits/{fname}"
+            elif is_audio:
+                if not tpath:
+                    tpath = f"assets/audio/{name}"
+            else:
+                if not tpath or str(tpath).startswith("assets/portraits/"):
+                    tpath = f"assets/sprites/{Path(str(name)).name}"
+
             out["name"] = name
             out["asset_id"] = aid
             out["target_path"] = tpath
 
-            # Sync description and visual_prompt_or_text
+            if "dimensions" not in out or not out["dimensions"]:
+                if is_portrait:
+                    out["dimensions"] = (256, 256)
+                elif fmode == "parallax_layer":
+                    out["dimensions"] = (640, 360)
+                elif fmode == "tile_surface":
+                    out["dimensions"] = (64, 64)
+                else:
+                    out["dimensions"] = (64, 64)
+
             desc = out.get("description")
             vprompt = out.get("visual_prompt_or_text")
-            final_text = desc or vprompt or f"Asset {aid}"
+            final_text = desc or vprompt or out.get("purpose") or f"Asset {aid}"
             out["description"] = final_text
-            out["visual_prompt_or_text"] = final_text
+            out["visual_prompt_or_text"] = vprompt or final_text
             return out
         return data
+
+
+class AssetLibraryEntry(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Indexed record in the Cartridge Asset Library (assets/asset_library.json) describing a fabricated asset,
+    its animation frames/states, or its articulated rig parts for GDScript consumption.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST: Epistemic summary of how this asset was fabricated and grounded.")
+    asset_id: str = Field(..., description="Unique asset slug in the library.")
+    asset_type: str = Field(default="sprite")
+    fabrication_mode: str = Field(default="static_sprite")
+    purpose: str = Field(default="")
+    res_path: str = Field(..., description="Godot resource path, e.g. 'res://assets/sprites/hero.png'.")
+    file_path: str = Field(..., description="Relative file path in cartridge, e.g. 'assets/sprites/hero.png'.")
+    target_display_size: Tuple[int, int] = Field(default=(64, 64), description="Intended in-world display size (width, height) in pixels.")
+    texture_pixel_size: Tuple[int, int] = Field(default=(256, 256), description="Actual PNG dimensions (width, height) on disk.")
+    hframes: int = Field(default=1, ge=1, description="Number of horizontal frames if sprite sheet.")
+    vframes: int = Field(default=1, ge=1, description="Number of vertical rows if sprite sheet.")
+    animation_states: Dict[str, Dict[str, Any]] = Field(
+        default_factory=dict,
+        description="Map of state_name -> {row, start_frame, frame_count, fps, loop, frame_res_paths}."
+    )
+    articulated_parts: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="List of articulated rig parts with {part_id, res_path, parent_part_id, pivot_normalized, attach_offset_px, z_index_offset, dimensions}."
+    )
+    pivot_normalized: Tuple[float, float] = Field(default=(0.5, 0.5))
+    concept_reference_used: Optional[str] = Field(default=None)
+    sha256_hash: str = Field(default="")
+    created_at_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class AssetLibraryCatalog(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Persistent catalog written to assets/asset_library.json indexing all purpose-built cartridge assets.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST: Holistic rationale for the cartridge's multimodal asset library.")
+    catalog_id: str = Field(default_factory=lambda: f"lib_{uuid.uuid4().hex[:8]}")
+    game_title: str = Field(default="")
+    camera_and_spatial_paradigm: str = Field(default="")
+    color_palette_hex: List[str] = Field(default_factory=list)
+    entries: Dict[str, AssetLibraryEntry] = Field(default_factory=dict)
+    updated_at_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
 
 
 class AssetManifestSpec(BaseEpistemicModel):
@@ -900,6 +1089,10 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
         ...,
         description="MANDATORY FIRST PROPERTY: Epistemic rationale explaining the architectural decisions, Godot 4 node composition, and track requirement fulfillment."
     )
+    requested_assets: List[AssetRequirement] = Field(
+        default_factory=list,
+        description="On-demand purpose-built assets (sprite sheets, articulated parts, props, tiles, parallax layers, UI, SFX) requested by the SWE agent for the Cartridge Asset Library."
+    )
     files: List[ModuleFileSpec] = Field(
         default_factory=list,
         description="Collection of cartridge files to create or update."
@@ -919,6 +1112,26 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
         """
         target_dir.mkdir(parents=True, exist_ok=True)
         results: Dict[str, Path] = {}
+
+        # 0. Fabricate any on-demand requested_assets into the CartridgeAssetLibrary first
+        # and ensure res://asset_library.gd is up to date so GDScript compilation succeeds.
+        try:
+            from engine.studio.asset_library import CartridgeAssetLibrary
+            visual_agent = getattr(swe_agent, "visual_agent", None) if swe_agent is not None else None
+            voice_agent = getattr(swe_agent, "voice_agent", None) if swe_agent is not None else None
+            lib = CartridgeAssetLibrary(
+                cartridge_dir=target_dir,
+                visual_agent=visual_agent,
+                voice_agent=voice_agent,
+            )
+            if self.requested_assets:
+                fabricated = lib.fabricate_assets(self.requested_assets)
+                results.update(fabricated)
+            helper_path = lib.export_gdscript_helper()
+            if helper_path and helper_path.is_file():
+                results["asset_library.gd"] = helper_path
+        except Exception:
+            pass
 
         # 1. Ensure minimal main.tscn exists
         main_tscn = target_dir / "main.tscn"
@@ -944,10 +1157,14 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
                 '[display]\n'
                 'window/size/viewport_width=1280\n'
                 'window/size/viewport_height=720\n'
+                'window/size/window_width_override=2560\n'
+                'window/size/window_height_override=1440\n'
+                'window/size/resizable=true\n'
+                'window/dpi/allow_hidpi=true\n'
                 'window/stretch/mode="canvas_items"\n'
                 'window/stretch/aspect="keep"\n\n'
                 '[rendering]\n'
-                'textures/canvas_textures/default_texture_filter=0\n',
+                'textures/canvas_textures/default_texture_filter=2\n',
                 encoding="utf-8"
             )
             results["project.godot"] = project_godot
@@ -959,13 +1176,63 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
             file_path.write_text(fspec.content, encoding="utf-8")
             results[fspec.filename] = file_path
 
+        # 3b. Enforce HiDPI Retina window sizing & resizable=true even if LLM overwrote project.godot
+        if project_godot.is_file():
+            enforce_hidpi_project_godot(project_godot)
+            results["project.godot"] = project_godot
+
         # 4. Write manifest.json
         if self.manifest_data:
             manifest_path = target_dir / "manifest.json"
-            manifest_path.write_text(json.dumps(self.manifest_data, indent=2), encoding="utf-8")
+            manifest_path.write_text(json.dumps(manifest_data_clean := self.manifest_data, indent=2), encoding="utf-8")
             results["manifest.json"] = manifest_path
 
+        # 5. Run Godot 4 compiler syntax verification & self-healing repair loop when live SWE agent is active
+        if (
+            swe_agent is not None
+            and hasattr(swe_agent, "_verify_and_heal_godot_syntax_and_probes")
+            and hasattr(swe_agent, "_is_live_genai_client")
+            and swe_agent._is_live_genai_client()
+            and any(f.filename.endswith(".gd") for f in self.files)
+        ):
+            healed = swe_agent._verify_and_heal_godot_syntax_and_probes(target_dir)
+            results.update(healed)
+
         return results
+
+
+def enforce_hidpi_project_godot(project_godot_path: Path) -> None:
+    """Ensures project.godot configures a crisp, resizable 2560x1440 HiDPI window on Retina displays."""
+    if not project_godot_path.is_file():
+        return
+    raw = project_godot_path.read_text(encoding="utf-8")
+    raw = raw.replace("window/size/resizable=false", "window/size/resizable=true")
+    raw = raw.replace("textures/canvas_textures/default_texture_filter=0", "textures/canvas_textures/default_texture_filter=2")
+
+    display_defaults = {
+        "window/size/viewport_width": "1280",
+        "window/size/viewport_height": "720",
+        "window/size/window_width_override": "2560",
+        "window/size/window_height_override": "1440",
+        "window/size/resizable": "true",
+        "window/dpi/allow_hidpi": "true",
+        "window/stretch/mode": '"canvas_items"',
+        "window/stretch/aspect": '"keep"',
+    }
+    if "[display]" not in raw:
+        raw = raw.rstrip() + "\n\n[display]\n" + "\n".join(f"{k}={v}" for k, v in display_defaults.items()) + "\n"
+    else:
+        missing_lines = [f"{k}={v}" for k, v in display_defaults.items() if f"{k}=" not in raw]
+        if missing_lines:
+            raw = raw.replace("[display]", "[display]\n" + "\n".join(missing_lines), 1)
+
+    if "[rendering]" not in raw:
+        raw = raw.rstrip() + "\n\n[rendering]\ntextures/canvas_textures/default_texture_filter=2\n"
+    elif "textures/canvas_textures/default_texture_filter=" not in raw:
+        raw = raw.replace("[rendering]", "[rendering]\ntextures/canvas_textures/default_texture_filter=2", 1)
+
+    project_godot_path.write_text(raw, encoding="utf-8")
+
 
 
 class CodeRepairSpec(BaseEpistemicModel):
@@ -984,6 +1251,257 @@ class CodeRepairSpec(BaseEpistemicModel):
         ...,
         description="Complete, syntactically valid repaired source code."
     )
+
+
+class WritersRoomListenCheck(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Determines whether a specialist agent listening to the Writers' Room has a high-value
+    critique, idea, or artifact to inject at the current moment in the conversation.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Epistemic reasoning evaluating the recent conversation from this specialist's perspective."
+    )
+    should_interject: bool = Field(
+        ...,
+        description="True if this specialist has an urgent critique, synergy, or creative artifact to contribute right now."
+    )
+    urgency_score: float = Field(
+        default=0.0,
+        description="Urgency/relevance score in [0.0, 1.0] for speaking next."
+    )
+    intended_contribution_summary: str = Field(
+        default="",
+        description="Concise 1-sentence summary of what the agent wants to say or propose."
+    )
+
+
+class ConceptEvolutionEntry(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Records a key milestone in how the game idea evolved during the Writers' Room.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Epistemic rationale explaining why the concept evolved or pivoted at this milestone."
+    )
+    entry_id: str = Field(default_factory=lambda: f"evo_{uuid.uuid4().hex[:8]}")
+    turn_index: int = Field(default=0)
+    author_role: str = Field(..., description="Specialist role that triggered this evolution.")
+    previous_premise: str = Field(default="", description="What the concept/feature was before this shift.")
+    evolved_premise: str = Field(..., description="How the concept/feature is now defined.")
+    pivot_reason: str = Field(..., description="Why the previous idea was rejected or deepened.")
+    timestamp_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class ExperienceStoryboardBeat(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Defines a beat in the player's emotional & sensory experience arc.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Epistemic rationale grounding this emotional/experiential beat."
+    )
+    beat_index: int = Field(...)
+    phase_title: str = Field(
+        ...,
+        description="E.g., 'First 30 Seconds: Sensory Cold Open', 'Diegetic Discovery', 'Mid-Episode Escalation', 'Climactic Resolution'."
+    )
+    player_emotional_state: str = Field(
+        ...,
+        description="What the player should feel at this moment (curiosity, dread, mastery, awe)."
+    )
+    sensory_and_camera_staging: str = Field(
+        ...,
+        description="What the player sees and hears on screen—lighting, camera framing, audio atmosphere, environmental storytelling."
+    )
+    diegetic_teaching_moment: str = Field(
+        ...,
+        description="How the player intuitively discovers or masters an interaction through the world itself without text-manual HUD overlays."
+    )
+    narrative_integration: str = Field(
+        ...,
+        description="How story, characters, or world lore manifest directly in this gameplay moment."
+    )
+
+
+class VisualMockupArtifact(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Represents a synthesized 16:9 concept art / gameplay UI mockup board in the Game Bible.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Artistic rationale for composition, palette, lighting, and diegetic UI framing."
+    )
+    mockup_id: str = Field(default_factory=lambda: f"mockup_{uuid.uuid4().hex[:8]}")
+    title: str = Field(..., description="Title of the visual mockup board (e.g., 'Core Gameplay Loop & Diegetic UI', 'Opening Scene Staging').")
+    scene_description: str = Field(..., description="Detailed visual description and prompt used to synthesize the mockup.")
+    image_path: str = Field(..., description="Relative cartridge path, e.g. 'assets/mockups/gameplay_mockup_1.png'.")
+    aspect_ratio: str = Field(default="16:9")
+    camera_and_spatial_paradigm: str = Field(
+        default="",
+        description="Explicit camera angle & spatial movement architecture depicted in this mockup (e.g., '2D side-scrolling platformer with vertical elevation and gravity', '3/4 top-down exploration', 'isometric tactical arena')."
+    )
+    color_palette_hex: List[str] = Field(
+        default_factory=list,
+        description="6-10 hex color codes (#RRGGBB) defining the sky/backdrop, primary terrain, secondary architecture, accent glow, and UI palette."
+    )
+    scene_layers: List[VisualSceneLayerSpec] = Field(
+        default_factory=list,
+        description="Ordered breakdown of visual depth layers depicted in this mockup."
+    )
+    ui_callout_notes: List[str] = Field(
+        default_factory=list,
+        description="Specific visual callouts for SWE & Challenger (e.g., 'Health is shown via chassis sparks/glow rather than a text label')."
+    )
+    created_at_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class WritersRoomUtterance(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    A single conversational turn in the open-ended Writers' Room transcript.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Internal epistemic reasoning before speaking to the room."
+    )
+    utterance_id: str = Field(default_factory=lambda: f"utt_{uuid.uuid4().hex[:8]}")
+    turn_index: int = Field(...)
+    speaker_role: str = Field(
+        ...,
+        description="'CreativeDirector' | 'GameplayDesigner' | 'StoryWorldArchitect' | 'CharacterDesigner' | 'UXExperienceDesigner' | 'VisualArtDirector' | 'AudioAtmosphereDesigner' | 'UserSteering'"
+    )
+    speaker_display_name: str = Field(..., description="Human-readable specialist title.")
+    spoken_dialogue: str = Field(
+        ...,
+        description="Natural, opinionated conversational contribution addressing the room, critiquing weak ideas, or pitching improvements."
+    )
+    addressed_to: List[str] = Field(
+        default_factory=list,
+        description="Other specialists specifically called upon or challenged in this turn."
+    )
+    bible_updates_summary: List[str] = Field(
+        default_factory=list,
+        description="Summary of concrete additions/revisions made to the Living Game Bible during this turn."
+    )
+    timestamp_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class WritersRoomTurnProposal(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Structured output produced when the selected specialist speaks and updates the Living Game Bible.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Epistemic deliberation on how to push the game experience forward and what to update in the Game Bible."
+    )
+    spoken_dialogue: str = Field(
+        ...,
+        description="Conversational statement to the Writers' Room."
+    )
+    addressed_to: List[str] = Field(default_factory=list)
+    updated_game_title: Optional[str] = Field(default=None)
+    updated_elevator_pitch: Optional[str] = Field(default=None)
+    updated_core_fantasy: Optional[str] = Field(default=None)
+    updated_first_60_seconds_hook: Optional[str] = Field(default=None)
+    updated_diegetic_ui_philosophy: Optional[str] = Field(default=None)
+    updated_camera_and_spatial_paradigm: Optional[str] = Field(default=None)
+    updated_color_palette_hex: List[str] = Field(default_factory=list)
+    added_or_updated_scene_layers: List[VisualSceneLayerSpec] = Field(default_factory=list)
+    concept_evolution_milestone: Optional[ConceptEvolutionEntry] = Field(default=None)
+    added_or_updated_storyboard_beats: List[ExperienceStoryboardBeat] = Field(default_factory=list)
+    added_or_updated_characters: List[CharacterSheet] = Field(default_factory=list)
+    added_or_updated_cutscenes: List[CutsceneScript] = Field(default_factory=list)
+    added_or_updated_dialogue_trees: List[DialogueTreeSpec] = Field(default_factory=list)
+    added_or_updated_barks: List[DialogueBarkSpec] = Field(default_factory=list)
+    mockup_to_generate: Optional[VisualMockupArtifact] = Field(default=None)
+    gameplay_pillars_additions: List[str] = Field(default_factory=list)
+    visual_style_guide_update: Optional[str] = Field(default=None)
+    audio_direction_update: Optional[str] = Field(default=None)
+
+
+class DirectorConvergenceCheck(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Evaluated by the CreativeDirector to decide whether the Writers' Room should keep brainstorming
+    or if the Living Game Bible is cohesive, rich, and ready to lock.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Director's critical evaluation of whether the experience, story, UX, art mockups, and characters feel like a cohesive, memorable game."
+    )
+    is_ready_to_lock_bible: bool = Field(
+        ...,
+        description="True ONLY when the Game Bible has a compelling hook, rich experience storyboard, diegetic UX plan, characters/world lore, and visual mockups."
+    )
+    experience_cohesion_score: float = Field(
+        ...,
+        description="Cohesion and polish readiness score in [0.0, 1.0]."
+    )
+    missing_or_weak_elements: List[str] = Field(
+        default_factory=list,
+        description="Specific gaps the room still needs to resolve if not ready."
+    )
+    director_steering_prompt: str = Field(
+        default="",
+        description="If not ready, the Director's next challenge or question to the room."
+    )
+
+
+class GameBibleSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    The Living Game Bible collaboratively authored by the Writers' Room and persisted to game_bible.json.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Holistic epistemic synthesis of the game's creative vision, player experience, and aesthetic identity."
+    )
+    bible_id: str = Field(default_factory=lambda: f"game_bible_{uuid.uuid4().hex[:8]}")
+    cartridge_id: str = Field(default="active")
+    target_episode: int = Field(default=0)
+    status: str = Field(
+        default="brainstorming",
+        description="'brainstorming' | 'awaiting_greenlight' | 'locked'"
+    )
+    game_title: str = Field(default="Untitled Concept")
+    core_genre: str = Field(default="unclassified")
+    elevator_pitch: str = Field(default="")
+    core_fantasy: str = Field(
+        default="",
+        description="Who the player is, what they feel, and why this world matters."
+    )
+    first_60_seconds_hook: str = Field(
+        default="",
+        description="Exact sensory and interactive experience of the first 60 seconds of play."
+    )
+    diegetic_ui_philosophy: str = Field(
+        default="",
+        description="How state, feedback, and onboarding are communicated naturally through the world and clean visual indicators rather than static instruction text walls."
+    )
+    camera_and_spatial_paradigm: str = Field(
+        default="",
+        description="Locked 2D camera perspective and spatial movement model agreed upon by the Writers' Room."
+    )
+    color_palette_hex: List[str] = Field(
+        default_factory=list,
+        description="Hex color palette (#RRGGBB) governing sky, terrain, architecture, energy accents, and diegetic UI."
+    )
+    scene_layers: List[VisualSceneLayerSpec] = Field(
+        default_factory=list,
+        description="Ordered visual depth layers decomposing the 16:9 mockup into constructible Godot 4 scene geometry."
+    )
+    gameplay_pillars: List[str] = Field(default_factory=list)
+    visual_style_guide: str = Field(default="")
+    audio_direction_guide: str = Field(default="")
+    concept_evolution: List[ConceptEvolutionEntry] = Field(default_factory=list)
+    writers_room_transcript: List[WritersRoomUtterance] = Field(default_factory=list)
+    experience_storyboard: List[ExperienceStoryboardBeat] = Field(default_factory=list)
+    visual_mockups: List[VisualMockupArtifact] = Field(default_factory=list)
+    world_spec: Optional[GenesisWorldSpec] = Field(default=None)
+    narrative_bible: Optional[NarrativeBible] = Field(default=None)
+    created_at_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
 
 
 def __getattr__(name: str) -> Any:

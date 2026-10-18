@@ -67,7 +67,14 @@ from engine.ui.models import (
 
 logger = logging.getLogger("StudioObservabilityServer")
 
+import sys
+
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+_PROD_EVENTS_LOG = (config.PROJECT_ROOT / "data" / "studio_events.jsonl").resolve()
+
+
+def _is_pytest_active() -> bool:
+    return bool("PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules)
 
 
 class SwarmEventBus:
@@ -93,7 +100,7 @@ class SwarmEventBus:
             self._db_path = Path(db_path)
         elif log_path is not None:
             self._db_path = None
-        elif "PYTEST_CURRENT_TEST" in os.environ:
+        elif _is_pytest_active():
             self._db_path = None
         else:
             self._db_path = (config.DATA_DIR / "telemetry.db")
@@ -225,6 +232,20 @@ class SwarmEventBus:
             "updated_at_utc": now_iso,
         }
         with self._thread_lock:
+            old_orch = getattr(self, "_active_orchestrator", None)
+            if old_orch is not None:
+                try:
+                    if hasattr(old_orch, "cancel_active_build"):
+                        old_orch.cancel_active_build()
+                    else:
+                        old_orch._abort_requested = True
+                        old_orch._greenlight_decision = {"approved": False, "aborted": True, "feedback": ""}
+                        ev = getattr(old_orch, "_greenlight_event", None)
+                        if ev is not None:
+                            ev.set()
+                except Exception:
+                    pass
+                self._active_orchestrator = None
             self._active_build_id = str(build_id)
             self._task_records.clear()
             self._task_order.clear()
@@ -264,8 +285,11 @@ class SwarmEventBus:
                     rec = db.get_latest_game_bible(build_id=target_bid)
                     if not rec and target_bid:
                         rec = db.get_latest_game_bible(build_id=None)
-                    if rec and isinstance(rec.get("bible"), dict):
-                        return rec["bible"]
+                    if isinstance(rec, dict):
+                        if isinstance(rec.get("bible"), dict):
+                            return rec["bible"]
+                        if "game_title" in rec or "bible_id" in rec:
+                            return rec
                 except Exception as exc:
                     logger.debug("Failed querying studio_game_bibles from DB: %s", exc)
             self._sync_from_disk()
@@ -277,7 +301,7 @@ class SwarmEventBus:
             return
         if not self._log_path or not self._log_path.exists():
             return
-        if "PYTEST_CURRENT_TEST" in os.environ and self._log_path == (config.DATA_DIR / "studio_events.jsonl"):
+        if _is_pytest_active() and self._log_path.resolve() == _PROD_EVENTS_LOG:
             return
         try:
             current_size = self._log_path.stat().st_size
@@ -379,8 +403,8 @@ class SwarmEventBus:
                     logger.debug("SwarmEventBus SQLite recording error (handled): %s", exc)
 
             should_log = self._log_path and (
-                "PYTEST_CURRENT_TEST" not in os.environ
-                or self._log_path != (config.DATA_DIR / "studio_events.jsonl")
+                not _is_pytest_active()
+                or self._log_path.resolve() != _PROD_EVENTS_LOG
             )
             if should_log:
                 try:
@@ -758,6 +782,8 @@ class SwarmEventBus:
                             "requirements": reqs,
                         }
                         return spec
+                    if target_bid:
+                        return self._requirements_spec
                 except Exception as e:
                     logger.debug("Failed querying studio_requirements from DB: %s", e)
 
@@ -2146,8 +2172,10 @@ def create_app(
         return cart_dir, None
 
     def _candidate_search_roots(cart_dir: Path, sanitized_cart: Optional[Path]) -> List[Path]:
-        roots = [cart_dir, target_cartridges / "active"]
-        if sanitized_cart is None and target_cartridges.exists():
+        roots: List[Path] = []
+        if sanitized_cart is not None:
+            roots.append(sanitized_cart)
+        elif cartridges_root is None and target_cartridges.exists():
             try:
                 cands = sorted(
                     [d for d in target_cartridges.glob("candidate_*") if d.is_dir()],
@@ -2155,6 +2183,23 @@ def create_app(
                     reverse=True,
                 )
                 roots.extend(cands)
+            except OSError:
+                pass
+        if cart_dir not in roots:
+            roots.append(cart_dir)
+        active_root = target_cartridges / "active"
+        if active_root not in roots:
+            roots.append(active_root)
+        if sanitized_cart is None and cartridges_root is not None and target_cartridges.exists():
+            try:
+                cands = sorted(
+                    [d for d in target_cartridges.glob("candidate_*") if d.is_dir()],
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                for c in cands:
+                    if c not in roots:
+                        roots.append(c)
             except OSError:
                 pass
         return roots
@@ -2194,7 +2239,11 @@ def create_app(
         cart_dir = sanitized_cart if sanitized_cart else target_active
         search_roots = _candidate_search_roots(cart_dir, sanitized_cart)
 
-        resolved = resolve_asset_safe(filename, ["sprites", "portrait", "mockups"], search_roots)
+        resolved = resolve_asset_safe(
+            filename,
+            ["sprites", "portraits", "portrait", "characters", "mockups", "tiles"],
+            search_roots,
+        )
         if not resolved:
             return JSONResponse({"error": f"Sprite asset '{filename}' not found"}, status_code=404)
 
@@ -2456,6 +2505,7 @@ def create_app(
         creative_prompt = str(body.get("creative_prompt", "") or "").strip()
         pause_for_greenlight = body.get("pause_for_greenlight")
         reset_active = bool(body.get("reset_active", False))
+        resume_current = bool(body.get("resume_current", False))
         job_id = f"gen_{uuid.uuid4().hex[:8]}"
         build_id = f"build_{job_id}"
 
@@ -2464,37 +2514,64 @@ def create_app(
             if target_bus is not swarm_bus:
                 swarm_bus._pause_for_greenlight = bool(pause_for_greenlight)
 
-        # Initialize a clean brainstorming session when starting a new game from scratch
-        if reset_active and "PYTEST_CURRENT_TEST" not in os.environ:
+        resumed_cand_name: Optional[str] = None
+        if resume_current:
             try:
-                old_cp_meta = target_active / "checkpoint_metadata.json"
-                if old_cp_meta.is_file():
-                    old_cp_meta.unlink()
-            except Exception:
-                pass
+                from engine.studio.daemon import rehydrate_resumable_candidate_from_db
+                rehydrated_dir = rehydrate_resumable_candidate_from_db(
+                    db_path=target_db,
+                    cartridges_root=target_cartridges,
+                )
+                if rehydrated_dir is not None:
+                    resumed_cand_name = rehydrated_dir.name
+                    build_id = f"build_{resumed_cand_name}"
+                    target_bus._active_build_id = build_id
+                    if target_bus is not swarm_bus:
+                        swarm_bus._active_build_id = build_id
+                    gb_file = rehydrated_dir / "game_bible.json"
+                    if gb_file.is_file():
+                        gb_data = json.loads(gb_file.read_text(encoding="utf-8"))
+                        target_bus.publish_game_bible_update(gb_data)
+                        if target_bus is not swarm_bus:
+                            swarm_bus.publish_game_bible_update(gb_data)
+            except Exception as rehyd_exc:
+                logger.warning("Rehydration during resume trigger encountered warning: %s", rehyd_exc)
+        else:
+            # Initialize a clean brainstorming session when starting a new game from scratch
+            if reset_active and "PYTEST_CURRENT_TEST" not in os.environ:
+                try:
+                    old_cp_meta = target_active / "checkpoint_metadata.json"
+                    if old_cp_meta.is_file():
+                        old_cp_meta.unlink()
+                except Exception:
+                    pass
 
-        if reset_active or creative_prompt or "PYTEST_CURRENT_TEST" not in os.environ:
-            initial_bible = target_bus.reset_for_new_genesis_build(
-                build_id=build_id,
-                creative_prompt=creative_prompt,
-            )
-            if target_bus is not swarm_bus:
-                swarm_bus.reset_for_new_genesis_build(
+            if reset_active or creative_prompt or "PYTEST_CURRENT_TEST" not in os.environ:
+                initial_bible = target_bus.reset_for_new_genesis_build(
                     build_id=build_id,
                     creative_prompt=creative_prompt,
                 )
-            await target_bus.broadcast({
-                "deliberation": initial_bible["deliberation"],
-                "event_type": SwarmEventType.GAME_BIBLE_UPDATED.value,
-                "agent_name": "CreativeWritersRoom",
-                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                "payload": initial_bible,
-            })
+                if target_bus is not swarm_bus:
+                    swarm_bus.reset_for_new_genesis_build(
+                        build_id=build_id,
+                        creative_prompt=creative_prompt,
+                    )
+                await target_bus.broadcast({
+                    "deliberation": initial_bible["deliberation"],
+                    "event_type": SwarmEventType.GAME_BIBLE_UPDATED.value,
+                    "agent_name": "CreativeWritersRoom",
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "payload": initial_bible,
+                })
 
         event = {
             "deliberation": (
-                f"Autonomous Genesis build dispatched for Steam profile '{profile_tag}'"
-                + (f" with creative seed: '{creative_prompt[:80]}'." if creative_prompt else ".")
+                f"Resuming Genesis game development for '{resumed_cand_name or build_id}' from persisted Game Bible and requirement tracks."
+                if resume_current
+                else (
+                    f"Autonomous Genesis build dispatched for Steam profile '{profile_tag}'"
+                    + (f" with creative seed: '{creative_prompt[:80]}'." if creative_prompt else ".")
+                )
             ),
             "event_type": "genesis_triggered",
             "agent_name": "StudioOrchestrator",
@@ -2504,6 +2581,8 @@ def create_app(
                 "build_id": build_id,
                 "profile_tag": profile_tag,
                 "creative_prompt": creative_prompt,
+                "resume_current": resume_current,
+                "resumed_candidate": resumed_cand_name,
             },
         }
         await target_bus.broadcast(event)
@@ -2512,7 +2591,14 @@ def create_app(
 
         if "PYTEST_CURRENT_TEST" not in os.environ:
             from engine.studio.daemon import StudioDaemon, StudioDaemonConfig, _genesis_build_lock
-            if _genesis_build_lock.locked():
+            if (reset_active or creative_prompt or resume_current) and _genesis_build_lock.locked():
+                # Give any cancelled AWAITING_GREENLIGHT orchestrator up to 1.5s to release the lock
+                for _ in range(30):
+                    if not _genesis_build_lock.locked():
+                        break
+                    await asyncio.sleep(0.05)
+
+            if _genesis_build_lock.locked() and not reset_active and not resume_current:
                 in_prog_ev = {
                     "deliberation": "Genesis build is already actively executing in the Studio swarm — streaming live progress below.",
                     "event_type": "AGENT_STREAM",
@@ -2526,12 +2612,18 @@ def create_app(
             else:
                 def _run_bg_genesis() -> None:
                     try:
+                        # Wait briefly if a previous cancelled build is finishing cleanup
+                        for _ in range(50):
+                            if not _genesis_build_lock.locked():
+                                break
+                            time.sleep(0.1)
                         cfg = StudioDaemonConfig(
                             steam_profile=profile_tag,
                             cartridges_root=target_cartridges,
                             active_cartridge_dir=target_active,
                             db_path=target_db,
                             creative_prompt=creative_prompt or None,
+                            resume_current=resume_current,
                         )
                         daemon_inst = StudioDaemon(config_obj=cfg, event_bus=target_bus)
                         daemon_inst.run_genesis_cycle()
@@ -2545,11 +2637,19 @@ def create_app(
                 ).start()
 
         resp = GenesisTriggerResponse(
-            deliberation=f"Genesis build job {job_id} initiated asynchronously for profile '{profile_tag}'.",
+            deliberation=(
+                f"Resumed Genesis build job {job_id} for candidate '{resumed_cand_name or build_id}'."
+                if resume_current
+                else f"Genesis build job {job_id} initiated asynchronously for profile '{profile_tag}'."
+            ),
             job_id=job_id,
-            status="triggered",
+            status="resumed" if resume_current else "triggered",
             target_episode=0,
-            message=f"Genesis pipeline execution initialized for profile '{profile_tag}'.",
+            message=(
+                f"Genesis pipeline resumed for '{resumed_cand_name or build_id}'."
+                if resume_current
+                else f"Genesis pipeline execution initialized for profile '{profile_tag}'."
+            ),
         )
         return JSONResponse(resp.model_dump())
 
@@ -2668,6 +2768,49 @@ def create_app(
             if target_bus is not swarm_bus:
                 await swarm_bus.unregister(websocket)
 
+    def _get_active_writers_room_bible() -> Optional[Dict[str, Any]]:
+        bible_obj = target_bus.get_game_bible()
+        if bible_obj is None and target_db and target_db.exists():
+            try:
+                tdb = TelemetryDB(target_db)
+                rec = tdb.get_latest_game_bible()
+                if isinstance(rec, dict):
+                    bible_obj = rec["bible"] if isinstance(rec.get("bible"), dict) else rec
+            except Exception:
+                bible_obj = None
+        if isinstance(bible_obj, dict) and bible_obj.get("game_title"):
+            return bible_obj
+        return None
+
+    def _resolve_matching_candidate_for_bible(bible_obj: Dict[str, Any]) -> Optional[Path]:
+        if not target_cartridges.exists():
+            return None
+        b_title = str(bible_obj.get("game_title") or "").strip()
+        b_cid = str(bible_obj.get("cartridge_id") or "").strip()
+        if b_cid and b_cid != "active":
+            cand_direct = target_cartridges / b_cid
+            if cand_direct.is_dir():
+                return cand_direct
+        try:
+            candidates = sorted(
+                [d for d in target_cartridges.glob("candidate_*") if d.is_dir()],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            for cand in candidates:
+                for fn in ("game_bible.json", "world_spec.json", "manifest.json"):
+                    fp = cand / fn
+                    if fp.is_file():
+                        try:
+                            d = json.loads(fp.read_text(encoding="utf-8"))
+                            if (d.get("game_title") or d.get("title")) == b_title:
+                                return cand
+                        except Exception:
+                            continue
+        except OSError:
+            pass
+        return None
+
     async def telemetry_dashboard_handler(request):
         """GET /api/telemetry/dashboard: Dynamic agent-architected telemetry manifest and hypotheses."""
         cart_override = request.query_params.get("cartridge")
@@ -2675,7 +2818,16 @@ def create_app(
         if err_resp is not None:
             return err_resp
 
-        cart_dir = sanitized_cart if sanitized_cart else target_active
+        live_bible = _get_active_writers_room_bible() if not sanitized_cart else None
+        matched_cand = _resolve_matching_candidate_for_bible(live_bible) if live_bible else None
+
+        if sanitized_cart:
+            cart_dir = sanitized_cart
+        elif matched_cand is not None:
+            cart_dir = matched_cand
+        else:
+            cart_dir = target_active
+
         has_active = cart_dir.exists() and cart_dir.is_dir()
         if not has_active and not sanitized_cart and target_db == config.DB_PATH and target_cartridges.exists():
             candidates = sorted(
@@ -2777,6 +2929,43 @@ def create_app(
                     except Exception:
                         pass
 
+        # If a Writers' Room Living Game Bible is active, synchronize the Game Blueprint with it
+        if live_bible and live_bible.get("game_title") and live_bible.get("game_title") != "Untitled Concept":
+            b_ws = live_bible.get("world_spec") if isinstance(live_bible.get("world_spec"), dict) else {}
+            b_title = str(live_bible.get("game_title") or b_ws.get("game_title") or "").strip()
+            b_genre = str(live_bible.get("core_genre") or b_ws.get("core_genre") or genre or "").strip()
+            b_premise = (
+                live_bible.get("elevator_pitch")
+                or live_bible.get("core_fantasy")
+                or b_ws.get("thematic_premise")
+                or b_ws.get("world_lore")
+                or ""
+            )
+            b_rules = live_bible.get("gameplay_pillars") or b_ws.get("mechanics_guidelines") or []
+            b_style_raw = live_bible.get("visual_style_guide") or ""
+            if isinstance(b_style_raw, dict):
+                b_aesthetic = b_style_raw.get("aesthetic_mood") or json.dumps(b_style_raw)
+            elif isinstance(b_style_raw, str) and b_style_raw.strip():
+                b_aesthetic = b_style_raw.strip()
+            else:
+                b_aesthetic = (
+                    f"{b_ws.get('aesthetic_style', '')} ({b_ws.get('palette_mood', '')})"
+                    if b_ws.get("palette_mood")
+                    else b_ws.get("aesthetic_style", "")
+                )
+            if b_title:
+                has_active = True
+                game_title = b_title
+                genre = b_genre
+                if manifest_data is None:
+                    manifest_data = {}
+                manifest_data["creative_direction"] = {
+                    "narrative_premise": b_premise,
+                    "world_lore": b_ws.get("world_lore", "") or b_premise,
+                    "core_rules": b_rules,
+                    "aesthetic_style": b_aesthetic,
+                }
+
         delib = (
             f"Dynamic telemetry dashboard for active cartridge '{cart_dir.name}': "
             f"{len(probes_list)} probes declared, {metrics['total_custom_events']} custom events recorded."
@@ -2805,17 +2994,38 @@ def create_app(
         if err_resp is not None:
             return err_resp
 
-        cart_dir = sanitized_cart if sanitized_cart else target_active
-        exists = cart_dir.exists() and cart_dir.is_dir()
-        if not exists and not sanitized_cart and target_db == config.DB_PATH and target_cartridges.exists():
-            candidates = sorted(
-                [d for d in target_cartridges.glob("candidate_*") if d.is_dir()],
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-            if candidates:
-                cart_dir = candidates[0]
-                exists = True
+        live_bible = _get_active_writers_room_bible() if not sanitized_cart else None
+        matched_cand = _resolve_matching_candidate_for_bible(live_bible) if live_bible else None
+
+        if sanitized_cart:
+            cart_dir = sanitized_cart
+            exists = cart_dir.exists() and cart_dir.is_dir()
+        elif matched_cand is not None:
+            cart_dir = matched_cand
+            exists = cart_dir.exists() and cart_dir.is_dir()
+        elif live_bible and live_bible.get("game_title") and live_bible.get("game_title") != "Untitled Concept":
+            # Check if target_active actually belongs to this game_bible
+            active_matches = False
+            if target_active.exists() and (target_active / "world_spec.json").is_file():
+                try:
+                    act_ws = json.loads((target_active / "world_spec.json").read_text(encoding="utf-8"))
+                    active_matches = (act_ws.get("game_title") == live_bible.get("game_title"))
+                except Exception:
+                    active_matches = False
+            cart_dir = target_active
+            exists = active_matches
+        else:
+            cart_dir = target_active
+            exists = cart_dir.exists() and cart_dir.is_dir()
+            if not exists and target_db == config.DB_PATH and target_cartridges.exists():
+                candidates = sorted(
+                    [d for d in target_cartridges.glob("candidate_*") if d.is_dir()],
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                if candidates:
+                    cart_dir = candidates[0]
+                    exists = True
 
         manifest_data = {}
         world_spec_data = None
@@ -3423,14 +3633,28 @@ def create_app(
                 cart_dir = candidates[0]
 
         bid = request.query_params.get("build_id")
+        active_bible = target_bus.get_game_bible(build_id=bid) if not sanitized_cart else None
+        bible_status = str((active_bible or {}).get("status") or "").lower()
+        bible_cart_id = str((active_bible or {}).get("cartridge_id") or "").strip()
+
         spec_data = target_bus.get_requirements_spec(build_id=bid)
-        if not spec_data and cart_dir.exists():
-            spec_file = cart_dir / "requirements_spec.json"
-            if spec_file.exists():
-                try:
-                    spec_data = json.loads(spec_file.read_text(encoding="utf-8"))
-                except Exception:
-                    spec_data = None
+        if not spec_data and not sanitized_cart and bible_status in ("brainstorming", "awaiting_greenlight"):
+            # Do not fall back to the previous game's requirements_spec.json while a new game is in the Writers' Room
+            spec_data = None
+        elif not spec_data:
+            if not sanitized_cart and bible_cart_id and bible_cart_id != "active" and target_cartridges.exists():
+                cand_cart_dir = target_cartridges / bible_cart_id
+                if cand_cart_dir.exists():
+                    cart_dir = cand_cart_dir
+                else:
+                    cart_dir = None
+            if cart_dir and cart_dir.exists():
+                spec_file = cart_dir / "requirements_spec.json"
+                if spec_file.exists():
+                    try:
+                        spec_data = json.loads(spec_file.read_text(encoding="utf-8"))
+                    except Exception:
+                        spec_data = None
 
         valid_spec = (
             isinstance(spec_data, dict)
@@ -3604,12 +3828,16 @@ def create_app(
             search_dirs = [
                 target_dir,
                 target_dir / "assets" / "sprites",
+                target_dir / "assets" / "portraits",
                 target_dir / "assets" / "mockups",
+                target_dir / "assets" / "playtest_captures",
                 target_dir / "assets" / "audio",
                 target_dir / "assets" / "tiles",
                 c_root / "active",
                 c_root / "active" / "assets" / "sprites",
+                c_root / "active" / "assets" / "portraits",
                 c_root / "active" / "assets" / "mockups",
+                c_root / "active" / "assets" / "playtest_captures",
                 c_root / "active" / "assets" / "audio",
                 c_root / "active" / "assets" / "tiles",
             ]
@@ -3627,6 +3855,7 @@ def create_app(
             is_safe = any(
                 _is_subpath(target_file.resolve(), boundary)
                 for boundary in (config.PROJECT_ROOT, c_root, target_dir)
+                for _ in (1,)
                 if boundary
             )
             if not is_safe:
@@ -3671,7 +3900,7 @@ def create_app(
             })
 
     async def game_bible_handler(request):
-        """GET /api/studio/game-bible: Returns the latest Living Game Bible (transcript, concept evolution, mockups, storyboard, characters)."""
+        """GET /api/studio/game-bible: Returns the latest Living Game Bible (transcript, concept evolution, mockups, storyboard, characters, and specialist sign-off)."""
         cart_override = request.query_params.get("cartridge")
         sanitized_cart, err_resp = _sanitize_cartridge_override(cart_override)
         if err_resp is not None:
@@ -3706,8 +3935,11 @@ def create_app(
                     rec = tdb.get_latest_game_bible(build_id=bid)
                     if not rec and bid:
                         rec = tdb.get_latest_game_bible(build_id=None)
-                    if rec and isinstance(rec.get("bible"), dict):
-                        bible_data = rec["bible"]
+                    if isinstance(rec, dict):
+                        if isinstance(rec.get("bible"), dict):
+                            bible_data = rec["bible"]
+                        elif "game_title" in rec or "bible_id" in rec:
+                            bible_data = rec
                 except Exception as exc:
                     logger.debug("TelemetryDB game_bible lookup error: %s", exc)
 
@@ -3812,6 +4044,28 @@ def create_app(
                     "updated_at_utc": now_iso,
                 }
 
+        # Discover sign_off_report.json from active or latest candidate directory
+        sign_off_report: Optional[Dict[str, Any]] = None
+        sign_off_search_dirs = [cart_dir, target_active]
+        if target_cartridges.exists():
+            try:
+                sign_off_search_dirs.extend(
+                    sorted(
+                        [d for d in target_cartridges.glob("candidate_*") if d.is_dir()],
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                )
+            except OSError:
+                pass
+        for sdir in sign_off_search_dirs:
+            if sdir and (sdir / "sign_off_report.json").is_file():
+                try:
+                    sign_off_report = json.loads((sdir / "sign_off_report.json").read_text(encoding="utf-8"))
+                    break
+                except Exception:
+                    continue
+
         orch = getattr(target_bus, "_active_orchestrator", None)
         orch_state = getattr(getattr(orch, "state", None), "value", "IDLE") if orch else "IDLE"
         pause_greenlight = bool(
@@ -3821,10 +4075,32 @@ def create_app(
 
         if bible_data:
             resp_payload = dict(bible_data)
+            nb_dict = resp_payload.get("narrative_bible")
+            if isinstance(nb_dict, dict) and isinstance(nb_dict.get("characters"), list) and len(nb_dict["characters"]) > 1:
+                try:
+                    from engine.studio.writers_room import consolidate_character_list
+                    deduped_chars, alias_map = consolidate_character_list([], nb_dict["characters"])
+                    nb_dict = dict(nb_dict)
+                    nb_dict["characters"] = deduped_chars
+                    if isinstance(nb_dict.get("dialogue_barks"), list) and alias_map:
+                        updated_barks = []
+                        for b in nb_dict["dialogue_barks"]:
+                            if isinstance(b, dict) and b.get("speaker_id") in alias_map:
+                                b = dict(b)
+                                b["speaker_id"] = alias_map[b["speaker_id"]]
+                            updated_barks.append(b)
+                        nb_dict["dialogue_barks"] = updated_barks
+                    resp_payload["narrative_bible"] = nb_dict
+                except Exception as dedup_exc:
+                    logger.debug("Character deduplication warning in game_bible_handler: %s", dedup_exc)
             resp_payload.setdefault("deliberation", f"Retrieved Living Game Bible for '{resp_payload.get('game_title', 'Active Game')}'.")
             resp_payload["has_bible"] = True
             resp_payload["pause_for_greenlight"] = pause_greenlight
-            resp_payload["orchestrator_state"] = orch_state
+            if str(resp_payload.get("status", "")).lower() == "brainstorming" and orch_state == "AWAITING_GREENLIGHT":
+                resp_payload["orchestrator_state"] = "BRAINSTORMING"
+            else:
+                resp_payload["orchestrator_state"] = orch_state
+            resp_payload["sign_off_report"] = sign_off_report
             return JSONResponse(resp_payload)
 
         return JSONResponse({
@@ -3847,6 +4123,7 @@ def create_app(
             "audio_direction_guide": {},
             "world_spec": None,
             "narrative_bible": None,
+            "sign_off_report": sign_off_report,
             "pause_for_greenlight": pause_greenlight,
             "orchestrator_state": orch_state,
         })

@@ -7,8 +7,9 @@ __pycache__/
 *$py.class
 *.so
 
-# Testing & Coverage
+# Testing, Linting & Coverage
 .pytest_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 
@@ -27,6 +28,7 @@ data/specs/
 
 # Dynamically Synthesized Game Cartridges & Checkpoints (Studio Output)
 cartridges/active/
+cartridges/candidate/
 cartridges/candidate_*/
 cartridges/checkpoints/
 cartridges/backup_*/

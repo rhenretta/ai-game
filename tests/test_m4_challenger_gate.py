@@ -945,3 +945,118 @@ class TestSwarmEventBusChallengerVerdict:
         assert last_ev["event_type"] == SwarmEventType.CHALLENGER_GATE_VERDICT.value
         assert last_ev["payload"]["passed"] is True
         assert last_ev["payload"]["candidate_id"] == "cand_pub_01"
+
+
+# =============================================================================
+# 9. Multi-Agent Specialist Sign-Off Council & Retina HiDPI Enforcement
+# =============================================================================
+
+class TestMultiAgentSignOffCouncilAndHiDPI:
+    """Verifies Retina HiDPI project.godot enforcement, WAV 24kHz AST checks, and Multi-Agent Sign-Off Council."""
+
+    def test_enforce_hidpi_project_godot(self, tmp_path: Path):
+        from engine.studio.models import enforce_hidpi_project_godot
+
+        proj = tmp_path / "project.godot"
+        proj.write_text(
+            'config_version=5\n\n[display]\nwindow/size/viewport_width=1280\nwindow/size/viewport_height=720\nwindow/size/resizable=false\n\n[rendering]\nrenderer/rendering_method="gl_compatibility"\n',
+            encoding="utf-8",
+        )
+        enforce_hidpi_project_godot(proj)
+        updated = proj.read_text(encoding="utf-8")
+        assert "window/size/window_width_override=2560" in updated
+        assert "window/size/window_height_override=1440" in updated
+        assert "window/size/resizable=true" in updated
+        assert "window/dpi/allow_hidpi=true" in updated
+        assert "textures/canvas_textures/default_texture_filter=2" in updated
+
+    def test_ast_inspector_catches_chipmunk_44100_and_unbound_sprites(self, tmp_path: Path):
+        (tmp_path / "project.godot").write_text("config_version=5\n", encoding="utf-8")
+        sprites_dir = tmp_path / "assets" / "sprites"
+        sprites_dir.mkdir(parents=True)
+        (sprites_dir / "hero_ship.png").write_bytes(b"png")
+        (sprites_dir / "orphan_prop_1.png").write_bytes(b"png")
+        (sprites_dir / "orphan_prop_2.png").write_bytes(b"png")
+        audio_dir = tmp_path / "assets" / "audio"
+        audio_dir.mkdir(parents=True)
+        (audio_dir / "voice_01.wav").write_bytes(b"RIFF" + b"\x00" * 100)
+
+        (tmp_path / "main.gd").write_text(
+            'extends Node2D\nfunc _ready():\n\tvar x = 1\nfunc _process(delta):\n\tdraw_circle(Vector2.ZERO, 5.0, Color.WHITE)\n',
+            encoding="utf-8",
+        )
+        (tmp_path / "ui_hud.gd").write_text(
+            'extends Node2D\nfunc play_bark():\n\tvar s = AudioStreamWAV.new()\n\ts.mix_rate = 44100\n\tvar tex = "res://assets/sprites/hero_ship.png"\n',
+            encoding="utf-8",
+        )
+        inspector = CandidateASTInspector()
+        report = inspector.inspect_directory(tmp_path)
+        assert report["has_critical_stubs"] is True
+        reasons = [s.get("reason", "") for s in report["hollow_stubs"]]
+        assert any("44100" in r for r in reasons)
+        assert any("orphan_prop_1.png" in r for r in reasons)
+
+    def test_multi_agent_sign_off_council_enforces_hard_invariants(self, tmp_path: Path):
+        from engine.supervisor.challenger import MultiAgentSignOffCouncil, SPECIALIST_COUNCIL_ROLES
+        from engine.supervisor.models import MultiAgentSignOffReport, SpecialistSignOffVerdict
+
+        council = MultiAgentSignOffCouncil()
+        initial_report = MultiAgentSignOffReport(
+            deliberation="Initial LLM council evaluation.",
+            candidate_id="test_cand_01",
+            unanimous_approval=True,
+            verdicts=[
+                SpecialistSignOffVerdict(
+                    deliberation="Looks okay at first glance.",
+                    specialist_role=role,
+                    approved=True,
+                )
+                for role in SPECIALIST_COUNCIL_ROLES
+            ],
+        )
+
+        ast_grounding = {
+            "hollow_stubs": [
+                {
+                    "module": "ui_hud.gd",
+                    "function": "play_voice_clip",
+                    "stmt": "stream.mix_rate = 44100",
+                    "reason": "AudioAtmosphereDesigner veto: mix_rate=44100 chipmunk distortion.",
+                },
+                {
+                    "module": "scenes.gd",
+                    "function": "load_sprites",
+                    "stmt": "unbound sprites",
+                    "reason": "VisualArtDirector veto: synthesized PNG sprites in assets/sprites/ are never loaded.",
+                },
+            ]
+        }
+        telemetry_grounding = {
+            "is_stagnant_or_frozen": True,
+            "scene_audit": {
+                "fullscreen_occlusion_detected": True,
+                "audio_players_found": 1,
+                "audio_streams_loaded": 1,
+                "audio_mix_rates": [44100],
+            },
+        }
+        visual_grounding = {
+            "blank_canvas_detected": False,
+            "captured_frame_paths": ["assets/playtest_captures/playtest_t0.png"],
+        }
+
+        enforced = council._enforce_specialist_invariants(
+            report=initial_report,
+            candidate_id="test_cand_01",
+            ast_grounding=ast_grounding,
+            telemetry_grounding=telemetry_grounding,
+            visual_grounding=visual_grounding,
+        )
+        assert enforced.unanimous_approval is False
+        veto_roles = [v.specialist_role for v in enforced.verdicts if not v.approved]
+        assert "AudioAtmosphereDesigner" in veto_roles
+        assert "VisualArtDirector" in veto_roles
+        assert "UXExperienceDesigner" in veto_roles
+        assert "GameplayDesigner" in veto_roles
+        assert "CreativeDirector" in veto_roles
+

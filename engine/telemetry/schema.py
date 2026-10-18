@@ -116,6 +116,31 @@ CREATE TABLE IF NOT EXISTS studio_checkpoints (
 );
 """
 
+STUDIO_REQUIREMENT_SPECS_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS studio_requirement_specs (
+    build_id TEXT PRIMARY KEY,
+    spec_id TEXT,
+    game_title TEXT,
+    genre_paradigm TEXT,
+    spec_json TEXT NOT NULL,
+    updated_at_utc TEXT NOT NULL,
+    FOREIGN KEY (build_id) REFERENCES studio_builds(build_id)
+);
+"""
+
+STUDIO_GAME_BIBLES_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS studio_game_bibles (
+    bible_id TEXT PRIMARY KEY,
+    cartridge_id TEXT NOT NULL,
+    target_episode INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'brainstorming',
+    game_title TEXT NOT NULL,
+    bible_json TEXT NOT NULL,
+    created_at_utc TEXT NOT NULL,
+    updated_at_utc TEXT NOT NULL
+);
+"""
+
 STUDIO_INDICES_DDL = """
 CREATE INDEX IF NOT EXISTS idx_studio_events_build_id ON studio_events(build_id);
 CREATE INDEX IF NOT EXISTS idx_studio_events_type ON studio_events(event_type);
@@ -125,6 +150,7 @@ CREATE INDEX IF NOT EXISTS idx_studio_artifacts_build_id ON studio_artifacts(bui
 CREATE INDEX IF NOT EXISTS idx_studio_artifacts_task_id ON studio_artifacts(task_id);
 CREATE INDEX IF NOT EXISTS idx_studio_requirements_build_id ON studio_requirements(build_id);
 CREATE INDEX IF NOT EXISTS idx_studio_checkpoints_build_id ON studio_checkpoints(build_id);
+CREATE INDEX IF NOT EXISTS idx_studio_game_bibles_updated ON studio_game_bibles(updated_at_utc);
 """
 
 ALL_STUDIO_DDL = [
@@ -133,7 +159,9 @@ ALL_STUDIO_DDL = [
     STUDIO_TASKS_TABLE_DDL,
     STUDIO_ARTIFACTS_TABLE_DDL,
     STUDIO_REQUIREMENTS_TABLE_DDL,
+    STUDIO_REQUIREMENT_SPECS_TABLE_DDL,
     STUDIO_CHECKPOINTS_TABLE_DDL,
+    STUDIO_GAME_BIBLES_TABLE_DDL,
     STUDIO_INDICES_DDL,
 ]
 

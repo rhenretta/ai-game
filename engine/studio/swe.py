@@ -114,11 +114,17 @@ class LeadGameplaySWEAgent:
         self.last_deliberation: Optional[str] = None
 
     def _discover_sealed_assets(self, staging_dir: Path) -> Dict[str, List[str]]:
-        """Discovers visual sprites and audio clips sealed upstream into staging_dir/assets/."""
-        assets: Dict[str, List[str]] = {"sprites": [], "audio": []}
+        """Discovers visual sprites, character portraits, visual mockups, and audio clips sealed upstream into staging_dir/assets/."""
+        assets: Dict[str, List[str]] = {"sprites": [], "portraits": [], "mockups": [], "audio": []}
         sprites_dir = staging_dir / "assets" / "sprites"
         if sprites_dir.is_dir():
             assets["sprites"] = sorted([f"assets/sprites/{p.name}" for p in sprites_dir.glob("*.png")])
+        portraits_dir = staging_dir / "assets" / "portraits"
+        if portraits_dir.is_dir():
+            assets["portraits"] = sorted([f"assets/portraits/{p.name}" for p in portraits_dir.glob("*.png")])
+        mockups_dir = staging_dir / "assets" / "mockups"
+        if mockups_dir.is_dir():
+            assets["mockups"] = sorted([f"assets/mockups/{p.name}" for p in mockups_dir.glob("*.png")])
         audio_dir = staging_dir / "assets" / "audio"
         if audio_dir.is_dir():
             assets["audio"] = sorted([f"assets/audio/{p.name}" for p in audio_dir.glob("*.wav")])
@@ -263,6 +269,121 @@ class LeadGameplaySWEAgent:
 
         return bundle.assemble_cartridge_directory(target_dir, swe_agent=self)
 
+    def _is_live_genai_client(self) -> bool:
+        """Returns True if self.client is a live google.genai Client rather than None or a unit-test mock."""
+        if self.client is None:
+            return False
+        mod = getattr(type(self.client), "__module__", "") or ""
+        return mod.startswith("google.genai")
+
+    def _build_bible_and_narrative_context(
+        self,
+        staging_dir: Path,
+        narrative_bible: Optional[NarrativeBible] = None,
+        game_bible: Optional[Any] = None,
+    ) -> Tuple[str, List[Any]]:
+        """Loads game_bible.json and narrative_bible.json from staging_dir if not passed in,
+        returning a rich prompt context block and any multimodal mockup image Parts.
+        """
+        from engine.studio.models import GameBibleSpec
+
+        if game_bible is None and (staging_dir / "game_bible.json").is_file():
+            try:
+                game_bible = GameBibleSpec.model_validate_json(
+                    (staging_dir / "game_bible.json").read_text(encoding="utf-8")
+                )
+            except Exception:
+                game_bible = None
+
+        if narrative_bible is None:
+            if game_bible is not None and getattr(game_bible, "narrative_bible", None) is not None:
+                narrative_bible = game_bible.narrative_bible
+            elif (staging_dir / "narrative_bible.json").is_file():
+                try:
+                    narrative_bible = NarrativeBible.model_validate_json(
+                        (staging_dir / "narrative_bible.json").read_text(encoding="utf-8")
+                    )
+                except Exception:
+                    narrative_bible = None
+
+        context_parts: List[str] = []
+        multimodal_parts: List[Any] = []
+
+        if game_bible is not None:
+            beats_lines = [
+                f"  * Beat {b.beat_index} ({b.phase_title}): Emotion={b.player_emotional_state} | Staging={b.sensory_and_camera_staging} | Diegetic Discovery={b.diegetic_teaching_moment} | Story={b.narrative_integration}"
+                for b in (getattr(game_bible, "experience_storyboard", []) or [])
+            ]
+            mockup_lines = [
+                f"  * '{m.title}' ({m.image_path}): {m.scene_description} | UI Callouts: {m.ui_callout_notes}"
+                for m in (getattr(game_bible, "visual_mockups", []) or [])
+            ]
+            context_parts.append(
+                f"LIVING GAME BIBLE (`game_bible.json` — AUTHORITATIVE EXPERIENCE & DIEGETIC UX BLUEPRINT):\n"
+                f"- Game Title: {getattr(game_bible, 'game_title', '')}\n"
+                f"- Elevator Pitch: {getattr(game_bible, 'elevator_pitch', '')}\n"
+                f"- Core Player Fantasy: {getattr(game_bible, 'core_fantasy', '')}\n"
+                f"- First 60 Seconds Hook: {getattr(game_bible, 'first_60_seconds_hook', '')}\n"
+                f"- Diegetic UI & Onboarding Philosophy (NO wall-of-text HUD control manuals!): {getattr(game_bible, 'diegetic_ui_philosophy', '')}\n"
+                f"- Gameplay Pillars: {getattr(game_bible, 'gameplay_pillars', [])}\n"
+                f"- Visual Style Guide: {getattr(game_bible, 'visual_style_guide', '')}\n"
+                f"- Audio Direction Guide: {getattr(game_bible, 'audio_direction_guide', '')}\n"
+                + (f"- Experience Storyboard Arc:\n" + "\n".join(beats_lines) + "\n" if beats_lines else "")
+                + (f"- Synthesized 16:9 Visual Mockup Boards:\n" + "\n".join(mockup_lines) + "\n" if mockup_lines else "")
+            )
+
+            try:
+                from google.genai import types
+                for m in (getattr(game_bible, "visual_mockups", []) or [])[:2]:
+                    m_path = staging_dir / m.image_path
+                    if m_path.is_file():
+                        multimodal_parts.append(
+                            types.Part.from_bytes(data=m_path.read_bytes(), mime_type="image/png")
+                        )
+            except Exception as exc:
+                logger.debug("Could not attach mockup bytes for SWE multimodal prompt: %s", exc)
+
+        if narrative_bible is not None:
+            chars_info = [
+                f"{getattr(c, 'name', 'Character')} (id={getattr(c, 'character_id', '')}, role={getattr(c, 'role', '')}, portrait={getattr(c, 'portrait_asset', '')}, backstory={getattr(c, 'backstory', '')[:80]})"
+                for c in getattr(narrative_bible, "characters", [])
+            ]
+            cutscenes_info = [
+                {
+                    "cutscene_id": getattr(cs, "cutscene_id", ""),
+                    "title": getattr(cs, "title", ""),
+                    "trigger": getattr(cs, "trigger", ""),
+                    "beats": [
+                        {
+                            "beat_number": getattr(b, "beat_number", 0),
+                            "action": getattr(b, "action_description", ""),
+                            "speaker_id": getattr(b, "speaker_id", ""),
+                            "line": getattr(b, "dialogue_line", ""),
+                        }
+                        for b in getattr(cs, "beats", [])
+                    ],
+                }
+                for cs in getattr(narrative_bible, "cutscenes", [])
+            ]
+            trees_info = [
+                dt.model_dump() if hasattr(dt, "model_dump") else dt
+                for dt in getattr(narrative_bible, "dialogue_trees", [])
+            ]
+            barks_info = [
+                f"[{getattr(b, 'bark_id', '')}] (trigger={getattr(b, 'trigger_type', '')}) {getattr(b, 'speaker_name', '')}: '{getattr(b, 'text', '')}' (audio: {getattr(b, 'voice_clip', '')})"
+                for b in getattr(narrative_bible, "dialogue_barks", [])
+            ]
+            context_parts.append(
+                f"NARRATIVE BIBLE & MULTIMODAL CHARACTERS (`narrative_bible.json`):\n"
+                f"- Setting Summary: {getattr(narrative_bible, 'setting_summary', '')}\n"
+                f"- Characters: {chars_info}\n"
+                f"- Cutscene Scripts (stage these in-game!): {json.dumps(cutscenes_info)}\n"
+                f"- Interactive Dialogue Trees: {json.dumps(trees_info)}\n"
+                f"- Reactive Voice Barks: {barks_info}\n"
+            )
+
+        return ("\n\n".join(context_parts) + "\n\n" if context_parts else ""), multimodal_parts
+
     def implement_requirement_track(
         self,
         track: RequirementTrack,
@@ -270,6 +391,8 @@ class LeadGameplaySWEAgent:
         requirements_spec: Optional[GameRequirementsSpec] = None,
         narrative_bible: Optional[NarrativeBible] = None,
         world_spec: Optional[Any] = None,
+        game_bible: Optional[Any] = None,
+        prior_error: Optional[str] = None,
     ) -> Dict[str, Path]:
         """Iteratively implements or expands cartridge code for a single RequirementTrack.
         Inspects existing code in staging_dir and sealed assets in staging_dir/assets/,
@@ -315,30 +438,17 @@ class LeadGameplaySWEAgent:
                 existing_code_summary.append(f"--- Existing {mod_name} ---\n{code}")
         existing_code_block = "\n".join(existing_code_summary) if existing_code_summary else "No existing code modules."
 
-        if narrative_bible is None and (staging_dir / "narrative_bible.json").is_file():
-            try:
-                narrative_bible = NarrativeBible.model_validate_json(
-                    (staging_dir / "narrative_bible.json").read_text(encoding="utf-8")
-                )
-            except Exception:
-                narrative_bible = None
+        bible_and_narrative_context, multimodal_mockup_parts = self._build_bible_and_narrative_context(
+            staging_dir=staging_dir,
+            narrative_bible=narrative_bible,
+            game_bible=game_bible,
+        )
 
-        narrative_context = ""
-        if narrative_bible:
-            chars_info = [
-                f"{getattr(c, 'name', 'Character')} (portrait: {getattr(c, 'portrait_asset', '')})"
-                for c in getattr(narrative_bible, "characters", [])
-            ]
-            barks_info = [
-                f"[{getattr(b, 'bark_id', '')}] {getattr(b, 'speaker_name', '')}: '{getattr(b, 'text', '')}' (audio: {getattr(b, 'voice_clip', '')})"
-                for b in getattr(narrative_bible, "dialogue_barks", [])
-            ]
-            narrative_context = (
-                f"NARRATIVE BIBLE & MULTIMODAL CHARACTERS:\n"
-                f"- Characters: {chars_info}\n"
-                f"- Dialogue Barks: {barks_info}\n"
-                f"- Setting Summary: {getattr(narrative_bible, 'setting_summary', '')}\n\n"
-            )
+        prior_error_block = (
+            f"CRITICAL — PREVIOUS ATTEMPT COMPILER/RUNTIME ERROR TO FIX & AVOID:\n{prior_error}\n\n"
+            if prior_error
+            else ""
+        )
 
         if is_godot:
             prompt = (
@@ -346,34 +456,43 @@ class LeadGameplaySWEAgent:
                 f"Description: {track.description}\n"
                 f"Target Modules: {track.target_modules}\n"
                 f"Acceptance Criteria:\n{criteria_context}\n\n"
-                f"{narrative_context}"
+                f"{prior_error_block}"
+                f"{bible_and_narrative_context}"
                 f"EXISTING CARTRIDGE CODE IN STAGING:\n{existing_code_block}\n\n"
                 f"SEALED ASSETS AVAILABLE IN STAGING:\n"
                 f"- Sprites: {sealed_assets['sprites']}\n"
+                f"- Portraits: {sealed_assets.get('portraits', [])}\n"
+                f"- Mockups: {sealed_assets.get('mockups', [])}\n"
                 f"- Audio: {sealed_assets['audio']}\n\n"
-                f"ARCHITECTURAL SPECIFICATION:\n"
-                f"1. Target: Godot 4.3-stable (GDScript 2.0). Resolution: 1280x720 at 60 FPS.\n"
+                f"ARCHITECTURAL & EXPERIENCE-FIRST SPECIFICATION:\n"
+                f"1. Target: Godot 4.3-stable (GDScript 2.0). Logical viewport: 1280x720 rendered on a 2560x1440 HiDPI resizable window at 60 FPS.\n"
                 f"2. Code-First Design: Zero complex .tscn files. A minimal 4-line main.tscn binds res://main.gd to root Node2D.\n"
                 f"3. Modular Architecture:\n"
                 f"   - main.gd: Root scene script extending Node2D. Preloads child modules using preload('res://<name>.gd'). Sets up Camera2D, level scene container, and UI CanvasLayer. Implements get_state_snapshot() -> Dictionary for headless playtesting.\n"
-                f"   - mechanics.gd: Core rules, physics/simulation loops, placement/action methods, scoring, damage/win/loss logic.\n"
+                f"   - mechanics.gd: Core rules, physics/simulation loops, placement/action methods, scoring, story progression, recoverable hazard/win/loss logic.\n"
                 f"   - entities.gd: CharacterBody2D, RigidBody2D, Area2D, or RefCounted/Node2D entity classes.\n"
-                f"   - scenes.gd: Level layouts, active world Node2D renderer (_draw() and/or Sprite2D children), coordinate projections, placement guide.\n"
-                f"   - ui_hud.gd: CanvasLayer containing HUD panels, build/action palette, portrait/bark comms display, hover tooltip, and input handling.\n"
-                f"4. Cross-Module Resolution & Strict Method Alignment: You MUST explicitly declare preloads:\n"
-                f"   const Mechanics = preload('res://mechanics.gd')\n"
-                f"   const Entities = preload('res://entities.gd')\n"
-                f"   const Scenes = preload('res://scenes.gd')\n"
-                f"   const UIHud = preload('res://ui_hud.gd')\n"
-                f"   Every method called or checked via .has_method(...) across main.gd, mechanics.gd, scenes.gd, entities.gd, and ui_hud.gd MUST match the exact function name defined in the target module.\n"
-                f"5. MANDATORY VISIBLE WORLD RENDERING & MULTIMODAL ASSET INTEGRATION:\n"
+                f"   - scenes.gd: Level layouts, active world Node2D renderer (_draw() and/or Sprite2D children), lighting/atmosphere, diegetic in-world visual cues.\n"
+                f"   - ui_hud.gd: Clean diegetic UI, character portrait & cutscene/dialogue tree presenter, voice bark audio player, and responsive input handling (NEVER render a static wall-of-text instruction manual explaining controls on the HUD!).\n"
+                f"4. Cross-Module Resolution, Scope & Strict Method Alignment:\n"
+                f"   - When preloading OTHER modules, declare:\n"
+                f"     const Mechanics = preload('res://mechanics.gd')\n"
+                f"     const Entities = preload('res://entities.gd')\n"
+                f"     const Scenes = preload('res://scenes.gd')\n"
+                f"     const UIHud = preload('res://ui_hud.gd')\n"
+                f"   - NEVER SELF-PRELOAD OR USE A MODULE'S OWN ALIAS INSIDE THAT MODULE: Inside `scenes.gd` (including inside any inner `class` defined in `scenes.gd`), NEVER write `Scenes.some_func()` or `preload('res://scenes.gd')` (causes `Parse Error: Identifier \"Scenes\" not declared in the current scope`). Likewise, never write `Mechanics.` inside `mechanics.gd`, `Entities.` inside `entities.gd`, or `UIHud.` inside `ui_hud.gd`. Call functions in the same script directly, or define helpers inside the inner class.\n"
+                f"   - STATIC VS INSTANCE CALLS ON PRELOADED SCRIPTS: `preload('res://scenes.gd')` returns a `GDScript` resource, NOT an instance! If `main.gd` calls `Scenes.create_world(...)` directly on `Scenes`, then `create_world` in `scenes.gd` MUST be declared `static func create_world(...)`. Otherwise, instantiate `var scenes_node = Scenes.new()` first and call instance methods on `scenes_node`!\n"
+                f"   - AVOID `:=` TYPE INFERENCE ON UNTYPED EXPRESSIONS: In GDScript 2.0, `var x := expr` causes `Parse Error: Cannot infer the type of \"x\" variable because the value doesn't have a set type` whenever `expr` returns `Variant`, comes from a Dictionary/Array lookup, or calls a function without an explicit return type. Always use `var x = expr` or explicit type annotations (`var x: Rect2 = expr`) instead of `:=`!\n"
+                f"   - Every method called across `main.gd`, `mechanics.gd`, `scenes.gd`, `entities.gd`, and `ui_hud.gd` MUST match the exact function name defined in the target module.\n"
+                f"5. MANDATORY VISIBLE WORLD RENDERING, STORY STAGING & MULTIMODAL ASSET INTEGRATION:\n"
                 f"   - NEVER return a bare/empty Node2D.new() stub from a map or scene builder without _draw() or child visual nodes!\n"
-                f"   - scenes.gd / main.gd MUST visibly render the entire active game world (terrain/grid cells, resource veins/nodes, core/objectives, placed structures/conveyors/units, and active enemies/projectiles) inside WorldContainer using custom _draw() (draw_colored_polygon, draw_polyline, draw_rect, draw_circle, draw_texture_rect, draw_string) and/or Sprite2D nodes, calling queue_redraw() every tick.\n"
-                f"   - Load and display synthesized PNG sprites from 'res://assets/sprites/*.png' via Image.load_from_file(ProjectSettings.globalize_path('res://assets/sprites/<name>.png')) + ImageTexture.create_from_image(img).\n"
-                f"   - Load and play WAV voice clips from 'res://assets/audio/*.wav' via FileAccess.open('res://assets/audio/<name>.wav', FileAccess.READ).\n"
-                f"6. MANDATORY CAMERA CONTROLS & INTERACTIVE MOUSE/KEYBOARD LOOP:\n"
-                f"   - Center Camera2D on the active world center on _ready(), and support smooth camera panning (WASD / Arrow keys / right-or-middle mouse drag) and zoom (MOUSE_BUTTON_WHEEL_UP / MOUSE_BUTTON_WHEEL_DOWN).\n"
-                f"   - Handle MOUSE_BUTTON_LEFT in _unhandled_input to place selected structures or interact with world coordinates (converting screen mouse position to world position accounting for Camera2D position/zoom) and invoke the corresponding mechanics.gd placement/action methods.\n"
+                f"   - Honor the Living Game Bible's First 60 Seconds Hook, Experience Storyboard Beats, Visual Style Guide, and 16:9 Visual Mockup boards.\n"
+                f"   - Stage the Narrative Bible's cutscenes, dialogue trees, and reactive voice barks in-game with character portraits and real WAV playback.\n"
+                f"   - Load and display ALL synthesized PNG sprites from 'res://assets/sprites/*.png' and portraits from 'res://assets/portraits/*.png' via Image.load_from_file(ProjectSettings.globalize_path('res://assets/...')) + ImageTexture.create_from_image(img).\n"
+                f"   - MANDATORY 24,000 Hz PCM WAV AUDIO LOADING & COOLDOWN: All synthesized WAV voice clips in 'res://assets/audio/*.wav' are 24,000 Hz, 16-bit mono PCM. When loading via FileAccess.get_file_as_bytes(ProjectSettings.globalize_path(path)), you MUST strip the 44-byte RIFF header (`stream.data = bytes.slice(44) if bytes.size() > 44 else bytes`), set `stream.format = AudioStreamWAV.FORMAT_16_BITS`, `stream.mix_rate = 24000` (NEVER 44100, which causes high-pitched chipmunk distortion!), and `stream.stereo = false`. Furthermore, enforce a non-overlapping playback guard (`if not audio_player.playing:`) and a minimum cooldown (>= 8.0 seconds) so voice barks NEVER spam or repeat every few seconds.\n"
+                f"6. DIEGETIC UX, CLEAR VIEWPORT & RECOVERABLE GAMEPLAY:\n"
+                f"   - Teach and guide the player through world cues, visual feedback, diegetic labels/hover callouts, and story context as specified in the Living Game Bible's `diegetic_ui_philosophy`—NEVER clutter the screen with a static instruction-manual text box listing keyboard shortcuts.\n"
+                f"   - NEVER blind the player on startup with >30% opaque full-screen overlays or frost, and NEVER lock out player controls with an unrecoverable game-over screen in the first 30 seconds.\n"
+                f"   - Use `get_global_mouse_position()` for accurate HiDPI world-space mouse picking.\n"
                 f"7. STRICTLY FORBIDDEN (Deprecated Godot 3 Syntax):\n"
                 f"   - NEVER use KinematicBody2D (use CharacterBody2D).\n"
                 f"   - NEVER use yield() (use await).\n"
@@ -411,11 +530,16 @@ class LeadGameplaySWEAgent:
         max_gemini_retries = 3
         bundle = None
         last_exc = None
+        contents_payload: Any = (
+            [prompt] + multimodal_mockup_parts
+            if (multimodal_mockup_parts and self._is_live_genai_client())
+            else prompt
+        )
         for g_attempt in range(1, max_gemini_retries + 1):
             try:
                 response = self.client.models.generate_content(
                     model=self.model_name,
-                    contents=prompt,
+                    contents=contents_payload,
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_schema=response_model,
@@ -867,7 +991,35 @@ class LeadGameplaySWEAgent:
                 return False
         return False
 
-    def repair_godot_module(self, filename: str, broken_code: str, diagnostic: str) -> str:
+    def _extract_gd_peer_signatures(self, c_dir: Path, exclude_file: str = "") -> str:
+        """Extracts class, func, static func, and const declarations from peer .gd files in c_dir
+        so repair_godot_module has accurate cross-module function & class signatures.
+        """
+        if not c_dir.is_dir():
+            return ""
+        blocks: List[str] = []
+        for gd_path in sorted(c_dir.glob("*.gd")):
+            if gd_path.name == exclude_file:
+                continue
+            try:
+                sig_lines: List[str] = []
+                for idx, raw_line in enumerate(gd_path.read_text(encoding="utf-8").splitlines(), start=1):
+                    stripped = raw_line.strip()
+                    if stripped.startswith(("extends ", "class_name ", "class ", "static func ", "func ", "const ", "signal ")):
+                        sig_lines.append(f"  L{idx}: {raw_line}")
+                if sig_lines:
+                    blocks.append(f"[{gd_path.name} signatures]\n" + "\n".join(sig_lines[:60]))
+            except Exception:
+                continue
+        return "\n\n".join(blocks)
+
+    def repair_godot_module(
+        self,
+        filename: str,
+        broken_code: str,
+        diagnostic: str,
+        peer_context: str = "",
+    ) -> str:
         """Autonomously repairs a GDScript module or project file using live Gemini inference with CodeRepairSpec."""
         if self.client is None:
             return broken_code
@@ -875,16 +1027,23 @@ class LeadGameplaySWEAgent:
         numbered_lines = "\n".join(
             f"{idx + 1:4d}: {line}" for idx, line in enumerate(broken_code.splitlines())
         )
+        peer_block = (
+            f"PEER MODULE SIGNATURES IN CARTRIDGE (for cross-module call alignment):\n{peer_context}\n\n"
+            if peer_context
+            else ""
+        )
         prompt = (
             f"You are the Lead Gameplay SWE Agent repairing broken Godot 4.3 GDScript code for '{filename}'.\n"
-            f"Compiler/Runtime Error Diagnostic:\n{diagnostic}\n\n"
+            f"Compiler/Runtime Error Diagnostic(s):\n{diagnostic}\n\n"
+            f"{peer_block}"
             f"BROKEN CODE (with line numbers for reference — DO NOT include line numbers in repaired_content):\n{numbered_lines}\n\n"
             f"Repair Guidelines:\n"
-            f"1. Fix the exact syntax error, indentation error (ensure every block after 'if:', 'elif:', 'else:', 'for:', 'while:', 'match:' is indented by one additional tab '\\t'), missing declaration, or invalid call on the reported line.\n"
-            f"2. Keep Godot 4.3 syntax (use CharacterBody2D, await, FileAccess, Area2D) and consistent tab ('\\t') indentation.\n"
-            f"3. Strictly avoid banned Godot 3 syntax (KinematicBody2D, yield, File.new()).\n"
-            f"4. Cross-module imports must use const Module = preload('res://<file>.gd').\n"
-            f"5. Return complete, valid source code (without line number prefixes) with deliberation strictly first."
+            f"1. Fix EVERY reported syntax/parse/runtime error, indentation error (ensure every block after 'if:', 'elif:', 'else:', 'for:', 'while:', 'match:' is indented by one additional tab '\\t'), missing declaration, or invalid call.\n"
+            f"2. SELF-REFERENCE ERROR FIX: If '{filename}' reports `Identifier \"Scenes\" (or \"Mechanics\"/\"Entities\"/\"UIHud\") not declared in the current scope`, remove the self-module prefix (`Scenes.`, `Mechanics.`, `Entities.`, `UIHud.`) inside `{filename}`—never reference a script's external preload alias inside that script itself (or inside an inner class in `{filename}`; call the function directly or move/duplicate the helper inside the inner class).\n"
+            f"3. TYPE INFERENCE ERROR FIX: If an error says `Cannot infer the type of \"<var>\" variable because the value doesn't have a set type`, replace `var <var> := ...` with `var <var> = ...` (or an explicit type annotation `var <var>: Type = ...`). Never use `:=` on untyped expressions.\n"
+            f"4. PRELOADED SCRIPT CALL FIX: If an error says `Invalid call. Nonexistent function '<fn>' in base 'GDScript'`, remember that `const Module = preload('res://...')` is a `GDScript` resource, not an instance. Either instantiate `var inst = Module.new()` before calling `inst.<fn>(...)`, or align with the `static func` / `func` names shown in PEER MODULE SIGNATURES.\n"
+            f"5. Keep Godot 4.3 syntax (use CharacterBody2D, await, FileAccess, Area2D), consistent tab ('\\t') indentation, and strictly avoid banned Godot 3 syntax (KinematicBody2D, yield, File.new()).\n"
+            f"6. Return complete, valid source code (without line number prefixes) with deliberation strictly first."
         )
         try:
             resp = self.client.models.generate_content(
@@ -1340,18 +1499,9 @@ class LeadGameplaySWEAgent:
 
         sealed_assets = self._discover_sealed_assets(c_dir)
 
-        narrative_context = ""
-        nb_path = c_dir / "narrative_bible.json"
-        if nb_path.is_file():
-            try:
-                nb_data = json.loads(nb_path.read_text(encoding="utf-8"))
-                narrative_context = (
-                    f"NARRATIVE BIBLE (`narrative_bible.json`):\n"
-                    f"- Characters: {json.dumps(nb_data.get('characters', []))}\n"
-                    f"- Dialogue Barks: {json.dumps(nb_data.get('dialogue_barks', []))}\n\n"
-                )
-            except Exception:
-                pass
+        bible_and_narrative_context, multimodal_mockup_parts = self._build_bible_and_narrative_context(
+            staging_dir=c_dir,
+        )
 
         req_context = ""
         if req_spec is not None and getattr(req_spec, "requirements", None):
@@ -1377,7 +1527,7 @@ class LeadGameplaySWEAgent:
             f"Recommended Remedy: {rec_remedy}\n"
             f"Detected Structural & Hollow Stubs:\n{json.dumps(hollow_stubs, indent=2)}\n\n"
             f"{req_context}"
-            f"{narrative_context}"
+            f"{bible_and_narrative_context}"
             f"SEALED MULTIMODAL ASSETS ON DISK:\n"
             f"- Sprites: {sealed_assets['sprites']}\n"
             f"- Audio: {sealed_assets['audio']}\n\n"
@@ -1386,37 +1536,27 @@ class LeadGameplaySWEAgent:
             f"1. RATIONALE-FIRST (Rule 4): Provide 'deliberation' FIRST explaining every root cause and how your updated .gd modules fix it.\n"
             f"2. ROOT SCENE ORCHESTRATOR & CAMERA (main.gd):\n"
             f"   - `main.gd` is attached to the root `Node2D` node in `main.tscn`. It MUST begin with `extends Node2D`.\n"
-            f"   - In `_ready()`, call `RenderingServer.set_default_clear_color(Color(0.05, 0.06, 0.09))` so the viewport background is deep cavern obsidian, never default gray.\n"
-            f"   - Instantiate `WorldContainer` (`Node2D`), `MainCamera` (`Camera2D` with `camera.enabled = true` and `camera.make_current()`), `ScenesModule`, `MechanicsModule`, and `UIHud` (`CanvasLayer`). Add `world_view` to `WorldContainer` BEFORE setting up `placement_guide` (and set `placement_guide.z_index = 10` so the placement cursor is ALWAYS rendered on top of the tilemap).\n"
-            f"3. ACCURATE HiDPI MOUSE PICKING, ROTATION ('R'), & DEMOLISH ('RMB') (main.gd & ui_hud.gd):\n"
-            f"   - NEVER use `(get_viewport().get_mouse_position() - get_viewport().size * 0.5)`! On Retina/HiDPI displays, `get_viewport().size` is 2x physical pixels while `get_mouse_position()` is 1280x720 canvas units, shifting clicks off by hundreds of pixels.\n"
-            f"   - ALWAYS use `var world_pos = get_global_mouse_position()` inside `main.gd` (`_get_current_hovered_grid_coord()`) to transform mouse screen coordinates into exact world coordinates.\n"
-            f"   - Support rotating build orientation (`build_direction: Vector2i`) with `KEY_R` (cycling `Vector2i(1,0) -> Vector2i(0,1) -> Vector2i(-1,0) -> Vector2i(0,-1)`), passing the selected `build_direction` when placing conveyors, drills, and smelters.\n"
-            f"   - On `MOUSE_BUTTON_LEFT`: if a build tool is active and placement is valid, place the structure and play a placement sound effect; if no build tool is active, inspect the clicked structure/vein.\n"
-            f"   - On `MOUSE_BUTTON_RIGHT`: if a build tool is active, deselect it (`select_build_item('')`); if no build tool is active and the hovered cell has a player structure, demolish/remove it from `mechanics_module` and `subterranean_grid` with audio feedback.\n"
+            f"   - Set an atmospheric clear color in `_ready()` matching the Living Game Bible's `visual_style_guide`, never default gray.\n"
+            f"   - Instantiate `WorldContainer` (`Node2D`), `MainCamera` (`Camera2D` with `camera.enabled = true` and `camera.make_current()`), `ScenesModule`, `MechanicsModule`, and `UIHud` (`CanvasLayer`).\n"
+            f"3. ACCURATE HiDPI MOUSE PICKING & RESPONSIVE INPUT (main.gd & ui_hud.gd):\n"
+            f"   - NEVER use `(get_viewport().get_mouse_position() - get_viewport().size * 0.5)`! On Retina/HiDPI displays, `get_viewport().size` is 2x physical pixels while `get_mouse_position()` is 1280x720 canvas units.\n"
+            f"   - ALWAYS use `var world_pos = get_global_mouse_position()` to transform mouse screen coordinates into exact world coordinates.\n"
             f"4. REAL AUDIO PLAYBACK WITHOUT .IMPORT FILES + PROCEDURAL GAMEPLAY SFX (ui_hud.gd & main.gd):\n"
             f"   - CRITICAL: In Godot 4 runtime without `.import` files, `ResourceLoader.exists(audio_path)` and `load(audio_path)` ALWAYS return `false`/`null` for raw `.wav` files in `res://assets/audio/*.wav`!\n"
             f"   - You MUST implement `static func load_wav_stream(path: String) -> AudioStreamWAV` using `FileAccess.open(ProjectSettings.globalize_path(path), FileAccess.READ)` that reads `channels` at offset 22 (`get_16()`), `sample_rate` at offset 24 (`get_32()`), seeks to offset 44, reads the PCM buffer (`file.get_buffer(total_len - 44)`), and returns an `AudioStreamWAV` (`format = AudioStreamWAV.FORMAT_16_BITS`, `mix_rate = sample_rate`, `stereo = (channels == 2)`, `data = pcm_bytes`).\n"
-            f"   - Also implement `static func make_tone_sfx(freq_start: float, freq_end: float, duration: float, volume: float = 0.3) -> AudioStreamWAV` generating a 16-bit PCM sine/triangle sweep `AudioStreamWAV` buffer so every player action (tool select, `R` rotate, building placement, invalid placement buzz, turret shot, thermal warning siren) plays immediate audible SFX!\n"
-            f"5. FULL-VIEWPORT ISOMETRIC RENDERING, SPRITE SCALING & ON-MAP LABELS (scenes.gd):\n"
-            f"   - In `SubterraneanWorldView._draw()`, use a wide culling range (`-38` to `+38` around the camera's cartesian grid center) so the isometric grid fills the entire 1280x720 viewport with zero gray cutoff corners.\n"
-            f"   - Render loaded `Texture2D` sprites from `res://assets/sprites/*.png` using `draw_texture_rect(tex, Rect2(iso - Vector2(22, 28), Vector2(44, 44)), false)` so sprites are crisp, centered on each isometric tile, and properly scaled.\n"
-            f"   - Draw clear on-map visual cues: glowing cyan crystal highlights + `'TELLURIUM VEIN'` label (`draw_string(ThemeDB.fallback_font, ...)`) on ore veins, `'GEOCORE'` label on the central rig at `(32, 32)`, animated directional chevrons and smoothly moving resource dots along conveyors, mining laser beams from active drills to veins, and bright tracer lines when turrets fire.\n"
-            f"   - In `PlacementGuide._draw()` (`z_index = 10`), draw a pulsing cyan (valid) or red (invalid) isometric diamond, a directional arrow showing `build_direction` (`[R to Rotate]`), and the structure name.\n"
-            f"6. CLEAR MISSION ONBOARDING GUIDE, NON-BLOCKING TOOLTIP & BALANCED SIMULATION (ui_hud.gd & mechanics.gd):\n"
-            f"   - NEVER place `HoverTooltipPanel` in the center of the screen (`Vector2(500, 480)`); dock it cleanly in the bottom-right corner (`Vector2(920, 515)`) or offset from the mouse cursor.\n"
-            f"   - Add a clear **Mission Objectives & Controls Panel** on the right side (`Vector2(940, 210)`) explaining:\n"
-            f"     * OBJECTIVE: Store 200 Tellurium & survive Tar-Phage waves without Geocore Heat reaching 100°C.\n"
-            f"     * CHAIN: [1] Drill (adjacent to Cyan Vein) -> [2] Conveyor -> [7] Depot (Ore) or [3] Smelter -> Kinetic Slugs for [6] Turrets.\n"
-            f"     * CONTROLS: [1-7] Select Tool | LMB Place | [R] Rotate Direction | RMB Cancel/Demolish | WASD/Scroll Pan & Zoom.\n"
-            f"   - In `mechanics.gd`: decay `noise_accumulators` each tick (`noise_accumulators[k] *= 0.82`) so noise stabilizes based on active machinery instead of growing to 3000+ dB, cap `active_phages.size() <= 10`, and make phages damage structures or add heat when they reach the base.\n"
-            f"7. Return the complete, updated source code for every modified `.gd` file (`main.gd`, `scenes.gd`, `mechanics.gd`, `entities.gd`, `ui_hud.gd`) in `files`.\n"
+            f"   - Also implement `static func make_tone_sfx(freq_start: float, freq_end: float, duration: float, volume: float = 0.3) -> AudioStreamWAV` generating a 16-bit PCM sine/triangle sweep `AudioStreamWAV` buffer so player actions and world events play immediate audible SFX!\n"
+            f"5. FULL-VIEWPORT WORLD RENDERING, VISUAL MOCKUP FIDELITY & DIEGETIC ONBOARDING (scenes.gd & ui_hud.gd):\n"
+            f"   - Render loaded `Texture2D` sprites from `res://assets/sprites/*.png` using `Image.load_from_file(ProjectSettings.globalize_path(...))` + `ImageTexture.create_from_image(img)` and custom `_draw()` / `Sprite2D` nodes so the world matches the Living Game Bible's 16:9 Visual Mockup boards and Visual Style Guide.\n"
+            f"   - Honor the Living Game Bible's `first_60_seconds_hook`, `experience_storyboard`, and `diegetic_ui_philosophy`: guide and teach the player through in-world visual cues, environmental storytelling, character cutscenes/dialogue trees, and reactive barks—NEVER place a static wall-of-text HUD control manual on screen!\n"
+            f"   - Ensure tooltips or dialogue panels are docked cleanly without obstructing the center play area.\n"
+            f"6. Return the complete, updated source code for every modified `.gd` file (`main.gd`, `scenes.gd`, `mechanics.gd`, `entities.gd`, `ui_hud.gd`) in `files`.\n"
         )
 
+        contents_payload: Any = [prompt] + multimodal_mockup_parts if multimodal_mockup_parts else prompt
         results: Dict[str, Path] = {}
         resp = self.client.models.generate_content(
             model=self.model_name,
-            contents=prompt,
+            contents=contents_payload,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=TrackCodeSynthesisPayload,
@@ -1448,17 +1588,37 @@ class LeadGameplaySWEAgent:
             is_valid, diagnostics = verify_godot_cartridge_syntax(c_dir)
             if is_valid:
                 break
-            repaired_in_pass = set()
+
+            # Group all diagnostics by file so every error line in a module is repaired in a single pass
+            diags_by_file: Dict[Path, List[str]] = {}
             for diag in diagnostics:
-                if diag.file_path.is_file() and diag.file_path.name not in repaired_in_pass:
-                    if "Could not preload resource script" in diag.error_message and len(diagnostics) > 1:
-                        continue
-                    broken_src = diag.file_path.read_text(encoding="utf-8")
-                    diag_str = f"Line {diag.line_number}: {diag.error_message}\nRaw: {diag.raw_line}"
-                    fixed_src = self.repair_godot_module(diag.file_path.name, broken_src, diag_str)
-                    diag.file_path.write_text(fixed_src, encoding="utf-8")
-                    results[diag.file_path.name] = diag.file_path
-                    repaired_in_pass.add(diag.file_path.name)
+                if not diag.file_path.is_file():
+                    continue
+                if "Could not preload resource script" in diag.error_message and len(diagnostics) > 1:
+                    continue
+                entry = f"Line {diag.line_number}: {diag.error_message} (Raw: {diag.raw_line})"
+                file_list = diags_by_file.setdefault(diag.file_path, [])
+                if entry not in file_list:
+                    file_list.append(entry)
+
+            if not diags_by_file:
+                for diag in diagnostics:
+                    if diag.file_path.is_file():
+                        entry = f"Line {diag.line_number}: {diag.error_message} (Raw: {diag.raw_line})"
+                        diags_by_file.setdefault(diag.file_path, []).append(entry)
+
+            for file_path, diag_entries in diags_by_file.items():
+                broken_src = file_path.read_text(encoding="utf-8")
+                combined_diag = "\n".join(diag_entries)
+                peer_ctx = self._extract_gd_peer_signatures(c_dir, exclude_file=file_path.name)
+                fixed_src = self.repair_godot_module(
+                    file_path.name,
+                    broken_src,
+                    combined_diag,
+                    peer_context=peer_ctx,
+                )
+                file_path.write_text(fixed_src, encoding="utf-8")
+                results[file_path.name] = file_path
 
         manifest_path = c_dir / "telemetry_manifest.json"
         if manifest_path.is_file():

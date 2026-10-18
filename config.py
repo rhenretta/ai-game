@@ -1,4 +1,5 @@
 """Central configuration constants for the Autonomous Game Engine."""
+import os
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -6,8 +7,8 @@ from typing import Dict, List, Tuple
 # Project Paths
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent
-DATA_DIR = PROJECT_ROOT / "data"
-DB_PATH = DATA_DIR / "telemetry.db"
+DATA_DIR = Path(os.environ["STUDIO_DATA_DIR"]) if os.environ.get("STUDIO_DATA_DIR") else (PROJECT_ROOT / "data")
+DB_PATH = Path(os.environ["STUDIO_DB_PATH"]) if os.environ.get("STUDIO_DB_PATH") else (DATA_DIR / "telemetry.db")
 SPECS_DIR = DATA_DIR / "specs"
 ASSETS_DIR = PROJECT_ROOT / "engine" / "assets"
 

@@ -29,9 +29,15 @@ class GameConceptDirectorAgent:
     """
     deliberation: str = "Cognitive game concept director and requirements architect driven by live Gemini reasoning."
 
-    def __init__(self, client: Optional[Any] = None, model_name: str = "gemini-3.8-flash"):
+    def __init__(
+        self,
+        client: Optional[Any] = None,
+        model_name: str = "gemini-3.8-flash",
+        creative_temperature: float = 1.2,
+    ):
         self.client = client
         self.model_name = model_name
+        self.creative_temperature = float(creative_temperature)
 
     def generate_genesis_world(self, dna: SteamPlayerDNA) -> GenesisWorldSpec:
         """Derives an original GenesisWorldSpec from the user's SteamPlayerDNA."""
@@ -56,9 +62,9 @@ class GameConceptDirectorAgent:
                 f"- Thematic biases: {dna.thematic_biases}\n"
                 f"- Preferred palette mood: {dna.preferred_palette_mood}\n"
                 + (f"- Player's Most-Played & Installed Steam Titles:\n{top_games_lines}\n" if top_games_lines else "")
-                + f"Conceive an original, deeply engaging game world, setting, overarching lore, conflict narrative, "
+                + f"Conceive a wildly imaginative, original, and deeply engaging 2D game world, setting, overarching lore, conflict narrative, "
                 f"and core mechanics guidelines tailored specifically to what this player genuinely loves playing. "
-                f"The world can span any genre or paradigm (action, puzzle, strategy, simulation, automation) without hardcoded arena constraints. "
+                f"The world can span any genre or paradigm (action, puzzle, strategy, simulation, automation, adventure) without hardcoded arena constraints. "
                 f"You MUST provide reasoning/deliberation FIRST before any other field."
             )
             response = self.client.models.generate_content(
@@ -67,6 +73,7 @@ class GameConceptDirectorAgent:
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=GenesisWorldSpec,
+                    temperature=self.creative_temperature,
                 ),
             )
             if not response.text:
@@ -103,6 +110,7 @@ class GameConceptDirectorAgent:
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=UpdateWorldSpec,
+                    temperature=self.creative_temperature,
                 ),
             )
             if not response.text:
@@ -119,6 +127,8 @@ class GameConceptDirectorAgent:
         world_spec: Optional[GenesisWorldSpec] = None,
         hypothesis_report: Optional[Any] = None,
         target_episode: int = 0,
+        game_bible: Optional[Any] = None,
+        narrative_bible: Optional[Any] = None,
     ) -> GameRequirementsSpec:
         """Authors a comprehensive GameRequirementsSpec decomposing the game concept into
         discrete, ordered implementation tracks and verifiable acceptance criteria.
@@ -156,6 +166,30 @@ class GameConceptDirectorAgent:
                     f"- Gameplay Pacing: {world_spec.gameplay_pacing}",
                 ])
 
+            bible_context_lines = []
+            if game_bible is not None:
+                storyboard_str = "\n".join(
+                    f"  * Beat {b.beat_index} ({b.phase_title}): Emotion={b.player_emotional_state} | Staging={b.sensory_and_camera_staging} | Diegetic Teaching={b.diegetic_teaching_moment} | Story={b.narrative_integration}"
+                    for b in (getattr(game_bible, "experience_storyboard", []) or [])
+                )
+                mockup_notes = [
+                    f"{m.title}: {m.ui_callout_notes}"
+                    for m in (getattr(game_bible, "visual_mockups", []) or [])
+                ]
+                bible_context_lines.extend([
+                    f"- Working Title: {getattr(game_bible, 'game_title', '')}",
+                    f"- Elevator Pitch: {getattr(game_bible, 'elevator_pitch', '')}",
+                    f"- Core Player Fantasy: {getattr(game_bible, 'core_fantasy', '')}",
+                    f"- First 60 Seconds Hook: {getattr(game_bible, 'first_60_seconds_hook', '')}",
+                    f"- Intuitive UI & Onboarding Philosophy (clean readable HUD + responsive world cues): {getattr(game_bible, 'diegetic_ui_philosophy', '')}",
+                    f"- Gameplay Pillars: {getattr(game_bible, 'gameplay_pillars', [])}",
+                    f"- Visual Style Guide: {getattr(game_bible, 'visual_style_guide', '')}",
+                    f"- Audio Direction Guide: {getattr(game_bible, 'audio_direction_guide', '')}",
+                    f"- Visual Mockup Callouts: {mockup_notes}",
+                ])
+                if storyboard_str:
+                    bible_context_lines.append(f"- Experience Storyboard:\n{storyboard_str}")
+
             hypothesis_lines = []
             if hypothesis_report is not None:
                 dominant_style = getattr(hypothesis_report, "dominant_playstyle", "unknown")
@@ -168,24 +202,29 @@ class GameConceptDirectorAgent:
 
             dna_block = "\n".join(dna_context_lines) if dna_context_lines else "None provided."
             world_block = "\n".join(world_context_lines) if world_context_lines else "None provided."
+            bible_block = "\n".join(bible_context_lines) if bible_context_lines else "None provided."
             hyp_block = "\n".join(hypothesis_lines) if hypothesis_lines else "None provided."
 
             prompt = (
                 f"You are the Game Concept Director and Lead Systems Architect AI.\n"
-                f"Your task is to deliberate on the player's profile and author a comprehensive, rigorous Game Requirements & Feature Specification (`GameRequirementsSpec`).\n"
+                f"Your task is to deliberate on the player's profile and the Writers' Room Living Game Bible to author a comprehensive, rigorous Game Requirements & Feature Specification (`GameRequirementsSpec`).\n"
                 f"\n--- PLAYER STEAM DNA ---\n{dna_block}\n"
                 f"\n--- CONCEIVED WORLD BLUEPRINT ---\n{world_block}\n"
+                f"\n--- LIVING GAME BIBLE (WRITERS' ROOM CONSENSUS) ---\n{bible_block}\n"
                 f"\n--- EVOLUTION HYPOTHESES ---\n{hyp_block}\n"
                 f"\n--- ARCHITECTURAL & AGENTIC DIRECTIVES ---\n"
                 f"1. RATIONALE-FIRST MANDATE (Rule 4): You MUST provide 'deliberation' FIRST before any decision tokens, spec details, or requirement lists.\n"
                 f"2. PURE GENERALIZABILITY MANDATE (Rule 1): Zero hardcoded genre, mechanic, character count, or arena prescriptions. "
                 f"The game can be an abstract puzzle, simulation, automation, turn-based tactics, bullet heaven, or narrative adventure depending on player preferences. "
                 f"If the game concept is character-less, it requires 0 characters.\n"
-                f"3. REQUIREMENTS DECOMPOSITION: Decompose the game into ordered, discrete RequirementTrack items ('R1', 'R2', ...). "
-                f"Each track must define its responsible agent(s), target code/asset modules, and explicit, verifiable AcceptanceCriterion items.\n"
-                f"Target modules MUST be Godot 4 GDScript modules chosen from ['main.gd', 'mechanics.gd', 'entities.gd', 'scenes.gd', 'ui_hud.gd'], NEVER Python (.py) files.\n"
-                f"4. VERIFIABLE ACCEPTANCE CRITERIA: Each criterion must declare a concrete verification_method ('ast_inspection', 'runtime_telemetry', 'headless_playtest', 'multi_modal', or 'design_critic') and explicit expected behavior.\n"
-                f"5. DYNAMIC MULTIMODAL ASSET MANIFEST: Define exact sprite, tile, portrait, and audio assets required in asset_manifest as AssetRequirement items, avoiding hardcoded legacy arena asset names.\n"
+                f"3. EXPERIENCE-FIRST FIDELITY: Your RequirementTrack items MUST translate the Living Game Bible's First 60 Seconds Hook, Experience Storyboard Beats, Story/Cutscenes/Dialogue, and UI Philosophy into concrete, playable systems (combining clean, readable HUD indicators with responsive world cues).\n"
+                f"4. PLAYABLE-WORLD-FIRST DECOMPOSITION: Decompose the game into ordered, discrete RequirementTrack items ('R1', 'R2', ...). "
+                f"Track 'R1' MUST ALWAYS establish the visible, interactive exterior/world loop with spatial navigation, interactive targets/objectives, and clear visual feedback—never a passive background telemetry counter or empty stub.\n"
+                f"   Each track must define its responsible agent(s), target code/asset modules, and explicit, verifiable AcceptanceCriterion items.\n"
+                f"   Target modules MUST be Godot 4 GDScript modules chosen from ['main.gd', 'mechanics.gd', 'entities.gd', 'scenes.gd', 'ui_hud.gd'], NEVER Python (.py) files.\n"
+                f"5. ZERO BLIND VIEWPORTS OR INSTANT LOCKOUTS: Never specify opaque full-screen overlays (>40% startup occlusion) that blind the player at boot, and never specify unrecoverable failure/game-over lockouts within the first 30 seconds of play; hazards must be recoverable via player actions.\n"
+                f"6. VERIFIABLE ACCEPTANCE CRITERIA: Each criterion must declare a concrete verification_method ('ast_inspection', 'runtime_telemetry', 'headless_playtest', 'multi_modal', or 'design_critic') and explicit expected behavior.\n"
+                f"7. DYNAMIC MULTIMODAL ASSET MANIFEST: Define exact sprite, tile, portrait, and audio assets required in asset_manifest as AssetRequirement items, avoiding hardcoded legacy arena asset names.\n"
             )
 
             response = self.client.models.generate_content(
@@ -194,12 +233,15 @@ class GameConceptDirectorAgent:
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=GameRequirementsSpec,
+                    temperature=1.0,
                 ),
             )
             if not response.text:
                 raise StudioAgentError("Empty response returned from Gemini requirements authoring call")
             data = json.loads(response.text)
             spec = GameRequirementsSpec(**data)
+            if game_bible is not None and getattr(game_bible, "game_title", None) and game_bible.game_title != "Untitled Concept":
+                spec.game_title = game_bible.game_title
             # Post-validation to enforce GDScript 4 target_modules (Milestone 7 Godot 4 Transition)
             for req in spec.requirements:
                 sanitized_mods = []

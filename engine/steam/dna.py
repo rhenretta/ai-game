@@ -388,10 +388,28 @@ class SteamDNAProfiler:
         }
 
         # 9. Calculate Palette Mood Weights
-        neon_score = 0.40 * genre_weights["Shooter"] + 0.35 * genre_weights["Action"] + 0.25 * max(0.0, pacing_score)
-        grim_score = 0.40 * genre_weights["Roguelike"] + 0.35 * genre_weights["Strategy"] + 0.25 * max(0.0, -pacing_score)
-        retro_score = 0.50 * genre_weights["BulletHell"] + 0.50 * genre_weights["PrecisionPlatformer"]
-        vibrant_score = 0.55 * genre_weights["RPG"] + 0.45 * genre_weights["Adventure"]
+        dark_theme_weight = thematic_weights.get("dark fantasy", 0.0) + thematic_weights.get("post-apocalyptic", 0.0)
+        neon_score = (
+            0.40 * genre_weights["Shooter"]
+            + 0.35 * genre_weights["Action"]
+            + 0.25 * max(0.0, pacing_score)
+        )
+        grim_score = (
+            0.45 * genre_weights["Roguelike"]
+            + 0.35 * max(0.0, dark_theme_weight - 0.25)
+            + 0.15 * genre_weights["Strategy"]
+        )
+        retro_score = (
+            0.50 * genre_weights["BulletHell"]
+            + 0.50 * genre_weights["PrecisionPlatformer"]
+        )
+        vibrant_score = (
+            0.45 * genre_weights["RPG"]
+            + 0.40 * genre_weights["Adventure"]
+            + 0.45 * genre_weights["Simulation"]
+            + 0.35 * genre_weights["Puzzle"]
+            + 0.25 * genre_weights["Strategy"]
+        )
 
         mood_scores = {
             "neon_cyberpunk": max(0.01, neon_score),
@@ -635,11 +653,23 @@ class SteamDNAPersistence:
 
     def __init__(
         self,
-        db_path: Union[Path, str] = DB_PATH,
+        db_path: Optional[Union[Path, str]] = None,
         deliberation: str = "Persisting and retrieving SteamPlayerDNA records in SQLite WAL mode."
     ):
+        import os
+        import sys
+        import tempfile
+        import config as _cfg
         self.deliberation = deliberation
-        self.db_path = Path(db_path)
+        resolved = Path(db_path) if db_path is not None else Path(os.environ.get("STUDIO_DB_PATH", str(_cfg.DB_PATH)))
+        prod_db = (_cfg.PROJECT_ROOT / "data" / "telemetry.db").resolve()
+        if ("PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules) and resolved.resolve() == prod_db:
+            env_override = os.environ.get("STUDIO_DB_PATH")
+            if env_override and Path(env_override).resolve() != prod_db:
+                resolved = Path(env_override)
+            else:
+                resolved = Path(tempfile.gettempdir()) / f"pytest_steam_dna_{os.getpid()}.db"
+        self.db_path = resolved
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.ensure_schema()
 

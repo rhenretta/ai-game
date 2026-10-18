@@ -51,26 +51,31 @@
       display: flex;
       justify-content: space-between;
       align-items: center;
-      padding: 12px 20px;
-      background: var(--navy);
+      flex-wrap: wrap;
+      gap: 12px;
+      padding: 10px 18px;
+      background: linear-gradient(90deg, #0b1532 0%, #16244a 100%);
       border: 1px solid var(--border);
       border-radius: 6px;
-      margin-bottom: 16px;
+      margin-bottom: 10px;
     }
 
     h1 {
-      font-size: 18px;
-      letter-spacing: 0.5px;
+      font-size: 16px;
+      letter-spacing: 0.4px;
       color: var(--cyan);
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 8px;
+      white-space: nowrap;
+      flex-shrink: 0;
     }
 
     .header-controls {
       display: flex;
-      gap: 12px;
+      gap: 10px;
       align-items: center;
+      flex-wrap: wrap;
     }
 
     .badge-status {
@@ -1263,16 +1268,328 @@
       display: inline-flex;
       align-items: center;
       gap: 6px;
-      background: rgba(0, 228, 54, 0.15);
-      border: 1px solid var(--green);
+      background: rgba(0, 228, 54, 0.12);
+      border: 1px solid rgba(0, 228, 54, 0.6);
       padding: 4px 10px;
       border-radius: 4px;
       font-size: 11px;
       cursor: pointer;
       transition: all 0.2s;
+      max-width: 240px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     .header-checkpoint-badge:hover {
       background: rgba(0, 228, 54, 0.25);
+    }
+    #header-checkpoint-track {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 110px;
+      display: inline-block;
+      vertical-align: bottom;
+    }
+    .btn-genesis-cta {
+      background: linear-gradient(135deg, #00E436 0%, #29ADFF 100%);
+      color: #02050e !important;
+      border: 1px solid var(--white);
+      font-weight: 800;
+      font-size: 12px;
+      padding: 7px 14px;
+      border-radius: 5px;
+      cursor: pointer;
+      letter-spacing: 0.4px;
+      box-shadow: 0 0 14px rgba(0, 228, 54, 0.35);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: transform 0.15s ease, box-shadow 0.2s ease;
+    }
+    .btn-genesis-cta:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 0 20px rgba(41, 173, 255, 0.6);
+    }
+
+    /* =========================================================================
+       Writers' Room & Living Game Bible Workspace Styles
+       ========================================================================= */
+    .workspace-nav-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 14px;
+      background: #070e22;
+      border: 1px solid var(--navy);
+      border-radius: 6px;
+      padding: 8px 14px;
+    }
+    .workspace-tabs-group {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .workspace-tab-btn {
+      background: #0d1630;
+      border: 1px solid var(--navy);
+      color: var(--light-gray);
+      padding: 7px 14px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: bold;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      transition: all 0.2s ease;
+    }
+    .workspace-tab-btn:hover {
+      border-color: var(--cyan);
+      color: var(--white);
+    }
+    .workspace-tab-btn.active {
+      background: rgba(41, 173, 255, 0.16);
+      border-color: var(--cyan);
+      color: var(--cyan);
+      box-shadow: 0 0 10px rgba(41, 173, 255, 0.25);
+    }
+    .bible-greenlight-bar {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      background: #0b1532;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin-bottom: 16px;
+    }
+    .bible-steering-controls {
+      display: flex;
+      flex: 1;
+      min-width: 340px;
+      gap: 8px;
+      align-items: center;
+    }
+    .writers-room-grid {
+      display: grid;
+      grid-template-columns: minmax(440px, 540px) 1fr;
+      gap: 16px;
+    }
+    @media (max-width: 1280px) {
+      .writers-room-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+    .specialist-roster-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--navy);
+    }
+    .specialist-pill {
+      font-size: 10px;
+      padding: 3px 8px;
+      border-radius: 12px;
+      background: #060b19;
+      border: 1px solid var(--navy);
+      color: var(--light-gray);
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .specialist-pill.speaking {
+      border-color: var(--yellow);
+      color: var(--yellow);
+      background: rgba(255, 236, 39, 0.12);
+    }
+    .writers-room-transcript {
+      background: #02050e;
+      border: 1px solid var(--navy);
+      border-radius: 6px;
+      padding: 12px;
+      height: 680px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .utterance-card {
+      background: #091229;
+      border: 1px solid rgba(41, 173, 255, 0.25);
+      border-left: 3px solid var(--cyan);
+      border-radius: 6px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .utterance-card.role-CreativeDirector { border-left-color: var(--pink); }
+    .utterance-card.role-GameplayDesigner { border-left-color: var(--green); }
+    .utterance-card.role-StoryWorldArchitect { border-left-color: var(--purple); }
+    .utterance-card.role-CharacterDesigner { border-left-color: var(--amber); }
+    .utterance-card.role-UXExperienceDesigner { border-left-color: var(--cyan); }
+    .utterance-card.role-VisualArtDirector { border-left-color: var(--yellow); }
+    .utterance-card.role-AudioAtmosphereDesigner { border-left-color: var(--peach); }
+    .utterance-card.role-ExecutiveProducer { border-left-color: var(--neon-red); background: rgba(255, 0, 77, 0.08); }
+    .utterance-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 11px;
+    }
+    .utterance-speaker {
+      font-weight: bold;
+      color: var(--cyan);
+    }
+    .utterance-message {
+      color: var(--white);
+      font-size: 12.5px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+    }
+    .utterance-delib-details {
+      font-size: 10.5px;
+      color: var(--light-gray);
+      background: rgba(0, 0, 0, 0.35);
+      border-radius: 4px;
+      padding: 4px 8px;
+    }
+    .utterance-delib-details summary {
+      cursor: pointer;
+      color: var(--amber);
+      font-weight: 600;
+      user-select: none;
+    }
+    .bible-subtabs {
+      display: flex;
+      gap: 6px;
+      border-bottom: 1px solid var(--navy);
+      padding-bottom: 8px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .bible-subtab-btn {
+      background: #060b19;
+      border: 1px solid var(--navy);
+      color: var(--light-gray);
+      padding: 6px 12px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: bold;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .bible-subtab-btn.active {
+      background: rgba(41, 173, 255, 0.18);
+      border-color: var(--cyan);
+      color: var(--cyan);
+    }
+    .bible-subview {
+      display: none;
+      flex-direction: column;
+      gap: 14px;
+      max-height: 650px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+    .bible-subview.active {
+      display: flex;
+    }
+    .evolution-timeline {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      border-left: 2px solid var(--cyan);
+      padding-left: 14px;
+      margin-left: 6px;
+    }
+    .evolution-card {
+      background: #070e22;
+      border: 1px solid rgba(41, 173, 255, 0.3);
+      border-radius: 6px;
+      padding: 10px 12px;
+      position: relative;
+    }
+    .storyboard-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 10px;
+    }
+    .storyboard-beat-card {
+      background: #070e22;
+      border: 1px solid var(--navy);
+      border-top: 3px solid var(--amber);
+      border-radius: 6px;
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 11px;
+    }
+    .mockups-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+      gap: 12px;
+    }
+    .mockup-card {
+      background: #060b19;
+      border: 1px solid rgba(41, 173, 255, 0.35);
+      border-radius: 6px;
+      overflow: hidden;
+      cursor: pointer;
+      transition: transform 0.15s ease, border-color 0.2s ease;
+    }
+    .mockup-card:hover {
+      transform: translateY(-2px);
+      border-color: var(--yellow);
+    }
+    .mockup-card img {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      object-fit: cover;
+      background: #02050e;
+      display: block;
+    }
+    .characters-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 12px;
+    }
+    .character-sheet-card {
+      background: #070e22;
+      border: 1px solid rgba(41, 173, 255, 0.3);
+      border-radius: 6px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    dialog#bible-mockup-lightbox,
+    dialog#new-game-modal {
+      margin: auto;
+      max-width: 90vw;
+      max-height: 90vh;
+      background: #050b1a;
+      border: 2px solid var(--cyan);
+      border-radius: 8px;
+      color: var(--white);
+      padding: 18px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.9);
+    }
+    dialog#new-game-modal {
+      width: min(560px, 92vw);
+    }
+    dialog#bible-mockup-lightbox::backdrop,
+    dialog#new-game-modal::backdrop {
+      background: rgba(0, 0, 0, 0.82);
+      backdrop-filter: blur(4px);
     }
   </style>
 </head>
@@ -1281,17 +1598,22 @@
     <h1>Autonomous Game Studio — Mission Control</h1>
     <div class="header-controls">
       <div id="last-checkpoint-badge" class="header-checkpoint-badge" style="display: none;" title="Click to view verified checkpoints in drawer">
-        <span style="color: var(--green); font-weight: bold;">🎮 Checkpoint:</span>
+        <span style="color: var(--green); font-weight: bold;">🎮</span>
         <span id="header-checkpoint-id" style="color: var(--white); font-weight: bold;">None</span>
         <span id="header-checkpoint-track" style="color: var(--light-gray); font-size: 10px;"></span>
       </div>
       <button id="btn-toggle-task-history" class="btn-primary" style="background: rgba(41, 173, 255, 0.15); border: 1px solid var(--cyan); color: var(--cyan); display: flex; align-items: center; gap: 8px;">
         <span class="activity-beacon"></span>
-        <span>Tasks & Handoffs</span>
+        <span>Tasks &amp; Handoffs</span>
         <span id="header-task-count" style="background: var(--navy); padding: 1px 6px; border-radius: 10px; font-size: 10px;">0</span>
       </button>
       <span id="studio-status-badge" class="badge-status">ONLINE</span>
-      <button id="btn-trigger-genesis" class="btn-primary">Genesis Build</button>
+      <button id="btn-resume-genesis" class="btn-primary" style="background: rgba(255, 163, 0, 0.18); border: 1px solid var(--amber); color: var(--yellow); display: inline-flex; align-items: center; gap: 6px;" title="Resume development on the current game from its persisted Game Bible and requirement tracks">
+        <span>▶️ Resume Game Build</span>
+      </button>
+      <button id="btn-trigger-genesis" class="btn-primary btn-genesis-cta" title="Start a brand-new game from scratch in the Creative Writers' Room">
+        <span>🚀 New Game from Scratch</span>
+      </button>
     </div>
   </header>
 
@@ -1299,7 +1621,196 @@
     Mission Control Disconnected from Studio Daemon. Reconnecting in background with exponential backoff...
   </div>
 
-  <div class="grid-container">
+  <!-- Workspace Navigation Bar -->
+  <nav class="workspace-nav-bar" aria-label="Mission Control Workspaces">
+    <div class="workspace-tabs-group">
+      <button id="ws-tab-telemetry" class="workspace-tab-btn active" type="button">
+        <span>📡 Swarm Telemetry &amp; Playable Preview</span>
+      </button>
+      <button id="ws-tab-bible" class="workspace-tab-btn" type="button">
+        <span>📖 Creative Writers' Room &amp; Living Game Bible</span>
+        <span id="header-bible-turn-count" style="background: var(--navy); padding: 1px 7px; border-radius: 10px; font-size: 10px; color: var(--cyan);">0</span>
+        <span id="ws-bible-badge" class="status-pill status-success" style="font-size: 9px;">LIVE</span>
+      </button>
+    </div>
+    <div style="display: flex; align-items: center; gap: 14px; font-size: 11px; color: var(--light-gray);">
+      <label style="display: inline-flex; align-items: center; gap: 6px; cursor: pointer;" title="When enabled, the studio pauses after the Writers' Room finishes the Game Bible so you can inspect or steer before coding starts.">
+        <input type="checkbox" id="toggle-pause-greenlight" />
+        <span>Pause for Executive Greenlight Before Coding</span>
+      </label>
+    </div>
+  </nav>
+
+  <!-- Native HTML <dialog closedby="any"> Modal for Commissioning a New Game from Scratch -->
+  <dialog id="new-game-modal" closedby="any" aria-label="Start New Game from Scratch">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; border-bottom: 1px solid var(--navy); padding-bottom: 8px;">
+      <div>
+        <strong style="color: var(--green); font-size: 15px;">🚀 Commission New Game from Scratch</strong>
+        <div style="font-size: 11px; color: var(--light-gray); margin-top: 2px;">Clears active session state and convenes the 7-specialist Creative Writers' Room.</div>
+      </div>
+      <button id="btn-close-new-game-modal" type="button" class="drawer-close-btn" title="Close (Esc)">✕</button>
+    </div>
+    <form id="form-new-game-scratch" style="display: flex; flex-direction: column; gap: 12px;">
+      <div>
+        <label for="input-new-game-prompt" style="display: block; font-size: 11.5px; font-weight: bold; color: var(--cyan); margin-bottom: 6px;">
+          Creative Direction / Seed Concept <span style="color: var(--light-gray); font-weight: normal;">(Optional — leave blank for autonomous Steam Player DNA synthesis)</span>
+        </label>
+        <textarea id="input-new-game-prompt" rows="3" class="stream-input" style="width: 100%; resize: vertical; font-family: inherit; line-height: 1.4;" placeholder="Describe a mood, setting, experience, or mechanic idea — or leave blank to let the Writers' Room invent a concept from your Steam DNA..."></textarea>
+      </div>
+      <label style="display: flex; align-items: flex-start; gap: 8px; background: #09132c; border: 1px solid var(--navy); padding: 10px; border-radius: 6px; cursor: pointer; font-size: 11.5px;">
+        <input type="checkbox" id="modal-pause-greenlight" style="margin-top: 2px;" />
+        <div>
+          <strong style="color: var(--amber);">Pause for Executive Greenlight Before Coding</strong>
+          <div style="color: var(--light-gray); font-size: 10.5px; margin-top: 2px;">Wait for your approval (or steering notes) on the Living Game Bible, 16:9 mockups, and storyboards before engineering agents write GDScript.</div>
+        </div>
+      </label>
+      <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 4px;">
+        <button id="btn-cancel-new-game" type="button" class="btn-primary" style="background: #0d1630; border-color: var(--slate); color: var(--light-gray);">Cancel</button>
+        <button id="btn-confirm-new-game" type="submit" class="btn-primary btn-genesis-cta">
+          <span>🚀 Launch Writers' Room &amp; Build</span>
+        </button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- WORKSPACE 2: Creative Writers' Room & Living Game Bible -->
+  <section id="workspace-game-bible" style="display: none; margin-bottom: 16px;" aria-label="Writers Room and Living Game Bible">
+    <div id="bible-greenlight-bar" class="bible-greenlight-bar">
+      <div style="display: flex; flex-direction: column; gap: 4px;">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <span id="bible-header-title" style="font-size: 16px; font-weight: bold; color: var(--cyan);">Living Game Bible</span>
+          <span id="bible-header-genre" class="genre-chip">Awaiting Concept</span>
+          <span id="bible-header-status" class="status-pill status-success">IDLE</span>
+        </div>
+        <div id="bible-header-vision" style="font-size: 11.5px; color: var(--light-gray); max-width: 780px;">
+          Multi-agent creative writers' room where Design, Gameplay, Story, Character, UX, Visual Art, and Audio specialists brainstorm the player experience before writing code.
+        </div>
+      </div>
+      <div class="bible-steering-controls">
+        <input id="input-steering-feedback" class="stream-input" type="text" placeholder="Inject Executive Producer creative direction or critique into the Writers' Room..." />
+        <button id="btn-inject-steering" type="button" class="btn-primary" style="background: rgba(41, 173, 255, 0.2); border-color: var(--cyan); color: var(--cyan); padding: 6px 12px;">
+          💬 Steer Room
+        </button>
+        <button id="btn-approve-greenlight" type="button" class="btn-primary" style="background: rgba(0, 228, 54, 0.22); border-color: var(--green); color: var(--green); padding: 6px 14px;">
+          ✅ Greenlight &amp; Build
+        </button>
+      </div>
+    </div>
+
+    <div id="bible-production-progress-banner" style="display: none; margin-bottom: 14px; background: linear-gradient(90deg, rgba(0, 228, 54, 0.1), rgba(41, 173, 255, 0.1)); border: 1px solid var(--green); border-radius: 6px; padding: 12px 16px;"></div>
+
+    <div class="writers-room-grid">
+      <!-- Left Column: Live Multi-Agent Writers' Room Transcript -->
+      <div class="panel">
+        <div class="panel-title">
+          <span>🎙️ Live Writers' Room Conversation</span>
+          <span id="writers-room-turn-counter" style="font-size: 11px; color: var(--amber);">0 Utterances</span>
+        </div>
+        <div id="specialist-roster-bar" class="specialist-roster-bar">
+          <span class="specialist-pill" data-role="CreativeDirector">🎬 CreativeDirector</span>
+          <span class="specialist-pill" data-role="GameplayDesigner">🎮 GameplayDesigner</span>
+          <span class="specialist-pill" data-role="StoryWorldArchitect">🌍 StoryWorldArchitect</span>
+          <span class="specialist-pill" data-role="CharacterDesigner">🎭 CharacterDesigner</span>
+          <span class="specialist-pill" data-role="UXExperienceDesigner">✨ UXExperienceDesigner</span>
+          <span class="specialist-pill" data-role="VisualArtDirector">🎨 VisualArtDirector</span>
+          <span class="specialist-pill" data-role="AudioAtmosphereDesigner">🔊 AudioAtmosphereDesigner</span>
+        </div>
+        <div id="writers-room-transcript-list" class="writers-room-transcript">
+          <div class="blueprint-empty">No Writers' Room utterances recorded yet. Trigger a Genesis Build to watch the specialists brainstorm live.</div>
+        </div>
+      </div>
+
+      <!-- Right Column: Living Game Bible Artifact Tabs -->
+      <div class="panel">
+        <div class="panel-title">
+          <span>📘 Living Game Bible Artifacts</span>
+          <span id="bible-updated-timestamp" style="font-size: 10px; color: var(--light-gray);">Live Sync</span>
+        </div>
+        <div class="bible-subtabs">
+          <button type="button" class="bible-subtab-btn active" data-bible-tab="evolution">
+            🌱 Evolution &amp; Experience Storyboard (<span id="bible-count-evolution">0</span>)
+          </button>
+          <button type="button" class="bible-subtab-btn" data-bible-tab="mockups">
+            🖼️ 16:9 Visual Mockups &amp; Art (<span id="bible-count-mockups">0</span>)
+          </button>
+          <button type="button" class="bible-subtab-btn" data-bible-tab="characters">
+            🎭 Characters, Cutscenes &amp; Voices (<span id="bible-count-characters">0</span>)
+          </button>
+          <button type="button" class="bible-subtab-btn" data-bible-tab="pillars">
+            ⚙️ Gameplay Pillars &amp; World Spec
+          </button>
+          <button type="button" class="bible-subtab-btn" data-bible-tab="signoff">
+            🛡️ Specialist Sign-Off Council (<span id="bible-count-signoff">0/6</span>)
+          </button>
+        </div>
+
+        <!-- Subtab 1: Concept Evolution & Experience Storyboard -->
+        <div id="bible-subview-evolution" class="bible-subview active">
+          <div id="bible-experience-hooks-card" class="blueprint-box" style="margin-top: 0;">
+            <div class="blueprint-field"><span class="blueprint-field-label">First 60 Seconds Hook:</span><span id="bible-first-60s">Awaiting UXExperienceDesigner...</span></div>
+            <div class="blueprint-field"><span class="blueprint-field-label">Diegetic UI Philosophy (Zero HUD Manuals):</span><span id="bible-diegetic-ui">Awaiting UXExperienceDesigner...</span></div>
+          </div>
+          <div>
+            <h4 style="color: var(--cyan); font-size: 12px; text-transform: uppercase; margin-bottom: 8px;">Concept Evolution Timeline (How the Idea Evolved)</h4>
+            <div id="concept-evolution-timeline" class="evolution-timeline">
+              <div class="blueprint-empty">No concept evolution pivots logged yet.</div>
+            </div>
+          </div>
+          <div>
+            <h4 style="color: var(--amber); font-size: 12px; text-transform: uppercase; margin-bottom: 8px;">Experience &amp; Pacing Storyboard</h4>
+            <div id="experience-storyboard-grid" class="storyboard-grid">
+              <div class="blueprint-empty">No storyboard beats authored yet.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Subtab 2: 16:9 Visual Mockups & Style Guide -->
+        <div id="bible-subview-mockups" class="bible-subview">
+          <div id="bible-mockups-gallery" class="mockups-grid">
+            <div class="blueprint-empty">No 16:9 visual mockups generated yet. VisualArtDirector and UXExperienceDesigner synthesize mockups during brainstorming.</div>
+          </div>
+          <div id="bible-style-audio-guides" class="blueprint-box"></div>
+        </div>
+
+        <!-- Subtab 3: Characters, Cutscenes & Voice Auditions -->
+        <div id="bible-subview-characters" class="bible-subview">
+          <div id="bible-characters-gallery" class="characters-grid">
+            <div class="blueprint-empty">No character sheets generated yet.</div>
+          </div>
+          <div id="bible-cutscenes-container"></div>
+        </div>
+
+        <!-- Subtab 4: Gameplay Pillars & World Spec -->
+        <div id="bible-subview-pillars" class="bible-subview">
+          <div id="bible-pillars-container" class="blueprint-box" style="margin-top: 0;">
+            <div class="blueprint-empty">No gameplay pillars locked yet.</div>
+          </div>
+        </div>
+
+        <!-- Subtab 5: Multi-Agent Final Sign-Off Council -->
+        <div id="bible-subview-signoff" class="bible-subview">
+          <div id="bible-signoff-container">
+            <div class="blueprint-empty">No Multi-Agent Specialist Sign-Off Council report recorded yet. Each specialist who authored the Living Game Bible inspects the rendered candidate build, audio mix rates, and scene tree audit before promotion.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Native HTML <dialog closedby="any"> Lightbox for 16:9 Concept & UI Mockups -->
+  <dialog id="bible-mockup-lightbox" closedby="any" aria-label="Concept Art Mockup Lightbox">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; gap: 16px;">
+      <div>
+        <strong id="lightbox-mockup-title" style="color: var(--cyan); font-size: 14px;">Mockup Preview</strong>
+        <span id="lightbox-mockup-scene" class="genre-chip" style="margin-left: 8px;">gameplay_scene</span>
+      </div>
+      <button id="btn-close-mockup-lightbox" type="button" class="drawer-close-btn" title="Close (Esc)">✕</button>
+    </div>
+    <img id="lightbox-mockup-img" src="" alt="16:9 Concept Mockup" style="max-width: 84vw; max-height: 70vh; border-radius: 4px; border: 1px solid var(--navy); display: block;" />
+    <div id="lightbox-mockup-notes" style="margin-top: 10px; font-size: 12px; color: var(--light-gray); max-width: 84vw;"></div>
+  </dialog>
+
+  <div id="workspace-telemetry" class="grid-container">
     <!-- Left Column: Agent Swarm DAG and Telemetry Heatmap -->
     <div style="display: flex; flex-direction: column; gap: 16px;">
       <div class="panel">
@@ -1723,6 +2234,51 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         .replace(/'/g, '&#039;');
     }
 
+    const _lastRenderedHtmlByEl = new WeakMap();
+    function setHtmlIfChanged(el, newHtml) {
+      if (!el) return false;
+      const normalized = String(newHtml ?? '');
+      if (_lastRenderedHtmlByEl.get(el) === normalized) {
+        return false;
+      }
+      // Capture scroll positions of the element, its scrollable ancestor, and inner <pre> blocks
+      const prevElScrollTop = el.scrollTop;
+      const prevElScrollLeft = el.scrollLeft;
+      const scrollParent = el.closest ? el.closest('.bible-subview, #handoff-viewer') : null;
+      const prevParentScrollTop = scrollParent ? scrollParent.scrollTop : 0;
+      const innerPres = el.querySelectorAll ? Array.from(el.querySelectorAll('pre, .json-dump')) : [];
+      const prevPreScrolls = innerPres.map(p => ({ top: p.scrollTop, left: p.scrollLeft }));
+      const openDetailsIdx = el.querySelectorAll
+        ? Array.from(el.querySelectorAll('details')).map(d => d.open)
+        : [];
+
+      el.innerHTML = normalized;
+      _lastRenderedHtmlByEl.set(el, normalized);
+
+      // Restore <details> open states and scroll positions
+      if (el.querySelectorAll && openDetailsIdx.length > 0) {
+        const nextDetails = Array.from(el.querySelectorAll('details'));
+        nextDetails.forEach((d, idx) => {
+          if (openDetailsIdx[idx]) d.open = true;
+        });
+      }
+      if (el.querySelectorAll && prevPreScrolls.length > 0) {
+        const nextPres = Array.from(el.querySelectorAll('pre, .json-dump'));
+        nextPres.forEach((p, idx) => {
+          if (prevPreScrolls[idx]) {
+            p.scrollTop = prevPreScrolls[idx].top;
+            p.scrollLeft = prevPreScrolls[idx].left;
+          }
+        });
+      }
+      el.scrollTop = prevElScrollTop;
+      el.scrollLeft = prevElScrollLeft;
+      if (scrollParent) {
+        scrollParent.scrollTop = prevParentScrollTop;
+      }
+      return true;
+    }
+
     function renderStreamEntry(entry) {
       const div = document.createElement('div');
       div.className = `stream-entry event-${(entry.event_type || 'stream').toLowerCase()}`;
@@ -1894,6 +2450,172 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     }
 
     let historyHydrated = false;
+    const activeAgentStates = {};
+    let _lastBuildStoppedByErrorOrPromote = false;
+    let _resumeOptimisticUntil = 0;
+
+    const AGENT_SHORT_LABELS = {
+      SteamAndTelemetryAnalystAgent: 'Steam Analyst',
+      CreativeDirectorWorldbuilderAgent: 'Creative Director',
+      NarrativeCharacterWriterAgent: 'Narrative Writer',
+      VoiceActingAudioProducerAgent: 'Voice & Audio',
+      VisualArtSpriteDesignerAgent: 'Visual Art',
+      LeadGameplaySWEAgent: 'Gameplay SWE',
+      TelemetryArchitectAgent: 'Telemetry Architect',
+      QAPlaytesterBuildSupervisor: 'QA Supervisor',
+      StudioOrchestrator: 'Orchestrator'
+    };
+
+    function observeEventForBuildActivity(ev) {
+      if (!ev) return;
+      const evType = (ev.event_type || '').toUpperCase();
+      const agent = ev.agent_name || (ev.payload && ev.payload.agent_name) || '';
+      if (
+        evType === 'GENESIS_TRIGGERED' ||
+        evType === 'GENESIS_STARTING' ||
+        evType === 'REQUIREMENTS_SPEC_GENERATED' ||
+        evType === 'WRITERS_ROOM_UTTERANCE'
+      ) {
+        _lastBuildStoppedByErrorOrPromote = false;
+      } else if (evType === 'REQUIREMENT_STATUS_UPDATE') {
+        const st = ((ev.payload && ev.payload.status) || '').toLowerCase();
+        if (st === 'in_progress' || st === 'completed') {
+          _lastBuildStoppedByErrorOrPromote = false;
+        }
+      } else if (evType === 'STATE_CHANGE' || (ev.payload && ev.payload.lifecycle_state)) {
+        const newSt = ((ev.payload && (ev.payload.lifecycle_state || ev.payload.state)) || '').toUpperCase();
+        if (['ANALYZING', 'SYNTHESIZING', 'VERIFYING', 'BRAINSTORMING'].includes(newSt)) {
+          _lastBuildStoppedByErrorOrPromote = false;
+        } else if (newSt === 'PROMOTED' || newSt === 'AWAITING_GREENLIGHT') {
+          _lastBuildStoppedByErrorOrPromote = true;
+          _resumeOptimisticUntil = 0;
+        }
+      } else if (evType === 'CARTRIDGE_PROMOTED') {
+        _lastBuildStoppedByErrorOrPromote = true;
+        _resumeOptimisticUntil = 0;
+      } else if (evType === 'ERROR') {
+        if (['StudioDaemon', 'BuildSupervisor', 'StudioOrchestrator', 'LeadGameplaySWEAgent', 'MissionControlGateway'].includes(agent)) {
+          _lastBuildStoppedByErrorOrPromote = true;
+          _resumeOptimisticUntil = 0;
+        }
+      }
+    }
+
+    function isBuildActivelyRunning() {
+      if (Date.now() < _resumeOptimisticUntil) return true;
+      const bible = (typeof cachedGameBible === 'object' && cachedGameBible) ? cachedGameBible : {};
+      const bibleSt = (bible.status || '').toLowerCase();
+      const orchSt = (bible.orchestrator_state || '').toUpperCase();
+      if (bibleSt === 'awaiting_greenlight' || orchSt === 'AWAITING_GREENLIGHT') {
+        return false;
+      }
+      if (_lastBuildStoppedByErrorOrPromote) {
+        return false;
+      }
+      if (bibleSt === 'brainstorming' || orchSt === 'BRAINSTORMING') {
+        return true;
+      }
+      const reqResp = (typeof observabilityState === 'object' && observabilityState && observabilityState.cachedRequirementsSpec) || {};
+      const specData = (reqResp.has_active_spec || reqResp.has_spec) && reqResp.requirements_spec
+        ? reqResp.requirements_spec
+        : (reqResp.requirements ? reqResp : null);
+      const tracks = (specData && Array.isArray(specData.requirements)) ? specData.requirements : [];
+      if (tracks.some(t => (t.status || '').toLowerCase() === 'in_progress')) {
+        return true;
+      }
+      const activeStates = ['ANALYZING', 'SYNTHESIZING', 'VERIFYING', 'BRAINSTORMING'];
+      for (const [ag, st] of Object.entries(activeAgentStates)) {
+        if (ag !== 'StudioOrchestrator' && activeStates.includes((st || '').toUpperCase())) {
+          return true;
+        }
+      }
+      if (
+        activeStates.includes((activeAgentStates['StudioOrchestrator'] || '').toUpperCase()) &&
+        (tracks.length === 0 || tracks.some(t => !['completed', 'satisfied'].includes((t.status || '').toLowerCase())))
+      ) {
+        return true;
+      }
+      return false;
+    }
+
+    function updateHeaderBuildStatus() {
+      const btn = document.getElementById('btn-resume-genesis');
+      if (!btn) return;
+
+      const reqResp = (typeof observabilityState === 'object' && observabilityState && observabilityState.cachedRequirementsSpec) || {};
+      const specData = (reqResp.has_active_spec || reqResp.has_spec) && reqResp.requirements_spec
+        ? reqResp.requirements_spec
+        : (reqResp.requirements ? reqResp : null);
+      const tracks = (specData && Array.isArray(specData.requirements)) ? specData.requirements : [];
+      const totalTracks = tracks.length;
+      const completedCount = tracks.filter(t => ['completed', 'satisfied'].includes((t.status || '').toLowerCase())).length;
+      const inProgTrack = tracks.find(t => (t.status || '').toLowerCase() === 'in_progress');
+      const running = isBuildActivelyRunning();
+
+      if (running) {
+        let label = '';
+        if (inProgTrack) {
+          const rawTitle = inProgTrack.title || '';
+          const shortTitle = rawTitle.length > 26 ? rawTitle.slice(0, 24) + '…' : rawTitle;
+          label = `⚙️ Building ${inProgTrack.id} (${completedCount}/${totalTracks}): ${shortTitle}`;
+        } else {
+          const activeStates = ['ANALYZING', 'SYNTHESIZING', 'VERIFYING', 'BRAINSTORMING'];
+          let activeAgentEntry = Object.entries(activeAgentStates).find(
+            ([ag, st]) => ag !== 'StudioOrchestrator' && activeStates.includes((st || '').toUpperCase())
+          );
+          if (!activeAgentEntry && activeStates.includes((activeAgentStates['StudioOrchestrator'] || '').toUpperCase())) {
+            activeAgentEntry = ['StudioOrchestrator', activeAgentStates['StudioOrchestrator']];
+          }
+          const bibleSt = ((typeof cachedGameBible === 'object' && cachedGameBible && cachedGameBible.status) || '').toLowerCase();
+          if (bibleSt === 'brainstorming') {
+            label = "⚙️ Writers' Room Brainstorming...";
+          } else if (activeAgentEntry) {
+            const [agName, agState] = activeAgentEntry;
+            const shortAg = AGENT_SHORT_LABELS[agName] || agName;
+            const stFormatted = agState.charAt(0).toUpperCase() + agState.slice(1).toLowerCase();
+            label = totalTracks > 0
+              ? `⚙️ ${shortAg}: ${stFormatted} (${completedCount}/${totalTracks})`
+              : `⚙️ ${shortAg}: ${stFormatted}...`;
+          } else {
+            label = totalTracks > 0
+              ? `⚙️ Building Game (${completedCount}/${totalTracks} Tracks)...`
+              : '⚙️ Resuming Game Build...';
+          }
+        }
+        btn.dataset.buildMode = 'running';
+        btn.style.background = 'rgba(41, 173, 255, 0.18)';
+        btn.style.borderColor = 'var(--cyan)';
+        btn.style.color = 'var(--cyan)';
+        btn.title = 'Build is actively running. Click to inspect live Requirement Tracks & Checkpoints.';
+        setHtmlIfChanged(
+          btn,
+          `<span class="activity-beacon" style="background: var(--cyan); box-shadow: 0 0 8px var(--cyan);"></span><span>${escapeHtml(label)}</span>`
+        );
+        return;
+      }
+
+      if (totalTracks > 0 && completedCount === totalTracks) {
+        btn.dataset.buildMode = 'completed';
+        btn.style.background = 'rgba(0, 228, 54, 0.16)';
+        btn.style.borderColor = 'var(--green)';
+        btn.style.color = 'var(--green)';
+        btn.title = 'All requirement tracks completed and verified! Click to view Requirement Tracks & Checkpoints.';
+        setHtmlIfChanged(btn, `<span>✅ Build Complete (${completedCount}/${totalTracks} Tracks)</span>`);
+        return;
+      }
+
+      btn.dataset.buildMode = 'resumable';
+      btn.style.background = 'rgba(255, 163, 0, 0.18)';
+      btn.style.borderColor = 'var(--amber)';
+      btn.style.color = 'var(--yellow)';
+      const nextTrack = tracks.find(t => !['completed', 'satisfied'].includes((t.status || '').toLowerCase()));
+      const resumeLabel = nextTrack
+        ? `▶️ Resume Build at ${nextTrack.id} (${completedCount}/${totalTracks})`
+        : '▶️ Resume Game Build';
+      btn.title = 'Resume development on the current game from its persisted Game Bible and requirement tracks';
+      setHtmlIfChanged(btn, `<span>${escapeHtml(resumeLabel)}</span>`);
+    }
+
     async function loadEventHistory() {
       try {
         const res = await fetch('/api/events/history');
@@ -1907,6 +2629,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         }
         if (Array.isArray(data.events) && data.events.length > 0) {
           data.events.forEach(ev => {
+            observeEventForBuildActivity(ev);
             if (ev.deliberation && ev.event_type !== 'TOOL_INVOCATION') {
               addDeliberation(ev);
             }
@@ -1928,6 +2651,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             }
           });
         }
+        updateHeaderBuildStatus();
+        if (typeof updateBibleProductionBanner === 'function') updateBibleProductionBanner();
       } catch (e) {
         // Ignore if history endpoint unavailable
       }
@@ -1935,28 +2660,30 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
 
     function updateAgentLifecycleState(agentName, state) {
       if (!agentName) return;
+      activeAgentStates[agentName] = (state || 'IDLE').toUpperCase();
       const node = document.querySelector(`[data-agent="${agentName}"]`) || document.getElementById(`node-${agentName}`);
-      if (!node) return;
+      if (node) {
+        const validStates = ['idle', 'analyzing', 'synthesizing', 'verifying', 'promoted'];
+        validStates.forEach(s => node.classList.remove(`state-${s}`));
 
-      const validStates = ['idle', 'analyzing', 'synthesizing', 'verifying', 'promoted'];
-      validStates.forEach(s => node.classList.remove(`state-${s}`));
+        const normalized = (state || 'idle').toLowerCase();
+        node.classList.add(`state-${normalized}`);
 
-      const normalized = (state || 'idle').toLowerCase();
-      node.classList.add(`state-${normalized}`);
+        const statusText = node.querySelector('.node-status-text');
+        if (statusText) {
+          statusText.textContent = state.toUpperCase();
+        }
 
-      const statusText = node.querySelector('.node-status-text');
-      if (statusText) {
-        statusText.textContent = state.toUpperCase();
-      }
-
-      const edge = document.querySelector(`.dag-edge[id*="${agentName.toLowerCase()}"]`);
-      if (edge) {
-        if (normalized === 'synthesizing') {
-          edge.classList.add('edge-active');
-        } else {
-          edge.classList.remove('edge-active');
+        const edge = document.querySelector(`.dag-edge[id*="${agentName.toLowerCase()}"]`);
+        if (edge) {
+          if (normalized === 'synthesizing') {
+            edge.classList.add('edge-active');
+          } else {
+            edge.classList.remove('edge-active');
+          }
         }
       }
+      updateHeaderBuildStatus();
     }
 
     // =========================================================================
@@ -2002,6 +2729,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           loadHeatmap();
           loadArtifacts();
           loadDiff();
+          if (typeof loadGameBible === 'function') loadGameBible();
         };
 
         this.ws.onmessage = (event) => {
@@ -2010,8 +2738,20 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             if (data.event_type === 'connected' || data.event_type === 'echo') {
               return;
             }
+            observeEventForBuildActivity(data);
             if (data.deliberation) {
               addDeliberation(data);
+            }
+            const evTypeLower = (data.event_type || '').toLowerCase();
+            if (
+              evTypeLower === 'writers_room_utterance' ||
+              evTypeLower === 'concept_evolution_logged' ||
+              evTypeLower === 'bible_mockup_generated' ||
+              evTypeLower === 'game_bible_updated'
+            ) {
+              if (typeof handleLiveWritersRoomEvent === 'function') {
+                handleLiveWritersRoomEvent(data);
+              }
             }
             if (data.event_type === 'TOOL_INVOCATION' || data.event_type === 'tool_call' || (data.payload && data.payload.tool)) {
               addToolCard({
@@ -2032,11 +2772,12 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
               const targetAgent = data.agent_name || data.payload.agent_name;
               const newState = data.payload.lifecycle_state || data.payload.state;
               updateAgentLifecycleState(targetAgent, newState);
-              if (newState === 'DONE' || newState === 'COMPLETED' || newState === 'PROMOTED') {
+              if (newState === 'DONE' || newState === 'COMPLETED' || newState === 'PROMOTED' || newState === 'AWAITING_GREENLIGHT' || newState === 'BRAINSTORMING') {
                 loadSteamDNA();
                 loadHeatmap();
                 loadArtifacts();
                 loadDiff();
+                if (typeof loadGameBible === 'function') loadGameBible();
               }
             }
             if (data.event_type === 'AGENT_STREAM' || data.event_type === 'CARTRIDGE_PROMOTED') {
@@ -2070,6 +2811,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
               if (typeof fetchTaskHistory === 'function') fetchTaskHistory();
               loadArtifacts();
             }
+            updateHeaderBuildStatus();
+            if (typeof updateBibleProductionBanner === 'function') updateBibleProductionBanner();
           } catch (e) {
             addDeliberation({ deliberation: event.data, event_type: 'raw_packet' });
           }
@@ -2113,6 +2856,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             if (typeof fetchTaskHistory === 'function') fetchTaskHistory();
             if (typeof fetchRequirementsBacklog === 'function') fetchRequirementsBacklog();
             if (typeof fetchCheckpoints === 'function') fetchCheckpoints();
+            if (typeof loadGameBible === 'function') loadGameBible();
           } catch (e) {
             // Ignore transient fetch errors
           }
@@ -2130,31 +2874,165 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     const wsClient = new ResilientWebSocketClient();
     wsClient.connect();
 
-    // Genesis Trigger Button Handler
-    btnGenesis.addEventListener('click', async () => {
+    async function triggerNewGameFromScratch(options = {}) {
+      const creativePrompt = typeof options.creativePrompt === 'string' ? options.creativePrompt.trim() : '';
+      const togglePause = document.getElementById('toggle-pause-greenlight');
+      const pauseForGreenlight = typeof options.pauseForGreenlight === 'boolean'
+        ? options.pauseForGreenlight
+        : Boolean(togglePause && togglePause.checked);
+
+      if (togglePause) {
+        togglePause.checked = pauseForGreenlight;
+      }
+
+      _lastBuildStoppedByErrorOrPromote = false;
+      _resumeOptimisticUntil = Date.now() + 15000;
+
+      // Immediately switch to the Creative Writers' Room & Living Game Bible workspace
+      if (typeof switchMainWorkspace === 'function') {
+        switchMainWorkspace('bible');
+      }
+
+      // Optimistically clear stale cartridge & requirements state in the UI while the backend initializes
+      if (typeof observabilityState === 'object' && observabilityState) {
+        observabilityState.cachedRequirementsSpec = null;
+        observabilityState.requirements = [];
+      }
+      if (typeof renderRequirementsBacklog === 'function') {
+        renderRequirementsBacklog({ has_active_spec: false, has_spec: false, requirements: [], total_tracks: 0, completed_tracks: 0, progress_percentage: 0 });
+      }
+      if (typeof renderGameBible === 'function') {
+        renderGameBible({
+          deliberation: 'Initializing new game from scratch in Creative Writers\' Room.',
+          status: 'brainstorming',
+          pause_for_greenlight: pauseForGreenlight,
+          greenlight_approved: false,
+          game_title: 'New Game Concept (Brainstorming Live...)',
+          core_genre: 'Writers\' Room Session',
+          creative_vision_summary: creativePrompt
+            ? `Executive Creative Seed: "${creativePrompt}" — Convening 7 specialists to brainstorm the player experience...`
+            : 'Convening CreativeDirector, GameplayDesigner, StoryWorldArchitect, CharacterDesigner, UXExperienceDesigner, VisualArtDirector, and AudioAtmosphereDesigner...',
+          first_60_seconds_hook: 'Specialists are debating the opening 60-second playable hook...',
+          diegetic_ui_philosophy: 'Clean, readable HUD paired with responsive in-world visual cues.',
+          writers_room_transcript: [],
+          concept_evolution_log: [],
+          experience_storyboard: [],
+          visual_mockups: [],
+          narrative_bible: { characters: [], cutscenes: [] },
+          gameplay_pillars: [],
+        });
+      }
+      updateHeaderBuildStatus();
+
       addDeliberation({
-        deliberation: "Initiating operator-requested Genesis Build cycle...",
-        agent_name: "MissionControlGateway",
-        event_type: "genesis_triggered"
+        deliberation: creativePrompt
+          ? `Initiating New Game from Scratch with creative seed: "${creativePrompt}"`
+          : 'Initiating New Game from Scratch (Autonomous Steam Player DNA mode)...',
+        agent_name: 'MissionControlGateway',
+        event_type: 'genesis_triggered'
+      });
+
+      try {
+        const res = await fetch('/api/genesis/trigger', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deliberation: creativePrompt
+              ? `Operator commissioned new game from scratch with seed: ${creativePrompt}`
+              : 'Operator commissioned new game from scratch from Mission Control',
+            profile_tag: 'default',
+            creative_prompt: creativePrompt,
+            pause_for_greenlight: pauseForGreenlight,
+            reset_active: true
+          })
+        });
+        const data = await res.json();
+        addDeliberation({
+          deliberation: `New Game Build Dispatched: ${data.job_id} | Status: ${data.status}`,
+          agent_name: 'StudioOrchestrator',
+          event_type: 'genesis_triggered'
+        });
+      } catch (err) {
+        _resumeOptimisticUntil = 0;
+        _lastBuildStoppedByErrorOrPromote = true;
+        updateHeaderBuildStatus();
+        addDeliberation({
+          deliberation: `Genesis Trigger Failed: ${err.message}`,
+          agent_name: 'MissionControlGateway',
+          event_type: 'error'
+        });
+      }
+    }
+
+    async function triggerResumeGameBuild() {
+      _lastBuildStoppedByErrorOrPromote = false;
+      _resumeOptimisticUntil = Date.now() + 15000;
+      updateHeaderBuildStatus();
+      if (typeof updateBibleProductionBanner === 'function') updateBibleProductionBanner();
+
+      addDeliberation({
+        deliberation: 'Resuming current game build from persisted Living Game Bible and requirement tracks...',
+        agent_name: 'MissionControlGateway',
+        event_type: 'genesis_triggered'
       });
       try {
         const res = await fetch('/api/genesis/trigger', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ profile_tag: 'default', deliberation: 'Operator dispatch from Mission Control' })
+          body: JSON.stringify({
+            deliberation: 'Operator requested resume of current game build from Mission Control',
+            profile_tag: 'default',
+            resume_current: true,
+            reset_active: false
+          })
         });
         const data = await res.json();
         addDeliberation({
-          deliberation: `Genesis Job Dispatched: ${data.job_id} | Status: ${data.status}`,
-          agent_name: "StudioOrchestrator",
-          event_type: "genesis_triggered"
+          deliberation: data.deliberation || `Resumed Game Build: ${data.job_id} | Status: ${data.status}`,
+          agent_name: 'StudioOrchestrator',
+          event_type: 'genesis_triggered'
         });
+        await Promise.all([loadGameBible(), fetchRequirementsBacklog(), fetchTaskHistory(), loadEventHistory()]);
       } catch (err) {
+        _resumeOptimisticUntil = 0;
+        _lastBuildStoppedByErrorOrPromote = true;
+        updateHeaderBuildStatus();
+        if (typeof updateBibleProductionBanner === 'function') updateBibleProductionBanner();
         addDeliberation({
-          deliberation: `Genesis Trigger Failed: ${err.message}`,
-          agent_name: "MissionControlGateway",
-          event_type: "error"
+          deliberation: `Resume Game Build Failed: ${err.message}`,
+          agent_name: 'MissionControlGateway',
+          event_type: 'error'
         });
+      }
+    }
+    window.triggerResumeGameBuild = triggerResumeGameBuild;
+
+    document.getElementById('btn-resume-genesis')?.addEventListener('click', (e) => {
+      const btn = e.currentTarget;
+      const mode = btn ? btn.dataset.buildMode : 'resumable';
+      if (mode === 'running' || mode === 'completed') {
+        if (typeof window.openDrawerToTab === 'function') {
+          window.openDrawerToTab('backlog');
+        }
+        return;
+      }
+      triggerResumeGameBuild();
+    });
+
+    // Genesis Trigger Button Handler — opens the "New Game from Scratch" modal
+    btnGenesis.addEventListener('click', () => {
+      const modal = document.getElementById('new-game-modal');
+      const modalPause = document.getElementById('modal-pause-greenlight');
+      const navPause = document.getElementById('toggle-pause-greenlight');
+      if (modalPause && navPause) {
+        modalPause.checked = navPause.checked;
+      }
+      if (modal && typeof modal.showModal === 'function') {
+        modal.showModal();
+        const promptInput = document.getElementById('input-new-game-prompt');
+        if (promptInput) promptInput.focus();
+      } else {
+        triggerNewGameFromScratch();
       }
     });
 
@@ -2204,6 +3082,73 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       }
     }
 
+    let _lastAudioClipsSignature = null;
+    let _lastCodeModulesSignature = null;
+    let _lastDiffSignature = null;
+
+    function renderGameBlueprintPanel(dashboardData, bibleData) {
+      const bpContent = document.getElementById('game-blueprint-content');
+      const bpStatus = document.getElementById('game-blueprint-status');
+      if (!bpContent) return;
+
+      const b = (bibleData && bibleData.game_title && bibleData.game_title !== 'Untitled Concept') ? bibleData : null;
+      const d = dashboardData || {};
+
+      if (b) {
+        const bWs = b.world_spec || {};
+        const title = b.game_title || bWs.game_title || 'Untitled';
+        const genre = b.core_genre || bWs.core_genre || d.genre || 'Autonomous';
+        const premise = b.elevator_pitch || b.core_fantasy || b.creative_vision_summary || bWs.thematic_premise || bWs.world_lore || '';
+        const rulesArr = (Array.isArray(b.gameplay_pillars) && b.gameplay_pillars.length > 0)
+          ? b.gameplay_pillars
+          : (bWs.mechanics_guidelines || []);
+        const rulesStr = Array.isArray(rulesArr) ? rulesArr.join(' • ') : String(rulesArr || '');
+        let aesthetic = '';
+        if (typeof b.visual_style_guide === 'string' && b.visual_style_guide.trim()) {
+          aesthetic = b.visual_style_guide.trim();
+        } else if (b.visual_style_guide && typeof b.visual_style_guide === 'object') {
+          aesthetic = b.visual_style_guide.aesthetic_mood || '';
+        } else if (bWs.aesthetic_style) {
+          aesthetic = bWs.palette_mood ? `${bWs.aesthetic_style} (${bWs.palette_mood})` : bWs.aesthetic_style;
+        }
+
+        if (bpStatus) {
+          const st = String(b.status || '').toLowerCase();
+          bpStatus.textContent = st === 'brainstorming' ? "Writers' Room (Live)" : (st === 'awaiting_greenlight' ? 'Awaiting Greenlight' : 'Active Game Bible');
+        }
+        let html = `<div class="blueprint-field"><span class="blueprint-field-label">Title:</span><strong>${escapeHtml(title)}</strong></div>`;
+        html += `<div class="blueprint-field"><span class="blueprint-field-label">Genre:</span><span>${escapeHtml(genre)}</span></div>`;
+        if (premise) html += `<div class="blueprint-field"><span class="blueprint-field-label">Premise:</span><span>${escapeHtml(premise)}</span></div>`;
+        if (rulesStr) html += `<div class="blueprint-field"><span class="blueprint-field-label">Rules:</span><span>${escapeHtml(rulesStr)}</span></div>`;
+        if (aesthetic) html += `<div class="blueprint-field"><span class="blueprint-field-label">Aesthetic:</span><span>${escapeHtml(aesthetic)}</span></div>`;
+        setHtmlIfChanged(bpContent, html);
+        return;
+      }
+
+      if (d.has_active_game && (d.game_title || d.manifest)) {
+        if (bpStatus) bpStatus.textContent = 'Active Cartridge';
+        let html = `<div class="blueprint-field"><span class="blueprint-field-label">Title:</span><strong>${escapeHtml(d.game_title || 'Untitled')}</strong></div>`;
+        html += `<div class="blueprint-field"><span class="blueprint-field-label">Genre:</span><span>${escapeHtml(d.genre || 'Autonomous')}</span></div>`;
+        if (d.manifest && d.manifest.creative_direction) {
+          const cd = d.manifest.creative_direction;
+          if (cd.narrative_premise) html += `<div class="blueprint-field"><span class="blueprint-field-label">Premise:</span><span>${escapeHtml(cd.narrative_premise)}</span></div>`;
+          if (cd.core_rules) {
+            const rulesStr = Array.isArray(cd.core_rules) ? cd.core_rules.join(' • ') : cd.core_rules;
+            html += `<div class="blueprint-field"><span class="blueprint-field-label">Rules:</span><span>${escapeHtml(rulesStr)}</span></div>`;
+          }
+          if (cd.aesthetic_style) html += `<div class="blueprint-field"><span class="blueprint-field-label">Aesthetic:</span><span>${escapeHtml(cd.aesthetic_style)}</span></div>`;
+        } else if (d.manifest && d.manifest.narrative_premise) {
+          html += `<div class="blueprint-field"><span class="blueprint-field-label">Premise:</span><span>${escapeHtml(d.manifest.narrative_premise)}</span></div>`;
+        } else if (d.manifest && d.manifest.description) {
+          html += `<div class="blueprint-field"><span class="blueprint-field-label">Description:</span><span>${escapeHtml(d.manifest.description)}</span></div>`;
+        }
+        setHtmlIfChanged(bpContent, html);
+      } else {
+        if (bpStatus) bpStatus.textContent = 'No Active Build';
+        setHtmlIfChanged(bpContent, '<div class="blueprint-empty">No Active Game Built Yet — Commission Genesis Build</div>');
+      }
+    }
+
     async function loadHeatmap() {
       try {
         const res = await fetch('/api/telemetry/dashboard');
@@ -2212,32 +3157,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         latestHeatmapData = data;
 
         // Update Game Blueprint
-        const bpContent = document.getElementById('game-blueprint-content');
-        const bpStatus = document.getElementById('game-blueprint-status');
-        if (bpContent) {
-          if (data.has_active_game && (data.game_title || data.manifest)) {
-            if (bpStatus) bpStatus.textContent = 'Active Cartridge';
-            let html = `<div class="blueprint-field"><span class="blueprint-field-label">Title:</span><strong>${escapeHtml(data.game_title || 'Untitled')}</strong></div>`;
-            html += `<div class="blueprint-field"><span class="blueprint-field-label">Genre:</span><span>${escapeHtml(data.genre || 'Autonomous')}</span></div>`;
-            if (data.manifest && data.manifest.creative_direction) {
-              const cd = data.manifest.creative_direction;
-              if (cd.narrative_premise) html += `<div class="blueprint-field"><span class="blueprint-field-label">Premise:</span><span>${escapeHtml(cd.narrative_premise)}</span></div>`;
-              if (cd.core_rules) {
-                const rulesStr = Array.isArray(cd.core_rules) ? cd.core_rules.join(' • ') : cd.core_rules;
-                html += `<div class="blueprint-field"><span class="blueprint-field-label">Rules:</span><span>${escapeHtml(rulesStr)}</span></div>`;
-              }
-              if (cd.aesthetic_style) html += `<div class="blueprint-field"><span class="blueprint-field-label">Aesthetic:</span><span>${escapeHtml(cd.aesthetic_style)}</span></div>`;
-            } else if (data.manifest && data.manifest.narrative_premise) {
-              html += `<div class="blueprint-field"><span class="blueprint-field-label">Premise:</span><span>${escapeHtml(data.manifest.narrative_premise)}</span></div>`;
-            } else if (data.manifest && data.manifest.description) {
-              html += `<div class="blueprint-field"><span class="blueprint-field-label">Description:</span><span>${escapeHtml(data.manifest.description)}</span></div>`;
-            }
-            bpContent.innerHTML = html;
-          } else {
-            if (bpStatus) bpStatus.textContent = 'No Active Build';
-            bpContent.innerHTML = '<div class="blueprint-empty">No Active Game Built Yet — Commission Genesis Build</div>';
-          }
-        }
+        renderGameBlueprintPanel(data, typeof cachedGameBible !== 'undefined' ? cachedGameBible : null);
 
         // Update Probes Catalog
         const probeContainer = document.getElementById('probes-catalog-container');
@@ -2251,9 +3171,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
               table += `<tr><td><strong>${escapeHtml(p.probe_name)}</strong></td><td><span class="probe-category-tag">${escapeHtml(p.category)}</span></td><td>${escapeHtml(p.hypothesis_target || '')}</td></tr>`;
             });
             table += '</tbody></table>';
-            probeContainer.innerHTML = table;
+            setHtmlIfChanged(probeContainer, table);
           } else {
-            probeContainer.innerHTML = '<div style="color:var(--slate); font-size:10px; padding:6px;">Awaiting custom telemetry probe injection from TelemetryArchitect...</div>';
+            setHtmlIfChanged(probeContainer, '<div style="color:var(--slate); font-size:10px; padding:6px;">Awaiting custom telemetry probe injection from TelemetryArchitect...</div>');
           }
         }
 
@@ -2261,19 +3181,13 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         const hypContainer = document.getElementById('telemetry-hypotheses-container');
         const hypList = data.hypotheses || [];
         if (hypContainer) {
-          hypContainer.innerHTML = '';
-          if (hypList.length > 0) {
-            hypList.forEach(h => {
-              const card = document.createElement('div');
-              card.className = 'hypothesis-card';
-              if (typeof h === 'string') {
-                card.innerHTML = `<span class="hypothesis-target">Hypothesis:</span> ${escapeHtml(h)}`;
-              } else {
-                card.innerHTML = `<div class="hypothesis-target">${escapeHtml(h.category || 'Hypothesis')}: ${escapeHtml(h.hypothesis || '')}</div><div>${escapeHtml(h.recommendation || '')}</div>`;
-              }
-              hypContainer.appendChild(card);
-            });
-          }
+          const hypHtml = hypList.map(h => {
+            if (typeof h === 'string') {
+              return `<div class="hypothesis-card"><span class="hypothesis-target">Hypothesis:</span> ${escapeHtml(h)}</div>`;
+            }
+            return `<div class="hypothesis-card"><div class="hypothesis-target">${escapeHtml(h.category || 'Hypothesis')}: ${escapeHtml(h.hypothesis || '')}</div><div>${escapeHtml(h.recommendation || '')}</div></div>`;
+          }).join('');
+          setHtmlIfChanged(hypContainer, hypHtml);
         }
 
         renderHeatmap();
@@ -2410,47 +3324,60 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         if (!res.ok) return;
         const data = await res.json();
 
-        // Audio Clips
-        audioSelector.innerHTML = '';
-        if (data.audio_clips && data.audio_clips.length > 0) {
-          data.audio_clips.forEach(clip => {
+        // Audio Clips — only rebuild selector if clip list changed
+        const audioSig = JSON.stringify((data.audio_clips || []).map(c => `${c.filename}:${c.size_bytes}`));
+        if (audioSig !== _lastAudioClipsSignature) {
+          _lastAudioClipsSignature = audioSig;
+          const prevSelectedAudio = audioSelector.value;
+          audioSelector.innerHTML = '';
+          if (data.audio_clips && data.audio_clips.length > 0) {
+            data.audio_clips.forEach(clip => {
+              const opt = document.createElement('option');
+              opt.value = clip.filename;
+              opt.textContent = `${clip.filename} (${(clip.size_bytes / 1024).toFixed(1)} KB)`;
+              audioSelector.appendChild(opt);
+            });
+            const keepSelection = data.audio_clips.some(c => c.filename === prevSelectedAudio);
+            const targetFile = keepSelection ? prevSelectedAudio : data.audio_clips[0].filename;
+            audioSelector.value = targetFile;
+            if (audioPlayer.paused) {
+              audioPlayer.src = `/api/artifacts/audio/${targetFile}`;
+            }
+          } else {
             const opt = document.createElement('option');
-            opt.value = clip.filename;
-            opt.textContent = `${clip.filename} (${(clip.size_bytes / 1024).toFixed(1)} KB)`;
+            opt.value = '';
+            opt.textContent = 'No voice clips generated yet';
             audioSelector.appendChild(opt);
-          });
-          audioPlayer.src = `/api/artifacts/audio/${data.audio_clips[0].filename}`;
-        } else {
-          const opt = document.createElement('option');
-          opt.value = '';
-          opt.textContent = 'No voice clips generated yet';
-          audioSelector.appendChild(opt);
-          audioPlayer.removeAttribute('src');
+            audioPlayer.removeAttribute('src');
+          }
         }
 
-        // Code Modules in diffSelector
+        // Code Modules in diffSelector — preserve active selection
         if (data.code_modules && data.code_modules.length > 0) {
-          diffSelector.innerHTML = '';
-          data.code_modules.forEach(mod => {
-            const opt = document.createElement('option');
-            opt.value = mod;
-            opt.textContent = mod;
-            diffSelector.appendChild(opt);
-          });
+          const modSig = JSON.stringify(data.code_modules);
+          if (modSig !== _lastCodeModulesSignature) {
+            _lastCodeModulesSignature = modSig;
+            const prevMod = diffSelector.value;
+            diffSelector.innerHTML = '';
+            data.code_modules.forEach(mod => {
+              const opt = document.createElement('option');
+              opt.value = mod;
+              opt.textContent = mod;
+              diffSelector.appendChild(opt);
+            });
+            if (prevMod && data.code_modules.includes(prevMod)) {
+              diffSelector.value = prevMod;
+            }
+          }
         }
 
         // Sprites Gallery
         const spritesGallery = document.getElementById('sprites-gallery-container');
         if (spritesGallery) {
-          spritesGallery.innerHTML = '';
-          if (data.sprites && data.sprites.length > 0) {
-            data.sprites.forEach(s => {
-              const chip = document.createElement('span');
-              chip.className = 'sprite-chip';
-              chip.textContent = s.filename;
-              spritesGallery.appendChild(chip);
-            });
-          }
+          const spritesHtml = (data.sprites || [])
+            .map(s => `<span class="sprite-chip">${escapeHtml(s.filename)}</span>`)
+            .join('');
+          setHtmlIfChanged(spritesGallery, spritesHtml);
         }
 
         // Artifacts Summary
@@ -2508,6 +3435,10 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         const res = await fetch(`/api/diff?module=${moduleName}`);
         if (!res.ok) return;
         const data = await res.json();
+        const sig = `${moduleName}::${data.diff || ''}`;
+        if (sig === _lastDiffSignature) return;
+        _lastDiffSignature = sig;
+        const prevScrollTop = diffContainer.scrollTop;
         if (data.diff) {
           const lines = data.diff.split('\n');
           diffContainer.innerHTML = '';
@@ -2525,6 +3456,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             div.textContent = line;
             diffContainer.appendChild(div);
           });
+          diffContainer.scrollTop = prevScrollTop;
         } else {
           diffContainer.textContent = `No active code diff available for ${moduleName}.`;
         }
@@ -2863,14 +3795,33 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       }
     };
 
+    let _lastRenderedTasksSignature = null;
+
     function renderTaskCards(tasks) {
       if (!taskCardsList) return;
+      const tasksSig = JSON.stringify(
+        (tasks || []).map(t => [
+          t.task_id,
+          t.status,
+          t.duration_ms,
+          Array.isArray(t.output_artifacts || t.outputs) ? (t.output_artifacts || t.outputs).length : 0
+        ])
+      ) + '::' + JSON.stringify(observabilityState.expandedCardIds || []);
+
+      if (tasksSig === _lastRenderedTasksSignature) {
+        return;
+      }
+      _lastRenderedTasksSignature = tasksSig;
+
+      const prevViewerScrollTop = handoffViewer ? handoffViewer.scrollTop : 0;
+      const prevListScrollTop = taskCardsList.scrollTop;
+
       if (!tasks || tasks.length === 0) {
-        taskCardsList.innerHTML = `
+        setHtmlIfChanged(taskCardsList, `
           <div class="empty-state-notice" style="color: var(--light-gray); font-size: 11px; text-align: center; padding: 24px;">
             No agent tasks match the active criteria.
           </div>
-        `;
+        `);
         return;
       }
 
@@ -3054,11 +4005,22 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           } else {
             observabilityState.expandedCardIds = observabilityState.expandedCardIds.filter(id => id !== task.task_id);
           }
+          _lastRenderedTasksSignature = JSON.stringify(
+            (tasks || []).map(t => [
+              t.task_id,
+              t.status,
+              t.duration_ms,
+              Array.isArray(t.output_artifacts || t.outputs) ? (t.output_artifacts || t.outputs).length : 0
+            ])
+          ) + '::' + JSON.stringify(observabilityState.expandedCardIds || []);
           saveObservabilityState();
         });
 
         taskCardsList.appendChild(card);
       });
+
+      taskCardsList.scrollTop = prevListScrollTop;
+      if (handoffViewer) handoffViewer.scrollTop = prevViewerScrollTop;
     }
 
     async function fetchRequirementsBacklog() {
@@ -3080,11 +4042,11 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const specData = hasSpec ? spec.requirements_spec : (spec && spec.requirements ? spec : null);
 
       if (!specData || !specData.requirements || specData.requirements.length === 0) {
-        requirementsBacklogContainer.innerHTML = `
+        setHtmlIfChanged(requirementsBacklogContainer, `
           <div class="empty-state-notice" style="color: var(--light-gray); font-size: 11px; text-align: center; padding: 24px;">
             No active requirements specification found. Launch a Genesis Build to synthesize requirements.
           </div>
-        `;
+        `);
         if (tabCountBacklog) tabCountBacklog.textContent = '0';
         return;
       }
@@ -3095,9 +4057,11 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       let totalCriteria = 0;
       let passedCriteria = 0;
       tracks.forEach(t => {
+        const tStatus = (t.status || 'pending').toLowerCase();
+        const trackDone = tStatus === 'completed' || tStatus === 'satisfied';
         (t.acceptance_criteria || []).forEach(ac => {
           totalCriteria++;
-          if (ac.passed) passedCriteria++;
+          if (ac.passed || trackDone) passedCriteria++;
         });
       });
       const pct = totalCriteria > 0 ? Math.round((passedCriteria / totalCriteria) * 100) : 0;
@@ -3122,6 +4086,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       let tracksHtml = '';
       tracks.forEach(track => {
         const status = (track.status || 'pending').toLowerCase();
+        const trackDone = status === 'completed' || status === 'satisfied';
         let statusClass = 'task-status-completed';
         if (status === 'pending') statusClass = 'task-status-verifying';
         else if (status === 'in_progress') statusClass = 'task-status-in_progress';
@@ -3129,7 +4094,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
 
         let criteriaHtml = '';
         (track.acceptance_criteria || []).forEach(ac => {
-          const isPass = ac.passed === true;
+          const isPass = ac.passed === true || trackDone;
           const badgeMethod = ac.verification_method || 'ast_inspection';
           criteriaHtml += `
             <div class="criterion-item">
@@ -3169,18 +4134,22 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         `;
       });
 
-      requirementsBacklogContainer.innerHTML = overviewHtml + tracksHtml;
-
-      requirementsBacklogContainer.querySelectorAll('.btn-inspect-track-tasks').forEach(btn => {
-        btn.addEventListener('click', () => {
-          const trackId = btn.getAttribute('data-track-id');
-          if (taskReqFilter) taskReqFilter.value = trackId;
-          observabilityState.filters.requirementId = trackId;
-          switchDrawerTab('tasks');
-          applyTaskFilters();
-          saveObservabilityState();
+      const changed = setHtmlIfChanged(requirementsBacklogContainer, overviewHtml + tracksHtml);
+      if (changed) {
+        requirementsBacklogContainer.querySelectorAll('.btn-inspect-track-tasks').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const trackId = btn.getAttribute('data-track-id');
+            if (taskReqFilter) taskReqFilter.value = trackId;
+            observabilityState.filters.requirementId = trackId;
+            switchDrawerTab('tasks');
+            applyTaskFilters();
+            saveObservabilityState();
+          });
         });
-      });
+      }
+      if (typeof updateBibleProductionBanner === 'function') {
+        updateBibleProductionBanner();
+      }
     }
 
     async function fetchCheckpoints() {
@@ -3214,11 +4183,11 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       }
 
       if (checkpoints.length === 0) {
-        checkpointsTimelineContainer.innerHTML = `
+        setHtmlIfChanged(checkpointsTimelineContainer, `
           <div class="empty-state-notice" style="color: var(--light-gray); font-size: 11px; text-align: center; padding: 24px;">
             No verified checkpoints recorded yet. Checkpoints are automatically generated as each requirement track passes verification.
           </div>
-        `;
+        `);
         return;
       }
 
@@ -3269,39 +4238,40 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         `;
       });
 
-      checkpointsTimelineContainer.innerHTML = html;
-
-      checkpointsTimelineContainer.querySelectorAll('.btn-activate-checkpoint').forEach(btn => {
-        btn.addEventListener('click', async () => {
-          const cpId = btn.getAttribute('data-cp-id');
-          if (!cpId) return;
-          btn.disabled = true;
-          btn.textContent = 'Activating...';
-          try {
-            const res = await fetch(`/api/checkpoints/${encodeURIComponent(cpId)}/activate`, {
-              method: 'POST'
-            });
-            const result = await res.json();
-            if (res.ok) {
-              addDeliberation({
-                deliberation: result.deliberation || `Activated verified checkpoint ${cpId}`,
-                agent_name: 'MissionControlGateway',
-                event_type: 'CHECKPOINT_ACTIVATED'
+      const changed = setHtmlIfChanged(checkpointsTimelineContainer, html);
+      if (changed) {
+        checkpointsTimelineContainer.querySelectorAll('.btn-activate-checkpoint').forEach(btn => {
+          btn.addEventListener('click', async () => {
+            const cpId = btn.getAttribute('data-cp-id');
+            if (!cpId) return;
+            btn.disabled = true;
+            btn.textContent = 'Activating...';
+            try {
+              const res = await fetch(`/api/checkpoints/${encodeURIComponent(cpId)}/activate`, {
+                method: 'POST'
               });
-              await fetchCheckpoints();
-              loadArtifacts();
-            } else {
-              alert(`Failed to activate checkpoint: ${result.error || result.deliberation}`);
+              const result = await res.json();
+              if (res.ok) {
+                addDeliberation({
+                  deliberation: result.deliberation || `Activated verified checkpoint ${cpId}`,
+                  agent_name: 'MissionControlGateway',
+                  event_type: 'CHECKPOINT_ACTIVATED'
+                });
+                await fetchCheckpoints();
+                loadArtifacts();
+              } else {
+                alert(`Failed to activate checkpoint: ${result.error || result.deliberation}`);
+                btn.disabled = false;
+                btn.textContent = '▶ Activate & Play';
+              }
+            } catch (err) {
+              alert(`Network error activating checkpoint: ${err.message}`);
               btn.disabled = false;
               btn.textContent = '▶ Activate & Play';
             }
-          } catch (err) {
-            alert(`Network error activating checkpoint: ${err.message}`);
-            btn.disabled = false;
-            btn.textContent = '▶ Activate & Play';
-          }
+          });
         });
-      });
+      }
     }
 
     function initTaskObservability() {
@@ -3392,6 +4362,853 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       fetchCheckpoints();
     }
 
+    // =========================================================================
+    // Creative Writers' Room & Living Game Bible Controller
+    // =========================================================================
+    let cachedGameBible = null;
+    const seenUtteranceIds = new Set();
+    let isWritersRoomAutoScroll = true;
+    const openUtteranceDelibIds = new Set();
+    let _lastTranscriptKeys = [];
+
+    function getUtteranceKey(utt, idx) {
+      return utt.utterance_id || `turn_${utt.turn_index || (idx + 1)}_${utt.speaker_role || 'CreativeDirector'}`;
+    }
+
+    function switchMainWorkspace(workspaceName) {
+      const wsTelemetry = document.getElementById('workspace-telemetry');
+      const wsBible = document.getElementById('workspace-game-bible');
+      const tabTelemetry = document.getElementById('ws-tab-telemetry');
+      const tabBible = document.getElementById('ws-tab-bible');
+      if (workspaceName === 'bible') {
+        if (wsTelemetry) wsTelemetry.style.display = 'none';
+        if (wsBible) wsBible.style.display = 'block';
+        if (tabTelemetry) tabTelemetry.classList.remove('active');
+        if (tabBible) tabBible.classList.add('active');
+        loadGameBible();
+      } else {
+        if (wsTelemetry) wsTelemetry.style.display = 'grid';
+        if (wsBible) wsBible.style.display = 'none';
+        if (tabTelemetry) tabTelemetry.classList.add('active');
+        if (tabBible) tabBible.classList.remove('active');
+      }
+    }
+
+    function switchBibleSubtab(subtabName) {
+      document.querySelectorAll('.bible-subtab-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.getAttribute('data-bible-tab') === subtabName);
+      });
+      ['evolution', 'mockups', 'characters', 'pillars', 'signoff'].forEach(name => {
+        const view = document.getElementById(`bible-subview-${name}`);
+        if (view) view.classList.toggle('active', name === subtabName);
+      });
+    }
+
+    window.openMockupLightbox = function(url, title, sceneType, notes) {
+      const dlg = document.getElementById('bible-mockup-lightbox');
+      const img = document.getElementById('lightbox-mockup-img');
+      const ttl = document.getElementById('lightbox-mockup-title');
+      const scn = document.getElementById('lightbox-mockup-scene');
+      const nts = document.getElementById('lightbox-mockup-notes');
+      if (!dlg || !img) return;
+      img.src = url;
+      if (ttl) ttl.textContent = title || '16:9 Concept Mockup';
+      if (scn) scn.textContent = sceneType || 'gameplay_scene';
+      if (nts) nts.textContent = notes || '';
+      if (typeof dlg.showModal === 'function') {
+        dlg.showModal();
+      } else {
+        dlg.setAttribute('open', 'open');
+      }
+    };
+
+    function renderUtteranceCard(utt, idx = 0) {
+      const role = utt.speaker_role || 'CreativeDirector';
+      const displayName = utt.speaker_display_name || role;
+      const turnIdx = utt.turn_index || (idx + 1);
+      const uttKey = getUtteranceKey(utt, idx);
+      const msg = utt.spoken_dialogue || utt.message || '';
+      const delib = utt.deliberation || '';
+      const rawRefs = Array.isArray(utt.addressed_to) && utt.addressed_to.length > 0
+        ? utt.addressed_to
+        : (Array.isArray(utt.referenced_roles) ? utt.referenced_roles : []);
+      const refs = rawRefs.length > 0
+        ? rawRefs.map(r => `@${escapeHtml(r)}`).join(' ')
+        : '';
+      const timeStr = utt.timestamp_utc ? new Date(utt.timestamp_utc).toLocaleTimeString() : '';
+
+      let artifactBadge = '';
+      if (utt.bible_updates_summary) {
+        artifactBadge += `<div style="margin-top: 4px; font-size: 10.5px; color: var(--cyan); background: rgba(41, 173, 255, 0.1); border-left: 2px solid var(--cyan); padding: 4px 8px; border-radius: 3px;">📘 <strong>Bible Update:</strong> ${escapeHtml(utt.bible_updates_summary)}</div>`;
+      }
+      if (utt.artifact_emitted && typeof utt.artifact_emitted === 'object') {
+        const aType = utt.artifact_emitted.type || 'artifact';
+        if (aType === 'mockup') {
+          const fname = (utt.artifact_emitted.file_path || utt.artifact_emitted.image_path || '').split('/').pop();
+          const mUrl = `/api/assets/mockups/${encodeURIComponent(fname)}`;
+          const mTitle = utt.artifact_emitted.title || fname;
+          artifactBadge += `
+            <div style="margin-top: 6px; background: #040814; border: 1px solid var(--navy); border-radius: 4px; padding: 6px;">
+              <div style="font-size: 10px; color: var(--yellow); font-weight: bold; margin-bottom: 4px;">🖼️ Synthesized 16:9 Concept Mockup: ${escapeHtml(mTitle)}</div>
+              <img src="${escapeHtml(mUrl)}" alt="${escapeHtml(mTitle)}" style="width: 100%; max-height: 160px; object-fit: cover; border-radius: 3px; cursor: pointer;" onclick="openMockupLightbox('${escapeHtml(mUrl)}', '${escapeHtml(mTitle)}', 'concept_mockup', '')" />
+            </div>
+          `;
+        } else if (aType === 'evolution') {
+          artifactBadge += `<div style="margin-top: 4px; font-size: 10px; color: var(--green);">🌱 Logged Concept Evolution v${escapeHtml(utt.artifact_emitted.version || '')}: ${escapeHtml(utt.artifact_emitted.hypothesis || utt.artifact_emitted.evolved_premise || '')}</div>`;
+        } else if (aType === 'storyboard') {
+          artifactBadge += `<div style="margin-top: 4px; font-size: 10px; color: var(--amber);">🎬 Authored ${escapeHtml(utt.artifact_emitted.beats_count || 1)} Experience Storyboard Beat(s)</div>`;
+        }
+      }
+
+      const isDelibOpen = openUtteranceDelibIds.has(uttKey);
+
+      return `
+        <div class="utterance-card role-${escapeHtml(role)}" data-utterance-id="${escapeHtml(uttKey)}">
+          <div class="utterance-header">
+            <div>
+              <span class="utterance-speaker">${escapeHtml(displayName)}</span>
+              <span style="color: var(--slate); margin-left: 6px;">Turn #${escapeHtml(turnIdx)}</span>
+              ${refs ? `<span style="color: var(--pink); font-size: 10px; margin-left: 6px;">${refs}</span>` : ''}
+            </div>
+            <span style="color: var(--slate); font-size: 10px;">${escapeHtml(timeStr)}</span>
+          </div>
+          ${delib ? `
+            <details class="utterance-delib-details" data-utterance-id="${escapeHtml(uttKey)}" ${isDelibOpen ? 'open' : ''}>
+              <summary>🧠 Internal Epistemic Deliberation (Index 0)</summary>
+              <div style="margin-top: 4px; white-space: pre-wrap;">${escapeHtml(delib)}</div>
+            </details>
+          ` : ''}
+          <div class="utterance-message">${escapeHtml(msg)}</div>
+          ${artifactBadge}
+        </div>
+      `;
+    }
+
+    function renderGameBible(bible) {
+      if (!bible) return;
+      cachedGameBible = bible;
+
+      const togglePause = document.getElementById('toggle-pause-greenlight');
+      if (togglePause && typeof bible.pause_for_greenlight === 'boolean') {
+        togglePause.checked = bible.pause_for_greenlight;
+      }
+
+      const transcript = Array.isArray(bible.writers_room_transcript) ? bible.writers_room_transcript : [];
+      const evolutions = Array.isArray(bible.concept_evolution) && bible.concept_evolution.length > 0
+        ? bible.concept_evolution
+        : (Array.isArray(bible.concept_evolution_log) ? bible.concept_evolution_log : []);
+      const storyboard = Array.isArray(bible.experience_storyboard) ? bible.experience_storyboard : [];
+      const mockups = Array.isArray(bible.visual_mockups) ? bible.visual_mockups : [];
+      const nb = bible.narrative_bible || {};
+      const rawCharacters = Array.isArray(nb.characters) ? nb.characters : [];
+      const characters = [];
+      const _normCharTokens = (s) => (String(s || '').toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length >= 2 && !['npc', 'char', 'character', 'the', 'and', 'of'].includes(t)));
+      for (const ch of rawCharacters) {
+        if (!ch || typeof ch !== 'object') continue;
+        const chId = String(ch.character_id || '').trim().toLowerCase();
+        const chTokens = _normCharTokens(ch.name);
+        const chPortrait = String(ch.portrait_asset || ch.portrait_file || '').split('/').pop();
+        const existingIdx = characters.findIndex(ex => {
+          const exId = String(ex.character_id || '').trim().toLowerCase();
+          if (chId && exId && chId === exId) return true;
+          const exPortrait = String(ex.portrait_asset || ex.portrait_file || '').split('/').pop();
+          if (chPortrait && exPortrait && chPortrait === exPortrait && !chPortrait.startsWith('portrait_char_')) return true;
+          const exTokens = _normCharTokens(ex.name);
+          if (chTokens.length > 0 && exTokens.length > 0) {
+            const chSub = chTokens.every(t => exTokens.includes(t));
+            const exSub = exTokens.every(t => chTokens.includes(t));
+            if (chSub || exSub) return true;
+          }
+          return false;
+        });
+        if (existingIdx >= 0) {
+          const prev = characters[existingIdx];
+          characters[existingIdx] = {
+            ...prev,
+            ...ch,
+            character_id: prev.character_id || ch.character_id,
+            name: (String(ch.name || '').length >= String(prev.name || '').length) ? ch.name : prev.name,
+            portrait_asset: ch.portrait_asset || prev.portrait_asset,
+          };
+        } else {
+          characters.push(ch);
+        }
+      }
+      const cutscenes = Array.isArray(nb.cutscenes) ? nb.cutscenes : [];
+      const pillars = Array.isArray(bible.gameplay_pillars) ? bible.gameplay_pillars : [];
+
+      // Header counts & badges
+      const hdrTurnCount = document.getElementById('header-bible-turn-count');
+      if (hdrTurnCount) hdrTurnCount.textContent = String(transcript.length);
+      const turnCounter = document.getElementById('writers-room-turn-counter');
+      if (turnCounter) turnCounter.textContent = `${transcript.length} Utterances`;
+
+      const countEvo = document.getElementById('bible-count-evolution');
+      if (countEvo) countEvo.textContent = String(evolutions.length + storyboard.length);
+      const countMock = document.getElementById('bible-count-mockups');
+      if (countMock) countMock.textContent = String(mockups.length);
+      const countChars = document.getElementById('bible-count-characters');
+      if (countChars) countChars.textContent = String(characters.length);
+
+      const titleEl = document.getElementById('bible-header-title');
+      if (titleEl) titleEl.textContent = bible.game_title || 'Living Game Bible';
+      const genreEl = document.getElementById('bible-header-genre');
+      if (genreEl) genreEl.textContent = bible.core_genre || 'Brainstorming';
+      const statusEl = document.getElementById('bible-header-status');
+      if (statusEl) {
+        const st = (bible.status || 'idle').toUpperCase();
+        statusEl.textContent = st;
+      }
+      const visionEl = document.getElementById('bible-header-vision');
+      const visionText = bible.creative_vision_summary || bible.elevator_pitch || bible.core_fantasy || '';
+      if (visionEl && visionText) {
+        visionEl.textContent = visionText;
+      }
+
+      // Highlight last speaker in specialist roster
+      const lastSpeaker = transcript.length > 0 ? transcript[transcript.length - 1].speaker_role : null;
+      document.querySelectorAll('#specialist-roster-bar .specialist-pill').forEach(pill => {
+        pill.classList.toggle('speaking', pill.getAttribute('data-role') === lastSpeaker);
+      });
+
+      // 1. Transcript — Incremental append & smart scroll preservation
+      const transcriptList = document.getElementById('writers-room-transcript-list');
+      if (transcriptList) {
+        if (transcript.length === 0) {
+          if (_lastTranscriptKeys.length > 0 || !transcriptList.querySelector('.blueprint-empty')) {
+            _lastTranscriptKeys = [];
+            transcriptList.innerHTML = '<div class="blueprint-empty">No Writers\' Room utterances recorded yet. Click "🚀 New Game from Scratch" to watch the specialists brainstorm live.</div>';
+          }
+        } else {
+          const newKeys = transcript.map((u, idx) => getUtteranceKey(u, idx));
+          const isPrefix =
+            _lastTranscriptKeys.length <= newKeys.length &&
+            _lastTranscriptKeys.every((k, i) => k === newKeys[i]) &&
+            transcriptList.querySelectorAll('.utterance-card').length === _lastTranscriptKeys.length;
+
+          if (isPrefix) {
+            if (newKeys.length > _lastTranscriptKeys.length) {
+              const emptyNotice = transcriptList.querySelector('.blueprint-empty');
+              if (emptyNotice) emptyNotice.remove();
+              const addedHtml = transcript
+                .slice(_lastTranscriptKeys.length)
+                .map((u, offset) => renderUtteranceCard(u, _lastTranscriptKeys.length + offset))
+                .join('');
+              transcriptList.insertAdjacentHTML('beforeend', addedHtml);
+              _lastTranscriptKeys = newKeys;
+              if (isWritersRoomAutoScroll) {
+                transcriptList.scrollTop = transcriptList.scrollHeight;
+              }
+            }
+            // When newKeys.length === _lastTranscriptKeys.length, zero DOM writes and zero scroll changes!
+          } else {
+            const prevScrollTop = transcriptList.scrollTop;
+            transcriptList.innerHTML = transcript.map((u, idx) => renderUtteranceCard(u, idx)).join('');
+            _lastTranscriptKeys = newKeys;
+            if (isWritersRoomAutoScroll) {
+              transcriptList.scrollTop = transcriptList.scrollHeight;
+            } else {
+              transcriptList.scrollTop = prevScrollTop;
+            }
+          }
+        }
+      }
+
+      // 2. Experience Hooks, Evolution Timeline & Storyboard
+      const first60El = document.getElementById('bible-first-60s');
+      if (first60El) first60El.textContent = bible.first_60_seconds_hook || 'Awaiting UXExperienceDesigner...';
+      const diegeticEl = document.getElementById('bible-diegetic-ui');
+      if (diegeticEl) diegeticEl.textContent = bible.diegetic_ui_philosophy || 'Diegetic in-world feedback (Zero HUD control manuals).';
+
+      const evoContainer = document.getElementById('concept-evolution-timeline');
+      if (evoContainer) {
+        const evoHtml = evolutions.length === 0
+          ? '<div class="blueprint-empty">No concept evolution pivots logged yet.</div>'
+          : evolutions.map(ev => {
+              const author = ev.triggered_by_role || ev.author_role || 'Specialist';
+              const premise = ev.evolved_premise || ev.hypothesis || '';
+              const prevPremise = ev.previous_premise || '';
+              const pivotReason = ev.pivot_reason || ev.critique_or_pivot_reason || '';
+              return `
+                <div class="evolution-card">
+                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                    <span style="font-weight: bold; color: var(--green); font-size: 11px;">v${escapeHtml(ev.version || 1)} — ${escapeHtml(author)}</span>
+                    <span style="font-size: 10px; color: var(--slate);">Turn #${escapeHtml(ev.turn_index || 1)}</span>
+                  </div>
+                  ${prevPremise ? `<div style="font-size: 10.5px; color: var(--slate); margin-bottom: 3px;"><em>From:</em> ${escapeHtml(prevPremise)}</div>` : ''}
+                  <div style="font-weight: bold; color: var(--white); font-size: 12px; margin-bottom: 4px;">${escapeHtml(premise)}</div>
+                  <div style="font-size: 11px; color: var(--peach);"><strong>Pivot / Critique Rationale:</strong> ${escapeHtml(pivotReason)}</div>
+                </div>
+              `;
+            }).join('');
+        setHtmlIfChanged(evoContainer, evoHtml);
+      }
+
+      const sbGrid = document.getElementById('experience-storyboard-grid');
+      if (sbGrid) {
+        const sbHtml = storyboard.length === 0
+          ? '<div class="blueprint-empty">No storyboard beats authored yet.</div>'
+          : storyboard.map(beat => {
+              const beatNum = beat.beat_index || beat.beat_number || 1;
+              const actionOrScene = beat.sensory_and_camera_staging || beat.player_action || '';
+              const emotion = beat.player_emotional_state || beat.emotional_target || '';
+              const diegeticCue = beat.diegetic_teaching_moment || beat.diegetic_onboarding_cue || '';
+              const extraNotes = beat.narrative_integration || beat.camera_and_lighting_notes || '';
+              return `
+                <div class="storyboard-beat-card">
+                  <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span style="font-weight: bold; color: var(--amber);">Beat #${escapeHtml(beatNum)}: ${escapeHtml(beat.phase_title || '')}</span>
+                  </div>
+                  <div><strong style="color: var(--cyan);">Staging &amp; Action:</strong> ${escapeHtml(actionOrScene)}</div>
+                  <div><strong style="color: var(--pink);">Emotional Target:</strong> ${escapeHtml(emotion)}</div>
+                  <div><strong style="color: var(--green);">Diegetic Cue:</strong> ${escapeHtml(diegeticCue)}</div>
+                  ${extraNotes ? `<div style="color: var(--light-gray); font-size: 10px;">🎬 ${escapeHtml(extraNotes)}</div>` : ''}
+                </div>
+              `;
+            }).join('');
+        setHtmlIfChanged(sbGrid, sbHtml);
+      }
+
+      // 3. 16:9 Visual Mockups & Style Guides
+      const mockGallery = document.getElementById('bible-mockups-gallery');
+      if (mockGallery) {
+        const mockHtml = mockups.length === 0
+          ? '<div class="blueprint-empty">No 16:9 visual mockups generated yet. VisualArtDirector and UXExperienceDesigner synthesize mockups during brainstorming.</div>'
+          : mockups.map(m => {
+              const rawPath = m.image_path || m.file_path || '';
+              const fname = rawPath.split('/').pop();
+              const mUrl = rawPath.startsWith('/api/') ? rawPath : `/api/assets/mockups/${encodeURIComponent(fname)}`;
+              const mNotes = m.ui_callout_notes || m.diegetic_ui_notes || m.scene_description || m.composition_prompt || '';
+              return `
+                <div class="mockup-card" onclick="openMockupLightbox('${escapeHtml(mUrl)}', '${escapeHtml(m.title || '')}', '${escapeHtml(m.scene_type || 'gameplay_scene')}', '${escapeHtml(mNotes)}')">
+                  <img src="${escapeHtml(mUrl)}" alt="${escapeHtml(m.title || '16:9 Mockup')}" loading="lazy" />
+                  <div style="padding: 10px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                      <strong style="color: var(--white); font-size: 12px;">${escapeHtml(m.title || fname)}</strong>
+                      <span class="genre-chip" style="font-size: 9px;">${escapeHtml(m.scene_type || '16:9')}</span>
+                    </div>
+                    <div style="font-size: 10.5px; color: var(--light-gray); line-height: 1.35;">${escapeHtml(mNotes)}</div>
+                  </div>
+                </div>
+              `;
+            }).join('');
+        setHtmlIfChanged(mockGallery, mockHtml);
+      }
+
+      const styleAudioBox = document.getElementById('bible-style-audio-guides');
+      if (styleAudioBox) {
+        const vsg = bible.visual_style_guide || {};
+        const adg = bible.audio_direction_guide || {};
+        const styleAudioHtml = `
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+            <div>
+              <h5 style="color: var(--yellow); font-size: 11px; text-transform: uppercase; margin-bottom: 6px;">🎨 Visual Style Guide</h5>
+              <pre class="json-dump" style="max-height: 140px;">${escapeHtml(JSON.stringify(vsg, null, 2))}</pre>
+            </div>
+            <div>
+              <h5 style="color: var(--peach); font-size: 11px; text-transform: uppercase; margin-bottom: 6px;">🔊 Audio Direction Guide</h5>
+              <pre class="json-dump" style="max-height: 140px;">${escapeHtml(JSON.stringify(adg, null, 2))}</pre>
+            </div>
+          </div>
+        `;
+        setHtmlIfChanged(styleAudioBox, styleAudioHtml);
+      }
+
+      // 4. Characters, Cutscenes & Voice Auditions
+      const charGallery = document.getElementById('bible-characters-gallery');
+      if (charGallery) {
+        const charHtml = characters.length === 0
+          ? '<div class="blueprint-empty">No character sheets generated yet.</div>'
+          : characters.map(c => {
+              const rawPortrait = c.portrait_asset || c.portrait_file || `portrait_${c.character_id}.png`;
+              const pFile = rawPortrait.split('/').pop();
+              const pUrl = `/api/assets/sprites/${encodeURIComponent(pFile)}`;
+              const traits = Array.isArray(c.personality_traits) ? c.personality_traits.join(', ') : '';
+              const vp = c.voice_profile || {};
+              const voiceDesc = c.voice_timbre || vp.voice_description || '';
+              const voiceName = c.gemini_voice_name || vp.prebuilt_voice_name || 'Kore';
+              const barksList = Array.isArray(nb.dialogue_barks) ? nb.dialogue_barks : (Array.isArray(nb.gameplay_barks) ? nb.gameplay_barks : []);
+              const cTokens = _normCharTokens(c.name);
+              const sampleBark = barksList.find(b => {
+                if (!b) return false;
+                if (b.speaker_id === c.character_id) return true;
+                const bTokens = _normCharTokens(b.speaker_id);
+                return bTokens.length > 0 && cTokens.length > 0 && (bTokens.every(t => cTokens.includes(t)) || cTokens.every(t => bTokens.includes(t)));
+              });
+              const barkLine = sampleBark ? (sampleBark.line_text || sampleBark.text || '') : '';
+              const rawAudio = sampleBark ? (sampleBark.voice_clip || sampleBark.audio_file || '') : '';
+              const audioFile = rawAudio ? rawAudio.split('/').pop() : null;
+              return `
+                <div class="character-sheet-card">
+                  <div style="display: flex; gap: 10px; align-items: center;">
+                    <img src="${escapeHtml(pUrl)}" alt="${escapeHtml(c.name)}" style="width: 56px; height: 56px; border-radius: 6px; border: 1px solid var(--cyan); image-rendering: pixelated; background: #02050e; object-fit: cover;" onerror="this.style.display='none'" />
+                    <div>
+                      <div style="font-weight: bold; font-size: 13px; color: var(--white);">${escapeHtml(c.name)}</div>
+                      <span class="task-badge-role" style="font-size: 9px;">${escapeHtml((c.role || 'npc').toUpperCase())}</span>
+                      ${traits ? `<div style="font-size: 10px; color: var(--amber); margin-top: 3px;">${escapeHtml(traits)}</div>` : ''}
+                    </div>
+                  </div>
+                  <div style="font-size: 11px; color: var(--light-gray); line-height: 1.4;">${escapeHtml(c.backstory || '')}</div>
+                  ${voiceDesc ? `<div style="font-size: 10px; color: var(--cyan);">🎙️ <strong>Voice (${escapeHtml(voiceName)}):</strong> ${escapeHtml(voiceDesc)}</div>` : ''}
+                  ${barkLine ? `<div style="font-size: 10.5px; color: var(--peach); font-style: italic; border-left: 2px solid var(--cyan); padding-left: 8px; margin-top: 2px;">"${escapeHtml(barkLine)}"</div>` : ''}
+                  ${audioFile ? `<audio controls preload="metadata" style="width: 100%; height: 28px; margin-top: 4px;" src="/api/assets/audio/${encodeURIComponent(audioFile)}" onerror="this.style.display='none'"></audio>` : ''}
+                </div>
+              `;
+            }).join('');
+        setHtmlIfChanged(charGallery, charHtml);
+      }
+
+      const cutscenesContainer = document.getElementById('bible-cutscenes-container');
+      if (cutscenesContainer) {
+        const cutscenesHtml = cutscenes.length === 0
+          ? ''
+          : `
+            <h4 style="color: var(--purple); font-size: 12px; text-transform: uppercase; margin: 8px 0;">🎬 Authored Cutscenes &amp; Dialogue (${cutscenes.length})</h4>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+              ${cutscenes.map(cs => {
+                const beats = Array.isArray(cs.beats) ? cs.beats : (Array.isArray(cs.lines) ? cs.lines : []);
+                return `
+                  <div class="blueprint-box" style="margin-top: 0;">
+                    <div style="font-weight: bold; color: var(--yellow); margin-bottom: 4px;">${escapeHtml(cs.title || cs.cutscene_id || cs.scene_id)} <span style="color: var(--slate); font-size: 10px;">(${escapeHtml(cs.trigger || cs.trigger_condition || '')})</span></div>
+                    <div style="display: flex; flex-direction: column; gap: 4px; font-size: 11px;">
+                      ${beats.map(b => `<div><strong style="color: var(--cyan);">${escapeHtml(b.speaker_id || 'Scene')}:</strong> ${escapeHtml(b.dialogue_line || b.text || b.action_description || '')}</div>`).join('')}
+                    </div>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          `;
+        setHtmlIfChanged(cutscenesContainer, cutscenesHtml);
+      }
+
+      // 5. Gameplay Pillars & World Spec
+      const pillarsContainer = document.getElementById('bible-pillars-container');
+      if (pillarsContainer) {
+        const ws = bible.world_spec || {};
+        const pillarsHtml = `
+          <div style="margin-bottom: 10px;">
+            <h5 style="color: var(--green); font-size: 11px; text-transform: uppercase; margin-bottom: 6px;">⚙️ Core Gameplay Pillars</h5>
+            ${pillars.length > 0
+              ? `<ul style="padding-left: 18px; color: var(--white); font-size: 11.5px; display: flex; flex-direction: column; gap: 4px;">${pillars.map(p => `<li>${escapeHtml(p)}</li>`).join('')}</ul>`
+              : '<div style="color: var(--slate); font-size: 11px;">No gameplay pillars locked yet.</div>'}
+          </div>
+          ${Object.keys(ws).length > 0 ? `
+            <div>
+              <h5 style="color: var(--cyan); font-size: 11px; text-transform: uppercase; margin-bottom: 6px;">🌍 Locked World Spec Blueprint</h5>
+              <pre class="json-dump" style="max-height: 320px;">${escapeHtml(JSON.stringify(ws, null, 2))}</pre>
+            </div>
+          ` : ''}
+        `;
+        setHtmlIfChanged(pillarsContainer, pillarsHtml);
+      }
+
+      // 6. Multi-Agent Final Sign-Off Council
+      const signoffReport = bible.sign_off_report || null;
+      const signoffCountEl = document.getElementById('bible-count-signoff');
+      const signoffContainer = document.getElementById('bible-signoff-container');
+      if (signoffReport && Array.isArray(signoffReport.verdicts) && signoffReport.verdicts.length > 0) {
+        const verdicts = signoffReport.verdicts;
+        const approvedCount = verdicts.filter(v => v.approved === true).length;
+        if (signoffCountEl) {
+          signoffCountEl.textContent = `${approvedCount}/${verdicts.length}`;
+        }
+        if (signoffContainer) {
+          const allApproved = Boolean(signoffReport.unanimous_approval !== undefined ? signoffReport.unanimous_approval : signoffReport.all_specialists_approved);
+          const vetoRoles = Array.isArray(signoffReport.vetoing_roles)
+            ? signoffReport.vetoing_roles
+            : verdicts.filter(v => !v.approved).map(v => v.specialist_role);
+          const bannerCol = allApproved ? 'var(--green)' : 'var(--neon-red)';
+          const bannerBg = allApproved ? 'rgba(0, 228, 54, 0.12)' : 'rgba(255, 0, 77, 0.12)';
+          const statusTitle = allApproved
+            ? `✅ UNANIMOUS MULTI-AGENT SIGN-OFF (${approvedCount}/${verdicts.length} Specialists Approved)`
+            : `❌ VETOED BY SPECIALIST COUNCIL (${approvedCount}/${verdicts.length} Approved — ${vetoRoles.join(', ')})`;
+
+          const verdictCardsHtml = verdicts.map(v => {
+            const isOk = v.approved === true;
+            const roleName = escapeHtml(v.specialist_role || 'Specialist');
+            const scorePct = typeof v.fidelity_score === 'number' ? `Fidelity: ${Math.round(v.fidelity_score * 100)}%` : '';
+            const badgeCol = isOk ? 'var(--green)' : 'var(--neon-red)';
+            const badgeBg = isOk ? 'rgba(0, 228, 54, 0.18)' : 'rgba(255, 0, 77, 0.2)';
+            const defects = Array.isArray(v.blocking_defects) ? v.blocking_defects : [];
+            const remedies = Array.isArray(v.remediation_directives)
+              ? v.remediation_directives
+              : (v.required_remediation ? [v.required_remediation] : []);
+            return `
+              <div class="blueprint-box" style="margin-top: 0; border-left: 3px solid ${badgeCol}; background: #070e22;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; gap: 8px; flex-wrap: wrap;">
+                  <div style="display: flex; align-items: center; gap: 8px;">
+                    <strong style="color: var(--white); font-size: 12.5px;">${roleName}</strong>
+                    ${scorePct ? `<span style="font-size: 10px; color: var(--cyan); font-family: monospace;">${scorePct}</span>` : ''}
+                  </div>
+                  <span style="padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; border: 1px solid ${badgeCol}; background: ${badgeBg}; color: ${badgeCol};">
+                    ${isOk ? '✓ SIGNED OFF' : '✗ VETOED'}
+                  </span>
+                </div>
+                <div style="font-size: 11px; color: var(--light-gray); line-height: 1.45; margin-bottom: ${defects.length > 0 || remedies.length > 0 ? '6px' : '0'};">
+                  <strong style="color: var(--amber);">🧠 Deliberation:</strong> ${escapeHtml(v.deliberation || '')}
+                </div>
+                ${defects.length > 0 ? `
+                  <div style="font-size: 10.5px; color: var(--neon-red); margin-top: 4px;">
+                    <strong>Blocking Defects:</strong>
+                    <ul style="margin: 3px 0 0 16px; padding: 0;">
+                      ${defects.map(d => `<li>${escapeHtml(d)}</li>`).join('')}
+                    </ul>
+                  </div>
+                ` : ''}
+                ${remedies.length > 0 ? `
+                  <div style="font-size: 10.5px; color: var(--yellow); margin-top: 4px;">
+                    <strong>Remediation Directives:</strong>
+                    <ul style="margin: 3px 0 0 16px; padding: 0;">
+                      ${remedies.map(r => `<li>${escapeHtml(r)}</li>`).join('')}
+                    </ul>
+                  </div>
+                ` : ''}
+              </div>
+            `;
+          }).join('');
+
+          const signoffHtml = `
+            <div style="background: ${bannerBg}; border: 1px solid ${bannerCol}; border-radius: 6px; padding: 12px 14px; margin-bottom: 12px;">
+              <div style="font-weight: bold; color: ${bannerCol}; font-size: 13px; margin-bottom: 4px;">${statusTitle}</div>
+              <div style="font-size: 11px; color: var(--light-gray); line-height: 1.4;">${escapeHtml(signoffReport.deliberation || '')}</div>
+              ${signoffReport.synthesized_repair_directive ? `
+                <div style="margin-top: 8px; padding: 8px; background: rgba(0,0,0,0.45); border-radius: 4px; font-size: 10.5px; color: var(--peach); white-space: pre-wrap;">${escapeHtml(signoffReport.synthesized_repair_directive)}</div>
+              ` : ''}
+            </div>
+            <div style="margin-bottom: 12px;">
+              <h5 style="color: var(--cyan); font-size: 11px; text-transform: uppercase; margin-bottom: 8px;">📸 Playtest Viewport Captures Inspected by Council</h5>
+              <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                <div class="mockup-card" onclick="openMockupLightbox('/api/artifacts/content?filename=playtest_t0.png', 'Playtest Startup Capture (t=0s)', 'playtest_capture', 'Startup viewport frame inspected by VisualArtDirector & UXExperienceDesigner')">
+                  <img src="/api/artifacts/content?filename=playtest_t0.png" alt="Playtest t=0s Capture" loading="lazy" onerror="this.parentElement.style.display='none'" />
+                  <div style="padding: 6px 10px; font-size: 10.5px; color: var(--light-gray);">Startup Viewport Frame (<code>playtest_t0.png</code>)</div>
+                </div>
+                <div class="mockup-card" onclick="openMockupLightbox('/api/artifacts/content?filename=playtest_tend.png', 'Playtest Post-Action Capture (t=end)', 'playtest_capture', 'Active gameplay frame after simulated player inputs')">
+                  <img src="/api/artifacts/content?filename=playtest_tend.png" alt="Playtest t=end Capture" loading="lazy" onerror="this.parentElement.style.display='none'" />
+                  <div style="padding: 6px 10px; font-size: 10.5px; color: var(--light-gray);">Active Gameplay Frame (<code>playtest_tend.png</code>)</div>
+                </div>
+              </div>
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 10px;">
+              ${verdictCardsHtml}
+            </div>
+          `;
+          setHtmlIfChanged(signoffContainer, signoffHtml);
+        }
+      } else {
+        if (signoffCountEl) signoffCountEl.textContent = '0/6';
+      }
+
+      renderGameBlueprintPanel(latestHeatmapData, cachedGameBible);
+      updateBibleProductionBanner();
+    }
+
+    function updateBibleProductionBanner() {
+      if (typeof updateHeaderBuildStatus === 'function') {
+        updateHeaderBuildStatus();
+      }
+      const bannerEl = document.getElementById('bible-production-progress-banner');
+      const btnApprove = document.getElementById('btn-approve-greenlight');
+      const bible = cachedGameBible || {};
+      const st = (bible.status || 'idle').toLowerCase();
+      const orchState = (bible.orchestrator_state || 'IDLE').toUpperCase();
+      const reqResp = observabilityState.cachedRequirementsSpec || {};
+      const hasReqSpec = Boolean((reqResp.has_active_spec || reqResp.has_spec) && Array.isArray(reqResp.requirements) && reqResp.requirements.length > 0);
+      const tracks = hasReqSpec ? reqResp.requirements : [];
+      const running = typeof isBuildActivelyRunning === 'function' ? isBuildActivelyRunning() : false;
+
+      if (btnApprove) {
+        if (st === 'awaiting_greenlight' || orchState === 'AWAITING_GREENLIGHT') {
+          btnApprove.disabled = false;
+          btnApprove.innerHTML = '✅ Greenlight &amp; Build';
+          btnApprove.style.opacity = '1';
+        } else if (st === 'locked' || st === 'greenlit') {
+          const allDone = tracks.length > 0 && tracks.every(t => (t.status || '').toLowerCase() === 'completed' || (t.status || '').toLowerCase() === 'satisfied');
+          btnApprove.disabled = true;
+          btnApprove.innerHTML = allDone
+            ? '✅ Greenlit — Cartridge Built'
+            : (running ? '⚙️ Greenlit — Building Game...' : '⏸️ Greenlit — Ready to Resume');
+          btnApprove.style.opacity = '0.85';
+        } else {
+          btnApprove.disabled = false;
+          btnApprove.innerHTML = '✅ Greenlight &amp; Build';
+          btnApprove.style.opacity = '1';
+        }
+      }
+
+      if (!bannerEl) return;
+
+      if (st === 'brainstorming') {
+        bannerEl.style.display = 'none';
+        return;
+      }
+
+      if (st === 'awaiting_greenlight' || (orchState === 'AWAITING_GREENLIGHT' && st !== 'idle')) {
+        bannerEl.style.display = 'block';
+        bannerEl.style.borderColor = 'var(--yellow)';
+        const waitHtml = `
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;">
+            <div>
+              <div style="font-weight: bold; color: var(--yellow); font-size: 13px;">⏸️ Paused for Executive Producer Greenlight</div>
+              <div style="font-size: 11.5px; color: var(--light-gray); margin-top: 2px;">Review the Living Game Bible below. Inject creative direction via <strong>💬 Steer Room</strong> or click <strong>✅ Greenlight &amp; Build</strong> to launch code &amp; asset synthesis.</div>
+            </div>
+          </div>
+        `;
+        setHtmlIfChanged(bannerEl, waitHtml);
+        return;
+      }
+
+      if (st === 'locked' || st === 'greenlit' || orchState === 'SYNTHESIZING' || orchState === 'VERIFYING' || hasReqSpec) {
+        bannerEl.style.display = 'block';
+        bannerEl.style.borderColor = running ? 'var(--cyan)' : 'var(--green)';
+        const completedCount = tracks.filter(t => ['completed', 'satisfied'].includes((t.status || '').toLowerCase())).length;
+        const inProgTrack = tracks.find(t => (t.status || '').toLowerCase() === 'in_progress');
+        const nextTrack = tracks.find(t => !['completed', 'satisfied'].includes((t.status || '').toLowerCase()));
+        const totalTracks = tracks.length;
+        const pct = totalTracks > 0 ? Math.round((completedCount / totalTracks) * 100) : 0;
+
+        const pillsHtml = tracks.map(t => {
+          const tSt = (t.status || 'pending').toLowerCase();
+          let icon = '⏳';
+          let borderCol = 'var(--navy)';
+          let bgCol = '#060b19';
+          let textCol = 'var(--light-gray)';
+          if (tSt === 'completed' || tSt === 'satisfied') {
+            icon = '✅';
+            borderCol = 'var(--green)';
+            bgCol = 'rgba(0, 228, 54, 0.14)';
+            textCol = 'var(--green)';
+          } else if (tSt === 'in_progress') {
+            icon = '🔄';
+            borderCol = 'var(--cyan)';
+            bgCol = 'rgba(41, 173, 255, 0.18)';
+            textCol = 'var(--cyan)';
+          } else if (tSt === 'rejected') {
+            icon = '❌';
+            borderCol = 'var(--neon-red)';
+            bgCol = 'rgba(255, 0, 77, 0.15)';
+            textCol = 'var(--neon-red)';
+          }
+          return `<span style="display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: 4px; border: 1px solid ${borderCol}; background: ${bgCol}; color: ${textCol}; font-size: 11px; font-weight: 600;">${icon} ${escapeHtml(t.id)}: ${escapeHtml(t.title || '')}</span>`;
+        }).join('');
+
+        let statusHeadline = '';
+        if (running && inProgTrack) {
+          statusHeadline = `⚙️ Actively Implementing ${escapeHtml(inProgTrack.id)}: "${escapeHtml(inProgTrack.title || '')}"`;
+        } else if (running) {
+          statusHeadline = `⚙️ Living Game Bible Locked — Synthesizing Requirements, Code & Assets (${orchState})`;
+        } else if (totalTracks > 0 && completedCount === totalTracks) {
+          statusHeadline = `🎉 All ${totalTracks} Requirement Tracks Implemented & Verified!`;
+        } else if (nextTrack) {
+          statusHeadline = `⏸️ Build Ready to Resume at ${escapeHtml(nextTrack.id)}: "${escapeHtml(nextTrack.title || '')}"`;
+        } else {
+          statusHeadline = `⏸️ Living Game Bible Locked — Ready to Resume Development`;
+        }
+
+        const prodHtml = `
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: ${totalTracks > 0 ? '8px' : '0'};">
+            <div style="flex: 1; min-width: 280px;">
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <span style="font-weight: bold; color: ${running ? 'var(--cyan)' : 'var(--green)'}; font-size: 13px;">${statusHeadline}</span>
+                ${totalTracks > 0 ? `<span class="status-pill status-success" style="font-size: 10px;">${completedCount} / ${totalTracks} Tracks (${pct}%)</span>` : ''}
+              </div>
+              <div style="font-size: 11px; color: var(--light-gray); margin-top: 3px;">
+                The Writers' Room has handed off the locked Game Bible to the 9-agent engineering &amp; art swarm.
+              </div>
+            </div>
+            <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+              ${(!running && (totalTracks === 0 || completedCount < totalTracks)) ? `
+                <button type="button" class="btn-primary" onclick="triggerResumeGameBuild()" style="background: rgba(255, 163, 0, 0.22); border-color: var(--amber); color: var(--yellow); padding: 6px 12px; font-size: 11px;">
+                  ▶️ Resume Development${nextTrack ? ` (${escapeHtml(nextTrack.id)})` : ''}
+                </button>
+              ` : ''}
+              <button type="button" class="btn-primary" onclick="switchMainWorkspace('telemetry')" style="background: rgba(41, 173, 255, 0.2); border-color: var(--cyan); color: var(--cyan); padding: 6px 12px; font-size: 11px;">
+                🕸️ Watch Live Agent Swarm &amp; Code Diffs
+              </button>
+              <button type="button" class="btn-primary" onclick="openDrawerToTab('backlog')" style="background: rgba(0, 228, 54, 0.2); border-color: var(--green); color: var(--green); padding: 6px 12px; font-size: 11px;">
+                📋 Open Requirements &amp; Checkpoints (${completedCount}/${totalTracks || 0})
+              </button>
+            </div>
+          </div>
+          ${totalTracks > 0 ? `
+            <div class="backlog-progress-bar-container" style="margin-bottom: 8px; height: 6px;">
+              <div class="backlog-progress-bar-fill" style="width: ${pct}%;"></div>
+            </div>
+            <div style="display: flex; gap: 6px; flex-wrap: wrap;">${pillsHtml}</div>
+          ` : ''}
+        `;
+        setHtmlIfChanged(bannerEl, prodHtml);
+        return;
+      }
+
+      bannerEl.style.display = 'none';
+    }
+
+    window.openDrawerToTab = function(tabName) {
+      if (typeof openDrawer === 'function') openDrawer();
+      if (typeof switchDrawerTab === 'function') switchDrawerTab(tabName || 'backlog');
+    };
+
+    async function loadGameBible() {
+      try {
+        const res = await fetch('/api/studio/game-bible');
+        if (!res.ok) return;
+        const data = await res.json();
+        renderGameBible(data);
+      } catch (e) {
+        // Ignore transient fetch errors
+      }
+    }
+
+    function handleLiveWritersRoomEvent(ev) {
+      const evType = (ev.event_type || '').toLowerCase();
+      const payload = ev.payload || {};
+      if (evType === 'game_bible_updated' && payload && payload.game_title !== undefined && Array.isArray(payload.writers_room_transcript)) {
+        renderGameBible(payload);
+        return;
+      }
+      if (evType === 'writers_room_utterance' && payload && (payload.spoken_dialogue || payload.message)) {
+        if (!cachedGameBible) {
+          loadGameBible();
+          return;
+        }
+        const list = cachedGameBible.writers_room_transcript || [];
+        if (!payload.utterance_id || !list.some(u => u.utterance_id === payload.utterance_id)) {
+          list.push(payload);
+          cachedGameBible.writers_room_transcript = list;
+          renderGameBible(cachedGameBible);
+        }
+        return;
+      }
+      loadGameBible();
+    }
+
+    async function submitGreenlightDecision(approved) {
+      const inputEl = document.getElementById('input-steering-feedback');
+      const btnApprove = document.getElementById('btn-approve-greenlight');
+      const feedback = inputEl ? inputEl.value.trim() : '';
+      if (approved && btnApprove) {
+        btnApprove.disabled = true;
+        btnApprove.innerHTML = '⏳ Greenlighting &amp; Starting Build...';
+      }
+      try {
+        const res = await fetch('/api/studio/greenlight', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deliberation: approved
+              ? 'Executive Producer greenlit the Living Game Bible from Mission Control.'
+              : `Executive Producer injected creative steering into the Writers' Room: ${feedback}`,
+            approved: Boolean(approved),
+            feedback: feedback,
+          }),
+        });
+        if (res.ok) {
+          if (inputEl) inputEl.value = '';
+          await Promise.all([loadGameBible(), fetchRequirementsBacklog(), fetchTaskHistory()]);
+          updateBibleProductionBanner();
+        }
+      } catch (e) {
+        console.warn('Failed submitting greenlight decision:', e);
+      }
+    }
+
+    function initWritersRoomWorkspace() {
+      document.getElementById('ws-tab-telemetry')?.addEventListener('click', () => switchMainWorkspace('telemetry'));
+      document.getElementById('ws-tab-bible')?.addEventListener('click', () => switchMainWorkspace('bible'));
+
+      const transcriptList = document.getElementById('writers-room-transcript-list');
+      if (transcriptList) {
+        transcriptList.addEventListener('scroll', () => {
+          const threshold = 45;
+          const distanceFromBottom = transcriptList.scrollHeight - (transcriptList.scrollTop + transcriptList.clientHeight);
+          isWritersRoomAutoScroll = distanceFromBottom < threshold;
+        });
+        transcriptList.addEventListener('toggle', (e) => {
+          const detailsEl = e.target;
+          if (detailsEl && detailsEl.classList && detailsEl.classList.contains('utterance-delib-details')) {
+            const uttId = detailsEl.getAttribute('data-utterance-id');
+            if (uttId) {
+              if (detailsEl.open) {
+                openUtteranceDelibIds.add(uttId);
+              } else {
+                openUtteranceDelibIds.delete(uttId);
+              }
+            }
+          }
+        }, true);
+      }
+
+      document.querySelectorAll('.bible-subtab-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const tab = btn.getAttribute('data-bible-tab');
+          if (tab) switchBibleSubtab(tab);
+        });
+      });
+
+      document.getElementById('btn-close-mockup-lightbox')?.addEventListener('click', () => {
+        const dlg = document.getElementById('bible-mockup-lightbox');
+        if (dlg && typeof dlg.close === 'function') dlg.close();
+      });
+
+      const newGameModal = document.getElementById('new-game-modal');
+      const closeNewGameModal = () => {
+        if (newGameModal && typeof newGameModal.close === 'function') {
+          newGameModal.close();
+        }
+      };
+      document.getElementById('btn-close-new-game-modal')?.addEventListener('click', closeNewGameModal);
+      document.getElementById('btn-cancel-new-game')?.addEventListener('click', closeNewGameModal);
+
+      document.getElementById('form-new-game-scratch')?.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const promptEl = document.getElementById('input-new-game-prompt');
+        const pauseEl = document.getElementById('modal-pause-greenlight');
+        const creativePrompt = promptEl ? promptEl.value.trim() : '';
+        const pauseForGreenlight = Boolean(pauseEl && pauseEl.checked);
+        closeNewGameModal();
+        if (promptEl) promptEl.value = '';
+        await triggerNewGameFromScratch({ creativePrompt, pauseForGreenlight });
+      });
+
+      // Fallback for browsers without native HTMLDialogElement.prototype.closedBy support
+      if (typeof HTMLDialogElement !== 'undefined' && !('closedBy' in HTMLDialogElement.prototype)) {
+        document.querySelectorAll('dialog[closedby="any"]').forEach(dlg => {
+          dlg.addEventListener('click', (event) => {
+            const rect = dlg.getBoundingClientRect();
+            const isInDialog =
+              rect.top <= event.clientY &&
+              event.clientY <= rect.top + rect.height &&
+              rect.left <= event.clientX &&
+              event.clientX <= rect.left + rect.width;
+            if (!isInDialog && typeof dlg.close === 'function') {
+              dlg.close();
+            }
+          });
+        });
+      }
+
+      document.getElementById('btn-inject-steering')?.addEventListener('click', () => submitGreenlightDecision(false));
+      document.getElementById('btn-approve-greenlight')?.addEventListener('click', () => submitGreenlightDecision(true));
+
+      const togglePause = document.getElementById('toggle-pause-greenlight');
+      if (togglePause) {
+        togglePause.addEventListener('change', async () => {
+          try {
+            await fetch('/api/studio/settings', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                deliberation: `Operator toggled pause_for_greenlight=${togglePause.checked}`,
+                pause_for_greenlight: togglePause.checked,
+              }),
+            });
+          } catch (e) {
+            console.warn('Failed updating studio settings:', e);
+          }
+        });
+      }
+    }
+
     // Initialize UI components
     loadSteamDNA();
     loadHeatmap();
@@ -3399,6 +5216,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     loadArtifacts();
     loadDiff();
     initTaskObservability();
+    initWritersRoomWorkspace();
+    loadGameBible();
   </script>
 </body>
 </html>

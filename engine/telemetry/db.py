@@ -5,17 +5,29 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 import logging
+import os
 from pathlib import Path
 import sqlite3
+import sys
+import tempfile
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("TelemetryDB")
+
+_PRODUCTION_TELEMETRY_DB = (Path(__file__).resolve().parent.parent.parent / "data" / "telemetry.db").resolve()
 
 
 class TelemetryDB:
     """Manages SQLite database connections, schemas, and WAL pragmas."""
 
     def __init__(self, db_path: str | Path = "data/telemetry.db"):
+        resolved_candidate = Path(db_path).resolve()
+        if resolved_candidate == _PRODUCTION_TELEMETRY_DB:
+            env_override = os.environ.get("STUDIO_DB_PATH")
+            if env_override:
+                db_path = Path(env_override)
+            elif "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
+                db_path = Path(tempfile.gettempdir()) / "pytest_isolated_telemetry.db"
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.initialize_database()
@@ -675,11 +687,11 @@ class TelemetryDB:
         build_id: str,
         spec: Any,
     ) -> None:
-        """Records requirement tracks from a GameRequirementsSpec into studio_requirements."""
+        """Records requirement tracks and full GameRequirementsSpec (including asset_manifest) into SQLite."""
         if hasattr(spec, "model_dump"):
             spec_data = spec.model_dump()
         elif isinstance(spec, dict):
-            spec_data = spec
+            spec_data = dict(spec)
         else:
             return
 
@@ -687,6 +699,45 @@ class TelemetryDB:
         now_utc = datetime.now(timezone.utc).isoformat()
         conn = self.get_write_connection()
         try:
+            # 1. Persist full GameRequirementsSpec JSON (preserving asset_manifest, high_concept_summary, etc.)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS studio_requirement_specs (
+                        build_id TEXT PRIMARY KEY,
+                        spec_id TEXT,
+                        game_title TEXT,
+                        genre_paradigm TEXT,
+                        spec_json TEXT NOT NULL,
+                        updated_at_utc TEXT NOT NULL
+                    );
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_requirement_specs (
+                        build_id, spec_id, game_title, genre_paradigm, spec_json, updated_at_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(build_id) DO UPDATE SET
+                        spec_id=excluded.spec_id,
+                        game_title=excluded.game_title,
+                        genre_paradigm=excluded.genre_paradigm,
+                        spec_json=excluded.spec_json,
+                        updated_at_utc=excluded.updated_at_utc
+                    """,
+                    (
+                        build_id,
+                        str(spec_data.get("spec_id") or ""),
+                        str(spec_data.get("game_title") or ""),
+                        str(spec_data.get("genre_paradigm") or spec_data.get("genre_verdict") or ""),
+                        json.dumps(spec_data, default=str),
+                        now_utc,
+                    ),
+                )
+            except Exception as e:
+                logger.debug("studio_requirement_specs upsert error: %s", e)
+
+            # 2. Persist normalized track rows into studio_requirements
             for idx, req in enumerate(requirements):
                 if hasattr(req, "model_dump"):
                     req = req.model_dump()
@@ -735,7 +786,7 @@ class TelemetryDB:
         status: str,
         updated_at_utc: Optional[str] = None,
     ) -> None:
-        """Updates the status of a specific requirement in studio_requirements."""
+        """Updates the status of a specific requirement in studio_requirements and studio_requirement_specs."""
         now_utc = updated_at_utc or datetime.now(timezone.utc).isoformat()
         conn = self.get_write_connection()
         try:
@@ -747,6 +798,21 @@ class TelemetryDB:
                 """,
                 (status, now_utc, build_id, requirement_id),
             )
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT spec_json FROM studio_requirement_specs WHERE build_id = ?;", (build_id,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    spec_dict = json.loads(row[0])
+                    for r in spec_dict.get("requirements", []):
+                        if isinstance(r, dict) and (r.get("id") == requirement_id or r.get("track_id") == requirement_id):
+                            r["status"] = status
+                    conn.execute(
+                        "UPDATE studio_requirement_specs SET spec_json = ?, updated_at_utc = ? WHERE build_id = ?;",
+                        (json.dumps(spec_dict, default=str), now_utc, build_id),
+                    )
+            except Exception:
+                pass
             conn.commit()
         finally:
             conn.close()
@@ -784,6 +850,33 @@ class TelemetryDB:
             return rows
         finally:
             conn.close()
+
+    def get_studio_requirements_spec(self, build_id: str) -> Optional[Dict[str, Any]]:
+        """Returns the full GameRequirementsSpec dictionary (including asset_manifest) merged with latest track statuses."""
+        conn = self.get_reader_connection()
+        spec_dict: Optional[Dict[str, Any]] = None
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT spec_json FROM studio_requirement_specs WHERE build_id = ?;", (build_id,))
+            row = cur.fetchone()
+            if row and row["spec_json"]:
+                spec_dict = json.loads(row["spec_json"])
+        except Exception:
+            spec_dict = None
+        finally:
+            conn.close()
+
+        tracks = self.get_studio_requirements(build_id=build_id)
+        if spec_dict and isinstance(spec_dict, dict):
+            if tracks:
+                status_by_id = {str(t.get("id") or t.get("requirement_id")): t.get("status", "pending") for t in tracks}
+                for req in spec_dict.get("requirements", []):
+                    if isinstance(req, dict):
+                        rid = str(req.get("id") or req.get("track_id") or "")
+                        if rid in status_by_id:
+                            req["status"] = status_by_id[rid]
+            return spec_dict
+        return None
 
     def record_studio_checkpoint(
         self,
@@ -847,5 +940,102 @@ class TelemetryDB:
             return rows
         finally:
             conn.close()
+
+    def upsert_game_bible(
+        self,
+        bible: Any = None,
+        *,
+        bible_id: Optional[str] = None,
+        cartridge_id: Optional[str] = None,
+        status: Optional[str] = None,
+        bible_dict: Optional[Dict[str, Any]] = None,
+        build_id: Optional[str] = None,
+    ) -> None:
+        """Upserts a GameBibleSpec (or dict) into studio_game_bibles."""
+        target_bible = bible if bible is not None else bible_dict
+        if hasattr(target_bible, "model_dump"):
+            b_dict = target_bible.model_dump(mode="json")
+            bible_json = target_bible.model_dump_json()
+        elif isinstance(target_bible, dict):
+            b_dict = dict(target_bible)
+            bible_json = json.dumps(b_dict, default=str)
+        else:
+            raise ValueError(f"Unsupported game bible type: {type(target_bible)}")
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        resolved_bible_id = str(bible_id or b_dict.get("bible_id") or f"game_bible_{uuid.uuid4().hex[:8]}")
+        resolved_cartridge_id = str(cartridge_id or build_id or b_dict.get("cartridge_id") or "active")
+        target_ep = int(b_dict.get("target_episode", 0) or 0)
+        resolved_status = str(b_dict.get("status") or status or "brainstorming").lower()
+        game_title = str(b_dict.get("game_title") or "Untitled Concept")
+        created_at = str(b_dict.get("created_at_utc") or now_iso)
+        updated_at = str(b_dict.get("updated_at_utc") or now_iso)
+
+        conn = self.get_write_connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO studio_game_bibles (
+                    bible_id, cartridge_id, target_episode, status,
+                    game_title, bible_json, created_at_utc, updated_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(bible_id) DO UPDATE SET
+                    cartridge_id=excluded.cartridge_id,
+                    target_episode=excluded.target_episode,
+                    status=excluded.status,
+                    game_title=excluded.game_title,
+                    bible_json=excluded.bible_json,
+                    updated_at_utc=excluded.updated_at_utc
+                """,
+                (
+                    resolved_bible_id,
+                    resolved_cartridge_id,
+                    target_ep,
+                    resolved_status,
+                    game_title,
+                    bible_json,
+                    created_at,
+                    updated_at,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_latest_game_bible(
+        self,
+        cartridge_id: Optional[str] = None,
+        build_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Returns the latest GameBibleSpec dictionary from studio_game_bibles."""
+        conn = self.get_reader_connection()
+        try:
+            cur = conn.cursor()
+            if cartridge_id:
+                cur.execute(
+                    "SELECT * FROM studio_game_bibles WHERE cartridge_id = ? ORDER BY updated_at_utc DESC LIMIT 1;",
+                    (cartridge_id,),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM studio_game_bibles ORDER BY updated_at_utc DESC LIMIT 1;"
+                )
+            row = cur.fetchone()
+            if not row:
+                return None
+            row_dict = dict(row)
+            raw_json = row_dict.get("bible_json", "{}")
+            try:
+                parsed = json.loads(raw_json)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+            return row_dict
+        except Exception:
+            return None
+        finally:
+            conn.close()
+
 
 

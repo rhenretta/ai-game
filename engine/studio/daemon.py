@@ -56,10 +56,264 @@ class StudioDaemonConfig(BaseModel):
     active_cartridge_dir: Path = Field(default=PROJECT_ROOT / "cartridges" / "active", description="Active cartridge path")
     lock_file: Path = Field(default=PROJECT_ROOT / "studio.lock", description="Process lockfile for concurrency guard")
     min_disk_space_mb: float = Field(default=100.0, description="Minimum free disk space threshold in MB")
+    creative_prompt: Optional[str] = Field(default=None, description="Optional Executive Producer creative seed/prompt for Genesis")
+    resume_current: bool = Field(default=False, description="Resume the latest in-progress or failed Genesis candidate from its persisted Game Bible and Requirements")
 
 
 _lock_mutex = threading.Lock()
 _genesis_build_lock = threading.Lock()
+
+
+def rehydrate_resumable_candidate_from_db(
+    db_path: Path,
+    cartridges_root: Path,
+) -> Optional[Path]:
+    """Rehydrates a resumable candidate_genesis_* directory from SQLite if missing or incomplete on disk."""
+    from engine.studio.models import (
+        AcceptanceCriterion,
+        GameBibleSpec,
+        GameRequirementsSpec,
+        GenesisWorldSpec,
+        NarrativeBible,
+        RequirementTrack,
+    )
+    from engine.telemetry.db import TelemetryDB
+
+    cartridges_root.mkdir(parents=True, exist_ok=True)
+    bible_dict: Optional[Dict[str, Any]] = None
+    req_rows: List[Dict[str, Any]] = []
+    cand_name: Optional[str] = None
+
+    if db_path and db_path.exists():
+        try:
+            db = TelemetryDB(db_path)
+            bible_dict = db.get_latest_game_bible()
+            if bible_dict:
+                raw_cid = str(bible_dict.get("cartridge_id") or "").strip()
+                if raw_cid.startswith("build_"):
+                    raw_cid = raw_cid[len("build_"):]
+                if raw_cid and raw_cid != "active":
+                    cand_name = raw_cid
+            if cand_name:
+                req_rows = db.get_studio_requirements(build_id=f"build_{cand_name}")
+            if not req_rows:
+                req_rows = db.get_studio_requirements()
+                if req_rows and not cand_name:
+                    raw_bid = str(req_rows[-1].get("build_id") or "").strip()
+                    if raw_bid.startswith("build_"):
+                        cand_name = raw_bid[len("build_"):]
+                    req_rows = [r for r in req_rows if r.get("build_id") == raw_bid]
+        except Exception as exc:
+            logger.warning("Failed reading telemetry DB during candidate rehydration: %s", exc)
+
+    if not cand_name:
+        existing_cands = sorted(
+            [
+                d
+                for d in cartridges_root.glob("candidate_genesis_*")
+                if d.is_dir()
+            ],
+            key=lambda d: d.stat().st_mtime,
+            reverse=True,
+        )
+        if existing_cands:
+            cand_name = existing_cands[0].name
+
+    if not cand_name:
+        return None
+
+    staging_dir = cartridges_root / cand_name
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Rehydrate game_bible.json, world_spec.json, manifest.json, narrative_bible.json, narrative.json
+    world_spec_obj: Optional[GenesisWorldSpec] = None
+    if bible_dict:
+        gb_path = staging_dir / "game_bible.json"
+        if not gb_path.is_file():
+            try:
+                gb_obj = GameBibleSpec.model_validate(bible_dict)
+                gb_path.write_text(gb_obj.model_dump_json(indent=2), encoding="utf-8")
+            except Exception:
+                gb_path.write_text(json.dumps(bible_dict, indent=2), encoding="utf-8")
+
+        ws_raw = bible_dict.get("world_spec")
+        ws_path = staging_dir / "world_spec.json"
+        if isinstance(ws_raw, dict) and ws_raw:
+            try:
+                world_spec_obj = GenesisWorldSpec.model_validate(ws_raw)
+                if not ws_path.is_file():
+                    ws_path.write_text(world_spec_obj.model_dump_json(indent=2), encoding="utf-8")
+                manifest_path = staging_dir / "manifest.json"
+                if not manifest_path.is_file():
+                    manifest_dict = {
+                        "deliberation": world_spec_obj.deliberation,
+                        "game_title": world_spec_obj.game_title,
+                        "genre": world_spec_obj.core_genre,
+                        "engine_type": "godot4",
+                        "entrypoint": "res://main.tscn",
+                        "version": "0.1.0",
+                        "palette_mood": world_spec_obj.palette_mood,
+                        "narrative_premise": getattr(world_spec_obj, "narrative_premise", None) or (bible_dict or {}).get("creative_vision_summary", ""),
+                    }
+                    manifest_path.write_text(
+                        json.dumps(manifest_dict, indent=2),
+                        encoding="utf-8",
+                    )
+            except Exception as ws_exc:
+                logger.warning("Failed rehydrating world_spec.json: %s", ws_exc)
+
+        nb_raw = bible_dict.get("narrative_bible")
+        nb_path = staging_dir / "narrative_bible.json"
+        nar_path = staging_dir / "narrative.json"
+        if isinstance(nb_raw, dict) and nb_raw and (not nb_path.is_file() or not nar_path.is_file()):
+            try:
+                nb_obj = NarrativeBible.model_validate(nb_raw)
+                if getattr(nb_obj, "dialogue_barks", None):
+                    nb_obj.dialogue_barks = list(nb_obj.dialogue_barks)[:3]
+                    for idx, b in enumerate(nb_obj.dialogue_barks):
+                        wav_name = Path(b.voice_clip).name if getattr(b, "voice_clip", None) else f"{b.bark_id or f'bark_{idx}'}.wav"
+                        if not wav_name.endswith(".wav"):
+                            wav_name = f"{wav_name}.wav"
+                        b.voice_clip = f"assets/audio/{wav_name}"
+                if getattr(nb_obj, "characters", None):
+                    for idx, c in enumerate(nb_obj.characters):
+                        p_name = Path(c.portrait_asset).name if getattr(c, "portrait_asset", None) else f"{c.character_id or f'char_{idx}'}_portrait.png"
+                        if not p_name.endswith(".png"):
+                            p_name = f"{p_name}.png"
+                        c.portrait_asset = f"assets/sprites/{p_name}"
+                nb_path.write_text(nb_obj.model_dump_json(indent=2), encoding="utf-8")
+                nar_path.write_text(
+                    json.dumps(nb_obj.to_cartridge_narrative_dict(), indent=2),
+                    encoding="utf-8",
+                )
+            except Exception as nb_exc:
+                logger.warning("Failed rehydrating narrative_bible.json: %s", nb_exc)
+
+        # Ensure 16:9 mockup PNGs exist on disk
+        mockups_raw = bible_dict.get("visual_mockups")
+        if isinstance(mockups_raw, list) and mockups_raw:
+            mockups_dir = staging_dir / "assets" / "mockups"
+            mockups_dir.mkdir(parents=True, exist_ok=True)
+            for idx, m in enumerate(mockups_raw):
+                if not isinstance(m, dict):
+                    continue
+                rel_p = str(m.get("image_path") or m.get("file_path") or f"assets/mockups/mockup_{idx + 1}.png")
+                target_png = staging_dir / rel_p if not Path(rel_p).is_absolute() else mockups_dir / Path(rel_p).name
+                if not target_png.is_file():
+                    try:
+                        from engine.studio.writers_room import CreativeWritersRoom
+                        target_png.parent.mkdir(parents=True, exist_ok=True)
+                        CreativeWritersRoom._render_procedural_16x9_png(
+                            target_png,
+                            seed_text=f"{m.get('title', 'Mockup')}:{m.get('scene_description', '')}",
+                            palette_hex=["#0b1d26", "#1b4d3e", "#2dd4bf", "#f59e0b"],
+                        )
+                    except Exception:
+                        pass
+
+    if world_spec_obj is None and (staging_dir / "world_spec.json").is_file():
+        try:
+            world_spec_obj = GenesisWorldSpec.model_validate_json(
+                (staging_dir / "world_spec.json").read_text(encoding="utf-8")
+            )
+        except Exception:
+            world_spec_obj = None
+
+    # 2. Rehydrate or reset requirements_spec.json
+    req_path = staging_dir / "requirements_spec.json"
+    req_spec_obj: Optional[GameRequirementsSpec] = None
+    if req_path.is_file():
+        try:
+            req_spec_obj = GameRequirementsSpec.model_validate_json(req_path.read_text(encoding="utf-8"))
+        except Exception:
+            req_spec_obj = None
+
+    if req_spec_obj is None and req_rows:
+        try:
+            g_title = (
+                getattr(world_spec_obj, "game_title", None)
+                or (bible_dict or {}).get("game_title")
+                or "Resumed Game Project"
+            )
+            g_genre = (
+                getattr(world_spec_obj, "core_genre", None)
+                or (bible_dict or {}).get("core_genre")
+                or "action_adventure"
+            )
+            req_items: List[RequirementTrack] = []
+            for r in req_rows:
+                raw_ac = r.get("acceptance_criteria", [])
+                ac_objs: List[AcceptanceCriterion] = []
+                for idx_ac, ac in enumerate(raw_ac if isinstance(raw_ac, list) else []):
+                    if isinstance(ac, dict):
+                        ac_objs.append(
+                            AcceptanceCriterion(
+                                deliberation=str(ac.get("deliberation") or f"Verify {ac.get('id', idx_ac + 1)}"),
+                                id=str(ac.get("id") or f"{r.get('requirement_id', 'R1')}-AC{idx_ac + 1}"),
+                                description=str(ac.get("description") or "Verify criterion"),
+                                verification_method=str(ac.get("verification_method") or "ast_inspection"),
+                                passed=bool(ac.get("passed", False)),
+                            )
+                        )
+                st_val = str(r.get("status") or "pending").lower()
+                if st_val in ("rejected", "in_progress"):
+                    st_val = "pending"
+                delib_str = str(r.get("deliberation") or f"Requirement track {r.get('requirement_id')}")
+                title_str = str(r.get("title") or "Gameplay Track")
+                desc_str = str(r.get("description") or delib_str)
+                owner_str = str(r.get("specialist_owner") or "LeadGameplaySWEAgent")
+                target_mods = r.get("target_modules")
+                if not isinstance(target_mods, list) or not target_mods:
+                    target_mods = ["main.gd", "mechanics.gd", "entities.gd", "scenes.gd", "ui_hud.gd"]
+                req_items.append(
+                    RequirementTrack(
+                        deliberation=delib_str,
+                        id=str(r.get("requirement_id") or f"R{len(req_items) + 1}"),
+                        title=title_str,
+                        description=desc_str,
+                        responsible_agents=[owner_str],
+                        target_modules=target_mods,
+                        status=st_val if st_val in ("pending", "in_progress", "completed", "satisfied", "rejected") else "pending",
+                        acceptance_criteria=ac_objs,
+                    )
+                )
+            if req_items:
+                req_spec_obj = GameRequirementsSpec(
+                    deliberation=f"Rehydrated requirements specification for '{g_title}' ({cand_name}) from SQLite telemetry.",
+                    spec_id=f"req_{cand_name}",
+                    game_title=str(g_title),
+                    genre_paradigm=str(g_genre),
+                    high_concept_summary=str(
+                        getattr(world_spec_obj, "narrative_premise", None)
+                        or (bible_dict or {}).get("creative_vision_summary")
+                        or f"Playable world of {g_title}"
+                    ),
+                    requirements=req_items,
+                )
+        except Exception as req_exc:
+            logger.warning("Failed reconstructing GameRequirementsSpec from DB rows: %s", req_exc)
+
+    if req_spec_obj is not None:
+        for trk in getattr(req_spec_obj, "requirements", []):
+            if getattr(trk, "status", "") in ("rejected", "in_progress"):
+                trk.status = "pending"
+        req_path.write_text(req_spec_obj.model_dump_json(indent=2), encoding="utf-8")
+
+        # Sync reset statuses back to SQLite
+        if db_path and db_path.exists():
+            try:
+                db = TelemetryDB(db_path)
+                build_id = f"build_{cand_name}"
+                for trk in req_spec_obj.requirements:
+                    db.update_studio_requirement_status(
+                        build_id=build_id,
+                        requirement_id=trk.id,
+                        status=trk.status,
+                    )
+            except Exception as sync_exc:
+                logger.warning("Failed syncing reset requirement status to SQLite: %s", sync_exc)
+
+    return staging_dir
 
 
 class StudioDaemon:
@@ -245,17 +499,38 @@ class StudioDaemon:
 
         try:
             self._last_cold_boot_attempt_ts = time.monotonic()
-            logger.info("Cold boot detected: Initiating Genesis Build...")
-            self.event_bus.publish_threadsafe({
-                "deliberation": "Cold boot detected; initiating autonomous Genesis build cycle.",
-                "event_type": "genesis_starting",
-                "agent_name": "StudioDaemon",
-                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                "payload": {"profile_tag": self.config.steam_profile},
-            })
+            resumed_dir: Optional[Path] = None
+            if self.config.resume_current:
+                resumed_dir = rehydrate_resumable_candidate_from_db(
+                    db_path=self.config.db_path,
+                    cartridges_root=self.config.cartridges_root,
+                )
 
-            staging_dir = self.config.cartridges_root / f"candidate_genesis_{uuid.uuid4().hex[:6]}"
-            staging_dir.mkdir(parents=True, exist_ok=True)
+            if resumed_dir is not None:
+                staging_dir = resumed_dir
+                logger.info("Resuming existing Genesis build in %s...", staging_dir)
+                self.event_bus.publish_threadsafe({
+                    "deliberation": f"Resuming Genesis game development in '{staging_dir.name}' from persisted Game Bible and requirement tracks.",
+                    "event_type": "genesis_starting",
+                    "agent_name": "StudioDaemon",
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "payload": {
+                        "profile_tag": self.config.steam_profile,
+                        "resumed_candidate": staging_dir.name,
+                        "resume_current": True,
+                    },
+                })
+            else:
+                logger.info("Cold boot detected: Initiating Genesis Build...")
+                self.event_bus.publish_threadsafe({
+                    "deliberation": "Cold boot detected; initiating autonomous Genesis build cycle.",
+                    "event_type": "genesis_starting",
+                    "agent_name": "StudioDaemon",
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "payload": {"profile_tag": self.config.steam_profile},
+                })
+                staging_dir = self.config.cartridges_root / f"candidate_genesis_{uuid.uuid4().hex[:6]}"
+                staging_dir.mkdir(parents=True, exist_ok=True)
             report = None
 
             try:
@@ -289,9 +564,66 @@ class StudioDaemon:
                         except Exception as dna_exc:
                             logger.warning("Steam DNA extraction warning during Genesis: %s", dna_exc)
 
-                        plan = self._resolve_maybe_coroutine(
-                            self.orchestrator.generate_swarm_plan(steam_dna=dna, target_episode=0)
-                        )
+                        if self.config.creative_prompt:
+                            self.orchestrator._creative_prompt = self.config.creative_prompt
+                        plan = None
+                        if self.config.resume_current and (staging_dir / "world_spec.json").is_file():
+                            try:
+                                from engine.studio.models import GenesisWorldSpec, StudioSwarmPlan
+                                ws_resumed = GenesisWorldSpec.model_validate_json(
+                                    (staging_dir / "world_spec.json").read_text(encoding="utf-8")
+                                )
+                                plan = StudioSwarmPlan(
+                                    deliberation=(
+                                        f"Resuming specialist agent swarm DAG for '{ws_resumed.game_title}' "
+                                        f"({ws_resumed.core_genre}) from persisted staging artifacts in {staging_dir.name}."
+                                    ),
+                                    game_title=ws_resumed.game_title,
+                                    genre_verdict=ws_resumed.core_genre,
+                                    target_episode=0,
+                                    specialist_agent_roles=[
+                                        "Director",
+                                        "Writer",
+                                        "Voice",
+                                        "Visual",
+                                        "SWE",
+                                        "TelemetryArchitect",
+                                        "Supervisor",
+                                    ],
+                                    dag_edges=[
+                                        ["Director", "Writer"],
+                                        ["Writer", "Voice"],
+                                        ["Writer", "Visual"],
+                                        ["Voice", "SWE"],
+                                        ["Visual", "SWE"],
+                                        ["SWE", "TelemetryArchitect"],
+                                        ["TelemetryArchitect", "Supervisor"],
+                                    ],
+                                    task_manifest=json.dumps({
+                                        "Director": "Resume world_spec.json and requirements_spec.json",
+                                        "Writer": "Resume narrative_bible.json and narrative.json",
+                                        "Voice": "Synthesize or resume character bark WAVs",
+                                        "Visual": "Synthesize or resume character portraits and sprites",
+                                        "SWE": "Implement remaining requirement tracks in Godot 4",
+                                        "TelemetryArchitect": "Instrument telemetry probes",
+                                        "Supervisor": "Run 5-gate verification and multi-agent sign-off",
+                                    }),
+                                )
+                            except Exception as resume_plan_exc:
+                                logger.warning("Could not build resumed StudioSwarmPlan from world_spec.json: %s", resume_plan_exc)
+                                plan = None
+
+                        if plan is None:
+                            plan_sig_kwargs: Dict[str, Any] = {"steam_dna": dna, "target_episode": 0}
+                            import inspect as _inspect
+                            try:
+                                if "creative_prompt" in _inspect.signature(self.orchestrator.generate_swarm_plan).parameters:
+                                    plan_sig_kwargs["creative_prompt"] = self.config.creative_prompt
+                            except Exception:
+                                pass
+                            plan = self._resolve_maybe_coroutine(
+                                self.orchestrator.generate_swarm_plan(**plan_sig_kwargs)
+                            )
                         report = self._resolve_maybe_coroutine(
                             self.orchestrator.execute_swarm_plan(plan, staging_dir)
                         )
@@ -344,7 +676,7 @@ class StudioDaemon:
                 })
                 raise
             finally:
-                if staging_dir.exists() and (not report or not getattr(report, "promoted_to_active", False)):
+                if staging_dir.exists() and not any(staging_dir.iterdir()):
                     shutil.rmtree(staging_dir, ignore_errors=True)
         finally:
             _genesis_build_lock.release()

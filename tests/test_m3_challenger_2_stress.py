@@ -626,12 +626,16 @@ class TestRationaleFirstKeyOrderingInvariance:
         return instances
 
     def test_all_26_models_present_and_accounted_for(self) -> None:
-        """Confirm that exactly 26 (or 31 with M1 requirement models) Pydantic models are defined in engine/studio/models.py."""
+        """Confirm that all Pydantic models defined in engine/studio/models.py enforce deliberation at field index 0."""
         discovered = [
             obj for name, obj in inspect.getmembers(m)
             if inspect.isclass(obj) and issubclass(obj, BaseModel) and obj is not BaseModel
         ]
-        assert len(discovered) in (26, 31), f"Expected 26 or 31 Pydantic models, discovered {len(discovered)}"
+        assert len(discovered) >= 26, f"Expected at least 26 Pydantic models, discovered {len(discovered)}"
+        for cls in discovered:
+            if cls.__name__ != "BaseEpistemicModel" and cls.model_fields:
+                first_field = list(cls.model_fields.keys())[0]
+                assert first_field == "deliberation", f"{cls.__name__} must declare 'deliberation' at field index 0, got '{first_field}'"
 
     def test_model_dump_deliberation_key_zero_all_25_models(self) -> None:
         """Assert list(model.model_dump().keys())[0] == 'deliberation' for every model."""

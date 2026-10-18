@@ -515,7 +515,7 @@ class TestSealedAssetDiscoveryAdversarial:
         swe = LeadGameplaySWEAgent()
         assets = swe._discover_sealed_assets(staging_dir)
 
-        assert assets == {"sprites": [], "audio": []}
+        assert assets == {"sprites": [], "portraits": [], "mockups": [], "audio": []}
 
     def test_discover_sealed_assets_ignores_non_standard_extensions(self, tmp_path: Path) -> None:
         """Ignores non-.png in sprites/ and non-.wav in audio/."""

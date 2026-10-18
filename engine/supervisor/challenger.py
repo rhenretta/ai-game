@@ -44,9 +44,11 @@ from engine.studio.models import (
 from engine.supervisor.models import (
     ChallengerGateEvaluation,
     GateFailureType,
+    MultiAgentSignOffReport,
     RejectionDiagnosticTrace,
     RemedyType,
     RequirementEvaluationRecord,
+    SpecialistSignOffVerdict,
 )
 
 logger = logging.getLogger("ChallengerGate")
@@ -430,13 +432,15 @@ class CandidateASTInspector:
                         ),
                     })
 
-                all_gd_concat = "\n".join(gd_sources.values())
-                sprites_dir = c_dir / "assets" / "sprites"
-                if sprites_dir.is_dir() and list(sprites_dir.glob("*.png")):
+            all_gd_concat = "\n".join(gd_sources.values())
+            sprites_dir = c_dir / "assets" / "sprites"
+            if sprites_dir.is_dir():
+                png_files = sorted(sprites_dir.glob("*.png"))
+                if png_files:
                     if "assets/sprites" not in all_gd_concat:
                         hollow_stubs.append({
-                            "file": "scenes.gd",
-                            "module": "scenes.gd",
+                            "file": "scenes.gd" if "scenes.gd" in gd_sources else "main.gd",
+                            "module": "scenes.gd" if "scenes.gd" in gd_sources else "main.gd",
                             "function": "load_sprites",
                             "line": 1,
                             "stmt": "unbound sprite assets",
@@ -444,70 +448,112 @@ class CandidateASTInspector:
                                 "Synthesized PNG sprites exist in assets/sprites/, but zero .gd scripts load or display them."
                             ),
                         })
+                    elif len(png_files) >= 3:
+                        referenced_sprites = [p.name for p in png_files if p.name in all_gd_concat]
+                        if len(referenced_sprites) < max(2, len(png_files) // 2):
+                            unref = [p.name for p in png_files if p.name not in all_gd_concat]
+                            hollow_stubs.append({
+                                "file": "scenes.gd" if "scenes.gd" in gd_sources else "main.gd",
+                                "module": "scenes.gd" if "scenes.gd" in gd_sources else "main.gd",
+                                "function": "load_sprites",
+                                "line": 1,
+                                "stmt": f"unbound sprites: {unref}",
+                                "reason": (
+                                    f"VisualArtDirector veto: {len(unref)}/{len(png_files)} synthesized PNG sprites in assets/sprites/ "
+                                    f"are never loaded or rendered in .gd scripts ({unref}). Every synthesized sprite must be bound and drawn."
+                                ),
+                            })
 
-                if "MOUSE_BUTTON_RIGHT" in all_gd_concat and "MOUSE_BUTTON_LEFT" not in all_gd_concat:
-                    target_ui = "ui_hud.gd" if "ui_hud.gd" in gd_sources else "main.gd"
+            if "MOUSE_BUTTON_RIGHT" in all_gd_concat and "MOUSE_BUTTON_LEFT" not in all_gd_concat:
+                target_ui = "ui_hud.gd" if "ui_hud.gd" in gd_sources else "main.gd"
+                hollow_stubs.append({
+                    "file": target_ui,
+                    "module": target_ui,
+                    "function": "_unhandled_input",
+                    "line": 1,
+                    "stmt": "missing MOUSE_BUTTON_LEFT handler",
+                    "reason": (
+                        f"{target_ui} handles MOUSE_BUTTON_RIGHT tool deselection but never handles MOUSE_BUTTON_LEFT "
+                        f"to place selected structures or interact with the world."
+                    ),
+                })
+
+            audio_dir = c_dir / "assets" / "audio"
+            if audio_dir.is_dir() and list(audio_dir.glob("*.wav")):
+                target_audio_mod = "ui_hud.gd" if "ui_hud.gd" in gd_sources else "main.gd"
+                if "AudioStreamWAV" not in all_gd_concat:
                     hollow_stubs.append({
-                        "file": target_ui,
-                        "module": target_ui,
-                        "function": "_unhandled_input",
+                        "file": target_audio_mod,
+                        "module": target_audio_mod,
+                        "function": "load_wav_stream",
                         "line": 1,
-                        "stmt": "missing MOUSE_BUTTON_LEFT handler",
+                        "stmt": "ResourceLoader.exists(audio_path) without AudioStreamWAV",
                         "reason": (
-                            f"{target_ui} handles MOUSE_BUTTON_RIGHT tool deselection but never handles MOUSE_BUTTON_LEFT "
-                            f"to place selected structures or interact with the world."
+                            f"Synthesized .wav files exist in assets/audio/, but {target_audio_mod} uses "
+                            f"ResourceLoader.exists()/load() without AudioStreamWAV. In Godot 4 runtime without .import "
+                            f"files, ResourceLoader.exists() returns false for raw .wav files, producing zero sound. "
+                            f"Must load raw PCM .wav files via FileAccess.open(ProjectSettings.globalize_path(path), FileAccess.READ) "
+                            f"(stripping the 44-byte RIFF header) into an AudioStreamWAV (FORMAT_16_BITS, mix_rate=24000) "
+                            f"and play interactive AudioStreamWAV sound effects on player actions."
                         ),
                     })
-
-                audio_dir = c_dir / "assets" / "audio"
-                if audio_dir.is_dir() and list(audio_dir.glob("*.wav")):
-                    if "AudioStreamWAV" not in all_gd_concat:
-                        target_audio_mod = "ui_hud.gd" if "ui_hud.gd" in gd_sources else "main.gd"
+                else:
+                    no_space_gd = all_gd_concat.replace(" ", "")
+                    if "mix_rate=44100" in no_space_gd or "mix_rate=48000" in no_space_gd:
                         hollow_stubs.append({
                             "file": target_audio_mod,
                             "module": target_audio_mod,
-                            "function": "load_wav_stream",
+                            "function": "play_voice_clip",
                             "line": 1,
-                            "stmt": "ResourceLoader.exists(audio_path) without AudioStreamWAV",
+                            "stmt": "stream.mix_rate = 44100 on 24000 Hz PCM WAV",
                             "reason": (
-                                f"Synthesized .wav files exist in assets/audio/, but {target_audio_mod} uses "
-                                f"ResourceLoader.exists()/load() without AudioStreamWAV. In Godot 4 runtime without .import "
-                                f"files, ResourceLoader.exists() returns false for raw .wav files, producing zero sound. "
-                                f"Must load raw PCM .wav files via FileAccess.open(ProjectSettings.globalize_path(path), FileAccess.READ) "
-                                f"(stripping the 44-byte RIFF header) into an AudioStreamWAV (FORMAT_16_BITS, mix_rate=24000) "
-                                f"and play interactive AudioStreamWAV sound effects on player actions."
+                                f"AudioAtmosphereDesigner veto in {target_audio_mod}: AudioStreamWAV sets mix_rate=44100 on "
+                                f"24,000 Hz mono PCM WAV files, causing 1.8375x high-pitched 'chipmunk' distortion! "
+                                f"Must set stream.mix_rate = 24000 and strip the 44-byte RIFF header via bytes.slice(44)."
+                            ),
+                        })
+                    if "get_file_as_bytes(" in all_gd_concat and ".slice(44)" not in all_gd_concat:
+                        hollow_stubs.append({
+                            "file": target_audio_mod,
+                            "module": target_audio_mod,
+                            "function": "play_voice_clip",
+                            "line": 1,
+                            "stmt": "stream.data = bytes without .slice(44) RIFF header strip",
+                            "reason": (
+                                f"AudioAtmosphereDesigner veto in {target_audio_mod}: Raw WAV bytes are assigned to AudioStreamWAV.data "
+                                f"without stripping the 44-byte RIFF WAV header via bytes.slice(44), causing a loud click/pop on playback."
                             ),
                         })
 
-                if "get_viewport().size" in all_gd_concat and "get_global_mouse_position()" not in all_gd_concat:
-                    target_mouse_mod = "main.gd" if "main.gd" in gd_sources else "scenes.gd"
-                    hollow_stubs.append({
-                        "file": target_mouse_mod,
-                        "module": target_mouse_mod,
-                        "function": "_get_current_hovered_grid_coord",
-                        "line": 1,
-                        "stmt": "broken HiDPI mouse-to-world math using get_viewport().size",
-                        "reason": (
-                            f"{target_mouse_mod} computes mouse world position using (mouse_pos - get_viewport().size * 0.5), "
-                            f"which mixes 1280x720 canvas coordinates with physical Retina/HiDPI window pixels and shifts all "
-                            f"clicks/hovers off by hundreds of pixels. Must use get_global_mouse_position() on the Node2D "
-                            f"(e.g., world_view.get_global_mouse_position() or get_global_mouse_position()) for exact world coordinates."
-                        ),
-                    })
+            if "get_viewport().size" in all_gd_concat and "get_global_mouse_position()" not in all_gd_concat:
+                target_mouse_mod = "main.gd" if "main.gd" in gd_sources else "scenes.gd"
+                hollow_stubs.append({
+                    "file": target_mouse_mod,
+                    "module": target_mouse_mod,
+                    "function": "_get_current_hovered_grid_coord",
+                    "line": 1,
+                    "stmt": "broken HiDPI mouse-to-world math using get_viewport().size",
+                    "reason": (
+                        f"{target_mouse_mod} computes mouse world position using (mouse_pos - get_viewport().size * 0.5), "
+                        f"which mixes 1280x720 canvas coordinates with physical Retina/HiDPI window pixels and shifts all "
+                        f"clicks/hovers off by hundreds of pixels. Must use get_global_mouse_position() on the Node2D "
+                        f"(e.g., world_view.get_global_mouse_position() or get_global_mouse_position()) for exact world coordinates."
+                    ),
+                })
 
-                if "placement_guide" in all_gd_concat and "z_index" not in all_gd_concat:
-                    target_guide_mod = "ui_hud.gd" if "ui_hud.gd" in gd_sources else "scenes.gd"
-                    hollow_stubs.append({
-                        "file": target_guide_mod,
-                        "module": target_guide_mod,
-                        "function": "_setup_placement_guide",
-                        "line": 1,
-                        "stmt": "placement_guide hidden beneath world_view (missing z_index)",
-                        "reason": (
-                            f"{target_guide_mod} adds placement_guide to WorldContainer before world_view without setting "
-                            f"placement_guide.z_index = 10, causing the tilemap to draw over and completely hide the placement cursor."
-                        ),
-                    })
+            if "placement_guide" in all_gd_concat and "z_index" not in all_gd_concat:
+                target_guide_mod = "ui_hud.gd" if "ui_hud.gd" in gd_sources else "scenes.gd"
+                hollow_stubs.append({
+                    "file": target_guide_mod,
+                    "module": target_guide_mod,
+                    "function": "_setup_placement_guide",
+                    "line": 1,
+                    "stmt": "placement_guide hidden beneath world_view (missing z_index)",
+                    "reason": (
+                        f"{target_guide_mod} adds placement_guide to WorldContainer before world_view without setting "
+                        f"placement_guide.z_index = 10, causing the tilemap to draw over and completely hide the placement cursor."
+                    ),
+                })
 
         # 3. Disconnected classes analysis
         disconnected_symbols: List[Dict[str, Any]] = []
@@ -876,13 +922,14 @@ class CandidateVisualPlaytester:
                 pass
 
         # Image color and motion delta analysis
-        colors_t0 = len(set(img_t0.getdata()))
+        _pixels = lambda im: im.get_flattened_data() if hasattr(im, "get_flattened_data") else im.getdata()
+        colors_t0 = len(set(_pixels(img_t0)))
         img_tend = Image.open(io.BytesIO(snapshots[-1])).convert("RGB")
-        colors_tend = len(set(img_tend.getdata()))
+        colors_tend = len(set(_pixels(img_tend)))
 
         diff_pixels = 0
-        p0 = list(downsampled_thumbs[0].getdata())
-        pend = list(downsampled_thumbs[-1].getdata())
+        p0 = list(_pixels(downsampled_thumbs[0]))
+        pend = list(_pixels(downsampled_thumbs[-1]))
         for c0, c1 in zip(p0, pend):
             if c0 != c1:
                 diff_pixels += 1
@@ -895,6 +942,30 @@ class CandidateVisualPlaytester:
         )
         blank_detected = bool(active_sim is not None and has_renderer and colors_t0 <= 1 and colors_tend <= 1)
         motion_verified = (diff_pixels > 5 or (len(snapshots) == 1 and not blank_detected))
+
+        # Persist captured frames to candidate_dir/assets/playtest_captures/ for UI and Sign-Off Council inspection
+        captured_frame_paths: List[str] = []
+        if candidate_dir is not None and snapshots:
+            try:
+                cpath = Path(candidate_dir).resolve()
+                cap_dir = cpath / "assets" / "playtest_captures"
+                cap_dir.mkdir(parents=True, exist_ok=True)
+                t0_file = cap_dir / "playtest_t0.png"
+                tend_file = cap_dir / "playtest_tend.png"
+                if not t0_file.is_file():
+                    t0_file.write_bytes(snapshots[0])
+                else:
+                    snapshots[0] = t0_file.read_bytes()
+                if not tend_file.is_file():
+                    tend_file.write_bytes(snapshots[-1])
+                else:
+                    snapshots[-1] = tend_file.read_bytes()
+                captured_frame_paths = [
+                    "assets/playtest_captures/playtest_t0.png",
+                    "assets/playtest_captures/playtest_tend.png",
+                ]
+            except Exception as cap_err:
+                logger.debug("Could not persist playtest_captures PNGs: %s", cap_err)
 
         # Multi-modal packaging for Gemini
         image_parts = []
@@ -915,6 +986,7 @@ class CandidateVisualPlaytester:
             "pixel_diff_t0_to_tend": diff_pixels,
             "visual_motion_verified": motion_verified,
             "synthetic_input_profiles_tested": ["idle_baseline", "kinetic_movement", "action_triggers"],
+            "captured_frame_paths": captured_frame_paths,
             "snapshot_images": snapshots,
             "image_parts": image_parts,
         }
@@ -926,7 +998,8 @@ class CandidateVisualPlaytester:
         active_sim: Optional[Any],
         tick_phase: float,
     ) -> None:
-        """Renders authentic candidate sprites dynamically across a domain-agnostic coordinate plane.
+        """Renders authentic candidate sprites dynamically across a domain-agnostic coordinate plane,
+        strictly honoring which sprites are actually bound in code and any full-screen occlusion state.
         Completely eliminates test-case poisoning (Rule 1) and hardcoded keyword heuristics (Rule 2).
         """
         surf.fill((20, 24, 32))
@@ -965,6 +1038,9 @@ class CandidateVisualPlaytester:
         if not sprites_dir.is_dir():
             return
 
+        gd_files = sorted(cpath.glob("*.gd"))
+        all_gd_src = "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in gd_files) if gd_files else ""
+
         # Load asset manifest if present for type-guided layout
         portrait_filenames = set()
         spec_path = cpath / "requirements_spec.json"
@@ -981,60 +1057,347 @@ class CandidateVisualPlaytester:
 
         loaded_sprites: List[Tuple[str, pygame.Surface]] = []
         for sp_path in sorted(sprites_dir.glob("*.png")):
+            if gd_files and sp_path.name not in all_gd_src and "DirAccess" not in all_gd_src:
+                continue
             try:
                 sp_surf = pygame.image.load(str(sp_path))
                 loaded_sprites.append((sp_path.name.lower(), sp_surf))
             except Exception:
                 continue
 
-        if not loaded_sprites:
+        portraits_dir = cpath / "assets" / "portraits"
+        if portraits_dir.is_dir():
+            for p_path in sorted(portraits_dir.glob("*.png")):
+                if gd_files and p_path.name not in all_gd_src and "assets/portraits" not in all_gd_src:
+                    continue
+                try:
+                    p_surf = pygame.image.load(str(p_path))
+                    loaded_sprites.append((p_path.name.lower(), p_surf))
+                    portrait_filenames.add(p_path.name.lower())
+                except Exception:
+                    continue
+
+        if loaded_sprites:
+            portraits: List[Tuple[str, pygame.Surface]] = []
+            world_sprites: List[Tuple[str, pygame.Surface]] = []
+            for sp_name, sp_surf in loaded_sprites:
+                w, h = sp_surf.get_size()
+                if sp_name in portrait_filenames or (w >= 96 and h >= 96 and 0.9 <= w / h <= 1.1 and "portrait" in sp_name):
+                    portraits.append((sp_name, sp_surf))
+                else:
+                    world_sprites.append((sp_name, sp_surf))
+
+            if portraits:
+                p_name, p_surf = portraits[0]
+                portrait_box = pygame.Rect(1140, 56, 120, 120)
+                pygame.draw.rect(surf, (14, 20, 30), portrait_box)
+                pygame.draw.rect(surf, (60, 140, 200), portrait_box, 2)
+                scaled_p = pygame.transform.scale(p_surf, (104, 104))
+                surf.blit(scaled_p, (1148, 64))
+
+            total_world = len(world_sprites)
+            center_x, center_y = 640, 360
+            delta_shift_x = int(math.cos(tick_phase * 2 * math.pi) * 25.0 + (pos_delta * 15.0 if pos_delta > 0 else tick_phase * 35.0))
+            delta_shift_y = int(math.sin(tick_phase * 2 * math.pi) * 15.0 + tick_phase * 20.0)
+
+            for idx, (sp_name, sp_surf) in enumerate(world_sprites):
+                w, h = sp_surf.get_size()
+                if idx == 0:
+                    px = center_x - w // 2 + delta_shift_x
+                    py = center_y - h // 2 + delta_shift_y
+                else:
+                    angle = (2.0 * math.pi * (idx - 1)) / max(1, total_world - 1) + (tick_phase * 0.15)
+                    orbit_radius = 160.0 + ((idx % 3) * 65.0)
+                    px = int(center_x + orbit_radius * math.cos(angle) - w // 2)
+                    py = int(center_y + orbit_radius * math.sin(angle) - h // 2)
+                px = max(24, min(1280 - w - 24, px))
+                py = max(64, min(650 - h - 24, py))
+                surf.blit(sp_surf, (px, py))
+
+            pygame.draw.rect(surf, (14, 18, 26), (100, 660, 1080, 52))
+            pygame.draw.rect(surf, (50, 100, 150), (100, 660, 1080, 52), 1)
+            palette_x = 120
+            for sp_name, sp_surf in loaded_sprites:
+                if palette_x + 40 > 1160:
+                    break
+                thumb = pygame.transform.scale(sp_surf, (36, 36))
+                surf.blit(thumb, (palette_x, 668))
+                palette_x += 48
+
+        # Reflect any full-screen occlusion detected in the Godot scene audit (e.g., 95% opaque frost or instant failure lockout)
+        scene_audit = getattr(active_sim, "scene_audit", None) if active_sim else None
+        if isinstance(scene_audit, dict) and scene_audit.get("fullscreen_occlusion_detected"):
+            occ = pygame.Surface((1280, 720), pygame.SRCALPHA)
+            occ.fill((180, 195, 210, 235) if tick_phase < 0.5 else (140, 20, 20, 235))
+            surf.blit(occ, (0, 0))
+
+
+# =============================================================================
+# Pillar 4: Multi-Agent Final Sign-Off Council
+# =============================================================================
+
+SPECIALIST_COUNCIL_ROLES: Tuple[str, ...] = (
+    "VisualArtDirector",
+    "UXExperienceDesigner",
+    "GameplayDesigner",
+    "StoryWorldArchitect",
+    "AudioAtmosphereDesigner",
+    "CreativeDirector",
+)
+
+
+class MultiAgentSignOffCouncil:
+    """Convenes all 6 studio specialist roles to inspect the rendered candidate build,
+    multimodal assets, audio configuration, and runtime scene audit before a build can be promoted.
+    Enforces Rule 4 (deliberation first) and 100% unanimous specialist sign-off.
+    """
+    deliberation: str = "Multi-Agent Final Sign-Off Council requiring unanimous approval from all 6 studio specialists."
+
+    def __init__(
+        self,
+        client: Optional[Any] = None,
+        model_name: str = "gemini-3.8-flash",
+        event_bus: Optional[Any] = None,
+    ):
+        self.client = client
+        self.model_name = model_name
+        self.event_bus = event_bus
+
+    @staticmethod
+    def _is_live_genai_client(client: Optional[Any]) -> bool:
+        if client is None:
+            return False
+        mod = getattr(type(client), "__module__", "") or ""
+        return mod.startswith("google.genai")
+
+    def evaluate_sign_off(
+        self,
+        candidate_dir: Union[Path, str],
+        spec: Optional[GameRequirementsSpec] = None,
+        ast_grounding: Optional[Dict[str, Any]] = None,
+        telemetry_grounding: Optional[Dict[str, Any]] = None,
+        visual_grounding: Optional[Dict[str, Any]] = None,
+        asset_grounding: Optional[Dict[str, Any]] = None,
+        client: Optional[Any] = None,
+    ) -> MultiAgentSignOffReport:
+        """Evaluates the candidate build across all 6 specialist perspectives, enforces deterministic
+        domain-specific quality invariants, persists sign_off_report.json, and emits SPECIALIST_SIGNOFF_VERDICT events.
+        """
+        c_dir = Path(candidate_dir).resolve()
+        candidate_id = c_dir.name
+        active_client = client or self.client
+        captured_paths = list((visual_grounding or {}).get("captured_frame_paths", []))
+
+        report: Optional[MultiAgentSignOffReport] = None
+
+        if self._is_live_genai_client(active_client):
+            try:
+                from google.genai import types
+                bible_text = ""
+                if (c_dir / "game_bible.json").is_file():
+                    bible_text = (c_dir / "game_bible.json").read_text(encoding="utf-8", errors="replace")[:12000]
+
+                prompt = (
+                    f"You are the Multi-Agent Final Sign-Off Council for candidate build '{candidate_id}'.\n"
+                    f"Every single specialist who authored the Living Game Bible MUST inspect the actual rendered game frames, "
+                    f"source code, audio configuration, and runtime scene audit, and render an independent sign-off verdict:\n"
+                    f"1. VisualArtDirector: Are ALL synthesized sprites and character portraits loaded and visible on screen? Does the visual composition honor the 16:9 concept mockups and visual style guide?\n"
+                    f"2. UXExperienceDesigner: Is the viewport clear on startup (zero 95% opaque frost or center-occluding panels)? Are controls discoverable via diegetic labels/hover cues?\n"
+                    f"3. GameplayDesigner: Is there an active, responsive, navigable world loop with meaningful objectives and recoverable hazards (zero instant 12-second unrecoverable lockouts)?\n"
+                    f"4. StoryWorldArchitect: Are the Narrative Bible's characters, cutscenes, dialogue trees, and voice barks staged in-game?\n"
+                    f"5. AudioAtmosphereDesigner: Are WAV files loaded at 24,000 Hz (`mix_rate = 24000`, never 44100 chipmunk distortion) with the 44-byte RIFF header stripped (`bytes.slice(44)`) and non-overlapping cooldown guards?\n"
+                    f"6. CreativeDirector: Does the final build fulfill the First 60 Seconds Hook and Core Player Fantasy?\n\n"
+                    f"LIVING GAME BIBLE:\n{bible_text}\n\n"
+                    f"AST & CODE AUDIT:\n{json.dumps(ast_grounding or {}, indent=2)}\n\n"
+                    f"RUNTIME TELEMETRY & SCENE AUDIT:\n{json.dumps(telemetry_grounding or {}, indent=2)}\n\n"
+                    f"ASSET CATALOG:\n{json.dumps(asset_grounding or {}, indent=2)}\n\n"
+                    f"Provide 'deliberation' FIRST (Rule 4), and return verdicts for all 6 specialists: {list(SPECIALIST_COUNCIL_ROLES)}."
+                )
+                contents: List[Any] = [prompt]
+                for part in (visual_grounding or {}).get("image_parts", []):
+                    contents.append(part)
+
+                response = active_client.models.generate_content(
+                    model=self.model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=MultiAgentSignOffReport,
+                    ),
+                )
+                if response.text:
+                    raw_report = json.loads(response.text)
+                    raw_report["candidate_id"] = candidate_id
+                    if captured_paths and not raw_report.get("captured_frame_paths"):
+                        raw_report["captured_frame_paths"] = captured_paths
+                    report = MultiAgentSignOffReport(**raw_report)
+            except Exception as exc:
+                logger.warning("Live Gemini MultiAgentSignOffCouncil call failed (%s); synthesizing deterministic council report.", exc)
+
+        # Synthesize or enforce deterministic specialist checks across all 6 roles
+        report = self._enforce_specialist_invariants(
+            report=report,
+            candidate_id=candidate_id,
+            ast_grounding=ast_grounding or {},
+            telemetry_grounding=telemetry_grounding or {},
+            visual_grounding=visual_grounding or {},
+        )
+
+        # Persist sign_off_report.json to candidate_dir
+        try:
+            (c_dir / "sign_off_report.json").write_text(
+                report.model_dump_json(indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.debug("Could not write sign_off_report.json to %s: %s", c_dir, e)
+
+        self._publish_sign_off_events(report)
+        return report
+
+    def _enforce_specialist_invariants(
+        self,
+        report: Optional[MultiAgentSignOffReport],
+        candidate_id: str,
+        ast_grounding: Dict[str, Any],
+        telemetry_grounding: Dict[str, Any],
+        visual_grounding: Dict[str, Any],
+    ) -> MultiAgentSignOffReport:
+        hollow_stubs = ast_grounding.get("hollow_stubs", [])
+        scene_audit = telemetry_grounding.get("scene_audit") or {}
+        blank_detected = bool(visual_grounding.get("blank_canvas_detected", False))
+        captured_paths = list(visual_grounding.get("captured_frame_paths", []))
+
+        existing_by_role: Dict[str, SpecialistSignOffVerdict] = {}
+        if report is not None:
+            for v in report.verdicts:
+                existing_by_role[v.specialist_role] = v
+
+        final_verdicts: List[SpecialistSignOffVerdict] = []
+        for role in SPECIALIST_COUNCIL_ROLES:
+            verdict = existing_by_role.get(role)
+            defects: List[str] = list(verdict.blocking_defects) if verdict else []
+            remedies: List[str] = list(verdict.remediation_directives) if verdict else []
+            approved: bool = verdict.approved if verdict else True
+
+            for stub in hollow_stubs:
+                reason = str(stub.get("reason", ""))
+                stmt = str(stub.get("stmt", ""))
+                if role == "VisualArtDirector" and ("sprite" in reason.lower() or "world renderer" in reason.lower()):
+                    approved = False
+                    defects.append(reason)
+                    remedies.append("Load and render all synthesized PNG sprites from res://assets/sprites/ and res://assets/portraits/ in scenes.gd and ui_hud.gd.")
+                elif role == "AudioAtmosphereDesigner" and ("audio" in reason.lower() or "mix_rate" in stmt.lower() or "slice(44)" in stmt.lower()):
+                    approved = False
+                    defects.append(reason)
+                    remedies.append("Set AudioStreamWAV.mix_rate = 24000, strip the 44-byte RIFF header via bytes.slice(44), and enforce an >=8s playback cooldown.")
+                elif role == "UXExperienceDesigner" and ("mouse" in reason.lower() or "placement_guide" in reason.lower()):
+                    approved = False
+                    defects.append(reason)
+                    remedies.append("Fix HiDPI mouse picking with get_global_mouse_position() and ensure clear viewport visibility.")
+                elif role == "GameplayDesigner" and ("mouse_button_left" in reason.lower() or "hollow" in reason.lower() or "empty" in reason.lower()):
+                    approved = False
+                    defects.append(reason)
+                    remedies.append(f"Implement complete interactive gameplay logic in {stub.get('module', 'mechanics.gd')}:{stub.get('function', '')}.")
+
+            if role == "VisualArtDirector" and blank_detected:
+                approved = False
+                defects.append("Blank monochrome canvas detected during visual playtest.")
+                remedies.append("Ensure scenes.gd and ui_hud.gd actively draw world geometry and bound sprite textures.")
+
+            if role == "UXExperienceDesigner":
+                if scene_audit.get("fullscreen_occlusion_detected"):
+                    approved = False
+                    defects.append("Full-screen viewport occlusion detected (startup frost >= 80% or unrecoverable failure overlay blinding the player).")
+                    remedies.append("Initialize frost/fog overlay <= 0.15 alpha so the exterior world is visible immediately, and make hazards recoverable.")
+                if scene_audit.get("center_occluding_panels"):
+                    approved = False
+                    defects.append(f"UI panel(s) occluding center playfield: {scene_audit.get('center_occluding_panels')}")
+                    remedies.append("Move HUD panels to the screen perimeter so the central viewport remains unobstructed.")
+
+            if role == "AudioAtmosphereDesigner":
+                ap_found = int(scene_audit.get("audio_players_found", 0) or 0)
+                as_loaded = int(scene_audit.get("audio_streams_loaded", 0) or 0)
+                mix_rates = scene_audit.get("audio_mix_rates") or []
+                if ap_found > 0 and as_loaded == 0:
+                    approved = False
+                    defects.append(f"{ap_found} AudioStreamPlayer node(s) found but 0 audio streams loaded.")
+                    remedies.append("Load WAV files via FileAccess.get_file_as_bytes() into AudioStreamWAV.")
+                if any(int(r) in (44100, 48000) for r in mix_rates):
+                    approved = False
+                    defects.append(f"AudioStreamWAV mix_rate set to {mix_rates} instead of 24000 Hz, causing high-pitched chipmunk distortion.")
+                    remedies.append("Set stream.mix_rate = 24000 and strip 44-byte RIFF header via bytes.slice(44).")
+
+            if role == "GameplayDesigner" and telemetry_grounding.get("is_stagnant_or_frozen"):
+                approved = False
+                defects.append("Simulation state remained stagnant/frozen across synthetic input schedule.")
+                remedies.append("Ensure player inputs drive continuous spatial navigation and world state progression.")
+
+            if role == "CreativeDirector" and not approved:
+                defects.append("CreativeDirector withholds final sign-off until all specialist domain defects are resolved.")
+
+            delib = (
+                verdict.deliberation
+                if (verdict and verdict.deliberation)
+                else (
+                    f"{role} inspected candidate '{candidate_id}' and APPROVED Pillar compliance."
+                    if approved
+                    else f"{role} VETOED candidate '{candidate_id}' due to blocking defects: {defects}"
+                )
+            )
+            final_verdicts.append(
+                SpecialistSignOffVerdict(
+                    deliberation=delib,
+                    specialist_role=role,
+                    approved=approved,
+                    blocking_defects=defects,
+                    remediation_directives=remedies,
+                )
+            )
+
+        # If any specialist vetoed, CreativeDirector also vetoes so unanimous_approval is False
+        any_veto = any(not v.approved for v in final_verdicts)
+        if any_veto:
+            for v in final_verdicts:
+                if v.specialist_role == "CreativeDirector" and v.approved:
+                    vetoing_roles = [x.specialist_role for x in final_verdicts if not x.approved]
+                    v.approved = False
+                    v.blocking_defects.append(f"Blocking vetoes from specialists: {vetoing_roles}")
+                    v.remediation_directives.append("Resolve all specialist blocking defects before promotion.")
+
+        unanimous = all(v.approved for v in final_verdicts)
+        council_delib = (
+            report.deliberation
+            if (report and report.deliberation)
+            else (
+                f"Multi-Agent Final Sign-Off Council unanimously APPROVED candidate '{candidate_id}' across all 6 specialists."
+                if unanimous
+                else f"Multi-Agent Final Sign-Off Council REJECTED candidate '{candidate_id}'; vetoes issued by {[v.specialist_role for v in final_verdicts if not v.approved]}."
+            )
+        )
+        return MultiAgentSignOffReport(
+            deliberation=council_delib,
+            candidate_id=candidate_id,
+            unanimous_approval=unanimous,
+            verdicts=final_verdicts,
+            captured_frame_paths=captured_paths,
+        )
+
+    def _publish_sign_off_events(self, report: MultiAgentSignOffReport) -> None:
+        if self.event_bus is None:
             return
-
-        portraits: List[Tuple[str, pygame.Surface]] = []
-        world_sprites: List[Tuple[str, pygame.Surface]] = []
-        for sp_name, sp_surf in loaded_sprites:
-            w, h = sp_surf.get_size()
-            if sp_name in portrait_filenames or (w >= 96 and h >= 96 and 0.9 <= w / h <= 1.1 and "portrait" in sp_name):
-                portraits.append((sp_name, sp_surf))
-            else:
-                world_sprites.append((sp_name, sp_surf))
-
-        if portraits:
-            p_name, p_surf = portraits[0]
-            portrait_box = pygame.Rect(1140, 56, 120, 120)
-            pygame.draw.rect(surf, (14, 20, 30), portrait_box)
-            pygame.draw.rect(surf, (60, 140, 200), portrait_box, 2)
-            scaled_p = pygame.transform.scale(p_surf, (104, 104))
-            surf.blit(scaled_p, (1148, 64))
-
-        total_world = len(world_sprites)
-        center_x, center_y = 640, 360
-        delta_shift_x = int(math.cos(tick_phase * 2 * math.pi) * 25.0 + (pos_delta * 15.0 if pos_delta > 0 else tick_phase * 35.0))
-        delta_shift_y = int(math.sin(tick_phase * 2 * math.pi) * 15.0 + tick_phase * 20.0)
-
-        for idx, (sp_name, sp_surf) in enumerate(world_sprites):
-            w, h = sp_surf.get_size()
-            if idx == 0:
-                px = center_x - w // 2 + delta_shift_x
-                py = center_y - h // 2 + delta_shift_y
-            else:
-                angle = (2.0 * math.pi * (idx - 1)) / max(1, total_world - 1) + (tick_phase * 0.15)
-                orbit_radius = 160.0 + ((idx % 3) * 65.0)
-                px = int(center_x + orbit_radius * math.cos(angle) - w // 2)
-                py = int(center_y + orbit_radius * math.sin(angle) - h // 2)
-            px = max(24, min(1280 - w - 24, px))
-            py = max(64, min(650 - h - 24, py))
-            surf.blit(sp_surf, (px, py))
-
-        pygame.draw.rect(surf, (14, 18, 26), (100, 660, 1080, 52))
-        pygame.draw.rect(surf, (50, 100, 150), (100, 660, 1080, 52), 1)
-        palette_x = 120
-        for sp_name, sp_surf in loaded_sprites:
-            if palette_x + 40 > 1160:
-                break
-            thumb = pygame.transform.scale(sp_surf, (36, 36))
-            surf.blit(thumb, (palette_x, 668))
-            palette_x += 48
+        try:
+            for v in report.verdicts:
+                if hasattr(self.event_bus, "publish_threadsafe"):
+                    self.event_bus.publish_threadsafe({
+                        "deliberation": v.deliberation,
+                        "event_type": "SPECIALIST_SIGNOFF_VERDICT",
+                        "agent_name": v.specialist_role,
+                        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                        "payload": v.to_dict(),
+                    })
+        except Exception as exc:
+            logger.debug("Could not publish SPECIALIST_SIGNOFF_VERDICT events: %s", exc)
 
 
 # =============================================================================
@@ -1042,7 +1405,8 @@ class CandidateVisualPlaytester:
 # =============================================================================
 
 class ChallengerGate:
-    """Gate F: Adversarial Design Critic auditing candidate builds against 100% of requirements_spec.json.
+    """Gate F: Adversarial Design Critic auditing candidate builds against 100% of requirements_spec.json
+    and convening the 6-specialist MultiAgentSignOffCouncil.
     Enforces Rule 1 (Pure Generalizability), Rule 2 (No Regex Intent Routing), Rule 4 (Deliberation First),
     Rule 5 (Fail Fast, Zero Silent Fallbacks), and Rule 6 (Container Runtime Invariance).
     """
@@ -1059,6 +1423,11 @@ class ChallengerGate:
         self.ast_inspector = CandidateASTInspector()
         self.telemetry_auditor = CandidateTelemetryAuditor()
         self.visual_playtester = CandidateVisualPlaytester()
+        self.sign_off_council = MultiAgentSignOffCouncil(
+            client=client,
+            model_name=model_name,
+            event_bus=event_bus,
+        )
 
     def evaluate(
         self,
@@ -1120,6 +1489,19 @@ class ChallengerGate:
         if image_parts:
             contents.extend(image_parts)
 
+        # Attach 16:9 Visual Mockup boards from game_bible.json if present for side-by-side visual comparison
+        if c_dir is not None and (c_dir / "game_bible.json").is_file():
+            try:
+                bible_raw = json.loads((c_dir / "game_bible.json").read_text(encoding="utf-8"))
+                for m_item in (bible_raw.get("visual_mockups") or [])[:2]:
+                    rel_p = m_item.get("image_path") if isinstance(m_item, dict) else None
+                    if rel_p and (c_dir / rel_p).is_file():
+                        contents.append(
+                            types.Part.from_bytes(data=(c_dir / rel_p).read_bytes(), mime_type="image/png")
+                        )
+            except Exception as exc:
+                logger.debug("Could not attach Game Bible mockup images to Challenger contents: %s", exc)
+
         try:
             response = active_client.models.generate_content(
                 model=self.model_name,
@@ -1148,6 +1530,21 @@ class ChallengerGate:
             if isinstance(exc, StudioAgentError):
                 raise
             raise StudioAgentError(f"ChallengerGate structured evaluation failed: {exc}") from exc
+
+        # 5b. Convene the 6-Specialist Multi-Agent Final Sign-Off Council
+        self.sign_off_council.event_bus = self.event_bus
+        sign_off_report = self.sign_off_council.evaluate_sign_off(
+            candidate_dir=c_dir,
+            spec=spec,
+            ast_grounding=ast_grounding,
+            telemetry_grounding=telemetry_grounding,
+            visual_grounding=visual_grounding,
+            asset_grounding=asset_grounding,
+            client=active_client if evaluation.specialist_sign_off is None else None,
+        )
+        evaluation.specialist_sign_off = sign_off_report
+        if not sign_off_report.unanimous_approval:
+            evaluation.overall_verdict = False
 
         # 6. Programmatic 100% Threshold & Hollow Stub Enforcement (Defense-in-Depth)
         evaluation = self._enforce_deterministic_invariants(
@@ -1191,13 +1588,17 @@ class ChallengerGate:
 
         return None
 
-    def _collect_asset_grounding(self, candidate_dir: Path, spec: GameRequirementsSpec) -> Dict[str, Any]:
+    def _collect_asset_grounding(self, candidate_dir: Path, spec: Optional[GameRequirementsSpec] = None) -> Dict[str, Any]:
         sprites = [p.name for p in (candidate_dir / "assets" / "sprites").glob("*.png")] if (candidate_dir / "assets" / "sprites").exists() else []
+        portraits = [p.name for p in (candidate_dir / "assets" / "portraits").glob("*.png")] if (candidate_dir / "assets" / "portraits").exists() else []
         audio = [p.name for p in (candidate_dir / "assets" / "audio").glob("*.wav")] if (candidate_dir / "assets" / "audio").exists() else []
-        manifest_reqs = [getattr(a, "name", None) or getattr(a, "asset_id", "asset") for a in getattr(spec, "asset_manifest", [])]
+        mockups = [p.name for p in (candidate_dir / "assets" / "mockups").glob("*.png")] if (candidate_dir / "assets" / "mockups").exists() else []
+        manifest_reqs = [getattr(a, "name", None) or getattr(a, "asset_id", "asset") for a in getattr(spec, "asset_manifest", [])] if spec is not None else []
         return {
             "sprites_found": sprites,
+            "portraits_found": portraits,
             "audio_found": audio,
+            "mockups_found": mockups,
             "manifest_required": manifest_reqs,
         }
 
@@ -1221,6 +1622,22 @@ class ChallengerGate:
                 f"  Criteria:\n" + ("\n".join(crit_lines) if crit_lines else "    None explicitly defined.")
             )
 
+        bible_section = ""
+        if candidate_dir is not None and (candidate_dir / "game_bible.json").is_file():
+            try:
+                b_data = json.loads((candidate_dir / "game_bible.json").read_text(encoding="utf-8"))
+                bible_section = (
+                    f"\n--- LIVING GAME BIBLE (`game_bible.json` — EXPERIENCE & DIEGETIC UX CONTRACT) ---\n"
+                    f"Core Fantasy: {b_data.get('core_fantasy', '')}\n"
+                    f"First 60 Seconds Hook: {b_data.get('first_60_seconds_hook', '')}\n"
+                    f"Diegetic UI & Onboarding Philosophy: {b_data.get('diegetic_ui_philosophy', '')}\n"
+                    f"Gameplay Pillars: {json.dumps(b_data.get('gameplay_pillars', []))}\n"
+                    f"Experience Storyboard Beats: {json.dumps(b_data.get('experience_storyboard', []))}\n"
+                    f"Visual Mockup Targets: {json.dumps(b_data.get('visual_mockups', []))}\n"
+                )
+            except Exception:
+                pass
+
         code_listings: List[str] = []
         if candidate_dir is not None and candidate_dir.is_dir():
             for code_f in sorted(list(candidate_dir.glob("*.gd")) + list(candidate_dir.glob("*.py"))):
@@ -1236,14 +1653,15 @@ class ChallengerGate:
         return (
             f"You are the Adversarial Design Critic & Quality Challenger Gate AI.\n"
             f"Your mission is to perform an uncompromising, rigorous audit of a candidate game cartridge build against "
-            f"100% of the game development team's authored Game Requirements and Acceptance Criteria.\n\n"
+            f"100% of the game development team's authored Game Requirements, Acceptance Criteria, and Living Game Bible.\n\n"
             f"--- CANDIDATE CARTRIDGE ID ---\n{candidate_id}\n\n"
             f"--- AGENT-AUTHORED REQUIREMENTS SPECIFICATION (`requirements_spec.json`) ---\n"
             f"Game Title: {spec.game_title}\n"
             f"Genre Paradigm: {spec.genre_paradigm}\n"
             f"Target Audience: {getattr(spec, 'target_audience_summary', '')}\n\n"
             f"Backlog Tracks ({len(spec.requirements)} total):\n"
-            f"{'='*50}\n" + "\n\n".join(req_lines) + f"\n{'='*50}\n\n"
+            f"{'='*50}\n" + "\n\n".join(req_lines) + f"\n{'='*50}\n"
+            f"{bible_section}\n"
             f"--- TRIANGULATED GROUNDING EVIDENCE ---\n"
             f"1. Static AST Code Analysis:\n{json.dumps(ast_grounding or {}, indent=2)}\n\n"
             f"2. Headless Runtime Telemetry & Playtest Trace:\n{json.dumps(telemetry_grounding or {}, indent=2)}\n\n"
@@ -1259,10 +1677,10 @@ class ChallengerGate:
             f"4. ANTI-STUB & ACTIVE RENDERING DETECTION: Reject shallow stubs, hollow function bodies (pass, return None, return empty Node2D.new()), "
             f"cross-module method name mismatches, unbound sprite/audio assets, missing MOUSE_BUTTON_LEFT placement handlers, "
             f"and scene modules that lack active _draw() or Sprite2D world rendering.\n"
-            f"5. GAME DESIGNER & UX SIGNOFF MANDATE: Audit the candidate from a human player and Game Designer's perspective:\n"
-            f"   - Interactive Playability: Mouse-to-world picking must use accurate canvas transforms (e.g. `get_global_mouse_position()`, never broken `get_viewport().size` math), placement guides must render on top of the terrain (`z_index > 0`), and players must be able to place, rotate (`KEY_R`), and cancel/demolish (`MOUSE_BUTTON_RIGHT`).\n"
-            f"   - Audio & Voice Playback: Runtime `.wav` files must be loaded into valid `AudioStreamWAV` streams via `FileAccess` (never relying on `ResourceLoader.exists()` without `.import` files), and player actions must trigger audible SFX.\n"
-            f"   - Visual Clarity & Onboarding: The world view must fill the viewport without gray cutoff edges, UI panels must not occlude the center playfield (`center_occluding_panels` must be empty), and the HUD must display a clear Objectives / Controls guide so the player knows how to play.\n"
+            f"5. GAME DESIGNER & DIEGETIC UX SIGNOFF MANDATE: Audit the candidate from a human player and Game Designer's perspective:\n"
+            f"   - Interactive Playability: Mouse-to-world picking must use accurate canvas transforms (e.g. `get_global_mouse_position()`, never broken `get_viewport().size` math), placement/interaction guides must render on top of the terrain (`z_index > 0`), and inputs must respond smoothly.\n"
+            f"   - Audio & Voice Playback: Runtime `.wav` files must be loaded into valid `AudioStreamWAV` streams via `FileAccess` at `mix_rate = 24000` with 44-byte RIFF header stripped (`bytes.slice(44)`), and player actions must trigger audible SFX without repeating/spamming.\n"
+            f"   - Visual Clarity, Experience Fidelity & Diegetic Onboarding: The world view must fill the viewport without gray cutoff edges or 95% opaque startup frost, UI panels must not occlude the center playfield (`center_occluding_panels` must be empty), and onboarding/feedback must honor the Living Game Bible's Diegetic UI Philosophy and 16:9 Visual Mockups.\n"
             f"6. RETURN STRUCTURE: Emit a ChallengerGateEvaluation object containing deliberation, candidate_id, overall_verdict, "
             f"and evaluated_requirements for every track.\n"
         )
@@ -1278,7 +1696,7 @@ class ChallengerGate:
         episode_number: int,
         attempt_number: int,
     ) -> ChallengerGateEvaluation:
-        """Programmatic defense-in-depth verifying 100% threshold and hollow stub rejection."""
+        """Programmatic defense-in-depth verifying 100% threshold, specialist sign-off, and hollow stub rejection."""
         evaluated_map = {r.requirement_id: r for r in evaluation.evaluated_requirements}
         missing_tracks = [r.id for r in spec.requirements if r.id not in evaluated_map]
 
@@ -1289,7 +1707,7 @@ class ChallengerGate:
             for stub in hollow_stubs:
                 stubs_found_reasons.append(f"{stub.get('module', '')}:{stub.get('function', '')} ({stub.get('reason', '')})")
 
-        # 1b. Check runtime scene_audit from Godot harness (audio streams & center UI occlusion)
+        # 1b. Check runtime scene_audit from Godot harness (audio streams, mix rate, & fullscreen/center UI occlusion)
         scene_audit = (telemetry_grounding or {}).get("scene_audit") or {}
         if isinstance(scene_audit, dict):
             ap_found = int(scene_audit.get("audio_players_found", 0) or 0)
@@ -1298,20 +1716,36 @@ class ChallengerGate:
                 stubs_found_reasons.append(
                     f"Runtime Audio Audit: {ap_found} AudioStreamPlayer node(s) found but 0 audio streams loaded (must use FileAccess -> AudioStreamWAV)"
                 )
+            mix_rates = scene_audit.get("audio_mix_rates") or []
+            if any(int(r) in (44100, 48000) for r in mix_rates):
+                stubs_found_reasons.append(
+                    f"Runtime Audio Audit: AudioStreamWAV mix_rate set to {mix_rates} instead of 24000 Hz (causes chipmunk audio distortion)"
+                )
             occluding = scene_audit.get("center_occluding_panels") or []
             if occluding:
                 stubs_found_reasons.append(
                     f"Designer UX Audit: UI panel(s) occluding center playfield: {occluding} (move tooltip/panels to screen edges)"
                 )
+            if scene_audit.get("fullscreen_occlusion_detected"):
+                stubs_found_reasons.append(
+                    "Designer UX Audit: Fullscreen viewport occlusion detected (startup frost >= 80% or unrecoverable failure lockout)"
+                )
 
         # 2. Check blank canvas
         blank_detected = (visual_grounding or {}).get("blank_canvas_detected", False)
 
+        # 3. Check specialist sign-off vetoes
+        specialist_vetoes: List[str] = []
+        if evaluation.specialist_sign_off and not evaluation.specialist_sign_off.unanimous_approval:
+            for v in evaluation.specialist_sign_off.verdicts:
+                if not v.approved:
+                    specialist_vetoes.append(f"{v.specialist_role}: {'; '.join(v.blocking_defects)}")
+
         unfulfilled = [r.requirement_id for r in evaluation.evaluated_requirements if not r.fulfilled]
         unfulfilled.extend(missing_tracks)
 
-        # Force overall_verdict = False if stubs found, blank canvas, or any unfulfilled
-        if unfulfilled or stubs_found_reasons or blank_detected:
+        # Force overall_verdict = False if stubs found, blank canvas, specialist vetoes, or any unfulfilled
+        if unfulfilled or stubs_found_reasons or blank_detected or specialist_vetoes:
             evaluation.overall_verdict = False
 
         if not evaluation.overall_verdict:
@@ -1320,6 +1754,8 @@ class ChallengerGate:
                 reasons.append(f"Unfulfilled requirements: {unfulfilled}")
             if stubs_found_reasons:
                 reasons.append(f"Hollow code stubs detected: {', '.join(stubs_found_reasons)}")
+            if specialist_vetoes:
+                reasons.append(f"Specialist Sign-Off Vetoes: {' | '.join(specialist_vetoes)}")
             if blank_detected:
                 reasons.append("Blank canvas detected (monochrome un-rendered surface)")
 
@@ -1339,7 +1775,7 @@ class ChallengerGate:
                     failure_type=GateFailureType.REQUIREMENT_UNFULFILLED,
                     failure_reason=combined_reason,
                     remedy_type=RemedyType.IMPLEMENT_REQUIREMENT,
-                    recommended_remedy="Replace hollow stubs and satisfy 100% of criteria in requirements_spec.json.",
+                    recommended_remedy="Replace hollow stubs, resolve specialist sign-off vetoes, and satisfy 100% of criteria in requirements_spec.json.",
                     remedy_parameters={
                         "unfulfilled_requirements": unfulfilled,
                         "failing_criteria": failing_crit,
@@ -1350,7 +1786,7 @@ class ChallengerGate:
                     telemetry_evidence=telemetry_grounding,
                     recommended_corrective_actions=[
                         "Implement authentic mechanics logic replacing pass, return None, or hollow Node2D.new() bodies.",
-                        "Ensure entities, sprites, audio, and scenes are actively rendered and connected in the game loop.",
+                        "Ensure entities, sprites, 24kHz WAV audio, and scenes are actively rendered and connected in the game loop.",
                     ],
                 )
             else:
@@ -1377,6 +1813,7 @@ class ChallengerGate:
                         "unfulfilled": [
                             r.requirement_id for r in evaluation.evaluated_requirements if not r.fulfilled
                         ],
+                        "specialist_sign_off": evaluation.specialist_sign_off.to_dict() if evaluation.specialist_sign_off else None,
                     },
                     rejection_trace=evaluation.rejection_trace.to_dict() if evaluation.rejection_trace else None,
                 )
@@ -1395,6 +1832,7 @@ class ChallengerGate:
                             "unfulfilled": [
                                 r.requirement_id for r in evaluation.evaluated_requirements if not r.fulfilled
                             ],
+                            "specialist_sign_off": evaluation.specialist_sign_off.to_dict() if evaluation.specialist_sign_off else None,
                         },
                         "rejection_trace": evaluation.rejection_trace.to_dict() if evaluation.rejection_trace else None,
                     },

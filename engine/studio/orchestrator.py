@@ -12,6 +12,8 @@ import logging
 import os
 from pathlib import Path
 import shutil
+import sys
+import threading
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 import time as _time
 import uuid
@@ -26,6 +28,7 @@ from engine.studio.models import (
     AgentVerificationRecord,
     BaseEpistemicModel,
     CartridgeCompilationResult,
+    GameBibleSpec,
     GameRequirementsSpec,
     GenesisWorldSpec,
     RequirementTrack,
@@ -189,8 +192,10 @@ class StudioOrchestrator:
 
     ALLOWED_TRANSITIONS: Dict[StudioBuildState, Set[StudioBuildState]] = {
         StudioBuildState.IDLE: {StudioBuildState.ANALYZING},
-        StudioBuildState.ANALYZING: {StudioBuildState.SYNTHESIZING},
-        StudioBuildState.SYNTHESIZING: {StudioBuildState.VERIFYING},
+        StudioBuildState.ANALYZING: {StudioBuildState.BRAINSTORMING, StudioBuildState.SYNTHESIZING},
+        StudioBuildState.BRAINSTORMING: {StudioBuildState.AWAITING_GREENLIGHT, StudioBuildState.SYNTHESIZING},
+        StudioBuildState.AWAITING_GREENLIGHT: {StudioBuildState.BRAINSTORMING, StudioBuildState.SYNTHESIZING, StudioBuildState.IDLE},
+        StudioBuildState.SYNTHESIZING: {StudioBuildState.VERIFYING, StudioBuildState.BRAINSTORMING, StudioBuildState.AWAITING_GREENLIGHT},
         StudioBuildState.VERIFYING: {StudioBuildState.PROMOTED, StudioBuildState.SYNTHESIZING},
         StudioBuildState.PROMOTED: {StudioBuildState.IDLE},
     }
@@ -203,6 +208,7 @@ class StudioOrchestrator:
         event_bus: Optional[Any] = None,
         deliberation: str = "Initializing StudioOrchestrator multi-agent studio swarm.",
         db_path: Optional[Any] = None,
+        enable_writers_room: Optional[bool] = None,
     ):
         self.deliberation = deliberation
         self.db_path = Path(db_path) if db_path else None
@@ -226,16 +232,37 @@ class StudioOrchestrator:
             except Exception:
                 self.event_bus = None
         self.client = client if client is not None else self._init_gemini_client(self.api_key, timeout_seconds=self.config.timeout_seconds)
+        self.enable_writers_room = enable_writers_room
+        self.active_game_bible: Optional[GameBibleSpec] = None
+        self._greenlight_decision: Optional[Dict[str, Any]] = None
+        self._greenlight_event: threading.Event = threading.Event()
+        self._abort_requested: bool = False
+        if self.event_bus is not None:
+            try:
+                self.event_bus._active_orchestrator = self
+                if getattr(self.event_bus, "_pause_for_greenlight", False):
+                    self.config.pause_for_greenlight = True
+            except Exception:
+                pass
 
-        # Assemble the 9 specialist agent roles
+        # Assemble the 9 specialist agent roles + CreativeWritersRoom
         self.agents: Dict[str, Any] = self._assemble_agents()
+
+    def _is_live_genai_client(self) -> bool:
+        """Returns True if self.client is a live google.genai Client rather than None or a unit-test mock."""
+        if self.client is None:
+            return False
+        if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
+            return False
+        mod = getattr(type(self.client), "__module__", "") or ""
+        return mod.startswith("google.genai")
 
     def _get_telemetry_db(self) -> Optional[Any]:
         """Returns TelemetryDB instance if configured or in live production mode; None in pytest without explicit DB path."""
         if self.db_path is not None:
             from engine.telemetry.db import TelemetryDB
             return TelemetryDB(self.db_path)
-        if "PYTEST_CURRENT_TEST" in os.environ:
+        if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
             return None
         from engine.telemetry.db import TelemetryDB
         return TelemetryDB()
@@ -290,6 +317,20 @@ class StudioOrchestrator:
     def _init_gemini_client(api_key: str, timeout_seconds: float = 300.0) -> Any:
         if not api_key or not api_key.strip():
             raise StudioAgentError("GEMINI_API_KEY is required to initialize google.genai Client")
+        if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
+            class _OfflinePytestModels:
+                def generate_content(self, *args: Any, **kwargs: Any) -> Any:
+                    raise StudioAgentError("Live Gemini API calls are blocked during pytest; provide a mocked client.")
+
+                def generate_images(self, *args: Any, **kwargs: Any) -> Any:
+                    raise StudioAgentError("Live Gemini API calls are blocked during pytest; provide a mocked client.")
+
+            class _OfflinePytestGeminiClient:
+                def __init__(self, key: str) -> None:
+                    self.api_key = key
+                    self.models = _OfflinePytestModels()
+
+            return _OfflinePytestGeminiClient(api_key)
         try:
             from google import genai
             timeout_ms = int(max(timeout_seconds, 10.0) * 1000)
@@ -299,13 +340,14 @@ class StudioOrchestrator:
             raise StudioAgentError(f"Failed to initialize google.genai Client: {exc}") from exc
 
     def _assemble_agents(self) -> Dict[str, Any]:
-        """Instantiates all 9 specialist agent personas (Rule 5: Zero Silent Fallbacks)."""
+        """Instantiates all 9 specialist agent personas plus CreativeWritersRoom (Rule 5: Zero Silent Fallbacks)."""
         from engine.studio.director import CreativeDirectorWorldbuilderAgent
         from engine.studio.narrative import NarrativeCharacterWriterAgent
         from engine.studio.audio import VoiceActingAudioProducerAgent
         from engine.studio.visual import VisualArtSpriteDesignerAgent
         from engine.studio.swe import LeadGameplaySWEAgent
         from engine.studio.telemetry_architect import TelemetryArchitectAgent
+        from engine.studio.writers_room import CreativeWritersRoom
         from engine.supervisor.supervisor import BuildSupervisor
 
         director_agent = CreativeDirectorWorldbuilderAgent(client=self.client, model_name=self.config.model_name)
@@ -322,6 +364,21 @@ class StudioOrchestrator:
             event_bus=self.event_bus,
         )
 
+        def _writers_room_event_cb(ev_type: str, payload: Dict[str, Any]) -> None:
+            delib = payload.get("deliberation", f"CreativeWritersRoom emitted {ev_type}")
+            speaker = payload.get("speaker_role") or "CreativeWritersRoom"
+            self._publish_event(ev_type, speaker, delib, payload)
+
+        self.writers_room = CreativeWritersRoom(
+            client=self.client,
+            model_name=self.config.model_name,
+            visual_agent=visual_agent,
+            narrative_agent=narrative_agent,
+            audio_agent=audio_agent,
+            telemetry_db=self._get_telemetry_db(),
+            event_callback=_writers_room_event_cb,
+        )
+
         return {
             "StudioOrchestrator": self,
             "SteamAndTelemetryAnalystAgent": None,
@@ -333,6 +390,58 @@ class StudioOrchestrator:
             "TelemetryArchitectAgent": telemetry_agent,
             "QAPlaytesterBuildSupervisor": supervisor_agent,
         }
+
+    def cancel_active_build(self) -> None:
+        """Signals an active or paused Genesis build (e.g. waiting at Greenlight gate) to abort immediately so a new game can start."""
+        self._abort_requested = True
+        self._greenlight_decision = {"approved": False, "aborted": True, "feedback": ""}
+        if self._greenlight_event is not None:
+            try:
+                self._greenlight_event.set()
+            except Exception:
+                pass
+
+    def submit_greenlight_decision(self, approved: bool = True, feedback: str = "") -> Dict[str, Any]:
+        """Allows Mission Control UI to approve the Living Game Bible or inject steering feedback."""
+        self._greenlight_decision = {
+            "approved": bool(approved),
+            "feedback": (feedback or "").strip(),
+        }
+        if self._greenlight_event is not None:
+            try:
+                self._greenlight_event.set()
+            except Exception:
+                pass
+        return {
+            "deliberation": "Greenlight decision recorded for StudioOrchestrator.",
+            "approved": bool(approved),
+            "feedback": (feedback or "").strip(),
+            "state": self.state.value,
+        }
+
+    def run_writers_room_session(
+        self,
+        dna: Optional[Any] = None,
+        hypothesis_report: Optional[Any] = None,
+        staging_dir: Optional[Union[Path, str]] = None,
+        target_episode: int = 0,
+        creative_prompt: Optional[str] = None,
+    ) -> GameBibleSpec:
+        """Executes the open-ended CreativeWritersRoom session to produce a locked GameBibleSpec."""
+        c_dir = Path(staging_dir) if staging_dir else (PROJECT_ROOT / "cartridges" / f"candidate_genesis_{uuid.uuid4().hex[:6]}")
+        c_dir.mkdir(parents=True, exist_ok=True)
+        self.writers_room.telemetry_db = self._get_telemetry_db()
+        seed = creative_prompt or getattr(self, "_creative_prompt", None)
+        bible = self.writers_room.run_writers_room(
+            dna=dna,
+            hypothesis_report=hypothesis_report,
+            candidate_dir=c_dir,
+            target_episode=target_episode,
+            cartridge_id=c_dir.name,
+            creative_prompt=seed,
+        )
+        self.active_game_bible = bible
+        return bible
 
     def transition_to(self, new_state: StudioBuildState, deliberation: str) -> None:
         """Enforces valid state machine transitions."""
@@ -421,11 +530,14 @@ class StudioOrchestrator:
         steam_dna: Optional[Any] = None,
         evolution_report: Optional[Any] = None,
         target_episode: int = 0,
+        creative_prompt: Optional[str] = None,
     ) -> AwaitableStudioSwarmPlan:
         """Invokes live Gemini reasoning to dynamically assemble specialist roles,
         DAG edges, and genre-specific commissioning task manifests.
         Fails fast if Gemini API call fails (Rule 5: Zero Silent Fallbacks).
         """
+        if creative_prompt is not None:
+            self._creative_prompt = creative_prompt.strip()
         if not self.client:
             raise StudioSwarmPlanError(
                 "Gemini client is not initialized; cannot perform live meta-planning. "
@@ -436,7 +548,7 @@ class StudioOrchestrator:
 
         if target_episode == 0:
             # Genesis Build Mode
-            if steam_dna is None and "PYTEST_CURRENT_TEST" not in os.environ:
+            if steam_dna is None and not ("PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules):
                 try:
                     from engine.steam.dna import SteamDNAPersistence, scan_and_extract_local_dna
                     repo = SteamDNAPersistence(config.DB_PATH)
@@ -465,19 +577,26 @@ class StudioOrchestrator:
                     f"- Palette mood: {getattr(steam_dna, 'preferred_palette_mood', 'neon')}\n"
                     + (f"- Most-Played & Installed Steam Titles:\n{top_games_lines}\n" if top_games_lines else "")
                 )
+            seed_str = getattr(self, "_creative_prompt", "") or ""
+            seed_block = (
+                f"\nEXECUTIVE PRODUCER CREATIVE SEED / DIRECTION:\n{seed_str}\n"
+                if seed_str
+                else ""
+            )
             prompt = (
                 f"You are the Meta-Cognitive Studio Orchestrator for an autonomous AI game studio.\n"
                 f"Your task is to deliberate on the player's actual Steam library DNA and dynamically assemble the specialist "
                 f"agent swarm DAG and task manifest to build an original game from scratch tailored to their real gaming tastes.\n\n"
-                f"STEAM PLAYER DNA:\n{dna_summary}\n\n"
+                f"STEAM PLAYER DNA:\n{dna_summary}\n"
+                f"{seed_block}\n"
                 f"REQUIREMENTS:\n"
                 f"1. Deliberate deeply in 'deliberation' FIRST on the player's actual top-played Steam games, hours, and genre affinities, "
                 f"   explaining why your chosen game genre, core mechanics, and visual aesthetic fit this specific player.\n"
                 f"2. Conclude with an evocative 'game_title' and specific 'genre_verdict' directly grounded in the player's real Steam library.\n"
                 f"3. Select 'specialist_agent_roles' from: ['Director', 'Writer', 'Voice', 'Visual', 'SWE', 'TelemetryArchitect', 'Supervisor'].\n"
                 f"4. Define causal dependency 'dag_edges' as pairs of [upstream_role, downstream_role] using those exact short role names "
-                f"   (e.g. [['Director', 'Writer'], ['Writer', 'Voice'], ['Writer', 'Visual'], ['Writer', 'SWE'], ['SWE', 'TelemetryArchitect'], ['Voice', 'Supervisor'], ['Visual', 'Supervisor'], ['TelemetryArchitect', 'Supervisor']]) "
-                f"   so 'Director' precedes 'Writer', 'Writer' precedes 'Voice'/'Visual'/'SWE', and 'SWE' precedes 'TelemetryArchitect'.\n"
+                f"   (e.g. [['Director', 'Writer'], ['Writer', 'Voice'], ['Writer', 'Visual'], ['Voice', 'SWE'], ['Visual', 'SWE'], ['SWE', 'TelemetryArchitect'], ['Voice', 'Supervisor'], ['Visual', 'Supervisor'], ['TelemetryArchitect', 'Supervisor']]) "
+                f"   so 'Director' precedes 'Writer', 'Writer' precedes 'Voice'/'Visual', 'Voice' and 'Visual' precede 'SWE' (so all synthesized sprites and voice files exist on disk before SWE writes asset-binding code), and 'SWE' precedes 'TelemetryArchitect'.\n"
                 f"5. Provide a detailed 'task_manifest' JSON-encoded object string containing specific commissioning directives "
                 f"   for each selected specialist.\n"
             )
@@ -516,6 +635,7 @@ class StudioOrchestrator:
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=StudioSwarmPlan,
+                    temperature=1.2,
                 ),
             )
             if not response.text:
@@ -524,6 +644,14 @@ class StudioOrchestrator:
             plan_dict = json.loads(response.text)
             plan = AwaitableStudioSwarmPlan(**plan_dict)
             plan.target_episode = target_episode
+            # Enforce that Visual and Voice precede SWE so synthesized assets exist before code synthesis
+            roles_set = set(plan.specialist_agent_roles)
+            existing_pairs = {(u, v) for u, v in plan.dag_edges if len([u, v]) == 2}
+            for asset_role in ("Visual", "Voice"):
+                if asset_role in roles_set and "SWE" in roles_set:
+                    if (asset_role, "SWE") not in existing_pairs and ("SWE", asset_role) not in existing_pairs:
+                        plan.dag_edges.append([asset_role, "SWE"])
+                        existing_pairs.add((asset_role, "SWE"))
             # Validate DAG acyclicity immediately
             plan.validate_dag()
 
@@ -638,12 +766,12 @@ class StudioOrchestrator:
             if canonical_name == "CreativeDirectorWorldbuilderAgent":
                 from engine.steam.models import SteamPlayerDNA
                 dna = context.raw_outputs.get("dna")
-                if dna is None:
+                if dna is None and not ("PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules):
                     try:
                         from engine.steam.dna import SteamDNAPersistence, scan_and_extract_local_dna
                         repo = SteamDNAPersistence(config.DB_PATH)
                         dna = repo.get_latest_dna()
-                        if (dna is None or getattr(dna, "total_games_analyzed", 0) == 0 or not getattr(dna, "top_games", None)) and "PYTEST_CURRENT_TEST" not in os.environ:
+                        if dna is None or getattr(dna, "total_games_analyzed", 0) == 0 or not getattr(dna, "top_games", None):
                             scanned = scan_and_extract_local_dna(db_path=config.DB_PATH)
                             if scanned is not None:
                                 dna = scanned
@@ -664,9 +792,35 @@ class StudioOrchestrator:
                     try:
                         world_spec = GenesisWorldSpec.model_validate_json((staging_dir / "world_spec.json").read_text(encoding="utf-8"))
                         req_spec = GameRequirementsSpec.model_validate_json((staging_dir / "requirements_spec.json").read_text(encoding="utf-8"))
+                        # Reset any rejected or interrupted in_progress tracks to pending so resumed builds retry them
+                        reset_any = False
+                        for trk in getattr(req_spec, "requirements", []):
+                            if getattr(trk, "status", "") in ("rejected", "in_progress"):
+                                trk.status = "pending"
+                                reset_any = True
+                        if reset_any:
+                            (staging_dir / "requirements_spec.json").write_text(
+                                req_spec.model_dump_json(indent=2), encoding="utf-8"
+                            )
+                        if (staging_dir / "game_bible.json").is_file():
+                            try:
+                                resumed_bible = GameBibleSpec.model_validate_json(
+                                    (staging_dir / "game_bible.json").read_text(encoding="utf-8")
+                                )
+                                self.active_game_bible = resumed_bible
+                                context.raw_outputs["game_bible"] = resumed_bible
+                                self._sync_bible_to_plan_and_staging(resumed_bible, plan, staging_dir)
+                            except Exception as gb_exc:
+                                logger.warning("Could not load game_bible.json during resume: %s", gb_exc)
+                        plan.game_title = getattr(world_spec, "game_title", plan.game_title)
+                        plan.genre_verdict = getattr(world_spec, "core_genre", plan.genre_verdict)
                         context.raw_outputs["requirements_spec"] = req_spec
                         context.raw_outputs["GameRequirementsSpec"] = req_spec
+                        context.raw_outputs["_agent_authored_req_spec"] = True
                         context.raw_outputs["world_spec"] = world_spec
+                        context.raw_outputs["Director"] = world_spec
+                        context.raw_outputs["CreativeDirectorWorldbuilderAgent"] = world_spec
+                        self._persist_requirements_to_db(req_spec, build_id=f"build_{staging_dir.name}")
                         logger.info("Resumed existing world_spec and requirements_spec from %s", staging_dir)
                         dur_ms = (_time.perf_counter() - t_start) * 1000.0
                         self._publish_event("AGENT_STREAM", canonical_name, world_spec.deliberation, {"game_title": getattr(world_spec, "game_title", plan.game_title)})
@@ -674,6 +828,18 @@ class StudioOrchestrator:
                         return world_spec
                     except Exception as e:
                         logger.warning("Failed resuming existing director specs from %s: %s, regenerating", staging_dir, e)
+
+                game_bible: Optional[GameBibleSpec] = context.raw_outputs.get("game_bible")
+                if game_bible is None and (staging_dir / "game_bible.json").is_file():
+                    try:
+                        game_bible = GameBibleSpec.model_validate_json(
+                            (staging_dir / "game_bible.json").read_text(encoding="utf-8")
+                        )
+                        self.active_game_bible = game_bible
+                        context.raw_outputs["game_bible"] = game_bible
+                    except Exception as exc:
+                        logger.warning("Failed to deserialize existing game_bible.json: %s", exc)
+                        game_bible = None
 
                 world_spec = None
                 if (staging_dir / "world_spec.json").is_file():
@@ -683,6 +849,150 @@ class StudioOrchestrator:
                     except Exception as e:
                         logger.warning("Failed to deserialize existing world_spec: %s, regenerating", e)
                         world_spec = None
+
+                use_writers_room = (
+                    self.enable_writers_room
+                    if self.enable_writers_room is not None
+                    else self._is_live_genai_client()
+                )
+
+                def _sync_bible_to_plan_and_staging(gb: GameBibleSpec) -> None:
+                    if gb.game_title and gb.game_title != "Untitled Concept":
+                        plan.game_title = gb.game_title
+                        if gb.world_spec is not None:
+                            gb.world_spec.game_title = gb.game_title
+                    elif gb.world_spec and getattr(gb.world_spec, "game_title", None):
+                        plan.game_title = gb.world_spec.game_title
+                        gb.game_title = gb.world_spec.game_title
+
+                    if getattr(gb, "core_genre", None):
+                        plan.genre_verdict = gb.core_genre
+                        if gb.world_spec is not None:
+                            gb.world_spec.core_genre = gb.core_genre
+                    elif gb.world_spec and getattr(gb.world_spec, "core_genre", None):
+                        plan.genre_verdict = gb.world_spec.core_genre
+                        gb.core_genre = gb.world_spec.core_genre
+
+                    if gb.world_spec is not None:
+                        (staging_dir / "world_spec.json").write_text(
+                            gb.world_spec.model_dump_json(indent=2), encoding="utf-8"
+                        )
+                        manifest_preview = {
+                            "title": plan.game_title,
+                            "genre": plan.genre_verdict,
+                            "episode": plan.target_episode,
+                            "deliberation": gb.world_spec.deliberation,
+                            "narrative_premise": gb.elevator_pitch or getattr(gb.world_spec, "thematic_premise", ""),
+                            "creative_direction": {
+                                "narrative_premise": gb.elevator_pitch or gb.core_fantasy or getattr(gb.world_spec, "thematic_premise", ""),
+                                "world_lore": getattr(gb.world_spec, "world_lore", "") or gb.core_fantasy,
+                                "core_rules": gb.gameplay_pillars or getattr(gb.world_spec, "mechanics_guidelines", []),
+                                "aesthetic_style": gb.visual_style_guide or getattr(gb.world_spec, "aesthetic_style", ""),
+                            },
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                        (staging_dir / "manifest.json").write_text(
+                            json.dumps(manifest_preview, indent=2), encoding="utf-8"
+                        )
+
+                if world_spec is None and use_writers_room:
+                    evolution_report = context.raw_outputs.get("evolution_report") or context.raw_outputs.get("hypothesis_report")
+                    if StudioBuildState.BRAINSTORMING in self.ALLOWED_TRANSITIONS.get(self.state, set()):
+                        self.transition_to(
+                            StudioBuildState.BRAINSTORMING,
+                            f"Convening Multi-Agent Creative Writers' Room for '{plan.game_title}'...",
+                        )
+                    game_bible = self.run_writers_room_session(
+                        dna=dna,
+                        hypothesis_report=evolution_report,
+                        staging_dir=staging_dir,
+                        target_episode=plan.target_episode,
+                    )
+                    _sync_bible_to_plan_and_staging(game_bible)
+                    # Optional Greenlight Pause Gate
+                    while getattr(self.config, "pause_for_greenlight", False) or getattr(self.event_bus, "_pause_for_greenlight", False):
+                        if getattr(self, "_abort_requested", False):
+                            break
+                        if self._greenlight_decision is None:
+                            game_bible.status = "awaiting_greenlight"
+                            self.writers_room._persist_bible(game_bible, candidate_dir=staging_dir)
+                            if StudioBuildState.AWAITING_GREENLIGHT in self.ALLOWED_TRANSITIONS.get(self.state, set()):
+                                self.transition_to(
+                                    StudioBuildState.AWAITING_GREENLIGHT,
+                                    f"Living Game Bible for '{game_bible.game_title}' awaiting Executive Producer greenlight.",
+                                )
+                            self._greenlight_event.clear()
+                            while not self._greenlight_event.is_set() and not getattr(self, "_abort_requested", False):
+                                await asyncio.sleep(0.05)
+                        if getattr(self, "_abort_requested", False):
+                            break
+                        decision = self._greenlight_decision or {"approved": True, "feedback": ""}
+                        self._greenlight_decision = None
+                        self._greenlight_event.clear()
+                        if decision.get("aborted"):
+                            self._abort_requested = True
+                            break
+                        if decision.get("approved", True) and not decision.get("feedback"):
+                            game_bible.status = "locked"
+                            self.writers_room._persist_bible(game_bible, candidate_dir=staging_dir)
+                            break
+                        feedback_text = decision.get("feedback", "")
+                        if feedback_text:
+                            if StudioBuildState.BRAINSTORMING in self.ALLOWED_TRANSITIONS.get(self.state, set()):
+                                self.transition_to(
+                                    StudioBuildState.BRAINSTORMING,
+                                    f"Writers' Room incorporating Executive Producer feedback: {feedback_text[:80]}",
+                                )
+                            game_bible = self.writers_room.inject_user_steering_and_continue(
+                                game_bible=game_bible,
+                                user_feedback=feedback_text,
+                                dna=dna,
+                                candidate_dir=staging_dir,
+                            )
+                            self.active_game_bible = game_bible
+                            _sync_bible_to_plan_and_staging(game_bible)
+                        if decision.get("approved", False):
+                            game_bible.status = "locked"
+                            self.writers_room._persist_bible(game_bible, candidate_dir=staging_dir)
+                            break
+
+                    if getattr(self, "_abort_requested", False):
+                        self.state = StudioBuildState.IDLE
+                        return StudioBuildReport(
+                            deliberation="Previous Genesis build cancelled at Greenlight gate to start a new game from scratch.",
+                            build_id=plan.plan_id,
+                            game_title=plan.game_title,
+                            target_episode=plan.target_episode,
+                            success=False,
+                            promoted_to_active=False,
+                            rejection_trace="Cancelled by user starting a new Genesis build.",
+                        )
+
+                    _sync_bible_to_plan_and_staging(game_bible)
+                    if self.state != StudioBuildState.SYNTHESIZING and StudioBuildState.SYNTHESIZING in self.ALLOWED_TRANSITIONS.get(self.state, set()):
+                        self.transition_to(
+                            StudioBuildState.SYNTHESIZING,
+                            f"Writers' Room locked Living Game Bible for '{game_bible.game_title}'; entering code & asset synthesis.",
+                        )
+
+                    context.raw_outputs["game_bible"] = game_bible
+                    world_spec = game_bible.world_spec
+                    if world_spec is not None:
+                        (staging_dir / "world_spec.json").write_text(world_spec.model_dump_json(indent=2), encoding="utf-8")
+                    if game_bible.narrative_bible is not None and (
+                        game_bible.narrative_bible.characters
+                        or game_bible.narrative_bible.dialogue_barks
+                        or game_bible.narrative_bible.cutscenes
+                    ):
+                        (staging_dir / "narrative_bible.json").write_text(
+                            game_bible.narrative_bible.model_dump_json(indent=2), encoding="utf-8"
+                        )
+                        (staging_dir / "narrative.json").write_text(
+                            json.dumps(game_bible.narrative_bible.to_cartridge_narrative_dict(), indent=2),
+                            encoding="utf-8",
+                        )
+                        context.raw_outputs["Writer"] = game_bible.narrative_bible
+                        context.raw_outputs["NarrativeCharacterWriterAgent"] = game_bible.narrative_bible
 
                 if world_spec is None:
                     if plan.target_episode == 0:
@@ -717,6 +1027,10 @@ class StudioOrchestrator:
                             previous_spec=previous_spec,
                             target_episode=plan.target_episode,
                         )
+                    if getattr(world_spec, "game_title", None):
+                        plan.game_title = world_spec.game_title
+                    if getattr(world_spec, "core_genre", None):
+                        plan.genre_verdict = world_spec.core_genre
                     (staging_dir / "world_spec.json").write_text(world_spec.model_dump_json(indent=2), encoding="utf-8")
 
                 if not (staging_dir / "manifest.json").is_file():
@@ -752,12 +1066,16 @@ class StudioOrchestrator:
 
                     if call_agent:
                         evolution_report = context.raw_outputs.get("evolution_report") or context.raw_outputs.get("hypothesis_report")
-                        req_spec = agent.generate_requirements_spec(
-                            dna=dna,
-                            world_spec=world_spec,
-                            hypothesis_report=evolution_report,
-                            target_episode=plan.target_episode,
-                        )
+                        sig = inspect.signature(agent.generate_requirements_spec)
+                        req_kwargs: Dict[str, Any] = {
+                            "dna": dna,
+                            "world_spec": world_spec,
+                            "hypothesis_report": evolution_report,
+                            "target_episode": plan.target_episode,
+                        }
+                        if "game_bible" in sig.parameters:
+                            req_kwargs["game_bible"] = game_bible
+                        req_spec = agent.generate_requirements_spec(**req_kwargs)
                         context.raw_outputs["_agent_authored_req_spec"] = True
 
                     if req_spec is None:
@@ -830,6 +1148,8 @@ class StudioOrchestrator:
                     try:
                         from engine.studio.models import NarrativeBible
                         narrative_bible = NarrativeBible.model_validate_json((staging_dir / "narrative_bible.json").read_text(encoding="utf-8"))
+                        context.raw_outputs["Writer"] = narrative_bible
+                        context.raw_outputs["NarrativeCharacterWriterAgent"] = narrative_bible
                         logger.info("Resumed existing narrative_bible from %s", staging_dir)
                         dur_ms = (_time.perf_counter() - t_start) * 1000.0
                         self._publish_event("AGENT_STREAM", canonical_name, narrative_bible.deliberation, {"theme": getattr(narrative_bible, "thematic_tone", "grim_tense")})
@@ -1223,7 +1543,7 @@ class StudioOrchestrator:
                             "metrics": {"compilation_pass": True, "smoke_pass": True, "resumed": True},
                         },
                     )
-                self._persist_verified_checkpoint(staging_dir, track, completed_track_ids)
+                self._persist_verified_checkpoint(staging_dir, track, completed_track_ids, mirror_to_active=False)
                 continue
 
             track_t_start = _time.perf_counter()
@@ -1261,21 +1581,30 @@ class StudioOrchestrator:
             if (staging_dir / "project.godot").is_file():
                 code_snapshot["project.godot"] = (staging_dir / "project.godot").read_text(encoding="utf-8")
 
-            max_track_retries = max(2, getattr(self.config, "max_retries", 2))
+            max_track_retries = (
+                max(2, getattr(self.config, "max_retries", 2))
+                if self._is_live_genai_client()
+                else 1
+            )
             track_succeeded = False
             last_track_exc = None
 
             for track_attempt in range(1, max_track_retries + 1):
                 try:
                     # Synthesize or expand code
+                    prior_err_str = str(last_track_exc) if last_track_exc else None
                     if hasattr(agent, "implement_requirement_track"):
-                        res = agent.implement_requirement_track(
-                            track=track,
-                            staging_dir=staging_dir,
-                            requirements_spec=req_spec,
-                            narrative_bible=narrative_bible,
-                            world_spec=world_spec,
-                        )
+                        sig = inspect.signature(agent.implement_requirement_track)
+                        call_kwargs: Dict[str, Any] = {
+                            "track": track,
+                            "staging_dir": staging_dir,
+                            "requirements_spec": req_spec,
+                            "narrative_bible": narrative_bible,
+                            "world_spec": world_spec,
+                        }
+                        if "prior_error" in sig.parameters and prior_err_str:
+                            call_kwargs["prior_error"] = prior_err_str
+                        res = agent.implement_requirement_track(**call_kwargs)
                         results.update(res)
                     elif hasattr(agent, "synthesize_requirement_track"):
                         res = agent.synthesize_requirement_track(
@@ -1300,7 +1629,7 @@ class StudioOrchestrator:
                         )
 
                     # Per-track AST and smoke verification
-                    self._verify_track_smoke_check(staging_dir, track)
+                    self._verify_track_smoke_check(staging_dir, track, swe_agent=agent)
                     track_succeeded = True
                     break
                 except Exception as exc:
@@ -1463,8 +1792,8 @@ class StudioOrchestrator:
             if context is not None:
                 context.record_task(track_task)
 
-            # 5. Persist Verified Checkpoint and live mirror to cartridges/active/
-            self._persist_verified_checkpoint(staging_dir, track, completed_track_ids)
+            # 5. Persist Verified Checkpoint in cartridges/checkpoints/ (do not overwrite cartridges/active/ mid-build before QA & Sign-Off Council)
+            self._persist_verified_checkpoint(staging_dir, track, completed_track_ids, mirror_to_active=False)
 
         for code_pattern in ["*.py", "*.gd", "*.tscn", "project.godot"]:
             for p in staging_dir.glob(code_pattern):
@@ -1479,9 +1808,10 @@ class StudioOrchestrator:
         staging_dir: Path,
         track: RequirementTrack,
         verified_tracks: List[str],
+        mirror_to_active: bool = True,
     ) -> Path:
         """Persists an immutable verified checkpoint under cartridges/checkpoints/<candidate_id>_<track_id>/
-        and atomically mirrors it to cartridges/active/ for live playability during Genesis.
+        and optionally mirrors it to cartridges/active/ when mirror_to_active is True.
         """
         candidate_id = staging_dir.name
         if "PYTEST_CURRENT_TEST" in os.environ and candidate_id.startswith("staging_"):
@@ -1501,6 +1831,7 @@ class StudioOrchestrator:
         # 2. Copy specification and metadata files
         for json_name in [
             "manifest.json",
+            "game_bible.json",
             "world_spec.json",
             "requirements_spec.json",
             "narrative_bible.json",
@@ -1561,10 +1892,10 @@ class StudioOrchestrator:
         except Exception as exc:
             logger.debug("Failed to record checkpoint in telemetry.db: %s", exc)
 
-        # 6. Atomically mirror to cartridges/active/ only if active does not already have a more complete build
+        # 6. Atomically mirror to cartridges/active/ only if mirror_to_active is True and active does not already have a more complete build
         active_dir = PROJECT_ROOT / "cartridges" / "active"
-        should_mirror = True
-        if active_dir.exists() and (active_dir / "checkpoint_metadata.json").is_file():
+        should_mirror = mirror_to_active
+        if should_mirror and active_dir.exists() and (active_dir / "checkpoint_metadata.json").is_file():
             try:
                 existing_meta = json.loads((active_dir / "checkpoint_metadata.json").read_text(encoding="utf-8"))
                 existing_cand = existing_meta.get("candidate_id", "")
@@ -1599,7 +1930,7 @@ class StudioOrchestrator:
         # 7. Emit CHECKPOINT_VERIFIED event to SwarmEventBus with deliberation first
         delib_checkpoint = (
             f"Verified checkpoint {checkpoint_id} for requirement {track.id}: '{track.title}' "
-            f"persisted under {checkpoint_dir.name} and mirrored to cartridges/active/."
+            f"persisted under {checkpoint_dir.name}."
         )
         self._publish_event(
             "CHECKPOINT_VERIFIED",
@@ -1616,15 +1947,71 @@ class StudioOrchestrator:
         )
         return checkpoint_dir
 
-    def _verify_track_smoke_check(self, staging_dir: Path, track: RequirementTrack) -> None:
+    def _verify_track_smoke_check(
+        self,
+        staging_dir: Path,
+        track: RequirementTrack,
+        swe_agent: Optional[Any] = None,
+    ) -> None:
         """Verifies AST security, bytecode compilation, and headless smoke stepping for current track."""
         if (staging_dir / "project.godot").is_file():
-            from engine.sim.godot_verifier import verify_godot_cartridge_syntax, GodotHeadlessSimulator
+            from engine.sim.godot_verifier import (
+                verify_godot_cartridge_syntax,
+                parse_godot_stderr,
+                GodotHeadlessSimulator,
+            )
             valid, errs = verify_godot_cartridge_syntax(staging_dir)
+            if not valid and swe_agent is not None and hasattr(swe_agent, "_verify_and_heal_godot_syntax_and_probes"):
+                swe_agent._verify_and_heal_godot_syntax_and_probes(staging_dir)
+                valid, errs = verify_godot_cartridge_syntax(staging_dir)
             if not valid:
                 raise RuntimeError(f"Godot syntax verification failed: {errs}")
+
             sim = GodotHeadlessSimulator(cartridge_path=staging_dir, max_frames=10)
             res = sim.run()
+            if not res.success and swe_agent is not None and hasattr(swe_agent, "repair_godot_module"):
+                for _rt_pass in range(2):
+                    rt_diags = parse_godot_stderr(staging_dir, res.stderr or res.error_message or "")
+                    if not rt_diags and (staging_dir / "main.gd").is_file():
+                        broken_main = (staging_dir / "main.gd").read_text(encoding="utf-8")
+                        peer_ctx = (
+                            swe_agent._extract_gd_peer_signatures(staging_dir, exclude_file="main.gd")
+                            if hasattr(swe_agent, "_extract_gd_peer_signatures")
+                            else ""
+                        )
+                        fixed_main = swe_agent.repair_godot_module(
+                            "main.gd",
+                            broken_main,
+                            res.error_message or res.stderr or "Headless runtime failure",
+                            peer_context=peer_ctx,
+                        )
+                        (staging_dir / "main.gd").write_text(fixed_main, encoding="utf-8")
+                    else:
+                        by_file: Dict[Path, List[str]] = {}
+                        for d in rt_diags:
+                            if d.file_path.is_file():
+                                by_file.setdefault(d.file_path, []).append(
+                                    f"Line {d.line_number}: {d.error_message} (Raw: {d.raw_line})"
+                                )
+                        for fpath, entries in by_file.items():
+                            peer_ctx = (
+                                swe_agent._extract_gd_peer_signatures(staging_dir, exclude_file=fpath.name)
+                                if hasattr(swe_agent, "_extract_gd_peer_signatures")
+                                else ""
+                            )
+                            fixed_code = swe_agent.repair_godot_module(
+                                fpath.name,
+                                fpath.read_text(encoding="utf-8"),
+                                "\n".join(entries),
+                                peer_context=peer_ctx,
+                            )
+                            fpath.write_text(fixed_code, encoding="utf-8")
+                    if hasattr(swe_agent, "_verify_and_heal_godot_syntax_and_probes"):
+                        swe_agent._verify_and_heal_godot_syntax_and_probes(staging_dir)
+                    sim = GodotHeadlessSimulator(cartridge_path=staging_dir, max_frames=10)
+                    res = sim.run()
+                    if res.success:
+                        break
             if not res.success:
                 raise RuntimeError(f"Godot headless smoke check failed: {res.error_message or res.stderr}")
             return
@@ -1811,7 +2198,7 @@ class StudioOrchestrator:
         rej_trace = getattr(report, "rejection_trace", None)
         if hasattr(rej_trace, "model_dump"):
             rej_trace = rej_trace.model_dump()
-        elif not isinstance(rej_trace, dict):
+        if not isinstance(rej_trace, dict):
             rej_trace = None
         promoted = bool(getattr(report, "promoted_to_active", False))
 

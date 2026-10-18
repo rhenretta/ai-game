@@ -1,7 +1,11 @@
 """Pytest configuration and shared fixtures for Autonomous Game Engine test suites."""
 
+import atexit
 import os
+from pathlib import Path
+import shutil
 import sqlite3
+import tempfile
 from typing import Any, Dict, List, Optional, Tuple, Union
 import pytest
 
@@ -9,6 +13,18 @@ import pytest
 os.environ["SDL_VIDEODRIVER"] = "dummy"
 os.environ["SDL_AUDIODRIVER"] = "dummy"
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
+
+# Hermetically isolate all pytest database & studio data paths away from production data/telemetry.db
+_PYTEST_DATA_DIR = Path(tempfile.mkdtemp(prefix="pytest_studio_data_"))
+_PYTEST_DB_PATH = _PYTEST_DATA_DIR / "telemetry.db"
+os.environ["STUDIO_DATA_DIR"] = str(_PYTEST_DATA_DIR)
+os.environ["STUDIO_DB_PATH"] = str(_PYTEST_DB_PATH)
+
+import config as _root_config  # noqa: E402
+_root_config.DATA_DIR = _PYTEST_DATA_DIR
+_root_config.DB_PATH = _PYTEST_DB_PATH
+
+atexit.register(lambda: shutil.rmtree(_PYTEST_DATA_DIR, ignore_errors=True))
 
 
 # Canonical 16-color Style Bible palette (RGB)
@@ -375,39 +391,25 @@ def sample_open_genre_cartridge(tmp_path_factory):
 
 @pytest.fixture(scope="session", autouse=True)
 def clean_stale_telemetry_db():
-    """Removes stale telemetry database state without unlinking open inodes.
+    """Initializes the isolated pytest temporary telemetry database.
 
-    Preserves open file handles and inodes for live processes (e.g. run_studio.py
-    server PID 34772) to prevent POSIX lock divergence, WAL mapping corruption,
-    and sqlite3.OperationalError('disk I/O error').
+    Never touches the production <PROJECT_ROOT>/data/telemetry.db database.
     """
     import sqlite3
     import config
+    from engine.telemetry.db import TelemetryDB
 
-    db_path = config.DB_PATH
-    if not db_path.exists():
-        return
+    prod_db = (config.PROJECT_ROOT / "data" / "telemetry.db").resolve()
+    db_path = _PYTEST_DB_PATH
+    assert db_path.resolve() != prod_db, "Pytest DB_PATH must never point to production data/telemetry.db"
 
     try:
+        # Ensure schema exists in the isolated pytest DB
+        TelemetryDB(db_path)
         conn = sqlite3.connect(str(db_path), timeout=5.0)
         try:
             conn.execute("PRAGMA busy_timeout = 5000;")
-            cur = conn.cursor()
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
-            tables = [row[0] for row in cur.fetchall()]
-            if tables:
-                conn.execute("PRAGMA foreign_keys = OFF;")
-                for tbl in ["custom_telemetry_events", "telemetry_events", "telemetry_episodes", "telemetry_sessions", "telemetry_probes"]:
-                    if tbl in tables:
-                        conn.execute(f"DELETE FROM {tbl};")
-                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sqlite_sequence';")
-                if cur.fetchone():
-                    conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('telemetry_events', 'custom_telemetry_events');")
-                conn.commit()
-                conn.execute("PRAGMA foreign_keys = ON;")
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-
-            # Re-seed built-in engine probes for referential integrity
+            # Seed built-in engine probes for referential integrity in the isolated test DB
             try:
                 conn.execute("""
                     INSERT INTO telemetry_probes (probe_id, probe_name, category, description, hypothesis_target, schema_json)
@@ -418,30 +420,6 @@ def clean_stale_telemetry_db():
                 """)
             except Exception:
                 pass
-
-            # Re-seed active cartridge probes from telemetry_manifest.json
-            active_manifest = config.PROJECT_ROOT / "cartridges" / "active" / "telemetry_manifest.json"
-            if active_manifest.is_file():
-                try:
-                    import json
-                    m_data = json.loads(active_manifest.read_text(encoding="utf-8"))
-                    for p in m_data.get("probes", []):
-                        if isinstance(p, dict) and p.get("probe_name"):
-                            conn.execute("""
-                                INSERT INTO telemetry_probes (probe_id, probe_name, category, description, hypothesis_target, schema_json)
-                                VALUES (?, ?, ?, ?, ?, ?)
-                                ON CONFLICT(probe_name) DO NOTHING;
-                            """, (
-                                str(p.get("probe_id") or f"prb_{p['probe_name']}"),
-                                str(p["probe_name"]),
-                                str(p.get("category", "general")),
-                                str(p.get("description", "")),
-                                str(p.get("hypothesis_target", "")),
-                                json.dumps(p.get("payload_schema", {})),
-                            ))
-                except Exception:
-                    pass
-
             conn.commit()
         finally:
             conn.close()
@@ -450,8 +428,35 @@ def clean_stale_telemetry_db():
 
 
 @pytest.fixture(autouse=True)
-def isolate_studio_daemon_in_run_studio_tests(request, monkeypatch):
-    """Ensures test_genesis_cycle_promotes_cartridge exercises mock_supervisor without unmocked live Gemini API calls."""
+def isolate_llm_and_db_in_tests(request, monkeypatch):
+    """Guarantees every test uses the isolated pytest DB and never makes live network Gemini API calls."""
+    import config
+
+    monkeypatch.setenv("STUDIO_DATA_DIR", str(_PYTEST_DATA_DIR))
+    monkeypatch.setenv("STUDIO_DB_PATH", str(_PYTEST_DB_PATH))
+    monkeypatch.setattr(config, "DATA_DIR", _PYTEST_DATA_DIR, raising=False)
+    monkeypatch.setattr(config, "DB_PATH", _PYTEST_DB_PATH, raising=False)
+
+    # Block any unmocked google.genai.Client network instantiation
+    try:
+        from google import genai
+
+        class _OfflineTestModels:
+            def generate_content(self, *args: Any, **kwargs: Any) -> Any:
+                raise RuntimeError("Unmocked live Gemini API call (generate_content) blocked during pytest.")
+
+            def generate_images(self, *args: Any, **kwargs: Any) -> Any:
+                raise RuntimeError("Unmocked live Gemini API call (generate_images) blocked during pytest.")
+
+        class _OfflineTestGenaiClient:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                self.api_key = kwargs.get("api_key", "mock-pytest-key")
+                self.models = _OfflineTestModels()
+
+        monkeypatch.setattr(genai, "Client", _OfflineTestGenaiClient)
+    except ImportError:
+        pass
+
     if "test_run_studio" in request.node.nodeid and "test_genesis_cycle_promotes_cartridge" in request.node.nodeid:
         from engine.studio.daemon import StudioDaemon
         orig_init = StudioDaemon.__init__

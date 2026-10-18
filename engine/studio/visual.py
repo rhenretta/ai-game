@@ -29,6 +29,7 @@ from engine.studio.models import (
     CharacterSheet,
     GameRequirementsSpec,
     StudioAgentError,
+    VisualMockupArtifact,
 )
 
 logger = logging.getLogger("VisualArtSpriteDesignerAgent")
@@ -661,6 +662,89 @@ class VisualArtSpriteDesignerAgent:
         quantized.save(out_p, "PNG")
         return out_p
 
+    def generate_concept_mockup(
+        self,
+        mockup: Union[VisualMockupArtifact, Dict[str, Any]],
+        output_path: Union[Path, str],
+        style_guide: str = "",
+        dimensions: Tuple[int, int] = (1280, 720),
+    ) -> Path:
+        """Synthesizes a 16:9 full-screen gameplay and diegetic UI visual mockup board via Gemini image model."""
+        if self.client is None:
+            raise StudioAgentError(
+                "VisualArtSpriteDesignerAgent requires an active google.genai Client to synthesize concept mockups (Rule 5: Zero Silent Fallbacks)"
+            )
+
+        out_p = Path(output_path)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+
+        if isinstance(mockup, dict):
+            title = mockup.get("title", "Gameplay Concept Mockup")
+            scene_desc = mockup.get("scene_description", "")
+            aspect = mockup.get("aspect_ratio", "16:9") or "16:9"
+            callouts = mockup.get("ui_callout_notes", []) or []
+        else:
+            title = mockup.title
+            scene_desc = mockup.scene_description
+            aspect = mockup.aspect_ratio or "16:9"
+            callouts = mockup.ui_callout_notes or []
+
+        callout_str = "; ".join(str(c) for c in callouts) if callouts else "Clean diegetic in-world visual feedback, zero instruction-manual text walls"
+        style_str = f" Art style direction: {style_guide}." if style_guide else ""
+
+        prompt = (
+            f"Polished indie video game 16:9 widescreen screenshot mockup: '{title}'. "
+            f"Scene staging: {scene_desc}.{style_str} "
+            f"UI & visual feedback framing: {callout_str}. "
+            f"Rich atmospheric lighting, cohesive color palette, distinct silhouettes, expressive visual storytelling, "
+            f"no wall-of-text tutorial overlays."
+        )
+
+        max_retries = 3
+        img_bytes = None
+        last_exc = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                from google.genai import types
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["IMAGE"],
+                        image_config=types.ImageConfig(aspect_ratio=aspect),
+                    ),
+                )
+                if response.candidates:
+                    for cand in response.candidates:
+                        if cand.content and cand.content.parts:
+                            for p in cand.content.parts:
+                                if hasattr(p, "inline_data") and p.inline_data:
+                                    img_bytes = p.inline_data.data
+                                    break
+                if img_bytes:
+                    break
+                logger.warning("Attempt %d: No image bytes returned for concept mockup '%s', retrying...", attempt, title)
+                time.sleep(1.0)
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("Attempt %d failed for concept mockup '%s': %s", attempt, title, exc)
+                time.sleep(1.0)
+
+        if not img_bytes:
+            if last_exc:
+                raise StudioAgentError(
+                    f"VisualArtSpriteDesigner failed to synthesize concept mockup '{title}' after {max_retries} attempts: {last_exc}"
+                ) from last_exc
+            raise StudioAgentError(
+                f"No image bytes returned from Gemini image generation for concept mockup '{title}' after {max_retries} attempts"
+            )
+
+        raw_img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+        if dimensions and dimensions[0] > 0 and dimensions[1] > 0:
+            raw_img = raw_img.resize(dimensions, Image.Resampling.LANCZOS)
+        raw_img.save(out_p, "PNG")
+        return out_p
+
     def _is_live_genai_client(self) -> bool:
         """Returns True if self.client is an active google.genai Client rather than None or a unit-test mock."""
         if self.client is None:
@@ -946,4 +1030,7 @@ class VisualArtSpriteDesignerAgent:
         sprites["floor"] = floor_path
 
         return sprites
+
+
+VisualArtisanAgent = VisualArtSpriteDesignerAgent
 

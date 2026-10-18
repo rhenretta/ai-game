@@ -131,11 +131,13 @@ class TestOrchestratorStateMachineAdversarial:
     deliberation: str = "Empirical verification of 5-state lifecycle and illegal transition barriers."
 
     def test_exhaustive_invalid_state_transitions(self) -> None:
-        """Exhaustively verifies all 19 invalid transitions across 5 states raise InvalidStateTransitionError."""
+        """Exhaustively verifies all invalid transitions across all StudioBuildState values raise InvalidStateTransitionError."""
         allowed: Dict[StudioBuildState, Set[StudioBuildState]] = {
             StudioBuildState.IDLE: {StudioBuildState.ANALYZING},
-            StudioBuildState.ANALYZING: {StudioBuildState.SYNTHESIZING},
-            StudioBuildState.SYNTHESIZING: {StudioBuildState.VERIFYING},
+            StudioBuildState.ANALYZING: {StudioBuildState.BRAINSTORMING, StudioBuildState.SYNTHESIZING},
+            StudioBuildState.BRAINSTORMING: {StudioBuildState.AWAITING_GREENLIGHT, StudioBuildState.SYNTHESIZING},
+            StudioBuildState.AWAITING_GREENLIGHT: {StudioBuildState.BRAINSTORMING, StudioBuildState.SYNTHESIZING, StudioBuildState.IDLE},
+            StudioBuildState.SYNTHESIZING: {StudioBuildState.VERIFYING, StudioBuildState.BRAINSTORMING, StudioBuildState.AWAITING_GREENLIGHT},
             StudioBuildState.VERIFYING: {StudioBuildState.PROMOTED, StudioBuildState.SYNTHESIZING},
             StudioBuildState.PROMOTED: {StudioBuildState.IDLE},
         }
@@ -148,6 +150,13 @@ class TestOrchestratorStateMachineAdversarial:
                 if current_state != StudioBuildState.IDLE:
                     if current_state == StudioBuildState.ANALYZING:
                         orch.transition_to(StudioBuildState.ANALYZING, "Setup")
+                    elif current_state == StudioBuildState.BRAINSTORMING:
+                        orch.transition_to(StudioBuildState.ANALYZING, "Setup")
+                        orch.transition_to(StudioBuildState.BRAINSTORMING, "Setup")
+                    elif current_state == StudioBuildState.AWAITING_GREENLIGHT:
+                        orch.transition_to(StudioBuildState.ANALYZING, "Setup")
+                        orch.transition_to(StudioBuildState.BRAINSTORMING, "Setup")
+                        orch.transition_to(StudioBuildState.AWAITING_GREENLIGHT, "Setup")
                     elif current_state == StudioBuildState.SYNTHESIZING:
                         orch.transition_to(StudioBuildState.ANALYZING, "Setup")
                         orch.transition_to(StudioBuildState.SYNTHESIZING, "Setup")
@@ -1199,11 +1208,10 @@ class TestExecuteSwarmPlanTopologiesAndArtifactsStress:
         tmp_path: Path,
         mock_gemini_client: MockGeminiClient,
     ) -> None:
-        """Surfaces the contract boundary gap where LeadGameplaySWEAgent accesses game_title
-        on UpdateWorldSpec during target_episode > 0, raising AttributeError as expected in M3.
+        """Verifies that when LeadGameplaySWEAgent runs with UpdateWorldSpec during target_episode > 0
+        without a queued track synthesis response, it surfaces a StudioSwarmExecutionError cleanly.
         """
         mock_gemini_client.set_json_response(self._get_update_world_spec_dict(1))
-        mock_gemini_client.set_json_response(self._get_cartridge_bundle_dict(1))
 
         orch = StudioOrchestrator(client=mock_gemini_client)
         self._mock_supervisor(orch, promoted=True)
@@ -1224,8 +1232,6 @@ class TestExecuteSwarmPlanTopologiesAndArtifactsStress:
             await orch.execute_swarm_plan(plan, staging_dir)
 
         assert "Specialist 'SWE' failed" in str(exc_info.value)
-        assert isinstance(exc_info.value.__cause__, AttributeError)
-        assert "game_title" in str(exc_info.value.__cause__)
 
     @pytest.mark.anyio
     async def test_execute_swarm_plan_cyclic_dag_fails_fast_circular_dependency(
@@ -1871,6 +1877,7 @@ class TestMilestone3Challenger1EmpiricalStress:
 
         swe = orch.agents["LeadGameplaySWEAgent"]
         swe.synthesize_cartridge_code = MagicMock(return_value={"entities.py": staging_dir / "entities.py"})
+        swe.implement_requirement_track = MagicMock(return_value={"entities.py": staging_dir / "entities.py"})
 
         world_spec = GenesisWorldSpec(
             deliberation="World spec",
@@ -1954,6 +1961,7 @@ class TestMilestone3Challenger1EmpiricalStress:
         )
 
         swe = orch.agents["LeadGameplaySWEAgent"]
+        swe.implement_requirement_track = MagicMock(return_value={"mechanics.py": staging_dir / "mechanics.py"})
         world_spec = GenesisWorldSpec(
             deliberation="World spec",
             game_title="Crash Test",

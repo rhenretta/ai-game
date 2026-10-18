@@ -312,6 +312,89 @@ class RequirementEvaluationRecord(BaseEpistemicModel):
         return self.model_dump()
 
 
+class SpecialistSignOffVerdict(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first at field index 0 (Rule 4).
+    Final build sign-off verdict from an individual specialist agent inspecting the rendered candidate build.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Specialist's rationale inspecting the rendered game, code, and assets against their Game Bible pillar."
+    )
+    specialist_role: str = Field(
+        ...,
+        description="Specialist role ('VisualArtDirector', 'UXExperienceDesigner', 'GameplayDesigner', 'StoryWorldArchitect', 'AudioAtmosphereDesigner', 'CreativeDirector')."
+    )
+    approved: bool = Field(
+        ...,
+        description="True ONLY if the actual candidate build satisfies this specialist's pillar without regressions."
+    )
+    blocking_defects: List[str] = Field(
+        default_factory=list,
+        description="Specific defects observed in the rendered frames, audio binding, UX visibility, or gameplay loop."
+    )
+    remediation_directives: List[str] = Field(
+        default_factory=list,
+        description="Concrete code/asset fixes required from LeadGameplaySWEAgent to earn sign-off."
+    )
+
+    @field_validator("deliberation")
+    @classmethod
+    def validate_deliberation(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("deliberation must not be empty or whitespace")
+        return v
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class MultiAgentSignOffReport(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first at field index 0 (Rule 4).
+    Unanimous sign-off report across all 6 studio specialist roles inspecting the rendered candidate build.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Synthesis of the Multi-Agent Final Sign-Off Council."
+    )
+    candidate_id: str = Field(
+        default="",
+        description="Identifier of the evaluated candidate cartridge."
+    )
+    unanimous_approval: bool = Field(
+        ...,
+        description="True ONLY if 100% of specialist agents approved the build."
+    )
+    verdicts: List[SpecialistSignOffVerdict] = Field(
+        default_factory=list,
+        description="Sign-off verdicts from all 6 studio specialists."
+    )
+    captured_frame_paths: List[str] = Field(
+        default_factory=list,
+        description="Paths to the rendered gameplay frames inspected by the council."
+    )
+    created_at_utc: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(),
+        description="ISO 8601 UTC timestamp."
+    )
+
+    @field_validator("deliberation")
+    @classmethod
+    def validate_deliberation(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("deliberation must not be empty or whitespace")
+        return v
+
+    @model_validator(mode="after")
+    def _enforce_unanimous_approval(self) -> "MultiAgentSignOffReport":
+        if self.unanimous_approval and self.verdicts:
+            if not all(v.approved for v in self.verdicts):
+                self.unanimous_approval = False
+        return self
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
 class ChallengerGateEvaluation(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first at field index 0 (Rule 4).
     Complete Gate F evaluation emitted by ChallengerGate auditing candidate against 100% of acceptance criteria.
@@ -332,6 +415,10 @@ class ChallengerGateEvaluation(BaseEpistemicModel):
         default_factory=list,
         description="Per-track evaluation records."
     )
+    specialist_sign_off: Optional[MultiAgentSignOffReport] = Field(
+        default=None,
+        description="Multi-Agent Final Sign-Off Council report across all 6 studio specialists."
+    )
     rejection_trace: Optional[RejectionDiagnosticTrace] = Field(
         default=None,
         description="Structured diagnostic trace if candidate was rejected."
@@ -346,9 +433,12 @@ class ChallengerGateEvaluation(BaseEpistemicModel):
 
     @model_validator(mode="after")
     def _enforce_100_percent_threshold(self) -> "ChallengerGateEvaluation":
-        """Enforces mathematical 100% acceptance threshold: any failed criterion forces overall_verdict=False."""
+        """Enforces mathematical 100% acceptance threshold: any failed criterion or specialist veto forces overall_verdict=False."""
         if self.overall_verdict and self.evaluated_requirements:
             if not all(r.fulfilled for r in self.evaluated_requirements):
+                self.overall_verdict = False
+        if self.overall_verdict and self.specialist_sign_off is not None:
+            if not self.specialist_sign_off.unanimous_approval:
                 self.overall_verdict = False
         return self
 
@@ -378,6 +468,10 @@ class BuildEvaluationReport(BaseModel):
     gate_results: Dict[str, QualityGateResult] = Field(
         default_factory=dict,
         description="Evaluation results for each of the 5 quality gates (gate_a, gate_e, gate_d, gate_b, gate_c)."
+    )
+    specialist_sign_off: Optional[MultiAgentSignOffReport] = Field(
+        default=None,
+        description="Multi-Agent Final Sign-Off Council report across all 6 studio specialists."
     )
     rejection_trace: Optional[RejectionDiagnosticTrace] = Field(
         default=None,
@@ -440,6 +534,7 @@ class BuildEvaluationReport(BaseModel):
             "candidate_dir": self.candidate_dir,
             "active_dir": self.active_dir,
             "gate_results": {k: v.to_dict() for k, v in self.gate_results.items()},
+            "specialist_sign_off": self.specialist_sign_off.to_dict() if self.specialist_sign_off else None,
             "rejection_trace": self.rejection_trace.to_dict() if self.rejection_trace else None,
             "attempt_count": self.attempt_count,
             "max_retries": self.max_retries,

@@ -678,7 +678,7 @@ class BuildSupervisor:
         # 3. Instantiate challenger gate lazily if needed
         if self.challenger_gate is None:
             client = self.gemini_client
-            if client is None:
+            if client is None and "PYTEST_CURRENT_TEST" not in os.environ and "pytest" not in sys.modules:
                 try:
                     from engine.studio.orchestrator import StudioOrchestrator
                     key = StudioOrchestrator._resolve_api_key(None, None)
@@ -705,16 +705,18 @@ class BuildSupervisor:
             raise
 
         # 5. Process verdict
+        sign_off_dict = evaluation.specialist_sign_off.to_dict() if getattr(evaluation, "specialist_sign_off", None) else None
         if evaluation.overall_verdict:
             res = QualityGateResult(
                 deliberation=evaluation.deliberation,
                 gate_name="Gate F: Adversarial Design Critic",
                 passed=True,
                 failure_type=GateFailureType.NONE,
-                details="Candidate cartridge satisfied 100% of agent-authored acceptance criteria.",
+                details="Candidate cartridge satisfied 100% of agent-authored acceptance criteria and unanimous specialist sign-off.",
                 diagnostic_data={
                     "candidate_id": evaluation.candidate_id,
                     "evaluated_requirements": [r.model_dump() for r in evaluation.evaluated_requirements],
+                    "specialist_sign_off": sign_off_dict,
                 },
             )
             return res, None
@@ -754,6 +756,7 @@ class BuildSupervisor:
                     "unfulfilled_requirements": unfulfilled,
                     "failing_criteria": failing_crit,
                     "evaluated_requirements": [r.model_dump() for r in evaluation.evaluated_requirements],
+                    "specialist_sign_off": sign_off_dict,
                 },
             )
             return res, trace

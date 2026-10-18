@@ -457,3 +457,244 @@ class TestStudioOrchestrator:
             max_retries=orch.config.max_retries,
         )
 
+
+def test_pytest_isolation_blocks_live_llm_and_prod_db_writes():
+    """Verifies that pytest execution never touches production data/telemetry.db and blocks unmocked LLM calls."""
+    import config
+    from engine.telemetry.db import TelemetryDB
+    from engine.steam.dna import SteamDNAPersistence
+    from engine.ui.server import swarm_bus
+
+    prod_db = (config.PROJECT_ROOT / "data" / "telemetry.db").resolve()
+
+    # 1. All default DB paths must resolve to temporary pytest storage, never production data/telemetry.db
+    assert config.DB_PATH.resolve() != prod_db
+    assert TelemetryDB().db_path.resolve() != prod_db
+    assert TelemetryDB(prod_db).db_path.resolve() != prod_db
+    assert SteamDNAPersistence().db_path.resolve() != prod_db
+    assert swarm_bus._db_path is None
+
+    # 2. StudioOrchestrator initialized without an explicit mock client must get an offline stub, not a live genai.Client
+    orch = StudioOrchestrator(api_key="test-key-isolation")
+    assert orch._is_live_genai_client() is False
+    assert orch._get_telemetry_db() is None
+    with pytest.raises(Exception, match="blocked during pytest"):
+        orch.client.models.generate_content(model="gemini-2.5-flash", contents="ping")
+
+
+def test_godot_track_smoke_check_heals_multi_line_gdscript_diagnostics_with_peer_signatures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Verifies that _verify_track_smoke_check invokes _verify_and_heal_godot_syntax_and_probes,
+    groups all diagnostics per file, and passes peer module signatures into repair_godot_module.
+    """
+    from engine.studio.swe import LeadGameplaySWEAgent
+    from engine.studio.models import RequirementTrack, CodeRepairSpec
+    from engine.sim.godot_verifier import GDScriptDiagnostic, GodotSimResult
+    from engine.sim.headless import SimulationState
+
+    c_dir = tmp_path / "candidate_godot_heal"
+    c_dir.mkdir(parents=True, exist_ok=True)
+    (c_dir / "project.godot").write_text("config_version=5\n", encoding="utf-8")
+    (c_dir / "scenes.gd").write_text(
+        "extends Node2D\n"
+        "static func build_world() -> Node2D:\n"
+        "\tvar rect := Scenes._helper()\n"
+        "\treturn Node2D.new()\n",
+        encoding="utf-8",
+    )
+    (c_dir / "main.gd").write_text(
+        "extends Node2D\n"
+        "const Scenes = preload('res://scenes.gd')\n"
+        "func _ready() -> void:\n"
+        "\tvar w = Scenes.build_world()\n"
+        "\tadd_child(w)\n",
+        encoding="utf-8",
+    )
+
+    repair_calls = []
+
+    class _RepairMockModels:
+        def generate_content(self, model: str, contents: Any, config: Any = None) -> Any:
+            repair_calls.append(contents)
+
+            class _Resp:
+                text = CodeRepairSpec(
+                    deliberation="Removed self-reference 'Scenes.' and walrus ':=' in scenes.gd.",
+                    filename="scenes.gd",
+                    repaired_content=(
+                        "extends Node2D\n"
+                        "static func build_world() -> Node2D:\n"
+                        "\tvar rect = Rect2(0, 0, 64, 64)\n"
+                        "\treturn Node2D.new()\n"
+                    ),
+                ).model_dump_json()
+
+            return _Resp()
+
+    class _RepairMockClient:
+        models = _RepairMockModels()
+
+    swe = LeadGameplaySWEAgent(client=_RepairMockClient())
+
+    synth_checks = {"count": 0}
+
+    def _fake_verify_syntax(path: Path, timeout: float = 30.0):
+        synth_checks["count"] += 1
+        src = (Path(path) / "scenes.gd").read_text(encoding="utf-8")
+        if "Scenes._helper" in src or ":=" in src:
+            return False, [
+                GDScriptDiagnostic(
+                    file_path=Path(path) / "scenes.gd",
+                    line_number=3,
+                    error_message='Identifier "Scenes" not declared in the current scope.',
+                    raw_line="SCRIPT ERROR: Parse Error: Identifier \"Scenes\" not declared in the current scope.",
+                ),
+                GDScriptDiagnostic(
+                    file_path=Path(path) / "scenes.gd",
+                    line_number=3,
+                    error_message='Cannot infer the type of "rect" variable because the value doesn\'t have a set type.',
+                    raw_line="SCRIPT ERROR: Parse Error: Cannot infer the type of \"rect\" variable",
+                ),
+            ]
+        return True, []
+
+    class _FakeGodotSim:
+        def __init__(self, **kwargs: Any):
+            pass
+
+        def run(self) -> GodotSimResult:
+            return GodotSimResult(
+                success=True,
+                error_message=None,
+                stderr="",
+                state=None,
+                ticks_executed=10,
+            )
+
+    import engine.sim.godot_verifier as gv
+    monkeypatch.setattr(gv, "verify_godot_cartridge_syntax", _fake_verify_syntax)
+    monkeypatch.setattr(gv, "GodotHeadlessSimulator", _FakeGodotSim)
+
+    orch = StudioOrchestrator(client=_RepairMockClient())
+    track = RequirementTrack(
+        deliberation="World foundation track.",
+        id="R1",
+        title="World Foundation",
+        description="Build world scene.",
+    )
+    orch._verify_track_smoke_check(c_dir, track, swe_agent=swe)
+
+    assert len(repair_calls) == 1
+    assert 'Identifier "Scenes" not declared' in repair_calls[0]
+    assert 'Cannot infer the type of "rect"' in repair_calls[0]
+    assert "[main.gd signatures]" in repair_calls[0]
+    assert "Scenes._helper" not in (c_dir / "scenes.gd").read_text(encoding="utf-8")
+
+
+def test_rehydrate_and_resume_interrupted_genesis_build(tmp_path: Path):
+    """Verifies that rehydrate_resumable_candidate_from_db reconstructs missing staging files
+    from SQLite studio_game_bibles and studio_requirements and resets rejected tracks to pending.
+    """
+    from engine.studio.daemon import rehydrate_resumable_candidate_from_db
+    from engine.studio.models import GameBibleSpec, GenesisWorldSpec, NarrativeBible, CharacterSheet
+    from engine.telemetry.db import TelemetryDB
+
+    db_file = tmp_path / "test_resume.db"
+    cartridges_root = tmp_path / "cartridges"
+    db = TelemetryDB(db_file)
+
+    ws = GenesisWorldSpec(
+        deliberation="World spec for resumed test game.",
+        game_title="Prismtide: Leyline Pioneer",
+        core_genre="action_adventure",
+        thematic_premise="Carve leyline canals across cantilevered jade terraces.",
+        world_lore="Ancient jade aqueducts suspended above a mist chasm.",
+        conflict_tone="grim_tense",
+        conflict_narrative="Overpressurized leylines threaten structural collapse.",
+        aesthetic_style="jade_solarpunk",
+        palette_mood="neon_cyber",
+        gameplay_pacing="methodical",
+        pacing_score=0.4,
+        target_difficulty=0.6,
+    )
+    nb = NarrativeBible(
+        deliberation="Narrative bible for resumed test game.",
+        world_title="Prismtide: Leyline Pioneer",
+        setting_summary="Cantilevered jade terraces suspended over a mist chasm.",
+        thematic_tone="grim_tense",
+        characters=[
+            CharacterSheet(
+                deliberation="Protagonist sheet.",
+                character_id="kaelen",
+                name="Vanguard Kaelen",
+                role="hero",
+                backstory="Veteran acoustic surveyor of the upper terraces.",
+                visual_description="Hydraulic surveyor",
+            )
+        ],
+    )
+    bible = GameBibleSpec(
+        deliberation="Locked Game Bible for Prismtide.",
+        bible_id="game_bible_resumetest",
+        cartridge_id="candidate_genesis_db8d94",
+        status="locked",
+        game_title="Prismtide: Leyline Pioneer",
+        core_genre="action_adventure",
+        creative_vision_summary="Carve leyline canals across cantilevered jade terraces.",
+        world_spec=ws,
+        narrative_bible=nb,
+    )
+    db.upsert_game_bible(bible)
+    db.record_studio_build(
+        build_id="build_candidate_genesis_db8d94",
+        candidate_id="candidate_genesis_db8d94",
+        game_title="Prismtide: Leyline Pioneer",
+        genre_paradigm="action_adventure",
+        status="SYNTHESIZING",
+        deliberation="Test build record for resume test.",
+    )
+    db.record_studio_requirements(
+        build_id="build_candidate_genesis_db8d94",
+        spec={
+            "requirements": [
+                {
+                    "deliberation": "R1 foundation.",
+                    "id": "R1",
+                    "title": "Cantilevered Jade Terrace World Foundation",
+                    "description": "Build world foundation.",
+                    "status": "rejected",
+                    "responsible_agents": ["LeadGameplaySWEAgent"],
+                    "target_modules": ["main.gd", "scenes.gd"],
+                    "acceptance_criteria": [],
+                },
+                {
+                    "deliberation": "R2 canals.",
+                    "id": "R2",
+                    "title": "Acoustic Surveying and Dynamic Leyline Canal Carving",
+                    "description": "Build canal carving.",
+                    "status": "pending",
+                    "responsible_agents": ["LeadGameplaySWEAgent"],
+                    "target_modules": ["mechanics.gd"],
+                    "acceptance_criteria": [],
+                },
+            ]
+        },
+    )
+
+    rehydrated = rehydrate_resumable_candidate_from_db(db_file, cartridges_root)
+    assert rehydrated is not None
+    assert rehydrated.name == "candidate_genesis_db8d94"
+    assert (rehydrated / "game_bible.json").is_file()
+    assert (rehydrated / "world_spec.json").is_file()
+    assert (rehydrated / "narrative_bible.json").is_file()
+    assert (rehydrated / "narrative.json").is_file()
+    assert (rehydrated / "requirements_spec.json").is_file()
+
+    import json
+    req_data = json.loads((rehydrated / "requirements_spec.json").read_text(encoding="utf-8"))
+    assert req_data["game_title"] == "Prismtide: Leyline Pioneer"
+    assert [r["status"] for r in req_data["requirements"]] == ["pending", "pending"]
+    db_reqs = db.get_studio_requirements(build_id="build_candidate_genesis_db8d94")
+    assert [r["status"] for r in db_reqs] == ["pending", "pending"]
+
+
+

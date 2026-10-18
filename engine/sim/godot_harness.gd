@@ -48,17 +48,36 @@ func _process(delta: float) -> bool:
 	# 1. Inject synthetic inputs according to schedule
 	_apply_synthetic_inputs(current_tick)
 
-	# 2. Record tick execution time in microseconds
+	# 2. Optional viewport capture when running with an active display/rendering server
+	if current_tick == 2:
+		_try_capture_viewport("res://assets/playtest_captures/playtest_t0.png")
+
+	# 3. Record tick execution time in microseconds
 	var dt_usec = Time.get_ticks_usec() - t0
 	frame_times_usec.append(dt_usec)
 
-	# 3. Check termination
+	# 4. Check termination
 	if current_tick >= max_ticks:
+		_try_capture_viewport("res://assets/playtest_captures/playtest_tend.png")
 		final_snapshot = _extract_state_snapshot()
 		_emit_summary_and_exit()
 		return true # Terminates SceneTree main loop
 
 	return false
+
+func _try_capture_viewport(res_target_path: String) -> void:
+	if DisplayServer.get_name() == "headless":
+		return
+	var vp_tex = root.get_texture()
+	if vp_tex == null:
+		return
+	var img = vp_tex.get_image()
+	if img == null or img.is_empty():
+		return
+	var abs_dir = ProjectSettings.globalize_path("res://assets/playtest_captures")
+	DirAccess.make_dir_recursive_absolute(abs_dir)
+	var abs_path = ProjectSettings.globalize_path(res_target_path)
+	img.save_png(abs_path)
 
 func _apply_synthetic_inputs(tick: int) -> void:
 	# Release previous frame inputs to prevent stuck action states
@@ -168,16 +187,23 @@ func _audit_scene_tree(node: Node, in_ui: bool = false) -> Dictionary:
 	var report = {
 		"world_visual_nodes": 0,
 		"ui_control_nodes": 0,
+		"textures_loaded_count": 0,
 		"empty_world_containers": [],
 		"camera_found": false,
 		"camera_pos": [0.0, 0.0],
 		"audio_players_found": 0,
 		"audio_streams_loaded": 0,
-		"center_occluding_panels": []
+		"audio_mix_rates": [],
+		"center_occluding_panels": [],
+		"fullscreen_occlusion_detected": false
 	}
 	if not node:
 		return report
 	_walk_scene_audit(node, in_ui, report)
+	var init_occlusion = float(initial_snapshot.get("viewport_occlusion", 0.0))
+	var final_failed = bool(final_snapshot.get("is_failed", false))
+	if init_occlusion >= 0.80 or final_failed:
+		report["fullscreen_occlusion_detected"] = true
 	return report
 
 func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
@@ -189,6 +215,13 @@ func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
 		report["audio_players_found"] = int(report["audio_players_found"]) + 1
 		if node.stream != null:
 			report["audio_streams_loaded"] = int(report["audio_streams_loaded"]) + 1
+			if node.stream is AudioStreamWAV:
+				report["audio_mix_rates"].append(int(node.stream.mix_rate))
+	if (node is Sprite2D and node.texture != null) or (node is TextureRect and node.texture != null):
+		report["textures_loaded_count"] = int(report["textures_loaded_count"]) + 1
+	if "loaded_textures" in node and typeof(node.get("loaded_textures")) == TYPE_DICTIONARY:
+		var lt: Dictionary = node.get("loaded_textures")
+		report["textures_loaded_count"] = int(report["textures_loaded_count"]) + lt.size()
 	if current_in_ui:
 		if node is Control:
 			report["ui_control_nodes"] = int(report["ui_control_nodes"]) + 1
@@ -196,6 +229,8 @@ func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
 				var p = node.position
 				if p.x > 360.0 and p.x < 760.0 and p.y > 220.0 and p.y < 540.0:
 					report["center_occluding_panels"].append(str(node.name) + "@" + str(p))
+			if node is ColorRect and node.visible and node.size.x >= 1100.0 and node.size.y >= 650.0 and node.color.a >= 0.80:
+				report["fullscreen_occlusion_detected"] = true
 	else:
 		var has_custom_draw = (node is CanvasItem and node.get_script() != null and node.has_method("_draw"))
 		var is_visual_primitive = (

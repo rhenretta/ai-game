@@ -33,6 +33,10 @@ class SwarmEventType(str, Enum):
     CHALLENGER_GATE_VERDICT = "CHALLENGER_GATE_VERDICT"
     AGENT_TASK_RECORD = "AGENT_TASK_RECORD"
     CHECKPOINT_VERIFIED = "CHECKPOINT_VERIFIED"
+    WRITERS_ROOM_UTTERANCE = "writers_room_utterance"
+    CONCEPT_EVOLUTION_LOGGED = "concept_evolution_logged"
+    BIBLE_MOCKUP_GENERATED = "bible_mockup_generated"
+    GAME_BIBLE_UPDATED = "game_bible_updated"
 
 
 class PEVCycleInfo(BaseModel):
@@ -652,6 +656,43 @@ class CheckpointsResponse(BaseModel):
 
 VerifiedCheckpointRecord.model_rebuild()
 CheckpointsResponse.model_rebuild()
+
+
+class GreenlightRequest(BaseModel):
+    """Payload to approve the Living Game Bible or inject Executive Producer steering feedback."""
+    deliberation: str = Field(
+        default="Executive Producer greenlight or steering feedback submitted from Mission Control.",
+        min_length=1,
+        description="MANDATORY FIRST PROPERTY: Epistemic rationale for greenlight decision or steering note",
+    )
+
+    @field_validator("deliberation")
+    @classmethod
+    def validate_deliberation(cls, v: str) -> str:
+        return _validate_deliberation(v)
+
+    approved: bool = Field(default=True, description="True to greenlight the Game Bible and proceed to code synthesis")
+    feedback: str = Field(default="", description="Optional steering feedback to inject into the Writers' Room")
+
+
+class StudioSettingsUpdateRequest(BaseModel):
+    """Payload to update studio runtime settings such as pause_for_greenlight."""
+    deliberation: str = Field(
+        default="Updating Mission Control studio configuration.",
+        min_length=1,
+        description="MANDATORY FIRST PROPERTY: Epistemic rationale for configuration update",
+    )
+
+    @field_validator("deliberation")
+    @classmethod
+    def validate_deliberation(cls, v: str) -> str:
+        return _validate_deliberation(v)
+
+    pause_for_greenlight: bool = Field(
+        default=False,
+        description="When True, pause at AWAITING_GREENLIGHT after the Writers' Room locks the Game Bible.",
+    )
+
 
 
 

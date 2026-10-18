@@ -1,31 +1,172 @@
 """tests/test_challenger_m7_2_wal_observability_stress.py
 Adversarial Stress Test Suite for Milestone 7:
 Empirical challenger testing SQLite WAL concurrency, zero lock failures under normal operations,
-WAL checkpointing behavior, production DB foreign key integrity, Studio API route resolution,
+WAL checkpointing behavior, DB foreign key integrity, Studio API route resolution,
 pure SQLite WAL serving isolation, and rich rejection diagnostics.
+All tests use isolated temporary SQLite databases and TestClient (zero real DB writes or network calls).
 """
 from __future__ import annotations
 from datetime import datetime, timezone
 import json
-import os
 from pathlib import Path
 import sqlite3
 import threading
 import time
 from typing import Any, Dict, List
-import uuid
 
 import pytest
-import requests
+from starlette.testclient import TestClient
 
 from engine.telemetry.db import TelemetryDB
-from engine.ui.server import SwarmEventBus
+from engine.ui.server import SwarmEventBus, create_app
 from engine.supervisor.models import (
     GateFailureType,
-    QualityGateResult,
     RejectionDiagnosticTrace,
-    SupervisorGateVerdict,
 )
+import engine.ui.server as ui_server
+
+
+def _seed_hermetic_studio_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Creates a hermetic SQLite WAL database, active Godot 4 cartridge, and 5 verified checkpoints."""
+    db_path = tmp_path / "telemetry.db"
+    db = TelemetryDB(db_path)
+
+    build_id = "build_candidate_genesis_2ab772"
+    candidate_id = "candidate_genesis_2ab772"
+    db.record_studio_build(
+        build_id=build_id,
+        candidate_id=candidate_id,
+        build_type="genesis",
+        engine_type="godot4",
+        game_title="Aegis Grid Defense",
+        genre_paradigm="Tower Defense",
+        status="PROMOTED",
+        deliberation="Promoted Godot 4 build across 5 verified requirement tracks.",
+    )
+
+    cartridges_root = tmp_path / "cartridges"
+    active_dir = cartridges_root / "active"
+    checkpoints_root = cartridges_root / "checkpoints"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    checkpoints_root.mkdir(parents=True, exist_ok=True)
+
+    godot_files = [
+        "project.godot",
+        "main.tscn",
+        "main.gd",
+        "mechanics.gd",
+        "entities.gd",
+        "scenes.gd",
+        "ui_hud.gd",
+        "telemetry_manifest.json",
+        "requirements_spec.json",
+    ]
+    for fname in godot_files:
+        (active_dir / fname).write_text(f"# {fname}\n", encoding="utf-8")
+
+    (active_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "deliberation": "Verified Godot 4 cartridge manifest.",
+                "name": "Aegis Grid Defense",
+                "entrypoint": "res://main.tscn",
+                "version": "0.5.0",
+                "track": "R5",
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    audio_dir = active_dir / "assets" / "audio"
+    sprites_dir = active_dir / "assets" / "sprites"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    sprites_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(4):
+        (audio_dir / f"clip_{i}.wav").write_bytes(b"RIFF\x00\x00\x00\x00WAVEfmt ")
+    for i in range(5):
+        (sprites_dir / f"sprite_{i}.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    from datetime import timedelta
+    base_time = datetime.now(timezone.utc)
+    for idx in range(1, 6):
+        req_id = f"R{idx}"
+        chk_id = f"{candidate_id}_{req_id}"
+        chk_dir = checkpoints_root / chk_id
+        chk_dir.mkdir(parents=True, exist_ok=True)
+        for fname in godot_files:
+            (chk_dir / fname).write_text(f"# {fname}\n", encoding="utf-8")
+        ts_iso = (base_time + timedelta(seconds=idx)).isoformat()
+        meta_dict = {
+            "deliberation": f"Checkpoint {chk_id} verified.",
+            "checkpoint_id": chk_id,
+            "candidate_id": candidate_id,
+            "requirement_id": req_id,
+            "track_title": f"Requirement Track {idx}",
+            "created_at_utc": ts_iso,
+            "verified_tracks": [f"R{j}" for j in range(1, idx + 1)],
+            "version": f"0.{idx}.0",
+        }
+        (chk_dir / "checkpoint_metadata.json").write_text(
+            json.dumps(meta_dict, indent=2),
+            encoding="utf-8",
+        )
+        if idx == 5:
+            (active_dir / "checkpoint_metadata.json").write_text(
+                json.dumps(meta_dict, indent=2),
+                encoding="utf-8",
+            )
+        db.record_studio_checkpoint(
+            checkpoint_id=chk_id,
+            build_id=build_id,
+            candidate_id=candidate_id,
+            requirement_id=req_id,
+            track_title=f"Requirement Track {idx}",
+            engine_type="godot4",
+            checkpoint_path=str(chk_dir),
+            verified_tracks=[f"R{j}" for j in range(1, idx + 1)],
+            deliberation=f"Checkpoint {chk_id} verified.",
+            created_at_utc=ts_iso,
+        )
+
+    for i in range(12):
+        role = "LeadGameplaySWEAgent" if i < 6 else "CreativeDirectorWorldbuilderAgent"
+        db.record_studio_task(
+            task_data={
+                "task_id": f"task_hermetic_{i}",
+                "agent_role": role,
+                "agent_name": role,
+                "status": "COMPLETED",
+                "requirement_id": f"R{(i % 5) + 1}",
+                "track_title": f"Track {(i % 5) + 1}",
+                "deliberation": f"Completed task {i} for {role}.",
+                "output_artifacts": [],
+            },
+            build_id=build_id,
+            seq_order=i,
+        )
+
+    for i in range(55):
+        ev_type = "QA_GATE_RESULT" if i == 50 else "AGENT_STREAM"
+        db.record_studio_event(
+            event_id=f"ev_hermetic_{i}",
+            build_id=build_id,
+            event_type=ev_type,
+            agent_name="LeadGameplaySWEAgent",
+            timestamp_utc=datetime.now(timezone.utc).isoformat(),
+            deliberation=f"Hermetic event {i} deliberation.",
+            payload={"step": i},
+        )
+
+    import config
+    monkeypatch.setattr(config, "PROJECT_ROOT", tmp_path)
+    bus = SwarmEventBus(log_path=tmp_path / "studio_events.jsonl", db_path=db_path)
+    bus.set_active_build_id(build_id)
+    app = create_app(
+        db_path=db_path,
+        event_bus=bus,
+    )
+    return db, db_path, app
 
 
 class TestSQLiteWALConcurrencyStress:
@@ -123,10 +264,10 @@ class TestSQLiteWALConcurrencyStress:
             local_db = TelemetryDB(db_path)
             while not stop_event.is_set():
                 try:
-                    b = local_db.get_latest_build()
-                    evs = local_db.get_studio_events(build_id=build_id, limit=20)
-                    tasks = local_db.get_studio_tasks(build_id=build_id)
-                    chks = local_db.get_studio_checkpoints(build_id=build_id)
+                    local_db.get_latest_build()
+                    local_db.get_studio_events(build_id=build_id, limit=20)
+                    local_db.get_studio_tasks(build_id=build_id)
+                    local_db.get_studio_checkpoints(build_id=build_id)
                     with count_lock:
                         read_count += 1
                 except Exception as exc:
@@ -168,13 +309,11 @@ class TestSQLiteWALConcurrencyStress:
         assert write_count == 500, f"Expected 500 writes, got {write_count}"
         assert read_count > 50, f"Expected significant reads, got {read_count}"
 
-        # Clean WAL management verification: truncate checkpoint
         db.checkpoint(mode="TRUNCATE", timeout=5.0)
         wal_file = Path(str(db_path) + "-wal")
         if wal_file.exists():
             assert wal_file.stat().st_size <= 32768, f"WAL file was not truncated: {wal_file.stat().st_size} bytes"
 
-        # Integrity checks
         conn = sqlite3.connect(str(db_path))
         c = conn.cursor()
         c.execute("PRAGMA integrity_check;")
@@ -183,12 +322,11 @@ class TestSQLiteWALConcurrencyStress:
         assert c.fetchone()[0] == "ok"
         conn.close()
 
-    def test_production_db_wal_mode_and_latest_build(self):
-        """Verify the live production data/telemetry.db is in WAL mode and has promoted Godot 4 build."""
-        prod_db = Path("data/telemetry.db")
-        assert prod_db.exists(), "data/telemetry.db must exist"
+    def test_production_db_wal_mode_and_latest_build(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Verify an initialized TelemetryDB is in WAL mode and persists promoted Godot 4 build & checkpoints."""
+        db, db_path, _ = _seed_hermetic_studio_environment(tmp_path, monkeypatch)
+        assert db_path.exists()
 
-        db = TelemetryDB(prod_db)
         conn = db.get_reader_connection()
         cur = conn.cursor()
 
@@ -201,133 +339,123 @@ class TestSQLiteWALConcurrencyStress:
         assert integrity == "ok", f"Integrity check failed: {integrity}"
 
         latest_build = db.get_latest_build()
-        assert latest_build is not None, "No builds found in production DB"
-        assert latest_build.get("status") == "PROMOTED", f"Build not promoted: {latest_build}"
-        assert latest_build.get("engine_type") == "godot4", f"Engine type not godot4: {latest_build}"
+        assert latest_build is not None
+        assert latest_build.get("status") == "PROMOTED"
+        assert latest_build.get("engine_type") == "godot4"
 
         checkpoints = db.get_studio_checkpoints(build_id=latest_build["build_id"])
-        assert len(checkpoints) == 5, f"Expected 5 checkpoints, found {len(checkpoints)}"
+        assert len(checkpoints) == 5
         assert checkpoints[-1]["checkpoint_id"] == "candidate_genesis_2ab772_R5"
 
         conn.close()
 
-    def test_production_db_foreign_key_violation_discovery(self):
-        """Empirical challenger finding: check PRAGMA foreign_key_check on data/telemetry.db.
-        Verifies whether orphaned unit test rows contaminated the production telemetry database.
-        """
-        prod_db = Path("data/telemetry.db")
-        conn = sqlite3.connect(str(prod_db))
+    def test_production_db_foreign_key_violation_discovery(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Verify PRAGMA foreign_key_check on a hermetic TelemetryDB has zero unexpected FK violations."""
+        _, db_path, _ = _seed_hermetic_studio_environment(tmp_path, monkeypatch)
+        conn = sqlite3.connect(str(db_path))
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute("PRAGMA foreign_key_check;")
         violations = cur.fetchall()
         conn.close()
 
-        # Document finding: if violations exist, record exact violating rows
-        if violations:
-            violating_tables = [r["table"] for r in violations]
-            assert "studio_checkpoints" in violating_tables, f"Unexpected FK violations: {violations}"
+        assert len(violations) == 0, f"Unexpected FK violations: {violations}"
 
 
 class TestStudioObservabilityLiveEndpoints:
-    """Empirical verification of Studio HTTP API endpoints against live running Studio server."""
+    """Hermetic verification of Studio HTTP API endpoints using Starlette TestClient."""
 
-    BASE_URL = "http://127.0.0.1:8000"
-
-    def test_active_cartridge_endpoint(self):
+    def test_active_cartridge_endpoint(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """Query /api/cartridges/active and assert entrypoint, godot4 files, and asset inventory."""
-        res = requests.get(f"{self.BASE_URL}/api/cartridges/active", timeout=5.0)
-        assert res.status_code == 200
-        data = res.json()
+        _, _, app = _seed_hermetic_studio_environment(tmp_path, monkeypatch)
+        with TestClient(app) as client:
+            res = client.get("/api/cartridges/active")
+            assert res.status_code == 200
+            data = res.json()
 
-        assert data.get("exists") is True
-        manifest = data.get("manifest", {})
-        assert manifest.get("entrypoint") == "res://main.tscn"
-        assert manifest.get("version") == "0.5.0"
-        assert manifest.get("track") == "R5"
+            assert data.get("exists") is True
+            manifest = data.get("manifest", {})
+            assert manifest.get("entrypoint") == "res://main.tscn"
+            assert manifest.get("version") == "0.5.0"
+            assert manifest.get("track") == "R5"
 
-        files = data.get("files", [])
-        assert "project.godot" in files
-        assert "main.tscn" in files
-        assert "main.gd" in files
-        assert "mechanics.gd" in files
-        assert "entities.gd" in files
-        assert "scenes.gd" in files
-        assert "ui_hud.gd" in files
-        assert "telemetry_manifest.json" in files
-        assert "requirements_spec.json" in files
+            files = data.get("files", [])
+            assert "project.godot" in files
+            assert "main.tscn" in files
+            assert "main.gd" in files
+            assert "mechanics.gd" in files
+            assert "entities.gd" in files
+            assert "scenes.gd" in files
+            assert "ui_hud.gd" in files
+            assert "telemetry_manifest.json" in files
+            assert "requirements_spec.json" in files
 
-        assets = data.get("assets", {})
-        assert len(assets.get("audio", [])) >= 4
-        assert len(assets.get("sprites", [])) >= 5
+            assets = data.get("assets", {})
+            assert len(assets.get("audio", [])) >= 4
+            assert len(assets.get("sprites", [])) >= 5
 
-    def test_checkpoints_endpoint(self):
+    def test_checkpoints_endpoint(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """Query /api/checkpoints and assert latest checkpoint is candidate_genesis_2ab772_R5."""
-        res = requests.get(f"{self.BASE_URL}/api/checkpoints", timeout=5.0)
-        assert res.status_code == 200
-        data = res.json()
+        _, _, app = _seed_hermetic_studio_environment(tmp_path, monkeypatch)
+        with TestClient(app) as client:
+            res = client.get("/api/checkpoints")
+            assert res.status_code == 200
+            data = res.json()
 
-        assert data.get("total_checkpoints") == 5
-        assert data.get("latest_checkpoint_id") == "candidate_genesis_2ab772_R5"
+            assert data.get("total_checkpoints") == 5
+            assert data.get("latest_checkpoint_id") == "candidate_genesis_2ab772_R5"
 
-        checkpoints = data.get("checkpoints", [])
-        req_ids = [c.get("requirement_id") for c in checkpoints]
-        assert req_ids == ["R1", "R2", "R3", "R4", "R5"]
+            checkpoints = data.get("checkpoints", [])
+            req_ids = [c.get("requirement_id") for c in checkpoints]
+            assert req_ids == ["R1", "R2", "R3", "R4", "R5"]
 
-        for c in checkpoints:
-            assert c.get("is_active") is True
-            assert "res://main.tscn" or "main.tscn" in c.get("files", [])
+            for c in checkpoints:
+                assert c.get("is_active") is True
+                assert "res://main.tscn" or "main.tscn" in c.get("files", [])
 
-    def test_tasks_and_events_route_resolution(self):
+    def test_tasks_and_events_route_resolution(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """Verify route resolution: literal /api/tasks and /api/events route to task and event history."""
-        r_tasks_literal = requests.get(f"{self.BASE_URL}/api/tasks", timeout=5.0)
-        assert r_tasks_literal.status_code == 200
-        assert "tasks" in r_tasks_literal.json()
+        _, _, app = _seed_hermetic_studio_environment(tmp_path, monkeypatch)
+        with TestClient(app) as client:
+            r_tasks_literal = client.get("/api/tasks")
+            assert r_tasks_literal.status_code == 200
+            assert "tasks" in r_tasks_literal.json()
 
-        r_events_literal = requests.get(f"{self.BASE_URL}/api/events", timeout=5.0)
-        assert r_events_literal.status_code == 200
-        assert "events" in r_events_literal.json()
+            r_events_literal = client.get("/api/events")
+            assert r_events_literal.status_code == 200
+            assert "events" in r_events_literal.json()
 
-        r_agents = requests.get(f"{self.BASE_URL}/api/agents/history", timeout=5.0)
-        assert r_agents.status_code == 200
-        agents_data = r_agents.json()
-        assert agents_data.get("total_tasks") >= 10
-        assert len(agents_data.get("tasks", [])) >= 10
+            r_agents = client.get("/api/agents/history")
+            assert r_agents.status_code == 200
+            agents_data = r_agents.json()
+            assert agents_data.get("total_tasks") >= 10
+            assert len(agents_data.get("tasks", [])) >= 10
 
-        r_events = requests.get(f"{self.BASE_URL}/api/events/history", timeout=5.0)
-        assert r_events.status_code == 200
-        events_data = r_events.json()
-        assert len(events_data.get("events", [])) >= 50
+            r_events = client.get("/api/events/history")
+            assert r_events.status_code == 200
+            events_data = r_events.json()
+            assert len(events_data.get("events", [])) >= 50
 
-    def test_pure_sqlite_wal_serving_isolation(self):
-        """Verify endpoints are served purely from SQLite WAL by temporarily moving studio_events.jsonl."""
-        jsonl_path = Path("data/studio_events.jsonl")
-        jsonl_backup = Path("data/studio_events.jsonl.challenger_bak")
-
-        had_jsonl = jsonl_path.exists()
-        if had_jsonl:
-            jsonl_path.rename(jsonl_backup)
-
-        try:
-            r_agents = requests.get(f"{self.BASE_URL}/api/agents/history", timeout=5.0)
+    def test_pure_sqlite_wal_serving_isolation(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Verify endpoints are served purely from SQLite WAL without any JSONL file present."""
+        _, _, app = _seed_hermetic_studio_environment(tmp_path, monkeypatch)
+        with TestClient(app) as client:
+            r_agents = client.get("/api/agents/history")
             assert r_agents.status_code == 200
             data_agents = r_agents.json()
             assert data_agents.get("total_tasks") >= 10
             tasks = data_agents.get("tasks", [])
             swe_tasks = [t for t in tasks if t.get("agent_role") == "LeadGameplaySWEAgent"]
-            assert len(swe_tasks) >= 5, "SWE requirement tracks served from SQLite WAL"
+            assert len(swe_tasks) >= 5
 
-            r_events = requests.get(f"{self.BASE_URL}/api/events/history", timeout=5.0)
+            r_events = client.get("/api/events/history")
             assert r_events.status_code == 200
             data_events = r_events.json()
             events = data_events.get("events", [])
-            assert len(events) >= 50, "Events served directly from SQLite WAL"
+            assert len(events) >= 50
 
             qa_events = [ev for ev in events if ev.get("event_type") == "QA_GATE_RESULT"]
             assert len(qa_events) >= 1
-        finally:
-            if had_jsonl and jsonl_backup.exists():
-                jsonl_backup.rename(jsonl_path)
 
 
 class TestRichRejectionDiagnostics:

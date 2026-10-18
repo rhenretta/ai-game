@@ -79,9 +79,15 @@ class NarrativeCharacterWriterAgent:
     """Specialist Agent authoring character bibles, cutscenes, and dialogue scripts."""
     deliberation: str = "Narrative character writer agent structuring story bibles and dialogue graphs."
 
-    def __init__(self, client: Optional[Any] = None, model_name: str = "gemini-3.8-flash"):
+    def __init__(
+        self,
+        client: Optional[Any] = None,
+        model_name: str = "gemini-3.8-flash",
+        creative_temperature: float = 1.2,
+    ):
         self.client = client
         self.model_name = model_name
+        self.creative_temperature = float(creative_temperature)
 
     def generate_narrative_bible(self, world_spec: GenesisWorldSpec) -> NarrativeBible:
         """Generates a cohesive NarrativeBible matching the world setting and conflict."""
@@ -92,7 +98,7 @@ class NarrativeCharacterWriterAgent:
             from google.genai import types
             prompt = (
                 f"You are the Lead Narrative Writer AI.\n"
-                f"Write a cohesive narrative bible for:\n"
+                f"Write a cohesive, vividly imaginative narrative bible for:\n"
                 f"- Title: {world_spec.game_title}\n"
                 f"- Genre: {world_spec.core_genre}\n"
                 f"- World lore: {world_spec.world_lore}\n"
@@ -110,6 +116,7 @@ class NarrativeCharacterWriterAgent:
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=NarrativeBible,
+                    temperature=self.creative_temperature,
                 ),
             )
             if not response.text:
