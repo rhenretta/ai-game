@@ -1561,28 +1561,40 @@ class StudioOrchestrator:
         except Exception as exc:
             logger.debug("Failed to record checkpoint in telemetry.db: %s", exc)
 
-        # 6. Atomically mirror to cartridges/active/ so run_game.py plays this verified checkpoint immediately
+        # 6. Atomically mirror to cartridges/active/ only if active does not already have a more complete build
         active_dir = PROJECT_ROOT / "cartridges" / "active"
-        tmp_active = PROJECT_ROOT / "cartridges" / f".active_checkpoint_tmp_{uuid.uuid4().hex[:6]}"
-        try:
-            shutil.copytree(checkpoint_dir, tmp_active)
-            if active_dir.exists():
-                old_active = PROJECT_ROOT / "cartridges" / f".active_old_{uuid.uuid4().hex[:6]}"
-                active_dir.rename(old_active)
-                tmp_active.rename(active_dir)
-                try:
-                    shutil.rmtree(old_active)
-                except Exception:
-                    pass
-            else:
-                tmp_active.rename(active_dir)
-        except Exception as copy_exc:
-            logger.warning("Failed to atomically mirror checkpoint to cartridges/active: %s", copy_exc)
-            if tmp_active.exists():
-                try:
-                    shutil.rmtree(tmp_active)
-                except Exception:
-                    pass
+        should_mirror = True
+        if active_dir.exists() and (active_dir / "checkpoint_metadata.json").is_file():
+            try:
+                existing_meta = json.loads((active_dir / "checkpoint_metadata.json").read_text(encoding="utf-8"))
+                existing_cand = existing_meta.get("candidate_id", "")
+                existing_tracks = existing_meta.get("verified_tracks", [])
+                if existing_cand and existing_cand != candidate_id and len(existing_tracks) > len(verified_tracks):
+                    should_mirror = False
+            except Exception:
+                pass
+
+        if should_mirror:
+            tmp_active = PROJECT_ROOT / "cartridges" / f".active_checkpoint_tmp_{uuid.uuid4().hex[:6]}"
+            try:
+                shutil.copytree(checkpoint_dir, tmp_active)
+                if active_dir.exists():
+                    old_active = PROJECT_ROOT / "cartridges" / f".active_old_{uuid.uuid4().hex[:6]}"
+                    active_dir.rename(old_active)
+                    tmp_active.rename(active_dir)
+                    try:
+                        shutil.rmtree(old_active)
+                    except Exception:
+                        pass
+                else:
+                    tmp_active.rename(active_dir)
+            except Exception as copy_exc:
+                logger.warning("Failed to atomically mirror checkpoint to cartridges/active: %s", copy_exc)
+                if tmp_active.exists():
+                    try:
+                        shutil.rmtree(tmp_active)
+                    except Exception:
+                        pass
 
         # 7. Emit CHECKPOINT_VERIFIED event to SwarmEventBus with deliberation first
         delib_checkpoint = (

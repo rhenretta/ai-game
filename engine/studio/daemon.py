@@ -202,7 +202,7 @@ class StudioDaemon:
             return True
 
     def is_cold_boot_required(self) -> bool:
-        """Returns True if cartridges/active/ has no valid cartridge manifest or mechanics."""
+        """Returns True if cartridges/active/ has no valid Godot 4 or Pygame cartridge."""
         if (
             (self.config.cartridges_root / ".no_cold_boot").exists()
             or os.environ.get("STUDIO_NO_COLD_BOOT") == "1"
@@ -215,9 +215,11 @@ class StudioDaemon:
         active = self.config.active_cartridge_dir
         if not active.exists():
             return True
-        has_manifest = (active / "manifest.json").exists()
-        has_mechanics = (active / "mechanics.py").exists()
-        return not (has_manifest and has_mechanics)
+        is_valid_godot = (active / "project.godot").exists() and (
+            (active / "main.gd").exists() or (active / "mechanics.gd").exists()
+        )
+        is_valid_pygame = (active / "manifest.json").exists() and (active / "mechanics.py").exists()
+        return not (is_valid_godot or is_valid_pygame)
 
     @staticmethod
     def _resolve_maybe_coroutine(obj: Any) -> Any:
