@@ -129,15 +129,18 @@ class GameConceptDirectorAgent:
         target_episode: int = 0,
         game_bible: Optional[Any] = None,
         narrative_bible: Optional[Any] = None,
+        candidate_dir: Optional[Any] = None,
     ) -> GameRequirementsSpec:
         """Authors a comprehensive GameRequirementsSpec decomposing the game concept into
-        discrete, ordered implementation tracks and verifiable acceptance criteria.
+        discrete, ordered implementation tracks, verifiable acceptance criteria, and a
+        concept-grounded Cartridge Asset Library manifest.
         Enforces Rule 4 (deliberation first) and Rule 1 (zero hardcoded genre/character assumptions).
         """
         if self.client is None:
             raise StudioAgentError("GameConceptDirectorAgent requires an active google.genai Client (Rule 5: Zero Silent Fallbacks)")
 
         try:
+            from pathlib import Path
             from google.genai import types
 
             dna_context_lines = []
@@ -167,13 +170,14 @@ class GameConceptDirectorAgent:
                 ])
 
             bible_context_lines = []
+            mockup_image_parts: List[Any] = []
             if game_bible is not None:
                 storyboard_str = "\n".join(
                     f"  * Beat {b.beat_index} ({b.phase_title}): Emotion={b.player_emotional_state} | Staging={b.sensory_and_camera_staging} | Diegetic Teaching={b.diegetic_teaching_moment} | Story={b.narrative_integration}"
                     for b in (getattr(game_bible, "experience_storyboard", []) or [])
                 )
                 mockup_notes = [
-                    f"{m.title}: {m.ui_callout_notes}"
+                    f"{m.title} ({getattr(m, 'camera_and_spatial_paradigm', '')}): {m.scene_description} | Callouts: {m.ui_callout_notes}"
                     for m in (getattr(game_bible, "visual_mockups", []) or [])
                 ]
                 bible_context_lines.extend([
@@ -181,6 +185,8 @@ class GameConceptDirectorAgent:
                     f"- Elevator Pitch: {getattr(game_bible, 'elevator_pitch', '')}",
                     f"- Core Player Fantasy: {getattr(game_bible, 'core_fantasy', '')}",
                     f"- First 60 Seconds Hook: {getattr(game_bible, 'first_60_seconds_hook', '')}",
+                    f"- Camera & Spatial Paradigm: {getattr(game_bible, 'camera_and_spatial_paradigm', '')}",
+                    f"- Color Palette Hex: {getattr(game_bible, 'color_palette_hex', [])}",
                     f"- Intuitive UI & Onboarding Philosophy (clean readable HUD + responsive world cues): {getattr(game_bible, 'diegetic_ui_philosophy', '')}",
                     f"- Gameplay Pillars: {getattr(game_bible, 'gameplay_pillars', [])}",
                     f"- Visual Style Guide: {getattr(game_bible, 'visual_style_guide', '')}",
@@ -189,6 +195,21 @@ class GameConceptDirectorAgent:
                 ])
                 if storyboard_str:
                     bible_context_lines.append(f"- Experience Storyboard:\n{storyboard_str}")
+
+                # Attach 16:9 mockup image bytes multimodally when running with a live genai client
+                mod_name = getattr(type(self.client), "__module__", "") or ""
+                if mod_name.startswith("google.genai") and candidate_dir is not None:
+                    for m in (getattr(game_bible, "visual_mockups", []) or [])[:1]:
+                        img_rel = getattr(m, "image_path", "") or ""
+                        if img_rel:
+                            mp = Path(candidate_dir) / img_rel
+                            if mp.is_file():
+                                try:
+                                    mockup_image_parts.append(
+                                        types.Part.from_bytes(data=mp.read_bytes(), mime_type="image/png")
+                                    )
+                                except Exception:
+                                    pass
 
             hypothesis_lines = []
             if hypothesis_report is not None:
@@ -207,7 +228,7 @@ class GameConceptDirectorAgent:
 
             prompt = (
                 f"You are the Game Concept Director and Lead Systems Architect AI.\n"
-                f"Your task is to deliberate on the player's profile and the Writers' Room Living Game Bible to author a comprehensive, rigorous Game Requirements & Feature Specification (`GameRequirementsSpec`).\n"
+                f"Your task is to deliberate on the player's profile and the Writers' Room Living Game Bible (and 16:9 concept mockup) to author a comprehensive, rigorous Game Requirements & Feature Specification (`GameRequirementsSpec`).\n"
                 f"\n--- PLAYER STEAM DNA ---\n{dna_block}\n"
                 f"\n--- CONCEIVED WORLD BLUEPRINT ---\n{world_block}\n"
                 f"\n--- LIVING GAME BIBLE (WRITERS' ROOM CONSENSUS) ---\n{bible_block}\n"
@@ -215,21 +236,25 @@ class GameConceptDirectorAgent:
                 f"\n--- ARCHITECTURAL & AGENTIC DIRECTIVES ---\n"
                 f"1. RATIONALE-FIRST MANDATE (Rule 4): You MUST provide 'deliberation' FIRST before any decision tokens, spec details, or requirement lists.\n"
                 f"2. PURE GENERALIZABILITY MANDATE (Rule 1): Zero hardcoded genre, mechanic, character count, or arena prescriptions. "
-                f"The game can be an abstract puzzle, simulation, automation, turn-based tactics, bullet heaven, or narrative adventure depending on player preferences. "
-                f"If the game concept is character-less, it requires 0 characters.\n"
-                f"3. EXPERIENCE-FIRST FIDELITY: Your RequirementTrack items MUST translate the Living Game Bible's First 60 Seconds Hook, Experience Storyboard Beats, Story/Cutscenes/Dialogue, and UI Philosophy into concrete, playable systems (combining clean, readable HUD indicators with responsive world cues).\n"
+                f"The game can be any genre or camera perspective conceived by the Writers' Room.\n"
+                f"3. EXPERIENCE & MOCKUP-TO-SCENE FIDELITY: Your `high_concept_summary` and `RequirementTrack` items MUST explicitly lock the camera perspective and visual scene staging from the 16:9 Writers' Room concept mockup (layered sky/backdrop, parallax midground, sculpted/textured terrain or platforms, animated characters/entities, interactive props, atmospheric particles, and diegetic UI).\n"
                 f"4. PLAYABLE-WORLD-FIRST DECOMPOSITION: Decompose the game into ordered, discrete RequirementTrack items ('R1', 'R2', ...). "
-                f"Track 'R1' MUST ALWAYS establish the visible, interactive exterior/world loop with spatial navigation, interactive targets/objectives, and clear visual feedback—never a passive background telemetry counter or empty stub.\n"
-                f"   Each track must define its responsible agent(s), target code/asset modules, and explicit, verifiable AcceptanceCriterion items.\n"
+                f"Track 'R1' MUST ALWAYS establish the multi-layered visual environment (`scenes.gd`), animated player/entity actors (`entities.gd`), and core movement/traversal loop (`main.gd`, `mechanics.gd`) matching the 16:9 mockup.\n"
                 f"   Target modules MUST be Godot 4 GDScript modules chosen from ['main.gd', 'mechanics.gd', 'entities.gd', 'scenes.gd', 'ui_hud.gd'], NEVER Python (.py) files.\n"
-                f"5. ZERO BLIND VIEWPORTS OR INSTANT LOCKOUTS: Never specify opaque full-screen overlays (>40% startup occlusion) that blind the player at boot, and never specify unrecoverable failure/game-over lockouts within the first 30 seconds of play; hazards must be recoverable via player actions.\n"
+                f"5. ZERO BLIND VIEWPORTS OR INSTANT LOCKOUTS: Never specify opaque full-screen overlays (>40% startup occlusion) that blind the player at boot, and never specify unrecoverable failure/game-over lockouts within the first 30 seconds of play.\n"
                 f"6. VERIFIABLE ACCEPTANCE CRITERIA: Each criterion must declare a concrete verification_method ('ast_inspection', 'runtime_telemetry', 'headless_playtest', 'multi_modal', or 'design_critic') and explicit expected behavior.\n"
-                f"7. DYNAMIC MULTIMODAL ASSET MANIFEST: Define exact sprite, tile, portrait, and audio assets required in asset_manifest as AssetRequirement items, avoiding hardcoded legacy arena asset names.\n"
+                f"7. DECOMPOSE CONCEPT ART INTO COMPOSABLE WORLD ELEMENTS (`asset_manifest`): NEVER slap a static full-screen background painting behind the game. Instead, decompose the 16:9 Writers' Room concept mockup into discrete, buildable game elements in `asset_manifest`:\n"
+                f"   - Use `fabrication_mode='tile_surface'` for repeatable terrain, platform, and structural wall materials (`terrain_surface`, `structure_wall_tile`) used to texture physical level geometry in `assets/sprites/`.\n"
+                f"   - Use `fabrication_mode='static_sprite'` for isolated alpha-transparent horizon/midground set-pieces (`horizon_setpiece_1`, `midground_setpiece_1`) and interactive world landmarks/props placed independently across depth layers.\n"
+                f"   - Use `fabrication_mode='articulated_parts'` when an entity, machine, turbine, or boss needs independently rotating/moving parts.\n"
+                f"   - Use `fabrication_mode='sprite_sheet'` (with `animation_states` such as 'idle', 'move', 'jump', 'action') for full-body in-world characters, companions, and reactive props in `assets/sprites/`.\n"
+                f"   - Use `fabrication_mode='portrait'` STRICTLY for UI dialogue busts in `assets/portraits/` (NEVER use portraits as in-world sprites).\n"
             )
 
+            contents_payload: Any = (mockup_image_parts + [prompt]) if mockup_image_parts else prompt
             response = self.client.models.generate_content(
                 model=self.model_name,
-                contents=prompt,
+                contents=contents_payload,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=GameRequirementsSpec,
@@ -243,14 +268,32 @@ class GameConceptDirectorAgent:
             if game_bible is not None and getattr(game_bible, "game_title", None) and game_bible.game_title != "Untitled Concept":
                 spec.game_title = game_bible.game_title
             # Post-validation to enforce GDScript 4 target_modules (Milestone 7 Godot 4 Transition)
-            for req in spec.requirements:
+            for idx_r, req in enumerate(spec.requirements):
                 sanitized_mods = []
                 for mod in getattr(req, "target_modules", []):
                     mod_gd = mod.replace(".py", ".gd")
                     if not mod_gd.endswith(".gd"):
                         mod_gd = f"{mod_gd}.gd"
                     sanitized_mods.append(mod_gd)
+                if idx_r == 0:
+                    for core_m in ("scenes.gd", "entities.gd", "mechanics.gd", "main.gd"):
+                        if core_m not in sanitized_mods:
+                            sanitized_mods.append(core_m)
                 req.target_modules = sanitized_mods or ["mechanics.gd"]
+
+            # Ensure baseline concept-derived assets from GameBibleSpec are always included in asset_manifest
+            if game_bible is not None:
+                try:
+                    from engine.studio.asset_library import CartridgeAssetLibrary
+                    temp_lib = CartridgeAssetLibrary(cartridge_dir=candidate_dir or Path("/tmp/studio_asset_plan"))
+                    baseline_reqs = temp_lib.derive_baseline_assets_from_bible(game_bible)
+                    existing_ids = {a.asset_id for a in spec.asset_manifest}
+                    for breq in baseline_reqs:
+                        if breq.asset_id not in existing_ids:
+                            spec.asset_manifest.append(breq)
+                            existing_ids.add(breq.asset_id)
+                except Exception as exc:
+                    logger.debug("Baseline asset manifest derivation warning: %s", exc)
             return spec
         except Exception as exc:
             logger.error("Gemini requirements authoring failed: %s", exc)

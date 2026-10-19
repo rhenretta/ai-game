@@ -413,6 +413,21 @@ class CreativeWritersRoom:
             game_bible.visual_style_guide = proposal.visual_style_guide_update.strip()
             updates_summary.append("Updated Visual Style Guide")
 
+        if proposal.updated_camera_and_spatial_paradigm and proposal.updated_camera_and_spatial_paradigm.strip():
+            game_bible.camera_and_spatial_paradigm = proposal.updated_camera_and_spatial_paradigm.strip()
+            updates_summary.append(f"Locked spatial/camera paradigm: {game_bible.camera_and_spatial_paradigm[:60]}")
+
+        if proposal.updated_color_palette_hex:
+            game_bible.color_palette_hex = [str(c).strip() for c in proposal.updated_color_palette_hex if str(c).strip()]
+            updates_summary.append(f"Updated color palette ({len(game_bible.color_palette_hex)} hex swatches)")
+
+        if proposal.added_or_updated_scene_layers:
+            layers_by_id = {l.layer_id: l for l in game_bible.scene_layers}
+            for layer in proposal.added_or_updated_scene_layers:
+                layers_by_id[layer.layer_id] = layer
+            game_bible.scene_layers = sorted(layers_by_id.values(), key=lambda x: x.depth_order)
+            updates_summary.append(f"Defined {len(game_bible.scene_layers)} visual scene depth layers")
+
         if proposal.audio_direction_update and proposal.audio_direction_update.strip():
             game_bible.audio_direction_guide = proposal.audio_direction_update.strip()
             updates_summary.append("Updated Audio & Voice Atmosphere Guide")
@@ -486,12 +501,15 @@ class CreativeWritersRoom:
             if game_bible.elevator_pitch:
                 game_bible.narrative_bible.setting_summary = game_bible.elevator_pitch
 
-        # Characters & Portrait synthesis (with domain-agnostic deduplication across turns)
+        # Characters & Portrait synthesis (with domain-agnostic deduplication across turns, isolated in assets/portraits/)
         char_alias_map: Dict[str, str] = {}
         if proposal.added_or_updated_characters:
             for char_sheet in proposal.added_or_updated_characters:
-                if not char_sheet.portrait_asset or not char_sheet.portrait_asset.startswith("assets/"):
-                    char_sheet.portrait_asset = f"assets/sprites/portrait_{char_sheet.character_id}.png"
+                if (
+                    not char_sheet.portrait_asset
+                    or not char_sheet.portrait_asset.startswith("assets/portraits/")
+                ):
+                    char_sheet.portrait_asset = f"assets/portraits/{char_sheet.character_id}_portrait.png"
             merged_chars, char_alias_map = consolidate_character_list(
                 game_bible.narrative_bible.characters,
                 proposal.added_or_updated_characters,
@@ -504,7 +522,8 @@ class CreativeWritersRoom:
                             self.visual_agent.generate_portrait(
                                 character=char_sheet,
                                 output_path=portrait_dest,
-                                dimensions=(128, 128),
+                                dimensions=(256, 256),
+                                style_guide=game_bible.visual_style_guide,
                             )
                     except Exception as exc:
                         logger.warning("Writers' Room portrait synthesis warning for '%s': %s", char_sheet.name, exc)
@@ -581,6 +600,12 @@ class CreativeWritersRoom:
             idx = len(game_bible.visual_mockups) + 1
             if not mockup.image_path or not mockup.image_path.startswith("assets/mockups/"):
                 mockup.image_path = f"assets/mockups/mockup_{idx}_{mockup.mockup_id}.png"
+            if mockup.camera_and_spatial_paradigm and not game_bible.camera_and_spatial_paradigm:
+                game_bible.camera_and_spatial_paradigm = mockup.camera_and_spatial_paradigm
+            if mockup.color_palette_hex and not game_bible.color_palette_hex:
+                game_bible.color_palette_hex = list(mockup.color_palette_hex)
+            if mockup.scene_layers and not game_bible.scene_layers:
+                game_bible.scene_layers = list(mockup.scene_layers)
             if self.visual_agent is not None and candidate_dir is not None and getattr(self.visual_agent, "client", None) is not None:
                 mockup_dest = Path(candidate_dir) / mockup.image_path
                 self.visual_agent.generate_concept_mockup(

@@ -21,6 +21,8 @@ func _init() -> void:
 			max_ticks = int(args[i + 1])
 
 func _initialize() -> void:
+	if DisplayServer.get_name() != "headless":
+		DisplayServer.window_set_position(Vector2i(-4000, -4000))
 	# 1. Instantiate the game's main scene specified in project.godot
 	var main_path = ProjectSettings.get_setting("application/run/main_scene", "res://main.tscn")
 	if not ResourceLoader.exists(main_path):
@@ -48,7 +50,7 @@ func _process(delta: float) -> bool:
 	# 1. Inject synthetic inputs according to schedule
 	_apply_synthetic_inputs(current_tick)
 
-	# 2. Optional viewport capture when running with an active display/rendering server
+	# 2. Viewport GPU capture at t0
 	if current_tick == 2:
 		_try_capture_viewport("res://assets/playtest_captures/playtest_t0.png")
 
@@ -68,16 +70,35 @@ func _process(delta: float) -> bool:
 func _try_capture_viewport(res_target_path: String) -> void:
 	if DisplayServer.get_name() == "headless":
 		return
+	RenderingServer.force_draw(true)
 	var vp_tex = root.get_texture()
 	if vp_tex == null:
 		return
 	var img = vp_tex.get_image()
 	if img == null or img.is_empty():
 		return
+	if img.get_width() != 1280 or img.get_height() != 720:
+		img.resize(1280, 720, Image.INTERPOLATE_BILINEAR)
 	var abs_dir = ProjectSettings.globalize_path("res://assets/playtest_captures")
 	DirAccess.make_dir_recursive_absolute(abs_dir)
 	var abs_path = ProjectSettings.globalize_path(res_target_path)
 	img.save_png(abs_path)
+	if res_target_path.ends_with("playtest_t0.png"):
+		img.save_png(ProjectSettings.globalize_path("res://playtest_t0.png"))
+	elif res_target_path.ends_with("playtest_tend.png"):
+		img.save_png(ProjectSettings.globalize_path("res://playtest_tend.png"))
+
+func _resolve_texture_path(node: Node, tex: Texture2D) -> String:
+	if node != null and node.has_meta("source_path"):
+		return str(node.get_meta("source_path"))
+	if tex != null:
+		if tex.has_meta("source_path"):
+			return str(tex.get_meta("source_path"))
+		if tex.resource_path != "":
+			return str(tex.resource_path)
+	if node != null and node.has_meta("asset_id"):
+		return "res://assets/sprites/" + str(node.get_meta("asset_id")) + ".png"
+	return ""
 
 func _apply_synthetic_inputs(tick: int) -> void:
 	# Release previous frame inputs to prevent stuck action states
@@ -195,7 +216,10 @@ func _audit_scene_tree(node: Node, in_ui: bool = false) -> Dictionary:
 		"audio_streams_loaded": 0,
 		"audio_mix_rates": [],
 		"center_occluding_panels": [],
-		"fullscreen_occlusion_detected": false
+		"fullscreen_occlusion_detected": false,
+		"portrait_misused_on_world_sprite": false,
+		"portrait_misused_nodes": [],
+		"oversized_ui_portraits": []
 	}
 	if not node:
 		return report
@@ -219,6 +243,17 @@ func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
 				report["audio_mix_rates"].append(int(node.stream.mix_rate))
 	if (node is Sprite2D and node.texture != null) or (node is TextureRect and node.texture != null):
 		report["textures_loaded_count"] = int(report["textures_loaded_count"]) + 1
+		if node is Sprite2D and not current_in_ui:
+			var tpath = _resolve_texture_path(node, node.texture).to_lower()
+			if tpath.find("portrait") != -1:
+				report["portrait_misused_on_world_sprite"] = true
+				report["portrait_misused_nodes"].append(str(node.name) + ":" + tpath)
+		if node is TextureRect and current_in_ui:
+			var sz = node.size
+			if sz.x <= 1.0 or sz.y <= 1.0:
+				sz = Vector2(float(node.texture.get_width()), float(node.texture.get_height()))
+			if (sz.x > 110.0 or sz.y > 110.0) or (node.expand_mode == TextureRect.EXPAND_KEEP_SIZE and (node.texture.get_width() > 110 or node.texture.get_height() > 110)):
+				report["oversized_ui_portraits"].append(str(node.name) + ":" + str(sz))
 	if "loaded_textures" in node and typeof(node.get("loaded_textures")) == TYPE_DICTIONARY:
 		var lt: Dictionary = node.get("loaded_textures")
 		report["textures_loaded_count"] = int(report["textures_loaded_count"]) + lt.size()
@@ -253,6 +288,9 @@ func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
 			and not (node is RigidBody2D)
 			and not (node is Area2D)
 			and not (node is StaticBody2D)
+			and not (node is CollisionShape2D)
+			and not (node is CollisionPolygon2D)
+			and not (node is Marker2D)
 			and not (node is PointLight2D)
 			and node.get_child_count() == 0
 			and not has_custom_draw

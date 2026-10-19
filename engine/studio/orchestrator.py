@@ -1050,6 +1050,13 @@ class StudioOrchestrator:
                         req_spec = GameRequirementsSpec.model_validate_json(
                             (staging_dir / "requirements_spec.json").read_text(encoding="utf-8")
                         )
+                        if req_spec and not req_spec.asset_manifest and (game_bible is not None or (staging_dir / "game_bible.json").is_file()):
+                            try:
+                                from engine.studio.asset_library import CartridgeAssetLibrary
+                                temp_lib = CartridgeAssetLibrary(cartridge_dir=staging_dir)
+                                req_spec.asset_manifest = temp_lib.derive_baseline_assets_from_bible(game_bible)
+                            except Exception:
+                                pass
                     except Exception:
                         req_spec = None
 
@@ -1075,6 +1082,8 @@ class StudioOrchestrator:
                         }
                         if "game_bible" in sig.parameters:
                             req_kwargs["game_bible"] = game_bible
+                        if "candidate_dir" in sig.parameters:
+                            req_kwargs["candidate_dir"] = staging_dir
                         req_spec = agent.generate_requirements_spec(**req_kwargs)
                         context.raw_outputs["_agent_authored_req_spec"] = True
 
@@ -1175,7 +1184,7 @@ class StudioOrchestrator:
                             p_name = Path(c.portrait_asset).name if getattr(c, "portrait_asset", None) else f"{c.character_id or f'char_{idx}'}_portrait.png"
                             if not p_name.endswith(".png"):
                                 p_name = f"{p_name}.png"
-                            c.portrait_asset = f"assets/sprites/{p_name}"
+                            c.portrait_asset = f"assets/portraits/{p_name}"
 
                     (staging_dir / "narrative_bible.json").write_text(narrative_bible.model_dump_json(indent=2), encoding="utf-8")
                     n_data = narrative_bible.to_cartridge_narrative_dict()
@@ -1250,40 +1259,65 @@ class StudioOrchestrator:
                 return results
 
             elif canonical_name == "VisualArtSpriteDesignerAgent":
+                from engine.studio.asset_library import CartridgeAssetLibrary
+
                 sprites_dir = staging_dir / "assets" / "sprites"
-                existing_pngs = list(sprites_dir.glob("*.png")) if sprites_dir.is_dir() else []
+                portraits_dir = staging_dir / "assets" / "portraits"
+                sprites_dir.mkdir(parents=True, exist_ok=True)
+                portraits_dir.mkdir(parents=True, exist_ok=True)
+
+                narrative = context.raw_outputs.get("Writer") or context.raw_outputs.get("NarrativeCharacterWriterAgent")
+                world_spec = context.raw_outputs.get("Director") or context.raw_outputs.get("CreativeDirectorWorldbuilderAgent")
+                mood = getattr(world_spec, "palette_mood", "retro_arcade") if world_spec else "retro_arcade"
                 req_spec = context.raw_outputs.get("requirements_spec")
+                game_bible_obj = context.raw_outputs.get("game_bible")
+
+                asset_lib = CartridgeAssetLibrary(
+                    cartridge_dir=staging_dir,
+                    visual_agent=agent,
+                    voice_agent=self.voice,
+                    mood=mood,
+                )
+
+                # If requirements_spec has an empty asset_manifest and a GameBible exists, derive baseline assets now
+                if req_spec is not None and not getattr(req_spec, "asset_manifest", None) and (game_bible_obj is not None or (staging_dir / "game_bible.json").is_file()):
+                    req_spec.asset_manifest = asset_lib.derive_baseline_assets_from_bible(game_bible_obj)
+                    (staging_dir / "requirements_spec.json").write_text(req_spec.model_dump_json(indent=2), encoding="utf-8")
+
                 manifest_items = getattr(req_spec, "asset_manifest", []) if req_spec else []
+                existing_pngs = [p for p in sprites_dir.glob("*.png") if "portrait" not in p.stem.lower()]
                 missing_sprites = False
                 if manifest_items:
                     for item in manifest_items:
                         iname = getattr(item, "name", "") or (item.get("name") if isinstance(item, dict) else "")
-                        if iname and iname.endswith((".png", ".jpg")) and not (sprites_dir / iname).is_file():
-                            missing_sprites = True
-                            break
-                if existing_pngs and not missing_sprites:
+                        itype = getattr(item, "asset_type", "sprite") if not isinstance(item, dict) else item.get("asset_type", "sprite")
+                        if iname and iname.endswith((".png", ".jpg")):
+                            check_dir = portraits_dir if str(itype).lower() == "portrait" else sprites_dir
+                            if not (check_dir / iname).is_file() and not (sprites_dir / iname).is_file():
+                                missing_sprites = True
+                                break
+                if existing_pngs and not missing_sprites and (staging_dir / "assets" / "asset_library.json").is_file():
+                    asset_lib.sanitize_misplaced_portraits_in_sprites_dir()
+                    asset_lib.save_catalog()
                     logger.info("Resumed %d existing sprite assets from %s", len(existing_pngs), sprites_dir)
                     dur_ms = (_time.perf_counter() - t_start) * 1000.0
                     self._publish_event("AGENT_STREAM", canonical_name, f"Resumed {len(existing_pngs)} sprite assets.", {"portraits": len(existing_pngs)})
                     self._publish_event("TOOL_INVOCATION", canonical_name, f"Resumed {len(existing_pngs)} sprite assets.", {"tool_name": "generate_portrait", "status": "success", "duration_ms": dur_ms})
                     return existing_pngs
 
-                narrative = context.raw_outputs.get("Writer") or context.raw_outputs.get("NarrativeCharacterWriterAgent")
-                world_spec = context.raw_outputs.get("Director") or context.raw_outputs.get("CreativeDirectorWorldbuilderAgent")
-                sprites_dir.mkdir(parents=True, exist_ok=True)
                 results = []
                 chars = getattr(narrative, "characters", []) if narrative else []
                 if not chars:
-                    chars = [{"name": "Hero", "archetype": "hero", "visual_description": "Pixel art cybernetic operative", "portrait_asset": "assets/sprites/hero.png"}]
+                    chars = [{"name": "Hero", "archetype": "hero", "visual_description": "Expressive protagonist", "portrait_asset": "assets/portraits/hero_portrait.png"}]
                 for idx, char in enumerate(chars):
                     c_name = char.get("name", "Hero") if isinstance(char, dict) else getattr(char, "name", "Hero")
                     c_arch = char.get("archetype", "hero") if isinstance(char, dict) else getattr(char, "role", getattr(char, "archetype", "hero"))
-                    c_desc = char.get("visual_description", "Pixel art hero") if isinstance(char, dict) else getattr(char, "visual_description", "Pixel art hero")
+                    c_desc = char.get("visual_description", "Expressive protagonist") if isinstance(char, dict) else getattr(char, "visual_description", "Expressive protagonist")
                     p_asset = char.get("portrait_asset", "") if isinstance(char, dict) else getattr(char, "portrait_asset", "")
                     p_filename = Path(p_asset).name if p_asset else f"{c_name.lower()}_portrait.png"
                     if not p_filename.endswith(".png"):
                         p_filename = f"{p_filename}.png"
-                    out_path = sprites_dir / p_filename
+                    out_path = portraits_dir / p_filename
                     if idx < 2:
                         res = agent.generate_portrait(
                             character=char,
@@ -1295,29 +1329,95 @@ class StudioOrchestrator:
                     elif results and Path(results[0]).is_file():
                         shutil.copy2(results[0], out_path)
                         results.append(out_path)
-                mood = getattr(world_spec, "palette_mood", "retro_arcade") if world_spec else "retro_arcade"
-                req_spec = context.raw_outputs.get("requirements_spec")
+                    # Mirror to explicit portrait_asset path if narrative.json references assets/sprites/...
+                    if p_asset:
+                        legacy_p_path = staging_dir / p_asset
+                        if legacy_p_path != out_path and out_path.is_file():
+                            legacy_p_path.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(out_path, legacy_p_path)
+
                 agent_authored = context.raw_outputs.get("_agent_authored_req_spec", False)
                 try:
-                    if agent_authored or (req_spec and req_spec.asset_manifest):
+                    if manifest_items:
+                        # Fabricate purpose-built assets (sprite sheets, articulated parts, props, tiles, backdrops) into AssetLibrary
+                        has_special_modes = any(
+                            getattr(it, "fabrication_mode", "static_sprite") in ("sprite_sheet", "articulated_parts", "parallax_layer", "tile_surface")
+                            for it in manifest_items
+                            if not isinstance(it, dict)
+                        )
+                        if has_special_modes and getattr(agent, "_is_live_genai_client", lambda: False)():
+                            asset_lib.fabricate_assets(manifest_items)
+                        else:
+                            agent.generate_cartridge_sprites(
+                                sprites_dir,
+                                mood=mood,
+                                requirements_spec=req_spec,
+                                reference_images=asset_lib.get_concept_reference_images(),
+                                style_guide=asset_lib.get_style_guide(),
+                            )
+                    elif agent_authored:
                         agent.generate_cartridge_sprites(sprites_dir, mood=mood, requirements_spec=req_spec)
                     else:
                         agent.generate_cartridge_sprites(sprites_dir, mood=mood)
                 except TypeError:
-                    agent.generate_cartridge_sprites(sprites_dir, mood=mood)
-                # Ensure default_portrait.png and hero.png exist if referenced by barks
+                    if agent_authored or (req_spec and req_spec.asset_manifest):
+                        agent.generate_cartridge_sprites(sprites_dir, mood=mood, requirements_spec=req_spec)
+                    else:
+                        agent.generate_cartridge_sprites(sprites_dir, mood=mood)
+
+                # Ensure default_portrait.png exists for dialogue barks (NEVER copy a portrait to hero.png!)
                 if results and Path(results[0]).is_file():
-                    for fallback_name in ("default_portrait.png", "hero.png"):
-                        fb_path = sprites_dir / fallback_name
-                        if not fb_path.exists():
-                            shutil.copy2(results[0], fb_path)
+                    for dp_dir in (portraits_dir, sprites_dir):
+                        dp_path = dp_dir / "default_portrait.png"
+                        if not dp_path.exists():
+                            shutil.copy2(results[0], dp_path)
+
+                # Ensure a genuine in-world hero.png sprite exists (full-body sprite, never a portrait copy)
+                hero_sprite_path = sprites_dir / "hero.png"
+                if not hero_sprite_path.exists():
+                    player_idle_path = sprites_dir / "player_idle.png"
+                    if player_idle_path.exists():
+                        shutil.copy2(player_idle_path, hero_sprite_path)
+                    else:
+                        hero_char = chars[0] if chars else {"name": "Hero", "visual_description": "Full-body protagonist"}
+                        h_desc = hero_char.get("visual_description", "Protagonist") if isinstance(hero_char, dict) else getattr(hero_char, "visual_description", "Protagonist")
+                        hero_req = AssetRequirement(
+                            deliberation="Dedicated full-body in-world protagonist sprite.",
+                            asset_id="hero",
+                            name="hero.png",
+                            asset_type="sprite",
+                            target_path="assets/sprites/hero.png",
+                            description=f"Full-body in-world character sprite: {h_desc}",
+                            visual_prompt_or_text=f"Full-body 2D in-game character sprite (head to toe, NOT a bust portrait): {h_desc}",
+                            dimensions=(64, 64),
+                        )
+                        try:
+                            agent.generate_dynamic_sprite(
+                                hero_req,
+                                output_path=hero_sprite_path,
+                                mood=mood,
+                                reference_images=asset_lib.get_concept_reference_images(),
+                                style_guide=asset_lib.get_style_guide(),
+                            )
+                        except Exception:
+                            agent.renderer.render_player_idle().save(hero_sprite_path, "PNG")
+
+                asset_lib.index_existing_files_on_disk()
+                asset_lib.save_catalog()
+
                 dur_ms = (_time.perf_counter() - t_start) * 1000.0
-                delib = f"Generated {len(results)} character portraits and 16-color sprite sheets in {sprites_dir.name}."
-                self._publish_event("AGENT_STREAM", canonical_name, delib, {"portraits": len(results)})
+                delib = f"Generated {len(results)} character portraits in {portraits_dir.name} and indexed {len(asset_lib.catalog.entries)} purpose-built assets in Cartridge Asset Library."
+                self._publish_event("AGENT_STREAM", canonical_name, delib, {"portraits": len(results), "library_assets": len(asset_lib.catalog.entries)})
                 self._publish_event("TOOL_INVOCATION", canonical_name, delib, {"tool_name": "generate_portrait", "status": "success", "duration_ms": dur_ms})
                 return results
 
             elif canonical_name == "LeadGameplaySWEAgent":
+                # Wire visual and voice agents onto SWE agent so on-demand requested_assets can be fabricated
+                try:
+                    agent.visual_agent = self.visual
+                    agent.voice_agent = self.voice
+                except Exception:
+                    pass
                 world_spec = context.raw_outputs.get("Director") or context.raw_outputs.get("CreativeDirectorWorldbuilderAgent")
                 narrative = context.raw_outputs.get("Writer") or context.raw_outputs.get("NarrativeCharacterWriterAgent")
                 req_spec = context.raw_outputs.get("requirements_spec") or context.raw_outputs.get("GameRequirementsSpec")
@@ -1516,6 +1616,23 @@ class StudioOrchestrator:
         results: Dict[str, Path] = {}
         tracks = req_spec.requirements
         completed_track_ids: List[str] = [t.id for t in tracks if t.status == "completed"]
+
+        # 0. Formulate master GameProductionStrategySpec before building tracks (when live Gemini + Game Bible present)
+        if (
+            self._is_live_genai_client()
+            and (staging_dir / "game_bible.json").is_file()
+            and hasattr(agent, "formulate_production_strategy")
+        ):
+            try:
+                strat = agent.formulate_production_strategy(staging_dir)
+                self._publish_event(
+                    "AGENT_STREAM",
+                    "LeadGameplaySWEAgent",
+                    strat.deliberation,
+                    {"phase": "formulate_production_strategy", "scene_layers": len(strat.scene_layers)},
+                )
+            except Exception as strat_exc:
+                logger.warning("Non-fatal error formulating production strategy: %s", strat_exc)
 
         for track_idx, track in enumerate(tracks):
             # 1. Skip Completed Tracks on Resume
@@ -1794,6 +1911,22 @@ class StudioOrchestrator:
 
             # 5. Persist Verified Checkpoint in cartridges/checkpoints/ (do not overwrite cartridges/active/ mid-build before QA & Sign-Off Council)
             self._persist_verified_checkpoint(staging_dir, track, completed_track_ids, mirror_to_active=False)
+
+        # 6. Execute Per-Scene Critique & Iterative Refinement Loop after tracks complete
+        if (
+            self._is_live_genai_client()
+            and (staging_dir / "project.godot").is_file()
+            and (staging_dir / "game_bible.json").is_file()
+            and hasattr(agent, "execute_scene_strategy_and_refine_loop")
+        ):
+            try:
+                refined = agent.execute_scene_strategy_and_refine_loop(
+                    staging_dir,
+                    max_scene_iterations=2,
+                )
+                results.update(refined)
+            except Exception as refine_exc:
+                logger.warning("Non-fatal error during post-track scene critique & refine loop: %s", refine_exc)
 
         for code_pattern in ["*.py", "*.gd", "*.tscn", "project.godot"]:
             for p in staging_dir.glob(code_pattern):
@@ -2153,18 +2286,35 @@ class StudioOrchestrator:
                         if not out_path.is_file():
                             voice_agent.synthesize_voice_line(bark=bark, output_path=out_path, character=char_map.get(getattr(bark, "speaker_id", "")))
         narrative_out = context.raw_outputs.get("Writer") or context.raw_outputs.get("NarrativeCharacterWriterAgent")
-        if narrative_out is not None:
-            sprites_dir = staging_dir / "assets" / "sprites"
-            if sprites_dir.exists() and getattr(narrative_out, "characters", None):
-                existing_pngs = sorted(sprites_dir.glob("*.png"))
-                if existing_pngs:
-                    for char in getattr(narrative_out, "characters", []):
-                        p_asset = getattr(char, "portrait_asset", "")
-                        if p_asset:
-                            p_path = staging_dir / p_asset
-                            if not p_path.is_file():
-                                p_path.parent.mkdir(parents=True, exist_ok=True)
-                                shutil.copy2(existing_pngs[0], p_path)
+        if narrative_out is not None and getattr(narrative_out, "characters", None):
+            visual_agent = self.agents.get("VisualArtSpriteDesignerAgent")
+            portraits_dir = staging_dir / "assets" / "portraits"
+            portraits_dir.mkdir(parents=True, exist_ok=True)
+            for char in getattr(narrative_out, "characters", []):
+                cid = getattr(char, "character_id", "character")
+                p_asset = getattr(char, "portrait_asset", "") or f"assets/portraits/{cid}_portrait.png"
+                if not p_asset.startswith("assets/portraits/"):
+                    p_asset = f"assets/portraits/{Path(p_asset).name}"
+                    try:
+                        char.portrait_asset = p_asset
+                    except Exception:
+                        pass
+                p_path = staging_dir / p_asset
+                if not p_path.is_file() and visual_agent is not None:
+                    try:
+                        if getattr(visual_agent, "_is_live_genai_client", lambda: False)():
+                            visual_agent.generate_portrait(character=char, output_path=p_path, dimensions=(256, 256))
+                        else:
+                            img = visual_agent.renderer.render_dynamic_sprite(
+                                dimensions=(256, 256),
+                                prompt=getattr(char, "visual_description", "") or getattr(char, "name", cid),
+                                asset_type="portrait",
+                                seed=cid,
+                            )
+                            p_path.parent.mkdir(parents=True, exist_ok=True)
+                            img.save(p_path, "PNG")
+                    except Exception as exc:
+                        logger.warning("Portrait synthesis warning for '%s': %s", cid, exc)
 
         # 3. Hand over to BuildSupervisor for 5-Gate Validation & Promotion
         self.transition_to(StudioBuildState.VERIFYING, "Handing staging cartridge to BuildSupervisor")

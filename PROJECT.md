@@ -8,17 +8,18 @@ The system is an autonomous, requirement-driven multi-agent game studio swarm th
   - `orchestrator.py`: Meta-planning DAG and iterative requirement-by-requirement (`R1..Rn`) execution loop with verified checkpointing (`cartridges/checkpoints/`).
   - `models.py`: Epistemic data models (Pydantic models inheriting from `BaseEpistemicModel` with `deliberation` strictly at field index 0).
   - `director.py`: Concept (`GenesisWorldSpec`) & Game Requirements (`GameRequirementsSpec`) authoring from `SteamPlayerDNA` / `EvolutionHypothesisReport`.
-  - `swe.py`: Iterative multi-module Godot 4.3 GDScript (`project.godot`, `main.tscn`, `main.gd`, `scenes.gd`, `mechanics.gd`, `entities.gd`, `ui_hud.gd`) and Python code synthesis & holistic self-healing (`LeadGameplaySWEAgent`).
-  - `visual.py`: Live Gemini pixel-art sprite and portrait synthesis with corner flood-fill alpha transparency extraction (`VisualArtSpriteDesignerAgent`).
+  - `swe.py`: Iterative multi-module Godot 4.3 GDScript (`project.godot`, `main.tscn`, `main.gd`, `scenes.gd`, `mechanics.gd`, `entities.gd`, `ui_hud.gd`) and Python code synthesis, upfront production strategy (`formulate_production_strategy`), per-scene multimodal critique & iterative refinement (`analyze_scene_and_restrategize`, `execute_scene_strategy_and_refine_loop`), and 2-hop scoped Plan-Execute-Verify surgical patching (`debug_and_patch_pev_cycle`) via `LeadGameplaySWEAgent`.
+  - `asset_library.py`: Concept-grounded sprite, 2x2 animation sheet, articulated rig, and seamless 90-degree orthographic top-down surface tile catalog (`CartridgeAssetLibrary`, `asset_catalog.json`) with strict portrait-vs-world-sprite separation.
+  - `visual.py`: Live Gemini pixel-art sprite, portrait, and seamless tile synthesis (`ensure_full_bleed_tile` with toroidal border cross-fading and corner-defect validation) via `VisualArtSpriteDesignerAgent`.
   - `audio.py`: Dynamic Gemini TTS `.wav` voice and sound synthesis (`VoiceActingAudioProducerAgent`).
   - `narrative.py`: Narrative bible, character sheets, dialogue trees, and situational barks (`NarrativeCharacterWriterAgent`).
   - `telemetry_architect.py`: Custom behavioral telemetry probe design (`telemetry_manifest.json`) and GDScript/Python AST instrumentation (`TelemetryArchitectAgent`).
 - `engine/supervisor/`: Verification, QA playtesting, and Game Designer signoff.
   - `supervisor.py`: `BuildSupervisor` executing Quality Gates A–F and closed-loop self-healing before atomic promotion to `cartridges/active/`.
-  - `challenger.py`: Gate F (`ChallengerGate` / Adversarial Design Critic & Game Designer Signoff) auditing 100% of acceptance criteria in `requirements_spec.json` plus runtime audio stream binding (`AudioStreamWAV`), HiDPI-exact mouse picking (`get_global_mouse_position()`), placement cursor Z-ordering (`z_index`), non-occluding HUD panels (`center_occluding_panels`), and player onboarding clarity.
+  - `challenger.py`: Gate F (`ChallengerGate` & `MultiAgentSignOffCouncil`) auditing 100% of acceptance criteria in `requirements_spec.json` plus camera/terrain perspective alignment, psychoacoustic comfort (zero continuous high-pitched looping sine/square wave drones), runtime audio stream binding (`AudioStreamWAV`), HiDPI-exact mouse picking (`get_global_mouse_position()`), non-occluding HUD panels (`center_occluding_panels`), and player onboarding clarity.
   - `models.py`: Verification models and `RejectionDiagnosticTrace` schema.
-- `engine/sim/`: Headless simulation and runtime scene auditing.
-  - `godot_verifier.py` & `godot_harness.gd`: Headless Godot 4.3 compiler verification (`verify_godot_cartridge_syntax`), multi-tick exploratory input driver (`GodotHeadlessSimulator`), live scene-tree UX/audio audit (`_audit_scene_tree`), and `[TELEMETRY_EVENT]` bridge into SQLite WAL.
+- `engine/sim/`: Headless simulation, real GPU viewport capture, and runtime scene auditing.
+  - `godot_verifier.py` & `godot_harness.gd`: Headless Godot 4.3 compiler verification (`verify_godot_cartridge_syntax`), real GPU OpenGL3 viewport capture (`GodotHeadlessSimulator`, `_validate_rendered_viewport_image`), live scene-tree UX/audio audit (`_audit_scene_tree`), and `[TELEMETRY_EVENT]` bridge into SQLite WAL.
   - `simulator.py` & `headless.py`: Headless Pygame simulation runner (`SDL_VIDEODRIVER=dummy`, `SDL_AUDIODRIVER=dummy`).
 - `engine/telemetry/`: Continuous SQLite WAL persistence.
   - `db.py`, `schema.sql`, `schema.py`, `recorder.py`, `writer.py`: Zero-lock SQLite WAL storage (`data/telemetry.db`) for `studio_events`, `agent_task_records`, `studio_requirements`, `studio_state_kv`, `telemetry_probes`, and `custom_telemetry_events`.

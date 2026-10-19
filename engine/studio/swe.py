@@ -22,14 +22,23 @@ from pydantic import Field
 from engine.api.contracts import BaseCartridge, BaseEnemy, BaseHazard, BasePlayer, BaseLevelSpec
 from engine.loader import ASTSecurityError, validate_cartridge_ast
 from engine.studio.models import (
+    AudioCueStrategy,
     BaseEpistemicModel,
     CodeRepairSpec,
+    CodeSliceRequest,
+    DebugResearchPlan,
+    GameProductionStrategySpec,
     GameRequirementsSpec,
     GenesisWorldSpec,
     ModuleFileSpec,
     NarrativeBible,
     RequirementTrack,
+    SceneCritiqueAndStrategySpec,
+    SceneDeficiencyItem,
+    SceneLayerStrategy,
     StudioAgentError,
+    SurgicalCodePatch,
+    SurgicalPatchPayload,
     TrackCodeSynthesisPayload,
 )
 
@@ -108,9 +117,17 @@ class LeadGameplaySWEAgent:
     """Specialist Agent that synthesizes executable Python cartridge code with zero string templates."""
     deliberation: str = "Lead gameplay SWE agent synthesizing executable Python game cartridges without static string templates."
 
-    def __init__(self, client: Optional[Any] = None, model_name: str = "gemini-3.8-flash"):
+    def __init__(
+        self,
+        client: Optional[Any] = None,
+        model_name: str = "gemini-3.8-flash",
+        visual_agent: Optional[Any] = None,
+        voice_agent: Optional[Any] = None,
+    ):
         self.client = client
         self.model_name = model_name
+        self.visual_agent = visual_agent
+        self.voice_agent = voice_agent
         self.last_deliberation: Optional[str] = None
 
     def _discover_sealed_assets(self, staging_dir: Path) -> Dict[str, List[str]]:
@@ -315,33 +332,75 @@ class LeadGameplaySWEAgent:
                 for b in (getattr(game_bible, "experience_storyboard", []) or [])
             ]
             mockup_lines = [
-                f"  * '{m.title}' ({m.image_path}): {m.scene_description} | UI Callouts: {m.ui_callout_notes}"
+                f"  * '{m.title}' ({m.image_path}): {m.scene_description} | Camera/Spatial Paradigm: {getattr(m, 'camera_and_spatial_paradigm', '')} | Palette: {getattr(m, 'color_palette_hex', [])} | UI Callouts: {m.ui_callout_notes}"
                 for m in (getattr(game_bible, "visual_mockups", []) or [])
+            ]
+            layer_lines = [
+                f"  * Layer '{getattr(l, 'layer_id', '')}' (type={getattr(l, 'layer_type', '')}, z_index={getattr(l, 'z_index', 0)}, parallax={getattr(l, 'parallax_factor', 1.0)}): {getattr(l, 'visual_description', '')}"
+                for l in (getattr(game_bible, "scene_layers", []) or [])
             ]
             context_parts.append(
                 f"LIVING GAME BIBLE (`game_bible.json` — AUTHORITATIVE EXPERIENCE & DIEGETIC UX BLUEPRINT):\n"
                 f"- Game Title: {getattr(game_bible, 'game_title', '')}\n"
                 f"- Elevator Pitch: {getattr(game_bible, 'elevator_pitch', '')}\n"
                 f"- Core Player Fantasy: {getattr(game_bible, 'core_fantasy', '')}\n"
+                f"- Camera & Spatial Paradigm (LOCKED): {getattr(game_bible, 'camera_and_spatial_paradigm', '')}\n"
+                f"- Color Palette Hex (LOCKED): {getattr(game_bible, 'color_palette_hex', [])}\n"
                 f"- First 60 Seconds Hook: {getattr(game_bible, 'first_60_seconds_hook', '')}\n"
                 f"- Diegetic UI & Onboarding Philosophy (NO wall-of-text HUD control manuals!): {getattr(game_bible, 'diegetic_ui_philosophy', '')}\n"
                 f"- Gameplay Pillars: {getattr(game_bible, 'gameplay_pillars', [])}\n"
                 f"- Visual Style Guide: {getattr(game_bible, 'visual_style_guide', '')}\n"
                 f"- Audio Direction Guide: {getattr(game_bible, 'audio_direction_guide', '')}\n"
+                + (f"- Multi-Layer Scene Architecture:\n" + "\n".join(layer_lines) + "\n" if layer_lines else "")
                 + (f"- Experience Storyboard Arc:\n" + "\n".join(beats_lines) + "\n" if beats_lines else "")
                 + (f"- Synthesized 16:9 Visual Mockup Boards:\n" + "\n".join(mockup_lines) + "\n" if mockup_lines else "")
             )
 
             try:
                 from google.genai import types
+                attached_paths: Set[Path] = set()
                 for m in (getattr(game_bible, "visual_mockups", []) or [])[:2]:
-                    m_path = staging_dir / m.image_path
-                    if m_path.is_file():
+                    m_path = (staging_dir / m.image_path).resolve()
+                    if m_path.is_file() and m_path not in attached_paths:
+                        attached_paths.add(m_path)
                         multimodal_parts.append(
                             types.Part.from_bytes(data=m_path.read_bytes(), mime_type="image/png")
                         )
+                mockups_dir = staging_dir / "assets" / "mockups"
+                if mockups_dir.is_dir() and len(multimodal_parts) < 2:
+                    for p in sorted(mockups_dir.glob("*.png"))[:2]:
+                        rp = p.resolve()
+                        if rp not in attached_paths:
+                            attached_paths.add(rp)
+                            multimodal_parts.append(
+                                types.Part.from_bytes(data=rp.read_bytes(), mime_type="image/png")
+                            )
             except Exception as exc:
                 logger.debug("Could not attach mockup bytes for SWE multimodal prompt: %s", exc)
+        else:
+            try:
+                from google.genai import types
+                mockups_dir = staging_dir / "assets" / "mockups"
+                if mockups_dir.is_dir():
+                    for p in sorted(mockups_dir.glob("*.png"))[:2]:
+                        multimodal_parts.append(
+                            types.Part.from_bytes(data=p.read_bytes(), mime_type="image/png")
+                        )
+            except Exception:
+                pass
+
+        try:
+            from engine.studio.asset_library import CartridgeAssetLibrary
+            lib = CartridgeAssetLibrary(
+                cartridge_dir=staging_dir,
+                visual_agent=getattr(self, "visual_agent", None),
+                voice_agent=getattr(self, "voice_agent", None),
+            )
+            lib.sanitize_misplaced_portraits_in_sprites_dir()
+            lib.save_catalog()
+            context_parts.append(lib.build_prompt_summary_for_swe())
+        except Exception as lib_exc:
+            logger.debug("Could not build CartridgeAssetLibrary prompt summary: %s", lib_exc)
 
         if narrative_bible is not None:
             chars_info = [
@@ -421,6 +480,11 @@ class LeadGameplaySWEAgent:
             except Exception:
                 pass
 
+        bible_and_narrative_context, multimodal_mockup_parts = self._build_bible_and_narrative_context(
+            staging_dir=staging_dir,
+            narrative_bible=narrative_bible,
+            game_bible=game_bible,
+        )
         sealed_assets = self._discover_sealed_assets(staging_dir)
 
         criteria_lines = [
@@ -438,12 +502,6 @@ class LeadGameplaySWEAgent:
                 existing_code_summary.append(f"--- Existing {mod_name} ---\n{code}")
         existing_code_block = "\n".join(existing_code_summary) if existing_code_summary else "No existing code modules."
 
-        bible_and_narrative_context, multimodal_mockup_parts = self._build_bible_and_narrative_context(
-            staging_dir=staging_dir,
-            narrative_bible=narrative_bible,
-            game_bible=game_bible,
-        )
-
         prior_error_block = (
             f"CRITICAL — PREVIOUS ATTEMPT COMPILER/RUNTIME ERROR TO FIX & AVOID:\n{prior_error}\n\n"
             if prior_error
@@ -460,19 +518,27 @@ class LeadGameplaySWEAgent:
                 f"{bible_and_narrative_context}"
                 f"EXISTING CARTRIDGE CODE IN STAGING:\n{existing_code_block}\n\n"
                 f"SEALED ASSETS AVAILABLE IN STAGING:\n"
-                f"- Sprites: {sealed_assets['sprites']}\n"
-                f"- Portraits: {sealed_assets.get('portraits', [])}\n"
-                f"- Mockups: {sealed_assets.get('mockups', [])}\n"
+                f"- World & Entity Sprites (ONLY use these for in-world entities/props/tiles): {sealed_assets['sprites']}\n"
+                f"- Character Portraits (STRICTLY FOR DIALOGUE UI IN ui_hud.gd — NEVER use as world entity sprites!): {sealed_assets.get('portraits', [])}\n"
+                f"- 16:9 Visual Mockups (attached multimodally — match this camera perspective, palette, and multi-layer scene composition!): {sealed_assets.get('mockups', [])}\n"
                 f"- Audio: {sealed_assets['audio']}\n\n"
-                f"ARCHITECTURAL & EXPERIENCE-FIRST SPECIFICATION:\n"
+                f"ARCHITECTURAL, ASSET LIBRARY & EXPERIENCE-FIRST SPECIFICATION:\n"
                 f"1. Target: Godot 4.3-stable (GDScript 2.0). Logical viewport: 1280x720 rendered on a 2560x1440 HiDPI resizable window at 60 FPS.\n"
-                f"2. Code-First Design: Zero complex .tscn files. A minimal 4-line main.tscn binds res://main.gd to root Node2D.\n"
-                f"3. Modular Architecture:\n"
-                f"   - main.gd: Root scene script extending Node2D. Preloads child modules using preload('res://<name>.gd'). Sets up Camera2D, level scene container, and UI CanvasLayer. Implements get_state_snapshot() -> Dictionary for headless playtesting.\n"
+                f"2. Code-First Design: Zero complex .tscn files. A minimal 4-line main.tscn binds res://main.gd to root Node2D. You author 100% of the `.gd` modules.\n"
+                f"3. Modular Architecture & Cartridge Asset Library Catalog (`res://assets/asset_library.json`):\n"
+                f"   - The Cartridge Asset Library manifest is stored at `res://assets/asset_library.json` and summarized above, containing metadata for every synthesized sprite sheet (`hframes`, `vframes`, `frame_size`, `animations`), articulated rig (`parts` with `pivot_offset`, `attach_offset`, `z_index_offset`), tile surface, set-piece, portrait, and audio clip.\n"
+                f"   - Load PNG textures at runtime without `.import` files via `Image.load_from_file(ProjectSettings.globalize_path(res_path))` and `ImageTexture.create_from_image(img)`. Set `tex.set_meta('source_path', res_path)` so runtime diagnostics can trace loaded textures.\n"
+                f"   - Drive multi-state sprite sheet animations (`hframes`, `vframes`, `frame`) and articulated child `Sprite2D` rigs according to the entity's live state (idle, locomotion, aerial, action) and scale sprites to their intended `display_size` from `assets/asset_library.json`.\n"
+                f"   - Render physical platforms, ground surfaces, and structures using tiled textures (`draw_texture_rect` with `tile=true` on a `CanvasItem` with `texture_repeat = CanvasItem.TEXTURE_REPEAT_ENABLED`) rather than flat untextured programmer-art `draw_rect` rectangles.\n"
+                f"   - Keep `z_index < 0` background/horizon layers visible: never paint a full-viewport opaque `draw_rect` at `z_index >= 0` that covers your `z_index < 0` sky/backdrop layers.\n"
+                f"   - Strictly separate character portraits (`res://assets/portraits/*.png`, used ONLY in `ui_hud.gd` dialogue panels with bounded size <= 64x64) from in-world entity sprites (`res://assets/sprites/*.png`).\n"
+                f"   - DECOMPOSE CONCEPT ART INTO COMPOSABLE WORLD ELEMENTS (NEVER USE A STATIC FULL-SCREEN BACKGROUND IMAGE): Build the world out of discrete, layered, interactive elements matching the 16:9 concept art—isolated horizon/midground set-pieces, textured physical geometry, and interactive `Node2D` / `CharacterBody2D` / `Area2D` entities.\n"
+                f"   - ON-DEMAND ASSET FABRICATION (`requested_assets`): If your gameplay mechanics, animations, or multi-layer world need ANY additional purpose-built asset (a `sprite_sheet` with custom `animation_states`, `articulated_parts` with custom pivots, `tile_surface`, isolated `static_sprite` set-piece/prop, `diegetic_ui` widget, or `sfx`), include it in `requested_assets` in your JSON response and the Cartridge Asset Library will fabricate it on disk and update `res://assets/asset_library.json`.\n"
+                f"   - main.gd: Root scene script extending Node2D. Preloads child modules (`mechanics.gd`, `entities.gd`, `scenes.gd`, `ui_hud.gd`). Sets up Camera2D, level scene container, and UI CanvasLayer. Implements `get_state_snapshot() -> Dictionary` for headless playtesting.\n"
                 f"   - mechanics.gd: Core rules, physics/simulation loops, placement/action methods, scoring, story progression, recoverable hazard/win/loss logic.\n"
-                f"   - entities.gd: CharacterBody2D, RigidBody2D, Area2D, or RefCounted/Node2D entity classes.\n"
-                f"   - scenes.gd: Level layouts, active world Node2D renderer (_draw() and/or Sprite2D children), lighting/atmosphere, diegetic in-world visual cues.\n"
-                f"   - ui_hud.gd: Clean diegetic UI, character portrait & cutscene/dialogue tree presenter, voice bark audio player, and responsive input handling (NEVER render a static wall-of-text instruction manual explaining controls on the HUD!).\n"
+                f"   - entities.gd: CharacterBody2D, RigidBody2D, Area2D, or Node2D entity classes with animated sprite sheets or articulated multi-part rigs and directional `flip_h`.\n"
+                f"   - scenes.gd: Multi-layered active world Node2D renderer built from decomposed world elements, textured physical geometry, interactive landmarks, and atmospheric effects.\n"
+                f"   - ui_hud.gd: Clean diegetic UI with a clear Mission Objective & Goal Progress tracker (`X / Y` objectives completed + victory state banner), character portrait & cutscene/dialogue tree presenter, voice bark audio player, and responsive input handling.\n"
                 f"4. Cross-Module Resolution, Scope & Strict Method Alignment:\n"
                 f"   - When preloading OTHER modules, declare:\n"
                 f"     const Mechanics = preload('res://mechanics.gd')\n"
@@ -485,9 +551,9 @@ class LeadGameplaySWEAgent:
                 f"   - Every method called across `main.gd`, `mechanics.gd`, `scenes.gd`, `entities.gd`, and `ui_hud.gd` MUST match the exact function name defined in the target module.\n"
                 f"5. MANDATORY VISIBLE WORLD RENDERING, STORY STAGING & MULTIMODAL ASSET INTEGRATION:\n"
                 f"   - NEVER return a bare/empty Node2D.new() stub from a map or scene builder without _draw() or child visual nodes!\n"
-                f"   - Honor the Living Game Bible's First 60 Seconds Hook, Experience Storyboard Beats, Visual Style Guide, and 16:9 Visual Mockup boards.\n"
-                f"   - Stage the Narrative Bible's cutscenes, dialogue trees, and reactive voice barks in-game with character portraits and real WAV playback.\n"
-                f"   - Load and display ALL synthesized PNG sprites from 'res://assets/sprites/*.png' and portraits from 'res://assets/portraits/*.png' via Image.load_from_file(ProjectSettings.globalize_path('res://assets/...')) + ImageTexture.create_from_image(img).\n"
+                f"   - Honor the Living Game Bible's First 60 Seconds Hook, Experience Storyboard Beats, Visual Style Guide, Camera & Spatial Paradigm, and 16:9 Visual Mockup boards.\n"
+                f"   - Stage the Narrative Bible's cutscenes, dialogue trees, and reactive voice barks in-game with character portraits (`res://assets/portraits/*.png`) and real WAV playback.\n"
+                f"   - Load and display synthesized PNG sprites from 'res://assets/sprites/*.png' according to `res://assets/asset_library.json`.\n"
                 f"   - MANDATORY 24,000 Hz PCM WAV AUDIO LOADING & COOLDOWN: All synthesized WAV voice clips in 'res://assets/audio/*.wav' are 24,000 Hz, 16-bit mono PCM. When loading via FileAccess.get_file_as_bytes(ProjectSettings.globalize_path(path)), you MUST strip the 44-byte RIFF header (`stream.data = bytes.slice(44) if bytes.size() > 44 else bytes`), set `stream.format = AudioStreamWAV.FORMAT_16_BITS`, `stream.mix_rate = 24000` (NEVER 44100, which causes high-pitched chipmunk distortion!), and `stream.stereo = false`. Furthermore, enforce a non-overlapping playback guard (`if not audio_player.playing:`) and a minimum cooldown (>= 8.0 seconds) so voice barks NEVER spam or repeat every few seconds.\n"
                 f"6. DIEGETIC UX, CLEAR VIEWPORT & RECOVERABLE GAMEPLAY:\n"
                 f"   - Teach and guide the player through world cues, visual feedback, diegetic labels/hover callouts, and story context as specified in the Living Game Bible's `diegetic_ui_philosophy`—NEVER clutter the screen with a static instruction-manual text box listing keyboard shortcuts.\n"
@@ -1042,24 +1108,26 @@ class LeadGameplaySWEAgent:
             f"2. SELF-REFERENCE ERROR FIX: If '{filename}' reports `Identifier \"Scenes\" (or \"Mechanics\"/\"Entities\"/\"UIHud\") not declared in the current scope`, remove the self-module prefix (`Scenes.`, `Mechanics.`, `Entities.`, `UIHud.`) inside `{filename}`—never reference a script's external preload alias inside that script itself (or inside an inner class in `{filename}`; call the function directly or move/duplicate the helper inside the inner class).\n"
             f"3. TYPE INFERENCE ERROR FIX: If an error says `Cannot infer the type of \"<var>\" variable because the value doesn't have a set type`, replace `var <var> := ...` with `var <var> = ...` (or an explicit type annotation `var <var>: Type = ...`). Never use `:=` on untyped expressions.\n"
             f"4. PRELOADED SCRIPT CALL FIX: If an error says `Invalid call. Nonexistent function '<fn>' in base 'GDScript'`, remember that `const Module = preload('res://...')` is a `GDScript` resource, not an instance. Either instantiate `var inst = Module.new()` before calling `inst.<fn>(...)`, or align with the `static func` / `func` names shown in PEER MODULE SIGNATURES.\n"
-            f"5. Keep Godot 4.3 syntax (use CharacterBody2D, await, FileAccess, Area2D), consistent tab ('\\t') indentation, and strictly avoid banned Godot 3 syntax (KinematicBody2D, yield, File.new()).\n"
-            f"6. Return complete, valid source code (without line number prefixes) with deliberation strictly first."
+            f"5. NO AUTO-GENERATED ASSET_LIBRARY.GD: `res://asset_library.gd` (`AssetLib`) does NOT exist. Load textures directly via `Image.load_from_file(ProjectSettings.globalize_path(res_path))` and `ImageTexture.create_from_image(img)` (and `tex.set_meta('source_path', res_path)`), and read asset metadata from `res://assets/asset_library.json`.\n"
+            f"6. Keep Godot 4.3 syntax (use CharacterBody2D, await, FileAccess, Area2D), consistent tab ('\\t') indentation, and strictly avoid banned Godot 3 syntax (KinematicBody2D, yield, File.new()).\n"
+            f"7. Return complete, valid source code (without line number prefixes) with deliberation strictly first."
         )
-        try:
-            resp = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=CodeRepairSpec,
-                ),
-            )
-            repair_spec = CodeRepairSpec.model_validate_json(resp.text)
-            self.last_deliberation = repair_spec.deliberation
-            return repair_spec.repaired_content
-        except Exception as exc:
-            logger.warning("Godot module repair call failed: %s", exc)
-            return broken_code
+        for attempt in range(2):
+            try:
+                resp = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=CodeRepairSpec,
+                    ),
+                )
+                repair_spec = CodeRepairSpec.model_validate_json(resp.text)
+                self.last_deliberation = repair_spec.deliberation
+                return repair_spec.repaired_content
+            except Exception as exc:
+                logger.warning("Godot module repair call failed (attempt %d): %s", attempt + 1, exc)
+        return broken_code
 
     def repair_cartridge_code(
         self,
@@ -1078,6 +1146,26 @@ class LeadGameplaySWEAgent:
 
         from engine.supervisor.models import GateFailureType, RemedyType, RejectionDiagnosticTrace
         failure_type = getattr(rejection_trace, "failure_type", None)
+        is_godot_cartridge = (c_dir / "project.godot").is_file() or bool(list(c_dir.glob("*.gd")))
+
+        if (
+            is_godot_cartridge
+            and self._is_live_genai_client()
+            and failure_type not in (GateFailureType.SYNTAX_AST_ERROR, GateFailureType.UNHANDLED_EXCEPTION)
+        ):
+            req_spec = None
+            req_spec_path = c_dir / "requirements_spec.json"
+            if req_spec_path.is_file():
+                try:
+                    from engine.studio.models import GameRequirementsSpec
+                    req_spec = GameRequirementsSpec.model_validate_json(req_spec_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            return self.repair_godot_cartridge_holistic(
+                c_dir=c_dir,
+                rejection_trace=rejection_trace,
+                req_spec=req_spec,
+            )
 
         # ---------------------------------------------------------------------
         # 1. Gate A & Gate D: Python Code Repair (mechanics.py, entities.py, abilities.py)
@@ -1241,23 +1329,26 @@ class LeadGameplaySWEAgent:
             import struct
             import math
 
-            # Safely re-quantize PNGs via in-memory buffer so files are never truncated on error
-            for png_file in c_dir.rglob("*.png"):
-                try:
-                    img = Image.open(png_file)
-                    img.load()
-                    quantized = quantize_image_to_indexed(img, STYLE_BIBLE_16_PALETTE)
-                    buf = io.BytesIO()
+            # Safely re-quantize PNGs via in-memory buffer in offline/mock mode so files are never truncated on error
+            if not self._is_live_genai_client():
+                for png_file in c_dir.rglob("*.png"):
+                    if "mockups" in png_file.parts:
+                        continue
                     try:
-                        quantized.save(buf, format="PNG")
-                    except Exception:
-                        quantized.info.pop("transparency", None)
+                        img = Image.open(png_file)
+                        img.load()
+                        quantized = quantize_image_to_indexed(img, STYLE_BIBLE_16_PALETTE)
                         buf = io.BytesIO()
-                        quantized.save(buf, format="PNG")
-                    png_file.write_bytes(buf.getvalue())
-                    results[png_file.name] = png_file
-                except Exception as exc:
-                    logger.warning("Could not re-quantize %s: %s", png_file, exc)
+                        try:
+                            quantized.save(buf, format="PNG")
+                        except Exception:
+                            quantized.info.pop("transparency", None)
+                            buf = io.BytesIO()
+                            quantized.save(buf, format="PNG")
+                        png_file.write_bytes(buf.getvalue())
+                        results[png_file.name] = png_file
+                    except Exception as exc:
+                        logger.warning("Could not re-quantize %s: %s", png_file, exc)
 
             # Re-synthesize silent or invalid WAV files
             for wav_file in c_dir.rglob("*.wav"):
@@ -1472,15 +1563,859 @@ class LeadGameplaySWEAgent:
 
         return results
 
+    # -----------------------------------------------------------------------
+    # PEV (Plan / Research -> Execute Surgical Patch -> Verify) Debugging Engine
+    # -----------------------------------------------------------------------
+
+    def _build_cartridge_symbol_index(self, c_dir: Path) -> str:
+        """Builds a compact structural symbol index (classes, functions, signals, constants, section headers,
+        and external script/asset references with exact 1-indexed line numbers) across all .gd files in c_dir.
+        Avoids dumping full files so the agent can research and request only relevant code slices.
+        """
+        if not c_dir.is_dir():
+            return ""
+        blocks: List[str] = []
+        for gd_path in sorted(c_dir.glob("*.gd")):
+            try:
+                lines = gd_path.read_text(encoding="utf-8").splitlines()
+                entry_lines: List[str] = []
+                for idx, raw_line in enumerate(lines, start=1):
+                    stripped = raw_line.strip()
+                    if stripped.startswith(("extends ", "class_name ", "class ", "static func ", "func ", "const ", "signal ")):
+                        entry_lines.append(f"  L{idx:4d}: {raw_line}")
+                    elif stripped.startswith("# ") and not stripped.startswith("# ---") and len(stripped) > 6:
+                        entry_lines.append(f"  L{idx:4d}: {raw_line}")
+                    elif "preload(" in stripped or "load(" in stripped or "AssetLib" in stripped or "asset_library" in stripped:
+                        entry_lines.append(f"  L{idx:4d}: {raw_line}")
+                header = f"=== {gd_path.name} ({len(lines)} lines total) ==="
+                blocks.append(header + "\n" + "\n".join(entry_lines[:110]))
+            except Exception:
+                continue
+        return "\n\n".join(blocks)
+
+    def _extract_code_slice(self, c_dir: Path, req: CodeSliceRequest) -> str:
+        """Extracts a bounded, line-numbered code slice from `req.filename` for PEV context inspection.
+        Caps slice span so the LLM receives only high-signal relevant context rather than full-file dumps.
+        """
+        fname = Path(req.filename).name
+        fpath = c_dir / fname
+        if not fpath.is_file():
+            return f"=== SLICE: {fname} (FILE NOT FOUND) ==="
+
+        lines = fpath.read_text(encoding="utf-8").splitlines()
+        total = len(lines)
+        if total == 0:
+            return f"=== SLICE: {fname} (EMPTY FILE) ==="
+
+        windows: List[Tuple[int, int]] = []
+        if req.symbol_query and req.symbol_query.strip():
+            raw_q = req.symbol_query.strip()
+            # Split on ' and ' if multiple targets are listed in one string
+            sub_queries = [sq.strip() for sq in raw_q.split(" and ") if sq.strip()]
+            for sq in sub_queries:
+                # Check if explicit line range is embedded like '(lines 298-360)'
+                if "lines " in sq:
+                    after_lines = sq.split("lines ", 1)[1]
+                    num_buf = ""
+                    nums: List[int] = []
+                    for ch in after_lines:
+                        if ch.isdigit():
+                            num_buf += ch
+                        elif num_buf:
+                            nums.append(int(num_buf))
+                            num_buf = ""
+                            if len(nums) >= 2:
+                                break
+                    if num_buf and len(nums) < 2:
+                        nums.append(int(num_buf))
+                    if len(nums) >= 2 and 1 <= nums[0] <= nums[1]:
+                        s_ln = max(1, min(nums[0] - 4, total))
+                        e_ln = max(s_ln, min(nums[1] + 6, s_ln + 90, total))
+                        windows.append((s_ln, e_ln))
+
+                clean_sq = sq.split("(", 1)[0].strip()
+                if "." in clean_sq:
+                    cls_part, mem_part = clean_sq.split(".", 1)
+                    cls_part = cls_part.strip()
+                    mem_part = mem_part.strip()
+                    cls_start = 1
+                    cls_end = total
+                    for idx, line in enumerate(lines, start=1):
+                        if line.strip().startswith(f"class {cls_part}"):
+                            cls_start = idx
+                            for next_idx in range(idx + 1, total + 1):
+                                if lines[next_idx - 1].startswith("class "):
+                                    cls_end = next_idx - 1
+                                    break
+                            break
+                    found_member = False
+                    for idx in range(cls_start, cls_end + 1):
+                        st = lines[idx - 1].strip()
+                        if st.startswith((f"func {mem_part}", f"static func {mem_part}")):
+                            s_ln = max(1, idx - 3)
+                            e_ln = min(cls_end, idx + 88)
+                            windows.append((s_ln, e_ln))
+                            found_member = True
+                            break
+                    if not found_member and cls_start > 1:
+                        windows.append((max(1, cls_start - 2), min(cls_end, cls_start + 88)))
+                else:
+                    for idx, line in enumerate(lines, start=1):
+                        if clean_sq and clean_sq in line:
+                            stripped = line.strip()
+                            if stripped.startswith(("class ", "func ", "static func ")):
+                                s_ln = max(1, idx - 2)
+                                e_ln = min(total, idx + 88)
+                            else:
+                                s_ln = max(1, idx - 8)
+                                e_ln = min(total, idx + 45)
+                            windows.append((s_ln, e_ln))
+                            break
+
+        if not windows:
+            s = max(1, min(req.start_line, total))
+            e = max(s, min(req.end_line, total))
+            if e - s > 95:
+                e = s + 95
+            windows.append((s, e))
+
+        # Merge overlapping windows
+        windows.sort(key=lambda w: w[0])
+        merged: List[Tuple[int, int]] = []
+        for s, e in windows:
+            if merged and s <= merged[-1][1] + 5:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+            else:
+                merged.append((s, e))
+
+        out_blocks: List[str] = []
+        for s, e in merged:
+            snippet_lines = [
+                f"{ln:4d}: {lines[ln - 1]}"
+                for ln in range(s, e + 1)
+            ]
+            out_blocks.append(
+                f"=== {fname} [Lines {s}..{e} of {total}] ===\n" + "\n".join(snippet_lines)
+            )
+        return "\n\n".join(out_blocks)
+
+    def _apply_surgical_patches(
+        self,
+        c_dir: Path,
+        patches: List[SurgicalCodePatch],
+    ) -> Dict[str, Path]:
+        """Applies surgical line-range replacements to cartridge files in descending line order."""
+        updated: Dict[str, Path] = {}
+        patches_by_file: Dict[str, List[SurgicalCodePatch]] = {}
+        for p in patches:
+            fname = Path(p.filename).name
+            if fname.endswith(".gd"):
+                patches_by_file.setdefault(fname, []).append(p)
+
+        for fname, file_patches in patches_by_file.items():
+            fpath = c_dir / fname
+            if not fpath.is_file():
+                continue
+            lines = fpath.read_text(encoding="utf-8").splitlines()
+            total = len(lines)
+            # Sort descending by start_line so earlier line indices do not shift
+            sorted_patches = sorted(file_patches, key=lambda x: (x.start_line, x.end_line), reverse=True)
+            last_start = total + 1
+            applied_any = False
+
+            for patch in sorted_patches:
+                s = max(1, min(patch.start_line, total))
+                e = max(s, min(patch.end_line, total))
+                if e >= last_start:
+                    # Skip overlapping patch range in the same pass
+                    continue
+                cleaned_replacement: List[str] = []
+                for raw_line in patch.replacement_code.splitlines():
+                    # Strip accidental ' 123: ' line number prefix only if LLM echoed slice numbering
+                    if (
+                        len(raw_line) >= 6
+                        and raw_line[:4].strip().isdigit()
+                        and raw_line[4:6] == ": "
+                    ):
+                        cleaned_replacement.append(raw_line[6:])
+                    else:
+                        cleaned_replacement.append(raw_line)
+                lines[s - 1 : e] = cleaned_replacement
+                last_start = s
+                applied_any = True
+
+            if applied_any:
+                fpath.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                updated[fname] = fpath
+
+        return updated
+
+    def debug_and_patch_pev_cycle(
+        self,
+        c_dir: Path,
+        defect_summary: str,
+        initial_diagnostics: Optional[List[Any]] = None,
+        multimodal_parts: Optional[List[Any]] = None,
+        pre_slice_requests: Optional[List[CodeSliceRequest]] = None,
+        max_pev_cycles: int = 4,
+    ) -> Dict[str, Path]:
+        """Executes a disciplined Plan (Research) -> Execute (Inspect Slices & Surgical Patch) -> Verify
+        loop without dumping full files at the LLM.
+        """
+        if self.client is None or not self._is_live_genai_client():
+            return {}
+
+        from google.genai import types
+        from engine.sim.godot_verifier import verify_godot_cartridge_syntax
+        from engine.studio.asset_library import CartridgeAssetLibrary
+
+        results: Dict[str, Path] = {}
+        current_diagnostics = list(initial_diagnostics or [])
+        current_defect = defect_summary
+
+        asset_summary = ""
+        try:
+            asset_summary = CartridgeAssetLibrary(cartridge_dir=c_dir).build_prompt_summary_for_swe()
+        except Exception:
+            pass
+
+        for pev_cycle in range(max_pev_cycles):
+            symbol_index = self._build_cartridge_symbol_index(c_dir)
+
+            # Pre-extract tight +/- 18 line windows around any concrete compiler/runtime diagnostic lines
+            auto_slices: List[str] = []
+            if pre_slice_requests and pev_cycle == 0:
+                for pre_req in pre_slice_requests[:4]:
+                    s_txt = self._extract_code_slice(c_dir, pre_req)
+                    if s_txt not in auto_slices:
+                        auto_slices.append(s_txt)
+
+            diag_lines_text: List[str] = []
+            for d in current_diagnostics[:6]:
+                d_file = getattr(d, "file_path", None)
+                d_line = int(getattr(d, "line_number", 1) or 1)
+                d_msg = getattr(d, "error_message", str(d))
+                fname = Path(d_file).name if d_file else "main.gd"
+                diag_lines_text.append(f"- {fname}:{d_line} -> {d_msg}")
+                if (c_dir / fname).is_file():
+                    err_slice = self._extract_code_slice(
+                        c_dir,
+                        CodeSliceRequest(
+                            deliberation=f"Auto-extracted error window around {fname}:{d_line}",
+                            filename=fname,
+                            start_line=max(1, d_line - 18),
+                            end_line=d_line + 18,
+                        ),
+                    )
+                    if err_slice not in auto_slices:
+                        auto_slices.append(err_slice)
+
+            diag_section = (
+                "CONCRETE COMPILER / RUNTIME DIAGNOSTICS:\n" + "\n".join(diag_lines_text) + "\n\n"
+                if diag_lines_text
+                else ""
+            )
+            auto_slice_section = (
+                "PRE-INSPECTED TARGET CODE WINDOWS:\n" + "\n\n".join(auto_slices) + "\n\n"
+                if auto_slices
+                else ""
+            )
+
+            # -----------------------------------------------------------------
+            # PEV PHASE 1: PLAN & RESEARCH (Request targeted code slices)
+            # -----------------------------------------------------------------
+            research_prompt = (
+                f"You are the Lead Gameplay SWE Agent in PHASE 1 (PLAN & RESEARCH) of a PEV debugging cycle (Iteration {pev_cycle + 1}/{max_pev_cycles}).\n"
+                f"Do NOT guess blindly and do NOT request entire large files. Analyze the defect and the Cartridge Symbol Index below, "
+                f"formulate a root-cause hypothesis, and request ONLY the specific sub-block code slices (40-80 lines each) "
+                f"you need to inspect to craft a compact surgical fix.\n\n"
+                f"--- DEFECT TO RESOLVE ---\n{current_defect}\n\n"
+                f"{diag_section}"
+                f"{auto_slice_section}"
+                f"--- CARTRIDGE SYMBOL & REFERENCE INDEX ---\n{symbol_index}\n\n"
+                f"{asset_summary}\n"
+                f"Return a `DebugResearchPlan` with `deliberation` strictly first."
+            )
+
+            plan: Optional[DebugResearchPlan] = None
+            for attempt in range(2):
+                try:
+                    resp_plan = self.client.models.generate_content(
+                        model=self.model_name,
+                        contents=research_prompt,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=DebugResearchPlan,
+                        ),
+                    )
+                    if resp_plan.text:
+                        plan = DebugResearchPlan.model_validate_json(resp_plan.text)
+                        self.last_deliberation = plan.deliberation
+                        break
+                except Exception as exc:
+                    logger.warning("PEV Phase 1 (Research Plan) failed (attempt %d): %s", attempt + 1, exc)
+
+            if plan is None:
+                break
+
+            # Extract the requested slices
+            extracted_slices: List[str] = list(auto_slices)
+            for req in plan.slice_requests[:6]:
+                slice_text = self._extract_code_slice(c_dir, req)
+                if slice_text not in extracted_slices:
+                    extracted_slices.append(slice_text)
+
+            # -----------------------------------------------------------------
+            # PEV PHASE 2: EXECUTE (Inspect focused slices & emit surgical patches)
+            # -----------------------------------------------------------------
+            patch_payload: Optional[SurgicalPatchPayload] = None
+            for hop in range(2):
+                slices_joined = "\n\n".join(extracted_slices)
+                hop_rule_6 = (
+                    "6. If you need to inspect one more function/caller before patching, populate `additional_slice_requests`."
+                    if hop == 0
+                    else "6. FINAL HOP — YOU MUST EMIT CONCRETE `SurgicalCodePatch` ITEMS IN `patches` NOW: Do NOT leave `patches` empty on Hop 2!"
+                )
+                execute_prompt = (
+                    f"You are the Lead Gameplay SWE Agent in PHASE 2 (EXECUTE SURGICAL PATCH) of a PEV debugging cycle (Iteration {pev_cycle + 1}/{max_pev_cycles}, Hop {hop + 1}).\n"
+                    f"Root-Cause Hypothesis: {plan.root_cause_hypothesis}\n\n"
+                    f"--- DEFECT TO RESOLVE ---\n{current_defect}\n\n"
+                    f"{diag_section}"
+                    f"--- INSPECTED CODE SLICES (1-indexed line numbers) ---\n{slices_joined}\n\n"
+                    f"--- CARTRIDGE SYMBOL INDEX (for cross-module call signatures) ---\n{symbol_index}\n\n"
+                    f"{asset_summary}\n"
+                    f"--- SURGICAL PATCH RULES ---\n"
+                    f"1. Provide `deliberation` strictly first (Rule 4).\n"
+                    f"2. Emit focused `SurgicalCodePatch` items replacing ONLY the defective contiguous line ranges `[start_line..end_line]` in the target `.gd` file(s).\n"
+                    f"3. KEEP EACH PATCH COMPACT AND SURGICAL (MAX 40-65 LINES OF REPLACEMENT CODE): Never rewrite an entire 150-line class or copy-paste unchanged trailing sections of a long `_draw()` method (such as shockwave/particle/geyser loops). Replace ONLY the specific 10-55 lines responsible for the defect (for example, `SceneAssets.draw_tiled_platform`, or the `for s in shelves:` block, or the `for coord in canal_grid.cells.keys():` block) while leaving surrounding lines untouched!\n"
+                    f"4. Do NOT include line number prefixes (like ` 196: `) in `replacement_code`. Preserve exact tab (`\\t`) indentation matching the surrounding function/class scope.\n"
+                    f"5. Never reference `AssetLib` or `res://asset_library.gd` (it does not exist). Load PNG textures via `Image.load_from_file(ProjectSettings.globalize_path(res_path))` and `ImageTexture.create_from_image(img)` (and `tex.set_meta('source_path', res_path)`). IMPORTANT GODOT 4 TEXTURE TILING RULE: When calling `draw_colored_polygon(pts, color, uvs, tex)` or `draw_polygon` with repeating UVs (`uv > 1.0`), you MUST set `texture_repeat = CanvasItem.TEXTURE_REPEAT_ENABLED` on the `Node2D`/`CanvasItem` (in `_init` or `_draw`), otherwise Godot 4 clamps UVs > 1.0 to a single edge pixel and renders a flat solid color! Also use bright modulation (`Color(0.85, 0.95, 0.90, 1.0)`) so the surface texture detail is vivid.\n"
+                    f"{hop_rule_6}\n"
+                )
+                contents_exec: Any = (
+                    [execute_prompt] + list(multimodal_parts)
+                    if (multimodal_parts and pev_cycle == 0 and hop == 0)
+                    else execute_prompt
+                )
+                for attempt in range(2):
+                    try:
+                        resp_exec = self.client.models.generate_content(
+                            model=self.model_name,
+                            contents=contents_exec,
+                            config=types.GenerateContentConfig(
+                                response_mime_type="application/json",
+                                response_schema=SurgicalPatchPayload,
+                            ),
+                        )
+                        if resp_exec.text:
+                            patch_payload = SurgicalPatchPayload.model_validate_json(resp_exec.text)
+                            self.last_deliberation = patch_payload.deliberation
+                            break
+                    except Exception as exc:
+                        logger.warning("PEV Phase 2 (Execute Patch) failed (attempt %d): %s", attempt + 1, exc)
+
+                if patch_payload is None:
+                    break
+
+                if patch_payload.additional_slice_requests and not patch_payload.patches and hop == 0:
+                    for extra_req in patch_payload.additional_slice_requests[:6]:
+                        extra_txt = self._extract_code_slice(c_dir, extra_req)
+                        if extra_txt not in extracted_slices:
+                            extracted_slices.append(extra_txt)
+                    continue
+                break
+
+            applied_in_cycle = False
+            if patch_payload and patch_payload.patches:
+                patched_files = self._apply_surgical_patches(c_dir, patch_payload.patches)
+                if patched_files:
+                    applied_in_cycle = True
+                    results.update(patched_files)
+
+            # -----------------------------------------------------------------
+            # PEV PHASE 3: VERIFY (Headless Godot compiler + 2-tick runtime check)
+            # -----------------------------------------------------------------
+            is_valid, new_diagnostics = verify_godot_cartridge_syntax(c_dir)
+            # Also check if any file still contains broken `AssetLib.` calls
+            lingering_assetlib: List[str] = []
+            for gd_p in sorted(c_dir.glob("*.gd")):
+                for ln_idx, ln_txt in enumerate(gd_p.read_text(encoding="utf-8").splitlines(), start=1):
+                    if "AssetLib." in ln_txt or "asset_library.gd" in ln_txt:
+                        lingering_assetlib.append(f"{gd_p.name}:{ln_idx}: references removed AssetLib/asset_library.gd (`{ln_txt.strip()}`)")
+
+            if is_valid and not lingering_assetlib:
+                if applied_in_cycle or results or initial_diagnostics:
+                    logger.info("PEV cycle %d verified clean (0 compiler/runtime errors).", pev_cycle + 1)
+                    break
+
+            current_diagnostics = list(new_diagnostics)
+            verify_feedback = []
+            for d in new_diagnostics[:6]:
+                verify_feedback.append(f"{d.file_path.name}:{d.line_number}: {d.error_message}")
+            verify_feedback.extend(lingering_assetlib[:6])
+            if not verify_feedback and not applied_in_cycle:
+                verify_feedback.append(
+                    "No SurgicalCodePatch items were emitted in `patches`! You MUST emit concrete SurgicalCodePatch line replacements to fix the defect."
+                )
+            current_defect = (
+                f"Previous patch verification found remaining issues:\n"
+                + "\n".join(f"- {item}" for item in verify_feedback)
+                + f"\nOriginal context: {defect_summary[:600]}"
+            )
+
+        return results
+
+    # -----------------------------------------------------------------------
+    # Strategic Game Production Planning & Iterative Per-Scene Critique Loop
+    # -----------------------------------------------------------------------
+
+    def _collect_concept_art_parts(self, c_dir: Path) -> List[Any]:
+        """Loads 16:9 concept art PNGs from assets/mockups/ and assets/concepts/ as multimodal Gemini image parts."""
+        if not self._is_live_genai_client():
+            return []
+        from google.genai import types
+        parts: List[Any] = []
+        for subdir_name in ("mockups", "concepts"):
+            c_sub = c_dir / "assets" / subdir_name
+            if c_sub.is_dir():
+                for png_path in sorted(c_sub.glob("*.png"))[:3]:
+                    try:
+                        parts.append(
+                            types.Part.from_bytes(data=png_path.read_bytes(), mime_type="image/png")
+                        )
+                    except Exception:
+                        continue
+        return parts[:3]
+
+    def formulate_production_strategy(
+        self,
+        c_dir: Path,
+        force_refresh: bool = False,
+    ) -> GameProductionStrategySpec:
+        """Formulates a holistic GameProductionStrategySpec before or during cartridge construction.
+        Decomposes the Game Bible and 16:9 Concept Mockups into an explicit multi-layer environment
+        topology plan, required visual sprite assets, procedural audio cues, code architecture, and
+        diegetic UI strategy. Automatically fabricates any missing required visual assets on disk.
+        """
+        if self.client is None or not self._is_live_genai_client():
+            raise StudioAgentError("formulate_production_strategy requires an active google.genai Client (Rule 5)")
+
+        from google.genai import types
+        from engine.studio.asset_library import CartridgeAssetLibrary
+
+        strategy_path = c_dir / "production_strategy.json"
+        if strategy_path.is_file() and not force_refresh:
+            try:
+                cached = GameProductionStrategySpec.model_validate_json(
+                    strategy_path.read_text(encoding="utf-8")
+                )
+                return cached
+            except Exception:
+                pass
+
+        bible_text = ""
+        bible_path = c_dir / "game_bible.json"
+        palette_mood = "stylized_fantasy"
+        art_direction = ""
+        if bible_path.is_file():
+            raw_bible = bible_path.read_text(encoding="utf-8")
+            bible_text = raw_bible[:14000]
+            try:
+                b_obj = json.loads(raw_bible)
+                palette_mood = b_obj.get("visual_style", {}).get("palette_mood", palette_mood)
+                art_direction = json.dumps(b_obj.get("visual_style", {}))
+            except Exception:
+                pass
+
+        lib = CartridgeAssetLibrary(cartridge_dir=c_dir, client=self.client)
+        existing_catalog_summary = lib.build_prompt_summary_for_swe()
+
+        concept_parts = self._collect_concept_art_parts(c_dir)
+
+        prompt = (
+            "You are the Principal Game Architect & Creative Director formulating the master "
+            "`GameProductionStrategySpec` for this Godot 4 game cartridge.\n"
+            "Study the Game Bible and the attached 16:9 Concept Art Mockups carefully.\n"
+            "We need a comprehensive strategy for how to build the intended game so it looks, sounds, and plays "
+            "like a rich, cohesive, playable environment matching the Concept Art — NEVER a static background or "
+            "blocky programmer-art rectangles.\n\n"
+            "--- STRATEGIC PLANNING REQUIREMENTS ---\n"
+            "1. Provide `deliberation` strictly first (Rule 4).\n"
+            "2. `environment_topology_strategy`: Explain how the level/world must be decomposed into multi-plane parallax "
+            "horizons, organic sculpted terrain silhouettes, continuous glowing fluid/energy channels, and interactive world "
+            "structures/flora.\n"
+            "3. `camera_and_perspective_coherence_strategy`: CRITICAL — Ensure 100% coherence between the character's movement plane "
+            "and the landscape orientation! When characters/canals operate in 2D top-down / 3/4 overhead `(x, y)` space across a "
+            "walkable shelf `Rect2` (`s.position.y .. s.end.y`), the ENTIRE shelf `Rect2` (`s.position.y .. s.end.y`) is the "
+            "**horizontal walkable TOP plateau surface** and MUST be filled with the lush ground texture (`terrain_surface.png` — "
+            "emerald moss, grass, and ancient flagstone pavers). NEVER fill `s.position.y .. s.end.y` with vertical cliff-wall "
+            "bricks (`structure_wall_tile.png`) or vertical cliff cracks, or the character will look like she is walking sideways "
+            "on the vertical face of a cliff! Instead, hang the vertical cliff wall (`structure_wall_tile.png` + vertical striations "
+            "+ tapering stalactites) and overhanging moss scallops ONLY **below the southern bottom edge (`s.end.y`)** of each "
+            "plateau (from `s.end.y` down to `s.end.y + 110`) as a 3/4 perspective front cliff skirt, and distribute flora/spires "
+            "across the 2D `(x, y)` plateau floor (`y` between `s.position.y + 30` and `s.end.y - 30`) with ground shadows.\n"
+            "4. `scene_layers`: Define the ordered depth layers (`z_index`) from distant sky/horizon backdrop to mid-ground "
+            "landmarks, main playfield terrain & fluid channels, interactive flora/structures/entities, foreground accents, "
+            "and diegetic HUD.\n"
+            "5. `required_visual_assets`: List all `AssetRequirement` sprites needed to realize the environment, "
+            "flora, structures, hazards, and characters. Include existing assets from the catalog AND specify any missing "
+            "environmental/flora/prop/structure sprites that should be fabricated.\n"
+            "6. `audio_cues` & `psychoacoustic_audio_strategy`: Define the procedural `AudioStreamWAV` audio cues required for "
+            "primary player mechanics, traversal, environmental resonance, and hazards. STRICT PSYCHOACOUSTIC RULE: Forbid "
+            "continuous looping high-pitched sine/square wave drones (`AudioStreamWAV.LOOP_FORWARD` on `> 200 Hz` tones like a "
+            "constant 523 Hz C5 hum playing from `_ready()`), forbid piercing high-frequency squeals (`>= 800 Hz`), and forbid "
+            "harsh square-wave buzzes. All procedural sounds must use `loop_mode = AudioStreamWAV.LOOP_DISABLED`, gentle "
+            "exponential decay envelopes (`exp(-8.0 * t)`), warm low/mid frequencies (`110–440 Hz`), and comfortable levels "
+            "(`volume_db <= -16.0`), triggered only on discrete events.\n"
+            "7. `code_architecture_strategy`: Detail how `scenes.gd`, `entities.gd`, `ui_hud.gd`, and `main.gd` collaborate.\n"
+            "8. `diegetic_ui_strategy`: Detail how the HUD must be styled as a clean, diegetic/thematic overlay matching the "
+            "concept art (warm parchment/crest frame, clear resource bar, concise objective & controls banner) rather than "
+            "raw engineering debug telemetry text.\n\n"
+            f"--- GAME BIBLE EXCERPT ---\n{bible_text}\n\n"
+            f"--- CURRENT ASSET CATALOG ON DISK ---\n{existing_catalog_summary}\n"
+        )
+
+        contents: Any = [prompt] + concept_parts if concept_parts else prompt
+        strategy: Optional[GameProductionStrategySpec] = None
+        last_err: Optional[Exception] = None
+        for attempt in range(2):
+            try:
+                resp = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=GameProductionStrategySpec,
+                    ),
+                )
+                if resp.text:
+                    strategy = GameProductionStrategySpec.model_validate_json(resp.text)
+                    self.last_deliberation = strategy.deliberation
+                    break
+            except Exception as exc:
+                last_err = exc
+                logger.warning("formulate_production_strategy attempt %d failed: %s", attempt + 1, exc)
+
+        if strategy is None:
+            raise StudioAgentError(f"Failed to formulate GameProductionStrategySpec: {last_err}")
+
+        strategy_path.write_text(strategy.model_dump_json(indent=2), encoding="utf-8")
+
+        # Fabricate any newly requested visual assets that are not yet in the asset catalog
+        if strategy.required_visual_assets:
+            try:
+                lib.ensure_required_assets(
+                    required_specs=strategy.required_visual_assets,
+                    palette_mood=palette_mood,
+                    art_direction=art_direction,
+                )
+            except Exception as asset_exc:
+                logger.warning("Non-fatal error fabricating additional strategy assets: %s", asset_exc)
+
+        return strategy
+
+    def analyze_scene_and_restrategize(
+        self,
+        c_dir: Path,
+        strategy: Optional[GameProductionStrategySpec] = None,
+    ) -> SceneCritiqueAndStrategySpec:
+        """Runs a live 60-tick headless Godot 4 viewport capture (`playtest_t0.png` and `playtest_tend.png`),
+        compares the rendered scene side-by-side against the Game Bible, 16:9 Concept Mockups, and
+        `GameProductionStrategySpec`, and outputs a structured `SceneCritiqueAndStrategySpec` identifying
+        every visual, perspective, environmental, audio, architectural, or UX deficiency to remediate.
+        """
+        if self.client is None or not self._is_live_genai_client():
+            raise StudioAgentError("analyze_scene_and_restrategize requires an active google.genai Client (Rule 5)")
+
+        from google.genai import types
+        from engine.sim.godot_verifier import GodotHeadlessSimulator, verify_godot_cartridge_syntax
+        from engine.studio.asset_library import CartridgeAssetLibrary
+
+        if strategy is None:
+            strategy = self.formulate_production_strategy(c_dir)
+
+        # 1. Run syntax check + live 60-tick Godot headless simulation with GPU viewport capture
+        is_valid, syntax_diags = verify_godot_cartridge_syntax(c_dir)
+        sim = GodotHeadlessSimulator(c_dir, capture_viewport=True, max_ticks=60)
+        sim_state = sim.run_until_complete()
+
+        diag_summary_lines = [
+            f"- {d.file_path.name}:{d.line_number}: {d.error_message}"
+            for d in (syntax_diags or [])[:8]
+        ]
+        for rd in (sim.runtime_diagnostics or [])[:8]:
+            diag_summary_lines.append(f"- Runtime {rd.file_path.name}:{rd.line_number}: {rd.error_message}")
+
+        last_frame_summary = (
+            f"Ticks completed: {sim_state.step_count} | Player pos: {sim_state.player_pos} | "
+            f"Scene audit: {json.dumps(getattr(sim, 'scene_audit', {}), default=str)[:1200]}"
+        )
+
+        # 2. Collect multimodal image parts: Concept Mockups FIRST, then live rendered Godot captures
+        multimodal_parts: List[Any] = []
+        concept_parts = self._collect_concept_art_parts(c_dir)
+        multimodal_parts.extend(concept_parts)
+
+        captures_dir = c_dir / "assets" / "playtest_captures"
+        for cap_name in ("playtest_t0.png", "playtest_tend.png"):
+            cap_p = captures_dir / cap_name
+            if cap_p.is_file():
+                try:
+                    multimodal_parts.append(
+                        types.Part.from_bytes(data=cap_p.read_bytes(), mime_type="image/png")
+                    )
+                except Exception:
+                    pass
+
+        symbol_index = self._build_cartridge_symbol_index(c_dir)
+        asset_summary = CartridgeAssetLibrary(cartridge_dir=c_dir).build_prompt_summary_for_swe()
+
+        # Extract focused slices for terrain perspective (scenes.gd), spire layering (scenes.gd), and audio synthesis (main.gd)
+        terrain_slice = self._extract_code_slice(
+            c_dir,
+            CodeSliceRequest(
+                deliberation="Inspect TerraceRenderer._draw to check camera/terrain perspective alignment and canal pass ordering",
+                filename="scenes.gd",
+                symbol_query="TerraceRenderer._draw",
+            ),
+        )
+        spires_slice = self._extract_code_slice(
+            c_dir,
+            CodeSliceRequest(
+                deliberation="Inspect WorldSpireLayer._draw and SceneAssets.draw_tiled_rect for oversized foreground column occlusion",
+                filename="scenes.gd",
+                symbol_query="WorldSpireLayer._draw",
+            ),
+        )
+        audio_slice = self._extract_code_slice(
+            c_dir,
+            CodeSliceRequest(
+                deliberation="Inspect audio setup and procedural synthesis in main.gd for continuous high-pitched loops or squeals",
+                filename="main.gd",
+                symbol_query="func _setup_audio",
+            ),
+        )
+
+        bible_excerpt = ""
+        if (c_dir / "game_bible.json").is_file():
+            bible_excerpt = (c_dir / "game_bible.json").read_text(encoding="utf-8")[:8000]
+
+        critique_prompt = (
+            "You are the Studio Art Director, Lead Level Designer, Audio Director & Principal Gameplay SWE conducting a "
+            "rigorous Per-Scene Visual, Perspective, Audio & Gameplay Critique (`SceneCritiqueAndStrategySpec`).\n"
+            "Attached images:\n"
+            "- First image(s): Target 16:9 Concept Art Mockups from the Game Bible.\n"
+            "- Final image(s): Actual live Godot 4 viewport renders (`playtest_t0.png` and `playtest_tend.png`) "
+            "captured from the current cartridge build.\n\n"
+            "Compare the actual rendered Godot scene and audio code against the Concept Art Mockups, the Game Bible, and the "
+            "`GameProductionStrategySpec` below. Scrutinize EVERY pillar below:\n"
+            "1. **CRITICAL — Camera & Landscape Perspective Coherence (`scenes.gd` -> `TerraceRenderer._draw`, `FernsCluster._init`, `WorldSpireLayer._draw`)**:\n"
+            "   - Look at where the character (`vesper` at `y ~ 420`) and canal (`y ~ 440`) are positioned on the island in `playtest_t0.png` / `playtest_tend.png` and in `TERRAIN CODE SLICE` / `SPIRES CODE SLICE` below.\n"
+            "   - In a 3/4 top-down floating island plateau:\n"
+            "     a) The ENTIRE walkable shelf `Rect2` (`s.position.y .. s.end.y`, e.g. `y = 260..700`) is the **horizontal walkable TOP plateau surface** and MUST be filled with `terrain_surface.png` (lush emerald moss/grass & ancient courtyard flagstone pavers, with organic mossy borders framing its perimeter).\n"
+            "     b) The vertical cliff face (`structure_wall_tile.png` + vertical cliff striations + jagged stalactites) and overhanging moss scallops MUST hang **ONLY below the southern bottom edge (`s.end.y`)** of each plateau (e.g., from `s.end.y` down to `s.end.y + 110`) as the 3/4 perspective front cliff skirt!\n"
+            "     c) Check `SPIRES CODE SLICE` (`WorldSpireLayer._draw` and `SceneAssets.draw_tiled_rect`): Does `WorldSpireLayer` draw giant 340px-tall rectangular `SceneAssets.draw_tiled_rect` columns (`shaft_rect = Rect2(p.x - 24, p.y - 90, 48, 196)` with a bright `1.5px` rectangle border in `draw_tiled_rect`) at `z_index = 1` directly over the plateau and canal (`Vector2(500, 395)`, `Vector2(720, 350)`), creating huge dark boxy slabs with white wireframe borders blocking the view?! If so, emit a `SceneDeficiencyItem` targeting `scenes.gd` (`WorldSpireLayer._draw` and `SceneAssets.draw_tiled_rect`) to remove the rectangle border in `draw_tiled_rect`, set `WorldSpireLayer` `z_index = -5` for distant horizon spires (`y < 200`), and render on-plateau shrines as compact, grounded `midground_setpiece_1.png` stone lanterns/shrines (`64x64` over a subtle elliptical ground shadow, positioned in the northern/southern terrace margins clear of the canal `y = 390..480`, WITHOUT giant 196px rectangular `structure_wall_tile` column shafts)!\n"
+            "2. **CRITICAL — Psychoacoustic Comfort & Audio Stream Critique (`main.gd` -> `acoustics_hum_setup`, `_synthesize_sine_loop`, `_setup_audio`, `_synthesize_buzz`)**:\n"
+            "   - Inspect `AUDIO CODE SLICE` from `main.gd` below! Does `acoustics_hum_setup` or `_synthesize_sine_loop` create a **continuous looping high-pitched sine wave** (`stream.loop_mode = AudioStreamWAV.LOOP_FORWARD`), or does `_setup_audio` synthesize a piercing `1200.0 Hz` squeal (`squeal_stream = _synthesize_tone(1200.0, ...)`) or harsh square-wave `_synthesize_buzz`?\n"
+            "   - If ANY continuous looping sine tone, `1200.0 Hz` squeal, or harsh square-wave buzz exists in `main.gd`, emit a mandatory `SceneDeficiencyItem` targeting `main.gd` (`_setup_audio` / `_synthesize_buzz` / `acoustics_hum_setup`) so all synthesized streams use `AudioStreamWAV.LOOP_DISABLED`, warm low/mid frequencies (`130–330 Hz`), and soft exponential decay (`exp(-8.0 * t)`, `volume_db <= -16.0`)!\n"
+            "3. **Fluid / Energy Channels (`scenes.gd` -> `TerraceRenderer._draw`)**:\n"
+            "   - Inspect `playtest_t0.png` / `playtest_tend.png` and the `canal_coords` passes inside `TERRAIN CODE SLICE` (`TerraceRenderer._draw`):\n"
+            "     * Are there vertical comb/ladder lines or dark gaps cutting across the 2-row wide canal basin (`x = 430..630`)? This happens when `fw` (`hw * 0.72 ~ 9.1px`) is smaller than half of `CELL_SIZE` (`12.0px`) AND `draw_line(w_pos + norm * fw, n_pos + norm * fw, ...)` is called unconditionally on `offset = Vector2i(0, 1)` vertical connectors (which draws bright vertical lines across the middle of the horizontal basin)!\n"
+            "     * To render a 100% seamless, organic multi-row water basin and river channel:\n"
+            "       - Use `mw = 16.5`, `hw = 14.0`, and `fw = 12.5` (`>= CELL_SIZE * 0.5`) so adjacent rows and columns overlap with zero dark gaps.\n"
+            "       - Keep the 3 separate passes (Pass 1: Masonry `mw`; Pass 2: Recessed dark bed `hw`; Pass 3: Luminous cyan water `fw` + caustics).\n"
+            "       - In Pass 1 and Pass 3, NEVER draw `masonry_rim` or white foam `draw_line` strokes along `offset = Vector2i(0, 1)` vertical connectors or along any side `norm` where the perpendicular neighbor (`coord + Vector2i(int(round(norm.x)), int(round(norm.y)))`) is ALSO in `canal_coords`! Only draw bank rim/foam lines along true outer shoreline edges, and only run horizontal caustic waves along `offset == Vector2i(1, 0)`!\n"
+            "     * Also check the Sunken Aqueduct Chasm (`x = 816..1066`): replace the harsh straight vertical `draw_line` at `chasm.position.x` and `chasm.end.x` with organic stepped rocky cliff edges and mossy rim scallops along the chasm walls!\n"
+            "4. **Diegetic HUD (`ui_hud.gd`)**: Does the HUD present a clean, warm diegetic fantasy interface matching the Game Bible and Concept Art?\n"
+            "5. **Compiler/Runtime Health**: Are there any GDScript compiler or runtime errors?\n\n"
+            "Be ruthlessly honest. Set `scene_matches_game_bible = False` if ANY of the above deficiencies exist, and "
+            "populate `deficiencies` with concrete `SceneDeficiencyItem` entries targeting the exact `.gd` file and class/method "
+            "from the Cartridge Symbol Index so the SWE agent can execute surgical PEV patches.\n\n"
+            f"--- COMPILER / RUNTIME DIAGNOSTICS (Valid={is_valid}) ---\n"
+            + ("\n".join(diag_summary_lines) if diag_summary_lines else "None (0 script errors)")
+            + f"\n{last_frame_summary}\n\n"
+            f"--- TERRAIN CODE SLICE (scenes.gd -> TerraceRenderer._draw) ---\n{terrain_slice}\n\n"
+            f"--- SPIRES CODE SLICE (scenes.gd -> WorldSpireLayer._draw) ---\n{spires_slice}\n\n"
+            f"--- AUDIO CODE SLICE (main.gd -> _setup_audio & acoustics_hum_setup) ---\n{audio_slice}\n\n"
+            f"--- MASTER PRODUCTION STRATEGY ---\n{strategy.model_dump_json(indent=2)[:6000]}\n\n"
+            f"--- GAME BIBLE EXCERPT ---\n{bible_excerpt}\n\n"
+            f"--- CARTRIDGE SYMBOL INDEX ---\n{symbol_index}\n\n"
+            f"{asset_summary}\n"
+        )
+
+        contents: Any = [critique_prompt] + multimodal_parts if multimodal_parts else critique_prompt
+        critique: Optional[SceneCritiqueAndStrategySpec] = None
+        last_err: Optional[Exception] = None
+        for attempt in range(2):
+            try:
+                resp = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=SceneCritiqueAndStrategySpec,
+                    ),
+                )
+                if resp.text:
+                    critique = SceneCritiqueAndStrategySpec.model_validate_json(resp.text)
+                    self.last_deliberation = critique.deliberation
+                    break
+            except Exception as exc:
+                last_err = exc
+                logger.warning("analyze_scene_and_restrategize attempt %d failed: %s", attempt + 1, exc)
+
+        if critique is None:
+            raise StudioAgentError(f"Failed to generate SceneCritiqueAndStrategySpec: {last_err}")
+
+        (c_dir / "scene_critique_report.json").write_text(
+            critique.model_dump_json(indent=2), encoding="utf-8"
+        )
+        return critique
+
+    def execute_scene_strategy_and_refine_loop(
+        self,
+        c_dir: Path,
+        max_scene_iterations: int = 3,
+    ) -> Dict[str, Path]:
+        """Executes the full Strategic Production & Per-Scene Iterative Refinement Loop:
+        1. Formulates the master `GameProductionStrategySpec` (and fabricates any missing required sprites).
+        2. Runs the headless Godot 4 simulator to capture live viewport screenshots (`playtest_t0.png`, `playtest_tend.png`).
+        3. Analyzes the rendered scene against the Game Bible, Concept Mockups, and Production Strategy (`analyze_scene_and_restrategize`).
+        4. For any identified `SceneDeficiencyItem`s, fabricates any `new_assets_needed` and runs targeted PEV surgical
+           patching (`debug_and_patch_pev_cycle`) per deficiency item, re-verifying in Godot 4 after each pass.
+        """
+        if self.client is None or not self._is_live_genai_client():
+            return {}
+
+        from engine.sim.godot_verifier import GodotHeadlessSimulator, verify_godot_cartridge_syntax
+        from engine.studio.asset_library import CartridgeAssetLibrary
+
+        updated_files: Dict[str, Path] = {}
+
+        # Step 1: Formulate master production strategy & ensure required assets exist
+        strategy = self.formulate_production_strategy(c_dir)
+
+        lib = CartridgeAssetLibrary(cartridge_dir=c_dir, client=self.client)
+        palette_mood = "stylized_fantasy"
+        art_direction = ""
+        if (c_dir / "game_bible.json").is_file():
+            try:
+                b_obj = json.loads((c_dir / "game_bible.json").read_text(encoding="utf-8"))
+                palette_mood = b_obj.get("visual_style", {}).get("palette_mood", palette_mood)
+                art_direction = json.dumps(b_obj.get("visual_style", {}))
+            except Exception:
+                pass
+
+        for scene_iter in range(max_scene_iterations):
+            logger.info("Scene Strategy & Critique Loop iteration %d/%d", scene_iter + 1, max_scene_iterations)
+            critique: Optional[SceneCritiqueAndStrategySpec] = None
+            critique_file = c_dir / "scene_critique_report.json"
+            if scene_iter == 0 and critique_file.is_file():
+                try:
+                    crit_mtime = critique_file.stat().st_mtime
+                    latest_gd_mtime = max((p.stat().st_mtime for p in c_dir.glob("*.gd")), default=0.0)
+                    if crit_mtime >= latest_gd_mtime:
+                        critique = SceneCritiqueAndStrategySpec.model_validate_json(
+                            critique_file.read_text(encoding="utf-8")
+                        )
+                        logger.info("Reusing fresh scene_critique_report.json for iteration 1")
+                except Exception:
+                    critique = None
+            if critique is None:
+                critique = self.analyze_scene_and_restrategize(c_dir, strategy=strategy)
+
+            # Fabricate any newly identified missing sprites before patching code
+            if critique.new_assets_needed:
+                try:
+                    lib.ensure_required_assets(
+                        required_specs=critique.new_assets_needed,
+                        palette_mood=palette_mood,
+                        art_direction=art_direction,
+                    )
+                except Exception as exc:
+                    logger.warning("Could not fabricate new_assets_needed in scene iteration %d: %s", scene_iter + 1, exc)
+
+            if critique.scene_matches_game_bible and not critique.deficiencies:
+                logger.info("Scene matches Game Bible and Production Strategy on iteration %d!", scene_iter + 1)
+                break
+
+            # Execute a dedicated PEV surgical pass for each individual SceneDeficiencyItem
+            for def_idx, fd in enumerate(critique.deficiencies, start=1):
+                target_fname = Path(fd.target_file).name
+                if not target_fname.endswith(".gd"):
+                    target_fname = "scenes.gd"
+                raw_sym = (fd.target_symbol_or_lines or "").strip()
+                pre_reqs: List[CodeSliceRequest] = []
+                if raw_sym:
+                    pre_reqs.append(
+                        CodeSliceRequest(
+                            deliberation=f"Pre-extract target symbol `{raw_sym}` in `{target_fname}`",
+                            filename=target_fname,
+                            symbol_query=raw_sym,
+                        )
+                    )
+                if target_fname == "scenes.gd" and "TerraceRenderer" in raw_sym:
+                    pre_reqs.append(
+                        CodeSliceRequest(
+                            deliberation="Also inspect SceneAssets.draw_tiled_platform helper called by TerraceRenderer",
+                            filename="scenes.gd",
+                            symbol_query="class SceneAssets",
+                        )
+                    )
+                if target_fname == "main.gd":
+                    pre_reqs.append(
+                        CodeSliceRequest(
+                            deliberation="Inspect audio setup and synthesis functions in main.gd",
+                            filename="main.gd",
+                            symbol_query="func _setup_audio",
+                        )
+                    )
+                    pre_reqs.append(
+                        CodeSliceRequest(
+                            deliberation="Inspect _synthesize_buzz and _synthesize_sine_loop in main.gd",
+                            filename="main.gd",
+                            symbol_query="func _synthesize_buzz",
+                        )
+                    )
+
+                focused_defect_brief = (
+                    f"SURGICAL PER-SCENE REMEDIATION #{def_idx}/{len(critique.deficiencies)} FOR `{target_fname}` -> `{raw_sym}` (Scene Iteration {scene_iter + 1}):\n"
+                    f"Environment Topology Strategy: {strategy.environment_topology_strategy}\n"
+                    f"Camera & Perspective Coherence Strategy: {strategy.camera_and_perspective_coherence_strategy}\n"
+                    f"Psychoacoustic Audio Strategy: {strategy.psychoacoustic_audio_strategy}\n\n"
+                    f"DEFICIENCY TO FIX IN `{target_fname}` (`{raw_sym}`):\n"
+                    f"  - Discrepancy: {fd.deficiency_description}\n"
+                    f"  - Concrete Remediation Strategy: {fd.remediation_strategy}\n"
+                )
+                _, current_diags = verify_godot_cartridge_syntax(c_dir)
+                patched = self.debug_and_patch_pev_cycle(
+                    c_dir=c_dir,
+                    defect_summary=focused_defect_brief,
+                    initial_diagnostics=current_diags,
+                    multimodal_parts=None,
+                    pre_slice_requests=pre_reqs,
+                    max_pev_cycles=2,
+                )
+                updated_files.update(patched)
+
+            healed = self._verify_and_heal_godot_syntax_and_probes(c_dir)
+            updated_files.update(healed)
+
+        # Final 60-tick simulation capture so playtest_t0.png and playtest_tend.png are fresh
+        sim_final = GodotHeadlessSimulator(c_dir, capture_viewport=True, max_ticks=60)
+        sim_final.run_until_complete()
+
+        return updated_files
+
     def repair_godot_cartridge_holistic(
         self,
         c_dir: Path,
         rejection_trace: Any,
         req_spec: Optional[GameRequirementsSpec] = None,
     ) -> Dict[str, Path]:
-        """Holistically repairs Godot 4 .gd modules across the cartridge with full cross-module context,
-        eliminating hollow stubs, wiring world rendering & sprites/audio, fixing cross-module method names,
-        and verifying with Godot 4 headless compiler diagnostics.
+        """Repairs Godot 4 .gd modules using the PEV (Plan/Research -> Execute Surgical Patch -> Verify)
+        debugging loop and Per-Scene Critique & Re-Strategizing loop so the agent inspects only relevant
+        code slices rather than full-file dumps.
         """
         if self.client is None:
             raise StudioAgentError("LeadGameplaySWEAgent requires an active google.genai Client (Rule 5)")
@@ -1489,136 +2424,119 @@ class LeadGameplaySWEAgent:
         from engine.supervisor.challenger import CandidateASTInspector
         from engine.sim.godot_verifier import verify_godot_cartridge_syntax
 
+        results: Dict[str, Path] = {}
+
         ast_insp = CandidateASTInspector()
         dir_ast = ast_insp.inspect_directory(c_dir)
         hollow_stubs = dir_ast.get("hollow_stubs", [])
 
-        existing_gd: Dict[str, str] = {}
-        for gd_file in sorted(c_dir.glob("*.gd")):
-            existing_gd[gd_file.name] = gd_file.read_text(encoding="utf-8")
+        sign_off_context = ""
+        sign_off_path = c_dir / "sign_off_report.json"
+        if sign_off_path.is_file():
+            try:
+                so_data = json.loads(sign_off_path.read_text(encoding="utf-8"))
+                veto_lines = []
+                for v in so_data.get("verdicts", []):
+                    if isinstance(v, dict) and not v.get("approved", True):
+                        veto_lines.append(
+                            f"- {v.get('specialist_role')}: Defects={v.get('blocking_defects')} | Remedies={v.get('remediation_directives')}"
+                        )
+                if veto_lines:
+                    sign_off_context = "MULTI-AGENT SIGN-OFF COUNCIL VETOES:\n" + "\n".join(veto_lines) + "\n"
+            except Exception:
+                pass
 
-        sealed_assets = self._discover_sealed_assets(c_dir)
+        playtest_image_parts: List[Any] = []
+        if self._is_live_genai_client():
+            for cap_name in ("playtest_t0.png", "playtest_tend.png"):
+                cap_path = c_dir / "assets" / "playtest_captures" / cap_name
+                if cap_path.is_file():
+                    try:
+                        playtest_image_parts.append(
+                            types.Part.from_bytes(data=cap_path.read_bytes(), mime_type="image/png")
+                        )
+                    except Exception:
+                        pass
 
-        bible_and_narrative_context, multimodal_mockup_parts = self._build_bible_and_narrative_context(
-            staging_dir=c_dir,
-        )
-
-        req_context = ""
-        if req_spec is not None and getattr(req_spec, "requirements", None):
-            r_lines = []
-            for r in req_spec.requirements:
-                crits = [f"  * [{c.id}] {c.description}" for c in getattr(r, "acceptance_criteria", [])]
-                r_lines.append(
-                    f"Track {r.id}: {r.title} (Targets: {getattr(r, 'target_modules', [])})\n"
-                    f"  Description: {r.description}\n" + "\n".join(crits)
-                )
-            req_context = "GAME REQUIREMENTS & ACCEPTANCE CRITERIA:\n" + "\n\n".join(r_lines) + "\n\n"
-
-        code_blocks = [f"=== {fname} ===\n{code}" for fname, code in existing_gd.items()]
         diag_reason = getattr(rejection_trace, "failure_reason", "Challenger Gate rejected build")
-        rec_remedy = getattr(rejection_trace, "recommended_remedy", "Eliminate all hollow stubs and fulfill 100% of requirements")
+        rec_remedy = getattr(rejection_trace, "recommended_remedy", "Eliminate hollow stubs and fulfill requirements")
         unfulfilled = getattr(rejection_trace, "unfulfilled_requirements", [])
 
-        prompt = (
-            f"You are the Lead Gameplay SWE Agent performing a holistic multi-module repair on a Godot 4.3 cartridge.\n\n"
-            f"--- CHALLENGER GATE REJECTION DIAGNOSTIC ---\n"
+        _, initial_diags = verify_godot_cartridge_syntax(c_dir)
+
+        defect_summary = (
             f"Failure Reason: {diag_reason}\n"
-            f"Unfulfilled Requirements: {unfulfilled}\n"
             f"Recommended Remedy: {rec_remedy}\n"
-            f"Detected Structural & Hollow Stubs:\n{json.dumps(hollow_stubs, indent=2)}\n\n"
-            f"{req_context}"
-            f"{bible_and_narrative_context}"
-            f"SEALED MULTIMODAL ASSETS ON DISK:\n"
-            f"- Sprites: {sealed_assets['sprites']}\n"
-            f"- Audio: {sealed_assets['audio']}\n\n"
-            f"--- CURRENT .GD MODULES IN CARTRIDGE ---\n" + "\n\n".join(code_blocks) + "\n\n"
-            f"--- MANDATORY REPAIR DIRECTIVES ---\n"
-            f"1. RATIONALE-FIRST (Rule 4): Provide 'deliberation' FIRST explaining every root cause and how your updated .gd modules fix it.\n"
-            f"2. ROOT SCENE ORCHESTRATOR & CAMERA (main.gd):\n"
-            f"   - `main.gd` is attached to the root `Node2D` node in `main.tscn`. It MUST begin with `extends Node2D`.\n"
-            f"   - Set an atmospheric clear color in `_ready()` matching the Living Game Bible's `visual_style_guide`, never default gray.\n"
-            f"   - Instantiate `WorldContainer` (`Node2D`), `MainCamera` (`Camera2D` with `camera.enabled = true` and `camera.make_current()`), `ScenesModule`, `MechanicsModule`, and `UIHud` (`CanvasLayer`).\n"
-            f"3. ACCURATE HiDPI MOUSE PICKING & RESPONSIVE INPUT (main.gd & ui_hud.gd):\n"
-            f"   - NEVER use `(get_viewport().get_mouse_position() - get_viewport().size * 0.5)`! On Retina/HiDPI displays, `get_viewport().size` is 2x physical pixels while `get_mouse_position()` is 1280x720 canvas units.\n"
-            f"   - ALWAYS use `var world_pos = get_global_mouse_position()` to transform mouse screen coordinates into exact world coordinates.\n"
-            f"4. REAL AUDIO PLAYBACK WITHOUT .IMPORT FILES + PROCEDURAL GAMEPLAY SFX (ui_hud.gd & main.gd):\n"
-            f"   - CRITICAL: In Godot 4 runtime without `.import` files, `ResourceLoader.exists(audio_path)` and `load(audio_path)` ALWAYS return `false`/`null` for raw `.wav` files in `res://assets/audio/*.wav`!\n"
-            f"   - You MUST implement `static func load_wav_stream(path: String) -> AudioStreamWAV` using `FileAccess.open(ProjectSettings.globalize_path(path), FileAccess.READ)` that reads `channels` at offset 22 (`get_16()`), `sample_rate` at offset 24 (`get_32()`), seeks to offset 44, reads the PCM buffer (`file.get_buffer(total_len - 44)`), and returns an `AudioStreamWAV` (`format = AudioStreamWAV.FORMAT_16_BITS`, `mix_rate = sample_rate`, `stereo = (channels == 2)`, `data = pcm_bytes`).\n"
-            f"   - Also implement `static func make_tone_sfx(freq_start: float, freq_end: float, duration: float, volume: float = 0.3) -> AudioStreamWAV` generating a 16-bit PCM sine/triangle sweep `AudioStreamWAV` buffer so player actions and world events play immediate audible SFX!\n"
-            f"5. FULL-VIEWPORT WORLD RENDERING, VISUAL MOCKUP FIDELITY & DIEGETIC ONBOARDING (scenes.gd & ui_hud.gd):\n"
-            f"   - Render loaded `Texture2D` sprites from `res://assets/sprites/*.png` using `Image.load_from_file(ProjectSettings.globalize_path(...))` + `ImageTexture.create_from_image(img)` and custom `_draw()` / `Sprite2D` nodes so the world matches the Living Game Bible's 16:9 Visual Mockup boards and Visual Style Guide.\n"
-            f"   - Honor the Living Game Bible's `first_60_seconds_hook`, `experience_storyboard`, and `diegetic_ui_philosophy`: guide and teach the player through in-world visual cues, environmental storytelling, character cutscenes/dialogue trees, and reactive barks—NEVER place a static wall-of-text HUD control manual on screen!\n"
-            f"   - Ensure tooltips or dialogue panels are docked cleanly without obstructing the center play area.\n"
-            f"6. Return the complete, updated source code for every modified `.gd` file (`main.gd`, `scenes.gd`, `mechanics.gd`, `entities.gd`, `ui_hud.gd`) in `files`.\n"
+            f"Unfulfilled Requirements: {unfulfilled}\n"
+            f"Hollow Stubs Detected: {json.dumps(hollow_stubs)}\n"
+            f"{sign_off_context}"
         )
 
-        contents_payload: Any = [prompt] + multimodal_mockup_parts if multimodal_mockup_parts else prompt
-        results: Dict[str, Path] = {}
-        resp = self.client.models.generate_content(
-            model=self.model_name,
-            contents=contents_payload,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=TrackCodeSynthesisPayload,
-            ),
+        pev_patched = self.debug_and_patch_pev_cycle(
+            c_dir=c_dir,
+            defect_summary=defect_summary,
+            initial_diagnostics=initial_diags,
+            multimodal_parts=playtest_image_parts,
+            max_pev_cycles=4,
         )
-        if not resp.text:
-            raise StudioAgentError("Empty response from Gemini during holistic Godot cartridge repair")
+        results.update(pev_patched)
 
-        payload = TrackCodeSynthesisPayload.model_validate_json(resp.text)
-        self.last_deliberation = payload.deliberation
-
-        for fspec in payload.files:
-            fpath = c_dir / Path(fspec.filename).name
-            fpath.write_text(fspec.content, encoding="utf-8")
-            results[fpath.name] = fpath
+        if self._is_live_genai_client() and (c_dir / "game_bible.json").is_file():
+            scene_refined = self.execute_scene_strategy_and_refine_loop(
+                c_dir=c_dir,
+                max_scene_iterations=2,
+            )
+            results.update(scene_refined)
 
         healed = self._verify_and_heal_godot_syntax_and_probes(c_dir)
         results.update(healed)
         return results
 
     def _verify_and_heal_godot_syntax_and_probes(self, c_dir: Path) -> Dict[str, Path]:
-        """Runs up to 5 compiler syntax verification & repair passes across all .gd files in c_dir,
-        then re-injects telemetry probes from telemetry_manifest.json so Gate E remains satisfied.
+        """Verifies Godot 4 syntax & 2-tick runtime execution across all .gd files in c_dir.
+        When live Gemini client is active, uses the PEV surgical debugging cycle on the exact broken lines
+        rather than dumping entire files; falls back to repair_godot_module for mock test clients.
+        Then re-injects telemetry probes from telemetry_manifest.json so Gate E remains satisfied.
         """
         from engine.sim.godot_verifier import verify_godot_cartridge_syntax
         results: Dict[str, Path] = {}
 
-        for fix_attempt in range(5):
-            is_valid, diagnostics = verify_godot_cartridge_syntax(c_dir)
-            if is_valid:
-                break
-
-            # Group all diagnostics by file so every error line in a module is repaired in a single pass
-            diags_by_file: Dict[Path, List[str]] = {}
-            for diag in diagnostics:
-                if not diag.file_path.is_file():
-                    continue
-                if "Could not preload resource script" in diag.error_message and len(diagnostics) > 1:
-                    continue
-                entry = f"Line {diag.line_number}: {diag.error_message} (Raw: {diag.raw_line})"
-                file_list = diags_by_file.setdefault(diag.file_path, [])
-                if entry not in file_list:
-                    file_list.append(entry)
-
-            if not diags_by_file:
-                for diag in diagnostics:
-                    if diag.file_path.is_file():
-                        entry = f"Line {diag.line_number}: {diag.error_message} (Raw: {diag.raw_line})"
-                        diags_by_file.setdefault(diag.file_path, []).append(entry)
-
-            for file_path, diag_entries in diags_by_file.items():
-                broken_src = file_path.read_text(encoding="utf-8")
-                combined_diag = "\n".join(diag_entries)
-                peer_ctx = self._extract_gd_peer_signatures(c_dir, exclude_file=file_path.name)
-                fixed_src = self.repair_godot_module(
-                    file_path.name,
-                    broken_src,
-                    combined_diag,
-                    peer_context=peer_ctx,
+        is_valid, diagnostics = verify_godot_cartridge_syntax(c_dir)
+        if not is_valid and diagnostics:
+            if self._is_live_genai_client():
+                diag_summary = "\n".join(
+                    f"- {d.file_path.name}:{d.line_number}: {d.error_message}"
+                    for d in diagnostics[:8]
                 )
-                file_path.write_text(fixed_src, encoding="utf-8")
-                results[file_path.name] = file_path
+                pev_res = self.debug_and_patch_pev_cycle(
+                    c_dir=c_dir,
+                    defect_summary=f"Fix Godot 4 compiler and runtime script errors:\n{diag_summary}",
+                    initial_diagnostics=diagnostics,
+                    max_pev_cycles=4,
+                )
+                results.update(pev_res)
+            else:
+                for fix_attempt in range(3):
+                    is_valid, diagnostics = verify_godot_cartridge_syntax(c_dir)
+                    if is_valid:
+                        break
+                    diags_by_file: Dict[Path, List[str]] = {}
+                    for diag in diagnostics:
+                        if diag.file_path.is_file():
+                            entry = f"Line {diag.line_number}: {diag.error_message} (Raw: {diag.raw_line})"
+                            diags_by_file.setdefault(diag.file_path, []).append(entry)
+                    for file_path, diag_entries in diags_by_file.items():
+                        broken_src = file_path.read_text(encoding="utf-8")
+                        combined_diag = "\n".join(diag_entries)
+                        peer_ctx = self._extract_gd_peer_signatures(c_dir, exclude_file=file_path.name)
+                        fixed_src = self.repair_godot_module(
+                            file_path.name,
+                            broken_src,
+                            combined_diag,
+                            peer_context=peer_ctx,
+                        )
+                        file_path.write_text(fixed_src, encoding="utf-8")
+                        results[file_path.name] = file_path
 
         manifest_path = c_dir / "telemetry_manifest.json"
         if manifest_path.is_file():

@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from enum import Enum
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 import uuid
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -745,6 +745,10 @@ class AnimationStateSpec(BaseEpistemicModel):
     """
     deliberation: str = Field(..., description="MANDATORY FIRST: Rationale for why this animation state is needed for gameplay/visual feedback.")
     state_name: str = Field(..., description="Animation state identifier (e.g. 'idle', 'move', 'jump', 'interact', 'active', 'damaged').")
+    motion_profile: Literal["idle", "locomotion", "aerial", "action"] = Field(
+        default="idle",
+        description="Explicit kinematic articulation profile: 'idle' | 'locomotion' | 'aerial' | 'action'."
+    )
     frame_count: int = Field(default=4, ge=1, le=12, description="Number of frames in this animation state.")
     fps: float = Field(default=8.0, description="Playback rate in frames per second.")
     loop: bool = Field(default=True, description="Whether this animation loops continuously.")
@@ -753,6 +757,16 @@ class AnimationStateSpec(BaseEpistemicModel):
         description="Detailed visual description of how the silhouette, limbs, or mechanism progress across frames."
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_animation_state(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            out = dict(data)
+            if not out.get("pose_progression_prompt") and out.get("motion_description"):
+                out["pose_progression_prompt"] = out["motion_description"]
+            return out
+        return data
+
 
 class ArticulatedPartSpec(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
@@ -760,7 +774,7 @@ class ArticulatedPartSpec(BaseEpistemicModel):
     """
     deliberation: str = Field(..., description="MANDATORY FIRST: Rationale for separating this part for procedural articulation in Godot.")
     part_id: str = Field(..., description="Unique part identifier within the rig (e.g. 'body', 'arm_tool', 'wing_left', 'rotor_blade').")
-    visual_prompt: str = Field(..., description="Visual prompt for this isolated component grounded in the concept art.")
+    visual_prompt: str = Field(default="", description="Visual prompt for this isolated component grounded in the concept art.")
     parent_part_id: Optional[str] = Field(default=None, description="Parent part_id in the rig hierarchy, or None for the root part.")
     pivot_normalized: Tuple[float, float] = Field(
         default=(0.5, 0.5),
@@ -772,6 +786,16 @@ class ArticulatedPartSpec(BaseEpistemicModel):
     )
     z_index_offset: int = Field(default=0, description="Relative z-order offset compared to the root part.")
     dimensions: Tuple[int, int] = Field(default=(48, 48), description="Target world-space pixel dimensions (width, height) for this part.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_articulated_part(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            out = dict(data)
+            if not out.get("visual_prompt") and out.get("part_description"):
+                out["visual_prompt"] = out["part_description"]
+            return out
+        return data
 
 
 class VisualSceneLayerSpec(BaseEpistemicModel):
@@ -1114,7 +1138,6 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
         results: Dict[str, Path] = {}
 
         # 0. Fabricate any on-demand requested_assets into the CartridgeAssetLibrary first
-        # and ensure res://asset_library.gd is up to date so GDScript compilation succeeds.
         try:
             from engine.studio.asset_library import CartridgeAssetLibrary
             visual_agent = getattr(swe_agent, "visual_agent", None) if swe_agent is not None else None
@@ -1127,9 +1150,7 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
             if self.requested_assets:
                 fabricated = lib.fabricate_assets(self.requested_assets)
                 results.update(fabricated)
-            helper_path = lib.export_gdscript_helper()
-            if helper_path and helper_path.is_file():
-                results["asset_library.gd"] = helper_path
+            lib.save_catalog()
         except Exception:
             pass
 
@@ -1250,6 +1271,249 @@ class CodeRepairSpec(BaseEpistemicModel):
     repaired_content: str = Field(
         ...,
         description="Complete, syntactically valid repaired source code."
+    )
+
+
+class CodeSliceRequest(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Scoped code inspection request issued by the SWE agent during the PEV Plan/Research phase.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Epistemic rationale explaining why this specific line range or symbol is needed to diagnose or fix the defect."
+    )
+    filename: str = Field(
+        ...,
+        description="Target file in cartridge (e.g. 'scenes.gd', 'entities.gd', 'main.gd', 'ui_hud.gd', 'mechanics.gd')."
+    )
+    start_line: int = Field(
+        default=1,
+        ge=1,
+        description="1-indexed starting line number to inspect."
+    )
+    end_line: int = Field(
+        default=80,
+        ge=1,
+        description="1-indexed inclusive ending line number to inspect (keep slices focused, e.g. 40-120 lines)."
+    )
+    symbol_query: Optional[str] = Field(
+        default=None,
+        description="Optional class, function, or identifier name to locate and extract with surrounding context."
+    )
+
+
+class DebugResearchPlan(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    PEV Phase 1 (Plan & Research): Formulates root-cause hypothesis and requests only the relevant code slices needed for context.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Epistemic reasoning analyzing the defect/diagnostic against the symbol outline and formulating a focused research plan."
+    )
+    root_cause_hypothesis: str = Field(
+        ...,
+        description="Specific technical hypothesis for what is causing the compiler, runtime, visual, or gameplay defect."
+    )
+    slice_requests: List[CodeSliceRequest] = Field(
+        ...,
+        description="Focused list of code slices or symbols to inspect (do NOT request entire large files; request only the relevant functions/classes)."
+    )
+
+
+class SurgicalCodePatch(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    A targeted line-range replacement within a cartridge file.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Epistemic rationale explaining why replacing lines [start_line..end_line] in filename fixes the root cause while preserving surrounding indentation and logic."
+    )
+    filename: str = Field(
+        ...,
+        description="Target file in cartridge (e.g. 'scenes.gd', 'main.gd')."
+    )
+    start_line: int = Field(
+        ...,
+        ge=1,
+        description="1-indexed first line of the contiguous block in `filename` to replace."
+    )
+    end_line: int = Field(
+        ...,
+        ge=1,
+        description="1-indexed last line (inclusive) of the contiguous block in `filename` to replace."
+    )
+    replacement_code: str = Field(
+        ...,
+        description="Exact replacement GDScript lines (without line number prefixes, using tab '\\t' indentation matching the surrounding block) to substitute for lines [start_line..end_line]."
+    )
+
+
+class SurgicalPatchPayload(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    PEV Phase 2 (Execute): Produces surgical line-range patches from the researched code slices, or requests additional slices if needed.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Epistemic rationale synthesizing findings from the inspected code slices and justifying the surgical patches."
+    )
+    additional_slice_requests: List[CodeSliceRequest] = Field(
+        default_factory=list,
+        description="If and only if the inspected slices revealed another caller/callee that must be read before patching, request those additional slices here."
+    )
+    patches: List[SurgicalCodePatch] = Field(
+        default_factory=list,
+        description="Surgical line-range replacements to apply to the cartridge files."
+    )
+    verification_expectation: str = Field(
+        default="",
+        description="What the Verify phase (compiler + runtime harness check) should confirm after applying these patches."
+    )
+
+
+class SceneLayerStrategy(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Defines how a specific depth layer of the 2D environment is constructed in Godot 4.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Epistemic rationale explaining how this layer contributes to a cohesive, organic environment matching the Game Bible and concept art."
+    )
+    layer_name: str = Field(
+        ...,
+        description="Descriptive name of the scene layer (e.g. 'Atmospheric Sky & Floating Horizon', 'Sculpted Floating Terraces & Cliff Undersides', 'Continuous Hydro-Mana River & Geyser Plume', 'Interactive Flora & Mechanical Landmarks')."
+    )
+    z_index: int = Field(
+        default=0,
+        description="Godot 4 z_index ordering for this layer."
+    )
+    construction_technique: str = Field(
+        ...,
+        description="Concrete Godot 4 construction technique (e.g. multi-vertex Polygon2D silhouettes with tapered rocky undersides, lush overhanging moss rim polygons, continuous curved Line2D/Polygon2D fluid streams with caustic highlights, animated Sprite2D flora/mechanisms anchored to terrain surfaces—never raw axis-aligned draw_rect blocks or stick-figure lines)."
+    )
+    required_asset_ids: List[str] = Field(
+        default_factory=list,
+        description="IDs of sprite sheets, tiles, or prop textures required by this layer."
+    )
+
+
+class AudioCueStrategy(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Defines a required audio asset or procedural acoustic cue and its gameplay trigger.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Epistemic rationale grounding this audio cue in the Game Bible's audio direction."
+    )
+    cue_id: str = Field(..., description="Unique identifier for the voice bark or sound effect cue.")
+    trigger_condition: str = Field(..., description="Exact gameplay event or state transition that triggers this sound.")
+    synthesis_or_bark_spec: str = Field(..., description="How this sound is loaded from disk or synthesized at 24,000 Hz.")
+
+
+class GameProductionStrategySpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Master multi-disciplinary strategy formulated by the agents before and during scene construction,
+    mapping the Game Bible and 16:9 Concept Mockups into concrete assets, environment topology, audio, and code architecture.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Holistic strategic reasoning decomposing the Game Bible and concept mockups into real multi-layered environments, required assets, audio, and code."
+    )
+    environment_topology_strategy: str = Field(
+        ...,
+        description="Detailed strategy for constructing organic, multi-layered level geometry (sculpted island silhouettes, cliff faces, lush top rims, tapered floating crags, continuous fluid waterways, and surface-anchored landmarks) rather than flat rectangular blocks or isolated sprites."
+    )
+    camera_and_perspective_coherence_strategy: str = Field(
+        default="",
+        description="Strategy ensuring 100% coherence between the gameplay movement plane (e.g. 3/4 top-down 2D plateau where the player moves in X and Y across the shelf Rect2 vs. 2D side-scroller) and terrain rendering (filling the entire walkable Rect2 with top-down ground surface terrain_surface.png, hanging vertical cliff walls structure_wall_tile.png ONLY below the southern bottom edge s.end.y, and distributing flora/landmarks across the 2D plateau floor)."
+    )
+    scene_layers: List[SceneLayerStrategy] = Field(
+        default_factory=list,
+        description="Ordered depth layers composing the playable scene."
+    )
+    required_visual_assets: List[AssetRequirement] = Field(
+        default_factory=list,
+        description="Purpose-built visual assets (sprite sheets, flora, props, terrain textures, ability icons) required to build the environment without programmer-art primitives."
+    )
+    audio_cues: List[AudioCueStrategy] = Field(
+        default_factory=list,
+        description="Voice barks and acoustic SFX cues required by the Game Bible."
+    )
+    psychoacoustic_audio_strategy: str = Field(
+        default="",
+        description="Strategy ensuring pleasant, event-driven audio synthesis with zero continuous looping high-pitched sine/square wave drones (no LOOP_FORWARD on >220Hz tones), zero piercing >800Hz squeals, and smooth exponential decay envelopes."
+    )
+    code_architecture_strategy: str = Field(
+        ...,
+        description="Cross-module code strategy across mechanics.gd, scenes.gd, entities.gd, ui_hud.gd, and main.gd, including surface coordinate anchoring so every entity/landmark sits naturally on the terrain."
+    )
+    diegetic_ui_strategy: str = Field(
+        ...,
+        description="Strategy for realizing the Game Bible's diegetic UI philosophy and clean fantasy HUD (vitals, objective progress, ability icons, and bottom dialogue bar without raw engineering debug text)."
+    )
+
+
+class SceneDeficiencyItem(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    A specific visual, environmental, spatial, asset, or UX deficiency identified when analyzing a rendered scene.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Epistemic reasoning explaining why this visual, perspective, audio, or structural element in the rendered scene falls short of the Game Bible and Concept Mockup."
+    )
+    target_file: str = Field(
+        ...,
+        description="The cartridge `.gd` module responsible for this deficiency (e.g. 'scenes.gd', 'ui_hud.gd', 'entities.gd', 'main.gd')."
+    )
+    target_symbol_or_lines: str = Field(
+        ...,
+        description="The specific class, function name (e.g. 'SkyBackdrop._draw', 'TerraceRenderer._draw', 'FernsCluster._init', 'acoustics_hum_setup'), or line range where the deficiency originates."
+    )
+    deficiency_description: str = Field(
+        ...,
+        description="Concrete description of the deficiency visible in the rendered Godot viewport or audio code (e.g. 'Character moves in 2D top-down space across y=260..700 but TerraceRenderer draws y=260..700 as a vertical side-view cliff wall so she appears to walk on the side of a cliff', 'main.gd plays a constant high-pitched 523Hz looping sine wave drone')."
+    )
+    remediation_strategy: str = Field(
+        ...,
+        description="Concrete surgical code strategy to replace the deficient rendering/audio logic with perspective-coherent 3/4 plateau rendering or pleasant event-driven audio matching the Game Bible."
+    )
+
+
+class SceneCritiqueAndStrategySpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Per-scene multimodal analysis and re-strategizing contract comparing the live Godot 4 viewport render
+    against the Game Bible, Concept Mockups, and Production Strategy Blueprint.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Comprehensive side-by-side analysis of the rendered Godot 4 viewport and audio synthesis against the Game Bible and 16:9 Concept Mockups."
+    )
+    environment_fidelity_critique: str = Field(
+        ...,
+        description="Detailed evaluation of the rendered environment topology, island silhouettes, terrain layering, fluid/canal rendering, background vistas, and prop placement."
+    )
+    perspective_and_camera_coherence_critique: str = Field(
+        default="",
+        description="Detailed evaluation of whether the camera perspective and character movement plane match the landscape orientation (e.g., verifying that a top-down/3/4 character walks on a top-down lush plateau surface rather than on the side of a vertical cliff wall)."
+    )
+    audio_and_psychoacoustic_critique: str = Field(
+        default="",
+        description="Detailed evaluation of the procedural audio synthesis and playback in main.gd (verifying there are no constant high-pitched looping sine-wave drones, piercing >800Hz tones, or harsh repetitive buzzes)."
+    )
+    ui_and_experience_critique: str = Field(
+        ...,
+        description="Detailed evaluation of the HUD against the Game Bible's diegetic UI philosophy and the concept art HUD."
+    )
+    deficiencies: List[SceneDeficiencyItem] = Field(
+        default_factory=list,
+        description="Ordered list of concrete deficiencies that must be surgically repaired in the `.gd` modules."
+    )
+    new_assets_needed: List[AssetRequirement] = Field(
+        default_factory=list,
+        description="Any missing visual or audio assets that must be fabricated so the scene does not rely on geometric programmer art."
+    )
+    scene_matches_game_bible: bool = Field(
+        ...,
+        description="Decision verdict (strictly last per Rule 4): True ONLY if the rendered scene genuinely matches the Game Bible and Concept Mockups with coherent camera/landscape perspective (character walking on top of a plateau, never on a cliff side), pleasant non-droney audio, zero blocky slab islands, zero stick-figure/triangle programmer art, and a clean fantasy HUD."
     )
 
 

@@ -699,6 +699,16 @@ class TelemetryDB:
         now_utc = datetime.now(timezone.utc).isoformat()
         conn = self.get_write_connection()
         try:
+            # 0. Ensure parent studio_builds row exists so foreign keys on studio_requirement_specs and studio_requirements succeed
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO studio_builds (
+                    build_id, status, started_at_utc, deliberation
+                ) VALUES (?, 'RUNNING', ?, 'Auto-registered build record for studio requirements.')
+                """,
+                (build_id, now_utc),
+            )
+
             # 1. Persist full GameRequirementsSpec JSON (preserving asset_manifest, high_concept_summary, etc.)
             try:
                 conn.execute(

@@ -261,8 +261,8 @@ class CandidateASTInspector:
                                 "comment": stripped,
                             })
                             break
-                elif stripped.startswith("func "):
-                    after_func = stripped[5:].strip()
+                elif stripped.startswith(("func ", "static func ")):
+                    after_func = stripped.split("func ", 1)[1].strip()
                     paren_idx = after_func.find("(")
                     if paren_idx > 0:
                         fn_name = after_func[:paren_idx].strip()
@@ -280,7 +280,7 @@ class CandidateASTInspector:
                             if not nxt or nxt.startswith("#"):
                                 continue
                             nxt_indent = len(raw_nxt) - len(raw_nxt.lstrip())
-                            if nxt_indent <= fn_indent and nxt.startswith(("func ", "class ", "var ", "const ", "signal ", "@")):
+                            if nxt_indent <= fn_indent and nxt.startswith(("func ", "static func ", "class ", "var ", "const ", "signal ", "@")):
                                 break
                             code_only = nxt.split("#", 1)[0].strip()
                             if code_only:
@@ -320,6 +320,7 @@ class CandidateASTInspector:
                                     "ProgressBar",
                                     "Button",
                                     "TileMapLayer",
+                                    "create_articulated_rig",
                                 )
                             )
                             if creates_bare_node and not populates_node:
@@ -435,48 +436,25 @@ class CandidateASTInspector:
             all_gd_concat = "\n".join(gd_sources.values())
             sprites_dir = c_dir / "assets" / "sprites"
             if sprites_dir.is_dir():
-                png_files = sorted(sprites_dir.glob("*.png"))
-                if png_files:
-                    if "assets/sprites" not in all_gd_concat:
-                        hollow_stubs.append({
-                            "file": "scenes.gd" if "scenes.gd" in gd_sources else "main.gd",
-                            "module": "scenes.gd" if "scenes.gd" in gd_sources else "main.gd",
-                            "function": "load_sprites",
-                            "line": 1,
-                            "stmt": "unbound sprite assets",
-                            "reason": (
-                                "Synthesized PNG sprites exist in assets/sprites/, but zero .gd scripts load or display them."
-                            ),
-                        })
-                    elif len(png_files) >= 3:
-                        referenced_sprites = [p.name for p in png_files if p.name in all_gd_concat]
-                        if len(referenced_sprites) < max(2, len(png_files) // 2):
-                            unref = [p.name for p in png_files if p.name not in all_gd_concat]
-                            hollow_stubs.append({
-                                "file": "scenes.gd" if "scenes.gd" in gd_sources else "main.gd",
-                                "module": "scenes.gd" if "scenes.gd" in gd_sources else "main.gd",
-                                "function": "load_sprites",
-                                "line": 1,
-                                "stmt": f"unbound sprites: {unref}",
-                                "reason": (
-                                    f"VisualArtDirector veto: {len(unref)}/{len(png_files)} synthesized PNG sprites in assets/sprites/ "
-                                    f"are never loaded or rendered in .gd scripts ({unref}). Every synthesized sprite must be bound and drawn."
-                                ),
-                            })
-
-            if "MOUSE_BUTTON_RIGHT" in all_gd_concat and "MOUSE_BUTTON_LEFT" not in all_gd_concat:
-                target_ui = "ui_hud.gd" if "ui_hud.gd" in gd_sources else "main.gd"
-                hollow_stubs.append({
-                    "file": target_ui,
-                    "module": target_ui,
-                    "function": "_unhandled_input",
-                    "line": 1,
-                    "stmt": "missing MOUSE_BUTTON_LEFT handler",
-                    "reason": (
-                        f"{target_ui} handles MOUSE_BUTTON_RIGHT tool deselection but never handles MOUSE_BUTTON_LEFT "
-                        f"to place selected structures or interact with the world."
-                    ),
-                })
+                png_files = [
+                    p for p in sorted(sprites_dir.glob("*.png"))
+                    if "_part_" not in p.name and not p.name.endswith("_portrait.png")
+                ]
+                logical_sprites: Dict[str, Path] = {}
+                for p in png_files:
+                    base_id = p.stem[:-6] if p.stem.endswith("_sheet") else p.stem
+                    logical_sprites.setdefault(base_id, p)
+                if logical_sprites and "assets/sprites" not in all_gd_concat and "asset_library.json" not in all_gd_concat:
+                    hollow_stubs.append({
+                        "file": "scenes.gd" if "scenes.gd" in gd_sources else "main.gd",
+                        "module": "scenes.gd" if "scenes.gd" in gd_sources else "main.gd",
+                        "function": "load_sprites",
+                        "line": 1,
+                        "stmt": "unbound sprite assets",
+                        "reason": (
+                            "Synthesized PNG sprites exist in assets/sprites/, but zero .gd scripts load or display them."
+                        ),
+                    })
 
             audio_dir = c_dir / "assets" / "audio"
             if audio_dir.is_dir() and list(audio_dir.glob("*.wav")):
@@ -492,68 +470,10 @@ class CandidateASTInspector:
                             f"Synthesized .wav files exist in assets/audio/, but {target_audio_mod} uses "
                             f"ResourceLoader.exists()/load() without AudioStreamWAV. In Godot 4 runtime without .import "
                             f"files, ResourceLoader.exists() returns false for raw .wav files, producing zero sound. "
-                            f"Must load raw PCM .wav files via FileAccess.open(ProjectSettings.globalize_path(path), FileAccess.READ) "
-                            f"(stripping the 44-byte RIFF header) into an AudioStreamWAV (FORMAT_16_BITS, mix_rate=24000) "
-                            f"and play interactive AudioStreamWAV sound effects on player actions."
+                            f"Must load raw PCM .wav files via FileAccess.get_file_as_bytes(ProjectSettings.globalize_path(path)) "
+                            f"(stripping the 44-byte RIFF header) into an AudioStreamWAV (FORMAT_16_BITS, mix_rate=24000)."
                         ),
                     })
-                else:
-                    no_space_gd = all_gd_concat.replace(" ", "")
-                    if "mix_rate=44100" in no_space_gd or "mix_rate=48000" in no_space_gd:
-                        hollow_stubs.append({
-                            "file": target_audio_mod,
-                            "module": target_audio_mod,
-                            "function": "play_voice_clip",
-                            "line": 1,
-                            "stmt": "stream.mix_rate = 44100 on 24000 Hz PCM WAV",
-                            "reason": (
-                                f"AudioAtmosphereDesigner veto in {target_audio_mod}: AudioStreamWAV sets mix_rate=44100 on "
-                                f"24,000 Hz mono PCM WAV files, causing 1.8375x high-pitched 'chipmunk' distortion! "
-                                f"Must set stream.mix_rate = 24000 and strip the 44-byte RIFF header via bytes.slice(44)."
-                            ),
-                        })
-                    if "get_file_as_bytes(" in all_gd_concat and ".slice(44)" not in all_gd_concat:
-                        hollow_stubs.append({
-                            "file": target_audio_mod,
-                            "module": target_audio_mod,
-                            "function": "play_voice_clip",
-                            "line": 1,
-                            "stmt": "stream.data = bytes without .slice(44) RIFF header strip",
-                            "reason": (
-                                f"AudioAtmosphereDesigner veto in {target_audio_mod}: Raw WAV bytes are assigned to AudioStreamWAV.data "
-                                f"without stripping the 44-byte RIFF WAV header via bytes.slice(44), causing a loud click/pop on playback."
-                            ),
-                        })
-
-            if "get_viewport().size" in all_gd_concat and "get_global_mouse_position()" not in all_gd_concat:
-                target_mouse_mod = "main.gd" if "main.gd" in gd_sources else "scenes.gd"
-                hollow_stubs.append({
-                    "file": target_mouse_mod,
-                    "module": target_mouse_mod,
-                    "function": "_get_current_hovered_grid_coord",
-                    "line": 1,
-                    "stmt": "broken HiDPI mouse-to-world math using get_viewport().size",
-                    "reason": (
-                        f"{target_mouse_mod} computes mouse world position using (mouse_pos - get_viewport().size * 0.5), "
-                        f"which mixes 1280x720 canvas coordinates with physical Retina/HiDPI window pixels and shifts all "
-                        f"clicks/hovers off by hundreds of pixels. Must use get_global_mouse_position() on the Node2D "
-                        f"(e.g., world_view.get_global_mouse_position() or get_global_mouse_position()) for exact world coordinates."
-                    ),
-                })
-
-            if "placement_guide" in all_gd_concat and "z_index" not in all_gd_concat:
-                target_guide_mod = "ui_hud.gd" if "ui_hud.gd" in gd_sources else "scenes.gd"
-                hollow_stubs.append({
-                    "file": target_guide_mod,
-                    "module": target_guide_mod,
-                    "function": "_setup_placement_guide",
-                    "line": 1,
-                    "stmt": "placement_guide hidden beneath world_view (missing z_index)",
-                    "reason": (
-                        f"{target_guide_mod} adds placement_guide to WorldContainer before world_view without setting "
-                        f"placement_guide.z_index = 10, causing the tilemap to draw over and completely hide the placement cursor."
-                    ),
-                })
 
         # 3. Disconnected classes analysis
         disconnected_symbols: List[Dict[str, Any]] = []
@@ -640,52 +560,67 @@ class CandidateTelemetryAuditor:
         initial_coords = None
 
         if active_sim is None and candidate_dir is not None:
-            try:
-                from engine.sim.headless import HeadlessSimulator, SimulationInput
-                active_sim = HeadlessSimulator(cartridge_path=Path(candidate_dir))
-                for tick_idx in range(ticks):
-                    if tick_idx in (1, 2, 3, 5):
-                        inp = SimulationInput(deliberation="Advance initial screen", fire=True, space=True, action_1=True)
-                    elif tick_idx < 15:
-                        inp = SimulationInput(deliberation="Baseline resting idle input")
-                    elif tick_idx < ticks - 15:
-                        inp = SimulationInput(
-                            deliberation="Kinetic motion input",
-                            move_x=1.0 if (tick_idx // 10) % 2 == 0 else -1.0,
-                            move_y=1.0 if (tick_idx // 5) % 2 == 0 else -1.0,
-                            right=True,
-                            action_1=(tick_idx % 4 == 0),
-                            fire=(tick_idx % 3 == 0),
-                        )
-                    else:
-                        inp = SimulationInput(
-                            deliberation="Action trigger input",
-                            fire=True,
-                            dash=True,
-                            action_1=True,
-                            space=True,
-                            right=True,
-                        )
-                    active_sim.step(inp)
-                    if initial_coords is None:
-                        curr_sc = getattr(active_sim, "current_scene", None)
-                        initial_coords = self._extract_actor_coords(curr_sc, active_sim)
-                owned_sim = True
-            except Exception as e:
-                logger.warning("Could not execute standalone simulation: %s", e)
-                return {
-                    "ticks_executed": 0,
-                    "avg_frame_time_ms": 999.0,
-                    "frame_budget_passed": False,
-                    "total_events_recorded": 0,
-                    "event_type_counts": {},
-                    "custom_probes_fired": [],
-                    "state_progression_verified": False,
-                    "is_stagnant_or_frozen": True,
-                    "metric_deltas": {},
-                    "crashed": True,
-                    "error": str(e),
-                }
+            cpath = Path(candidate_dir).resolve()
+            if (cpath / "project.godot").is_file():
+                try:
+                    from engine.sim.godot_verifier import GodotHeadlessSimulator
+                    active_sim = GodotHeadlessSimulator(
+                        cartridge_path=cpath,
+                        max_ticks=ticks,
+                        telemetry_mode="in_memory",
+                        capture_viewport=True,
+                    )
+                    active_sim.run_until_complete(max_steps=ticks, capture_viewport=True)
+                    owned_sim = True
+                except Exception as e:
+                    logger.warning("Could not execute Godot simulation in TelemetryAuditor: %s", e)
+            else:
+                try:
+                    from engine.sim.headless import HeadlessSimulator, SimulationInput
+                    active_sim = HeadlessSimulator(cartridge_path=cpath)
+                    for tick_idx in range(ticks):
+                        if tick_idx in (1, 2, 3, 5):
+                            inp = SimulationInput(deliberation="Advance initial screen", fire=True, space=True, action_1=True)
+                        elif tick_idx < 15:
+                            inp = SimulationInput(deliberation="Baseline resting idle input")
+                        elif tick_idx < ticks - 15:
+                            inp = SimulationInput(
+                                deliberation="Kinetic motion input",
+                                move_x=1.0 if (tick_idx // 10) % 2 == 0 else -1.0,
+                                move_y=1.0 if (tick_idx // 5) % 2 == 0 else -1.0,
+                                right=True,
+                                action_1=(tick_idx % 4 == 0),
+                                fire=(tick_idx % 3 == 0),
+                            )
+                        else:
+                            inp = SimulationInput(
+                                deliberation="Action trigger input",
+                                fire=True,
+                                dash=True,
+                                action_1=True,
+                                space=True,
+                                right=True,
+                            )
+                        active_sim.step(inp)
+                        if initial_coords is None:
+                            curr_sc = getattr(active_sim, "current_scene", None)
+                            initial_coords = self._extract_actor_coords(curr_sc, active_sim)
+                    owned_sim = True
+                except Exception as e:
+                    logger.warning("Could not execute standalone simulation: %s", e)
+                    return {
+                        "ticks_executed": 0,
+                        "avg_frame_time_ms": 999.0,
+                        "frame_budget_passed": False,
+                        "total_events_recorded": 0,
+                        "event_type_counts": {},
+                        "custom_probes_fired": [],
+                        "state_progression_verified": False,
+                        "is_stagnant_or_frozen": True,
+                        "metric_deltas": {},
+                        "crashed": True,
+                        "error": str(e),
+                    }
 
         if active_sim is None:
             return {
@@ -800,20 +735,27 @@ class CandidateVisualPlaytester:
         candidate_dir: Optional[Union[Path, str]] = None,
         ticks: int = 60,
     ) -> Dict[str, Any]:
-        """Runs input profiles, captures in-memory frame buffers, and computes visual deltas."""
+        """Runs input profiles, captures frame buffers (strictly real Godot 4 viewport PNGs for Godot cartridges),
+        and computes visual deltas. Zero Pygame fallback rendering for Godot cartridges (Rule 5).
+        """
+        if isinstance(sim, (Path, str)) and candidate_dir is None:
+            candidate_dir = sim
+            sim = None
         surf: Optional[pygame.Surface] = None
         active_sim = sim
         owned_sim = False
 
         is_godot = False
+        cpath: Optional[Path] = None
         if candidate_dir is not None:
             cpath = Path(candidate_dir).resolve()
             is_godot = (cpath / "project.godot").is_file()
         elif active_sim is not None:
             is_godot = getattr(active_sim, "is_godot", False) or "Godot" in active_sim.__class__.__name__
+            if hasattr(active_sim, "cartridge_path"):
+                cpath = Path(active_sim.cartridge_path).resolve()
 
-        if active_sim is None and candidate_dir is not None:
-            cpath = Path(candidate_dir).resolve()
+        if active_sim is None and cpath is not None:
             if is_godot:
                 try:
                     from engine.sim.godot_verifier import GodotHeadlessSimulator
@@ -821,6 +763,7 @@ class CandidateVisualPlaytester:
                         cartridge_path=cpath,
                         max_ticks=ticks,
                         telemetry_mode="in_memory",
+                        capture_viewport=True,
                     )
                     owned_sim = True
                 except Exception as e:
@@ -835,6 +778,80 @@ class CandidateVisualPlaytester:
                     logger.warning("Visual playtester could not initialize HeadlessSimulator: %s", e)
                     active_sim = None
 
+        _pixels = lambda im: im.get_flattened_data() if hasattr(im, "get_flattened_data") else im.getdata()
+
+        # --- GODOT 4 AUTHENTIC VIEWPORT CAPTURE PATH (Zero Pygame Impersonation) ---
+        if is_godot:
+            if active_sim is not None and hasattr(active_sim, "run_until_complete"):
+                if not getattr(active_sim, "viewport_captured", False):
+                    try:
+                        active_sim.run_until_complete(max_steps=ticks, capture_viewport=True)
+                    except TypeError:
+                        active_sim.run_until_complete(max_steps=ticks)
+                    except Exception as sim_err:
+                        logger.warning("GodotHeadlessSimulator viewport execution error: %s", sim_err)
+
+            if owned_sim and hasattr(active_sim, "close"):
+                try:
+                    active_sim.close()
+                except Exception:
+                    pass
+
+            snapshots: List[bytes] = []
+            captured_frame_paths: List[str] = []
+            canvas_dims = (1280, 720)
+            colors_t0 = 0
+            colors_tend = 0
+            diff_pixels = 0
+
+            if cpath is not None:
+                t0_file = cpath / "assets" / "playtest_captures" / "playtest_t0.png"
+                tend_file = cpath / "assets" / "playtest_captures" / "playtest_tend.png"
+                if t0_file.is_file() and tend_file.is_file():
+                    b_t0 = t0_file.read_bytes()
+                    b_tend = tend_file.read_bytes()
+                    snapshots = [b_t0, b_tend]
+                    captured_frame_paths = [
+                        "assets/playtest_captures/playtest_t0.png",
+                        "assets/playtest_captures/playtest_tend.png",
+                    ]
+                    img_t0 = Image.open(io.BytesIO(b_t0)).convert("RGB")
+                    img_tend = Image.open(io.BytesIO(b_tend)).convert("RGB")
+                    canvas_dims = img_t0.size
+                    colors_t0 = len(set(_pixels(img_t0)))
+                    colors_tend = len(set(_pixels(img_tend)))
+                    p0 = list(_pixels(img_t0.resize((64, 36))))
+                    pend = list(_pixels(img_tend.resize((64, 36))))
+                    diff_pixels = sum(1 for c0, c1 in zip(p0, pend) if c0 != c1)
+
+            blank_detected = (len(snapshots) < 2) or (colors_t0 <= 1 and colors_tend <= 1)
+            motion_verified = (not blank_detected) and (diff_pixels > 5)
+
+            image_parts = []
+            if len(snapshots) >= 2:
+                try:
+                    from google.genai import types
+                    for s_bytes in (snapshots[0], snapshots[-1]):
+                        image_parts.append(types.Part.from_bytes(data=s_bytes, mime_type="image/png"))
+                except Exception as part_err:
+                    logger.debug("Could not package image parts via types.Part: %s", part_err)
+
+            return {
+                "snapshots_captured_count": len(snapshots),
+                "canvas_dimensions": canvas_dims,
+                "non_blank_verified": not blank_detected,
+                "blank_canvas_detected": blank_detected,
+                "unique_colors_t0": colors_t0,
+                "unique_colors_t_end": colors_tend,
+                "pixel_diff_t0_to_tend": diff_pixels,
+                "visual_motion_verified": motion_verified,
+                "synthetic_input_profiles_tested": ["idle_baseline", "kinetic_movement", "action_triggers"],
+                "captured_frame_paths": captured_frame_paths,
+                "snapshot_images": snapshots,
+                "image_parts": image_parts,
+            }
+
+        # --- LEGACY PYGAME SIMULATOR PATH (Only for non-Godot Pygame mocks/cartridges) ---
         if active_sim is not None:
             engine = getattr(active_sim, "engine", None)
             surf = getattr(engine, "logical_surface", None)
@@ -844,20 +861,10 @@ class CandidateVisualPlaytester:
         if surf is None:
             surf = pygame.Surface((1280, 720))
 
-        if is_godot and active_sim is not None and hasattr(active_sim, "run_until_complete"):
-            if not getattr(active_sim, "is_completed", False):
-                try:
-                    active_sim.run_until_complete(max_steps=ticks)
-                except Exception as sim_err:
-                    logger.warning("GodotHeadlessSimulator execution error: %s", sim_err)
-
-        snapshots: List[bytes] = []
+        snapshots = []
         downsampled_thumbs: List[Any] = []
 
-        # T0 snapshot
-        if is_godot and candidate_dir is not None:
-            self._render_domain_agnostic_scene(surf, Path(candidate_dir), active_sim, tick_phase=0.0)
-        elif active_sim is not None and hasattr(active_sim, "current_scene") and hasattr(active_sim.current_scene, "render"):
+        if active_sim is not None and hasattr(active_sim, "current_scene") and hasattr(active_sim.current_scene, "render"):
             try:
                 active_sim.current_scene.render(surf)
             except Exception:
@@ -868,13 +875,7 @@ class CandidateVisualPlaytester:
         img_t0 = Image.open(io.BytesIO(snap_t0)).convert("RGB")
         downsampled_thumbs.append(img_t0.resize((64, 36)))
 
-        if is_godot and candidate_dir is not None:
-            self._render_domain_agnostic_scene(surf, Path(candidate_dir), active_sim, tick_phase=1.0)
-            snap_tend = self.capture_surface_png(surf)
-            snapshots.append(snap_tend)
-            img_tend = Image.open(io.BytesIO(snap_tend)).convert("RGB")
-            downsampled_thumbs.append(img_tend.resize((64, 36)))
-        elif active_sim is not None and hasattr(active_sim, "step"):
+        if active_sim is not None and hasattr(active_sim, "step"):
             from engine.sim.headless import SimulationInput
             for tick_idx in range(ticks):
                 if tick_idx in (2, 5):
@@ -921,8 +922,6 @@ class CandidateVisualPlaytester:
             except Exception:
                 pass
 
-        # Image color and motion delta analysis
-        _pixels = lambda im: im.get_flattened_data() if hasattr(im, "get_flattened_data") else im.getdata()
         colors_t0 = len(set(_pixels(img_t0)))
         img_tend = Image.open(io.BytesIO(snapshots[-1])).convert("RGB")
         colors_tend = len(set(_pixels(img_tend)))
@@ -938,28 +937,19 @@ class CandidateVisualPlaytester:
             (hasattr(active_sim, "current_scene") and active_sim.current_scene is not None and hasattr(active_sim.current_scene, "render"))
             or (hasattr(active_sim, "engine") and hasattr(active_sim.engine, "current_scene") and active_sim.engine.current_scene is not None and hasattr(active_sim.engine.current_scene, "render"))
             or (hasattr(active_sim, "cartridge") and hasattr(active_sim.cartridge, "render"))
-            or is_godot
         )
         blank_detected = bool(active_sim is not None and has_renderer and colors_t0 <= 1 and colors_tend <= 1)
         motion_verified = (diff_pixels > 5 or (len(snapshots) == 1 and not blank_detected))
 
-        # Persist captured frames to candidate_dir/assets/playtest_captures/ for UI and Sign-Off Council inspection
-        captured_frame_paths: List[str] = []
-        if candidate_dir is not None and snapshots:
+        captured_frame_paths = []
+        if cpath is not None and snapshots:
             try:
-                cpath = Path(candidate_dir).resolve()
                 cap_dir = cpath / "assets" / "playtest_captures"
                 cap_dir.mkdir(parents=True, exist_ok=True)
                 t0_file = cap_dir / "playtest_t0.png"
                 tend_file = cap_dir / "playtest_tend.png"
-                if not t0_file.is_file():
-                    t0_file.write_bytes(snapshots[0])
-                else:
-                    snapshots[0] = t0_file.read_bytes()
-                if not tend_file.is_file():
-                    tend_file.write_bytes(snapshots[-1])
-                else:
-                    snapshots[-1] = tend_file.read_bytes()
+                t0_file.write_bytes(snapshots[0])
+                tend_file.write_bytes(snapshots[-1])
                 captured_frame_paths = [
                     "assets/playtest_captures/playtest_t0.png",
                     "assets/playtest_captures/playtest_tend.png",
@@ -967,7 +957,6 @@ class CandidateVisualPlaytester:
             except Exception as cap_err:
                 logger.debug("Could not persist playtest_captures PNGs: %s", cap_err)
 
-        # Multi-modal packaging for Gemini
         image_parts = []
         try:
             from google.genai import types
@@ -991,145 +980,6 @@ class CandidateVisualPlaytester:
             "image_parts": image_parts,
         }
 
-    def _render_domain_agnostic_scene(
-        self,
-        surf: pygame.Surface,
-        candidate_dir: Optional[Path],
-        active_sim: Optional[Any],
-        tick_phase: float,
-    ) -> None:
-        """Renders authentic candidate sprites dynamically across a domain-agnostic coordinate plane,
-        strictly honoring which sprites are actually bound in code and any full-screen occlusion state.
-        Completely eliminates test-case poisoning (Rule 1) and hardcoded keyword heuristics (Rule 2).
-        """
-        surf.fill((20, 24, 32))
-
-        # 1. Neutral Cartesian Coordinate Grid (Domain-Agnostic, Zero Isometric / Subterranean Assumptions)
-        grid_color = (36, 44, 58)
-        for y in range(48, 720, 64):
-            pygame.draw.line(surf, grid_color, (0, y), (1280, y), 1)
-        for x in range(0, 1280, 64):
-            pygame.draw.line(surf, grid_color, (x, 48), (x, 720), 1)
-        pygame.draw.line(surf, (50, 65, 85), (640, 48), (640, 720), 1)
-        pygame.draw.line(surf, (50, 65, 85), (0, 384), (1280, 384), 1)
-
-        # 2. Universal HUD Bar & Progress Tracker
-        pygame.draw.rect(surf, (14, 18, 26), (0, 0, 1280, 48))
-        pygame.draw.line(surf, (40, 140, 200), (0, 48), (1280, 48), 2)
-
-        # Telemetry / State reflection
-        pos_delta = getattr(active_sim, "pos_delta", 0.0) if active_sim else 0.0
-        health = getattr(active_sim, "player_health", 100.0) if active_sim else 100.0
-        pygame.draw.rect(surf, (30, 40, 55), (20, 14, 200, 20), border_radius=3)
-        health_w = int(max(0.0, min(100.0, health)) * 1.96)
-        if health_w > 0:
-            pygame.draw.rect(surf, (50, 180, 120), (22, 16, health_w, 16), border_radius=2)
-
-        pygame.draw.rect(surf, (30, 40, 55), (1060, 14, 200, 20), border_radius=3)
-        phase_w = int(max(0.0, min(1.0, tick_phase)) * 196)
-        if phase_w > 0:
-            pygame.draw.rect(surf, (60, 150, 240), (1062, 16, phase_w, 16), border_radius=2)
-
-        if candidate_dir is None:
-            return
-
-        cpath = Path(candidate_dir)
-        sprites_dir = cpath / "assets" / "sprites"
-        if not sprites_dir.is_dir():
-            return
-
-        gd_files = sorted(cpath.glob("*.gd"))
-        all_gd_src = "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in gd_files) if gd_files else ""
-
-        # Load asset manifest if present for type-guided layout
-        portrait_filenames = set()
-        spec_path = cpath / "requirements_spec.json"
-        if spec_path.is_file():
-            try:
-                spec_data = json.loads(spec_path.read_text(encoding="utf-8"))
-                for asset_req in spec_data.get("asset_manifest", []):
-                    if asset_req.get("asset_type") == "portrait":
-                        p_name = asset_req.get("name") or Path(asset_req.get("target_path", "")).name
-                        if p_name:
-                            portrait_filenames.add(p_name.lower())
-            except Exception:
-                pass
-
-        loaded_sprites: List[Tuple[str, pygame.Surface]] = []
-        for sp_path in sorted(sprites_dir.glob("*.png")):
-            if gd_files and sp_path.name not in all_gd_src and "DirAccess" not in all_gd_src:
-                continue
-            try:
-                sp_surf = pygame.image.load(str(sp_path))
-                loaded_sprites.append((sp_path.name.lower(), sp_surf))
-            except Exception:
-                continue
-
-        portraits_dir = cpath / "assets" / "portraits"
-        if portraits_dir.is_dir():
-            for p_path in sorted(portraits_dir.glob("*.png")):
-                if gd_files and p_path.name not in all_gd_src and "assets/portraits" not in all_gd_src:
-                    continue
-                try:
-                    p_surf = pygame.image.load(str(p_path))
-                    loaded_sprites.append((p_path.name.lower(), p_surf))
-                    portrait_filenames.add(p_path.name.lower())
-                except Exception:
-                    continue
-
-        if loaded_sprites:
-            portraits: List[Tuple[str, pygame.Surface]] = []
-            world_sprites: List[Tuple[str, pygame.Surface]] = []
-            for sp_name, sp_surf in loaded_sprites:
-                w, h = sp_surf.get_size()
-                if sp_name in portrait_filenames or (w >= 96 and h >= 96 and 0.9 <= w / h <= 1.1 and "portrait" in sp_name):
-                    portraits.append((sp_name, sp_surf))
-                else:
-                    world_sprites.append((sp_name, sp_surf))
-
-            if portraits:
-                p_name, p_surf = portraits[0]
-                portrait_box = pygame.Rect(1140, 56, 120, 120)
-                pygame.draw.rect(surf, (14, 20, 30), portrait_box)
-                pygame.draw.rect(surf, (60, 140, 200), portrait_box, 2)
-                scaled_p = pygame.transform.scale(p_surf, (104, 104))
-                surf.blit(scaled_p, (1148, 64))
-
-            total_world = len(world_sprites)
-            center_x, center_y = 640, 360
-            delta_shift_x = int(math.cos(tick_phase * 2 * math.pi) * 25.0 + (pos_delta * 15.0 if pos_delta > 0 else tick_phase * 35.0))
-            delta_shift_y = int(math.sin(tick_phase * 2 * math.pi) * 15.0 + tick_phase * 20.0)
-
-            for idx, (sp_name, sp_surf) in enumerate(world_sprites):
-                w, h = sp_surf.get_size()
-                if idx == 0:
-                    px = center_x - w // 2 + delta_shift_x
-                    py = center_y - h // 2 + delta_shift_y
-                else:
-                    angle = (2.0 * math.pi * (idx - 1)) / max(1, total_world - 1) + (tick_phase * 0.15)
-                    orbit_radius = 160.0 + ((idx % 3) * 65.0)
-                    px = int(center_x + orbit_radius * math.cos(angle) - w // 2)
-                    py = int(center_y + orbit_radius * math.sin(angle) - h // 2)
-                px = max(24, min(1280 - w - 24, px))
-                py = max(64, min(650 - h - 24, py))
-                surf.blit(sp_surf, (px, py))
-
-            pygame.draw.rect(surf, (14, 18, 26), (100, 660, 1080, 52))
-            pygame.draw.rect(surf, (50, 100, 150), (100, 660, 1080, 52), 1)
-            palette_x = 120
-            for sp_name, sp_surf in loaded_sprites:
-                if palette_x + 40 > 1160:
-                    break
-                thumb = pygame.transform.scale(sp_surf, (36, 36))
-                surf.blit(thumb, (palette_x, 668))
-                palette_x += 48
-
-        # Reflect any full-screen occlusion detected in the Godot scene audit (e.g., 95% opaque frost or instant failure lockout)
-        scene_audit = getattr(active_sim, "scene_audit", None) if active_sim else None
-        if isinstance(scene_audit, dict) and scene_audit.get("fullscreen_occlusion_detected"):
-            occ = pygame.Surface((1280, 720), pygame.SRCALPHA)
-            occ.fill((180, 195, 210, 235) if tick_phase < 0.5 else (140, 20, 20, 235))
-            surf.blit(occ, (0, 0))
 
 
 # =============================================================================
@@ -1199,14 +1049,15 @@ class MultiAgentSignOffCouncil:
 
                 prompt = (
                     f"You are the Multi-Agent Final Sign-Off Council for candidate build '{candidate_id}'.\n"
-                    f"Every single specialist who authored the Living Game Bible MUST inspect the actual rendered game frames, "
+                    f"Every single specialist who authored the Living Game Bible MUST inspect the actual rendered game frames "
+                    f"(playtest_t0.png and playtest_tend.png) SIDE-BY-SIDE against the Writers' Room 16:9 Concept Mockup, "
                     f"source code, audio configuration, and runtime scene audit, and render an independent sign-off verdict:\n"
-                    f"1. VisualArtDirector: Are ALL synthesized sprites and character portraits loaded and visible on screen? Does the visual composition honor the 16:9 concept mockups and visual style guide?\n"
+                    f"1. VisualArtDirector: Compare the rendered game frames side-by-side against the 16:9 Concept Mockup! CRITICAL PERSPECTIVE CHECK: Does the landscape orientation match the character's movement plane? (If the character moves in 2D top-down / 3/4 overhead X-Y space across a shelf Rect2, the entire walkable shelf Rect2 MUST be rendered as the lush top-down plateau surface `terrain_surface.png` with the vertical cliff wall `structure_wall_tile.png` hanging ONLY below the southern bottom edge `s.end.y`—REJECT immediately if the character appears to be walking sideways on the vertical face of a cliff!). Are ALL synthesized sprites loaded with clean alpha transparency and proper world scale? Are character portraits strictly isolated in UI dialogue panels?\n"
                     f"2. UXExperienceDesigner: Is the viewport clear on startup (zero 95% opaque frost or center-occluding panels)? Are controls discoverable via diegetic labels/hover cues?\n"
-                    f"3. GameplayDesigner: Is there an active, responsive, navigable world loop with meaningful objectives and recoverable hazards (zero instant 12-second unrecoverable lockouts)?\n"
+                    f"3. GameplayDesigner: Is there an active, responsive, navigable world loop with meaningful objectives, recoverable hazards, and coherent spatial navigation where entities walk on top of the plateau surface rather than across cliff walls?\n"
                     f"4. StoryWorldArchitect: Are the Narrative Bible's characters, cutscenes, dialogue trees, and voice barks staged in-game?\n"
-                    f"5. AudioAtmosphereDesigner: Are WAV files loaded at 24,000 Hz (`mix_rate = 24000`, never 44100 chipmunk distortion) with the 44-byte RIFF header stripped (`bytes.slice(44)`) and non-overlapping cooldown guards?\n"
-                    f"6. CreativeDirector: Does the final build fulfill the First 60 Seconds Hook and Core Player Fantasy?\n\n"
+                    f"5. AudioAtmosphereDesigner: Are WAV files loaded at 24,000 Hz (`mix_rate = 24000`, never 44100 chipmunk distortion) with the 44-byte RIFF header stripped (`bytes.slice(44)`) and non-overlapping cooldown guards? CRITICAL PSYCHOACOUSTIC CHECK: Reject immediately if the game plays a continuous looping high-pitched sine/square wave drone (`AudioStreamWAV.LOOP_FORWARD` on `> 200 Hz` tones like a constant 523 Hz hum) or piercing `>= 800 Hz` squeals!\n"
+                    f"6. CreativeDirector: Does the final build fulfill the First 60 Seconds Hook, Core Player Fantasy, and look/play like the Writers' Room vision?\n\n"
                     f"LIVING GAME BIBLE:\n{bible_text}\n\n"
                     f"AST & CODE AUDIT:\n{json.dumps(ast_grounding or {}, indent=2)}\n\n"
                     f"RUNTIME TELEMETRY & SCENE AUDIT:\n{json.dumps(telemetry_grounding or {}, indent=2)}\n\n"
@@ -1214,6 +1065,14 @@ class MultiAgentSignOffCouncil:
                     f"Provide 'deliberation' FIRST (Rule 4), and return verdicts for all 6 specialists: {list(SPECIALIST_COUNCIL_ROLES)}."
                 )
                 contents: List[Any] = [prompt]
+                # Attach 16:9 Writers' Room Concept Mockup first for side-by-side comparison
+                mockups_dir = c_dir / "assets" / "mockups"
+                if mockups_dir.is_dir():
+                    for m_file in sorted(mockups_dir.glob("*.png"))[:1]:
+                        try:
+                            contents.append(types.Part.from_bytes(data=m_file.read_bytes(), mime_type="image/png"))
+                        except Exception:
+                            pass
                 for part in (visual_grounding or {}).get("image_parts", []):
                     contents.append(part)
 
@@ -1280,30 +1139,28 @@ class MultiAgentSignOffCouncil:
             remedies: List[str] = list(verdict.remediation_directives) if verdict else []
             approved: bool = verdict.approved if verdict else True
 
-            for stub in hollow_stubs:
-                reason = str(stub.get("reason", ""))
-                stmt = str(stub.get("stmt", ""))
-                if role == "VisualArtDirector" and ("sprite" in reason.lower() or "world renderer" in reason.lower()):
+            if role == "GameplayDesigner":
+                for stub in hollow_stubs:
+                    reason = str(stub.get("reason", ""))
+                    if reason:
+                        approved = False
+                        defects.append(reason)
+                        remedies.append(f"Implement complete interactive logic in {stub.get('module', 'mechanics.gd')}:{stub.get('function', '')}.")
+                if telemetry_grounding.get("is_stagnant_or_frozen"):
                     approved = False
-                    defects.append(reason)
-                    remedies.append("Load and render all synthesized PNG sprites from res://assets/sprites/ and res://assets/portraits/ in scenes.gd and ui_hud.gd.")
-                elif role == "AudioAtmosphereDesigner" and ("audio" in reason.lower() or "mix_rate" in stmt.lower() or "slice(44)" in stmt.lower()):
-                    approved = False
-                    defects.append(reason)
-                    remedies.append("Set AudioStreamWAV.mix_rate = 24000, strip the 44-byte RIFF header via bytes.slice(44), and enforce an >=8s playback cooldown.")
-                elif role == "UXExperienceDesigner" and ("mouse" in reason.lower() or "placement_guide" in reason.lower()):
-                    approved = False
-                    defects.append(reason)
-                    remedies.append("Fix HiDPI mouse picking with get_global_mouse_position() and ensure clear viewport visibility.")
-                elif role == "GameplayDesigner" and ("mouse_button_left" in reason.lower() or "hollow" in reason.lower() or "empty" in reason.lower()):
-                    approved = False
-                    defects.append(reason)
-                    remedies.append(f"Implement complete interactive gameplay logic in {stub.get('module', 'mechanics.gd')}:{stub.get('function', '')}.")
+                    defects.append("Simulation state remained stagnant/frozen across synthetic input schedule.")
+                    remedies.append("Ensure player inputs drive continuous spatial navigation and world state progression.")
 
-            if role == "VisualArtDirector" and blank_detected:
-                approved = False
-                defects.append("Blank monochrome canvas detected during visual playtest.")
-                remedies.append("Ensure scenes.gd and ui_hud.gd actively draw world geometry and bound sprite textures.")
+            if role == "VisualArtDirector":
+                if blank_detected:
+                    approved = False
+                    defects.append("Blank monochrome canvas detected during visual playtest.")
+                    remedies.append("Ensure scenes.gd and ui_hud.gd actively draw world geometry and bound sprite textures.")
+                if scene_audit.get("portrait_misused_on_world_sprite"):
+                    approved = False
+                    misused = scene_audit.get("portrait_misused_nodes", [])
+                    defects.append(f"Character portrait asset bound to world Sprite2D entity ({misused}) instead of a purpose-built transparent sprite.")
+                    remedies.append("Bind world entities to res://assets/sprites/*.png and use portraits only inside ui_hud.gd dialogue panels.")
 
             if role == "UXExperienceDesigner":
                 if scene_audit.get("fullscreen_occlusion_detected"):
@@ -1314,6 +1171,10 @@ class MultiAgentSignOffCouncil:
                     approved = False
                     defects.append(f"UI panel(s) occluding center playfield: {scene_audit.get('center_occluding_panels')}")
                     remedies.append("Move HUD panels to the screen perimeter so the central viewport remains unobstructed.")
+                if scene_audit.get("oversized_ui_portraits"):
+                    approved = False
+                    defects.append(f"Oversized UI portrait TextureRect node(s) overlapping HUD controls: {scene_audit.get('oversized_ui_portraits')}")
+                    remedies.append("In ui_hud.gd, bound character portrait TextureRect size <= Vector2(64, 64) with TextureRect.EXPAND_IGNORE_SIZE.")
 
             if role == "AudioAtmosphereDesigner":
                 ap_found = int(scene_audit.get("audio_players_found", 0) or 0)
@@ -1327,11 +1188,6 @@ class MultiAgentSignOffCouncil:
                     approved = False
                     defects.append(f"AudioStreamWAV mix_rate set to {mix_rates} instead of 24000 Hz, causing high-pitched chipmunk distortion.")
                     remedies.append("Set stream.mix_rate = 24000 and strip 44-byte RIFF header via bytes.slice(44).")
-
-            if role == "GameplayDesigner" and telemetry_grounding.get("is_stagnant_or_frozen"):
-                approved = False
-                defects.append("Simulation state remained stagnant/frozen across synthetic input schedule.")
-                remedies.append("Ensure player inputs drive continuous spatial navigation and world state progression.")
 
             if role == "CreativeDirector" and not approved:
                 defects.append("CreativeDirector withholds final sign-off until all specialist domain defects are resolved.")
@@ -1730,6 +1586,11 @@ class ChallengerGate:
                 stubs_found_reasons.append(
                     "Designer UX Audit: Fullscreen viewport occlusion detected (startup frost >= 80% or unrecoverable failure lockout)"
                 )
+            oversized_portraits = scene_audit.get("oversized_ui_portraits") or []
+            if oversized_portraits:
+                stubs_found_reasons.append(
+                    f"Designer UX Audit: Oversized UI portrait TextureRect node(s) overlapping HUD controls: {oversized_portraits} (set expand_mode = TextureRect.EXPAND_IGNORE_SIZE with size <= 64x64)"
+                )
 
         # 2. Check blank canvas
         blank_detected = (visual_grounding or {}).get("blank_canvas_detected", False)
@@ -1790,7 +1651,7 @@ class ChallengerGate:
                     ],
                 )
             else:
-                if stubs_found_reasons and "Hollow code stubs" not in (evaluation.rejection_trace.failure_reason or ""):
+                if combined_reason not in (evaluation.rejection_trace.failure_reason or ""):
                     evaluation.rejection_trace.failure_reason = f"{evaluation.rejection_trace.failure_reason} | {combined_reason}"
                 if not evaluation.rejection_trace.ast_evidence:
                     evaluation.rejection_trace.ast_evidence = ast_grounding

@@ -59,7 +59,7 @@ GDSCRIPT_ERROR_PATTERNS = [
 
 
 MULTILINE_ERROR_PATTERNS = [
-    re.compile(r'SCRIPT ERROR:\s*(?:Parse Error:\s*)?([^\n]+)\n\s*at:\s*GDScript::\w+\s*\((res://[^:]+):(\d+)\)'),
+    re.compile(r'SCRIPT ERROR:\s*(?:Parse Error:\s*)?([^\n]+)\n\s*at:\s*[^\n]*?\((res://[^:]+):(\d+)\)'),
     re.compile(r'ERROR:\s*([^\n]+)\n\s*at:\s*[^\n]*?\((res://[^:]+):(\d+)\)'),
 ]
 
@@ -182,7 +182,8 @@ def verify_godot_cartridge_syntax(
     cartridge_dir: Union[Path, str],
     timeout: float = 30.0,
 ) -> Tuple[bool, List[GDScriptDiagnostic]]:
-    """Validates Godot 4 cartridge syntax and project integrity headlessly.
+    """Validates Godot 4 cartridge syntax and project integrity headlessly across all .gd files
+    plus a 2-tick runtime initialization check.
     Returns (is_valid, diagnostics).
     """
     c_dir = Path(cartridge_dir).resolve()
@@ -196,15 +197,43 @@ def verify_godot_cartridge_syntax(
             )
         ]
 
-    # Run check-only / quit boot
-    res = run_godot_command(
-        ["--path", str(c_dir), "--quit"],
-        cwd=c_dir,
-        timeout=timeout,
-        headless=True,
-    )
+    diagnostics: List[GDScriptDiagnostic] = []
 
-    diagnostics = parse_godot_stderr(c_dir, res.stderr)
+    # 1. Run check-only on every .gd script in the cartridge so dynamically loaded scripts are also compiled
+    gd_files = sorted(c_dir.glob("*.gd"))
+    for gd_file in gd_files:
+        res_script = run_godot_command(
+            ["--path", str(c_dir), "--check-only", "--script", f"res://{gd_file.name}"],
+            cwd=c_dir,
+            timeout=timeout,
+            headless=True,
+        )
+        script_diags = parse_godot_stderr(c_dir, res_script.stderr)
+        for d in script_diags:
+            if d not in diagnostics:
+                diagnostics.append(d)
+
+    # 2. Run project boot check (or 2-tick harness smoke check if main.gd exists and no compile errors yet)
+    if not diagnostics and (c_dir / "main.gd").is_file() and HARNESS_SCRIPT_PATH.is_file():
+        res = run_godot_command(
+            ["--path", str(c_dir), "-s", str(HARNESS_SCRIPT_PATH), "--max-ticks", "2"],
+            cwd=c_dir,
+            timeout=timeout,
+            headless=True,
+        )
+    else:
+        res = run_godot_command(
+            ["--path", str(c_dir), "--quit"],
+            cwd=c_dir,
+            timeout=timeout,
+            headless=True,
+        )
+
+    boot_diags = parse_godot_stderr(c_dir, res.stderr)
+    for d in boot_diags:
+        if d not in diagnostics:
+            diagnostics.append(d)
+
     is_valid = (res.returncode == 0) and (len(diagnostics) == 0)
     return is_valid, diagnostics
 
@@ -224,11 +253,14 @@ class GodotHeadlessSimulator:
         max_frames: Optional[int] = None,
         session_id: Optional[str] = None,
         episode_id: Optional[str] = None,
+        capture_viewport: bool = False,
         **kwargs: Any,
     ):
         self.cartridge_path = Path(cartridge_path).resolve()
         self.telemetry_mode = telemetry_mode
         self.max_ticks = max_frames or ticks or max_ticks
+        self.capture_viewport = capture_viewport
+        self.viewport_captured = False
         self.step_count = 0
         self.elapsed_time = 0.0
 
@@ -272,18 +304,53 @@ class GodotHeadlessSimulator:
     def get_events(self, event_type: Any) -> List[Any]:
         return self.get_events_by_type(event_type)
 
-    def run_until_complete(self, max_steps: Optional[int] = None) -> SimulationState:
-        """Executes headless Godot playtest harness and streams metrics."""
+    def run_until_complete(
+        self,
+        max_steps: Optional[int] = None,
+        capture_viewport: Optional[bool] = None,
+    ) -> SimulationState:
+        """Executes Godot playtest harness and streams metrics (and real viewport PNGs when capture_viewport=True)."""
+        import platform
+        import shutil
+
         limit = max_steps or self.max_ticks
+        use_viewport = self.capture_viewport if capture_viewport is None else bool(capture_viewport)
         godot_bin = ensure_godot_binary()
 
-        cmd = [
-            str(godot_bin),
-            "--headless",
-            "--path", str(self.cartridge_path),
-            "-s", str(HARNESS_SCRIPT_PATH),
-            "--max-ticks", str(limit),
-        ]
+        if use_viewport:
+            cap_dir = self.cartridge_path / "assets" / "playtest_captures"
+            for stale_name in ("playtest_t0.png", "playtest_tend.png"):
+                stale_p = cap_dir / stale_name
+                if stale_p.is_file():
+                    try:
+                        stale_p.unlink()
+                    except Exception:
+                        pass
+
+        sys_name = platform.system()
+        has_display = (sys_name == "Darwin") or bool(os.environ.get("DISPLAY")) or bool(os.environ.get("WAYLAND_DISPLAY"))
+        xvfb_bin = shutil.which("xvfb-run") if (sys_name == "Linux" and not has_display) else None
+
+        if use_viewport and (has_display or xvfb_bin):
+            cmd: List[str] = []
+            if xvfb_bin:
+                cmd.extend([xvfb_bin, "-a"])
+            cmd.extend([
+                str(godot_bin),
+                "--audio-driver", "Dummy",
+                "--position", "-4000,-4000",
+                "--path", str(self.cartridge_path),
+                "-s", str(HARNESS_SCRIPT_PATH),
+                "--max-ticks", str(limit),
+            ])
+        else:
+            cmd = [
+                str(godot_bin),
+                "--headless",
+                "--path", str(self.cartridge_path),
+                "-s", str(HARNESS_SCRIPT_PATH),
+                "--max-ticks", str(limit),
+            ]
 
         logger.info("Executing Godot playtest harness: %s", " ".join(cmd))
         proc = subprocess.Popen(
@@ -375,14 +442,20 @@ class GodotHeadlessSimulator:
             returncode = proc.wait()
 
         err_thread.join(timeout=1.0)
+        stderr_full = "".join(stderr_lines)
+        self.stderr = stderr_full
+        self.runtime_diagnostics = parse_godot_stderr(self.cartridge_path, stderr_full)
 
         self.step_count = self.ticks_executed or limit
         self.elapsed_time = self.step_count * (1.0 / 60.0)
         self.is_completed = True
         self.outcome = "COMPLETED" if returncode == 0 else "CRASHED"
+        self.viewport_captured = bool(
+            use_viewport
+            and (self.cartridge_path / "assets" / "playtest_captures" / "playtest_t0.png").is_file()
+        )
 
         if returncode != 0:
-            stderr_full = "".join(stderr_lines)
             raise RuntimeError(f"Godot headless simulation failed with code {returncode}: {stderr_full}")
 
         return self.get_state()
@@ -420,7 +493,7 @@ class GodotHeadlessSimulator:
             return GodotSimResult(
                 success=True,
                 error_message=None,
-                stderr="",
+                stderr=getattr(self, "stderr", ""),
                 state=state,
                 avg_frame_time_ms=self.avg_frame_time_ms,
                 frame_budget_passed=self.frame_budget_passed,
