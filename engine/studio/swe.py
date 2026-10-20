@@ -22,6 +22,9 @@ from pydantic import Field
 from engine.api.contracts import BaseCartridge, BaseEnemy, BaseHazard, BasePlayer, BaseLevelSpec
 from engine.loader import ASTSecurityError, validate_cartridge_ast
 from engine.studio.models import (
+    AtomicInvariantSpec,
+    AtomicTestSynthesisPayload,
+    AtomicWorkUnit,
     AudioCueStrategy,
     BaseEpistemicModel,
     CodeRepairSpec,
@@ -36,9 +39,11 @@ from engine.studio.models import (
     SceneCritiqueAndStrategySpec,
     SceneDeficiencyItem,
     SceneLayerStrategy,
+    SceneUnitVisualVerdict,
     StudioAgentError,
     SurgicalCodePatch,
     SurgicalPatchPayload,
+    TrackAtomicDecompositionPlan,
     TrackCodeSynthesisPayload,
 )
 
@@ -339,6 +344,14 @@ class LeadGameplaySWEAgent:
                 f"  * Layer '{getattr(l, 'layer_id', '')}' (type={getattr(l, 'layer_type', '')}, z_index={getattr(l, 'z_index', 0)}, parallax={getattr(l, 'parallax_factor', 1.0)}): {getattr(l, 'visual_description', '')}"
                 for l in (getattr(game_bible, "scene_layers", []) or [])
             ]
+            eng_lines = [
+                f"  * [{getattr(e, 'mechanic_id', '')}] {getattr(e, 'title', '')} (modules={getattr(e, 'target_gd_modules', [])}): "
+                f"Nodes/Colliders={getattr(e, 'godot_node_and_collider_architecture', '')} | "
+                f"State Machine={getattr(e, 'state_machine_and_input_contract', '')} | "
+                f"Required Assets={getattr(e, 'required_sprite_and_tile_assets', [])} | "
+                f"Test Invariants={getattr(e, 'falsifiable_test_invariants', [])}"
+                for e in (getattr(game_bible, "technical_architecture_blueprint", []) or [])
+            ]
             context_parts.append(
                 f"LIVING GAME BIBLE (`game_bible.json` — AUTHORITATIVE EXPERIENCE & DIEGETIC UX BLUEPRINT):\n"
                 f"- Game Title: {getattr(game_bible, 'game_title', '')}\n"
@@ -351,6 +364,7 @@ class LeadGameplaySWEAgent:
                 f"- Gameplay Pillars: {getattr(game_bible, 'gameplay_pillars', [])}\n"
                 f"- Visual Style Guide: {getattr(game_bible, 'visual_style_guide', '')}\n"
                 f"- Audio Direction Guide: {getattr(game_bible, 'audio_direction_guide', '')}\n"
+                + (f"- Technical Architecture Blueprint (GameplaySystemsEngineer — follow these exact Godot 4 node/collider strategies & state machines):\n" + "\n".join(eng_lines) + "\n" if eng_lines else "")
                 + (f"- Multi-Layer Scene Architecture:\n" + "\n".join(layer_lines) + "\n" if layer_lines else "")
                 + (f"- Experience Storyboard Arc:\n" + "\n".join(beats_lines) + "\n" if beats_lines else "")
                 + (f"- Synthesized 16:9 Visual Mockup Boards:\n" + "\n".join(mockup_lines) + "\n" if mockup_lines else "")
@@ -566,7 +580,12 @@ class LeadGameplaySWEAgent:
                 f"   - NEVER use Directory.new() (use DirAccess.open()).\n"
                 f"   - NEVER use 3-argument .connect('sig', target, 'fn') (use signal.connect(fn)).\n"
                 f"   - NEVER pass arguments to move_and_slide().\n"
-                f"8. RATIONALE-FIRST EPISTEMIC RULE (Rule 4): deliberation MUST be provided FIRST in every payload before files and code.\n"
+                f"8. 1:1 VISUAL-TO-PHYSICAL COLLIDER CONTAINMENT:\n"
+                f"   - Every walkable terrain shelf/plateau (`shelves: Array[Rect2]` or polygon) MUST have matching `StaticBody2D` / `CollisionPolygon2D` physical barrier walls along its northern sky horizon edge (`y < walkable_min_y`), southern cliff drop, and any unbridged chasms so the player character can NEVER walk onto the sky backdrop or float over empty chasms.\n"
+                f"9. ABSOLUTE BAN ON PRE-SOLVED t=0 LEVELS & FAKE DISCONNECTED SIMULATIONS:\n"
+                f"   - NEVER pre-carve or pre-solve the puzzle at `t = 0` (`is_completed` and target `engine.is_active` MUST be `false` during passive zero-input ticking).\n"
+                f"   - Any fluid, energy, signal, or resource propagation MUST compute true graph connectivity from active source cells (e.g., BFS/DFS reachability from source nodes)—NEVER add fluid/energy to disconnected cells out of thin air.\n"
+                f"10. RATIONALE-FIRST EPISTEMIC RULE (Rule 4): deliberation MUST be provided FIRST in every payload before files and code.\n"
             )
             response_model = TrackCodeSynthesisPayload
         else:
@@ -1889,7 +1908,7 @@ class LeadGameplaySWEAgent:
                     f"2. Emit focused `SurgicalCodePatch` items replacing ONLY the defective contiguous line ranges `[start_line..end_line]` in the target `.gd` file(s).\n"
                     f"3. KEEP EACH PATCH COMPACT AND SURGICAL (MAX 40-65 LINES OF REPLACEMENT CODE): Never rewrite an entire 150-line class or copy-paste unchanged trailing sections of a long `_draw()` method (such as shockwave/particle/geyser loops). Replace ONLY the specific 10-55 lines responsible for the defect (for example, `SceneAssets.draw_tiled_platform`, or the `for s in shelves:` block, or the `for coord in canal_grid.cells.keys():` block) while leaving surrounding lines untouched!\n"
                     f"4. Do NOT include line number prefixes (like ` 196: `) in `replacement_code`. Preserve exact tab (`\\t`) indentation matching the surrounding function/class scope.\n"
-                    f"5. Never reference `AssetLib` or `res://asset_library.gd` (it does not exist). Load PNG textures via `Image.load_from_file(ProjectSettings.globalize_path(res_path))` and `ImageTexture.create_from_image(img)` (and `tex.set_meta('source_path', res_path)`). IMPORTANT GODOT 4 TEXTURE TILING RULE: When calling `draw_colored_polygon(pts, color, uvs, tex)` or `draw_polygon` with repeating UVs (`uv > 1.0`), you MUST set `texture_repeat = CanvasItem.TEXTURE_REPEAT_ENABLED` on the `Node2D`/`CanvasItem` (in `_init` or `_draw`), otherwise Godot 4 clamps UVs > 1.0 to a single edge pixel and renders a flat solid color! Also use bright modulation (`Color(0.85, 0.95, 0.90, 1.0)`) so the surface texture detail is vivid.\n"
+                    f"5. Never reference `AssetLib` or `res://asset_library.gd` (it does not exist). Load PNG textures via `Image.load_from_file(ProjectSettings.globalize_path(res_path))` and `ImageTexture.create_from_image(img)` (and `tex.set_meta('source_path', res_path)`), or use `StudioRigHelper` (`res://src/studio_rig_and_collider.gd`) for `AnimationPlayer` keyframe rigs (`StudioRigHelper.build_articulated_rig`), `BitMap.opaque_to_polygons()` auto-colliders (`StudioRigHelper.attach_alpha_polygon_collider`), and `Polygon2D` repeating tiled surfaces (`StudioRigHelper.create_tiled_polygon`). IMPORTANT GODOT 4 TEXTURE TILING RULE: When calling `draw_colored_polygon(pts, color, uvs, tex)` or `draw_polygon` with repeating UVs (`uv > 1.0`), you MUST set `texture_repeat = CanvasItem.TEXTURE_REPEAT_ENABLED` on the `Node2D`/`CanvasItem` (in `_init` or `_draw`), otherwise Godot 4 clamps UVs > 1.0 to a single edge pixel and renders a flat solid color! Also use bright modulation (`Color(0.85, 0.95, 0.90, 1.0)`) so the surface texture detail is vivid.\n"
                     f"{hop_rule_6}\n"
                 )
                 contents_exec: Any = (
@@ -2170,21 +2189,13 @@ class LeadGameplaySWEAgent:
         symbol_index = self._build_cartridge_symbol_index(c_dir)
         asset_summary = CartridgeAssetLibrary(cartridge_dir=c_dir).build_prompt_summary_for_swe()
 
-        # Extract focused slices for terrain perspective (scenes.gd), spire layering (scenes.gd), and audio synthesis (main.gd)
+        # Extract focused slices for scene rendering (scenes.gd) and audio synthesis (main.gd)
         terrain_slice = self._extract_code_slice(
             c_dir,
             CodeSliceRequest(
-                deliberation="Inspect TerraceRenderer._draw to check camera/terrain perspective alignment and canal pass ordering",
+                deliberation="Inspect primary scene rendering in scenes.gd to check camera/terrain perspective alignment and layer ordering",
                 filename="scenes.gd",
-                symbol_query="TerraceRenderer._draw",
-            ),
-        )
-        spires_slice = self._extract_code_slice(
-            c_dir,
-            CodeSliceRequest(
-                deliberation="Inspect WorldSpireLayer._draw and SceneAssets.draw_tiled_rect for oversized foreground column occlusion",
-                filename="scenes.gd",
-                symbol_query="WorldSpireLayer._draw",
+                symbol_query="func _draw",
             ),
         )
         audio_slice = self._extract_code_slice(
@@ -2209,24 +2220,16 @@ class LeadGameplaySWEAgent:
             "captured from the current cartridge build.\n\n"
             "Compare the actual rendered Godot scene and audio code against the Concept Art Mockups, the Game Bible, and the "
             "`GameProductionStrategySpec` below. Scrutinize EVERY pillar below:\n"
-            "1. **CRITICAL — Camera & Landscape Perspective Coherence (`scenes.gd` -> `TerraceRenderer._draw`, `FernsCluster._init`, `WorldSpireLayer._draw`)**:\n"
-            "   - Look at where the character (`vesper` at `y ~ 420`) and canal (`y ~ 440`) are positioned on the island in `playtest_t0.png` / `playtest_tend.png` and in `TERRAIN CODE SLICE` / `SPIRES CODE SLICE` below.\n"
-            "   - In a 3/4 top-down floating island plateau:\n"
-            "     a) The ENTIRE walkable shelf `Rect2` (`s.position.y .. s.end.y`, e.g. `y = 260..700`) is the **horizontal walkable TOP plateau surface** and MUST be filled with `terrain_surface.png` (lush emerald moss/grass & ancient courtyard flagstone pavers, with organic mossy borders framing its perimeter).\n"
-            "     b) The vertical cliff face (`structure_wall_tile.png` + vertical cliff striations + jagged stalactites) and overhanging moss scallops MUST hang **ONLY below the southern bottom edge (`s.end.y`)** of each plateau (e.g., from `s.end.y` down to `s.end.y + 110`) as the 3/4 perspective front cliff skirt!\n"
-            "     c) Check `SPIRES CODE SLICE` (`WorldSpireLayer._draw` and `SceneAssets.draw_tiled_rect`): Does `WorldSpireLayer` draw giant 340px-tall rectangular `SceneAssets.draw_tiled_rect` columns (`shaft_rect = Rect2(p.x - 24, p.y - 90, 48, 196)` with a bright `1.5px` rectangle border in `draw_tiled_rect`) at `z_index = 1` directly over the plateau and canal (`Vector2(500, 395)`, `Vector2(720, 350)`), creating huge dark boxy slabs with white wireframe borders blocking the view?! If so, emit a `SceneDeficiencyItem` targeting `scenes.gd` (`WorldSpireLayer._draw` and `SceneAssets.draw_tiled_rect`) to remove the rectangle border in `draw_tiled_rect`, set `WorldSpireLayer` `z_index = -5` for distant horizon spires (`y < 200`), and render on-plateau shrines as compact, grounded `midground_setpiece_1.png` stone lanterns/shrines (`64x64` over a subtle elliptical ground shadow, positioned in the northern/southern terrace margins clear of the canal `y = 390..480`, WITHOUT giant 196px rectangular `structure_wall_tile` column shafts)!\n"
-            "2. **CRITICAL — Psychoacoustic Comfort & Audio Stream Critique (`main.gd` -> `acoustics_hum_setup`, `_synthesize_sine_loop`, `_setup_audio`, `_synthesize_buzz`)**:\n"
-            "   - Inspect `AUDIO CODE SLICE` from `main.gd` below! Does `acoustics_hum_setup` or `_synthesize_sine_loop` create a **continuous looping high-pitched sine wave** (`stream.loop_mode = AudioStreamWAV.LOOP_FORWARD`), or does `_setup_audio` synthesize a piercing `1200.0 Hz` squeal (`squeal_stream = _synthesize_tone(1200.0, ...)`) or harsh square-wave `_synthesize_buzz`?\n"
-            "   - If ANY continuous looping sine tone, `1200.0 Hz` squeal, or harsh square-wave buzz exists in `main.gd`, emit a mandatory `SceneDeficiencyItem` targeting `main.gd` (`_setup_audio` / `_synthesize_buzz` / `acoustics_hum_setup`) so all synthesized streams use `AudioStreamWAV.LOOP_DISABLED`, warm low/mid frequencies (`130–330 Hz`), and soft exponential decay (`exp(-8.0 * t)`, `volume_db <= -16.0`)!\n"
-            "3. **Fluid / Energy Channels (`scenes.gd` -> `TerraceRenderer._draw`)**:\n"
-            "   - Inspect `playtest_t0.png` / `playtest_tend.png` and the `canal_coords` passes inside `TERRAIN CODE SLICE` (`TerraceRenderer._draw`):\n"
-            "     * Are there vertical comb/ladder lines or dark gaps cutting across the 2-row wide canal basin (`x = 430..630`)? This happens when `fw` (`hw * 0.72 ~ 9.1px`) is smaller than half of `CELL_SIZE` (`12.0px`) AND `draw_line(w_pos + norm * fw, n_pos + norm * fw, ...)` is called unconditionally on `offset = Vector2i(0, 1)` vertical connectors (which draws bright vertical lines across the middle of the horizontal basin)!\n"
-            "     * To render a 100% seamless, organic multi-row water basin and river channel:\n"
-            "       - Use `mw = 16.5`, `hw = 14.0`, and `fw = 12.5` (`>= CELL_SIZE * 0.5`) so adjacent rows and columns overlap with zero dark gaps.\n"
-            "       - Keep the 3 separate passes (Pass 1: Masonry `mw`; Pass 2: Recessed dark bed `hw`; Pass 3: Luminous cyan water `fw` + caustics).\n"
-            "       - In Pass 1 and Pass 3, NEVER draw `masonry_rim` or white foam `draw_line` strokes along `offset = Vector2i(0, 1)` vertical connectors or along any side `norm` where the perpendicular neighbor (`coord + Vector2i(int(round(norm.x)), int(round(norm.y)))`) is ALSO in `canal_coords`! Only draw bank rim/foam lines along true outer shoreline edges, and only run horizontal caustic waves along `offset == Vector2i(1, 0)`!\n"
-            "     * Also check the Sunken Aqueduct Chasm (`x = 816..1066`): replace the harsh straight vertical `draw_line` at `chasm.position.x` and `chasm.end.x` with organic stepped rocky cliff edges and mossy rim scallops along the chasm walls!\n"
-            "4. **Diegetic HUD (`ui_hud.gd`)**: Does the HUD present a clean, warm diegetic fantasy interface matching the Game Bible and Concept Art?\n"
+            "1. **CRITICAL — Camera & Landscape Perspective Coherence (`scenes.gd`)**:\n"
+            "   - Verify that the character's movement plane and physical colliders align 1:1 with the rendered terrain surfaces.\n"
+            "   - Walkable horizontal/top-down ground regions must be textured with ground surface tiles from `assets/asset_library.json`, while vertical cliff skirts or walls hang only along non-walkable drop-off edges.\n"
+            "   - Ensure foreground props and landmarks use their clean alpha sprites from `assets/sprites/` without opaque rectangular wireframe borders or oversized blocks occluding the playfield.\n"
+            "2. **CRITICAL — Psychoacoustic Comfort & Audio Stream Critique (`main.gd`)**:\n"
+            "   - Inspect `AUDIO CODE SLICE` from `main.gd` below! Verify that procedural audio streams do NOT use continuous high-pitched looping sine waves (`AudioStreamWAV.LOOP_FORWARD`), piercing `>= 800 Hz` squeals, or harsh square-wave buzzes.\n"
+            "   - All synthesized streams must use `AudioStreamWAV.LOOP_DISABLED`, warm low/mid frequencies (`130–330 Hz`), and soft exponential decay (`exp(-8.0 * t)`, `volume_db <= -16.0`).\n"
+            "3. **Channel / Path Continuity & Organic Geometry (`scenes.gd`)**:\n"
+            "   - Verify that multi-cell channels, paths, or terrain edges render seamlessly without internal grid comb lines, gaps, or raw programmer-art shapes.\n"
+            "4. **Diegetic HUD (`ui_hud.gd`)**: Does the HUD present a clean, readable diegetic interface matching the Game Bible and Concept Art?\n"
             "5. **Compiler/Runtime Health**: Are there any GDScript compiler or runtime errors?\n\n"
             "Be ruthlessly honest. Set `scene_matches_game_bible = False` if ANY of the above deficiencies exist, and "
             "populate `deficiencies` with concrete `SceneDeficiencyItem` entries targeting the exact `.gd` file and class/method "
@@ -2234,9 +2237,8 @@ class LeadGameplaySWEAgent:
             f"--- COMPILER / RUNTIME DIAGNOSTICS (Valid={is_valid}) ---\n"
             + ("\n".join(diag_summary_lines) if diag_summary_lines else "None (0 script errors)")
             + f"\n{last_frame_summary}\n\n"
-            f"--- TERRAIN CODE SLICE (scenes.gd -> TerraceRenderer._draw) ---\n{terrain_slice}\n\n"
-            f"--- SPIRES CODE SLICE (scenes.gd -> WorldSpireLayer._draw) ---\n{spires_slice}\n\n"
-            f"--- AUDIO CODE SLICE (main.gd -> _setup_audio & acoustics_hum_setup) ---\n{audio_slice}\n\n"
+            f"--- SCENE RENDERING CODE SLICE (scenes.gd) ---\n{terrain_slice}\n\n"
+            f"--- AUDIO CODE SLICE (main.gd) ---\n{audio_slice}\n\n"
             f"--- MASTER PRODUCTION STRATEGY ---\n{strategy.model_dump_json(indent=2)[:6000]}\n\n"
             f"--- GAME BIBLE EXCERPT ---\n{bible_excerpt}\n\n"
             f"--- CARTRIDGE SYMBOL INDEX ---\n{symbol_index}\n\n"
@@ -2354,27 +2356,12 @@ class LeadGameplaySWEAgent:
                             symbol_query=raw_sym,
                         )
                     )
-                if target_fname == "scenes.gd" and "TerraceRenderer" in raw_sym:
-                    pre_reqs.append(
-                        CodeSliceRequest(
-                            deliberation="Also inspect SceneAssets.draw_tiled_platform helper called by TerraceRenderer",
-                            filename="scenes.gd",
-                            symbol_query="class SceneAssets",
-                        )
-                    )
                 if target_fname == "main.gd":
                     pre_reqs.append(
                         CodeSliceRequest(
                             deliberation="Inspect audio setup and synthesis functions in main.gd",
                             filename="main.gd",
                             symbol_query="func _setup_audio",
-                        )
-                    )
-                    pre_reqs.append(
-                        CodeSliceRequest(
-                            deliberation="Inspect _synthesize_buzz and _synthesize_sine_loop in main.gd",
-                            filename="main.gd",
-                            symbol_query="func _synthesize_buzz",
                         )
                     )
 
@@ -2401,9 +2388,400 @@ class LeadGameplaySWEAgent:
             healed = self._verify_and_heal_godot_syntax_and_probes(c_dir)
             updated_files.update(healed)
 
-        # Final 60-tick simulation capture so playtest_t0.png and playtest_tend.png are fresh
+        # Final 60-tick simulation capture so playtest_t0.png, playtest_tend.png, and playtest_collision_overlay.png are fresh
         sim_final = GodotHeadlessSimulator(c_dir, capture_viewport=True, max_ticks=60)
         sim_final.run_until_complete()
+
+        return updated_files
+
+    # -----------------------------------------------------------------------
+    # Recursive Hierarchical Decomposition + Atomic Godot TDD & 4-Tier Render Verification
+    # -----------------------------------------------------------------------
+
+    def decompose_track_into_atomic_units(
+        self,
+        c_dir: Path,
+        track_or_scope_id: str,
+        description: str,
+        defect_context: str = "",
+    ) -> TrackAtomicDecompositionPlan:
+        """Decomposes a RequirementTrack or cartridge defect scope into 2 to 4 granular,
+        independently verifiable `AtomicWorkUnit` items, each with explicit `unsolved_baseline`,
+        `negative_counterfactual`/`spatial_boundary`, and `positive_causal` invariants.
+        """
+        if self.client is None or not self._is_live_genai_client():
+            return TrackAtomicDecompositionPlan(
+                deliberation=f"Offline/mock atomic decomposition for {track_or_scope_id}.",
+                track_id=track_or_scope_id,
+                atomic_units=[],
+            )
+
+        from google.genai import types
+        symbol_index = self._build_cartridge_symbol_index(c_dir)
+        eng_blueprint_block = ""
+        bible_file = c_dir / "game_bible.json"
+        if bible_file.is_file():
+            try:
+                b_data = json.loads(bible_file.read_text(encoding="utf-8"))
+                eng_list = b_data.get("technical_architecture_blueprint") or []
+                if eng_list:
+                    eng_lines = [
+                        f"  * [{e.get('mechanic_id', '')}] {e.get('title', '')} (modules={e.get('target_gd_modules', [])}): "
+                        f"Nodes/Colliders={e.get('godot_node_and_collider_architecture', '')} | "
+                        f"State Machine={e.get('state_machine_and_input_contract', '')} | "
+                        f"Invariants={e.get('falsifiable_test_invariants', [])}"
+                        for e in eng_list
+                        if isinstance(e, dict)
+                    ]
+                    if eng_lines:
+                        eng_blueprint_block = (
+                            "WRITERS' ROOM TECHNICAL ARCHITECTURE BLUEPRINT (from GameplaySystemsEngineer):\n"
+                            + "\n".join(eng_lines)
+                            + "\n\n"
+                        )
+            except Exception:
+                pass
+        prompt = (
+            f"You are the Lead Systems & Gameplay Architect decomposing track/scope '{track_or_scope_id}' into "
+            f"2 to 4 granular, self-contained Atomic Work Units (`TrackAtomicDecompositionPlan`).\n\n"
+            f"TRACK / SCOPE DESCRIPTION:\n{description}\n\n"
+            f"{eng_blueprint_block}"
+            f"{f'ACTIVE REJECTION / DEFECT CONTEXT TO RESOLVE:{chr(10)}{defect_context}{chr(10)}{chr(10)}' if defect_context else ''}"
+            f"CARTRIDGE SYMBOL INDEX (Current .gd files & line numbers):\n{symbol_index}\n\n"
+            f"MANDATORY DECOMPOSITION RULES:\n"
+            f"1. RATIONALE-FIRST (Rule 4): Provide `deliberation` FIRST in every schema object.\n"
+            f"2. ATOMIC GRANULARITY: Each `AtomicWorkUnit` must isolate ONE concrete system slice aligned with the Technical Architecture Blueprint (e.g., Unit 1: Physical Walkable Terrain & Horizon/Chasm Colliders in `scenes.gd`; Unit 2: Unsolved t=0 State & True Source-Connected Graph/Mechanic Solver in `mechanics.gd`; Unit 3: Multi-Stage Obstacle & Causal Progression Loop in `main.gd` + `mechanics.gd`).\n"
+            f"3. THREE MANDATORY INVARIANT CLASSES PER UNIT (`invariants`):\n"
+            f"   - `unsolved_baseline`: Proves that at initialization (t=0) and during passive zero-input frames, the puzzle/level/target is NOT pre-solved (`is_completed == false`, target mechanism dormant).\n"
+            f"   - `spatial_boundary` or `negative_counterfactual`: Proves that invalid actions or out-of-bounds movements are blocked (e.g., walking toward non-walkable backdrop/chasm regions is physically blocked by a `StaticBody2D` barrier; activating a disconnected node not linked to a source yields 0.0 flow/power).\n"
+            f"   - `positive_causal`: Proves that executing the valid connected sequence of player operations causally transitions the system state and advances progression.\n"
+            f"4. VERIFICATION MODALITY: Set `verification_modality` to `'behavioral_and_scene_overlay'` for spatial/scene units, `'behavioral_and_animation_strip'` for animated character/rig units, or `'behavioral_and_level_progression'` for gameplay progression units.\n"
+        )
+
+        resp = self.client.models.generate_content(
+            model=self.model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=TrackAtomicDecompositionPlan,
+            ),
+        )
+        plan = TrackAtomicDecompositionPlan.model_validate_json(resp.text)
+        self.last_deliberation = plan.deliberation
+        art_dir = c_dir / "artifacts"
+        art_dir.mkdir(parents=True, exist_ok=True)
+        (art_dir / f"atomic_plan_{track_or_scope_id}.json").write_text(
+            plan.model_dump_json(indent=2), encoding="utf-8"
+        )
+        return plan
+
+    def synthesize_atomic_godot_test(
+        self,
+        c_dir: Path,
+        unit: AtomicWorkUnit,
+        prior_test_error: str = "",
+    ) -> Path:
+        """Synthesizes an executable Godot 4 `extends SceneTree` unit test (`tests/test_<unit.unit_id>.gd`)
+        that tests all `AtomicInvariantSpec` items on `unit` and emits `[ATOMIC_ASSERT_PASS]` / `[ATOMIC_ASSERT_FAIL]`.
+        """
+        from google.genai import types
+        from engine.godot_runtime import run_godot_command
+        from engine.sim.godot_verifier import parse_godot_stderr
+
+        tests_dir = c_dir / "tests"
+        tests_dir.mkdir(parents=True, exist_ok=True)
+        safe_id = re.sub(r"[^a-zA-Z0-9_]", "_", unit.unit_id)
+        rel_path = f"tests/test_{safe_id}.gd"
+        dest_path = c_dir / rel_path
+
+        slices: List[str] = []
+        for tf in unit.target_files[:3]:
+            fname = Path(tf).name
+            if (c_dir / fname).is_file():
+                if unit.target_classes_and_methods:
+                    for sym in unit.target_classes_and_methods[:3]:
+                        slices.append(
+                            self._extract_code_slice(
+                                c_dir,
+                                CodeSliceRequest(
+                                    deliberation=f"Inspect {sym} in {fname} for test synthesis",
+                                    filename=fname,
+                                    symbol_query=sym,
+                                ),
+                            )
+                        )
+                else:
+                    slices.append(
+                        self._extract_code_slice(
+                            c_dir,
+                            CodeSliceRequest(
+                                deliberation=f"Inspect top of {fname}",
+                                filename=fname,
+                                start_line=1,
+                                end_line=90,
+                            ),
+                        )
+                    )
+
+        symbol_index = self._build_cartridge_symbol_index(c_dir)
+        invariants_json = json.dumps([inv.model_dump() for inv in unit.invariants], indent=2)
+
+        prompt = (
+            f"You are the Lead Godot 4 Test Engineer synthesizing an executable headless Godot 4.3 unit test script "
+            f"(`{rel_path}`) for Atomic Work Unit '{unit.unit_id}' ({unit.title}).\n\n"
+            f"SINGLE RESPONSIBILITY SCOPE: {unit.single_responsibility_scope}\n"
+            f"INVARIANTS TO TEST:\n{invariants_json}\n\n"
+            f"{f'PREVIOUS TEST SCRIPT ERROR TO FIX:{chr(10)}{prior_test_error}{chr(10)}{chr(10)}' if prior_test_error else ''}"
+            f"CARTRIDGE SYMBOL INDEX:\n{symbol_index}\n\n"
+            f"RELEVANT CARTRIDGE CODE SLICES:\n" + "\n\n".join(slices) + "\n\n"
+            f"STRICT GODOT 4 TEST SCRIPT RULES:\n"
+            f"1. The script MUST start with `extends SceneTree` and run inside `func _initialize() -> void:`.\n"
+            f"2. Load cartridge scripts via `const Mechanics = preload(\"res://mechanics.gd\")`, `const Scenes = preload(\"res://scenes.gd\")`, `const Entities = preload(\"res://entities.gd\")`, or instantiate `load(\"res://main.tscn\").instantiate()` and add it to `root`.\n"
+            f"3. For EVERY invariant in `invariants`, execute the real setup and action sequence against the cartridge classes/nodes, evaluate the condition, and print:\n"
+            f"   - If passed: `print(\"[ATOMIC_ASSERT_PASS] \" + inv_id + \" | \" + inv_type + \" | \" + details)`\n"
+            f"   - If failed: `print(\"[ATOMIC_ASSERT_FAIL] \" + inv_id + \" | \" + inv_type + \" | \" + details)`\n"
+            f"4. Never fake or hardcode a pass! Every `[ATOMIC_ASSERT_PASS]` MUST be guarded by a real `if <condition>: ... else: print(\"[ATOMIC_ASSERT_FAIL] ...\")` check on actual state/positions/volumes returned by the cartridge objects.\n"
+            f"5. Avoid `:=` type inference on untyped expressions (use `var x = ...`). Use tabs (`\\t`) for indentation.\n"
+            f"6. At the end of `_initialize()`, call `quit(0)` if all assertions passed, or `quit(1)` if any assertion failed.\n"
+            f"7. MANDATORY (Rule 4): Provide `deliberation` FIRST in the JSON response."
+        )
+
+        resp = self.client.models.generate_content(
+            model=self.model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=AtomicTestSynthesisPayload,
+            ),
+        )
+        payload = AtomicTestSynthesisPayload.model_validate_json(resp.text)
+        code = payload.test_gdscript_code.strip()
+        if code.startswith("```"):
+            code = re.sub(r"^```[a-zA-Z]*\s*", "", code)
+            code = re.sub(r"\s*```$", "", code).strip()
+        dest_path.write_text(code + "\n", encoding="utf-8")
+
+        # Verify test script syntax and self-heal if needed
+        chk = run_godot_command(
+            ["--path", str(c_dir), "--check-only", "--script", f"res://{rel_path}"],
+            cwd=c_dir,
+            timeout=15.0,
+            headless=True,
+        )
+        diags = parse_godot_stderr(c_dir, chk.stderr)
+        if chk.returncode != 0 or diags:
+            err_str = "\n".join(f"Line {d.line_number}: {d.error_message}" for d in diags) or chk.stderr
+            peer_ctx = self._extract_gd_peer_signatures(c_dir)
+            repaired_test = self.repair_godot_module(rel_path, code, err_str, peer_context=peer_ctx)
+            dest_path.write_text(repaired_test.strip() + "\n", encoding="utf-8")
+
+        return dest_path
+
+    def verify_scene_unit_visually(
+        self,
+        c_dir: Path,
+        unit: AtomicWorkUnit,
+    ) -> SceneUnitVisualVerdict:
+        """Tier 3 & Tier 4 Visual, Animation Strip, and Physics Collision Overlay Verification for an AtomicWorkUnit."""
+        from engine.sim.atomic_runner import GodotAtomicTestRunner
+
+        render_info = GodotAtomicTestRunner.render_scene_and_collision_overlay(
+            cartridge_dir=c_dir,
+            unit_id=unit.unit_id,
+            ticks=40,
+        )
+        scene_audit = render_info.get("scene_audit") or {}
+        defects: List[str] = []
+        remedies: List[str] = []
+
+        if scene_audit.get("passive_auto_win_detected"):
+            reason = scene_audit.get("passive_win_reason") or "Game auto-solved during passive zero-input window."
+            defects.append(f"PASSIVE AUTO-WIN DEFECT: {reason}")
+            remedies.append(
+                "Remove any t=0 pre-carved/pre-solved initialization so the level starts unsolved and requires player action."
+            )
+
+        if scene_audit.get("unbounded_sky_or_void_detected"):
+            b_reason = scene_audit.get("boundary_violation_reason") or "Player walked into sky backdrop or uncollided void."
+            defects.append(f"VISUAL-TO-COLLIDER BOUNDARY DEFECT: {b_reason}")
+            remedies.append(
+                "Add StaticBody2D / CollisionPolygon2D barriers along the walkable shelf edges (especially the north horizon y=walkable_min_y and chasm edges) so the player cannot walk into the sky or chasm."
+            )
+
+        if unit.verification_modality == "behavioral_and_animation_strip":
+            anim_info = GodotAtomicTestRunner.render_in_engine_animation_strip(c_dir, unit_id=unit.unit_id)
+            rej_anims = anim_info.get("rejected_animations") or []
+            if rej_anims:
+                defects.append(f"Rejected static or defective animations: {rej_anims}")
+                remedies.append("Ensure all sprite_sheet and articulated_rig animations have distinct frame progression.")
+
+        if unit.verification_modality == "behavioral_and_level_progression":
+            prog_info = GodotAtomicTestRunner.render_level_progression_states(c_dir, stage_id=unit.unit_id)
+            if not prog_info.get("visually_distinct_states", True):
+                defects.append("Level t0 and progression renders are visually identical (zero visible world feedback).")
+                remedies.append("Ensure active gameplay and stage completion produce visible world/HUD state changes.")
+
+        clean_p = render_info.get("clean_render_path")
+        overlay_p = render_info.get("collision_overlay_path")
+
+        if self._is_live_genai_client() and clean_p and Path(clean_p).is_file():
+            try:
+                from google.genai import types
+                parts: List[Any] = [
+                    types.Part.from_bytes(data=Path(clean_p).read_bytes(), mime_type="image/png"),
+                ]
+                if overlay_p and Path(overlay_p).is_file():
+                    parts.append(types.Part.from_bytes(data=Path(overlay_p).read_bytes(), mime_type="image/png"))
+                parts.append(
+                    f"You are the Studio Lead Visual & Spatial Physics QA Critic inspecting Atomic Work Unit '{unit.unit_id}' ({unit.title}).\n"
+                    f"Scope: {unit.single_responsibility_scope}\n"
+                    f"Attached Image 1: Clean Godot 4 viewport render (`scene_{unit.unit_id}_clean.png`).\n"
+                    f"Attached Image 2 (if present): Live Physics Collision & Walkability Overlay (`scene_{unit.unit_id}_collision_overlay.png`), "
+                    f"where StaticBody2D colliders are drawn in red/magenta, walkable shelves in green outline, and actor in cyan.\n"
+                    f"Deterministic Scene Audit Telemetry: {json.dumps(scene_audit)}\n"
+                    f"Deterministic Defects Already Flagged: {defects}\n\n"
+                    f"Evaluate:\n"
+                    f"1. `visual_to_collider_alignment_passed`: Do the red StaticBody2D colliders in the overlay properly bound the walkable green plateau edges (blocking the northern sky backdrop and any chasm gaps), rather than only placing a giant rectangle around the outer screen?\n"
+                    f"2. `spatial_depth_and_proportion_passed`: Are sprites, terrain tiles, and landmarks properly proportioned and layered?\n"
+                    f"3. `state_progression_visibility_passed`: Does the scene start unsolved and show clear diegetic feedback?\n"
+                    f"MANDATORY (Rule 4): Provide `deliberation` FIRST, and `accepted` LAST."
+                )
+                resp = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=parts,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=SceneUnitVisualVerdict,
+                    ),
+                )
+                if resp.text:
+                    verdict = SceneUnitVisualVerdict.model_validate_json(resp.text)
+                    if defects:
+                        verdict.accepted = False
+                        for d in defects:
+                            if d not in verdict.blocking_visual_or_spatial_defects:
+                                verdict.blocking_visual_or_spatial_defects.append(d)
+                        for r in remedies:
+                            if r not in verdict.remediation_instructions:
+                                verdict.remediation_instructions.append(r)
+                        if scene_audit.get("unbounded_sky_or_void_detected"):
+                            verdict.visual_to_collider_alignment_passed = False
+                        if scene_audit.get("passive_auto_win_detected"):
+                            verdict.state_progression_visibility_passed = False
+                    return verdict
+            except Exception as exc:
+                logger.warning("Multimodal scene unit verification warning for '%s': %s", unit.unit_id, exc)
+
+        passed = len(defects) == 0
+        return SceneUnitVisualVerdict(
+            deliberation=f"Evaluated scene & collision overlay for unit '{unit.unit_id}': defects={defects}.",
+            unit_id=unit.unit_id,
+            visual_to_collider_alignment_passed=not bool(scene_audit.get("unbounded_sky_or_void_detected")),
+            spatial_depth_and_proportion_passed=True,
+            state_progression_visibility_passed=not bool(scene_audit.get("passive_auto_win_detected")),
+            blocking_visual_or_spatial_defects=defects,
+            remediation_instructions=remedies,
+            accepted=passed,
+        )
+
+    def implement_and_verify_atomic_unit(
+        self,
+        c_dir: Path,
+        unit: AtomicWorkUnit,
+        max_tdd_iterations: int = 3,
+    ) -> Dict[str, Path]:
+        """Executes the closed-loop Atomic Build -> Headless Godot Unit Test (`test_<unit_id>.gd`)
+        -> Visual/Collision/Animation Render Verification -> Scoped PEV Repair cycle for a single `AtomicWorkUnit`.
+        """
+        if self.client is None or not self._is_live_genai_client():
+            return {}
+
+        from engine.sim.atomic_runner import GodotAtomicTestRunner
+        from engine.sim.godot_verifier import verify_godot_cartridge_syntax
+
+        updated_files: Dict[str, Path] = {}
+        test_path = self.synthesize_atomic_godot_test(c_dir, unit)
+        rel_test = f"tests/{test_path.name}"
+
+        for tdd_iter in range(1, max_tdd_iterations + 1):
+            test_res = GodotAtomicTestRunner.run_atomic_test(c_dir, rel_test, unit_id=unit.unit_id)
+
+            # If the test script itself failed to compile or emitted zero assertions / runtime error in test script, regenerate test script
+            if (
+                not test_res.syntax_valid
+                or any(fa.invariant_id in ("NO_ASSERTIONS_EMITTED", "RUNTIME_ERROR", "SYNTAX_CHECK") for fa in test_res.failed_assertions)
+            ):
+                err_detail = "; ".join(fa.message for fa in test_res.failed_assertions) or test_res.stderr
+                test_path = self.synthesize_atomic_godot_test(c_dir, unit, prior_test_error=err_detail)
+                test_res = GodotAtomicTestRunner.run_atomic_test(c_dir, rel_test, unit_id=unit.unit_id)
+
+            vis_verdict = self.verify_scene_unit_visually(c_dir, unit)
+
+            if test_res.passed and vis_verdict.accepted:
+                # Verify cumulative regression across all previously sealed atomic tests
+                suite_res = GodotAtomicTestRunner.run_all_atomic_tests(c_dir)
+                if suite_res.all_passed:
+                    logger.info(
+                        "Atomic unit '%s' passed all behavioral assertions (%d) and visual/collision checks on iteration %d!",
+                        unit.unit_id,
+                        len(test_res.assertions),
+                        tdd_iter,
+                    )
+                    break
+
+            # Build surgical PEV remediation brief from exact failing assertions & visual/collider defects
+            fail_lines = [
+                f"- [{fa.invariant_id} ({fa.invariant_type})]: {fa.message}"
+                for fa in test_res.failed_assertions
+            ]
+            for vd in vis_verdict.blocking_visual_or_spatial_defects:
+                fail_lines.append(f"- [VISUAL/COLLIDER AUDIT]: {vd}")
+            for rem in vis_verdict.remediation_instructions:
+                fail_lines.append(f"  * Remedy: {rem}")
+
+            pre_slices: List[CodeSliceRequest] = []
+            for tf in unit.target_files[:3]:
+                fname = Path(tf).name
+                if unit.target_classes_and_methods:
+                    for sym in unit.target_classes_and_methods[:3]:
+                        pre_slices.append(
+                            CodeSliceRequest(
+                                deliberation=f"Inspect {sym} in {fname} for atomic unit {unit.unit_id}",
+                                filename=fname,
+                                symbol_query=sym,
+                            )
+                        )
+                else:
+                    pre_slices.append(
+                        CodeSliceRequest(
+                            deliberation=f"Inspect {fname} for atomic unit {unit.unit_id}",
+                            filename=fname,
+                            start_line=1,
+                            end_line=90,
+                        )
+                    )
+
+            atomic_defect_brief = (
+                f"ATOMIC WORK UNIT TDD & VISUAL/COLLIDER REMEDIATION (Unit '{unit.unit_id}': {unit.title} — Iteration {tdd_iter}/{max_tdd_iterations}):\n"
+                f"Single Responsibility Scope: {unit.single_responsibility_scope}\n"
+                f"Target Files: {unit.target_files}\n"
+                f"Target Classes/Methods: {unit.target_classes_and_methods}\n"
+                f"FAILING ATOMIC ASSERTIONS & VISUAL/COLLIDER CHECKS:\n"
+                + ("\n".join(fail_lines) if fail_lines else "Ensure all unit invariants pass.")
+                + "\n"
+            )
+
+            _, cur_diags = verify_godot_cartridge_syntax(c_dir)
+            patched = self.debug_and_patch_pev_cycle(
+                c_dir=c_dir,
+                defect_summary=atomic_defect_brief,
+                initial_diagnostics=cur_diags,
+                pre_slice_requests=pre_slices,
+                max_pev_cycles=2,
+            )
+            updated_files.update(patched)
+            healed = self._verify_and_heal_godot_syntax_and_probes(c_dir)
+            updated_files.update(healed)
 
         return updated_files
 
@@ -2413,9 +2791,10 @@ class LeadGameplaySWEAgent:
         rejection_trace: Any,
         req_spec: Optional[GameRequirementsSpec] = None,
     ) -> Dict[str, Path]:
-        """Repairs Godot 4 .gd modules using the PEV (Plan/Research -> Execute Surgical Patch -> Verify)
-        debugging loop and Per-Scene Critique & Re-Strategizing loop so the agent inspects only relevant
-        code slices rather than full-file dumps.
+        """Repairs Godot 4 .gd modules using:
+        1. Tier 1 & Tier 2 Asset & Animation Render-Verify Audit (`verify_all_catalog_assets_and_animations`),
+        2. Recursive Atomic Decomposition (`decompose_track_into_atomic_units`) + Headless Godot Atomic TDD & Collision Overlay Loop (`implement_and_verify_atomic_unit`),
+        3. PEV (Plan/Research -> Execute Surgical Patch -> Verify) debugging loop and Per-Scene Critique & Re-Strategizing loop.
         """
         if self.client is None:
             raise StudioAgentError("LeadGameplaySWEAgent requires an active google.genai Client (Rule 5)")
@@ -2425,6 +2804,16 @@ class LeadGameplaySWEAgent:
         from engine.sim.godot_verifier import verify_godot_cartridge_syntax
 
         results: Dict[str, Path] = {}
+
+        # Step 0: Render and validate every asset plate (3x3 tile grids, alpha cutouts) & animation strip in the catalog
+        try:
+            from engine.studio.asset_library import AssetLibraryManager
+            lib_mgr = AssetLibraryManager(cartridge_dir=c_dir, client=self.client)
+            lib_mgr.export_godot_studio_helper()
+            if self._is_live_genai_client():
+                lib_mgr.verify_all_catalog_assets_and_animations(auto_remediate=True)
+        except Exception as exc:
+            logger.warning("Catalog asset & animation verification warning: %s", exc)
 
         ast_insp = CandidateASTInspector()
         dir_ast = ast_insp.inspect_directory(c_dir)
@@ -2448,7 +2837,7 @@ class LeadGameplaySWEAgent:
 
         playtest_image_parts: List[Any] = []
         if self._is_live_genai_client():
-            for cap_name in ("playtest_t0.png", "playtest_tend.png"):
+            for cap_name in ("playtest_t0.png", "playtest_tend.png", "playtest_collision_overlay.png"):
                 cap_path = c_dir / "assets" / "playtest_captures" / cap_name
                 if cap_path.is_file():
                     try:
@@ -2472,25 +2861,61 @@ class LeadGameplaySWEAgent:
             f"{sign_off_context}"
         )
 
-        pev_patched = self.debug_and_patch_pev_cycle(
-            c_dir=c_dir,
-            defect_summary=defect_summary,
-            initial_diagnostics=initial_diags,
-            multimodal_parts=playtest_image_parts,
-            max_pev_cycles=4,
-        )
-        results.update(pev_patched)
+        # Step 1: Decompose rejection defects into Atomic Work Units and run Atomic Godot TDD + Visual/Collider Verification
+        atomic_all_verified = False
+        if self._is_live_genai_client():
+            try:
+                from engine.sim.atomic_runner import GodotAtomicTestRunner
+                atomic_plan = self.decompose_track_into_atomic_units(
+                    c_dir=c_dir,
+                    track_or_scope_id="holistic_repair",
+                    description=f"Resolve all Challenger & Spatial/Simulation defects for cartridge {c_dir.name}",
+                    defect_context=defect_summary,
+                )
+                for unit in atomic_plan.atomic_units[:4]:
+                    unit_updated = self.implement_and_verify_atomic_unit(
+                        c_dir=c_dir,
+                        unit=unit,
+                        max_tdd_iterations=3,
+                    )
+                    results.update(unit_updated)
 
-        if self._is_live_genai_client() and (c_dir / "game_bible.json").is_file():
-            scene_refined = self.execute_scene_strategy_and_refine_loop(
+                suite_post = GodotAtomicTestRunner.run_all_atomic_tests(c_dir)
+                render_post = GodotAtomicTestRunner.render_scene_and_collision_overlay(c_dir, unit_id="post_atomic", ticks=40)
+                sa_post = render_post.get("scene_audit") or {}
+                if (
+                    suite_post.total_tests > 0
+                    and suite_post.all_passed
+                    and not sa_post.get("passive_auto_win_detected")
+                    and not sa_post.get("unbounded_sky_or_void_detected")
+                ):
+                    atomic_all_verified = True
+            except Exception as atomic_exc:
+                logger.warning("Atomic decomposition & TDD loop encountered warning: %s", atomic_exc)
+
+        # Step 2: Run PEV surgical cycle only if diagnostics or unresolved spatial/causal defects remain
+        _, post_atomic_diags = verify_godot_cartridge_syntax(c_dir)
+        if not atomic_all_verified or post_atomic_diags:
+            pev_patched = self.debug_and_patch_pev_cycle(
                 c_dir=c_dir,
-                max_scene_iterations=2,
+                defect_summary=defect_summary,
+                initial_diagnostics=post_atomic_diags or initial_diags,
+                multimodal_parts=playtest_image_parts,
+                max_pev_cycles=3,
             )
-            results.update(scene_refined)
+            results.update(pev_patched)
+
+            if self._is_live_genai_client() and (c_dir / "game_bible.json").is_file():
+                scene_refined = self.execute_scene_strategy_and_refine_loop(
+                    c_dir=c_dir,
+                    max_scene_iterations=2,
+                )
+                results.update(scene_refined)
 
         healed = self._verify_and_heal_godot_syntax_and_probes(c_dir)
         results.update(healed)
         return results
+
 
     def _verify_and_heal_godot_syntax_and_probes(self, c_dir: Path) -> Dict[str, Path]:
         """Verifies Godot 4 syntax & 2-tick runtime execution across all .gd files in c_dir.

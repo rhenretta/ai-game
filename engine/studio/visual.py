@@ -15,6 +15,8 @@ from pathlib import Path
 import random
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
+import cv2
+import numpy as np
 from PIL import Image, ImageDraw
 
 from engine.assets.palette import (
@@ -24,17 +26,23 @@ from engine.assets.palette import (
     quantize_image_to_indexed,
 )
 from engine.studio.models import (
+    DEFAULT_STUDIO_MODEL,
     AnimationStateSpec,
+    AnimationValidationVerdict,
     ArticulatedPartSpec,
     AssetManifestSpec,
     AssetRequirement,
+    AssetVisualValidationVerdict,
     CharacterSheet,
     GameRequirementsSpec,
+    KeyframeTransformSpec,
+    PartKeyframeTrackSpec,
     StudioAgentError,
     VisualMockupArtifact,
 )
 
 logger = logging.getLogger("VisualArtSpriteDesignerAgent")
+
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
@@ -556,44 +564,60 @@ class ProceduralSpriteRenderer:
 class VisualArtSpriteDesignerAgent:
     """Specialist Agent producing 16-color character portraits, sprites, and tiles."""
     deliberation: str = "Visual art sprite designer agent generating 16-color Style Bible assets."
+    _rembg_session: Optional[Any] = None
 
     def __init__(
         self,
         client: Optional[Any] = None,
         model_name: str = "gemini-3.1-flash-lite-image",
+        text_model_name: str = DEFAULT_STUDIO_MODEL,
     ):
         self.client = client
         self.model_name = model_name
+        self.text_model_name = text_model_name
         self.renderer = ProceduralSpriteRenderer()
+
+    @classmethod
+    def _get_rembg_session(cls) -> Optional[Any]:
+        if cls._rembg_session is None:
+            try:
+                from rembg import new_session
+                cls._rembg_session = new_session("u2netp")
+            except Exception as exc:
+                logger.debug("rembg session initialization skipped: %s", exc)
+        return cls._rembg_session
 
     @staticmethod
     def quantize_color(rgb: Tuple[int, int, int]) -> Tuple[int, int, int]:
         """Quantizes an arbitrary RGB tuple to the nearest Euclidean 16-color entry."""
         return quantize_rgb(rgb)
 
-    @staticmethod
+    @classmethod
     def extract_clean_alpha_sprite(
+        cls,
         raw_img: Union[Image.Image, bytes, bytearray],
         target_size: Tuple[int, int] = (64, 64),
         strip_border_frame: bool = True,
         pad_ratio: float = 0.06,
         target_dimensions: Optional[Tuple[int, int]] = None,
+        size: Optional[Tuple[int, int]] = None,
         **_kwargs: Any,
     ) -> Image.Image:
-        """Extracts a clean 32-bit RGBA sprite or portrait from a raw synthesized image.
-        1. Detects and strips outer rectangular picture-frame borders (e.g. beige/dark frames around portraits).
-        2. Runs multi-seed perimeter + inset-corner flood-fill background removal with soft alpha feathering.
-        3. Auto-crops to the tight non-transparent subject bounding box and centers inside target_size.
+        """Extracts a clean 32-bit RGBA foreground cutout from a synthesized image.
+        1. Uses neural salient-object segmentation (`rembg` U2-Net) + perimeter-connected background flood-fill
+           to isolate the foreground subject without hand-rolled interior white/eye hole-punching heuristics.
+        2. Clears any residual pure chroma-key (`#FF00FF`) background pockets if a chroma backdrop was used.
+        3. Auto-crops to the tight non-transparent foreground bounding box and centers inside `target_size`.
         """
         if isinstance(raw_img, (bytes, bytearray)):
             raw_img = Image.open(io.BytesIO(raw_img))
-        eff_size = target_dimensions if target_dimensions is not None else target_size
+        eff_size = target_dimensions if target_dimensions is not None else (size if size is not None else target_size)
         w, h = max(1, int(eff_size[0])), max(1, int(eff_size[1]))
         work_w, work_h = 256, 256
         work_img = raw_img.convert("RGBA").resize((work_w, work_h), Image.Resampling.LANCZOS)
         px = work_img.load()
 
-        # Step 1: Detect if there is an outer decorative frame/border and determine interior background seeds
+        # Step 1: Perimeter seed collection for outer background connected component
         seed_coords: List[Tuple[int, int]] = []
         for x in range(0, work_w, 4):
             seed_coords.append((x, 0))
@@ -603,8 +627,7 @@ class VisualArtSpriteDesignerAgent:
             seed_coords.append((work_w - 1, y))
 
         if strip_border_frame:
-            # Sample inset rings (3%, 6%, 10% inward from corners/edges) in case an outer border frame encloses a solid backdrop
-            for frac in (0.03, 0.06, 0.10):
+            for frac in (0.03, 0.06):
                 ix = int(work_w * frac)
                 iy = int(work_h * frac)
                 inset_pts = [
@@ -612,32 +635,16 @@ class VisualArtSpriteDesignerAgent:
                     (work_w - 1 - ix, iy),
                     (ix, work_h - 1 - iy),
                     (work_w - 1 - ix, work_h - 1 - iy),
-                    (work_w // 2, iy),
-                    (ix, work_h // 2),
-                    (work_w - 1 - ix, work_h // 2),
                 ]
-                # Check if the four inset corners share a roughly consistent backdrop color
                 c0 = px[ix, iy][:3]
                 corners_match = sum(
                     1
-                    for pt in inset_pts[:4]
-                    if ((px[pt[0], pt[1]][0] - c0[0]) ** 2 + (px[pt[0], pt[1]][1] - c0[1]) ** 2 + (px[pt[0], pt[1]][2] - c0[2]) ** 2) <= 45 * 45
+                    for pt in inset_pts
+                    if ((px[pt[0], pt[1]][0] - c0[0]) ** 2 + (px[pt[0], pt[1]][1] - c0[1]) ** 2 + (px[pt[0], pt[1]][2] - c0[2]) ** 2) <= 35 * 35
                 )
                 if corners_match >= 3:
                     seed_coords.extend(inset_pts)
-                    # Also clear the thin outer frame band outside (ix, iy) along the 4 edges if corners matched
-                    for bx in range(work_w):
-                        for by in range(iy):
-                            seed_coords.append((bx, by))
-                        for by in range(work_h - iy, work_h):
-                            seed_coords.append((bx, by))
-                    for by in range(work_h):
-                        for bx in range(ix):
-                            seed_coords.append((bx, by))
-                        for bx in range(work_w - ix, work_w):
-                            seed_coords.append((bx, by))
 
-        # Collect dominant background reference colors from the seeds
         bg_samples: List[Tuple[int, int, int]] = []
         for sx, sy in seed_coords[:32]:
             r, g, b, a = px[sx, sy]
@@ -646,7 +653,7 @@ class VisualArtSpriteDesignerAgent:
         if not bg_samples:
             bg_samples = [(0, 0, 0)]
 
-        # Step 2: Multi-seed flood-fill background removal
+        # Step 2: Perimeter-connected flood fill (never punches disconnected interior eyes/highlights)
         visited = set()
         stack: List[Tuple[int, int, Tuple[int, int, int]]] = []
         for sx, sy in seed_coords:
@@ -655,8 +662,8 @@ class VisualArtSpriteDesignerAgent:
                 continue
             stack.append((sx, sy, (r, g, b)))
 
-        tol_hard_sq = 28 * 28
-        tol_soft_sq = 40 * 40
+        tol_hard_sq = 26 * 26
+        tol_soft_sq = 38 * 38
 
         while stack:
             cx, cy, ref_rgb = stack.pop()
@@ -667,8 +674,6 @@ class VisualArtSpriteDesignerAgent:
             if a == 0:
                 continue
 
-            # Compare against BOTH local neighbor reference AND global corner background samples
-            # so flood-fill never drifts across gradients into character clothing or interiors.
             dist_local_sq = (r - ref_rgb[0]) ** 2 + (g - ref_rgb[1]) ** 2 + (b - ref_rgb[2]) ** 2
             dist_global_sq = min(
                 (r - br) ** 2 + (g - bg) ** 2 + (b - bb) ** 2
@@ -690,12 +695,11 @@ class VisualArtSpriteDesignerAgent:
                     (cx, cy - 1, next_ref),
                 ])
             elif effective_dist_sq <= tol_soft_sq:
-                # Feather edge alpha for clean anti-aliased silhouette
-                ratio = (math.sqrt(effective_dist_sq) - 28.0) / 12.0
+                ratio = (math.sqrt(effective_dist_sq) - 26.0) / 12.0
                 new_a = max(0, min(255, int(a * ratio)))
                 px[cx, cy] = (r, g, b, new_a)
 
-        # Step 2b: Clear enclosed chroma-key magenta pockets (e.g., between character legs/arms) and despill fringes
+        # Step 2b: Clear pure #FF00FF chroma-key pockets and despill chroma fringes
         for iy in range(work_h):
             for ix in range(work_w):
                 r, g, b, a = px[ix, iy]
@@ -705,16 +709,59 @@ class VisualArtSpriteDesignerAgent:
                 if r > 175 and b > 175 and g < 95 and magenta_excess > 105:
                     px[ix, iy] = (0, 0, 0, 0)
                 elif r > 140 and b > 140 and g < 110 and magenta_excess > 65:
-                    # Despill magenta fringe along anti-aliased silhouette edges
                     clamped_rb = min(r, b, g + 35)
                     new_a = max(0, min(a, int(a * 0.55)))
                     px[ix, iy] = (clamped_rb, g, clamped_rb, new_a)
+
+        rgba_np = np.array(work_img, dtype=np.uint8)
+
+        # Step 2c: If the outer perimeter was a uniform synthetic studio background, clear only enclosed
+        # interior pockets between limbs/handles (where an opaque foreground ring encloses background color)
+        # while protecting internal facial/head features.
+        c_tl = np.array(bg_samples[0], dtype=np.float32)
+        bg_uniform = all(float(np.linalg.norm(np.array(s, dtype=np.float32) - c_tl)) < 25.0 for s in bg_samples[:8])
+        if bg_uniform:
+            rgb_f = rgba_np[:, :, :3].astype(np.float32)
+            dist_sq = np.sum((rgb_f - c_tl[None, None, :]) ** 2, axis=-1)
+            cand = ((rgba_np[:, :, 3] > 0) & (dist_sq <= 14.0 * 14.0)).astype(np.uint8)
+            num_lbl, lbls, stats, centroids = cv2.connectedComponentsWithStats(cand, connectivity=8)
+            for lbl in range(1, num_lbl):
+                area = int(stats[lbl, cv2.CC_STAT_AREA])
+                cy_cent = float(centroids[lbl][1])
+                # Only clear mid/lower-body enclosed background loops (e.g. between arm and torso or arch opening),
+                # never small specular highlights or upper-head eye sclera
+                if 28 <= area <= int(work_w * work_h * 0.10) and cy_cent > work_h * 0.36:
+                    rgba_np[lbls == lbl] = [0, 0, 0, 0]
+
+        # Step 2d: Neural salient-object matting (`rembg`) when perimeter flood-fill leaves a non-uniform background
+        opaque_frac = float(np.count_nonzero(rgba_np[:, :, 3] > 24)) / float(work_w * work_h)
+        if opaque_frac > 0.78:
+            from rembg import remove as rembg_remove
+            session = cls._get_rembg_session()
+            rembg_out = rembg_remove(work_img, session=session) if session is not None else rembg_remove(work_img)
+            rembg_np = np.array(rembg_out.convert("RGBA"), dtype=np.uint8)
+            rembg_opaque = float(np.count_nonzero(rembg_np[:, :, 3] > 24)) / float(work_w * work_h)
+            if 0.03 <= rembg_opaque <= 0.85:
+                rgba_np[:, :, 3] = np.minimum(rgba_np[:, :, 3], rembg_np[:, :, 3])
+                rgba_np[rgba_np[:, :, 3] == 0] = [0, 0, 0, 0]
+
+        # Step 2e: Strip tiny detached noise specks (< 1% of primary subject area)
+        fg_mask = (rgba_np[:, :, 3] > 24).astype(np.uint8)
+        num_fg, fg_labels, fg_stats, _ = cv2.connectedComponentsWithStats(fg_mask, connectivity=8)
+        if num_fg > 2:
+            areas = [int(fg_stats[i, cv2.CC_STAT_AREA]) for i in range(1, num_fg)]
+            max_fg_area = max(areas) if areas else 0
+            min_keep_area = max(10, int(max_fg_area * 0.015))
+            for lbl in range(1, num_fg):
+                if int(fg_stats[lbl, cv2.CC_STAT_AREA]) < min_keep_area:
+                    rgba_np[fg_labels == lbl] = [0, 0, 0, 0]
+
+        work_img = Image.fromarray(rgba_np)
 
         # Step 3: Crop to tight foreground bounding box and fit into target_size with padding
         bbox = work_img.getbbox()
         if bbox:
             x0, y0, x1, y1 = bbox
-            # Guard against complete erasure if subject color matched background
             if (x1 - x0) >= 8 and (y1 - y0) >= 8:
                 cropped = work_img.crop(bbox)
                 cw, ch = cropped.size
@@ -731,6 +778,7 @@ class VisualArtSpriteDesignerAgent:
                 return final_img
 
         return raw_img.convert("RGBA").resize((w, h), Image.Resampling.LANCZOS)
+
 
     def _build_reference_parts(
         self,
@@ -961,6 +1009,7 @@ class VisualArtSpriteDesignerAgent:
         dimensions: Tuple[int, int] = (64, 64),
         reference_images: Optional[List[Union[Path, str, bytes, Image.Image]]] = None,
         style_guide: str = "",
+        is_animated_actor: bool = False,
     ) -> Image.Image:
         """Synthesizes a real 2D game sprite, prop, tile, or parallax backdrop via Gemini image generation."""
         from google.genai import types
@@ -969,7 +1018,10 @@ class VisualArtSpriteDesignerAgent:
         norm_type = str(asset_type).lower().strip()
         is_tile = norm_type in ("tile", "tile_surface")
         is_backdrop = norm_type in ("backdrop", "parallax_layer")
-        style_clause = f" Match the visual style and color palette of the attached reference concept art ({style_guide})." if (reference_images or style_guide) else ""
+        is_actor = bool(is_animated_actor or norm_type in ("sprite_sheet", "entity", "character"))
+
+        filtered_refs: List[Union[Path, str, bytes, Image.Image]] = list(reference_images) if (reference_images and not is_tile) else []
+        style_clause = f" Match the visual style and color palette ({style_guide})." if (filtered_refs or style_guide) else ""
 
         if is_backdrop:
             aspect = "16:9"
@@ -982,23 +1034,28 @@ class VisualArtSpriteDesignerAgent:
             full_prompt = (
                 f"Flat 90-degree orthographic top-down seamless game material texture swatch (macro close-up of surface material only): {prompt}. "
                 f"Color palette & art style: {style_guide or 'vibrant hand-painted fantasy'}. "
-                f"100% full-bleed edge-to-edge uniform repeatable material surface filling every pixel of the square frame. "
-                f"Strictly NO rivers, NO water channels, NO cliffs, NO sky, NO horizon, NO isometric 3D cube or diorama block, "
-                f"NO diagonal pipes, NO white corners, NO empty margins, NO border frame, NO text."
+                f"100% full-bleed edge-to-edge organic asymmetric repeatable material surface filling every pixel of the square frame. "
+                f"Strictly NO horizon, NO sky, NO isometric 3D block, NO bilateral mirror symmetry, NO white corners, NO empty margins, NO border frame, NO text."
+            )
+        elif is_actor:
+            aspect = "1:1"
+            full_prompt = (
+                f"SINGLE solitary full-body 2D in-game animated subject sprite in a clean grounded neutral readiness pose: {prompt}.{style_clause} "
+                f"Strictly ONE single isolated full-body figure centered on a solid flat bright magenta (#FF00FF) chroma-key background with complete silhouette and grounded base. "
+                f"STRICTLY ONLY ONE single subject instance — NEVER multiple figures, NEVER a multi-angle turnaround chart, NEVER a sprite grid, "
+                f"NO detached environment terrain slab, NO ground pedestal, NO cast shadow on the floor, NO background scenery, NOT a bust portrait, NO border frame, NO text."
             )
         else:
             aspect = "1:1"
             full_prompt = (
-                f"Full-body 2D in-game sprite asset: {prompt}.{style_clause} "
-                f"Single isolated full-body game sprite or prop centered on a solid flat bright magenta (#FF00FF) chroma-key background. "
-                f"STRICTLY ONLY the isolated subject itself — NO ground slab, NO pedestal, NO rock/grass platform under the feet, "
-                f"NO cast shadow on the floor, NO background scenery, NOT a bust portrait, NO border frame, NO picture box, NO text, "
+                f"Single isolated 2D in-game architectural structure or interactive prop sprite: {prompt}.{style_clause} "
+                f"Centered on a solid flat bright magenta (#FF00FF) chroma-key background. "
+                f"STRICTLY ONLY the single discrete object/structure itself — NO ground slab, NO pedestal, "
+                f"NO cast shadow on the floor, NO background sky/scenery, NO border frame, NO picture box, NO text, "
                 f"crisp readable silhouette and vibrant details."
             )
 
-        # Do not attach full-scene 16:9 landscape mockups when generating a macro surface material tile,
-        # otherwise the image model copies the full landscape scene (rivers/islands) into the tile.
-        ref_parts = [] if is_tile else self._build_reference_parts(reference_images)
+        ref_parts = [] if is_tile else self._build_reference_parts(filtered_refs)
         contents: Any = (ref_parts + [full_prompt]) if ref_parts else full_prompt
 
         max_retries = 3
@@ -1044,164 +1101,508 @@ class VisualArtSpriteDesignerAgent:
         if is_backdrop:
             return raw_img.resize((w, h), Image.Resampling.LANCZOS)
 
-        return self.extract_clean_alpha_sprite(raw_img, target_size=(w, h), strip_border_frame=True, pad_ratio=0.06)
+        return self.extract_clean_alpha_sprite(
+            raw_img,
+            target_size=(w, h),
+            strip_border_frame=True,
+            pad_ratio=0.06,
+        )
 
     @staticmethod
-    def ensure_full_bleed_tile(raw_img: Image.Image, target_size: Tuple[int, int] = (256, 256)) -> Image.Image:
-        """Ensures a tile texture is 100% full-bleed with zero white/magenta/transparent isometric corner triangles,
-        and applies toroidal border blending so repeating tiles have zero harsh grid seams.
+    def compute_tile_mirror_symmetry(img: Image.Image) -> float:
+        """Computes the maximum bilateral mirror correlation in [0.0, 1.0] across both the full tile
+        and the outer 20% border strips (detecting Rorschach / kaleidoscope mirror-reflection defects).
+        """
+        rgb = np.array(img.convert("RGB"), dtype=np.float32)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        h, w = gray.shape
+        if h < 16 or w < 16:
+            return 0.0
+
+        def _corr(a: np.ndarray, b: np.ndarray) -> float:
+            a_z = a - float(np.mean(a))
+            b_z = b - float(np.mean(b))
+            denom = float(np.linalg.norm(a_z) * np.linalg.norm(b_z))
+            if denom <= 1e-5:
+                return 0.0
+            return float(np.sum(a_z * b_z) / denom)
+
+        half_w = w // 2
+        half_h = h // 2
+        full_lr = _corr(gray[:, :half_w], np.fliplr(gray[:, w - half_w :]))
+        full_tb = _corr(gray[:half_h, :], np.flipud(gray[h - half_h :, :]))
+
+        margin_w = max(4, w // 5)
+        margin_h = max(4, h // 5)
+        border_lr = _corr(gray[:, :margin_w], np.fliplr(gray[:, w - margin_w :]))
+        border_tb = _corr(gray[:margin_h, :], np.flipud(gray[h - margin_h :, :]))
+
+        return round(float(max(0.0, full_lr, full_tb, (border_lr + border_tb) * 0.5)), 4)
+
+    @classmethod
+    def ensure_full_bleed_tile(cls, raw_img: Image.Image, target_size: Tuple[int, int] = (256, 256)) -> Image.Image:
+        """Ensures a tile texture is 100% full-bleed with zero white/magenta/transparent corner triangles,
+        and synthesizes a seamless toroidal tile using NON-MIRRORED offset translation (`np.roll`) +
+        raised-cosine diamond blending (eliminating Rorschach/kaleidoscope mirror artifacts).
         """
         w, h = max(16, int(target_size[0])), max(16, int(target_size[1]))
         img = raw_img.convert("RGBA").resize((256, 256), Image.Resampling.LANCZOS)
-        px = img.load()
+        arr_rgba = np.array(img, dtype=np.uint8)
+        r_ch, g_ch, b_ch, a_ch = arr_rgba[:, :, 0], arr_rgba[:, :, 1], arr_rgba[:, :, 2], arr_rgba[:, :, 3]
+        is_bg = (a_ch < 200) | ((r_ch > 215) & (g_ch > 215) & (b_ch > 215)) | ((r_ch > 200) & (b_ch > 200) & (g_ch < 80))
+        fg_mask = ~is_bg
 
-        def _is_bg_pixel(r: int, g: int, b: int, a: int) -> bool:
-            if a < 200:
-                return True
-            if r > 215 and g > 215 and b > 215:
-                return True
-            if r > 200 and b > 200 and g < 80:
-                return True
-            return False
+        fg_rows = np.where(np.mean(fg_mask, axis=1) > 0.50)[0]
+        fg_cols = np.where(np.mean(fg_mask, axis=0) > 0.50)[0]
+        if len(fg_rows) >= 64 and len(fg_cols) >= 64:
+            top, bottom = int(fg_rows[0]), int(fg_rows[-1]) + 1
+            left, right = int(fg_cols[0]), int(fg_cols[-1]) + 1
+            # Also inset past any remaining corner bg pixels
+            for _ in range(24):
+                if (bottom - top) <= 96 or (right - left) <= 96:
+                    break
+                sub_bg = is_bg[top:bottom, left:right]
+                if not np.any(sub_bg):
+                    break
+                if np.any(sub_bg[0, :]):
+                    top += 2
+                if np.any(sub_bg[-1, :]):
+                    bottom -= 2
+                if np.any(sub_bg[:, 0]):
+                    left += 2
+                if np.any(sub_bg[:, -1]):
+                    right -= 2
+            inset = 4
+            if (right - left) > 96 + inset * 2:
+                left += inset
+                right -= inset
+            if (bottom - top) > 96 + inset * 2:
+                top += inset
+                bottom -= inset
+        else:
+            top, bottom, left, right = 16, 240, 16, 240
 
-        # Shrink crop bounds inward from any edge/corner that contains background triangles
-        top, bottom, left, right = 0, 256, 0, 256
-        while bottom - top > 96:
-            row_bg = sum(1 for x in range(left, right, 2) if _is_bg_pixel(*px[x, bottom - 1]))
-            if row_bg > 0:
-                bottom -= 2
-            else:
-                break
-        while bottom - top > 96:
-            row_bg = sum(1 for x in range(left, right, 2) if _is_bg_pixel(*px[x, top]))
-            if row_bg > 0:
-                top += 2
-            else:
-                break
-        while right - left > 96:
-            col_bg = sum(1 for y in range(top, bottom, 2) if _is_bg_pixel(*px[left, y]))
-            if col_bg > 0:
-                left += 2
-            else:
-                break
-        while right - left > 96:
-            col_bg = sum(1 for y in range(top, bottom, 2) if _is_bg_pixel(*px[right - 1, y]))
-            if col_bg > 0:
-                right -= 2
-            else:
-                break
+        cropped = img.crop((left, top, right, bottom))
+        # If the input image already exhibits bilateral mirror symmetry (e.g. a legacy Rorschach tile),
+        # crop an off-center asymmetric sub-quadrant to break the symmetry before toroidal synthesis.
+        if cls.compute_tile_mirror_symmetry(cropped) > 0.55:
+            cw_c, ch_c = cropped.size
+            cropped = cropped.crop((int(cw_c * 0.04), int(ch_c * 0.06), int(cw_c * 0.66), int(ch_c * 0.70)))
 
-        cropped = img.crop((left, top, right, bottom)).resize((w, h), Image.Resampling.LANCZOS)
-        # Apply smooth toroidal edge wrap across outer 18% margin so repeating UV tiles have zero visible seams
-        src_px = cropped.load()
-        seamless = cropped.copy()
-        dst_px = seamless.load()
-        margin_x = max(4, w // 5)
-        margin_y = max(4, h // 5)
-        for y in range(h):
-            for x in range(margin_x):
-                alpha_x = 0.5 * (1.0 - (x / float(margin_x)))
-                r1, g1, b1, _ = dst_px[x, y]
-                r2, g2, b2, _ = src_px[w - 1 - x, y]
-                rb = int(r1 * (1.0 - alpha_x) + r2 * alpha_x)
-                gb = int(g1 * (1.0 - alpha_x) + g2 * alpha_x)
-                bb = int(b1 * (1.0 - alpha_x) + b2 * alpha_x)
-                dst_px[x, y] = (rb, gb, bb, 255)
-                dst_px[w - 1 - x, y] = (
-                    int(r2 * (1.0 - alpha_x) + r1 * alpha_x),
-                    int(g2 * (1.0 - alpha_x) + g1 * alpha_x),
-                    int(b2 * (1.0 - alpha_x) + b1 * alpha_x),
-                    255,
-                )
-        temp_px = seamless.copy().load()
-        for x in range(w):
-            for y in range(margin_y):
-                alpha_y = 0.5 * (1.0 - (y / float(margin_y)))
-                r1, g1, b1, _ = temp_px[x, y]
-                r2, g2, b2, _ = temp_px[x, h - 1 - y]
-                dst_px[x, y] = (
-                    int(r1 * (1.0 - alpha_y) + r2 * alpha_y),
-                    int(g1 * (1.0 - alpha_y) + g2 * alpha_y),
-                    int(b1 * (1.0 - alpha_y) + b2 * alpha_y),
-                    255,
-                )
-                dst_px[x, h - 1 - y] = (
-                    int(r2 * (1.0 - alpha_y) + r1 * alpha_y),
-                    int(g2 * (1.0 - alpha_y) + g1 * alpha_y),
-                    int(b2 * (1.0 - alpha_y) + b1 * alpha_y),
-                    255,
-                )
-        r_ch, g_ch, b_ch, _ = seamless.split()
-        full_a = Image.new("L", (w, h), 255)
-        return Image.merge("RGBA", (r_ch, g_ch, b_ch, full_a))
+        cropped = cropped.resize((w, h), Image.Resampling.LANCZOS)
+        arr_a = np.array(cropped.convert("RGB"), dtype=np.float32)
 
+        # Non-mirrored toroidal offset synthesis:
+        # Roll by (h // 2, w // 2) so opposite boundaries wrap seamlessly with ZERO mirror reflection.
+        arr_b = np.roll(arr_a, shift=(h // 2, w // 2), axis=(0, 1))
+
+        # Smooth raised-cosine interior weight mask: 1.0 at center, 0.0 at outer boundaries (where arr_b is continuous)
+        ux = np.linspace(0.0, 2.0 * np.pi, w, endpoint=False, dtype=np.float32)
+        uy = np.linspace(0.0, 2.0 * np.pi, h, endpoint=False, dtype=np.float32)
+        wx = 0.5 - 0.5 * np.cos(ux)
+        wy = 0.5 - 0.5 * np.cos(uy)
+        mask = (wy[:, None] * wx[None, :])[..., None]
+
+        # Variance-preserving blend so cross-fade regions retain crisp texture contrast
+        mean_a = np.mean(arr_a, axis=(0, 1), keepdims=True)
+        std_a = np.std(arr_a, axis=(0, 1), keepdims=True) + 1e-5
+        blended = arr_a * mask + arr_b * (1.0 - mask)
+        mean_bl = np.mean(blended, axis=(0, 1), keepdims=True)
+        std_bl = np.std(blended, axis=(0, 1), keepdims=True) + 1e-5
+        seamless_rgb = np.clip((blended - mean_bl) * (std_a / std_bl) + mean_a, 0.0, 255.0).astype(np.uint8)
+
+        alpha_full = np.full((h, w, 1), 255, dtype=np.uint8)
+        seamless_rgba = np.concatenate([seamless_rgb, alpha_full], axis=-1)
+        return Image.fromarray(seamless_rgba)
+
+    @staticmethod
+    def default_keyframe_tracks_for_profile(motion_profile: str) -> List[PartKeyframeTrackSpec]:
+        """Returns explicit biomechanical PartKeyframeTrackSpecs across normalized time t in [0.0, 1.0]
+        for 'idle', 'locomotion', 'aerial', or 'action'.
+        """
+        prof = str(motion_profile or "idle").lower().strip()
+        if prof == "locomotion":
+            return [
+                PartKeyframeTrackSpec(
+                    deliberation="Torso forward lean and double-frequency stride bounce during run cycle.",
+                    part_id="torso",
+                    keyframes=[
+                        KeyframeTransformSpec(deliberation="Contact phase 1", time_normalized=0.0, position_offset_px=(2.0, -3.0), rotation_degrees=8.0, scale_xy=(1.02, 0.97)),
+                        KeyframeTransformSpec(deliberation="Passing phase 1", time_normalized=0.25, position_offset_px=(0.0, 1.0), rotation_degrees=4.0, scale_xy=(0.98, 1.03)),
+                        KeyframeTransformSpec(deliberation="Contact phase 2", time_normalized=0.50, position_offset_px=(-2.0, -3.0), rotation_degrees=-8.0, scale_xy=(1.02, 0.97)),
+                        KeyframeTransformSpec(deliberation="Passing phase 2", time_normalized=0.75, position_offset_px=(0.0, 1.0), rotation_degrees=-4.0, scale_xy=(0.98, 1.03)),
+                        KeyframeTransformSpec(deliberation="Cycle loop closure", time_normalized=1.0, position_offset_px=(2.0, -3.0), rotation_degrees=8.0, scale_xy=(1.02, 0.97)),
+                    ],
+                ),
+                PartKeyframeTrackSpec(
+                    deliberation="Left leg wide forward-and-back stride swing around hip pivot.",
+                    part_id="leg_left",
+                    keyframes=[
+                        KeyframeTransformSpec(deliberation="Left leg forward stride extension", time_normalized=0.0, position_offset_px=(-5.0, -3.0), rotation_degrees=28.0, scale_xy=(1.05, 0.96)),
+                        KeyframeTransformSpec(deliberation="Left leg planted stance pass", time_normalized=0.25, position_offset_px=(0.0, 0.0), rotation_degrees=0.0, scale_xy=(1.0, 1.0)),
+                        KeyframeTransformSpec(deliberation="Left leg rear push-off extension", time_normalized=0.50, position_offset_px=(5.0, -2.0), rotation_degrees=-28.0, scale_xy=(1.05, 0.96)),
+                        KeyframeTransformSpec(deliberation="Left leg knee-lift recovery pass", time_normalized=0.75, position_offset_px=(0.0, -4.0), rotation_degrees=6.0, scale_xy=(0.96, 0.92)),
+                        KeyframeTransformSpec(deliberation="Loop closure", time_normalized=1.0, position_offset_px=(-5.0, -3.0), rotation_degrees=28.0, scale_xy=(1.05, 0.96)),
+                    ],
+                ),
+                PartKeyframeTrackSpec(
+                    deliberation="Right leg counter-phase stride swing around hip pivot.",
+                    part_id="leg_right",
+                    keyframes=[
+                        KeyframeTransformSpec(deliberation="Right leg rear push-off extension", time_normalized=0.0, position_offset_px=(5.0, -2.0), rotation_degrees=-28.0, scale_xy=(1.05, 0.96)),
+                        KeyframeTransformSpec(deliberation="Right leg knee-lift recovery pass", time_normalized=0.25, position_offset_px=(0.0, -4.0), rotation_degrees=6.0, scale_xy=(0.96, 0.92)),
+                        KeyframeTransformSpec(deliberation="Right leg forward stride extension", time_normalized=0.50, position_offset_px=(-5.0, -3.0), rotation_degrees=28.0, scale_xy=(1.05, 0.96)),
+                        KeyframeTransformSpec(deliberation="Right leg planted stance pass", time_normalized=0.75, position_offset_px=(0.0, 0.0), rotation_degrees=0.0, scale_xy=(1.0, 1.0)),
+                        KeyframeTransformSpec(deliberation="Loop closure", time_normalized=1.0, position_offset_px=(5.0, -2.0), rotation_degrees=-28.0, scale_xy=(1.05, 0.96)),
+                    ],
+                ),
+                PartKeyframeTrackSpec(
+                    deliberation="Lead arm/staff counter-swing balancing leg stride.",
+                    part_id="arm_lead",
+                    keyframes=[
+                        KeyframeTransformSpec(deliberation="Arm back swing", time_normalized=0.0, position_offset_px=(-4.0, 0.0), rotation_degrees=-24.0, scale_xy=(1.0, 1.0)),
+                        KeyframeTransformSpec(deliberation="Arm neutral pass", time_normalized=0.25, position_offset_px=(0.0, 1.0), rotation_degrees=0.0, scale_xy=(1.0, 1.0)),
+                        KeyframeTransformSpec(deliberation="Arm forward swing", time_normalized=0.50, position_offset_px=(5.0, -2.0), rotation_degrees=26.0, scale_xy=(1.04, 1.0)),
+                        KeyframeTransformSpec(deliberation="Arm neutral pass", time_normalized=0.75, position_offset_px=(0.0, 1.0), rotation_degrees=0.0, scale_xy=(1.0, 1.0)),
+                        KeyframeTransformSpec(deliberation="Loop closure", time_normalized=1.0, position_offset_px=(-4.0, 0.0), rotation_degrees=-24.0, scale_xy=(1.0, 1.0)),
+                    ],
+                ),
+            ]
+        if prof == "aerial":
+            return [
+                PartKeyframeTrackSpec(
+                    deliberation="Jump crouch launch, airborne apex stretch, and landing poise within cell bounds.",
+                    part_id="torso",
+                    keyframes=[
+                        KeyframeTransformSpec(deliberation="Takeoff crouch squash", time_normalized=0.0, position_offset_px=(0.0, 3.0), rotation_degrees=-10.0, scale_xy=(1.10, 0.90)),
+                        KeyframeTransformSpec(deliberation="Airborne apex upward stretch", time_normalized=0.50, position_offset_px=(0.0, -3.0), rotation_degrees=8.0, scale_xy=(0.94, 1.04)),
+                        KeyframeTransformSpec(deliberation="Descent reach pose", time_normalized=1.0, position_offset_px=(2.0, -1.0), rotation_degrees=-6.0, scale_xy=(1.04, 0.96)),
+                    ],
+                ),
+                PartKeyframeTrackSpec(
+                    deliberation="Left leg crouch bend, aerial tuck, and landing extension.",
+                    part_id="leg_left",
+                    keyframes=[
+                        KeyframeTransformSpec(deliberation="Crouch coil", time_normalized=0.0, position_offset_px=(-3.0, 2.0), rotation_degrees=20.0, scale_xy=(1.08, 0.88)),
+                        KeyframeTransformSpec(deliberation="Aerial knee tuck", time_normalized=0.50, position_offset_px=(-3.5, -3.5), rotation_degrees=26.0, scale_xy=(0.95, 0.92)),
+                        KeyframeTransformSpec(deliberation="Landing reach", time_normalized=1.0, position_offset_px=(-2.0, 0.0), rotation_degrees=-16.0, scale_xy=(1.0, 1.02)),
+                    ],
+                ),
+                PartKeyframeTrackSpec(
+                    deliberation="Right leg crouch coil, aerial trail, and brace.",
+                    part_id="leg_right",
+                    keyframes=[
+                        KeyframeTransformSpec(deliberation="Crouch coil", time_normalized=0.0, position_offset_px=(3.0, 2.0), rotation_degrees=-20.0, scale_xy=(1.08, 0.88)),
+                        KeyframeTransformSpec(deliberation="Aerial trail extension", time_normalized=0.50, position_offset_px=(3.5, -2.5), rotation_degrees=-22.0, scale_xy=(0.95, 1.02)),
+                        KeyframeTransformSpec(deliberation="Landing brace", time_normalized=1.0, position_offset_px=(3.0, 0.0), rotation_degrees=18.0, scale_xy=(1.0, 1.0)),
+                    ],
+                ),
+                PartKeyframeTrackSpec(
+                    deliberation="Arm/tool upward thrust during jump.",
+                    part_id="arm_lead",
+                    keyframes=[
+                        KeyframeTransformSpec(deliberation="Backswing coil", time_normalized=0.0, position_offset_px=(-3.0, 2.0), rotation_degrees=-22.0, scale_xy=(1.0, 1.0)),
+                        KeyframeTransformSpec(deliberation="Apex overhead reach", time_normalized=0.50, position_offset_px=(2.5, -3.0), rotation_degrees=24.0, scale_xy=(1.03, 1.03)),
+                        KeyframeTransformSpec(deliberation="Outstretched balance", time_normalized=1.0, position_offset_px=(3.0, -1.0), rotation_degrees=14.0, scale_xy=(1.0, 1.0)),
+                    ],
+                ),
+            ]
+        if prof == "action":
+            return [
+                PartKeyframeTrackSpec(
+                    deliberation="Action wind-up coil, dynamic forward strike lunge, surge extension, and recovery.",
+                    part_id="torso",
+                    keyframes=[
+                        KeyframeTransformSpec(deliberation="Wind-up coil back", time_normalized=0.0, position_offset_px=(-4.0, 1.0), rotation_degrees=-14.0, scale_xy=(0.95, 1.04)),
+                        KeyframeTransformSpec(deliberation="Forward strike lunge", time_normalized=0.33, position_offset_px=(6.0, -2.0), rotation_degrees=16.0, scale_xy=(1.12, 0.94)),
+                        KeyframeTransformSpec(deliberation="Channeling resonance burst", time_normalized=0.67, position_offset_px=(3.0, -4.0), rotation_degrees=8.0, scale_xy=(1.08, 1.06)),
+                        KeyframeTransformSpec(deliberation="Follow-through recovery", time_normalized=1.0, position_offset_px=(-1.0, 0.0), rotation_degrees=-4.0, scale_xy=(1.0, 1.0)),
+                    ],
+                ),
+                PartKeyframeTrackSpec(
+                    deliberation="Lead arm / tool sweep across action keyframes.",
+                    part_id="arm_lead",
+                    keyframes=[
+                        KeyframeTransformSpec(deliberation="Raise tool high", time_normalized=0.0, position_offset_px=(-5.0, -5.0), rotation_degrees=-34.0, scale_xy=(1.04, 1.04)),
+                        KeyframeTransformSpec(deliberation="Full forward strike extension", time_normalized=0.33, position_offset_px=(8.0, 1.0), rotation_degrees=38.0, scale_xy=(1.16, 1.08)),
+                        KeyframeTransformSpec(deliberation="Wide arc follow-through", time_normalized=0.67, position_offset_px=(5.0, -3.0), rotation_degrees=20.0, scale_xy=(1.10, 1.10)),
+                        KeyframeTransformSpec(deliberation="Return to guard", time_normalized=1.0, position_offset_px=(0.0, 0.0), rotation_degrees=-6.0, scale_xy=(1.0, 1.0)),
+                    ],
+                ),
+                PartKeyframeTrackSpec(
+                    deliberation="Left leg braced lunge stance.",
+                    part_id="leg_left",
+                    keyframes=[
+                        KeyframeTransformSpec(deliberation="Coil stance", time_normalized=0.0, position_offset_px=(2.0, 0.0), rotation_degrees=-12.0, scale_xy=(1.0, 1.0)),
+                        KeyframeTransformSpec(deliberation="Rear anchor push", time_normalized=0.33, position_offset_px=(-5.0, 0.0), rotation_degrees=24.0, scale_xy=(1.06, 0.96)),
+                        KeyframeTransformSpec(deliberation="Wide brace", time_normalized=0.67, position_offset_px=(-3.0, 0.0), rotation_degrees=16.0, scale_xy=(1.02, 1.0)),
+                        KeyframeTransformSpec(deliberation="Recovery stance", time_normalized=1.0, position_offset_px=(0.0, 0.0), rotation_degrees=0.0, scale_xy=(1.0, 1.0)),
+                    ],
+                ),
+                PartKeyframeTrackSpec(
+                    deliberation="Right leg forward step into action lunge.",
+                    part_id="leg_right",
+                    keyframes=[
+                        KeyframeTransformSpec(deliberation="Lift step", time_normalized=0.0, position_offset_px=(-2.0, -2.0), rotation_degrees=14.0, scale_xy=(1.0, 0.95)),
+                        KeyframeTransformSpec(deliberation="Planted forward lunge", time_normalized=0.33, position_offset_px=(6.0, 0.0), rotation_degrees=-24.0, scale_xy=(1.06, 0.96)),
+                        KeyframeTransformSpec(deliberation="Hold forward brace", time_normalized=0.67, position_offset_px=(4.0, 0.0), rotation_degrees=-14.0, scale_xy=(1.02, 1.0)),
+                        KeyframeTransformSpec(deliberation="Recovery stance", time_normalized=1.0, position_offset_px=(0.0, 0.0), rotation_degrees=0.0, scale_xy=(1.0, 1.0)),
+                    ],
+                ),
+            ]
+        # Default 'idle': feet planted firmly on baseline while torso/head/arm articulate breathing & alert poise
+        return [
+            PartKeyframeTrackSpec(
+                deliberation="Rhythmic chest breathing and alert upper-body poise shift while feet remain grounded.",
+                part_id="torso",
+                keyframes=[
+                    KeyframeTransformSpec(deliberation="Neutral alert inhale start", time_normalized=0.0, position_offset_px=(0.0, 0.0), rotation_degrees=0.0, scale_xy=(1.0, 1.0)),
+                    KeyframeTransformSpec(deliberation="Full chest expansion & slight forward poise", time_normalized=0.25, position_offset_px=(2.0, -2.0), rotation_degrees=6.0, scale_xy=(1.06, 1.05)),
+                    KeyframeTransformSpec(deliberation="Exhale settle", time_normalized=0.50, position_offset_px=(0.0, 1.0), rotation_degrees=0.0, scale_xy=(1.03, 0.96)),
+                    KeyframeTransformSpec(deliberation="Alert counter-look poise", time_normalized=0.75, position_offset_px=(-2.0, -1.0), rotation_degrees=-6.0, scale_xy=(0.96, 1.04)),
+                    KeyframeTransformSpec(deliberation="Loop closure", time_normalized=1.0, position_offset_px=(0.0, 0.0), rotation_degrees=0.0, scale_xy=(1.0, 1.0)),
+                ],
+            ),
+            PartKeyframeTrackSpec(
+                deliberation="Lead arm / staff ready sway during idle breathing.",
+                part_id="arm_lead",
+                keyframes=[
+                    KeyframeTransformSpec(deliberation="Neutral guard", time_normalized=0.0, position_offset_px=(0.0, 0.0), rotation_degrees=0.0, scale_xy=(1.0, 1.0)),
+                    KeyframeTransformSpec(deliberation="Raise ready poise", time_normalized=0.25, position_offset_px=(3.0, -3.0), rotation_degrees=15.0, scale_xy=(1.04, 1.02)),
+                    KeyframeTransformSpec(deliberation="Lower relax", time_normalized=0.50, position_offset_px=(0.0, 1.0), rotation_degrees=-5.0, scale_xy=(1.0, 1.0)),
+                    KeyframeTransformSpec(deliberation="Back poise", time_normalized=0.75, position_offset_px=(-3.0, -1.0), rotation_degrees=-14.0, scale_xy=(1.02, 1.0)),
+                    KeyframeTransformSpec(deliberation="Loop closure", time_normalized=1.0, position_offset_px=(0.0, 0.0), rotation_degrees=0.0, scale_xy=(1.0, 1.0)),
+                ],
+            ),
+            PartKeyframeTrackSpec(
+                deliberation="Left leg planted knee-flex weight shift.",
+                part_id="leg_left",
+                keyframes=[
+                    KeyframeTransformSpec(deliberation="Planted neutral", time_normalized=0.0, position_offset_px=(0.0, 0.0), rotation_degrees=0.0, scale_xy=(1.0, 1.0)),
+                    KeyframeTransformSpec(deliberation="Weight shift left", time_normalized=0.25, position_offset_px=(-1.0, 0.0), rotation_degrees=6.0, scale_xy=(1.02, 0.98)),
+                    KeyframeTransformSpec(deliberation="Planted neutral", time_normalized=0.50, position_offset_px=(0.0, 0.0), rotation_degrees=0.0, scale_xy=(1.0, 1.0)),
+                    KeyframeTransformSpec(deliberation="Weight shift right", time_normalized=0.75, position_offset_px=(1.0, 0.0), rotation_degrees=-6.0, scale_xy=(0.98, 1.02)),
+                    KeyframeTransformSpec(deliberation="Loop closure", time_normalized=1.0, position_offset_px=(0.0, 0.0), rotation_degrees=0.0, scale_xy=(1.0, 1.0)),
+                ],
+            ),
+            PartKeyframeTrackSpec(
+                deliberation="Right leg planted counter weight shift.",
+                part_id="leg_right",
+                keyframes=[
+                    KeyframeTransformSpec(deliberation="Planted neutral", time_normalized=0.0, position_offset_px=(0.0, 0.0), rotation_degrees=0.0, scale_xy=(1.0, 1.0)),
+                    KeyframeTransformSpec(deliberation="Weight shift left", time_normalized=0.25, position_offset_px=(1.0, 0.0), rotation_degrees=-6.0, scale_xy=(0.98, 1.02)),
+                    KeyframeTransformSpec(deliberation="Planted neutral", time_normalized=0.50, position_offset_px=(0.0, 0.0), rotation_degrees=0.0, scale_xy=(1.0, 1.0)),
+                    KeyframeTransformSpec(deliberation="Weight shift right", time_normalized=0.75, position_offset_px=(-1.0, 0.0), rotation_degrees=6.0, scale_xy=(1.02, 0.98)),
+                    KeyframeTransformSpec(deliberation="Loop closure", time_normalized=1.0, position_offset_px=(0.0, 0.0), rotation_degrees=0.0, scale_xy=(1.0, 1.0)),
+                ],
+            ),
+        ]
+
+    @staticmethod
+    def _interpolate_keyframe_track(
+        track: PartKeyframeTrackSpec,
+        t_norm: float,
+    ) -> Tuple[Tuple[float, float], float, Tuple[float, float]]:
+        """Linearly interpolates (position_offset_px, rotation_degrees, scale_xy) at normalized time t_norm in [0, 1]."""
+        kfs = sorted(track.keyframes, key=lambda k: float(k.time_normalized))
+        if not kfs:
+            return (0.0, 0.0), 0.0, (1.0, 1.0)
+        t = max(0.0, min(1.0, float(t_norm)))
+        if t <= kfs[0].time_normalized:
+            k0 = kfs[0]
+            return k0.position_offset_px, float(k0.rotation_degrees), k0.scale_xy
+        if t >= kfs[-1].time_normalized:
+            k1 = kfs[-1]
+            return k1.position_offset_px, float(k1.rotation_degrees), k1.scale_xy
+
+        for idx in range(len(kfs) - 1):
+            k0, k1 = kfs[idx], kfs[idx + 1]
+            t0, t1 = float(k0.time_normalized), float(k1.time_normalized)
+            if t0 <= t <= t1:
+                span = max(1e-5, t1 - t0)
+                alpha = (t - t0) / span
+                dx = k0.position_offset_px[0] + alpha * (k1.position_offset_px[0] - k0.position_offset_px[0])
+                dy = k0.position_offset_px[1] + alpha * (k1.position_offset_px[1] - k0.position_offset_px[1])
+                rot = float(k0.rotation_degrees) + alpha * (float(k1.rotation_degrees) - float(k0.rotation_degrees))
+                sx = k0.scale_xy[0] + alpha * (k1.scale_xy[0] - k0.scale_xy[0])
+                sy = k0.scale_xy[1] + alpha * (k1.scale_xy[1] - k0.scale_xy[1])
+                return (dx, dy), rot, (sx, sy)
+        k_last = kfs[-1]
+        return k_last.position_offset_px, float(k_last.rotation_degrees), k_last.scale_xy
+
+    @staticmethod
+    def _warp_part_around_pivot(
+        part_rgba: np.ndarray,
+        pivot_xy: Tuple[float, float],
+        pos_offset: Tuple[float, float],
+        rot_deg: float,
+        scale_xy: Tuple[float, float],
+    ) -> np.ndarray:
+        """Applies a 2D affine keyframe transform (anisotropic scale + pivot rotation + translation) via OpenCV."""
+        h, w = part_rgba.shape[:2]
+        px, py = float(pivot_xy[0]), float(pivot_xy[1])
+        sx, sy = float(scale_xy[0]), float(scale_xy[1])
+        dx, dy = float(pos_offset[0]), float(pos_offset[1])
+
+        rad = math.radians(float(rot_deg))
+        cos_a = math.cos(rad)
+        sin_a = math.sin(rad)
+
+        # Combined scale around pivot + rotation around pivot + translation
+        m00 = cos_a * sx
+        m01 = -sin_a * sy
+        m10 = sin_a * sx
+        m11 = cos_a * sy
+        tx = px - (m00 * px + m01 * py) + dx
+        ty = py - (m10 * px + m11 * py) + dy
+        mat = np.array([[m00, m01, tx], [m10, m11, ty]], dtype=np.float32)
+
+        return cv2.warpAffine(
+            part_rgba,
+            mat,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0, 0),
+        )
+
+    @staticmethod
+    def _alpha_composite_np(dst: np.ndarray, src: np.ndarray) -> np.ndarray:
+        """Alpha-composites `src` (H, W, 4) over `dst` (H, W, 4) in uint8 RGBA."""
+        src_a = src[:, :, 3:4].astype(np.float32) / 255.0
+        dst_a = dst[:, :, 3:4].astype(np.float32) / 255.0
+        out_a = src_a + dst_a * (1.0 - src_a)
+        safe_out_a = np.where(out_a > 1e-5, out_a, 1.0)
+        out_rgb = (src[:, :, :3].astype(np.float32) * src_a + dst[:, :, :3].astype(np.float32) * dst_a * (1.0 - src_a)) / safe_out_a
+        res = np.zeros_like(dst, dtype=np.uint8)
+        res[:, :, :3] = np.clip(out_rgb, 0.0, 255.0).astype(np.uint8)
+        res[:, :, 3:4] = np.clip(out_a * 255.0, 0.0, 255.0).astype(np.uint8)
+        return res
+
+    @classmethod
     def fabricate_pose_frame_from_base(
-        self,
+        cls,
         base_sprite: Image.Image,
-        state_name: str,
-        frame_idx: int,
-        frame_count: int,
+        state_name: str = "move",
+        frame_idx: int = 0,
+        frame_count: int = 4,
         cell_size: Tuple[int, int] = (64, 64),
         motion_profile: str = "idle",
+        keyframe_tracks: Optional[List[PartKeyframeTrackSpec]] = None,
+        target_size: Optional[Tuple[int, int]] = None,
     ) -> Image.Image:
-        """Generates an articulated animation frame from a clean base sprite using the explicit motion_profile
-        from AnimationStateSpec ('idle' | 'locomotion' | 'aerial' | 'action').
+        """Synthesizes an articulated keyframe pose from `base_sprite` using a continuous, topology-preserving
+        2D UV displacement field (`cv2.remap`) evaluated across normalized sprite coordinates (u, v).
+        Unlike rigid quadrant slicing, continuous C^infinity UV deformation preserves 100% topological continuity
+        across any entity anatomy, handheld tool, or organic structure while producing distinct keyframe poses.
         """
-        cw, ch = max(16, int(cell_size[0])), max(16, int(cell_size[1]))
-        src = base_sprite.convert("RGBA").resize((cw, ch), Image.Resampling.LANCZOS)
-        phase = (2.0 * math.pi * frame_idx) / max(1, frame_count)
+        eff_size = target_size if target_size is not None else cell_size
+        cw, ch = max(16, int(eff_size[0])), max(16, int(eff_size[1]))
+        src_pil = base_sprite.convert("RGBA").resize((cw, ch), Image.Resampling.LANCZOS)
+        src_np = np.array(src_pil, dtype=np.uint8)
+
         profile = str(motion_profile or "idle").lower().strip()
+        tracks = list(keyframe_tracks) if keyframe_tracks else cls.default_keyframe_tracks_for_profile(profile)
+        track_map: Dict[str, PartKeyframeTrackSpec] = {t.part_id: t for t in tracks}
 
-        canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
-        mid_y = int(ch * 0.56)
-        upper = src.crop((0, 0, cw, mid_y))
-        lower = src.crop((0, mid_y, cw, ch))
-
-        if profile == "locomotion":
-            # Stride cycle: alternating leg shear/shift + torso bob and forward lean
-            bob_y = int(round(-abs(math.sin(phase)) * max(2.0, ch * 0.05)))
-            lean_deg = math.sin(phase) * 5.0
-            stride_x = int(round(math.sin(phase) * max(2.0, cw * 0.06)))
-            upper_rot = upper.rotate(-lean_deg, resample=Image.Resampling.BICUBIC, expand=False)
-            half_x = cw // 2
-            leg_l = lower.crop((0, 0, half_x, ch - mid_y))
-            leg_r = lower.crop((half_x, 0, cw, ch - mid_y))
-            canvas.paste(leg_l, (max(0, stride_x), max(0, mid_y + bob_y - (1 if stride_x > 0 else 0))), leg_l)
-            canvas.paste(leg_r, (min(cw - half_x, half_x - stride_x), max(0, mid_y + bob_y - (1 if stride_x < 0 else 0))), leg_r)
-            canvas.paste(upper_rot, (0, max(0, bob_y)), upper_rot)
-        elif profile == "aerial":
-            # Jump arc: crouch squash -> upward stretch -> apex tuck -> landing
-            t = frame_idx / max(1, frame_count - 1) if frame_count > 1 else 0.5
-            if t < 0.25:
-                sx, sy, dy = 1.10, 0.88, int(ch * 0.06)
-            elif t < 0.75:
-                sx, sy, dy = 0.92, 1.10, -int(ch * 0.06)
-            else:
-                sx, sy, dy = 1.04, 0.95, 0
-            nw = max(4, min(cw, int(cw * sx)))
-            nh = max(4, min(ch, int(ch * sy)))
-            morphed = src.resize((nw, nh), Image.Resampling.LANCZOS)
-            ox = (cw - nw) // 2
-            oy = max(0, min(ch - nh, (ch - nh) // 2 + dy))
-            canvas.paste(morphed, (ox, oy), morphed)
-        elif profile == "action":
-            # Action / resonance state: dynamic lunge + scale pulse
-            lunge_x = int(round(math.sin(phase) * max(2.0, cw * 0.06)))
-            rot_deg = math.sin(phase) * 8.0
-            rotated = src.rotate(rot_deg, resample=Image.Resampling.BICUBIC, expand=False)
-            canvas.paste(rotated, (max(0, min(cw - 1, lunge_x)), 0), rotated)
+        if profile in ("idle", "locomotion"):
+            t_norm = float(frame_idx) / float(max(1, frame_count))
         else:
-            # Idle / breathing cycle: subtle rhythmic torso breathing and vertical sway
-            scale_y = 1.0 + 0.035 * math.sin(phase)
-            scale_x = 1.0 - 0.02 * math.sin(phase)
-            nw = max(4, min(cw, int(round(cw * scale_x))))
-            nh = max(4, min(ch, int(round(ch * scale_y))))
-            morphed = src.resize((nw, nh), Image.Resampling.LANCZOS)
-            ox = (cw - nw) // 2
-            oy = ch - nh
-            canvas.paste(morphed, (ox, max(0, oy)), morphed)
+            t_norm = float(frame_idx) / float(max(1, frame_count - 1)) if frame_count > 1 else 0.5
 
-        return canvas
+        ys, xs = np.where(src_np[:, :, 3] > 24)
+        if len(ys) < 16:
+            return src_pil
+
+        x0, x1 = int(np.min(xs)), int(np.max(xs))
+        y0, y1 = int(np.min(ys)), int(np.max(ys))
+        bw = max(4.0, float(x1 - x0 + 1))
+        bh = max(4.0, float(y1 - y0 + 1))
+        cx = x0 + bw * 0.5
+        cy = y0 + bh * 0.5
+        scale_factor = float(cw) / 64.0
+
+        def _get_kf(pid: str) -> Tuple[Tuple[float, float], float, Tuple[float, float]]:
+            trk = track_map.get(pid)
+            if trk is None:
+                return (0.0, 0.0), 0.0, (1.0, 1.0)
+            return cls._interpolate_keyframe_track(trk, t_norm)
+
+        (t_dx, t_dy), t_rot, (t_sx, t_sy) = _get_kf("torso")
+        (ll_dx, ll_dy), ll_rot, _ = _get_kf("leg_left")
+        (lr_dx, lr_dy), lr_rot, _ = _get_kf("leg_right")
+        (arm_dx, arm_dy), arm_rot, _ = _get_kf("arm_lead")
+
+        yy, xx = np.mgrid[0:ch, 0:cw].astype(np.float32)
+        # Normalized subject coordinates: u in [-1, 1] across width, v in [0, 1] from top (0) to base (1)
+        u = np.clip((xx - cx) / (bw * 0.5), -1.25, 1.25)
+        v = np.clip((yy - y0) / bh, 0.0, 1.0)
+
+        # Smooth C^infinity spatial influence weights (never cuts or tears connected structures)
+        w_upper = np.cos(v * (np.pi * 0.5)) ** 2
+        w_lower = np.sin(v * (np.pi * 0.5)) ** 2
+        w_left = 0.5 * (1.0 - np.tanh(2.2 * u))
+        w_right = 0.5 * (1.0 + np.tanh(2.2 * u))
+        w_mid_lead = np.exp(-(((v - 0.42) / 0.30) ** 2)) * w_right
+
+        # 1. Core / upper-body squash-stretch, harmonic bend, and translation around grounded base (cx, y1)
+        rad_t = math.radians(t_rot * 0.45)
+        dx_upper = (
+            t_dx * scale_factor * w_upper
+            + (xx - cx) * (1.0 - 1.0 / max(0.82, min(1.22, t_sx)))
+            + (y1 - yy) * math.sin(rad_t) * w_upper * 0.55
+        )
+        dy_upper = (
+            t_dy * scale_factor * w_upper
+            + (yy - y1) * (1.0 - 1.0 / max(0.82, min(1.22, t_sy)))
+        )
+
+        # 2. Smooth lower-body / base counter-phase stride & sway field (continuous across u=0)
+        stride_l_x = (ll_dx * scale_factor * 0.65 + math.sin(math.radians(ll_rot)) * bw * 0.14) * w_lower * w_left
+        stride_r_x = (lr_dx * scale_factor * 0.65 + math.sin(math.radians(lr_rot)) * bw * 0.14) * w_lower * w_right
+        stride_l_y = (ll_dy * scale_factor * 0.55 - abs(math.sin(math.radians(ll_rot))) * bh * 0.06) * w_lower * w_left
+        stride_r_y = (lr_dy * scale_factor * 0.55 - abs(math.sin(math.radians(lr_rot))) * bh * 0.06) * w_lower * w_right
+
+        # 3. Smooth secondary appendage / lead follow-through wave
+        lead_x = (arm_dx * scale_factor * 0.50 + math.sin(math.radians(arm_rot)) * bw * 0.10) * w_mid_lead
+        lead_y = (arm_dy * scale_factor * 0.50 - math.sin(math.radians(arm_rot)) * bh * 0.08) * w_mid_lead
+
+        total_dx = dx_upper + stride_l_x + stride_r_x + lead_x
+        total_dy = dy_upper + stride_l_y + stride_r_y + lead_y
+
+        # Inverse mapping coordinates for cv2.remap
+        map_x = (xx - total_dx).astype(np.float32)
+        map_y = (yy - total_dy).astype(np.float32)
+
+        comp = cv2.remap(
+            src_np,
+            map_x,
+            map_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0, 0),
+        )
+
+        # Grounded baseline lock for 'idle' and 'locomotion': lock the lowest opaque pixel to `y1`
+        # so grounded animations never float or jitter vertically across frames.
+        if profile in ("idle", "locomotion"):
+            comp_ys = np.where(comp[:, :, 3] > 32)[0]
+            if len(comp_ys) > 0:
+                cur_bottom = int(np.max(comp_ys))
+                target_bottom = min(ch - 2, y1)
+                shift_y = target_bottom - cur_bottom
+                if shift_y != 0:
+                    mat_ground = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, float(shift_y)]], dtype=np.float32)
+                    comp = cv2.warpAffine(
+                        comp,
+                        mat_ground,
+                        (cw, ch),
+                        flags=cv2.INTER_NEAREST,
+                        borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=(0, 0, 0, 0),
+                    )
+
+        return Image.fromarray(comp)
 
     def fabricate_sprite_sheet(
         self,
@@ -1211,9 +1612,9 @@ class VisualArtSpriteDesignerAgent:
         reference_images: Optional[List[Union[Path, str, bytes, Image.Image]]] = None,
         style_guide: str = "",
     ) -> Tuple[Path, Dict[str, Any]]:
-        """Fabricates a multi-row, multi-frame sprite sheet PNG and returns (sheet_path, metadata_dict).
-        Each row corresponds to an AnimationStateSpec in asset_req.animation_states.
-        Also saves a clean single-frame default sprite at the base sprite path if needed.
+        """Fabricates a multi-row, multi-frame keyframed sprite sheet PNG and returns (sheet_path, metadata_dict).
+        Each row corresponds to an AnimationStateSpec in asset_req.animation_states and carries explicit
+        `keyframe_tracks` exported into `asset_library.json` for runtime Godot `AnimationPlayer` binding.
         """
         cell_w, cell_h = asset_req.dimensions or (64, 64)
         cell_w = max(32, int(cell_w))
@@ -1258,15 +1659,15 @@ class VisualArtSpriteDesignerAgent:
             ),
         ]
 
-        # Synthesize the master base character/object sprite at 2x cell resolution for crisp pose articulation
         base_dims = (cell_w * 2, cell_h * 2)
         if self._is_live_genai_client():
             base_img = self._generate_gemini_sprite_image(
                 prompt=asset_req.visual_prompt_or_text or asset_req.description or asset_req.asset_id,
-                asset_type="sprite",
+                asset_type=asset_req.asset_type or "sprite_sheet",
                 dimensions=base_dims,
                 reference_images=reference_images,
                 style_guide=style_guide,
+                is_animated_actor=True,
             )
         else:
             renderer = ProceduralSpriteRenderer(mood=mood)
@@ -1288,6 +1689,7 @@ class VisualArtSpriteDesignerAgent:
         for row_idx, st in enumerate(states):
             fcount = max(1, int(st.frame_count))
             m_profile = getattr(st, "motion_profile", "idle") or "idle"
+            kf_tracks = list(st.keyframe_tracks) if getattr(st, "keyframe_tracks", None) else self.default_keyframe_tracks_for_profile(m_profile)
             for col_idx in range(fcount):
                 frame_img = self.fabricate_pose_frame_from_base(
                     base_sprite=base_img,
@@ -1296,6 +1698,7 @@ class VisualArtSpriteDesignerAgent:
                     frame_count=fcount,
                     cell_size=(cell_w, cell_h),
                     motion_profile=m_profile,
+                    keyframe_tracks=kf_tracks,
                 )
                 sheet_img.paste(frame_img, (col_idx * cell_w, row_idx * cell_h), frame_img)
 
@@ -1306,6 +1709,7 @@ class VisualArtSpriteDesignerAgent:
                 "fps": float(st.fps),
                 "loop": bool(st.loop),
                 "motion_profile": m_profile,
+                "keyframe_tracks": [t.model_dump() for t in kf_tracks],
             }
 
         output_path = Path(output_path)
@@ -1321,6 +1725,7 @@ class VisualArtSpriteDesignerAgent:
             "base_frame_image": base_img.resize((cell_w, cell_h), Image.Resampling.LANCZOS),
         }
         return output_path, meta
+
 
     def fabricate_articulated_rig(
         self,
@@ -1608,6 +2013,540 @@ class VisualArtSpriteDesignerAgent:
 
         return sprites
 
+    @staticmethod
+    def _draw_checkerboard(
+        canvas: Image.Image,
+        rect: Tuple[int, int, int, int],
+        color_a: Tuple[int, int, int, int],
+        color_b: Tuple[int, int, int, int],
+        tile_px: int = 8,
+    ) -> None:
+        """Draws a dual-tone checkerboard pattern inside `rect = (x0, y0, x1, y1)` on `canvas`."""
+        draw = ImageDraw.Draw(canvas)
+        x0, y0, x1, y1 = rect
+        step = max(4, int(tile_px))
+        for y in range(y0, y1, step):
+            row_idx = (y - y0) // step
+            for x in range(x0, x1, step):
+                col_idx = (x - x0) // step
+                fill = color_a if (row_idx + col_idx) % 2 == 0 else color_b
+                draw.rectangle([x, y, min(x1 - 1, x + step - 1), min(y1 - 1, y + step - 1)], fill=fill)
+
+    @classmethod
+    def render_asset_inspection_plate(
+        cls,
+        img: Union[Image.Image, Path, str],
+        asset_type: str = "sprite",
+        output_path: Optional[Union[Path, str]] = None,
+    ) -> Image.Image:
+        """Tier 1 Isolated Asset Render Plate:
+        - For `tile` / `tile_surface`: renders a 3x3 seamless tiled grid (`3*w x 3*h`) so any edge seam or corner defect is immediately visible.
+        - For `sprite`, `prop`, `portrait`, `diegetic_ui`, `backdrop`: renders a side-by-side Dual-Tone Checkerboard Alpha Inspection Plate
+          (dark checkerboard on left with cyan tight alpha bounding box, light checkerboard on right to expose dark/magenta edge halos).
+        """
+        if isinstance(img, (Path, str)):
+            with Image.open(img) as opened:
+                rgba = opened.convert("RGBA")
+        else:
+            rgba = img.convert("RGBA")
+
+        w, h = rgba.size
+        norm_type = str(asset_type or "sprite").lower().strip()
+        is_tile = norm_type in ("tile", "tile_surface")
+
+        if is_tile:
+            # Render 3x3 repeating grid plate to inspect edge-to-edge seamless tiling
+            cell_w = max(32, min(128, w))
+            cell_h = max(32, min(128, h))
+            tile_cell = rgba.resize((cell_w, cell_h), Image.Resampling.LANCZOS) if (w, h) != (cell_w, cell_h) else rgba
+            plate = Image.new("RGBA", (cell_w * 3, cell_h * 3), (0, 0, 0, 255))
+            for gy in range(3):
+                for gx in range(3):
+                    plate.paste(tile_cell, (gx * cell_w, gy * cell_h))
+        else:
+            # Render side-by-side Dark & Light Checkerboard Alpha Cutout Plate
+            disp_w = max(64, min(192, w))
+            disp_h = max(64, min(192, h))
+            scaled = rgba.resize((disp_w, disp_h), Image.Resampling.NEAREST if max(w, h) <= 64 else Image.Resampling.LANCZOS)
+            pad = 12
+            plate_w = disp_w * 2 + pad * 3
+            plate_h = disp_h + pad * 2
+            plate = Image.new("RGBA", (plate_w, plate_h), (18, 20, 26, 255))
+
+            left_rect = (pad, pad, pad + disp_w, pad + disp_h)
+            right_rect = (pad * 2 + disp_w, pad, pad * 2 + disp_w * 2, pad + disp_h)
+            cls._draw_checkerboard(plate, left_rect, (30, 34, 42, 255), (46, 52, 64, 255), tile_px=8)
+            cls._draw_checkerboard(plate, right_rect, (216, 220, 230, 255), (242, 244, 248, 255), tile_px=8)
+
+            plate.paste(scaled, (pad, pad), scaled)
+            plate.paste(scaled, (pad * 2 + disp_w, pad), scaled)
+
+            draw = ImageDraw.Draw(plate)
+            bbox = scaled.getbbox()
+            if bbox:
+                bx0, by0, bx1, by1 = bbox
+                draw.rectangle(
+                    [pad + bx0, pad + by0, pad + bx1 - 1, pad + by1 - 1],
+                    outline=(0, 229, 255, 220),
+                    width=1,
+                )
+
+        if output_path is not None:
+            out_p = Path(output_path)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            plate.save(out_p, "PNG")
+        return plate
+
+    @classmethod
+    def render_animation_contact_sheet(
+        cls,
+        sheet_img: Union[Image.Image, Path, str],
+        states_meta: Dict[str, Any],
+        cell_size: Tuple[int, int] = (64, 64),
+        output_path: Optional[Union[Path, str]] = None,
+    ) -> Tuple[Image.Image, Dict[str, Any]]:
+        """Tier 2 Multi-Frame Animation Contact Sheet & Deterministic Motion Telemetry:
+        Extracts each animation state row from `sheet_img`, renders a padded filmstrip with checkerboard alpha background,
+        frame boundary boxes, and ground-contact foot baselines, and computes deterministic inter-frame pixel deltas.
+        """
+        if isinstance(sheet_img, (Path, str)):
+            with Image.open(sheet_img) as opened:
+                rgba = opened.convert("RGBA")
+        else:
+            rgba = sheet_img.convert("RGBA")
+
+        cw, ch = max(16, int(cell_size[0])), max(16, int(cell_size[1]))
+        sheet_w, sheet_h = rgba.size
+
+        if not states_meta:
+            hframes = max(1, sheet_w // cw)
+            states_meta = {
+                "default": {"row": 0, "frame_count": hframes, "fps": 8.0, "loop": True, "motion_profile": "idle"}
+            }
+
+        ordered_states = sorted(states_meta.items(), key=lambda kv: int(kv[1].get("row", 0)))
+        max_cols = max(max(1, int(st.get("frame_count", 1))) for _, st in ordered_states)
+        num_rows = max(1, len(ordered_states))
+
+        pad = 8
+        cell_stride_x = cw + pad
+        cell_stride_y = ch + pad
+        contact_w = pad + max_cols * cell_stride_x
+        contact_h = pad + num_rows * cell_stride_y
+        contact = Image.new("RGBA", (contact_w, contact_h), (20, 22, 28, 255))
+        draw = ImageDraw.Draw(contact)
+
+        state_telemetry: Dict[str, Dict[str, Any]] = {}
+        overall_min_l1 = None
+        all_non_empty = True
+        any_multi_frame_static = False
+
+        for r_idx, (state_name, sinfo) in enumerate(ordered_states):
+            row_num = int(sinfo.get("row", r_idx))
+            fcount = max(1, int(sinfo.get("frame_count", 1)))
+            frames: List[Image.Image] = []
+            foot_ys: List[int] = []
+            non_empty_frames = 0
+
+            for c_idx in range(fcount):
+                sx0 = min(max(0, c_idx * cw), max(0, sheet_w - cw))
+                sy0 = min(max(0, row_num * ch), max(0, sheet_h - ch))
+                frame_crop = rgba.crop((sx0, sy0, sx0 + cw, sy0 + ch))
+                frames.append(frame_crop)
+
+                dest_x = pad + c_idx * cell_stride_x
+                dest_y = pad + r_idx * cell_stride_y
+                cls._draw_checkerboard(
+                    contact,
+                    (dest_x, dest_y, dest_x + cw, dest_y + ch),
+                    (32, 36, 46, 255),
+                    (48, 54, 68, 255),
+                    tile_px=8,
+                )
+                contact.paste(frame_crop, (dest_x, dest_y), frame_crop)
+
+                fbbox = frame_crop.getbbox()
+                if fbbox is not None and (fbbox[2] - fbbox[0]) >= 2 and (fbbox[3] - fbbox[1]) >= 2:
+                    non_empty_frames += 1
+                    foot_ys.append(int(fbbox[3]))
+                    # Draw gold foot-baseline indicator at the bottom of the frame's subject bbox
+                    by = dest_y + min(ch - 1, int(fbbox[3]) - 1)
+                    draw.line([dest_x + 2, by, dest_x + cw - 3, by], fill=(255, 200, 60, 210), width=1)
+                else:
+                    all_non_empty = False
+
+                draw.rectangle(
+                    [dest_x, dest_y, dest_x + cw - 1, dest_y + ch - 1],
+                    outline=(0, 210, 255, 180),
+                    width=1,
+                )
+
+            # Compute inter-frame L1 pixel differences and OpenCV Farneback dense optical flow across consecutive frames
+            deltas: List[float] = []
+            flow_mags: List[float] = []
+            for idx_f in range(len(frames) - 1):
+                arr_a = np.array(frames[idx_f], dtype=np.float32)
+                arr_b = np.array(frames[idx_f + 1], dtype=np.float32)
+                mean_l1 = float(np.mean(np.abs(arr_a - arr_b)))
+                deltas.append(round(mean_l1, 4))
+
+                gray_a = cv2.cvtColor(arr_a[:, :, :3].astype(np.uint8), cv2.COLOR_RGB2GRAY)
+                gray_b = cv2.cvtColor(arr_b[:, :, :3].astype(np.uint8), cv2.COLOR_RGB2GRAY)
+                active_mask = (arr_a[:, :, 3] > 24) | (arr_b[:, :, 3] > 24)
+                if np.any(active_mask):
+                    flow = cv2.calcOpticalFlowFarneback(
+                        gray_a, gray_b, None,
+                        pyr_scale=0.5, levels=2, winsize=9, iterations=3, poly_n=5, poly_sigma=1.1, flags=0,
+                    )
+                    mag = np.sqrt(flow[:, :, 0] ** 2 + flow[:, :, 1] ** 2)
+                    flow_mags.append(round(float(np.mean(mag[active_mask])), 4))
+                else:
+                    flow_mags.append(0.0)
+
+            min_l1 = min(deltas) if deltas else 0.0
+            max_l1 = max(deltas) if deltas else 0.0
+            mean_flow = float(np.mean(flow_mags)) if flow_mags else 0.0
+            if fcount > 1:
+                if overall_min_l1 is None or min_l1 < overall_min_l1:
+                    overall_min_l1 = min_l1
+                if max_l1 <= 0.25:
+                    any_multi_frame_static = True
+
+            foot_drift = (max(foot_ys) - min(foot_ys)) if len(foot_ys) >= 2 else 0
+            state_telemetry[state_name] = {
+                "frame_count": fcount,
+                "non_empty_frames": non_empty_frames,
+                "min_interframe_l1_delta": round(min_l1, 4),
+                "max_interframe_l1_delta": round(max_l1, 4),
+                "mean_optical_flow_magnitude": round(mean_flow, 4),
+                "foot_baseline_max_drift_px": int(foot_drift),
+            }
+
+        all_flows = [float(st.get("mean_optical_flow_magnitude", 0.0)) for st in state_telemetry.values() if int(st.get("frame_count", 1)) > 1]
+        overall_flow_mean = round(float(np.mean(all_flows)), 4) if all_flows else 0.0
+
+        telemetry = {
+            "states": state_telemetry,
+            "all_frames_non_empty": bool(all_non_empty),
+            "min_interframe_l1_delta": round(overall_min_l1 if overall_min_l1 is not None else 0.0, 4),
+            "optical_flow_magnitude_mean": overall_flow_mean,
+            "is_truly_animated": bool(all_non_empty and not any_multi_frame_static),
+        }
+
+        if output_path is not None:
+            out_p = Path(output_path)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            contact.save(out_p, "PNG")
+        return contact, telemetry
+
+    @classmethod
+    def render_articulated_rig_contact_sheet(
+        cls,
+        composite_path: Union[Path, str],
+        articulated_parts: List[Dict[str, Any]],
+        cartridge_dir: Path,
+        cell_size: Tuple[int, int] = (64, 64),
+        output_path: Optional[Union[Path, str]] = None,
+    ) -> Tuple[Image.Image, Dict[str, Any]]:
+        """Tier 2 Articulated Rig Multi-Pose Contact Sheet:
+        Renders 4 articulated keyframes (t=0, t=1, t=2, t=3) by rotating/oscillating child parts around their declared pivots
+        so the multimodal critic can inspect whether parts articulate cleanly without detaching or clipping.
+        """
+        cw, ch = max(32, int(cell_size[0])), max(32, int(cell_size[1]))
+        loaded_parts: List[Tuple[Dict[str, Any], Image.Image]] = []
+        for pmeta in articulated_parts:
+            rel = str(pmeta.get("file_path") or pmeta.get("res_path", "").replace("res://", ""))
+            pfile = cartridge_dir / rel
+            if pfile.is_file():
+                with Image.open(pfile) as pim:
+                    pdims = pmeta.get("dimensions") or [cw // 2, ch // 2]
+                    pw, ph = max(8, int(pdims[0])), max(8, int(pdims[1]))
+                    loaded_parts.append((pmeta, pim.convert("RGBA").resize((pw, ph), Image.Resampling.LANCZOS)))
+
+        frame_count = 4
+        strip = Image.new("RGBA", (cw * frame_count, ch), (0, 0, 0, 0))
+        for f_idx in range(frame_count):
+            phase = (2.0 * math.pi * f_idx) / frame_count
+            frame_canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+            if loaded_parts:
+                sorted_parts = sorted(loaded_parts, key=lambda item: int(item[0].get("z_index_offset", 0)))
+                for idx_p, (pmeta, pimg) in enumerate(sorted_parts):
+                    pw, ph = pimg.size
+                    is_child = bool(pmeta.get("parent_part_id")) or idx_p > 0
+                    if is_child:
+                        angle = math.sin(phase + idx_p * 0.7) * 22.0
+                        part_frame = pimg.rotate(angle, resample=Image.Resampling.BICUBIC, expand=False)
+                    else:
+                        part_frame = pimg
+                    offs = pmeta.get("attach_offset_px") or [0.0, 0.0]
+                    ox = int((cw - pw) // 2 + float(offs[0]))
+                    oy = int((ch - ph) // 2 + float(offs[1]))
+                    frame_canvas.paste(part_frame, (max(0, min(cw - pw, ox)), max(0, min(ch - ph, oy))), part_frame)
+            elif Path(composite_path).is_file():
+                with Image.open(composite_path) as cim:
+                    base = cim.convert("RGBA").resize((cw, ch), Image.Resampling.LANCZOS)
+                    rot = base.rotate(math.sin(phase) * 12.0, resample=Image.Resampling.BICUBIC, expand=False)
+                    frame_canvas.paste(rot, (0, 0), rot)
+            strip.paste(frame_canvas, (f_idx * cw, 0), frame_canvas)
+
+        states_meta = {
+            "articulated_cycle": {"row": 0, "frame_count": frame_count, "fps": 8.0, "loop": True, "motion_profile": "action"}
+        }
+        return cls.render_animation_contact_sheet(
+            sheet_img=strip,
+            states_meta=states_meta,
+            cell_size=(cw, ch),
+            output_path=output_path,
+        )
+
+    def verify_rendered_asset(
+        self,
+        asset_req: Union[AssetRequirement, Dict[str, Any]],
+        rendered_asset_path: Union[Path, str],
+        inspection_plate_path: Optional[Union[Path, str]] = None,
+        reference_images: Optional[List[Any]] = None,
+        style_guide: str = "",
+    ) -> AssetVisualValidationVerdict:
+        """Tier 1 Deterministic OpenCV + Multimodal Visual Asset Verification.
+        Inspects the rendered asset and its isolated inspection plate before allowing it into asset_library.json.
+        """
+        req = AssetRequirement.model_validate(asset_req) if isinstance(asset_req, dict) else asset_req
+        asset_p = Path(rendered_asset_path)
+        if not asset_p.is_file():
+            return AssetVisualValidationVerdict(
+                deliberation=f"Rendered asset file '{asset_p}' is missing on disk.",
+                asset_id=req.asset_id,
+                alpha_cleanliness_passed=False,
+                interior_hole_cleanliness_passed=False,
+                subject_framing_and_completeness_passed=False,
+                tile_seam_continuity_passed=False,
+                mirror_symmetry_score=0.0,
+                style_coherence_score=1,
+                visual_defects=["Asset file missing on disk"],
+                prompt_refinement_directive="Regenerate valid PNG image.",
+                accepted=False,
+            )
+
+        with Image.open(asset_p) as im:
+            rgba = im.convert("RGBA")
+            w, h = rgba.size
+            rgba_np = np.array(rgba, dtype=np.uint8)
+
+        total_px = max(1, w * h)
+        opaque_px = int(np.count_nonzero(rgba_np[:, :, 3] > 24))
+        r_ch = rgba_np[:, :, 0].astype(np.int32)
+        g_ch = rgba_np[:, :, 1].astype(np.int32)
+        b_ch = rgba_np[:, :, 2].astype(np.int32)
+        a_ch = rgba_np[:, :, 3].astype(np.int32)
+        magenta_mask = (a_ch > 40) & (r_ch > 185) & (b_ch > 185) & (g_ch < 90) & ((np.minimum(r_ch, b_ch) - g_ch) > 100)
+        magenta_px = int(np.count_nonzero(magenta_mask))
+        alpha_ratio = opaque_px / float(total_px)
+        magenta_ratio = magenta_px / float(total_px)
+
+        is_tile = req.fabrication_mode == "tile_surface" or req.asset_type in ("tile", "tile_surface")
+        is_backdrop = req.fabrication_mode == "parallax_layer" or req.asset_type in ("backdrop", "parallax_layer")
+
+        defects: List[str] = []
+        alpha_ok = True
+        holes_ok = True
+        framing_ok = True
+        tile_ok = True
+        mirror_sym = 0.0
+
+        if opaque_px == 0 or alpha_ratio < 0.02:
+            defects.append(f"Asset '{req.asset_id}' is nearly blank/transparent (alpha coverage={alpha_ratio:.3f}).")
+            framing_ok = False
+        if magenta_ratio > 0.015:
+            defects.append(f"Asset '{req.asset_id}' has residual chroma-key magenta spill ({magenta_ratio:.3f}).")
+            alpha_ok = False
+
+        if is_tile:
+            px = rgba.load()
+            corners = [px[0, 0], px[w - 1, 0], px[0, h - 1], px[w - 1, h - 1]]
+            for r, g, b, a in corners:
+                if a < 240 or (r > 215 and g > 215 and b > 215) or (r > 200 and b > 200 and g < 80):
+                    tile_ok = False
+                    defects.append("Tile texture has defective white/magenta/transparent corner pixels.")
+                    break
+            mirror_sym = self.compute_tile_mirror_symmetry(rgba)
+            if mirror_sym > 0.62:
+                tile_ok = False
+                defects.append(
+                    f"Tile texture '{req.asset_id}' exhibits excessive bilateral mirror symmetry "
+                    f"(mirror_symmetry_score={mirror_sym:.3f} > 0.62). Must be synthesized with non-mirrored toroidal tiling."
+                )
+        elif not is_backdrop:
+            px = rgba.load()
+            corners_opaque = sum(1 for (cx, cy) in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)] if px[cx, cy][3] > 220)
+            if corners_opaque == 4 and alpha_ratio > 0.96:
+                alpha_ok = False
+                defects.append("Cutout sprite/portrait has all 4 outer corners opaque (>96% fill), indicating an unremoved background box or frame.")
+
+        plate_p = Path(inspection_plate_path) if inspection_plate_path else asset_p.parent / "renders" / f"plate_{req.asset_id}.png"
+        if not plate_p.is_file():
+            self.render_asset_inspection_plate(rgba, asset_type=req.asset_type, output_path=plate_p)
+
+        det_passed = bool(alpha_ok and holes_ok and framing_ok and tile_ok and not defects)
+
+        if self._is_live_genai_client():
+            from google.genai import types
+            contents: List[Any] = [
+                types.Part.from_bytes(data=plate_p.read_bytes(), mime_type="image/png"),
+            ]
+            for rp in self._build_reference_parts(reference_images)[:1]:
+                contents.append(rp)
+            v_prompt = (
+                f"You are the Studio Lead Visual QA Critic inspecting a rendered asset inspection plate before sealing it into the Cartridge Asset Library.\n"
+                f"Asset ID: '{req.asset_id}' | Type: '{req.asset_type}' | Mode: '{req.fabrication_mode}'\n"
+                f"Intended Purpose: {req.purpose or req.description}\n"
+                f"Style Guide: {style_guide}\n"
+                f"Deterministic OpenCV Pre-Check: det_passed={det_passed}, mirror_symmetry_score={mirror_sym:.3f}, pre_detected_defects={defects}\n"
+                f"Inspection Rules:\n"
+                f"- If mode is 'tile_surface' (shown as a 3x3 tiled grid): verify seamless edge-to-edge organic material repetition with ZERO bilateral mirror symmetry, ZERO harsh grid seams, ZERO isometric 3D block corners, and ZERO sky horizons.\n"
+                f"- If mode is 'static_sprite', 'sprite_sheet', or 'portrait' (shown over dark and light checkerboards): verify clean alpha cutout silhouette (ZERO solid background boxes or picture frames, ZERO trapped background pockets between limbs, ZERO transparent holes inside the subject's eyes or face), complete subject framing (ZERO detached environment terrain slabs or ground pedestals attached beneath the subject's base), and cohesive art style.\n"
+                f"MANDATORY (Rule 4): Provide `deliberation` FIRST, and `accepted` LAST."
+            )
+            contents.append(v_prompt)
+            text_model = getattr(self, "text_model_name", DEFAULT_STUDIO_MODEL) or DEFAULT_STUDIO_MODEL
+            try:
+                resp = self.client.models.generate_content(
+                    model=text_model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=AssetVisualValidationVerdict,
+                    ),
+                )
+            except Exception as exc:
+                raise StudioAgentError(
+                    f"Multimodal asset verification failed for '{req.asset_id}' on model '{text_model}': {exc}"
+                ) from exc
+            if not resp.text:
+                raise StudioAgentError(
+                    f"Multimodal asset verification returned empty response for '{req.asset_id}' on model '{text_model}'."
+                )
+            verdict = AssetVisualValidationVerdict.model_validate_json(resp.text)
+            verdict.mirror_symmetry_score = mirror_sym
+            if not det_passed:
+                verdict.accepted = False
+                verdict.alpha_cleanliness_passed = verdict.alpha_cleanliness_passed and alpha_ok
+                verdict.subject_framing_and_completeness_passed = verdict.subject_framing_and_completeness_passed and framing_ok
+                verdict.tile_seam_continuity_passed = verdict.tile_seam_continuity_passed and tile_ok
+                for d in defects:
+                    if d not in verdict.visual_defects:
+                        verdict.visual_defects.append(d)
+            return verdict
+
+        return AssetVisualValidationVerdict(
+            deliberation=(
+                f"Inspected rendered plate for '{req.asset_id}' ({req.fabrication_mode}): "
+                f"alpha_ratio={alpha_ratio:.2f}, magenta_ratio={magenta_ratio:.4f}, mirror_symmetry={mirror_sym:.3f}, defects={len(defects)}."
+            ),
+            asset_id=req.asset_id,
+            alpha_cleanliness_passed=alpha_ok,
+            interior_hole_cleanliness_passed=holes_ok,
+            subject_framing_and_completeness_passed=framing_ok,
+            tile_seam_continuity_passed=tile_ok,
+            mirror_symmetry_score=mirror_sym,
+            style_coherence_score=9 if det_passed else 3,
+            visual_defects=defects,
+            prompt_refinement_directive=(
+                "Ensure isolated grounded subject on flat #FF00FF chroma background with zero detached ground pedestal or bilateral mirror symmetry."
+                if not det_passed else ""
+            ),
+            accepted=det_passed,
+        )
+
+    def verify_rendered_animation(
+        self,
+        target_id: str,
+        contact_sheet_path: Union[Path, str],
+        anim_telemetry: Dict[str, Any],
+        purpose: str = "",
+        style_guide: str = "",
+    ) -> AnimationValidationVerdict:
+        """Tier 2 Deterministic OpenCV Optical Flow + Multimodal Animation Strip / Contact Sheet Verification."""
+        sheet_p = Path(contact_sheet_path)
+        all_non_empty = bool(anim_telemetry.get("all_frames_non_empty", False))
+        is_animated = bool(anim_telemetry.get("is_truly_animated", False))
+        min_l1 = float(anim_telemetry.get("min_interframe_l1_delta", 0.0))
+        flow_mean = float(anim_telemetry.get("optical_flow_magnitude_mean", 0.0))
+
+        defects: List[str] = []
+        if not sheet_p.is_file():
+            defects.append(f"Animation contact sheet '{sheet_p}' missing on disk.")
+        if not all_non_empty:
+            defects.append(f"Animation '{target_id}' contains empty/blank frames in the contact sheet.")
+        if not is_animated or min_l1 < 0.35:
+            is_animated = False
+            defects.append(
+                f"Animation '{target_id}' has static or insufficiently articulated frames (min_interframe_l1_delta={min_l1:.4f} < 0.35, optical_flow={flow_mean:.4f})."
+            )
+
+        if self._is_live_genai_client() and sheet_p.is_file():
+            from google.genai import types
+            contents: List[Any] = [
+                types.Part.from_bytes(data=sheet_p.read_bytes(), mime_type="image/png"),
+                (
+                    f"You are the Studio Lead Animation QA Critic inspecting a rendered multi-frame animation contact sheet.\n"
+                    f"Target Animation ID: '{target_id}' | Purpose: {purpose}\n"
+                    f"Deterministic OpenCV & Frame Telemetry: {anim_telemetry}\n"
+                    f"Pre-detected Defects: {defects}\n"
+                    f"Style Guide: {style_guide}\n"
+                    f"Verify that:\n"
+                    f"1. Frames show genuine, readable keyframe pose or mechanism articulation across the strip (not identical static copies).\n"
+                    f"2. Subject silhouette is continuous and intact (no severed props, torn limbs, or detached terrain slabs across states).\n"
+                    f"3. Grounded poses (idle/move) maintain consistent base contact along the gold baseline guide.\n"
+                    f"MANDATORY (Rule 4): Provide `deliberation` FIRST, and `accepted` LAST."
+                ),
+            ]
+            text_model = getattr(self, "text_model_name", DEFAULT_STUDIO_MODEL) or DEFAULT_STUDIO_MODEL
+            try:
+                resp = self.client.models.generate_content(
+                    model=text_model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=AnimationValidationVerdict,
+                    ),
+                )
+            except Exception as exc:
+                raise StudioAgentError(
+                    f"Multimodal animation verification failed for '{target_id}' on model '{text_model}': {exc}"
+                ) from exc
+            if not resp.text:
+                raise StudioAgentError(
+                    f"Multimodal animation verification returned empty response for '{target_id}' on model '{text_model}'."
+                )
+            verdict = AnimationValidationVerdict.model_validate_json(resp.text)
+            verdict.optical_flow_magnitude_mean = flow_mean
+            if not is_animated or not all_non_empty or defects:
+                verdict.accepted = False
+                verdict.motion_progression_verified = False
+                for d in defects:
+                    if d not in verdict.animation_defects:
+                        verdict.animation_defects.append(d)
+            return verdict
+
+        passed = bool(all_non_empty and is_animated and not defects)
+        return AnimationValidationVerdict(
+            deliberation=(
+                f"Evaluated rendered animation strip for '{target_id}': "
+                f"all_frames_non_empty={all_non_empty}, is_truly_animated={is_animated}, "
+                f"min_interframe_l1_delta={min_l1:.4f}, optical_flow_mean={flow_mean:.4f}."
+            ),
+            target_id=target_id,
+            motion_progression_verified=is_animated,
+            optical_flow_magnitude_mean=flow_mean,
+            silhouette_and_pivot_integrity_passed=all_non_empty,
+            baseline_grounding_passed=True,
+            animation_defects=defects,
+            remediation_directive="" if passed else "Regenerate clean grounded base sprite and apply continuous keyframe articulation.",
+            accepted=passed,
+        )
+
 
 VisualArtisanAgent = VisualArtSpriteDesignerAgent
+
+
 

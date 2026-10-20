@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 import uuid
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+DEFAULT_STUDIO_MODEL = "gemini-3.8-flash"
+
 
 def _sanitize_gemini_json_schema(node: Any) -> Any:
     """Recursively strips 'additionalProperties' and 'prefixItems' for Gemini Developer API compatibility,
@@ -739,6 +741,26 @@ class AcceptanceCriterion(BaseEpistemicModel):
         return data
 
 
+class KeyframeTransformSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Defines an explicit keyframe pose transform at normalized time t in [0.0, 1.0].
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST: Biomechanical rationale for this keyframe pose at normalized time t.")
+    time_normalized: float = Field(default=0.0, ge=0.0, le=1.0, description="Normalized timestamp in [0.0, 1.0] within the animation cycle.")
+    position_offset_px: Tuple[float, float] = Field(default=(0.0, 0.0), description="(dx, dy) pixel translation relative to rest attachment.")
+    rotation_degrees: float = Field(default=0.0, description="Rotation angle in degrees around the part or rig pivot.")
+    scale_xy: Tuple[float, float] = Field(default=(1.0, 1.0), description="(sx, sy) squash/stretch scale factor at this keyframe.")
+
+
+class PartKeyframeTrackSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Defines an ordered sequence of KeyframeTransformSpecs for a specific body/mechanism part.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST: Why this part's keyframe curve communicates the state's motion.")
+    part_id: str = Field(..., description="Target part_id ('root', 'torso', 'head', 'arm_l', 'arm_r', 'leg_l', 'leg_r', 'appendage').")
+    keyframes: List[KeyframeTransformSpec] = Field(default_factory=list, description="Ordered keyframes from t=0.0 to t=1.0.")
+
+
 class AnimationStateSpec(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     Defines an agent-authored animation state or pose sequence for a sprite sheet / animated asset.
@@ -756,6 +778,10 @@ class AnimationStateSpec(BaseEpistemicModel):
         default="",
         description="Detailed visual description of how the silhouette, limbs, or mechanism progress across frames."
     )
+    keyframe_tracks: List[PartKeyframeTrackSpec] = Field(
+        default_factory=list,
+        description="Optional explicit keyframe transform tracks per part/region across t in [0.0, 1.0]."
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -766,6 +792,7 @@ class AnimationStateSpec(BaseEpistemicModel):
                 out["pose_progression_prompt"] = out["motion_description"]
             return out
         return data
+
 
 
 class ArticulatedPartSpec(BaseEpistemicModel):
@@ -1620,6 +1647,46 @@ class VisualMockupArtifact(BaseEpistemicModel):
     created_at_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
+class MechanicEngineeringSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Engineering strategy authored by GameplaySystemsEngineer in the Writers' Room translating
+    a creative gameplay pillar or scene element into concrete Godot 4 nodes, state machines,
+    required sprite/tile assets, and falsifiable headless test invariants.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Engineering rationale translating the creative gameplay mechanic or spatial concept into a concrete, deterministic Godot 4 implementation."
+    )
+    mechanic_id: str = Field(
+        ...,
+        description="Unique snake_case identifier for this mechanic or system slice (e.g., 'player_traversal_and_colliders', 'source_connected_flow_solver', 'companion_interaction_state_machine')."
+    )
+    title: str = Field(
+        ...,
+        description="Concise human-readable title of the gameplay system or spatial mechanic."
+    )
+    target_gd_modules: List[str] = Field(
+        default_factory=lambda: ["mechanics.gd", "scenes.gd", "entities.gd", "main.gd"],
+        description="Target Godot 4 GDScript files ('main.gd', 'mechanics.gd', 'scenes.gd', 'entities.gd', 'ui_hud.gd') that implement this system."
+    )
+    godot_node_and_collider_architecture: str = Field(
+        ...,
+        description="Concrete Godot 4 node hierarchy, physics body motion_mode, and 1:1 visual-to-physical StaticBody2D/CollisionPolygon2D/Area2D topology."
+    )
+    state_machine_and_input_contract: str = Field(
+        ...,
+        description="Deterministic input triggers, state variables, unsolved t=0 baseline state, and causal transition rules."
+    )
+    required_sprite_and_tile_assets: List[str] = Field(
+        default_factory=list,
+        description="Explicit asset specs in format '<asset_id>:<tile|prop|sprite_sheet>:<visual description>' required by this mechanic so zero geometric programmer-art shapes are drawn."
+    )
+    falsifiable_test_invariants: List[str] = Field(
+        default_factory=list,
+        description="Concrete falsifiable assertions for headless Godot testing covering unsolved_baseline at t=0, spatial_boundary / negative_counterfactual, and positive_causal state progression."
+    )
+
+
 class WritersRoomUtterance(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     A single conversational turn in the open-ended Writers' Room transcript.
@@ -1632,7 +1699,7 @@ class WritersRoomUtterance(BaseEpistemicModel):
     turn_index: int = Field(...)
     speaker_role: str = Field(
         ...,
-        description="'CreativeDirector' | 'GameplayDesigner' | 'StoryWorldArchitect' | 'CharacterDesigner' | 'UXExperienceDesigner' | 'VisualArtDirector' | 'AudioAtmosphereDesigner' | 'UserSteering'"
+        description="'CreativeDirector' | 'GameplayDesigner' | 'GameplaySystemsEngineer' | 'StoryWorldArchitect' | 'CharacterDesigner' | 'UXExperienceDesigner' | 'VisualArtDirector' | 'AudioAtmosphereDesigner' | 'UserSteering'"
     )
     speaker_display_name: str = Field(..., description="Human-readable specialist title.")
     spoken_dialogue: str = Field(
@@ -1679,6 +1746,7 @@ class WritersRoomTurnProposal(BaseEpistemicModel):
     added_or_updated_barks: List[DialogueBarkSpec] = Field(default_factory=list)
     mockup_to_generate: Optional[VisualMockupArtifact] = Field(default=None)
     gameplay_pillars_additions: List[str] = Field(default_factory=list)
+    added_or_updated_engineering_specs: List[MechanicEngineeringSpec] = Field(default_factory=list)
     visual_style_guide_update: Optional[str] = Field(default=None)
     audio_direction_update: Optional[str] = Field(default=None)
 
@@ -1690,11 +1758,11 @@ class DirectorConvergenceCheck(BaseEpistemicModel):
     """
     deliberation: str = Field(
         ...,
-        description="MANDATORY FIRST PROPERTY: Director's critical evaluation of whether the experience, story, UX, art mockups, and characters feel like a cohesive, memorable game."
+        description="MANDATORY FIRST PROPERTY: Director's critical evaluation of whether the experience, story, UX, art mockups, characters, and engineering blueprint feel like a cohesive, buildable game."
     )
     is_ready_to_lock_bible: bool = Field(
         ...,
-        description="True ONLY when the Game Bible has a compelling hook, rich experience storyboard, diegetic UX plan, characters/world lore, and visual mockups."
+        description="True ONLY when the Game Bible has a compelling hook, rich experience storyboard, diegetic UX plan, characters/world lore, visual mockups, and a concrete technical architecture blueprint from GameplaySystemsEngineer."
     )
     experience_cohesion_score: float = Field(
         ...,
@@ -1753,6 +1821,10 @@ class GameBibleSpec(BaseEpistemicModel):
         description="Ordered visual depth layers decomposing the 16:9 mockup into constructible Godot 4 scene geometry."
     )
     gameplay_pillars: List[str] = Field(default_factory=list)
+    technical_architecture_blueprint: List[MechanicEngineeringSpec] = Field(
+        default_factory=list,
+        description="Concrete Godot 4 engineering strategies authored by GameplaySystemsEngineer mapping gameplay pillars and visual mockups to nodes, colliders, state machines, required assets, and test invariants."
+    )
     visual_style_guide: str = Field(default="")
     audio_direction_guide: str = Field(default="")
     concept_evolution: List[ConceptEvolutionEntry] = Field(default_factory=list)
@@ -1768,9 +1840,232 @@ class GameBibleSpec(BaseEpistemicModel):
         return self.model_dump()
 
 
+class AssetVisualValidationVerdict(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Tier 1 per-asset visual inspection verdict evaluating an isolated rendered asset plate
+    (dual-checkerboard alpha cutout plate for sprites/portraits, or 3x3 tiled grid plate for tiles).
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Detailed visual inspection of the rendered asset plate (alpha cutout cleanliness, subject completeness, 3x3 tile edge continuity, and art direction match)."
+    )
+    asset_id: str = Field(..., description="Identifier of the inspected asset.")
+    alpha_cleanliness_passed: bool = Field(
+        default=True,
+        description="True if sprites/portraits have clean alpha cutouts with zero leftover background boxes, outer picture frames, or magenta halos."
+    )
+    interior_hole_cleanliness_passed: bool = Field(
+        default=True,
+        description="True if enclosed interior pockets (between legs, under arms, inside arches/spokes) have clean transparency rather than trapped background patches."
+    )
+    subject_framing_and_completeness_passed: bool = Field(
+        default=True,
+        description="True if the subject is complete (e.g., full-body actor rather than cropped bust for sprites, zero baked-in ground pedestals or surfing water wakes under feet)."
+    )
+    tile_seam_continuity_passed: bool = Field(
+        default=True,
+        description="True if 3x3 tiled surface plates repeat seamlessly without harsh grid borders, Rorschach/kaleidoscope mirror symmetry, white/magenta corner triangles, or baked-in perspective horizons."
+    )
+    mirror_symmetry_score: float = Field(
+        default=0.0,
+        description="Maximum bilateral horizontal/vertical mirror correlation in [0.0, 1.0]. Tiles above 0.65 indicate artificial Rorschach mirror-blending defects."
+    )
+    style_coherence_score: int = Field(
+        default=8,
+        ge=1,
+        le=10,
+        description="Coherence score (1..10) against the Game Bible style guide and reference mockup."
+    )
+    visual_defects: List[str] = Field(
+        default_factory=list,
+        description="Specific visual defects observed on the rendered inspection plate."
+    )
+    prompt_refinement_directive: str = Field(
+        default="",
+        description="Targeted prompt or parameter refinement directive to fix the asset on regeneration if rejected."
+    )
+    accepted: bool = Field(
+        ...,
+        description="Decision token (strictly last per Rule 4): True ONLY if the rendered asset passes all visual quality and alpha/seam checks."
+    )
+
+
+class AnimationValidationVerdict(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Tier 2 per-animation contact-sheet and in-engine multi-frame strip validation verdict.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Frame-by-frame visual analysis of the rendered animation strip / contact sheet across timestamps t0..tk."
+    )
+    target_id: str = Field(..., description="Asset ID or atomic unit ID of the inspected animation.")
+    motion_progression_verified: bool = Field(
+        default=True,
+        description="True if frames exhibit clear, purposeful keyframe pose or articulated-part progression across t0..tk rather than static duplicate or micro-shifted frames."
+    )
+    optical_flow_magnitude_mean: float = Field(
+        default=0.0,
+        description="Mean dense optical flow magnitude across consecutive frames computed via OpenCV Farneback flow."
+    )
+    silhouette_and_pivot_integrity_passed: bool = Field(
+        default=True,
+        description="True if limbs/parts remain coherently attached without wild clipping, detached floating pieces, or broken proportions."
+    )
+    baseline_grounding_passed: bool = Field(
+        default=True,
+        description="True if grounded states (idle/move) maintain consistent foot/base contact along the baseline guide without erratic vertical jitter."
+    )
+    animation_defects: List[str] = Field(
+        default_factory=list,
+        description="Specific frame-level or motion defects observed in the rendered animation strip."
+    )
+    remediation_directive: str = Field(
+        default="",
+        description="Specific instructions to repair the sprite sheet articulation or in-engine GDScript animation logic."
+    )
+    accepted: bool = Field(
+        ...,
+        description="Decision token (strictly last per Rule 4): True ONLY if the rendered animation strip demonstrates clean, readable, non-static motion."
+    )
+
+
+
+class SceneUnitVisualVerdict(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Tier 3 & Tier 4 visual & spatial-collider alignment verdict evaluating rendered scene components
+    (clean viewport + physics collision overlay) and multi-state level progression snapshots.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Side-by-side analysis of the clean Godot render, the live physics collision overlay render, and the concept art."
+    )
+    unit_id: str = Field(..., description="Atomic unit ID or stage ID being visually verified.")
+    visual_to_collider_alignment_passed: bool = Field(
+        default=True,
+        description="True ONLY if every visual cliff edge, sky backdrop boundary, water/chasm gap, and solid structure in the clean render is accurately bounded by physical StaticBody2D/CollisionPolygon2D shapes in the collision overlay."
+    )
+    spatial_depth_and_proportion_passed: bool = Field(
+        default=True,
+        description="True if sprites, tiles, and landmarks are properly scaled and layered without giant unscaled textures or raw programmer-art rectangles."
+    )
+    state_progression_visibility_passed: bool = Field(
+        default=True,
+        description="True if active/completed state renders show clear, gratifying visual feedback and world transformation compared to the unsolved t0 render."
+    )
+    blocking_visual_or_spatial_defects: List[str] = Field(
+        default_factory=list,
+        description="Concrete visual, perspective, or visual-to-collider misalignment defects."
+    )
+    remediation_instructions: List[str] = Field(
+        default_factory=list,
+        description="Surgical GDScript remediation steps to fix the identified visual or collider alignment defects."
+    )
+    accepted: bool = Field(
+        ...,
+        description="Decision token (strictly last per Rule 4): True ONLY if visual composition, collider alignment, and state progression all pass."
+    )
+
+
+class AtomicInvariantSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    A single falsifiable behavioral or spatial invariant tested by a headless Godot atomic unit test.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Epistemic rationale explaining why this invariant is necessary to prove the atomic unit works and cannot be gamed."
+    )
+    invariant_id: str = Field(..., description="Unique invariant identifier, e.g. 'INV_R1_U1_BASE' or 'INV_R1_U1_BOUNDARY'.")
+    invariant_type: Literal[
+        "unsolved_baseline",
+        "negative_counterfactual",
+        "spatial_boundary",
+        "positive_causal",
+    ] = Field(
+        ...,
+        description="Category of invariant: 'unsolved_baseline' | 'negative_counterfactual' | 'spatial_boundary' | 'positive_causal'."
+    )
+    setup_description: str = Field(..., description="Exact node/state initialization for this test scenario.")
+    action_sequence: str = Field(..., description="Exact stimulus, method calls, or physics frames applied during the test.")
+    expected_assertion: str = Field(..., description="Exact falsifiable assertion condition that must hold.")
+
+
+class AtomicWorkUnit(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    A granular, self-contained implementation and verification unit decomposed from a RequirementTrack.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Architectural rationale for isolating this atomic piece and how it will be verified behaviorally and visually."
+    )
+    unit_id: str = Field(..., description="Unique atomic unit identifier, e.g. 'R1_U1_terrace_colliders'.")
+    parent_track_id: str = Field(default="R1", description="Parent RequirementTrack ID.")
+    title: str = Field(..., description="Concise title of this atomic work unit.")
+    single_responsibility_scope: str = Field(
+        ...,
+        description="Exact single responsibility of this unit (one cohesive class, mechanic solver, collider topology, or animated entity)."
+    )
+    verification_modality: Literal[
+        "behavioral_and_scene_overlay",
+        "behavioral_and_animation_strip",
+        "behavioral_and_level_progression",
+        "behavioral_only",
+    ] = Field(
+        default="behavioral_and_scene_overlay",
+        description="Which visual render verification tier accompanies the behavioral Godot unit test."
+    )
+    target_files: List[str] = Field(
+        default_factory=lambda: ["mechanics.gd"],
+        description="Cartridge `.gd` files created or updated by this atomic unit."
+    )
+    target_classes_and_methods: List[str] = Field(
+        default_factory=list,
+        description="Specific classes and methods targeted by this unit."
+    )
+    invariants: List[AtomicInvariantSpec] = Field(
+        default_factory=list,
+        description="Mandatory falsifiable invariants (must include baseline/negative/boundary + positive causal)."
+    )
+
+
+class TrackAtomicDecompositionPlan(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Decomposes a high-level RequirementTrack (or cartridge repair scope) into ordered AtomicWorkUnits.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Engineering deliberation decomposing the track into small, independently verifiable atomic pieces."
+    )
+    track_id: str = Field(..., description="Identifier of the parent RequirementTrack.")
+    atomic_units: List[AtomicWorkUnit] = Field(
+        default_factory=list,
+        description="Ordered list of atomic work units to build, test, render, and verify one by one."
+    )
+
+
+class AtomicTestSynthesisPayload(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Structured output containing an executable Godot 4 SceneTree unit test script (`tests/test_<unit_id>.gd`)
+    that tests all invariants of an AtomicWorkUnit.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Step-by-step design of the headless Godot 4 SceneTree test script verifying unsolved baseline, negative/counterfactual/boundary, and positive causal assertions."
+    )
+    unit_id: str = Field(..., description="Atomic unit ID tested by this script.")
+    test_script_filename: str = Field(
+        ...,
+        description="Relative path in the cartridge, e.g. 'tests/test_R1_U1.gd'."
+    )
+    test_gdscript_code: str = Field(
+        ...,
+        description="Complete valid Godot 4 GDScript code (`extends SceneTree`) that instantiates the target classes/scene, executes each invariant check, prints `[ATOMIC_ASSERT_PASS]` / `[ATOMIC_ASSERT_FAIL]` lines, and calls `quit(0)` or `quit(1)`."
+    )
+
+
 def __getattr__(name: str) -> Any:
     if name == "OpenGenreCartridgeBundle":
         from engine.studio.swe import OpenGenreCartridgeBundle
         return OpenGenreCartridgeBundle
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 

@@ -1432,6 +1432,7 @@
     }
     .utterance-card.role-CreativeDirector { border-left-color: var(--pink); }
     .utterance-card.role-GameplayDesigner { border-left-color: var(--green); }
+    .utterance-card.role-GameplaySystemsEngineer { border-left-color: var(--orange, #ff8c1a); }
     .utterance-card.role-StoryWorldArchitect { border-left-color: var(--purple); }
     .utterance-card.role-CharacterDesigner { border-left-color: var(--amber); }
     .utterance-card.role-UXExperienceDesigner { border-left-color: var(--cyan); }
@@ -1646,7 +1647,7 @@
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; border-bottom: 1px solid var(--navy); padding-bottom: 8px;">
       <div>
         <strong style="color: var(--green); font-size: 15px;">🚀 Commission New Game from Scratch</strong>
-        <div style="font-size: 11px; color: var(--light-gray); margin-top: 2px;">Clears active session state and convenes the 7-specialist Creative Writers' Room.</div>
+        <div style="font-size: 11px; color: var(--light-gray); margin-top: 2px;">Clears active session state and convenes the 8-specialist Creative Writers' Room.</div>
       </div>
       <button id="btn-close-new-game-modal" type="button" class="drawer-close-btn" title="Close (Esc)">✕</button>
     </div>
@@ -1709,6 +1710,7 @@
         <div id="specialist-roster-bar" class="specialist-roster-bar">
           <span class="specialist-pill" data-role="CreativeDirector">🎬 CreativeDirector</span>
           <span class="specialist-pill" data-role="GameplayDesigner">🎮 GameplayDesigner</span>
+          <span class="specialist-pill" data-role="GameplaySystemsEngineer">🛠️ GameplaySystemsEngineer</span>
           <span class="specialist-pill" data-role="StoryWorldArchitect">🌍 StoryWorldArchitect</span>
           <span class="specialist-pill" data-role="CharacterDesigner">🎭 CharacterDesigner</span>
           <span class="specialist-pill" data-role="UXExperienceDesigner">✨ UXExperienceDesigner</span>
@@ -2595,12 +2597,14 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       }
 
       if (totalTracks > 0 && completedCount === totalTracks) {
+        // All tracks are implemented, but that does NOT mean the quality gates ran or passed.
+        // Keep the button actionable so the quality-gate stage can be re-run via resume.
         btn.dataset.buildMode = 'completed';
         btn.style.background = 'rgba(0, 228, 54, 0.16)';
         btn.style.borderColor = 'var(--green)';
         btn.style.color = 'var(--green)';
-        btn.title = 'All requirement tracks completed and verified! Click to view Requirement Tracks & Checkpoints.';
-        setHtmlIfChanged(btn, `<span>✅ Build Complete (${completedCount}/${totalTracks} Tracks)</span>`);
+        btn.title = 'All requirement tracks are implemented. This does not mean quality gates passed. Click to re-run the build from the Quality Gates stage (completed tracks are skipped). Use "Tasks & Handoffs" to inspect tracks and checkpoints.';
+        setHtmlIfChanged(btn, `<span>▶️ Tracks Complete (${completedCount}/${totalTracks}) — Run Quality Gates</span>`);
         return;
       }
 
@@ -2911,7 +2915,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           core_genre: 'Writers\' Room Session',
           creative_vision_summary: creativePrompt
             ? `Executive Creative Seed: "${creativePrompt}" — Convening 7 specialists to brainstorm the player experience...`
-            : 'Convening CreativeDirector, GameplayDesigner, StoryWorldArchitect, CharacterDesigner, UXExperienceDesigner, VisualArtDirector, and AudioAtmosphereDesigner...',
+            : 'Convening CreativeDirector, GameplayDesigner, GameplaySystemsEngineer, StoryWorldArchitect, CharacterDesigner, UXExperienceDesigner, VisualArtDirector, and AudioAtmosphereDesigner...',
           first_60_seconds_hook: 'Specialists are debating the opening 60-second playable hook...',
           diegetic_ui_philosophy: 'Clean, readable HUD paired with responsive in-world visual cues.',
           writers_room_transcript: [],
@@ -3010,7 +3014,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     document.getElementById('btn-resume-genesis')?.addEventListener('click', (e) => {
       const btn = e.currentTarget;
       const mode = btn ? btn.dataset.buildMode : 'resumable';
-      if (mode === 'running' || mode === 'completed') {
+      if (mode === 'running') {
         if (typeof window.openDrawerToTab === 'function') {
           window.openDrawerToTab('backlog');
         }
@@ -4785,6 +4789,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const pillarsContainer = document.getElementById('bible-pillars-container');
       if (pillarsContainer) {
         const ws = bible.world_spec || {};
+        const engSpecs = Array.isArray(bible.technical_architecture_blueprint) ? bible.technical_architecture_blueprint : [];
         const pillarsHtml = `
           <div style="margin-bottom: 10px;">
             <h5 style="color: var(--green); font-size: 11px; text-transform: uppercase; margin-bottom: 6px;">⚙️ Core Gameplay Pillars</h5>
@@ -4792,6 +4797,22 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
               ? `<ul style="padding-left: 18px; color: var(--white); font-size: 11.5px; display: flex; flex-direction: column; gap: 4px;">${pillars.map(p => `<li>${escapeHtml(p)}</li>`).join('')}</ul>`
               : '<div style="color: var(--slate); font-size: 11px;">No gameplay pillars locked yet.</div>'}
           </div>
+          ${engSpecs.length > 0 ? `
+            <div style="margin-bottom: 10px;">
+              <h5 style="color: var(--orange, #ff8c1a); font-size: 11px; text-transform: uppercase; margin-bottom: 6px;">🛠️ Technical Architecture Blueprint (GameplaySystemsEngineer) — ${engSpecs.length}</h5>
+              <div style="display: flex; flex-direction: column; gap: 8px;">
+                ${engSpecs.map(e => `
+                  <div class="blueprint-box" style="margin-top: 0; border-left: 3px solid var(--orange, #ff8c1a); background: #070e22; font-size: 11px; line-height: 1.45;">
+                    <div style="font-weight: bold; color: var(--white); margin-bottom: 4px;">${escapeHtml(e.title || e.mechanic_id)} <span style="color: var(--slate); font-size: 10px;">(${escapeHtml((e.target_gd_modules || []).join(', '))})</span></div>
+                    <div><strong style="color: var(--cyan);">Nodes &amp; Colliders:</strong> ${escapeHtml(e.godot_node_and_collider_architecture || '')}</div>
+                    <div><strong style="color: var(--green);">State Machine &amp; Inputs:</strong> ${escapeHtml(e.state_machine_and_input_contract || '')}</div>
+                    <div><strong style="color: var(--yellow);">Required Assets:</strong> ${escapeHtml((e.required_sprite_and_tile_assets || []).join(' | '))}</div>
+                    <div><strong style="color: var(--pink);">Test Invariants:</strong> ${escapeHtml((e.falsifiable_test_invariants || []).join(' | '))}</div>
+                  </div>
+                `).join('')}
+              </div>
+            </div>
+          ` : ''}
           ${Object.keys(ws).length > 0 ? `
             <div>
               <h5 style="color: var(--cyan); font-size: 11px; text-transform: uppercase; margin-bottom: 6px;">🌍 Locked World Spec Blueprint</h5>

@@ -180,6 +180,14 @@ class GameConceptDirectorAgent:
                     f"{m.title} ({getattr(m, 'camera_and_spatial_paradigm', '')}): {m.scene_description} | Callouts: {m.ui_callout_notes}"
                     for m in (getattr(game_bible, "visual_mockups", []) or [])
                 ]
+                eng_blueprint_str = "\n".join(
+                    f"  * [{e.mechanic_id}] {e.title} (modules={e.target_gd_modules}): "
+                    f"Nodes/Colliders={e.godot_node_and_collider_architecture} | "
+                    f"State Machine={e.state_machine_and_input_contract} | "
+                    f"Required Assets={e.required_sprite_and_tile_assets} | "
+                    f"Test Invariants={e.falsifiable_test_invariants}"
+                    for e in (getattr(game_bible, "technical_architecture_blueprint", []) or [])
+                )
                 bible_context_lines.extend([
                     f"- Working Title: {getattr(game_bible, 'game_title', '')}",
                     f"- Elevator Pitch: {getattr(game_bible, 'elevator_pitch', '')}",
@@ -193,6 +201,10 @@ class GameConceptDirectorAgent:
                     f"- Audio Direction Guide: {getattr(game_bible, 'audio_direction_guide', '')}",
                     f"- Visual Mockup Callouts: {mockup_notes}",
                 ])
+                if eng_blueprint_str:
+                    bible_context_lines.append(
+                        f"- Technical Architecture Blueprint (from Writers' Room GameplaySystemsEngineer — honor these exact node/collider strategies, state machines, required assets, and invariants):\n{eng_blueprint_str}"
+                    )
                 if storyboard_str:
                     bible_context_lines.append(f"- Experience Storyboard:\n{storyboard_str}")
 
@@ -249,6 +261,9 @@ class GameConceptDirectorAgent:
                 f"   - Use `fabrication_mode='articulated_parts'` when an entity, machine, turbine, or boss needs independently rotating/moving parts.\n"
                 f"   - Use `fabrication_mode='sprite_sheet'` (with `animation_states` such as 'idle', 'move', 'jump', 'action') for full-body in-world characters, companions, and reactive props in `assets/sprites/`.\n"
                 f"   - Use `fabrication_mode='portrait'` STRICTLY for UI dialogue busts in `assets/portraits/` (NEVER use portraits as in-world sprites).\n"
+                f"8. 1:1 VISUAL-TO-PHYSICAL COLLIDER CONTAINMENT: Track 'R1' MUST mandate that physical `StaticBody2D` / `CollisionPolygon2D` boundaries align 1:1 with the visual walkable terrain edges so the player character can NEVER walk into sky backdrops, across unbridged chasms, or off walkable shelves.\n"
+                f"9. ABSOLUTE BAN ON PRE-SOLVED t=0 LEVELS & FAKE SIMULATIONS: Every mechanic and stage MUST initialize in an UNSOLVED state at t=0 (zero pre-completed paths or self-winning demo loops). Simulation propagation (e.g. fluid, energy, signals, logistics) MUST require true graph/source connectivity from a source to a target, and levels must feature genuine multi-stage obstacles and progression depth.\n"
+                f"10. ATOMIC TDD & MULTI-TIER VISUAL RENDER VERIFICATION: Structure each track's acceptance criteria so they can be decomposed into atomic work units tested for (a) unsolved passive baseline, (b) negative counterfactual & spatial boundary containment, (c) positive causal state transition, and (d) rendered visual, animation strip, and collision-overlay alignment.\n"
             )
 
             contents_payload: Any = (mockup_image_parts + [prompt]) if mockup_image_parts else prompt

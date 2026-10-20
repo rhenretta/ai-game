@@ -6,3 +6,7 @@ pillow>=11.0.0
 typing-extensions>=4.10.0
 google-genai>=1.0.0
 python-dotenv>=1.0.0
+numpy>=1.26.0
+opencv-python-headless>=4.10.0
+rembg>=2.0.50
+onnxruntime>=1.18.0

@@ -319,7 +319,7 @@ class GodotHeadlessSimulator:
 
         if use_viewport:
             cap_dir = self.cartridge_path / "assets" / "playtest_captures"
-            for stale_name in ("playtest_t0.png", "playtest_tend.png"):
+            for stale_name in ("playtest_t0.png", "playtest_tend.png", "playtest_collision_overlay.png"):
                 stale_p = cap_dir / stale_name
                 if stale_p.is_file():
                     try:

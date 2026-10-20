@@ -21,7 +21,7 @@ import json
 import logging
 from pathlib import Path
 import shutil
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from PIL import Image
 
@@ -104,7 +104,153 @@ class CartridgeAssetLibrary:
             json.dumps(self.catalog.to_dict(), indent=2, default=str),
             encoding="utf-8",
         )
+        if (self.cartridge_dir / "project.godot").is_file() or (self.cartridge_dir / "src").is_dir():
+            try:
+                self.export_godot_studio_helper()
+            except Exception as exc:
+                logger.debug("StudioRigHelper export skipped: %s", exc)
         return self.catalog_path
+
+    def export_godot_studio_helper(self) -> Path:
+        """Writes `src/studio_rig_and_collider.gd` (`class_name StudioRigHelper`) into the cartridge
+        so the SWE agent has native Godot 4 helpers for:
+        1. `AnimationPlayer` + keyframe track binding (`attach_sprite_sheet_animation_player`)
+        2. Pixel-accurate `BitMap.opaque_to_polygons()` collision tracing (`create_bitmap_collision_polygons`)
+        3. Non-stretched repeating `Polygon2D` tiled surfaces (`create_tiled_surface`)
+        """
+        src_dir = self.cartridge_dir / "src"
+        src_dir.mkdir(parents=True, exist_ok=True)
+        helper_path = src_dir / "studio_rig_and_collider.gd"
+        code = '''class_name StudioRigHelper
+extends RefCounted
+
+static func attach_sprite_sheet_animation_player(
+\thost: Node2D,
+\ttex: Texture2D,
+\thframes_count: int = 4,
+\tvframes_count: int = 4,
+\tstates_meta: Dictionary = {},
+\ttarget_size: Vector2 = Vector2(64, 64)
+) -> Dictionary:
+\tvar spr := Sprite2D.new()
+\tspr.name = "RigSprite"
+\tspr.texture = tex
+\tspr.hframes = maxi(1, hframes_count)
+\tspr.vframes = maxi(1, vframes_count)
+\tif tex != null:
+\t\tvar cell_w := float(tex.get_width()) / float(spr.hframes)
+\t\tvar cell_h := float(tex.get_height()) / float(spr.vframes)
+\t\tif cell_w > 0.0 and cell_h > 0.0:
+\t\t\tspr.scale = Vector2(target_size.x / cell_w, target_size.y / cell_h)
+\thost.add_child(spr)
+
+\tvar anim_player := AnimationPlayer.new()
+\tanim_player.name = "RigAnimationPlayer"
+\thost.add_child(anim_player)
+
+\tvar lib := AnimationLibrary.new()
+\tvar eff_states := states_meta
+\tif eff_states.is_empty():
+\t\teff_states = {
+\t\t\t"idle": {"row": 0, "frame_count": spr.hframes, "fps": 6.0, "loop": true},
+\t\t\t"move": {"row": mini(1, spr.vframes - 1), "frame_count": spr.hframes, "fps": 10.0, "loop": true},
+\t\t\t"jump": {"row": mini(2, spr.vframes - 1), "frame_count": mini(3, spr.hframes), "fps": 8.0, "loop": false},
+\t\t\t"action": {"row": mini(3, spr.vframes - 1), "frame_count": spr.hframes, "fps": 10.0, "loop": false}
+\t\t}
+
+\tfor state_name in eff_states.keys():
+\t\tvar info: Dictionary = eff_states[state_name]
+\t\tvar row_idx := int(info.get("row", 0))
+\t\tvar fcount := maxi(1, int(info.get("frame_count", spr.hframes)))
+\t\tvar fps := maxf(1.0, float(info.get("fps", 8.0)))
+\t\tvar is_loop := bool(info.get("loop", true))
+\t\tvar anim := Animation.new()
+\t\tvar duration := float(fcount) / fps
+\t\tanim.length = maxf(0.1, duration)
+\t\tanim.loop_mode = Animation.LOOP_LINEAR if is_loop else Animation.LOOP_NONE
+
+\t\tvar track_idx := anim.add_track(Animation.TYPE_VALUE)
+\t\tanim.track_set_path(track_idx, NodePath("RigSprite:frame"))
+\t\tanim.value_track_set_update_mode(track_idx, Animation.UPDATE_DISCRETE)
+\t\tfor f in range(fcount):
+\t\t\tvar frame_coord := clampi(row_idx * spr.hframes + f, 0, spr.hframes * spr.vframes - 1)
+\t\t\tanim.track_insert_key(track_idx, float(f) / fps, frame_coord)
+\t\tlib.add_animation(str(state_name), anim)
+
+\tanim_player.add_animation_library("", lib)
+\tif lib.has_animation("idle"):
+\t\tanim_player.play("idle")
+\treturn {"sprite": spr, "anim_player": anim_player}
+
+static func create_bitmap_collision_polygons(
+\ttex: Texture2D,
+\ttarget_size: Vector2,
+\talpha_threshold: float = 0.2,
+\tepsilon: float = 2.5
+) -> Array[CollisionPolygon2D]:
+\tvar result: Array[CollisionPolygon2D] = []
+\tif tex == null:
+\t\treturn result
+\tvar img := tex.get_image()
+\tif img == null or img.is_empty():
+\t\treturn result
+\tvar bm := BitMap.new()
+\tbm.create_from_image_alpha(img, alpha_threshold)
+\tvar polys := bm.opaque_to_polygons(Rect2i(Vector2i.ZERO, img.get_size()), epsilon)
+\tvar iw := maxf(1.0, float(img.get_width()))
+\tvar ih := maxf(1.0, float(img.get_height()))
+\tfor poly in polys:
+\t\tif poly.size() < 3:
+\t\t\tcontinue
+\t\tvar cpoly := CollisionPolygon2D.new()
+\t\tvar scaled := PackedVector2Array()
+\t\tfor pt in poly:
+\t\t\tvar nx := ( (pt.x / iw) - 0.5 ) * target_size.x
+\t\t\tvar ny := ( (pt.y / ih) - 0.5 ) * target_size.y
+\t\t\tscaled.append(Vector2(nx, ny))
+\t\tcpoly.polygon = scaled
+\t\tresult.append(cpoly)
+\treturn result
+
+static func create_tiled_surface(
+\tbody: StaticBody2D,
+\ttex: Texture2D,
+\tsize: Vector2,
+\tis_walkable_shelf: bool = true
+) -> Polygon2D:
+\tif is_walkable_shelf and not body.is_in_group("walkable_shelf"):
+\t\tbody.add_to_group("walkable_shelf")
+\tvar hw := maxf(8.0, size.x * 0.5)
+\tvar hh := maxf(8.0, size.y * 0.5)
+\tvar poly := Polygon2D.new()
+\tpoly.name = "TiledSurfaceVisual"
+\tpoly.polygon = PackedVector2Array([
+\t\tVector2(-hw, -hh),
+\t\tVector2(hw, -hh),
+\t\tVector2(hw, hh),
+\t\tVector2(-hw, hh)
+\t])
+\tpoly.uv = PackedVector2Array([
+\t\tVector2(0, 0),
+\t\tVector2(size.x, 0),
+\t\tVector2(size.x, size.y),
+\t\tVector2(0, size.y)
+\t])
+\tif tex != null:
+\t\tpoly.texture = tex
+\t\tpoly.texture_repeat = CanvasItem.TEXTURE_REPEAT_ENABLED
+\tbody.add_child(poly)
+
+\tvar col := CollisionShape2D.new()
+\tcol.name = "TiledSurfaceCollider"
+\tvar rect := RectangleShape2D.new()
+\trect.size = Vector2(hw * 2.0, hh * 2.0)
+\tcol.shape = rect
+\tbody.add_child(col)
+\treturn poly
+'''
+        helper_path.write_text(code, encoding="utf-8")
+        return helper_path
 
     def get_concept_reference_images(self, concept_reference_id: Optional[str] = None) -> List[Path]:
         """Resolves Writers' Room 16:9 mockup PNGs and optional character reference portraits
@@ -118,11 +264,14 @@ class CartridgeAssetLibrary:
             cand_portrait_alt = self.portraits_dir / f"{concept_reference_id}.png"
             if cand_portrait_alt.is_file() and cand_portrait_alt not in refs:
                 refs.append(cand_portrait_alt)
+            if refs:
+                return refs[:2]
 
-        if self.mockups_dir.is_dir():
-            for mp in sorted(self.mockups_dir.glob("*.png")):
-                if mp not in refs:
-                    refs.append(mp)
+        for d in (self.mockups_dir, self.cartridge_dir / "artifacts" / "concept_art"):
+            if d.is_dir():
+                for mp in sorted(d.glob("*.png")):
+                    if mp not in refs:
+                        refs.append(mp)
         return refs[:2]
 
     def get_style_guide(self, for_environment: bool = False) -> str:
@@ -251,6 +400,7 @@ class CartridgeAssetLibrary:
                 AnimationStateSpec(
                     deliberation=f"Idle breathing animation for {cname}.",
                     state_name="idle",
+                    motion_profile="idle",
                     frame_count=4,
                     fps=6.0,
                     loop=True,
@@ -259,6 +409,7 @@ class CartridgeAssetLibrary:
                 AnimationStateSpec(
                     deliberation=f"Locomotion stride animation for {cname}.",
                     state_name="move",
+                    motion_profile="locomotion",
                     frame_count=4,
                     fps=10.0,
                     loop=True,
@@ -267,6 +418,7 @@ class CartridgeAssetLibrary:
                 AnimationStateSpec(
                     deliberation=f"Jump / aerial traversal animation for {cname}.",
                     state_name="jump",
+                    motion_profile="aerial",
                     frame_count=3,
                     fps=8.0,
                     loop=False,
@@ -275,6 +427,7 @@ class CartridgeAssetLibrary:
                 AnimationStateSpec(
                     deliberation=f"Primary interaction / ability animation for {cname}.",
                     state_name="action",
+                    motion_profile="action",
                     frame_count=4,
                     fps=10.0,
                     loop=False,
@@ -291,10 +444,10 @@ class CartridgeAssetLibrary:
                     purpose=f"Playable/NPC in-world animated actor sprite for {cname}",
                     concept_reference_id=cid,
                     target_path=f"assets/sprites/{cid}.png",
-                    description=f"Full-body in-world 2D game character sprite of {cname} ({crole}): {cdesc}",
+                    description=f"Full-body grounded standing 2D game character sprite of {cname} ({crole}): {cdesc}",
                     visual_prompt_or_text=(
-                        f"Full-body 2D in-game character sprite (head to toe, NOT a bust portrait) of {cname} ({crole}): "
-                        f"{cdesc}. {style_guide}"
+                        f"SINGLE solitary full-body 2D in-game character sprite (strictly ONE single figure standing upright head to toe with grounded base, "
+                        f"NEVER a multi-angle turnaround chart, NO detached ground pedestal beneath feet, NOT a bust portrait) of {cname} ({crole}): {cdesc}. {style_guide}"
                     ),
                     dimensions=(72, 72) if idx == 0 else (64, 64),
                     animation_states=states,
@@ -312,19 +465,16 @@ class CartridgeAssetLibrary:
                         purpose=f"Primary player CharacterBody2D sprite for protagonist {cname}",
                         concept_reference_id=cid,
                         target_path="assets/sprites/hero.png",
-                        description=f"Full-body in-world 2D protagonist sprite of {cname}: {cdesc}",
+                        description=f"Full-body grounded standing 2D protagonist sprite of {cname}: {cdesc}",
                         visual_prompt_or_text=(
-                            f"Full-body 2D in-game protagonist sprite (head to toe, NOT a bust portrait) of {cname}: "
-                            f"{cdesc}. {style_guide}"
+                            f"SINGLE solitary full-body 2D in-game protagonist sprite (strictly ONE single figure standing upright head to toe with grounded base, "
+                            f"NEVER a multi-angle turnaround chart, NO detached ground pedestal beneath feet, NOT a bust portrait) of {cname}: {cdesc}. {style_guide}"
                         ),
                         dimensions=(72, 72),
                         animation_states=states,
                     )
                 )
 
-        # 2 & 3. Decompose the Writers' Room 16:9 concept art & world layout into modular,
-        # isolated, composable world-building elements (tiles, horizon set-pieces, midground
-        # structures, and interactive landmarks/mechanisms)—never a static full-screen background image.
         derived.extend(
             self.decompose_concept_into_elements(
                 bible_dict=bible_dict,
@@ -345,15 +495,29 @@ class CartridgeAssetLibrary:
         style_guide: str = "",
     ) -> List[AssetRequirement]:
         """Decomposes the Writers' Room 16:9 concept scene into discrete, isolated, buildable 2D world elements
-        via a structured LLM JSON contract (AssetManifestSpec, Rule 2 & Rule 4) grounded in the concept art and Game Bible.
+        via a structured LLM JSON contract (Rule 2 & Rule 4) grounded in the concept art and Game Bible.
         """
-        from engine.studio.models import AssetManifestSpec
+        from pydantic import BaseModel, Field
+
+        class DecomposedElementItemSpec(BaseModel):
+            deliberation: str = Field(description="Reasoning for isolating this modular world element or repeatable tile surface.")
+            asset_id: str = Field(description="Snake_case identifier for this asset (e.g. 'terrace_stone_tile', 'prism_channel_tile', 'resonance_pylon', 'harmonic_flora').")
+            asset_type: Literal["tile", "prop", "sprite_sheet"] = Field(description="'tile' for repeatable surfaces, 'prop' for discrete structures, 'sprite_sheet' for animated flora/mechanisms.")
+            fabrication_mode: Literal["tile_surface", "static_sprite", "sprite_sheet"] = Field(description="Fabrication pipeline mode matching asset_type.")
+            purpose: str = Field(description="In-world gameplay/visual role of this asset.")
+            visual_prompt: str = Field(description="Detailed visual prompt for synthesizing this isolated asset or full-bleed material texture.")
+            width: int = Field(default=64, description="Target display width in pixels (64 to 128).")
+            height: int = Field(default=64, description="Target display height in pixels (64 to 128).")
+
+        class DecomposedConceptManifestSpec(BaseModel):
+            deliberation: str = Field(description="Architectural decomposition plan breaking the 16:9 concept scene into modular tiles, props, and animated elements.")
+            elements: List[DecomposedElementItemSpec] = Field(default_factory=list)
 
         if bible_dict is None:
             bible_dict = self._load_game_bible_dict()
-        if world_spec is None:
-            world_spec = bible_dict.get("world_layout_and_level_design") or {}
-        if landmarks is None:
+        if not world_spec:
+            world_spec = bible_dict.get("world_layout_and_level_design") or bible_dict.get("world_spec") or {}
+        if not landmarks:
             landmarks = world_spec.get("landmarks") or []
         if not style_guide:
             style_guide = self.get_style_guide(for_environment=True)
@@ -383,59 +547,125 @@ class CartridgeAssetLibrary:
                     target_path=f"assets/sprites/{lid}.png",
                     description=f"{lname}: {ldesc}",
                     visual_prompt_or_text=(
-                        f"Single isolated 2D game interactive world landmark mechanism/prop '{lname}' ({ltype}): {ldesc}. "
-                        f"STRICTLY an inanimate environment/architectural structure — NO characters, NO creatures. {style_guide}"
+                        f"Single isolated 2D game architectural landmark or mechanism prop '{lname}' ({ltype}): {ldesc}. "
+                        f"STRICTLY a single discrete structure/object on flat #FF00FF magenta chroma background — NO characters, NO floating island vignette. {style_guide}"
                     ),
                     dimensions=(96, 96),
                 )
             )
 
-        # 2. Delegate visual concept decomposition to Gemini via structured AssetManifestSpec contract (Rule 2 & Rule 4)
-        client = getattr(self.visual_agent, "client", None) if self.visual_agent is not None else None
-        is_live = getattr(self.visual_agent, "_is_live_genai_client", lambda: False)() if self.visual_agent is not None else False
-        if client is not None and is_live:
-            try:
-                from google.genai import types
-                ref_imgs = self.get_concept_reference_images()
-                contents: List[Any] = []
-                for rp in ref_imgs:
-                    if rp.is_file():
-                        contents.append(types.Part.from_bytes(data=rp.read_bytes(), mime_type="image/png"))
-                prompt = (
-                    f"You are the Visual Art & Technical Environment Director decomposing the attached 16:9 Writers' Room concept art "
-                    f"and Game Bible into discrete, composable 2D game assets (NEVER a static full-screen background painting).\n"
-                    f"Game Title: {bible_dict.get('game_title', '')}\n"
-                    f"Camera & Spatial Paradigm: {bible_dict.get('camera_and_spatial_paradigm', '')}\n"
-                    f"Visual Style Guide: {style_guide}\n"
-                    f"Concept Scene Description: {mockup_desc}\n"
-                    f"Scene Layers in Bible: {json.dumps(bible_dict.get('scene_layers') or [])}\n\n"
-                    f"Decompose the environment into 4 to 6 modular, reusable visual assets in `assets`:\n"
-                    f"- Repeatable surface/material tiles (`asset_type='tile'`, `fabrication_mode='tile_surface'`) for walkable terrain and architectural structures.\n"
-                    f"- Isolated alpha-transparent horizon and midground environmental set-piece sprites (`asset_type='prop'`, `fabrication_mode='static_sprite'`) that can be placed across depth layers.\n"
-                    f"- Any articulated environmental mechanisms (`asset_type='articulated_rig'`, `fabrication_mode='articulated_parts'`) or animated props (`asset_type='sprite_sheet'`, `fabrication_mode='sprite_sheet'`).\n"
-                    f"MANDATORY (Rule 4): Provide `deliberation` FIRST in every schema object."
-                )
-                contents.append(prompt)
-                text_model = getattr(self.visual_agent, "text_model_name", "gemini-3.8-flash")
-                resp = client.models.generate_content(
-                    model=text_model,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=AssetManifestSpec,
-                    ),
-                )
-                if resp.text:
-                    manifest_spec = AssetManifestSpec.model_validate_json(resp.text)
-                    existing_ids = {e.asset_id for e in elements}
-                    for req in manifest_spec.assets:
-                        if req.asset_id not in existing_ids:
-                            elements.append(req)
-                            existing_ids.add(req.asset_id)
-            except Exception as exc:
-                logger.warning("LLM concept decomposition encountered error: %s", exc)
+        # 1b. Extract explicit assets requested by GameplaySystemsEngineer in technical_architecture_blueprint
+        eng_blueprint = bible_dict.get("technical_architecture_blueprint") or []
+        eng_asset_notes: List[str] = []
+        existing_elem_ids = {e.asset_id for e in elements}
+        for espec in eng_blueprint:
+            if not isinstance(espec, dict):
+                espec = espec.model_dump() if hasattr(espec, "model_dump") else {}
+            mech_title = str(espec.get("title") or espec.get("mechanic_id") or "")
+            for raw_asset_str in espec.get("required_sprite_and_tile_assets") or []:
+                raw_s = str(raw_asset_str).strip()
+                if not raw_s:
+                    continue
+                eng_asset_notes.append(f"[{mech_title}] {raw_s}")
+                parts = [p.strip() for p in raw_s.split(":", 2)]
+                if len(parts) >= 2:
+                    aid_raw = "".join(ch if ch.isalnum() else "_" for ch in parts[0].lower()).strip("_").removesuffix("_sheet")
+                    while "__" in aid_raw:
+                        aid_raw = aid_raw.replace("__", "_")
+                    atype_raw = parts[1].lower().strip()
+                    adesc_raw = parts[2] if len(parts) >= 3 else f"{aid_raw} for {mech_title}"
+                    if aid_raw and aid_raw not in existing_elem_ids and aid_raw not in ("hero", "companion"):
+                        if atype_raw in ("tile", "tile_surface"):
+                            a_type, f_mode, dims = "tile", "tile_surface", (64, 64)
+                        elif atype_raw in ("sprite_sheet", "animated_prop"):
+                            a_type, f_mode, dims = "sprite_sheet", "sprite_sheet", (64, 64)
+                        else:
+                            a_type, f_mode, dims = "prop", "static_sprite", (80, 80)
+                        elements.append(
+                            AssetRequirement(
+                                deliberation=f"Asset required by GameplaySystemsEngineer for mechanic '{mech_title}'.",
+                                asset_id=aid_raw,
+                                name=f"{aid_raw}.png",
+                                asset_type=a_type,
+                                fabrication_mode=f_mode,
+                                purpose=f"Engineered gameplay asset for {mech_title}: {adesc_raw}",
+                                target_path=f"assets/sprites/{aid_raw}.png",
+                                description=adesc_raw,
+                                visual_prompt_or_text=f"{adesc_raw}. {style_guide}",
+                                dimensions=dims,
+                            )
+                        )
+                        existing_elem_ids.add(aid_raw)
 
-        # 3. Also map any explicit scene_layers defined in game_bible.json
+        # 2. Delegate visual concept decomposition to Gemini via structured DecomposedConceptManifestSpec contract (Rule 2, Rule 4, Rule 5)
+        client = getattr(self.visual_agent, "client", None) if self.visual_agent is not None else self.client
+        is_live = (
+            getattr(self.visual_agent, "_is_live_genai_client", lambda: False)()
+            if self.visual_agent is not None
+            else (client is not None and getattr(type(client), "__module__", "").startswith("google.genai"))
+        )
+        if client is not None and is_live:
+            from google.genai import types
+            ref_imgs = self.get_concept_reference_images()
+            contents: List[Any] = []
+            for rp in ref_imgs[:2]:
+                if rp.is_file():
+                    contents.append(types.Part.from_bytes(data=rp.read_bytes(), mime_type="image/png"))
+            eng_context_str = (
+                f"GameplaySystemsEngineer Required Mechanic Assets:\n  " + "\n  ".join(eng_asset_notes) + "\n"
+                if eng_asset_notes
+                else ""
+            )
+            prompt = (
+                f"You are the Visual Art & Technical Environment Director decomposing the attached 16:9 Writers' Room concept art "
+                f"and Game Bible into discrete, composable 2D game assets (NEVER a static full-screen background painting or floating island vignette).\n"
+                f"Game Title: {bible_dict.get('game_title', '')}\n"
+                f"Elevator Pitch: {bible_dict.get('elevator_pitch', '')}\n"
+                f"First 60 Seconds Hook: {bible_dict.get('first_60_seconds_hook', '')}\n"
+                f"Visual Style Guide: {style_guide}\n"
+                f"Concept Scene Description: {mockup_desc}\n"
+                f"{eng_context_str}\n"
+                f"Decompose the environment into 5 modular, reusable visual assets in `elements`:\n"
+                f"- 2 repeatable surface/material tiles (`asset_type='tile'`, `fabrication_mode='tile_surface'`, width=64, height=64) for walkable terrain and channels/surfaces.\n"
+                f"- 2 discrete, single-object architectural pillars, arches, or interactive mechanisms (`asset_type='prop'`, `fabrication_mode='static_sprite'`, width=96, height=96).\n"
+                f"- 1 animated reactive environmental flora or mechanism (`asset_type='sprite_sheet'`, `fabrication_mode='sprite_sheet'`, width=64, height=64).\n"
+                f"MANDATORY (Rule 4): Provide `deliberation` FIRST in every schema object."
+            )
+            contents.append(prompt)
+            text_model = getattr(self.visual_agent, "text_model_name", "gemini-3.8-flash") if self.visual_agent else "gemini-3.8-flash"
+            resp = client.models.generate_content(
+                model=text_model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=DecomposedConceptManifestSpec,
+                ),
+            )
+            if resp.text:
+                manifest_spec = DecomposedConceptManifestSpec.model_validate_json(resp.text)
+                existing_ids = {e.asset_id for e in elements}
+                for item in manifest_spec.elements:
+                    aid_clean = str(item.asset_id).strip().lower().replace(".png", "").removesuffix("_sheet")
+                    if aid_clean and aid_clean not in existing_ids:
+                        w_clamped = max(48, min(128, int(item.width or 64)))
+                        h_clamped = max(48, min(128, int(item.height or 64)))
+                        elements.append(
+                            AssetRequirement(
+                                deliberation=item.deliberation,
+                                asset_id=aid_clean,
+                                name=f"{aid_clean}.png",
+                                asset_type=item.asset_type,
+                                fabrication_mode=item.fabrication_mode,
+                                purpose=item.purpose,
+                                target_path=f"assets/sprites/{aid_clean}.png",
+                                description=item.purpose,
+                                visual_prompt_or_text=f"{item.visual_prompt}. {style_guide}",
+                                dimensions=(w_clamped, h_clamped),
+                            )
+                        )
+                        existing_ids.add(aid_clean)
+
+        # 3. Map explicit scene_layers defined in game_bible.json as single discrete modular structures
         for layer in (bible_dict.get("scene_layers") or []):
             if not isinstance(layer, dict):
                 layer = layer.model_dump() if hasattr(layer, "model_dump") else {}
@@ -446,20 +676,25 @@ class CartridgeAssetLibrary:
                     is_tile_layer = int(layer.get("depth_order", 1)) >= 2
                     elements.append(
                         AssetRequirement(
-                            deliberation=f"Asset '{aid}' referenced by GameBible scene_layer '{layer.get('layer_id', '')}'.",
+                            deliberation=f"Modular architectural element '{aid}' referenced by GameBible scene_layer '{layer.get('layer_id', '')}'.",
                             asset_id=aid,
                             name=f"{aid}.png",
                             asset_type="tile" if is_tile_layer else "prop",
                             fabrication_mode="tile_surface" if is_tile_layer else "static_sprite",
-                            purpose=f"Scene layer element for {layer.get('layer_id', '')}: {ldesc}",
+                            purpose=f"Single modular architectural structure for {layer.get('layer_id', '')}: {ldesc}",
                             target_path=f"assets/sprites/{aid}.png",
                             description=ldesc,
-                            visual_prompt_or_text=f"{ldesc}. {style_guide}",
+                            visual_prompt_or_text=(
+                                f"{ldesc}. {style_guide}"
+                                if is_tile_layer
+                                else f"Single isolated architectural structure or column element (NOT a floating island or full landscape scene): {ldesc}. {style_guide}"
+                            ),
                             dimensions=(64, 64) if is_tile_layer else (128, 128),
                         )
                     )
 
         return elements
+
 
     def fabricate_single_asset(
         self,
@@ -516,34 +751,61 @@ class CartridgeAssetLibrary:
             from engine.studio.visual import VisualArtSpriteDesignerAgent
             self.visual_agent = VisualArtSpriteDesignerAgent(client=self.client)
 
-        # 1. Portrait fabrication (strictly in assets/portraits/)
+        renders_dir = self.cartridge_dir / "artifacts" / "renders"
+        renders_dir.mkdir(parents=True, exist_ok=True)
+        max_val_attempts = 2
+
+        # 1. Portrait fabrication + Tier 1 Render Plate Verification (strictly in assets/portraits/)
         if fmode == "portrait" or atype == "portrait":
             portrait_rel = f"assets/portraits/{Path(req.target_path).name}"
             portrait_dest = self.cartridge_dir / portrait_rel
             portrait_dest.parent.mkdir(parents=True, exist_ok=True)
-            if not portrait_dest.is_file() or force_regenerate:
-                if getattr(self.visual_agent, "client", None) is not None:
-                    self.visual_agent.generate_portrait(
-                        character={
-                            "deliberation": req.deliberation,
-                            "character_id": req.asset_id.replace("_portrait", ""),
-                            "name": req.asset_id.replace("_portrait", "").replace("_", " ").title(),
-                            "role": "character",
-                            "visual_description": req.visual_prompt_or_text or req.description,
-                        },
-                        output_path=portrait_dest,
-                        dimensions=req.dimensions or (256, 256),
-                        style_guide=style_guide,
+            plate_path = renders_dir / f"plate_{req.asset_id}.png"
+            cur_prompt = req.visual_prompt_or_text or req.description
+
+            for attempt in range(1, max_val_attempts + 1):
+                if not portrait_dest.is_file() or force_regenerate or attempt > 1:
+                    if getattr(self.visual_agent, "client", None) is not None:
+                        self.visual_agent.generate_portrait(
+                            character={
+                                "deliberation": req.deliberation,
+                                "character_id": req.asset_id.replace("_portrait", ""),
+                                "name": req.asset_id.replace("_portrait", "").replace("_", " ").title(),
+                                "role": "character",
+                                "visual_description": cur_prompt,
+                            },
+                            output_path=portrait_dest,
+                            dimensions=req.dimensions or (256, 256),
+                            style_guide=style_guide,
+                            reference_images=ref_images,
+                        )
+                    else:
+                        img = self.visual_agent.renderer.render_dynamic_sprite(
+                            dimensions=req.dimensions or (256, 256),
+                            prompt=cur_prompt,
+                            asset_type="portrait",
+                            seed=f"{req.asset_id}_{attempt}",
+                        )
+                        img.save(portrait_dest, "PNG")
+
+                if hasattr(self.visual_agent, "render_asset_inspection_plate") and portrait_dest.is_file():
+                    self.visual_agent.render_asset_inspection_plate(
+                        portrait_dest, asset_type="portrait", output_path=plate_path
+                    )
+                if hasattr(self.visual_agent, "verify_rendered_asset") and portrait_dest.is_file():
+                    verdict = self.visual_agent.verify_rendered_asset(
+                        asset_req=req,
+                        rendered_asset_path=portrait_dest,
+                        inspection_plate_path=plate_path,
                         reference_images=ref_images,
+                        style_guide=style_guide,
                     )
+                    if verdict.accepted:
+                        break
+                    if verdict.prompt_refinement_directive:
+                        cur_prompt = f"{cur_prompt}. {verdict.prompt_refinement_directive}"
                 else:
-                    img = self.visual_agent.renderer.render_dynamic_sprite(
-                        dimensions=req.dimensions or (256, 256),
-                        prompt=req.visual_prompt_or_text or req.description,
-                        asset_type="portrait",
-                        seed=req.asset_id,
-                    )
-                    img.save(portrait_dest, "PNG")
+                    break
 
             tex_size = self._read_image_size(portrait_dest)
             self.catalog.entries[req.asset_id] = AssetLibraryEntry(
@@ -561,7 +823,7 @@ class CartridgeAssetLibrary:
             )
             return portrait_dest
 
-        # 2. Multi-Pose / Multi-State Sprite Sheet fabrication
+        # 2. Multi-Pose / Multi-State Sprite Sheet fabrication + Tier 1 & Tier 2 Contact Sheet Verification
         if fmode == "sprite_sheet" or atype == "sprite_sheet":
             stem = dest_path.stem
             sheet_filename = f"{stem}_sheet.png" if not stem.endswith("_sheet") else f"{stem}.png"
@@ -569,19 +831,52 @@ class CartridgeAssetLibrary:
             sheet_dest = self.cartridge_dir / sheet_rel
             single_rel = f"assets/sprites/{stem.replace('_sheet', '')}.png"
             single_dest = self.cartridge_dir / single_rel
+            contact_path = renders_dir / f"anim_sheet_{req.asset_id}.png"
+            plate_path = renders_dir / f"plate_{req.asset_id}.png"
 
-            sheet_path, meta = self.visual_agent.fabricate_sprite_sheet(
-                asset_req=req,
-                output_path=sheet_dest,
-                mood=self.mood,
-                reference_images=ref_images,
-                style_guide=style_guide,
-            )
-            base_frame: Optional[Image.Image] = meta.get("base_frame_image")
-            if base_frame is not None:
-                base_frame.save(single_dest, "PNG")
-            elif not single_dest.is_file():
-                shutil.copyfile(sheet_path, single_dest)
+            sheet_path = sheet_dest
+            meta: Dict[str, Any] = {}
+            for attempt in range(1, max_val_attempts + 1):
+                sheet_path, meta = self.visual_agent.fabricate_sprite_sheet(
+                    asset_req=req,
+                    output_path=sheet_dest,
+                    mood=self.mood,
+                    reference_images=ref_images,
+                    style_guide=style_guide,
+                )
+                base_frame: Optional[Image.Image] = meta.get("base_frame_image")
+                if base_frame is not None:
+                    base_frame.save(single_dest, "PNG")
+                elif not single_dest.is_file():
+                    shutil.copyfile(sheet_path, single_dest)
+
+                if hasattr(self.visual_agent, "render_asset_inspection_plate") and single_dest.is_file():
+                    self.visual_agent.render_asset_inspection_plate(
+                        single_dest, asset_type="sprite", output_path=plate_path
+                    )
+                if hasattr(self.visual_agent, "render_animation_contact_sheet") and sheet_path.is_file():
+                    _, anim_telemetry = self.visual_agent.render_animation_contact_sheet(
+                        sheet_img=sheet_path,
+                        states_meta=dict(meta.get("animation_states") or {}),
+                        cell_size=tuple(meta.get("target_display_size") or req.dimensions or (64, 64)),
+                        output_path=contact_path,
+                    )
+                    if hasattr(self.visual_agent, "verify_rendered_animation"):
+                        anim_verdict = self.visual_agent.verify_rendered_animation(
+                            target_id=req.asset_id,
+                            contact_sheet_path=contact_path,
+                            anim_telemetry=anim_telemetry,
+                            purpose=req.purpose or req.description,
+                            style_guide=style_guide,
+                        )
+                        if anim_verdict.accepted:
+                            break
+                        if anim_verdict.remediation_directive:
+                            req.visual_prompt_or_text = f"{req.visual_prompt_or_text}. {anim_verdict.remediation_directive}"
+                    else:
+                        break
+                else:
+                    break
 
             self.catalog.entries[req.asset_id] = AssetLibraryEntry(
                 deliberation=req.deliberation,
@@ -601,15 +896,44 @@ class CartridgeAssetLibrary:
             )
             return single_dest
 
-        # 3. Articulated Multi-Part Rig fabrication
+        # 3. Articulated Multi-Part Rig fabrication + Tier 2 Articulated Rig Contact Sheet Verification
         if fmode == "articulated_parts" or atype == "articulated_rig":
-            comp_path, meta = self.visual_agent.fabricate_articulated_rig(
-                asset_req=req,
-                output_path=dest_path,
-                mood=self.mood,
-                reference_images=ref_images,
-                style_guide=style_guide,
-            )
+            contact_path = renders_dir / f"anim_rig_{req.asset_id}.png"
+            plate_path = renders_dir / f"plate_{req.asset_id}.png"
+            comp_path = dest_path
+            meta = {}
+            for attempt in range(1, max_val_attempts + 1):
+                comp_path, meta = self.visual_agent.fabricate_articulated_rig(
+                    asset_req=req,
+                    output_path=dest_path,
+                    mood=self.mood,
+                    reference_images=ref_images,
+                    style_guide=style_guide,
+                )
+                if hasattr(self.visual_agent, "render_asset_inspection_plate") and comp_path.is_file():
+                    self.visual_agent.render_asset_inspection_plate(
+                        comp_path, asset_type="sprite", output_path=plate_path
+                    )
+                if hasattr(self.visual_agent, "render_articulated_rig_contact_sheet") and comp_path.is_file():
+                    _, rig_telemetry = self.visual_agent.render_articulated_rig_contact_sheet(
+                        composite_path=comp_path,
+                        articulated_parts=list(meta.get("articulated_parts") or []),
+                        cartridge_dir=self.cartridge_dir,
+                        cell_size=tuple(meta.get("target_display_size") or req.dimensions or (64, 64)),
+                        output_path=contact_path,
+                    )
+                    if hasattr(self.visual_agent, "verify_rendered_animation"):
+                        rig_verdict = self.visual_agent.verify_rendered_animation(
+                            target_id=req.asset_id,
+                            contact_sheet_path=contact_path,
+                            anim_telemetry=rig_telemetry,
+                            purpose=req.purpose or req.description,
+                            style_guide=style_guide,
+                        )
+                        if rig_verdict.accepted:
+                            break
+                break
+
             self.catalog.entries[req.asset_id] = AssetLibraryEntry(
                 deliberation=req.deliberation,
                 asset_id=req.asset_id,
@@ -626,14 +950,38 @@ class CartridgeAssetLibrary:
             )
             return comp_path
 
-        # 4. Static Sprite / Prop / Tile Surface / Parallax Layer / Diegetic UI
-        out_path = self.visual_agent.generate_dynamic_sprite(
-            asset_req=req,
-            output_path=dest_path,
-            mood=self.mood,
-            reference_images=ref_images,
-            style_guide=style_guide,
-        )
+        # 4. Static Sprite / Prop / Tile Surface / Parallax Layer / Diegetic UI + Tier 1 Render Plate Verification
+        plate_path = renders_dir / f"plate_{req.asset_id}.png"
+        out_path = dest_path
+        for attempt in range(1, max_val_attempts + 1):
+            out_path = self.visual_agent.generate_dynamic_sprite(
+                asset_req=req,
+                output_path=dest_path,
+                mood=self.mood,
+                reference_images=ref_images,
+                style_guide=style_guide,
+            )
+            if hasattr(self.visual_agent, "render_asset_inspection_plate") and out_path.is_file():
+                self.visual_agent.render_asset_inspection_plate(
+                    out_path,
+                    asset_type="tile_surface" if fmode == "tile_surface" else atype,
+                    output_path=plate_path,
+                )
+            if hasattr(self.visual_agent, "verify_rendered_asset") and out_path.is_file():
+                verdict = self.visual_agent.verify_rendered_asset(
+                    asset_req=req,
+                    rendered_asset_path=out_path,
+                    inspection_plate_path=plate_path,
+                    reference_images=ref_images,
+                    style_guide=style_guide,
+                )
+                if verdict.accepted:
+                    break
+                if verdict.prompt_refinement_directive:
+                    req.visual_prompt_or_text = f"{req.visual_prompt_or_text}. {verdict.prompt_refinement_directive}"
+            else:
+                break
+
         tex_size = self._read_image_size(out_path)
         self.catalog.entries[req.asset_id] = AssetLibraryEntry(
             deliberation=req.deliberation,
@@ -649,6 +997,250 @@ class CartridgeAssetLibrary:
             sha256_hash=self._compute_sha256(out_path),
         )
         return out_path
+
+    def verify_all_catalog_assets_and_animations(self, auto_remediate: bool = True) -> Dict[str, Any]:
+        """Renders isolated Tier 1 inspection plates (checkerboard alpha cutouts & 3x3 tile grids)
+        and Tier 2 animation contact sheets for every visual asset in `self.catalog.entries`.
+        When `auto_remediate=True`, any asset or animation rejected by the deterministic OpenCV or
+        multimodal Gemini critic is automatically regenerated (`force_regenerate=True`) with the
+        critic's remediation directive and re-verified before sealing the catalog.
+        """
+        if self.visual_agent is None:
+            from engine.studio.visual import VisualArtSpriteDesignerAgent
+            self.visual_agent = VisualArtSpriteDesignerAgent(client=self.client)
+
+        self.index_existing_files_on_disk()
+        renders_dir = self.cartridge_dir / "artifacts" / "renders"
+        renders_dir.mkdir(parents=True, exist_ok=True)
+        style_guide = self.get_style_guide(for_environment=False)
+
+        asset_verdicts: Dict[str, Any] = {}
+        animation_verdicts: Dict[str, Any] = {}
+        rejected_assets: List[str] = []
+        rejected_animations: List[str] = []
+        remediated_assets: List[str] = []
+
+        for aid in sorted(list(self.catalog.entries.keys())):
+            entry = self.catalog.entries[aid]
+            if entry.fabrication_mode in ("audio_bark", "sfx", "ambient_loop"):
+                continue
+            f_path = self.cartridge_dir / entry.file_path
+            if not f_path.is_file():
+                continue
+
+            plate_p = renders_dir / f"plate_{aid}.png"
+            req_stub = AssetRequirement(
+                deliberation=entry.deliberation,
+                asset_id=aid,
+                name=f_path.name,
+                asset_type=entry.asset_type,
+                fabrication_mode=entry.fabrication_mode,
+                purpose=entry.purpose,
+                concept_reference_id=aid.replace("_portrait", ""),
+                description=entry.purpose,
+                visual_prompt_or_text=f"{entry.purpose}. {style_guide}",
+                target_path=entry.file_path,
+                dimensions=entry.target_display_size or (64, 64),
+            )
+            single_f = self.sprites_dir / f"{aid}.png"
+            target_for_plate = single_f if (entry.fabrication_mode == "sprite_sheet" and single_f.is_file()) else f_path
+
+            # If this is a cutout sprite or character on disk, apply neural/OpenCV alpha matting pass
+            if auto_remediate and entry.fabrication_mode not in ("tile_surface", "parallax_layer") and target_for_plate.is_file():
+                try:
+                    with Image.open(target_for_plate) as raw_im:
+                        raw_rgba = raw_im.convert("RGBA")
+                    matted = self.visual_agent.extract_clean_alpha_sprite(
+                        raw_rgba,
+                        target_size=raw_rgba.size,
+                        strip_border_frame=True,
+                        pad_ratio=0.04,
+                    )
+                    matted.save(target_for_plate, format="PNG")
+                except Exception as exc:
+                    logger.debug("Pre-audit alpha matting pass skipped for '%s': %s", aid, exc)
+
+            # If a sprite_sheet entry was generated before keyframe_tracks were introduced, rebuild its sheet frames
+            # from the matted base sprite using the 5-part biomechanical keyframe rig
+            missing_kf_tracks = False
+            if entry.fabrication_mode == "sprite_sheet":
+                st_dict = entry.animation_states or {}
+                if not st_dict or any(not isinstance(sv, dict) or not sv.get("keyframe_tracks") for sv in st_dict.values()):
+                    missing_kf_tracks = True
+                    if auto_remediate and single_f.is_file():
+                        try:
+                            with Image.open(single_f) as base_im:
+                                base_rgba = base_im.convert("RGBA")
+                            cw, ch = entry.target_display_size or (64, 64)
+                            cw, ch = max(32, int(cw)), max(32, int(ch))
+                            default_states = [
+                                ("idle", "idle", 4, 6.0, True),
+                                ("move", "locomotion", 4, 10.0, True),
+                                ("jump", "aerial", 3, 8.0, False),
+                                ("action", "action", 4, 10.0, False),
+                            ]
+                            max_cols = 4
+                            num_rows = len(default_states)
+                            rebuilt_sheet = Image.new("RGBA", (cw * max_cols, ch * num_rows), (0, 0, 0, 0))
+                            new_states_meta: Dict[str, Any] = {}
+                            for r_idx, (sname, mprof, fcnt, fps_val, loop_val) in enumerate(default_states):
+                                kf_list = self.visual_agent.default_keyframe_tracks_for_profile(mprof)
+                                for c_idx in range(fcnt):
+                                    pose_im = self.visual_agent.fabricate_pose_frame_from_base(
+                                        base_sprite=base_rgba,
+                                        state_name=sname,
+                                        frame_idx=c_idx,
+                                        frame_count=fcnt,
+                                        cell_size=(cw, ch),
+                                        motion_profile=mprof,
+                                        keyframe_tracks=kf_list,
+                                    )
+                                    rebuilt_sheet.paste(pose_im, (c_idx * cw, r_idx * ch), pose_im)
+                                new_states_meta[sname] = {
+                                    "row": r_idx,
+                                    "start_frame": r_idx * max_cols,
+                                    "frame_count": fcnt,
+                                    "fps": fps_val,
+                                    "loop": loop_val,
+                                    "motion_profile": mprof,
+                                    "keyframe_tracks": [t.model_dump() for t in kf_list],
+                                }
+                            rebuilt_sheet.save(f_path, format="PNG")
+                            entry.animation_states = new_states_meta
+                            remediated_assets.append(aid)
+                            missing_kf_tracks = False
+                        except Exception as exc:
+                            logger.warning("Keyframe sheet upgrade failed for '%s': %s", aid, exc)
+
+            self.visual_agent.render_asset_inspection_plate(
+                target_for_plate,
+                asset_type="tile_surface" if entry.fabrication_mode == "tile_surface" else entry.asset_type,
+                output_path=plate_p,
+            )
+            v_asset = self.visual_agent.verify_rendered_asset(
+                asset_req=req_stub,
+                rendered_asset_path=target_for_plate,
+                inspection_plate_path=plate_p,
+                style_guide=style_guide,
+            )
+
+            v_anim = None
+            if entry.fabrication_mode == "sprite_sheet":
+                contact_p = renders_dir / f"anim_sheet_{aid}.png"
+                _, anim_tel = self.visual_agent.render_animation_contact_sheet(
+                    sheet_img=f_path,
+                    states_meta=entry.animation_states,
+                    cell_size=entry.target_display_size or (64, 64),
+                    output_path=contact_p,
+                )
+                v_anim = self.visual_agent.verify_rendered_animation(
+                    target_id=aid,
+                    contact_sheet_path=contact_p,
+                    anim_telemetry=anim_tel,
+                    purpose=entry.purpose,
+                    style_guide=style_guide,
+                )
+            elif entry.fabrication_mode == "articulated_parts":
+                contact_p = renders_dir / f"anim_rig_{aid}.png"
+                _, rig_tel = self.visual_agent.render_articulated_rig_contact_sheet(
+                    composite_path=f_path,
+                    articulated_parts=entry.articulated_parts,
+                    cartridge_dir=self.cartridge_dir,
+                    cell_size=entry.target_display_size or (64, 64),
+                    output_path=contact_p,
+                )
+                v_anim = self.visual_agent.verify_rendered_animation(
+                    target_id=aid,
+                    contact_sheet_path=contact_p,
+                    anim_telemetry=rig_tel,
+                    purpose=entry.purpose,
+                    style_guide=style_guide,
+                )
+
+            needs_remediation = (not v_asset.accepted) or (v_anim is not None and not v_anim.accepted) or missing_kf_tracks
+            if auto_remediate and needs_remediation:
+                refinement_parts = [entry.purpose]
+                if v_asset.prompt_refinement_directive:
+                    refinement_parts.append(v_asset.prompt_refinement_directive)
+                if v_anim is not None and v_anim.remediation_directive:
+                    refinement_parts.append(v_anim.remediation_directive)
+                req_stub.visual_prompt_or_text = ". ".join(p for p in refinement_parts if p)
+                if entry.fabrication_mode == "sprite_sheet":
+                    req_stub.target_path = f"assets/sprites/{aid}.png"
+                try:
+                    logger.info("Auto-remediating rejected catalog asset '%s' (mode=%s)...", aid, entry.fabrication_mode)
+                    self.fabricate_single_asset(req_stub, force_regenerate=True)
+                    if aid not in remediated_assets:
+                        remediated_assets.append(aid)
+                    entry = self.catalog.entries[aid]
+                    f_path = self.cartridge_dir / entry.file_path
+                    single_f = self.sprites_dir / f"{aid}.png"
+                    target_for_plate = single_f if (entry.fabrication_mode == "sprite_sheet" and single_f.is_file()) else f_path
+                    self.visual_agent.render_asset_inspection_plate(
+                        target_for_plate,
+                        asset_type="tile_surface" if entry.fabrication_mode == "tile_surface" else entry.asset_type,
+                        output_path=plate_p,
+                    )
+                    v_asset = self.visual_agent.verify_rendered_asset(
+                        asset_req=req_stub,
+                        rendered_asset_path=target_for_plate,
+                        inspection_plate_path=plate_p,
+                        style_guide=style_guide,
+                    )
+                    if entry.fabrication_mode == "sprite_sheet":
+                        contact_p = renders_dir / f"anim_sheet_{aid}.png"
+                        _, anim_tel = self.visual_agent.render_animation_contact_sheet(
+                            sheet_img=f_path,
+                            states_meta=entry.animation_states,
+                            cell_size=entry.target_display_size or (64, 64),
+                            output_path=contact_p,
+                        )
+                        v_anim = self.visual_agent.verify_rendered_animation(
+                            target_id=aid,
+                            contact_sheet_path=contact_p,
+                            anim_telemetry=anim_tel,
+                            purpose=entry.purpose,
+                            style_guide=style_guide,
+                        )
+                    elif entry.fabrication_mode == "articulated_parts":
+                        contact_p = renders_dir / f"anim_rig_{aid}.png"
+                        _, rig_tel = self.visual_agent.render_articulated_rig_contact_sheet(
+                            composite_path=f_path,
+                            articulated_parts=entry.articulated_parts,
+                            cartridge_dir=self.cartridge_dir,
+                            cell_size=entry.target_display_size or (64, 64),
+                            output_path=contact_p,
+                        )
+                        v_anim = self.visual_agent.verify_rendered_animation(
+                            target_id=aid,
+                            contact_sheet_path=contact_p,
+                            anim_telemetry=rig_tel,
+                            purpose=entry.purpose,
+                            style_guide=style_guide,
+                        )
+                except Exception as exc:
+                    logger.warning("Auto-remediation failed for '%s': %s", aid, exc)
+
+            asset_verdicts[aid] = v_asset.model_dump()
+            if not v_asset.accepted:
+                rejected_assets.append(aid)
+
+            if v_anim is not None:
+                animation_verdicts[aid] = v_anim.model_dump()
+                if not v_anim.accepted:
+                    rejected_animations.append(aid)
+
+        if remediated_assets:
+            self.save_catalog()
+
+        return {
+            "asset_verdicts": asset_verdicts,
+            "animation_verdicts": animation_verdicts,
+            "rejected_assets": rejected_assets,
+            "rejected_animations": rejected_animations,
+            "remediated_assets": remediated_assets,
+            "all_passed": len(rejected_assets) == 0 and len(rejected_animations) == 0,
+        }
 
     def ensure_concept_mockups_on_disk(self) -> List[Path]:
         """Ensures that any VisualMockupArtifact declared in game_bible.json has its 16:9 PNG on disk."""
@@ -678,10 +1270,11 @@ class CartridgeAssetLibrary:
 
     @staticmethod
     def _tile_has_defective_corners(path: Path) -> bool:
-        """Returns True if a tile texture on disk has white/magenta background corners from an isometric cube render."""
+        """Returns True if a tile texture on disk has white/magenta background corners OR artificial Rorschach mirror symmetry."""
         if not path.is_file():
             return True
         try:
+            from engine.studio.visual import VisualArtSpriteDesignerAgent
             with Image.open(path) as im:
                 rgba = im.convert("RGBA")
                 w, h = rgba.size
@@ -690,6 +1283,8 @@ class CartridgeAssetLibrary:
                 for r, g, b, a in corners:
                     if a < 240 or (r > 210 and g > 210 and b > 210) or (r > 200 and b > 200 and g < 80):
                         return True
+                if VisualArtSpriteDesignerAgent.compute_tile_mirror_symmetry(rgba) > 0.62:
+                    return True
         except Exception:
             return True
         return False
@@ -840,11 +1435,21 @@ class CartridgeAssetLibrary:
         (assets/asset_library.json) for LeadGameplaySWEAgent prompts.
         """
         self.index_existing_files_on_disk()
+        if (self.cartridge_dir / "project.godot").is_file() or (self.cartridge_dir / "src").is_dir():
+            try:
+                self.export_godot_studio_helper()
+            except Exception:
+                pass
         lines: List[str] = [
             "=== CARTRIDGE ASSET LIBRARY CATALOG (res://assets/asset_library.json) ===",
             "CRITICAL RULE: NEVER load files from 'res://assets/portraits/' or '*_portrait.png' as in-world CharacterBody2D/Node2D sprites!",
             "Use 'res://assets/portraits/' ONLY for UI/HUD dialogue busts in ui_hud.gd.",
             "Use 'res://assets/sprites/' for all in-world characters, props, tiles, and environmental set-pieces.",
+            "",
+            "NATIVE GODOT 4 RIG, ANIMATION & COLLIDER HELPER (`res://src/studio_rig_and_collider.gd`, `class_name StudioRigHelper`):",
+            "- `StudioRigHelper.attach_sprite_sheet_animation_player(host_node, tex, hframes, vframes, states_meta, target_size)` -> returns `{\"sprite\": Sprite2D, \"anim_player\": AnimationPlayer}` with discrete keyframe tracks for `idle`, `move`, `jump`, `action`.",
+            "- `StudioRigHelper.create_bitmap_collision_polygons(tex, target_size)` -> traces pixel-accurate `Array[CollisionPolygon2D]` from sprite alpha via `BitMap.opaque_to_polygons()`.",
+            "- `StudioRigHelper.create_tiled_surface(static_body, tex, size, true)` -> builds a non-stretched `Polygon2D` (`TEXTURE_REPEAT_ENABLED`) + matching `CollisionShape2D` in group `'walkable_shelf'`.",
             "",
             "AVAILABLE ASSETS IN CATALOG:",
         ]
@@ -878,3 +1483,8 @@ class CartridgeAssetLibrary:
                     f"display_size={entry.target_display_size}, tex_size={entry.texture_pixel_size} | {entry.purpose}"
                 )
         return "\n".join(lines)
+
+
+AssetLibraryManager = CartridgeAssetLibrary
+
+

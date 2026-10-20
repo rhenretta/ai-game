@@ -1275,7 +1275,7 @@ class StudioOrchestrator:
                 asset_lib = CartridgeAssetLibrary(
                     cartridge_dir=staging_dir,
                     visual_agent=agent,
-                    voice_agent=self.voice,
+                    voice_agent=self.agents.get("VoiceActingAudioProducerAgent"),
                     mood=mood,
                 )
 
@@ -1414,8 +1414,8 @@ class StudioOrchestrator:
             elif canonical_name == "LeadGameplaySWEAgent":
                 # Wire visual and voice agents onto SWE agent so on-demand requested_assets can be fabricated
                 try:
-                    agent.visual_agent = self.visual
-                    agent.voice_agent = self.voice
+                    agent.visual_agent = self.agents.get("VisualArtSpriteDesignerAgent")
+                    agent.voice_agent = self.agents.get("VoiceActingAudioProducerAgent")
                 except Exception:
                     pass
                 world_spec = context.raw_outputs.get("Director") or context.raw_outputs.get("CreativeDirectorWorldbuilderAgent")

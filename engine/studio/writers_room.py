@@ -29,6 +29,7 @@ from engine.studio.models import (
     ExperienceStoryboardBeat,
     GameBibleSpec,
     GenesisWorldSpec,
+    MechanicEngineeringSpec,
     NarrativeBible,
     StudioAgentError,
     VisualMockupArtifact,
@@ -47,6 +48,16 @@ SPECIALIST_ROSTER: List[Dict[str, str]] = [
         "focus": (
             "Tactile feel, core game loop, emergent mechanical depth, moment-to-moment player agency, "
             "and why the mechanics are genuinely fun and immediately playable in a 2D viewport."
+        ),
+    },
+    {
+        "role": "GameplaySystemsEngineer",
+        "display_name": "Lead Gameplay & Godot Systems Engineer",
+        "focus": (
+            "Translating creative gameplay pillars, spatial camera staging, and story interactions into concrete "
+            "Godot 4 node architectures (CharacterBody2D, StaticBody2D, Area2D, AnimatedSprite2D), 1:1 visual-to-physical "
+            "collider alignment, deterministic state machines (unsolved at t=0), required sprite/tile assets (banning "
+            "geometric programmer art), and falsifiable headless test invariants."
         ),
     },
     {
@@ -358,6 +369,10 @@ class CreativeWritersRoom:
         char_names = [f"{c.name} [character_id={c.character_id}, role={c.role}]" for c in chars]
         beats = [f"Beat {b.beat_index}: {b.phase_title} ({b.player_emotional_state})" for b in game_bible.experience_storyboard]
         mockups = [f"{m.title} ({m.image_path})" for m in game_bible.visual_mockups]
+        eng_specs = [
+            f"{e.mechanic_id} ({e.title}) -> nodes={e.godot_node_and_collider_architecture[:80]}, assets={e.required_sprite_and_tile_assets}"
+            for e in getattr(game_bible, "technical_architecture_blueprint", [])
+        ]
         return (
             f"CURRENT LIVING GAME BIBLE STATE:\n"
             f"- Working Title: {game_bible.game_title}\n"
@@ -367,6 +382,7 @@ class CreativeWritersRoom:
             f"- First 60 Seconds Hook: {game_bible.first_60_seconds_hook or '(not yet defined)'}\n"
             f"- Diegetic UI & Onboarding Philosophy: {game_bible.diegetic_ui_philosophy or '(not yet defined)'}\n"
             f"- Gameplay Pillars ({len(game_bible.gameplay_pillars)}): {game_bible.gameplay_pillars}\n"
+            f"- Technical Architecture Blueprint ({len(eng_specs)}): {eng_specs}\n"
             f"- Visual Style Guide: {game_bible.visual_style_guide or '(not yet defined)'}\n"
             f"- Audio Direction Guide: {game_bible.audio_direction_guide or '(not yet defined)'}\n"
             f"- Experience Storyboard Beats ({len(beats)}): {beats}\n"
@@ -436,6 +452,24 @@ class CreativeWritersRoom:
             if pillar and pillar.strip() and pillar.strip() not in game_bible.gameplay_pillars:
                 game_bible.gameplay_pillars.append(pillar.strip())
                 updates_summary.append(f"Added gameplay pillar: {pillar.strip()[:60]}")
+
+        if proposal.added_or_updated_engineering_specs:
+            existing_eng = {e.mechanic_id: e for e in game_bible.technical_architecture_blueprint}
+            for espec in proposal.added_or_updated_engineering_specs:
+                existing_eng[espec.mechanic_id] = espec
+            game_bible.technical_architecture_blueprint = list(existing_eng.values())
+            updates_summary.append(
+                f"Engineered {len(proposal.added_or_updated_engineering_specs)} technical architecture spec(s)"
+            )
+            self._emit_event(
+                "bible_engineering_blueprint_updated",
+                {
+                    "deliberation": proposal.deliberation,
+                    "speaker_role": speaker_role,
+                    "engineering_specs_count": len(game_bible.technical_architecture_blueprint),
+                    "mechanic_ids": [e.mechanic_id for e in game_bible.technical_architecture_blueprint],
+                },
+            )
 
         # Concept evolution milestone
         if proposal.concept_evolution_milestone is not None:
@@ -674,7 +708,8 @@ class CreativeWritersRoom:
             f"1. Challenge a generic/boring 'Hello World' idea and pitch a much richer experiential hook,\n"
             f"2. Answer a colleague who called on you, or\n"
             f"3. Contribute missing artifacts in your domain (e.g., Experience Storyboard & Diegetic UI for UXExperienceDesigner, "
-            f"16:9 Visual Mockup for VisualArtDirector, Characters/Dialogue/Barks for CharacterDesigner, World Lore/Cutscenes for StoryWorldArchitect).\n"
+            f"16:9 Visual Mockup for VisualArtDirector, Characters/Dialogue/Barks for CharacterDesigner, World Lore/Cutscenes for StoryWorldArchitect, "
+            f"or Technical Architecture Blueprints, Godot 4 Node/Collider strategies, Required Assets, and Falsifiable Test Invariants for GameplaySystemsEngineer).\n"
             f"Return your structured WritersRoomListenCheck with deliberation FIRST."
         )
         return self._call_structured_llm(prompt, WritersRoomListenCheck)
@@ -721,6 +756,16 @@ class CreativeWritersRoom:
                 "As GameplayDesigner, you MUST challenge any shallow prototype mechanics, add concrete tactile pillars in "
                 "`gameplay_pillars_additions` that are genuinely fun to play in a 2D viewport, and log a `concept_evolution_milestone` explaining how the gameplay loop evolved."
             )
+        elif role == "GameplaySystemsEngineer":
+            domain_instructions = (
+                "As GameplaySystemsEngineer, you MUST consult with the designers and translate the pitched gameplay pillars, "
+                "camera/spatial paradigm, and visual mockups into concrete Godot 4 engineering strategies in `added_or_updated_engineering_specs` "
+                "(at least 2-3 `MechanicEngineeringSpec` items). Specifically:\n"
+                "1. Lock 1:1 visual-to-physical collider coherence (`CharacterBody2D` motion_mode matching the camera perspective, and `StaticBody2D`/`CollisionPolygon2D` barriers bounding walkable surfaces and blocking sky/chasm regions),\n"
+                "2. Discretize abstract creative verbs into deterministic state machines (`state_machine_and_input_contract`) that initialize UNSOLVED at t=0 and require true causal graph/action progression,\n"
+                "3. Inventory every required visual asset in `required_sprite_and_tile_assets` formatted as `'<asset_id>:<tile|prop|sprite_sheet>:<visual description>'` so downstream GDScript synthesis NEVER falls back to geometric programmer-art (`draw_rect`/`Polygon2D` shapes),\n"
+                "4. Define concrete `falsifiable_test_invariants` (`unsolved_baseline` at t=0, `spatial_boundary`/`negative_counterfactual`, and `positive_causal`) for headless Godot verification."
+            )
         elif role == "AudioAtmosphereDesigner":
             domain_instructions = (
                 "As AudioAtmosphereDesigner, you MUST define `audio_direction_update` and contribute atmospheric or reactive `added_or_updated_barks`."
@@ -764,6 +809,8 @@ class CreativeWritersRoom:
                 effective_score += 0.4
             elif role == "VisualArtDirector" and not game_bible.visual_mockups:
                 effective_score += 0.4
+            elif role == "GameplaySystemsEngineer" and not game_bible.technical_architecture_blueprint:
+                effective_score += 0.4
             elif role == "CharacterDesigner" and (not game_bible.narrative_bible or not game_bible.narrative_bible.characters):
                 effective_score += 0.35
             elif role == "StoryWorldArchitect" and (not game_bible.narrative_bible or not game_bible.narrative_bible.cutscenes):
@@ -790,7 +837,8 @@ class CreativeWritersRoom:
             f"2. A compelling First 60 Seconds Hook and Intuitive UI & Onboarding Philosophy (clean, readable HUD paired with responsive world cues),\n"
             f"3. An Experience Storyboard detailing the player's emotional & sensory arc,\n"
             f"4. Synthesized 16:9 Visual Mockup board(s),\n"
-            f"5. Cohesive World Lore, Characters/Entities, Cutscenes, and Audio/Voice direction.\n"
+            f"5. Cohesive World Lore, Characters/Entities, Cutscenes, and Audio/Voice direction,\n"
+            f"6. A Technical Architecture Blueprint (`technical_architecture_blueprint`) from GameplaySystemsEngineer translating mechanics into Godot 4 nodes, colliders, required assets, and test invariants.\n"
             f"Return your structured DirectorConvergenceCheck with `deliberation` FIRST."
         )
         return self._call_structured_llm(prompt, DirectorConvergenceCheck, temperature=0.9)

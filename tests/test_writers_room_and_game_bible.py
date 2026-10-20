@@ -695,4 +695,78 @@ def test_game_blueprint_dashboard_synchronizes_with_latest_writers_room_bible(tm
     assert "canopy glider" in cd["narrative_premise"].lower()
 
 
+def test_gameplay_systems_engineer_in_writers_room_and_downstream_pipeline(tmp_path: Path):
+    """Verify GameplaySystemsEngineer is in SPECIALIST_ROSTER, MechanicEngineeringSpec enforces Rule 4,
+    and technical_architecture_blueprint flows into CartridgeAssetLibrary, Director, and LeadGameplaySWEAgent.
+    """
+    from engine.studio.asset_library import CartridgeAssetLibrary
+    from engine.studio.models import MechanicEngineeringSpec
+    from engine.studio.writers_room import SPECIALIST_ROSTER
+
+    roles = [s["role"] for s in SPECIALIST_ROSTER]
+    assert "GameplaySystemsEngineer" in roles
+
+    espec = MechanicEngineeringSpec(
+        deliberation="Translate canopy thermal updrafts into Area2D wind volumes and CharacterBody2D velocity impulses.",
+        mechanic_id="thermal_updraft_flight",
+        title="Thermal Updraft Flight & Chime Resonance",
+        target_gd_modules=["mechanics.gd", "scenes.gd", "entities.gd"],
+        godot_node_and_collider_architecture=(
+            "CharacterBody2D player with StaticBody2D cliff boundaries and Area2D thermal columns."
+        ),
+        state_machine_and_input_contract=(
+            "Starts UNSOLVED at t=0 (chime_resonated=false); diving through Area2D thermal column sets velocity.y < -280."
+        ),
+        required_sprite_and_tile_assets=[
+            "wind_canyon_stone_tile:tile:Weathered cyan-veined canyon cliff stone surface",
+            "resonance_chime_pylon:prop:Ancient bronze wind-chime pylon with glowing core",
+            "thermal_updraft_plume:sprite_sheet:Swirling bioluminescent wind current plume",
+        ],
+        falsifiable_test_invariants=[
+            "unsolved_baseline: chime_resonated == false at t=0 during passive ticks",
+            "spatial_boundary: StaticBody2D canyon floor blocks descent below y=680",
+            "positive_causal: entering thermal Area2D transitions chime_resonated to true",
+        ],
+    )
+    assert list(espec.model_dump().keys())[0] == "deliberation"
+
+    fake_client = _FakeGeminiClient()
+    room = CreativeWritersRoom(client=fake_client, max_turns=2, min_turns_before_convergence=1)
+    bible = room.run_writers_room(dna=_sample_dna(), candidate_dir=tmp_path, cartridge_id="test_swe_room")
+
+    # Apply a turn proposal from GameplaySystemsEngineer
+    swe_proposal = WritersRoomTurnProposal(
+        deliberation="Engineering consultation locking Godot 4 node hierarchy, assets, and test invariants.",
+        spoken_dialogue="I've mapped the canopy dive and chime resonance into Area2D thermal volumes and StaticBody2D cliff colliders.",
+        addressed_to=["GameplayDesigner", "VisualArtDirector"],
+        added_or_updated_engineering_specs=[espec],
+    )
+    room._apply_turn_proposal(
+        game_bible=bible,
+        speaker_role="GameplaySystemsEngineer",
+        speaker_display_name="Lead Gameplay & Godot Systems Engineer",
+        proposal=swe_proposal,
+        candidate_dir=tmp_path,
+    )
+
+    assert len(bible.technical_architecture_blueprint) == 1
+    assert bible.technical_architecture_blueprint[0].mechanic_id == "thermal_updraft_flight"
+
+    # Verify CartridgeAssetLibrary extracts the SWE's required_sprite_and_tile_assets
+    lib = CartridgeAssetLibrary(cartridge_dir=tmp_path)
+    derived_assets = lib.derive_baseline_assets_from_bible(bible)
+    derived_ids = {a.asset_id for a in derived_assets}
+    assert "wind_canyon_stone_tile" in derived_ids
+    assert "resonance_chime_pylon" in derived_ids
+    assert "thermal_updraft_plume" in derived_ids
+
+    # Verify LeadGameplaySWEAgent includes technical_architecture_blueprint in prompt context
+    swe = LeadGameplaySWEAgent(client=fake_client)
+    ctx_str, _ = swe._build_bible_and_narrative_context(staging_dir=tmp_path, game_bible=bible)
+    assert "Technical Architecture Blueprint (GameplaySystemsEngineer" in ctx_str
+    assert "thermal_updraft_flight" in ctx_str
+    assert "CharacterBody2D player with StaticBody2D cliff boundaries" in ctx_str
+
+
+
 

@@ -1,5 +1,5 @@
 # engine/sim/godot_harness.gd
-# Headless SceneTree playtest runner for Godot 4 cartridges (Milestone 7).
+# Headless SceneTree verification & spatial-boundary auditor for Godot 4 cartridges.
 # Injected via `godot --headless --path <cartridge_dir> -s <path_to_godot_harness.gd>`.
 # Strictly resides outside cartridges/ to preserve Rule 1 (Scope Boundary).
 extends SceneTree
@@ -9,8 +9,16 @@ var current_tick: int = 0
 var main_scene_node: Node = null
 var frame_times_usec: Array[int] = []
 var initial_snapshot: Dictionary = {}
+var passive_idle_snapshot: Dictionary = {}
 var final_snapshot: Dictionary = {}
 var telemetry_events_captured: int = 0
+var passive_auto_win_detected: bool = false
+var passive_win_reason: String = ""
+var min_player_y_reached: float = 99999.0
+var max_player_y_reached: float = -99999.0
+var min_player_x_reached: float = 99999.0
+var max_player_x_reached: float = -99999.0
+var spawn_pos: Array = [0.0, 0.0]
 
 func _init() -> void:
 	var args = OS.get_cmdline_args()
@@ -23,13 +31,12 @@ func _init() -> void:
 func _initialize() -> void:
 	if DisplayServer.get_name() != "headless":
 		DisplayServer.window_set_position(Vector2i(-4000, -4000))
-	# 1. Instantiate the game's main scene specified in project.godot
 	var main_path = ProjectSettings.get_setting("application/run/main_scene", "res://main.tscn")
 	if not ResourceLoader.exists(main_path):
 		printerr("CRITICAL: Main scene not found at " + str(main_path))
 		quit(1)
 		return
-		
+
 	var packed = load(main_path)
 	if packed:
 		main_scene_node = packed.instantiate()
@@ -39,33 +46,90 @@ func _initialize() -> void:
 		quit(1)
 		return
 
-	# Capture initial baseline snapshot
 	initial_snapshot = _extract_state_snapshot()
+	spawn_pos = initial_snapshot.get("player_pos", [0.0, 0.0])
+	min_player_x_reached = float(spawn_pos[0])
+	max_player_x_reached = float(spawn_pos[0])
+	min_player_y_reached = float(spawn_pos[1])
+	max_player_y_reached = float(spawn_pos[1])
+	_check_snapshot_for_auto_win(initial_snapshot, 0)
 	print("[HARNESS_INIT] Loaded main scene: " + str(main_path) + " (max_ticks=" + str(max_ticks) + ")")
 
-func _process(delta: float) -> bool:
+func _process(_delta: float) -> bool:
 	var t0 = Time.get_ticks_usec()
 	current_tick += 1
 
-	# 1. Inject synthetic inputs according to schedule
-	_apply_synthetic_inputs(current_tick)
+	var passive_window_end = min(16, max(2, int(max_ticks / 4)))
 
-	# 2. Viewport GPU capture at t0
+	# Phase A: Passive Zero-Input Window (ticks 1..passive_window_end)
+	# Verifies the cartridge does NOT auto-solve or pre-complete objectives with zero player input.
+	if current_tick <= passive_window_end:
+		_release_all_inputs()
+		var cur_snap = _extract_state_snapshot()
+		_check_snapshot_for_auto_win(cur_snap, current_tick)
+		if current_tick == passive_window_end:
+			passive_idle_snapshot = cur_snap
+	else:
+		# Phase B: Sustained Directional Boundary Excursion + Action Probes
+		_apply_synthetic_inputs(current_tick, passive_window_end)
+
+	# Track actor spatial extrema across the run
+	var live_snap = _extract_state_snapshot()
+	var ppos = live_snap.get("player_pos", [0.0, 0.0])
+	if typeof(ppos) == TYPE_ARRAY and ppos.size() >= 2:
+		var px = float(ppos[0])
+		var py = float(ppos[1])
+		if px < min_player_x_reached:
+			min_player_x_reached = px
+		if px > max_player_x_reached:
+			max_player_x_reached = px
+		if py < min_player_y_reached:
+			min_player_y_reached = py
+		if py > max_player_y_reached:
+			max_player_y_reached = py
+
+	# Viewport GPU capture at t0 (during passive window before inputs)
 	if current_tick == 2:
 		_try_capture_viewport("res://assets/playtest_captures/playtest_t0.png")
 
-	# 3. Record tick execution time in microseconds
 	var dt_usec = Time.get_ticks_usec() - t0
 	frame_times_usec.append(dt_usec)
 
-	# 4. Check termination
 	if current_tick >= max_ticks:
 		_try_capture_viewport("res://assets/playtest_captures/playtest_tend.png")
+		_try_capture_collision_overlay("res://assets/playtest_captures/playtest_collision_overlay.png")
 		final_snapshot = _extract_state_snapshot()
 		_emit_summary_and_exit()
-		return true # Terminates SceneTree main loop
+		return true
 
 	return false
+
+func _check_snapshot_for_auto_win(snap: Dictionary, tick_num: int) -> void:
+	if passive_auto_win_detected:
+		return
+	if bool(snap.get("is_completed", false)) or bool(snap.get("victory", false)) or bool(snap.get("level_completed", false)):
+		passive_auto_win_detected = true
+		passive_win_reason = "Game reported is_completed/victory=true at passive tick " + str(tick_num) + " with zero player input."
+		return
+	var eng_status = str(snap.get("engine_status", "")).to_lower()
+	if eng_status == "active" or eng_status == "completed" or eng_status == "solved":
+		passive_auto_win_detected = true
+		passive_win_reason = "Target mechanism reported engine_status='" + eng_status + "' at passive tick " + str(tick_num) + " with zero player input."
+		return
+	# Also inspect main_scene_node properties for pre-activated target mechanisms or pre-solved stages
+	if main_scene_node != null:
+		if "engine" in main_scene_node and main_scene_node.get("engine") != null:
+			var eng_node = main_scene_node.get("engine")
+			if "is_active" in eng_node and bool(eng_node.get("is_active")):
+				passive_auto_win_detected = true
+				passive_win_reason = "Main scene target engine.is_active became true at passive tick " + str(tick_num) + " with zero player input."
+				return
+		if "flume_grid" in main_scene_node and main_scene_node.get("flume_grid") != null:
+			var fg = main_scene_node.get("flume_grid")
+			if fg.has_method("get_powered_target_count") and int(fg.call("get_powered_target_count")) > 0:
+				passive_auto_win_detected = true
+				passive_win_reason = "Simulation grid powered target count > 0 at passive tick " + str(tick_num) + " with zero player input."
+				return
 
 func _try_capture_viewport(res_target_path: String) -> void:
 	if DisplayServer.get_name() == "headless":
@@ -87,6 +151,177 @@ func _try_capture_viewport(res_target_path: String) -> void:
 		img.save_png(ProjectSettings.globalize_path("res://playtest_t0.png"))
 	elif res_target_path.ends_with("playtest_tend.png"):
 		img.save_png(ProjectSettings.globalize_path("res://playtest_tend.png"))
+	elif res_target_path.ends_with("playtest_collision_overlay.png"):
+		img.save_png(ProjectSettings.globalize_path("res://playtest_collision_overlay.png"))
+
+func _try_capture_collision_overlay(res_target_path: String) -> void:
+	if DisplayServer.get_name() == "headless" or main_scene_node == null:
+		return
+	var shapes_data: Array = []
+	_collect_collision_shapes_recursive(main_scene_node, shapes_data)
+
+	RenderingServer.force_draw(true)
+	var vp_tex = root.get_texture()
+	if vp_tex == null:
+		return
+	var img = vp_tex.get_image()
+	if img == null or img.is_empty():
+		return
+	var vp_w = float(max(1, img.get_width()))
+	var vp_h = float(max(1, img.get_height()))
+	if img.get_width() != 1280 or img.get_height() != 720:
+		img.resize(1280, 720, Image.INTERPOLATE_BILINEAR)
+	if img.is_compressed():
+		img.decompress()
+	img.convert(Image.FORMAT_RGBA8)
+
+	var scale_x = 1280.0 / vp_w
+	var scale_y = 720.0 / vp_h
+	var canvas_xform: Transform2D = Transform2D.IDENTITY
+	if main_scene_node.get_viewport() != null:
+		canvas_xform = main_scene_node.get_viewport().get_canvas_transform()
+
+	_rasterize_shapes_on_image(img, shapes_data, canvas_xform, scale_x, scale_y)
+
+	var abs_dir = ProjectSettings.globalize_path("res://assets/playtest_captures")
+	DirAccess.make_dir_recursive_absolute(abs_dir)
+	var abs_path = ProjectSettings.globalize_path(res_target_path)
+	img.save_png(abs_path)
+	if res_target_path.ends_with("playtest_collision_overlay.png"):
+		img.save_png(ProjectSettings.globalize_path("res://playtest_collision_overlay.png"))
+
+func _blend_pixel(img: Image, x: int, y: int, col: Color) -> void:
+	if x < 0 or x >= 1280 or y < 0 or y >= 720:
+		return
+	var dst = img.get_pixel(x, y)
+	var a = col.a
+	var out_r = dst.r * (1.0 - a) + col.r * a
+	var out_g = dst.g * (1.0 - a) + col.g * a
+	var out_b = dst.b * (1.0 - a) + col.b * a
+	img.set_pixel(x, y, Color(out_r, out_g, out_b, 1.0))
+
+func _draw_thick_line_on_image(img: Image, p0: Vector2, p1: Vector2, col: Color, thickness: int = 2) -> void:
+	var dist = p0.distance_to(p1)
+	var steps = int(max(1.0, ceil(dist)))
+	for i in range(steps + 1):
+		var t = float(i) / float(steps)
+		var pt = p0.lerp(p1, t)
+		var cx = int(round(pt.x))
+		var cy = int(round(pt.y))
+		for dy in range(-thickness, thickness + 1):
+			for dx in range(-thickness, thickness + 1):
+				if dx * dx + dy * dy <= thickness * thickness:
+					_blend_pixel(img, cx + dx, cy + dy, col)
+
+func _rasterize_shapes_on_image(img: Image, shapes_list: Array, canvas_xform: Transform2D, scale_x: float, scale_y: float) -> void:
+	for item in shapes_list:
+		var kind = str(item.get("kind", "static"))
+		var fill_col = Color(1.0, 0.15, 0.35, 0.32)
+		var line_col = Color(1.0, 0.2, 0.4, 0.96)
+		if kind == "actor":
+			fill_col = Color(0.0, 0.9, 1.0, 0.38)
+			line_col = Color(0.0, 1.0, 1.0, 1.0)
+		elif kind == "area":
+			fill_col = Color(1.0, 0.82, 0.1, 0.28)
+			line_col = Color(1.0, 0.88, 0.2, 0.95)
+		elif kind == "walkable_shelf":
+			fill_col = Color(0.1, 0.95, 0.4, 0.22)
+			line_col = Color(0.1, 0.95, 0.4, 0.95)
+
+		if item.has("rect"):
+			var r: Rect2 = item["rect"]
+			var tl_w = canvas_xform * r.position
+			var br_w = canvas_xform * (r.position + r.size)
+			var x0 = int(clamp(min(tl_w.x, br_w.x) * scale_x, 0.0, 1279.0))
+			var x1 = int(clamp(max(tl_w.x, br_w.x) * scale_x, 0.0, 1279.0))
+			var y0 = int(clamp(min(tl_w.y, br_w.y) * scale_y, 0.0, 719.0))
+			var y1 = int(clamp(max(tl_w.y, br_w.y) * scale_y, 0.0, 719.0))
+			for y in range(y0, y1 + 1, 2):
+				for x in range(x0, x1 + 1, 2):
+					_blend_pixel(img, x, y, fill_col)
+			var c_tl = Vector2(float(x0), float(y0))
+			var c_tr = Vector2(float(x1), float(y0))
+			var c_br = Vector2(float(x1), float(y1))
+			var c_bl = Vector2(float(x0), float(y1))
+			_draw_thick_line_on_image(img, c_tl, c_tr, line_col, 2)
+			_draw_thick_line_on_image(img, c_tr, c_br, line_col, 2)
+			_draw_thick_line_on_image(img, c_br, c_bl, line_col, 2)
+			_draw_thick_line_on_image(img, c_bl, c_tl, line_col, 2)
+		elif item.has("polygon"):
+			var pts: PackedVector2Array = item["polygon"]
+			if pts.size() >= 3:
+				var screen_pts = PackedVector2Array()
+				var min_x = 1280.0
+				var max_x = 0.0
+				var min_y = 720.0
+				var max_y = 0.0
+				for p in pts:
+					var sp = canvas_xform * p
+					var sx = sp.x * scale_x
+					var sy = sp.y * scale_y
+					screen_pts.append(Vector2(sx, sy))
+					if sx < min_x:
+						min_x = sx
+					if sx > max_x:
+						max_x = sx
+					if sy < min_y:
+						min_y = sy
+					if sy > max_y:
+						max_y = sy
+				var ix0 = int(clamp(min_x, 0.0, 1279.0))
+				var ix1 = int(clamp(max_x, 0.0, 1279.0))
+				var iy0 = int(clamp(min_y, 0.0, 719.0))
+				var iy1 = int(clamp(max_y, 0.0, 719.0))
+				for y in range(iy0, iy1 + 1, 2):
+					for x in range(ix0, ix1 + 1, 2):
+						if Geometry2D.is_point_in_polygon(Vector2(float(x), float(y)), screen_pts):
+							_blend_pixel(img, x, y, fill_col)
+				for i in range(screen_pts.size()):
+					var a_pt = screen_pts[i]
+					var b_pt = screen_pts[(i + 1) % screen_pts.size()]
+					_draw_thick_line_on_image(img, a_pt, b_pt, line_col, 2)
+
+
+func _collect_collision_shapes_recursive(node: Node, out_list: Array) -> void:
+	if node == null:
+		return
+	if "shelves" in node and typeof(node.get("shelves")) == TYPE_ARRAY:
+		for s in node.get("shelves"):
+			if typeof(s) == TYPE_RECT2:
+				out_list.append({"kind": "walkable_shelf", "rect": s})
+	if node is CollisionPolygon2D and node.polygon.size() >= 3 and not node.disabled:
+		var parent = node.get_parent()
+		var kind = "static"
+		if parent is CharacterBody2D:
+			kind = "actor"
+		elif parent is Area2D:
+			kind = "area"
+		var xform: Transform2D = node.get_global_transform()
+		var world_pts = PackedVector2Array()
+		for p in node.polygon:
+			world_pts.append(xform * p)
+		out_list.append({"kind": kind, "polygon": world_pts})
+	elif node is CollisionShape2D and node.shape != null and not node.disabled:
+		var parent = node.get_parent()
+		var kind = "static"
+		if parent is CharacterBody2D:
+			kind = "actor"
+		elif parent is Area2D:
+			kind = "area"
+		var gpos: Vector2 = node.global_position
+		var shp = node.shape
+		if shp is RectangleShape2D:
+			var sz: Vector2 = shp.size
+			out_list.append({"kind": kind, "rect": Rect2(gpos - sz * 0.5, sz)})
+		elif shp is CircleShape2D:
+			var rad: float = shp.radius
+			out_list.append({"kind": kind, "rect": Rect2(gpos - Vector2(rad, rad), Vector2(rad * 2.0, rad * 2.0))})
+		elif shp is CapsuleShape2D:
+			var rad_c: float = shp.radius
+			var h_c: float = shp.height
+			out_list.append({"kind": kind, "rect": Rect2(gpos - Vector2(rad_c, h_c * 0.5), Vector2(rad_c * 2.0, h_c))})
+	for child in node.get_children():
+		_collect_collision_shapes_recursive(child, out_list)
 
 func _resolve_texture_path(node: Node, tex: Texture2D) -> String:
 	if node != null and node.has_meta("source_path"):
@@ -100,63 +335,65 @@ func _resolve_texture_path(node: Node, tex: Texture2D) -> String:
 		return "res://assets/sprites/" + str(node.get_meta("asset_id")) + ".png"
 	return ""
 
-func _apply_synthetic_inputs(tick: int) -> void:
-	# Release previous frame inputs to prevent stuck action states
+func _release_all_inputs() -> void:
 	for action in ["ui_right", "ui_left", "ui_up", "ui_down", "ui_accept", "ui_select", "RIGHT", "LEFT", "UP", "DOWN", "SPACE", "ACTION_1"]:
 		if InputMap.has_action(action):
 			Input.action_release(action)
 
-	# Multi-Profile Synthetic Schedule:
-	# Phase A: Initial boot / screen advance
-	if tick in [1, 2, 3]:
-		_press("ui_accept")
-		_press("SPACE")
-	# Phase B: Idle baseline (ticks 4..14)
-	elif tick < 15:
-		pass
-	# Phase C: Kinetic locomotion (ticks 15..44)
-	elif tick < 45:
-		if (tick / 10) % 2 == 0:
+func _apply_synthetic_inputs(tick: int, passive_end: int) -> void:
+	_release_all_inputs()
+	var active_tick = tick - passive_end
+
+	# Segment 1 (active_tick 1..20): Sustained North (-Y) Boundary Excursion to test sky/horizon containment
+	if active_tick <= 20:
+		_press("ui_up")
+		_press("UP")
+	# Segment 2 (active_tick 21..32): Sustained East (+X) Excursion + Action triggers
+	elif active_tick <= 32:
+		_press("ui_right")
+		_press("RIGHT")
+		if active_tick % 3 == 0:
+			_press("ACTION_1")
+			_press("ui_accept")
+			_press("SPACE")
+	# Segment 3 (active_tick 33+): South/West & Interactive triggers
+	else:
+		if (active_tick / 6) % 2 == 0:
+			_press("ui_down")
+			_press("DOWN")
 			_press("ui_right")
 			_press("RIGHT")
 		else:
 			_press("ui_left")
 			_press("LEFT")
-		if (tick / 5) % 2 == 0:
-			_press("ui_down")
-			_press("DOWN")
-	# Phase D: Action triggers & abilities (ticks 45+)
-	else:
-		_press("ui_right")
-		_press("RIGHT")
-		if tick % 4 == 0:
+		if active_tick % 3 == 0:
 			_press("ACTION_1")
 			_press("ui_accept")
-		if tick % 5 == 0:
+		if active_tick % 4 == 0:
 			_press("SPACE")
 
 	# Inject synthetic InputEvents into SceneTree root so _unhandled_input / _input handlers are exercised
-	if tick == 6:
+	if active_tick == 2:
 		var key_ev = InputEventKey.new()
 		key_ev.keycode = KEY_1
 		key_ev.physical_keycode = KEY_1
 		key_ev.pressed = true
 		root.push_input(key_ev)
-	elif tick in [10, 25, 40]:
+	elif active_tick in [6, 18, 28]:
 		var motion_ev = InputEventMouseMotion.new()
-		motion_ev.position = Vector2(640.0 + float(tick * 2), 360.0 + float(tick))
+		motion_ev.position = Vector2(640.0 + float(active_tick * 2), 360.0 + float(active_tick))
 		root.push_input(motion_ev)
-	elif tick in [12, 28, 42]:
+	elif active_tick in [8, 22, 30]:
 		var click_ev = InputEventMouseButton.new()
 		click_ev.button_index = MOUSE_BUTTON_LEFT
 		click_ev.pressed = true
-		click_ev.position = Vector2(640.0 + float(tick * 2), 360.0 + float(tick))
+		click_ev.position = Vector2(640.0 + float(active_tick * 2), 360.0 + float(active_tick))
 		root.push_input(click_ev)
-	elif tick in [13, 29, 43]:
+	elif active_tick in [9, 23, 31]:
 		var rel_ev = InputEventMouseButton.new()
 		rel_ev.button_index = MOUSE_BUTTON_LEFT
 		rel_ev.pressed = false
-		rel_ev.position = Vector2(640.0 + float(tick * 2), 360.0 + float(tick))
+		rel_ev.position = Vector2(640.0 + float(active_tick * 2), 360.0 + float(active_tick))
 		root.push_input(rel_ev)
 
 func _press(action: String) -> void:
@@ -173,7 +410,6 @@ func _extract_state_snapshot() -> Dictionary:
 		"node_count": root.get_child_count(),
 		"is_completed": false
 	}
-	# Check if main scene provides an explicit get_state_snapshot() hook
 	if main_scene_node and main_scene_node.has_method("get_state_snapshot"):
 		var custom_snap = main_scene_node.call("get_state_snapshot")
 		if typeof(custom_snap) == TYPE_DICTIONARY:
@@ -181,7 +417,6 @@ func _extract_state_snapshot() -> Dictionary:
 				snap[k] = custom_snap[k]
 			return snap
 
-	# Fallback to automated node tree reflection
 	var actor = _find_actor_node(main_scene_node)
 	if actor:
 		if "position" in actor:
@@ -199,10 +434,94 @@ func _find_actor_node(node: Node) -> Node:
 		if node.has_node(name):
 			return node.get_node(name)
 	for child in node.get_children():
+		if child is CharacterBody2D:
+			return child
 		var found = _find_actor_node(child)
 		if found:
 			return found
 	return null
+
+func _audit_spatial_boundaries(node: Node) -> Dictionary:
+	var walkable_min_y: float = 99999.0
+	var walkable_max_y: float = -99999.0
+	var has_explicit_shelves: bool = false
+	var has_sky_backdrop: bool = false
+	var static_collider_count: int = 0
+	var interior_north_barrier_found: bool = false
+
+	var shapes_list: Array = []
+	_collect_collision_shapes_recursive(node, shapes_list)
+	for item in shapes_list:
+		var kind = str(item.get("kind", ""))
+		if kind == "walkable_shelf" and item.has("rect"):
+			var r: Rect2 = item["rect"]
+			has_explicit_shelves = true
+			if r.position.y < walkable_min_y:
+				walkable_min_y = r.position.y
+			if r.end.y > walkable_max_y:
+				walkable_max_y = r.end.y
+		elif kind == "static":
+			static_collider_count += 1
+			if item.has("polygon"):
+				var pts: PackedVector2Array = item["polygon"]
+				var min_py = 99999.0
+				var max_py = -99999.0
+				for p in pts:
+					if p.y < min_py:
+						min_py = p.y
+					if p.y > max_py:
+						max_py = p.y
+				# Check if this collider acts as a horizon/shelf top barrier (y between 120 and 380) rather than y<=32 canvas ceiling
+				if max_py >= 140.0 and min_py <= 380.0 and (max_py - min_py) <= 320.0:
+					interior_north_barrier_found = true
+			elif item.has("rect"):
+				var sr: Rect2 = item["rect"]
+				if sr.end.y >= 140.0 and sr.position.y <= 380.0 and sr.size.y <= 320.0:
+					interior_north_barrier_found = true
+
+	if node != null:
+		for child in node.get_children():
+			var cname = str(child.name).to_lower()
+			if cname.find("sky") != -1 or cname.find("backdrop") != -1:
+				has_sky_backdrop = true
+
+	var unbounded_sky_detected: bool = false
+	var boundary_violation_reason: String = ""
+
+	if has_explicit_shelves and walkable_min_y < 9000.0:
+		# If the player walked > 24px above the highest walkable shelf into the sky backdrop
+		if min_player_y_reached < walkable_min_y - 24.0:
+			unbounded_sky_detected = true
+			boundary_violation_reason = (
+				"Player walked into sky/void at y=" + str(snapped(min_player_y_reached, 0.1))
+				+ " above walkable shelf top y=" + str(snapped(walkable_min_y, 0.1))
+			)
+		elif not interior_north_barrier_found and walkable_min_y >= 180.0:
+			unbounded_sky_detected = true
+			boundary_violation_reason = (
+				"Walkable shelves start at y=" + str(snapped(walkable_min_y, 0.1))
+				+ " (sky above y<" + str(snapped(walkable_min_y, 0.1)) + ") but no StaticBody2D north horizon collider bounds y="
+				+ str(snapped(walkable_min_y, 0.1))
+			)
+	elif has_sky_backdrop and float(spawn_pos[1]) >= 260.0 and min_player_y_reached < 180.0 and not interior_north_barrier_found:
+		unbounded_sky_detected = true
+		boundary_violation_reason = (
+			"Scene has SkyBackdrop and player spawned at y=" + str(snapped(float(spawn_pos[1]), 0.1))
+			+ " but walked unobstructed into sky region y=" + str(snapped(min_player_y_reached, 0.1))
+		)
+
+	return {
+		"static_collider_count": static_collider_count,
+		"has_explicit_shelves": has_explicit_shelves,
+		"walkable_min_y": walkable_min_y if has_explicit_shelves else 0.0,
+		"min_player_y_reached": min_player_y_reached,
+		"max_player_y_reached": max_player_y_reached,
+		"min_player_x_reached": min_player_x_reached,
+		"max_player_x_reached": max_player_x_reached,
+		"interior_north_barrier_found": interior_north_barrier_found,
+		"unbounded_sky_or_void_detected": unbounded_sky_detected,
+		"boundary_violation_reason": boundary_violation_reason
+	}
 
 func _audit_scene_tree(node: Node, in_ui: bool = false) -> Dictionary:
 	var report = {
@@ -219,11 +538,21 @@ func _audit_scene_tree(node: Node, in_ui: bool = false) -> Dictionary:
 		"fullscreen_occlusion_detected": false,
 		"portrait_misused_on_world_sprite": false,
 		"portrait_misused_nodes": [],
-		"oversized_ui_portraits": []
+		"oversized_ui_portraits": [],
+		"passive_auto_win_detected": passive_auto_win_detected,
+		"passive_win_reason": passive_win_reason,
+		"unbounded_sky_or_void_detected": false,
+		"boundary_violation_reason": "",
+		"spatial_boundary_audit": {}
 	}
 	if not node:
 		return report
 	_walk_scene_audit(node, in_ui, report)
+	var boundary_audit = _audit_spatial_boundaries(node)
+	report["spatial_boundary_audit"] = boundary_audit
+	report["unbounded_sky_or_void_detected"] = bool(boundary_audit.get("unbounded_sky_or_void_detected", false))
+	report["boundary_violation_reason"] = str(boundary_audit.get("boundary_violation_reason", ""))
+
 	var init_occlusion = float(initial_snapshot.get("viewport_occlusion", 0.0))
 	var final_failed = bool(final_snapshot.get("is_failed", false))
 	if init_occlusion >= 0.80 or final_failed:
@@ -316,7 +645,12 @@ func _emit_summary_and_exit() -> void:
 	var dx = pos1[0] - pos0[0]
 	var dy = pos1[1] - pos0[1]
 	var pos_delta = sqrt(dx * dx + dy * dy)
-	var progression_verified = (pos_delta > 0.1 or current_tick >= max_ticks)
+	var max_excursion = sqrt(
+		pow(max_player_x_reached - min_player_x_reached, 2.0) +
+		pow(max_player_y_reached - min_player_y_reached, 2.0)
+	)
+	var effective_delta = max(pos_delta, max_excursion)
+	var progression_verified = (effective_delta > 0.1 or current_tick >= max_ticks)
 	var scene_audit = _audit_scene_tree(main_scene_node, false)
 
 	print("[STATE_SNAPSHOT] " + JSON.stringify(final_snapshot))
@@ -328,7 +662,8 @@ func _emit_summary_and_exit() -> void:
 		"ticks_executed": current_tick
 	}))
 	print("[PROGRESSION] " + JSON.stringify({
-		"pos_delta": pos_delta,
+		"pos_delta": effective_delta,
 		"progression_verified": progression_verified
 	}))
 	quit(0)
+

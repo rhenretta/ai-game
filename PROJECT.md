@@ -8,9 +8,10 @@ The system is an autonomous, requirement-driven multi-agent game studio swarm th
   - `orchestrator.py`: Meta-planning DAG and iterative requirement-by-requirement (`R1..Rn`) execution loop with verified checkpointing (`cartridges/checkpoints/`).
   - `models.py`: Epistemic data models (Pydantic models inheriting from `BaseEpistemicModel` with `deliberation` strictly at field index 0).
   - `director.py`: Concept (`GenesisWorldSpec`) & Game Requirements (`GameRequirementsSpec`) authoring from `SteamPlayerDNA` / `EvolutionHypothesisReport`.
-  - `swe.py`: Iterative multi-module Godot 4.3 GDScript (`project.godot`, `main.tscn`, `main.gd`, `scenes.gd`, `mechanics.gd`, `entities.gd`, `ui_hud.gd`) and Python code synthesis, upfront production strategy (`formulate_production_strategy`), per-scene multimodal critique & iterative refinement (`analyze_scene_and_restrategize`, `execute_scene_strategy_and_refine_loop`), and 2-hop scoped Plan-Execute-Verify surgical patching (`debug_and_patch_pev_cycle`) via `LeadGameplaySWEAgent`.
-  - `asset_library.py`: Concept-grounded sprite, 2x2 animation sheet, articulated rig, and seamless 90-degree orthographic top-down surface tile catalog (`CartridgeAssetLibrary`, `asset_catalog.json`) with strict portrait-vs-world-sprite separation.
-  - `visual.py`: Live Gemini pixel-art sprite, portrait, and seamless tile synthesis (`ensure_full_bleed_tile` with toroidal border cross-fading and corner-defect validation) via `VisualArtSpriteDesignerAgent`.
+  - `writers_room.py`: 8-specialist `CreativeWritersRoom` (including `GameplaySystemsEngineer`) that builds the Living Game Bible (`GameBibleSpec`), including the `technical_architecture_blueprint` (`MechanicEngineeringSpec` list: Godot node/collider topology, unsolved-at-t=0 state machines, required assets, test invariants) that downstream agents consume.
+  - `swe.py`: Iterative multi-module Godot 4.3 GDScript (`project.godot`, `main.tscn`, `main.gd`, `scenes.gd`, `mechanics.gd`, `entities.gd`, `ui_hud.gd`) and Python code synthesis, upfront production strategy (`formulate_production_strategy`), per-scene multimodal critique & iterative refinement (`analyze_scene_and_restrategize`, `execute_scene_strategy_and_refine_loop`), atomic work-unit decomposition and Godot test synthesis (`decompose_track_into_atomic_units`, `synthesize_atomic_godot_test`), and 2-hop scoped Plan-Execute-Verify surgical patching (`debug_and_patch_pev_cycle`) via `LeadGameplaySWEAgent`.
+  - `asset_library.py`: Concept-grounded asset catalog (`CartridgeAssetLibrary`, `assets/asset_library.json`) with concept decomposition (flat structured-output schema, engineer-requested assets), portrait-vs-world-sprite separation, and baseline asset derivation from the Game Bible.
+  - `visual.py`: Gemini sprite, portrait, and tile synthesis via `VisualArtSpriteDesignerAgent`: `rembg` + perimeter flood-fill alpha matting, continuous UV-displacement keyframe animation (`cv2.remap`), non-mirrored toroidal tiles, and Tier 1 / Tier 2 vision verification (`verify_rendered_asset`, `verify_rendered_animation`) that fail fast with `StudioAgentError`.
   - `audio.py`: Dynamic Gemini TTS `.wav` voice and sound synthesis (`VoiceActingAudioProducerAgent`).
   - `narrative.py`: Narrative bible, character sheets, dialogue trees, and situational barks (`NarrativeCharacterWriterAgent`).
   - `telemetry_architect.py`: Custom behavioral telemetry probe design (`telemetry_manifest.json`) and GDScript/Python AST instrumentation (`TelemetryArchitectAgent`).
@@ -19,7 +20,8 @@ The system is an autonomous, requirement-driven multi-agent game studio swarm th
   - `challenger.py`: Gate F (`ChallengerGate` & `MultiAgentSignOffCouncil`) auditing 100% of acceptance criteria in `requirements_spec.json` plus camera/terrain perspective alignment, psychoacoustic comfort (zero continuous high-pitched looping sine/square wave drones), runtime audio stream binding (`AudioStreamWAV`), HiDPI-exact mouse picking (`get_global_mouse_position()`), non-occluding HUD panels (`center_occluding_panels`), and player onboarding clarity.
   - `models.py`: Verification models and `RejectionDiagnosticTrace` schema.
 - `engine/sim/`: Headless simulation, real GPU viewport capture, and runtime scene auditing.
-  - `godot_verifier.py` & `godot_harness.gd`: Headless Godot 4.3 compiler verification (`verify_godot_cartridge_syntax`), real GPU OpenGL3 viewport capture (`GodotHeadlessSimulator`, `_validate_rendered_viewport_image`), live scene-tree UX/audio audit (`_audit_scene_tree`), and `[TELEMETRY_EVENT]` bridge into SQLite WAL.
+  - `godot_verifier.py` & `godot_harness.gd`: Headless Godot 4.3 compiler verification (`verify_godot_cartridge_syntax`), real GPU OpenGL3 viewport capture (`GodotHeadlessSimulator`, `_validate_rendered_viewport_image`), live scene-tree UX/audio audit (`_audit_scene_tree`), collision-overlay capture, and `[TELEMETRY_EVENT]` bridge into SQLite WAL.
+  - `atomic_runner.py`: `GodotAtomicTestRunner` executing `tests/test_*.gd` headless SceneTree unit tests (`[ATOMIC_ASSERT_PASS]` / `[ATOMIC_ASSERT_FAIL]`) and rendering `playtest_collision_overlay.png`.
   - `simulator.py` & `headless.py`: Headless Pygame simulation runner (`SDL_VIDEODRIVER=dummy`, `SDL_AUDIODRIVER=dummy`).
 - `engine/telemetry/`: Continuous SQLite WAL persistence.
   - `db.py`, `schema.sql`, `schema.py`, `recorder.py`, `writer.py`: Zero-lock SQLite WAL storage (`data/telemetry.db`) for `studio_events`, `agent_task_records`, `studio_requirements`, `studio_state_kv`, `telemetry_probes`, and `custom_telemetry_events`.
@@ -50,6 +52,10 @@ The system is an autonomous, requirement-driven multi-agent game studio swarm th
 | 18 | Agent Task History & Handoff Observability UI | Task history persistence in SQLite WAL (`agent_task_records`) and interactive drawer with `ArtifactMetadataEnvelope` cards in `index.html` | M_UI | R5 |
 | 19 | Checkpoint Resilience & Per-Track Retry | Transient error handling, `.gd`/`.py` snapshotting/restoration, and completed-track resumption in `orchestrator.py` | M6, M7 | Follow-up |
 | 20 | Incremental Playable Verified Checkpoints | Immutable checkpoint persistence in `cartridges/checkpoints/`, launcher `--checkpoint` / `--latest-checkpoint` support, and UI timeline | M6, M7 | R6 |
+| 21 | Gameplay Systems Engineer in the Writers' Room | `GameplaySystemsEngineer` specialist authors `technical_architecture_blueprint` (`MechanicEngineeringSpec`) consumed by asset decomposition, requirements authoring, and SWE synthesis | M9 | Follow-up |
+| 22 | Atomic Godot TDD & Collision-Overlay Verification | `GodotAtomicTestRunner`, `AtomicWorkUnit` decomposition, passive auto-win / unbounded-sky Challenger checks | M9 | Follow-up |
+| 23 | Neural Alpha Matting & Keyframe Animation | `rembg` matting, continuous UV-displacement keyframe sheets, non-mirrored toroidal tiles, Tier 1/2 vision verification with no silent fallbacks | M9 | Follow-up |
+| 24 | Resumable Quality-Gate Stage | UI "Run Quality Gates" action when all tracks are complete; orchestrator `self.agents` lookups; `audit_simulation` `cpath` fix | M9 | Follow-up |
 
 ## Milestones
 | # | Name | Scope | Dependencies | Status |
@@ -64,6 +70,7 @@ The system is an autonomous, requirement-driven multi-agent game studio swarm th
 | M6 | Final Milestone & Live Genesis Verification | Phase 1 (100% E2E tests pass), Phase 2 (Tier 5 hardening), live Genesis build, pytest | E2E, M1–M5, M_UI | DONE |
 | M7 | Godot 4.3 Transition & SQLite WAL Persistence | Code-First Godot 4.3 Engine, GDScript 4 Synthesis, Headless Verification, SQLite WAL & Checkpoints | M6 | DONE |
 | M8 | Live WAL Streaming, Gemini Sprites & Designer Signoff Gate | Real-time `/ws/swarm` SQLite WAL tailing, live Gemini sprite synthesis, HiDPI mouse & `AudioStreamWAV` repair, and Designer UX Signoff | M7 | DONE |
+| M9 | Systems Engineer, Atomic TDD & Asset Quality | `GameplaySystemsEngineer`, `engine/sim/atomic_runner.py`, `rembg`/keyframe asset pipeline, quality-gate resume | M8 | DONE (live-run quality verification ongoing) |
 
 ## Interface Contracts
 

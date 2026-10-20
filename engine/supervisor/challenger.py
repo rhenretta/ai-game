@@ -558,6 +558,7 @@ class CandidateTelemetryAuditor:
         active_sim = sim
         owned_sim = False
         initial_coords = None
+        cpath: Optional[Path] = Path(candidate_dir).resolve() if candidate_dir is not None else None
 
         if active_sim is None and candidate_dir is not None:
             cpath = Path(candidate_dir).resolve()
@@ -685,6 +686,31 @@ class CandidateTelemetryAuditor:
             is_stagnant = True
 
         raw_scene_audit = getattr(active_sim, "scene_audit", None)
+        atomic_suite_summary: Dict[str, Any] = {}
+        if cpath is not None and (cpath / "project.godot").is_file() and (cpath / "tests").is_dir():
+            try:
+                from engine.sim.atomic_runner import GodotAtomicTestRunner
+                suite_res = GodotAtomicTestRunner.run_all_atomic_tests(cpath)
+                failed_list = [
+                    {
+                        "unit_id": r.unit_id,
+                        "test_script": r.test_script_path,
+                        "failed_assertions": [a._asdict() for a in r.failed_assertions],
+                        "stderr": r.stderr,
+                    }
+                    for r in suite_res.results
+                    if not r.passed
+                ]
+                atomic_suite_summary = {
+                    "total_tests": suite_res.total_tests,
+                    "passed_tests": suite_res.passed_tests,
+                    "failed_tests": suite_res.failed_tests,
+                    "all_passed": suite_res.all_passed,
+                    "failed_details": failed_list,
+                }
+            except Exception as atomic_err:
+                logger.warning("Could not execute GodotAtomicTestRunner suite in TelemetryAuditor: %s", atomic_err)
+
         report = {
             "ticks_executed": step_count,
             "simulation_duration_sec": getattr(active_sim, "elapsed_time", step_count * (1.0 / 60.0)),
@@ -696,6 +722,7 @@ class CandidateTelemetryAuditor:
             "state_progression_verified": not is_stagnant,
             "is_stagnant_or_frozen": is_stagnant,
             "scene_audit": raw_scene_audit if isinstance(raw_scene_audit, dict) else {},
+            "atomic_test_suite": atomic_suite_summary,
             "metric_deltas": {
                 "pos_delta_px": round(pos_delta, 2),
                 "events_count": len(events),
@@ -804,9 +831,11 @@ class CandidateVisualPlaytester:
             colors_tend = 0
             diff_pixels = 0
 
+            overlay_bytes: Optional[bytes] = None
             if cpath is not None:
                 t0_file = cpath / "assets" / "playtest_captures" / "playtest_t0.png"
                 tend_file = cpath / "assets" / "playtest_captures" / "playtest_tend.png"
+                overlay_file = cpath / "assets" / "playtest_captures" / "playtest_collision_overlay.png"
                 if t0_file.is_file() and tend_file.is_file():
                     b_t0 = t0_file.read_bytes()
                     b_tend = tend_file.read_bytes()
@@ -815,6 +844,9 @@ class CandidateVisualPlaytester:
                         "assets/playtest_captures/playtest_t0.png",
                         "assets/playtest_captures/playtest_tend.png",
                     ]
+                    if overlay_file.is_file():
+                        overlay_bytes = overlay_file.read_bytes()
+                        captured_frame_paths.append("assets/playtest_captures/playtest_collision_overlay.png")
                     img_t0 = Image.open(io.BytesIO(b_t0)).convert("RGB")
                     img_tend = Image.open(io.BytesIO(b_tend)).convert("RGB")
                     canvas_dims = img_t0.size
@@ -833,6 +865,8 @@ class CandidateVisualPlaytester:
                     from google.genai import types
                     for s_bytes in (snapshots[0], snapshots[-1]):
                         image_parts.append(types.Part.from_bytes(data=s_bytes, mime_type="image/png"))
+                    if overlay_bytes:
+                        image_parts.append(types.Part.from_bytes(data=overlay_bytes, mime_type="image/png"))
                 except Exception as part_err:
                     logger.debug("Could not package image parts via types.Part: %s", part_err)
 
@@ -1050,11 +1084,11 @@ class MultiAgentSignOffCouncil:
                 prompt = (
                     f"You are the Multi-Agent Final Sign-Off Council for candidate build '{candidate_id}'.\n"
                     f"Every single specialist who authored the Living Game Bible MUST inspect the actual rendered game frames "
-                    f"(playtest_t0.png and playtest_tend.png) SIDE-BY-SIDE against the Writers' Room 16:9 Concept Mockup, "
+                    f"(playtest_t0.png, playtest_tend.png, and playtest_collision_overlay.png) SIDE-BY-SIDE against the Writers' Room 16:9 Concept Mockup, "
                     f"source code, audio configuration, and runtime scene audit, and render an independent sign-off verdict:\n"
-                    f"1. VisualArtDirector: Compare the rendered game frames side-by-side against the 16:9 Concept Mockup! CRITICAL PERSPECTIVE CHECK: Does the landscape orientation match the character's movement plane? (If the character moves in 2D top-down / 3/4 overhead X-Y space across a shelf Rect2, the entire walkable shelf Rect2 MUST be rendered as the lush top-down plateau surface `terrain_surface.png` with the vertical cliff wall `structure_wall_tile.png` hanging ONLY below the southern bottom edge `s.end.y`—REJECT immediately if the character appears to be walking sideways on the vertical face of a cliff!). Are ALL synthesized sprites loaded with clean alpha transparency and proper world scale? Are character portraits strictly isolated in UI dialogue panels?\n"
+                    f"1. VisualArtDirector: Compare the rendered game frames side-by-side against the 16:9 Concept Mockup and playtest_collision_overlay.png! CRITICAL PERSPECTIVE & COLLISION CHECK: Does the landscape orientation match the character's movement plane? Are red StaticBody2D collision boundaries aligned 1:1 with the north sky horizon and chasm edges so the player can NEVER walk on the sky or empty void? Are ALL synthesized sprites loaded with clean alpha transparency and proper world scale? Are character portraits strictly isolated in UI dialogue panels?\n"
                     f"2. UXExperienceDesigner: Is the viewport clear on startup (zero 95% opaque frost or center-occluding panels)? Are controls discoverable via diegetic labels/hover cues?\n"
-                    f"3. GameplayDesigner: Is there an active, responsive, navigable world loop with meaningful objectives, recoverable hazards, and coherent spatial navigation where entities walk on top of the plateau surface rather than across cliff walls?\n"
+                    f"3. GameplayDesigner: Is there an active, responsive, navigable world loop with meaningful objectives, zero t=0 pre-solved/pre-carved cheats, recoverable hazards, and coherent spatial navigation where entities are physically bounded by StaticBody2D colliders to walkable plateau surfaces?\n"
                     f"4. StoryWorldArchitect: Are the Narrative Bible's characters, cutscenes, dialogue trees, and voice barks staged in-game?\n"
                     f"5. AudioAtmosphereDesigner: Are WAV files loaded at 24,000 Hz (`mix_rate = 24000`, never 44100 chipmunk distortion) with the 44-byte RIFF header stripped (`bytes.slice(44)`) and non-overlapping cooldown guards? CRITICAL PSYCHOACOUSTIC CHECK: Reject immediately if the game plays a continuous looping high-pitched sine/square wave drone (`AudioStreamWAV.LOOP_FORWARD` on `> 200 Hz` tones like a constant 523 Hz hum) or piercing `>= 800 Hz` squeals!\n"
                     f"6. CreativeDirector: Does the final build fulfill the First 60 Seconds Hook, Core Player Fantasy, and look/play like the Writers' Room vision?\n\n"
@@ -1124,6 +1158,7 @@ class MultiAgentSignOffCouncil:
     ) -> MultiAgentSignOffReport:
         hollow_stubs = ast_grounding.get("hollow_stubs", [])
         scene_audit = telemetry_grounding.get("scene_audit") or {}
+        atomic_suite = telemetry_grounding.get("atomic_test_suite") or {}
         blank_detected = bool(visual_grounding.get("blank_canvas_detected", False))
         captured_paths = list(visual_grounding.get("captured_frame_paths", []))
 
@@ -1150,6 +1185,20 @@ class MultiAgentSignOffCouncil:
                     approved = False
                     defects.append("Simulation state remained stagnant/frozen across synthetic input schedule.")
                     remedies.append("Ensure player inputs drive continuous spatial navigation and world state progression.")
+                if scene_audit.get("passive_auto_win_detected"):
+                    approved = False
+                    p_reason = scene_audit.get("passive_win_reason") or "Game auto-activates or completes during passive zero-input window."
+                    defects.append(f"Passive auto-win / t=0 pre-solved state detected: {p_reason}")
+                    remedies.append("Remove all t=0 pre-solved/pre-carved initialization cheats so objectives require genuine player actions.")
+                if scene_audit.get("unbounded_sky_or_void_detected"):
+                    approved = False
+                    b_reason = scene_audit.get("boundary_violation_reason") or "Player can walk into sky or chasm void."
+                    defects.append(f"Unbounded sky or chasm excursion detected: {b_reason}")
+                    remedies.append("Add StaticBody2D/CollisionPolygon2D barriers along the north sky horizon and between disconnected shelves.")
+                if isinstance(atomic_suite, dict) and int(atomic_suite.get("failed_tests", 0) or 0) > 0:
+                    approved = False
+                    defects.append(f"Atomic Godot unit test failure(s) in tests/test_*.gd: {atomic_suite.get('failed_details', [])}")
+                    remedies.append("Fix the failing atomic unit invariants verified in res://tests/test_*.gd.")
 
             if role == "VisualArtDirector":
                 if blank_detected:
@@ -1161,6 +1210,11 @@ class MultiAgentSignOffCouncil:
                     misused = scene_audit.get("portrait_misused_nodes", [])
                     defects.append(f"Character portrait asset bound to world Sprite2D entity ({misused}) instead of a purpose-built transparent sprite.")
                     remedies.append("Bind world entities to res://assets/sprites/*.png and use portraits only inside ui_hud.gd dialogue panels.")
+                if scene_audit.get("unbounded_sky_or_void_detected"):
+                    approved = False
+                    b_reason = scene_audit.get("boundary_violation_reason") or "Visual sky/chasm lacks matching StaticBody2D collider."
+                    defects.append(f"Visual-to-physics boundary mismatch (walk-on-sky defect): {b_reason}")
+                    remedies.append("Align StaticBody2D collision boundaries 1:1 with the visual walkable shelf edges in playtest_collision_overlay.png.")
 
             if role == "UXExperienceDesigner":
                 if scene_audit.get("fullscreen_occlusion_detected"):
@@ -1530,11 +1584,12 @@ class ChallengerGate:
             f"Zero hardcoded genre, mechanic, or character assumptions (e.g. an abstract automation game requires zero characters).\n"
             f"3. STRICT 100% ACCEPTANCE THRESHOLD (R3): Every single requirement track must be genuinely fulfilled with verifiable grounding evidence. "
             f"If even 1 track or acceptance criterion is unfulfilled, stubbed out, or non-functional, overall_verdict MUST BE FALSE.\n"
-            f"4. ANTI-STUB & ACTIVE RENDERING DETECTION: Reject shallow stubs, hollow function bodies (pass, return None, return empty Node2D.new()), "
+            f"4. ANTI-STUB, CAUSAL & SPATIAL INVARIANT DETECTION: Reject shallow stubs, hollow function bodies (pass, return None, return empty Node2D.new()), "
+            f"t=0 pre-solved/pre-carved state cheats (`passive_auto_win_detected == true`), missing sky/chasm physics colliders (`unbounded_sky_or_void_detected == true`), "
             f"cross-module method name mismatches, unbound sprite/audio assets, missing MOUSE_BUTTON_LEFT placement handlers, "
             f"and scene modules that lack active _draw() or Sprite2D world rendering.\n"
             f"5. GAME DESIGNER & DIEGETIC UX SIGNOFF MANDATE: Audit the candidate from a human player and Game Designer's perspective:\n"
-            f"   - Interactive Playability: Mouse-to-world picking must use accurate canvas transforms (e.g. `get_global_mouse_position()`, never broken `get_viewport().size` math), placement/interaction guides must render on top of the terrain (`z_index > 0`), and inputs must respond smoothly.\n"
+            f"   - Interactive Playability & Physical Boundaries: Mouse-to-world picking must use accurate canvas transforms (e.g. `get_global_mouse_position()`, never broken `get_viewport().size` math), placement/interaction guides must render on top of the terrain (`z_index > 0`), and `StaticBody2D` colliders in `playtest_collision_overlay.png` must bound the player 1:1 to walkable surfaces.\n"
             f"   - Audio & Voice Playback: Runtime `.wav` files must be loaded into valid `AudioStreamWAV` streams via `FileAccess` at `mix_rate = 24000` with 44-byte RIFF header stripped (`bytes.slice(44)`), and player actions must trigger audible SFX without repeating/spamming.\n"
             f"   - Visual Clarity, Experience Fidelity & Diegetic Onboarding: The world view must fill the viewport without gray cutoff edges or 95% opaque startup frost, UI panels must not occlude the center playfield (`center_occluding_panels` must be empty), and onboarding/feedback must honor the Living Game Bible's Diegetic UI Philosophy and 16:9 Visual Mockups.\n"
             f"6. RETURN STRUCTURE: Emit a ChallengerGateEvaluation object containing deliberation, candidate_id, overall_verdict, "
@@ -1563,7 +1618,7 @@ class ChallengerGate:
             for stub in hollow_stubs:
                 stubs_found_reasons.append(f"{stub.get('module', '')}:{stub.get('function', '')} ({stub.get('reason', '')})")
 
-        # 1b. Check runtime scene_audit from Godot harness (audio streams, mix rate, & fullscreen/center UI occlusion)
+        # 1b. Check runtime scene_audit & atomic_test_suite from Godot harness
         scene_audit = (telemetry_grounding or {}).get("scene_audit") or {}
         if isinstance(scene_audit, dict):
             ap_found = int(scene_audit.get("audio_players_found", 0) or 0)
@@ -1591,6 +1646,20 @@ class ChallengerGate:
                 stubs_found_reasons.append(
                     f"Designer UX Audit: Oversized UI portrait TextureRect node(s) overlapping HUD controls: {oversized_portraits} (set expand_mode = TextureRect.EXPAND_IGNORE_SIZE with size <= 64x64)"
                 )
+            if scene_audit.get("passive_auto_win_detected"):
+                stubs_found_reasons.append(
+                    f"Causal Invariant Violation (Passive Auto-Win): {scene_audit.get('passive_win_reason', 'Game auto-activates/completes with zero player input during passive window')}"
+                )
+            if scene_audit.get("unbounded_sky_or_void_detected"):
+                stubs_found_reasons.append(
+                    f"Spatial Invariant Violation (Unbounded Sky/Void): {scene_audit.get('boundary_violation_reason', 'Player walked into sky/void without StaticBody2D boundary')}"
+                )
+
+        atomic_suite = (telemetry_grounding or {}).get("atomic_test_suite") or {}
+        if isinstance(atomic_suite, dict) and int(atomic_suite.get("failed_tests", 0) or 0) > 0:
+            stubs_found_reasons.append(
+                f"Atomic Unit Test Failure: {atomic_suite.get('failed_tests')} test(s) failed in tests/test_*.gd ({atomic_suite.get('failed_details', [])})"
+            )
 
         # 2. Check blank canvas
         blank_detected = (visual_grounding or {}).get("blank_canvas_detected", False)
