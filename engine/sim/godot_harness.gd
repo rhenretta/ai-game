@@ -19,6 +19,13 @@ var max_player_y_reached: float = -99999.0
 var min_player_x_reached: float = 99999.0
 var max_player_x_reached: float = -99999.0
 var spawn_pos: Array = [0.0, 0.0]
+# Filmstrip / scripted-input support (council proof of actions & mechanics)
+var capture_ticks: Array = []
+var input_script: Array = []
+var setup_script: Array = []
+var _active_scripted_actions: Array[String] = []
+var script_error: String = ""
+var scripted_mode: bool = false
 
 func _init() -> void:
 	var args = OS.get_cmdline_args()
@@ -27,8 +34,43 @@ func _init() -> void:
 			max_ticks = int(args[i + 1])
 		elif args[i] == "--ticks" and i + 1 < args.size():
 			max_ticks = int(args[i + 1])
+		elif args[i] == "--capture-ticks" and i + 1 < args.size():
+			for t in String(args[i + 1]).split(",", false):
+				capture_ticks.append(int(t))
+		elif args[i] == "--input-script" and i + 1 < args.size():
+			scripted_mode = true
+			_load_input_script(String(args[i + 1]))
+		elif args[i] == "--setup-script" and i + 1 < args.size():
+			scripted_mode = true
+			_load_setup_script(String(args[i + 1]))
+
+func _load_input_script(path: String) -> void:
+	var f = FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		script_error = "cannot open input script " + path
+		return
+	var parsed = JSON.parse_string(f.get_as_text())
+	if typeof(parsed) != TYPE_ARRAY:
+		script_error = "input script must be a JSON array of {from, to, actions}: " + path
+		return
+	input_script = parsed
+
+func _load_setup_script(path: String) -> void:
+	var f = FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		script_error = "cannot open setup script " + path
+		return
+	var parsed = JSON.parse_string(f.get_as_text())
+	if typeof(parsed) != TYPE_ARRAY:
+		script_error = "setup script must be a JSON array of setup call objects: " + path
+		return
+	setup_script = parsed
 
 func _initialize() -> void:
+	if script_error != "":
+		printerr("CRITICAL: " + script_error)
+		quit(1)
+		return
 	if DisplayServer.get_name() != "headless":
 		DisplayServer.window_set_position(Vector2i(-4000, -4000))
 	var main_path = ProjectSettings.get_setting("application/run/main_scene", "res://main.tscn")
@@ -63,7 +105,10 @@ func _process(_delta: float) -> bool:
 
 	# Phase A: Passive Zero-Input Window (ticks 1..passive_window_end)
 	# Verifies the cartridge does NOT auto-solve or pre-complete objectives with zero player input.
-	if current_tick <= passive_window_end:
+	if scripted_mode:
+		# Scripted run: the council-specified inputs drive the game from tick 1 (no passive window).
+		_apply_scripted_inputs(current_tick)
+	elif current_tick <= passive_window_end:
 		_release_all_inputs()
 		var cur_snap = _extract_state_snapshot()
 		_check_snapshot_for_auto_win(cur_snap, current_tick)
@@ -87,6 +132,10 @@ func _process(_delta: float) -> bool:
 			min_player_y_reached = py
 		if py > max_player_y_reached:
 			max_player_y_reached = py
+
+	if capture_ticks.has(current_tick):
+		_try_capture_viewport("res://assets/playtest_captures/filmstrip_%04d.png" % current_tick)
+		print("[QA_TICK_SNAPSHOT] " + JSON.stringify(live_snap))
 
 	# Viewport GPU capture at t0 (during passive window before inputs)
 	if current_tick == 2:
@@ -336,9 +385,199 @@ func _resolve_texture_path(node: Node, tex: Texture2D) -> String:
 	return ""
 
 func _release_all_inputs() -> void:
-	for action in ["ui_right", "ui_left", "ui_up", "ui_down", "ui_accept", "ui_select", "RIGHT", "LEFT", "UP", "DOWN", "SPACE", "ACTION_1"]:
+	for action in ["ui_right", "ui_left", "ui_up", "ui_down", "ui_accept", "ui_select", "ui_cancel", "RIGHT", "LEFT", "UP", "DOWN", "SPACE", "ACTION_1"]:
 		if InputMap.has_action(action):
 			Input.action_release(action)
+	for custom_act in _active_scripted_actions:
+		if InputMap.has_action(custom_act):
+			Input.action_release(custom_act)
+	_active_scripted_actions.clear()
+
+func _action_to_keycode(action: String) -> int:
+	var norm = action.strip_edges().to_upper()
+	if norm.begins_with("KEY_"):
+		norm = norm.substr(4)
+	match norm:
+		"SPACE", "UI_ACCEPT", "UI_SELECT", "ACTION_1":
+			return KEY_SPACE
+		"ENTER", "RETURN":
+			return KEY_ENTER
+		"ESCAPE", "ESC", "UI_CANCEL":
+			return KEY_ESCAPE
+		"SHIFT":
+			return KEY_SHIFT
+		"CTRL", "CONTROL":
+			return KEY_CTRL
+		"TAB":
+			return KEY_TAB
+		"LEFT", "UI_LEFT":
+			return KEY_LEFT
+		"RIGHT", "UI_RIGHT":
+			return KEY_RIGHT
+		"UP", "UI_UP":
+			return KEY_UP
+		"DOWN", "UI_DOWN":
+			return KEY_DOWN
+		"0": return KEY_0
+		"1": return KEY_1
+		"2": return KEY_2
+		"3": return KEY_3
+		"4": return KEY_4
+		"5": return KEY_5
+		"6": return KEY_6
+		"7": return KEY_7
+		"8": return KEY_8
+		"9": return KEY_9
+		"A": return KEY_A
+		"B": return KEY_B
+		"C": return KEY_C
+		"D": return KEY_D
+		"E": return KEY_E
+		"F": return KEY_F
+		"G": return KEY_G
+		"H": return KEY_H
+		"I": return KEY_I
+		"J": return KEY_J
+		"K": return KEY_K
+		"L": return KEY_L
+		"M": return KEY_M
+		"N": return KEY_N
+		"O": return KEY_O
+		"P": return KEY_P
+		"Q": return KEY_Q
+		"R": return KEY_R
+		"S": return KEY_S
+		"T": return KEY_T
+		"U": return KEY_U
+		"V": return KEY_V
+		"W": return KEY_W
+		"X": return KEY_X
+		"Y": return KEY_Y
+		"Z": return KEY_Z
+	return 0
+
+func _emit_action_and_key_event(action: String, is_pressed: bool) -> void:
+	if not InputMap.has_action(action):
+		InputMap.add_action(action)
+	var act_ev = InputEventAction.new()
+	act_ev.action = action
+	act_ev.pressed = is_pressed
+	act_ev.strength = 1.0 if is_pressed else 0.0
+	root.push_input(act_ev)
+	var kc = _action_to_keycode(action)
+	if kc != 0:
+		var key_ev = InputEventKey.new()
+		key_ev.keycode = kc
+		key_ev.physical_keycode = kc
+		key_ev.pressed = is_pressed
+		key_ev.echo = false
+		root.push_input(key_ev)
+
+func _resolve_qa_target(base_node: Node, target_spec: String) -> Object:
+	if base_node == null:
+		return null
+	var clean = target_spec.strip_edges()
+	if clean == "" or clean == "main" or clean == "root" or clean == ".":
+		return base_node
+	if base_node.has_node(clean):
+		return base_node.get_node(clean)
+	var parts = clean.split(".")
+	var cur: Object = base_node
+	for p in parts:
+		if cur == null:
+			return null
+		if cur is Node and (cur as Node).has_node(p):
+			cur = (cur as Node).get_node(p)
+		elif p in cur:
+			cur = cur.get(p)
+		else:
+			var found_child = (cur as Node).find_child(p, true, false) if (cur is Node) else null
+			if found_child != null:
+				cur = found_child
+			else:
+				return null
+	return cur
+
+func _execute_setup_calls_for_tick(tick: int) -> void:
+	for entry in setup_script:
+		if typeof(entry) != TYPE_DICTIONARY:
+			continue
+		var at_t = int(entry.get("at_tick", 1))
+		if at_t != tick:
+			continue
+		var target_spec = String(entry.get("target_node_or_property", ""))
+		var method_name = String(entry.get("method_name", "")).strip_edges()
+		if method_name == "":
+			continue
+		var raw_args = entry.get("args", null)
+		var args_arr: Array = []
+		if typeof(raw_args) == TYPE_ARRAY:
+			args_arr = raw_args
+		else:
+			var parsed_args = JSON.parse_string(String(entry.get("args_json", "[]")))
+			if typeof(parsed_args) == TYPE_ARRAY:
+				args_arr = parsed_args
+		var target_obj = _resolve_qa_target(main_scene_node, target_spec)
+		var status = "skipped_missing_target"
+		if target_obj != null:
+			if method_name == "set_property" and args_arr.size() >= 2:
+				var prop_name = String(args_arr[0])
+				if prop_name in target_obj:
+					target_obj.set(prop_name, args_arr[1])
+					status = "property_set"
+				else:
+					status = "missing_property"
+			elif target_obj.has_method(method_name):
+				target_obj.callv(method_name, args_arr)
+				status = "called"
+			else:
+				status = "missing_method"
+		print("[QA_SETUP_CALL] " + JSON.stringify({
+			"tick": tick,
+			"target": target_spec,
+			"method": method_name,
+			"status": status
+		}))
+
+func _apply_scripted_inputs(tick: int) -> void:
+	_execute_setup_calls_for_tick(tick)
+	_release_all_inputs()
+	for entry in input_script:
+		if typeof(entry) != TYPE_DICTIONARY:
+			continue
+		var first = int(entry.get("from", 0))
+		var last = int(entry.get("to", first))
+		if tick == last + 1:
+			for rel_action in entry.get("actions", []):
+				_emit_action_and_key_event(String(rel_action), false)
+			var rel_click = entry.get("mouse_click_pos", null)
+			if typeof(rel_click) == TYPE_ARRAY and rel_click.size() >= 2:
+				var rel_ev = InputEventMouseButton.new()
+				rel_ev.button_index = MOUSE_BUTTON_LEFT
+				rel_ev.pressed = false
+				rel_ev.position = Vector2(float(rel_click[0]), float(rel_click[1]))
+				root.push_input(rel_ev)
+			continue
+		if tick < first or tick > last:
+			continue
+		for action in entry.get("actions", []):
+			var act_str = String(action)
+			_press(act_str)
+			if not _active_scripted_actions.has(act_str):
+				_active_scripted_actions.append(act_str)
+			if tick == first:
+				_emit_action_and_key_event(act_str, true)
+		var click_pos = entry.get("mouse_click_pos", null)
+		if typeof(click_pos) == TYPE_ARRAY and click_pos.size() >= 2 and tick == first:
+			var cpos = Vector2(float(click_pos[0]), float(click_pos[1]))
+			var motion_ev = InputEventMouseMotion.new()
+			motion_ev.position = cpos
+			root.push_input(motion_ev)
+			var click_ev = InputEventMouseButton.new()
+			click_ev.button_index = MOUSE_BUTTON_LEFT
+			click_ev.pressed = true
+			click_ev.position = cpos
+			root.push_input(click_ev)
 
 func _apply_synthetic_inputs(tick: int, passive_end: int) -> void:
 	_release_all_inputs()
@@ -410,21 +649,31 @@ func _extract_state_snapshot() -> Dictionary:
 		"node_count": root.get_child_count(),
 		"is_completed": false
 	}
-	if main_scene_node and main_scene_node.has_method("get_state_snapshot"):
-		var custom_snap = main_scene_node.call("get_state_snapshot")
-		if typeof(custom_snap) == TYPE_DICTIONARY:
-			for k in custom_snap:
-				snap[k] = custom_snap[k]
-			return snap
-
 	var actor = _find_actor_node(main_scene_node)
 	if actor:
-		if "position" in actor:
+		if "global_position" in actor:
+			snap["player_pos"] = [actor.global_position.x, actor.global_position.y]
+		elif "position" in actor:
 			snap["player_pos"] = [actor.position.x, actor.position.y]
 		if "velocity" in actor:
 			snap["player_vel"] = [actor.velocity.x, actor.velocity.y]
 		if "health" in actor:
 			snap["player_health"] = float(actor.health)
+
+	if main_scene_node and main_scene_node.has_method("get_state_snapshot"):
+		var custom_snap = main_scene_node.call("get_state_snapshot")
+		if typeof(custom_snap) == TYPE_DICTIONARY:
+			var actor_pos = snap["player_pos"]
+			for k in custom_snap:
+				var val = custom_snap[k]
+				if typeof(val) == TYPE_VECTOR2 or typeof(val) == TYPE_VECTOR2I:
+					val = [float(val.x), float(val.y)]
+				snap[k] = val
+				if String(k).ends_with("_pos") and typeof(val) == TYPE_ARRAY and val.size() >= 2:
+					if actor_pos[0] == 0.0 and actor_pos[1] == 0.0 and (float(val[0]) != 0.0 or float(val[1]) != 0.0):
+						actor_pos = [float(val[0]), float(val[1])]
+			if typeof(snap.get("player_pos")) != TYPE_ARRAY or (snap["player_pos"][0] == 0.0 and snap["player_pos"][1] == 0.0 and (actor_pos[0] != 0.0 or actor_pos[1] != 0.0)):
+				snap["player_pos"] = actor_pos
 	return snap
 
 func _find_actor_node(node: Node) -> Node:

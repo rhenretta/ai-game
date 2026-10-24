@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Mission Control</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎮</text></svg>">
   <style>
     :root {
       /* 16-color Style Bible palette & theme colors */
@@ -43,7 +44,7 @@
       color: var(--white);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", monospace;
       line-height: 1.4;
-      padding: 16px;
+      padding: 10px 14px;
       font-size: 13px;
     }
 
@@ -52,28 +53,28 @@
       justify-content: space-between;
       align-items: center;
       flex-wrap: wrap;
-      gap: 12px;
-      padding: 10px 18px;
+      gap: 8px;
+      padding: 7px 14px;
       background: linear-gradient(90deg, #0b1532 0%, #16244a 100%);
       border: 1px solid var(--border);
       border-radius: 6px;
-      margin-bottom: 10px;
+      margin-bottom: 6px;
     }
 
     h1 {
-      font-size: 16px;
-      letter-spacing: 0.4px;
+      font-size: 14.5px;
+      letter-spacing: 0.3px;
       color: var(--cyan);
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
       white-space: nowrap;
       flex-shrink: 0;
     }
 
     .header-controls {
       display: flex;
-      gap: 10px;
+      gap: 7px;
       align-items: center;
       flex-wrap: wrap;
     }
@@ -1361,29 +1362,24 @@
       flex-wrap: wrap;
       justify-content: space-between;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
       background: #0b1532;
-      border: 1px solid var(--border);
+      border: 1px solid rgba(41, 173, 255, 0.45);
       border-radius: 6px;
-      padding: 12px 16px;
-      margin-bottom: 16px;
+      padding: 8px 14px;
+      margin-bottom: 8px;
     }
     .bible-steering-controls {
       display: flex;
       flex: 1;
-      min-width: 340px;
-      gap: 8px;
+      min-width: 300px;
+      max-width: 580px;
+      gap: 6px;
       align-items: center;
     }
     .writers-room-grid {
-      display: grid;
-      grid-template-columns: minmax(440px, 540px) 1fr;
-      gap: 16px;
-    }
-    @media (max-width: 1280px) {
-      .writers-room-grid {
-        grid-template-columns: 1fr;
-      }
+      display: block;
+      width: 100%;
     }
     .specialist-roster-bar {
       display: flex;
@@ -1414,8 +1410,6 @@
       border: 1px solid var(--navy);
       border-radius: 6px;
       padding: 12px;
-      height: 680px;
-      overflow-y: auto;
       display: flex;
       flex-direction: column;
       gap: 12px;
@@ -1433,6 +1427,7 @@
     .utterance-card.role-CreativeDirector { border-left-color: var(--pink); }
     .utterance-card.role-GameplayDesigner { border-left-color: var(--green); }
     .utterance-card.role-GameplaySystemsEngineer { border-left-color: var(--orange, #ff8c1a); }
+    .utterance-card.role-LevelAndProgressionDesigner { border-left-color: var(--cyan); }
     .utterance-card.role-StoryWorldArchitect { border-left-color: var(--purple); }
     .utterance-card.role-CharacterDesigner { border-left-color: var(--amber); }
     .utterance-card.role-UXExperienceDesigner { border-left-color: var(--cyan); }
@@ -1473,7 +1468,7 @@
       gap: 6px;
       border-bottom: 1px solid var(--navy);
       padding-bottom: 8px;
-      margin-bottom: 12px;
+      margin-bottom: 10px;
       flex-wrap: wrap;
     }
     .bible-subtab-btn {
@@ -1482,10 +1477,14 @@
       color: var(--light-gray);
       padding: 6px 12px;
       border-radius: 4px;
-      font-size: 11px;
+      font-size: 11.5px;
       font-weight: bold;
       cursor: pointer;
-      transition: all 0.2s;
+      transition: all 0.15s;
+    }
+    .bible-subtab-btn:hover {
+      border-color: var(--cyan);
+      color: var(--white);
     }
     .bible-subtab-btn.active {
       background: rgba(41, 173, 255, 0.18);
@@ -1495,10 +1494,7 @@
     .bible-subview {
       display: none;
       flex-direction: column;
-      gap: 14px;
-      max-height: 650px;
-      overflow-y: auto;
-      padding-right: 4px;
+      gap: 12px;
     }
     .bible-subview.active {
       display: flex;
@@ -1592,28 +1588,374 @@
       background: rgba(0, 0, 0, 0.82);
       backdrop-filter: blur(4px);
     }
+
+    /* Empathetic Live Studio Pulse Ribbon & Production Board UX */
+    .studio-pulse-ribbon {
+      background: linear-gradient(90deg, rgba(9, 19, 44, 0.96), rgba(14, 29, 64, 0.96));
+      border: 1px solid rgba(41, 173, 255, 0.4);
+      border-radius: 6px;
+      padding: 7px 12px;
+      margin-bottom: 8px;
+      display: grid;
+      grid-template-columns: minmax(280px, 1.7fr) minmax(220px, 1fr) auto;
+      align-items: center;
+      gap: 12px;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+    }
+    @media (max-width: 1100px) {
+      .studio-pulse-ribbon {
+        grid-template-columns: 1fr;
+      }
+    }
+    .pulse-now-playing {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+    .pulse-live-orb {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--cyan);
+      box-shadow: 0 0 10px var(--cyan);
+      flex-shrink: 0;
+      animation: pulse-orb-anim 1.4s infinite ease-in-out;
+    }
+    .pulse-live-orb.idle {
+      background: var(--slate);
+      box-shadow: none;
+      animation: none;
+    }
+    .pulse-live-orb.warning {
+      background: var(--amber);
+      box-shadow: 0 0 10px var(--amber);
+    }
+    @keyframes pulse-orb-anim {
+      0%, 100% { transform: scale(0.92); opacity: 0.75; }
+      50% { transform: scale(1.22); opacity: 1; }
+    }
+    .pulse-text-col {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+    .pulse-headline-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .pulse-activity-detail {
+      font-size: 11.5px;
+      color: var(--white);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .progress-track-shell {
+      container-type: inline-size;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      width: 100%;
+    }
+    progress.studio-native-progress {
+      appearance: none;
+      -webkit-appearance: none;
+      border: 1px solid rgba(41, 173, 255, 0.35);
+      inline-size: 100%;
+      block-size: 9px;
+      border-radius: 999px;
+      overflow: hidden;
+      background-color: #060b19;
+    }
+    progress.studio-native-progress::-webkit-progress-bar {
+      background-color: #060b19;
+      border-radius: 999px;
+    }
+    progress.studio-native-progress::-webkit-progress-value {
+      background: linear-gradient(90deg, var(--cyan), var(--green));
+      border-radius: 999px;
+      transition: inline-size 0.35s ease, width 0.35s ease;
+    }
+    progress.studio-native-progress::-moz-progress-bar {
+      background: linear-gradient(90deg, var(--cyan), var(--green));
+      border-radius: 999px;
+      transition: inline-size 0.35s ease, width 0.35s ease;
+    }
+    .pulse-stage-pills {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .pulse-stage-pill {
+      background: #071026;
+      border: 1px solid rgba(41, 173, 255, 0.3);
+      color: var(--light-gray);
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 10.5px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      transition: all 0.15s ease;
+    }
+    .pulse-stage-pill:hover {
+      border-color: var(--cyan);
+      color: var(--white);
+      transform: translateY(-1px);
+    }
+    .pulse-stage-pill.active-work {
+      border-color: var(--cyan);
+      background: rgba(41, 173, 255, 0.16);
+      color: var(--cyan);
+    }
+    .pulse-stage-pill.awaiting-review {
+      border-color: var(--yellow);
+      background: rgba(255, 236, 39, 0.14);
+      color: var(--yellow);
+    }
+    .pulse-stage-pill.changes-req {
+      border-color: var(--amber);
+      background: rgba(255, 163, 0, 0.16);
+      color: var(--amber);
+    }
+    .pulse-stage-pill.approved-work {
+      border-color: var(--green);
+      background: rgba(0, 228, 54, 0.14);
+      color: var(--green);
+    }
+    .board-items-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+      gap: 12px;
+      margin-top: 6px;
+    }
+    .board-item-card {
+      background: #070e22;
+      border: 1px solid rgba(41, 173, 255, 0.28);
+      border-radius: 6px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      transition: border-color 0.2s ease;
+    }
+    .board-item-card.state-in_progress,
+    .board-item-card.status-in_progress {
+      border-color: var(--cyan);
+      box-shadow: 0 0 14px rgba(41, 173, 255, 0.14);
+    }
+    .board-item-card.state-awaiting_review,
+    .board-item-card.status-awaiting_review {
+      border-color: var(--yellow);
+      box-shadow: 0 0 14px rgba(255, 236, 39, 0.14);
+    }
+    .board-item-card.state-changes_requested,
+    .board-item-card.status-changes_requested,
+    .board-item-card.state-failed,
+    .board-item-card.status-failed,
+    .board-item-card.state-needs_decision,
+    .board-item-card.status-needs_decision {
+      border-color: var(--amber);
+    }
+    .board-item-card.state-approved,
+    .board-item-card.status-approved {
+      border-color: rgba(0, 228, 54, 0.45);
+    }
+    .board-proof-strip {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 8px;
+      margin-top: 4px;
+    }
+    .board-proof-thumb {
+      width: 100%;
+      background: #02050e;
+      border: 1px solid rgba(41, 173, 255, 0.35);
+      border-radius: 5px;
+      overflow: hidden;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      transition: border-color 0.15s ease, transform 0.15s ease;
+    }
+    .board-proof-thumb:hover {
+      border-color: var(--yellow);
+      transform: translateY(-1px);
+    }
+    .board-proof-thumb img {
+      width: 100%;
+      height: 112px;
+      object-fit: contain;
+      background: repeating-conic-gradient(#050a18 0% 25%, #091229 0% 50%) 50% / 14px 14px;
+      display: block;
+    }
+    .board-proof-thumb .proof-caption {
+      font-size: 9.5px;
+      color: var(--light-gray);
+      padding: 4px 6px;
+      background: #040918;
+      border-top: 1px solid rgba(41, 173, 255, 0.18);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-family: monospace;
+    }
+
+    /* Modern Customizable Select (branded-select-styling) */
+    .game-switcher-shell {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: #060d24;
+      border: 1px solid rgba(41, 173, 255, 0.55);
+      border-radius: 6px;
+      padding: 2px 7px;
+    }
+    .brand-game-select {
+      background: #04091a;
+      color: var(--white);
+      border: 1px solid var(--cyan);
+      border-radius: 4px;
+      padding: 4px 8px;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      min-width: 210px;
+      max-width: 320px;
+    }
+    @supports (appearance: base-select) {
+      .brand-game-select,
+      .brand-game-select::picker(select) {
+        appearance: base-select;
+      }
+      .brand-game-select {
+        background: linear-gradient(180deg, #0b1636 0%, #060d24 100%);
+        border: 1px solid var(--cyan);
+        border-radius: 5px;
+        color: var(--white);
+        padding: 5px 10px;
+      }
+      .brand-game-select::picker(select) {
+        background: #071026;
+        border: 1px solid var(--cyan);
+        border-radius: 6px;
+        color: var(--white);
+        box-shadow: 0 12px 32px rgba(0, 0, 0, 0.75);
+        padding: 4px;
+      }
+      .brand-game-select option {
+        padding: 6px 10px;
+        border-radius: 4px;
+        color: var(--white);
+      }
+      .brand-game-select option:hover {
+        background: rgba(41, 173, 255, 0.2);
+      }
+      .brand-game-select option:checked {
+        background: rgba(0, 228, 54, 0.2);
+        color: var(--green);
+        font-weight: 800;
+      }
+    }
+
+    /* Deferred Heavy Asset Galleries (defer-rendering-heavy-content) */
+    .deferred-asset-section {
+      content-visibility: auto;
+      contain-intrinsic-size: auto 320px;
+      background: #060c1f;
+      border: 1px solid var(--navy);
+      border-radius: 6px;
+      padding: 12px;
+      margin-bottom: 12px;
+    }
+    .built-renders-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 10px;
+      margin-top: 8px;
+    }
+    .built-sprites-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(135px, 1fr));
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .built-render-card {
+      background: #030714;
+      border: 1px solid rgba(41, 173, 255, 0.3);
+      border-radius: 6px;
+      overflow: hidden;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      transition: border-color 0.15s ease, transform 0.15s ease;
+    }
+    .built-render-card:hover {
+      border-color: var(--yellow);
+      transform: translateY(-2px);
+    }
+    .built-render-card img {
+      width: 100%;
+      height: 132px;
+      object-fit: contain;
+      background: repeating-conic-gradient(#060c1c 0% 25%, #0a142d 0% 50%) 50% / 16px 16px;
+      display: block;
+    }
+    .built-render-card.sprite-card img {
+      height: 92px;
+      image-rendering: pixelated;
+    }
   </style>
 </head>
 <body>
   <header>
-    <h1>Autonomous Game Studio — Mission Control</h1>
+    <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+      <h1>Autonomous Game Studio — Mission Control</h1>
+      <div class="game-switcher-shell" title="Switch between any built or in-progress game cartridge to inspect its Game Bible, Production Board, Assets, Renders, and GDScript">
+        <label for="studio-game-switcher" style="font-size: 10px; color: var(--cyan); font-weight: 800; text-transform: uppercase; letter-spacing: 0.4px;">🎮 Game:</label>
+        <select id="studio-game-switcher" class="brand-game-select" aria-label="Switch Active Game Cartridge">
+          <option value="">Loading games...</option>
+        </select>
+        <button id="btn-activate-selected-game" type="button" class="btn-activate-checkpoint" style="padding: 3px 8px; font-size: 10px;" title="Promote the currently selected game to cartridges/active">
+          ⭐ Set Active
+        </button>
+      </div>
+      <nav class="workspace-nav-bar" style="margin: 0; padding: 0; border: none; background: transparent;" aria-label="Mission Control Workspaces">
+        <div class="workspace-tabs-group" style="gap: 6px;">
+          <button id="ws-tab-bible" class="workspace-tab-btn active" type="button" style="padding: 4px 10px; font-size: 11px;">
+            <span>🏗️ Studio Board &amp; Bible</span>
+            <span id="header-bible-turn-count" style="background: var(--navy); padding: 1px 6px; border-radius: 10px; font-size: 9.5px; color: var(--cyan);">0</span>
+          </button>
+          <button id="ws-tab-telemetry" class="workspace-tab-btn" type="button" style="padding: 4px 10px; font-size: 11px;">
+            <span>📡 Swarm DAG &amp; Telemetry</span>
+          </button>
+        </div>
+      </nav>
+    </div>
     <div class="header-controls">
-      <div id="last-checkpoint-badge" class="header-checkpoint-badge" style="display: none;" title="Click to view verified checkpoints in drawer">
+      <div id="last-checkpoint-badge" class="header-checkpoint-badge" style="display: none; cursor: default;" title="Latest verified checkpoint">
         <span style="color: var(--green); font-weight: bold;">🎮</span>
         <span id="header-checkpoint-id" style="color: var(--white); font-weight: bold;">None</span>
-        <span id="header-checkpoint-track" style="color: var(--light-gray); font-size: 10px;"></span>
+        <span id="header-checkpoint-track" style="display: none;"></span>
       </div>
-      <button id="btn-toggle-task-history" class="btn-primary" style="background: rgba(41, 173, 255, 0.15); border: 1px solid var(--cyan); color: var(--cyan); display: flex; align-items: center; gap: 8px;">
+      <button id="btn-toggle-task-history" class="btn-primary" style="background: rgba(41, 173, 255, 0.15); border: 1px solid var(--cyan); color: var(--cyan); display: flex; align-items: center; gap: 6px; padding: 5px 10px; font-size: 11px;">
         <span class="activity-beacon"></span>
-        <span>Tasks &amp; Handoffs</span>
+        <span>Tasks &amp; Checkpoints</span>
         <span id="header-task-count" style="background: var(--navy); padding: 1px 6px; border-radius: 10px; font-size: 10px;">0</span>
       </button>
       <span id="studio-status-badge" class="badge-status">ONLINE</span>
-      <button id="btn-resume-genesis" class="btn-primary" style="background: rgba(255, 163, 0, 0.18); border: 1px solid var(--amber); color: var(--yellow); display: inline-flex; align-items: center; gap: 6px;" title="Resume development on the current game from its persisted Game Bible and requirement tracks">
-        <span>▶️ Resume Game Build</span>
+      <button id="btn-resume-genesis" class="btn-primary" style="background: rgba(255, 163, 0, 0.18); border: 1px solid var(--amber); color: var(--yellow); display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; font-size: 11px;" title="Pause or resume development on the selected game at any time">
+        <span>▶️ Resume Build</span>
       </button>
-      <button id="btn-trigger-genesis" class="btn-primary btn-genesis-cta" title="Start a brand-new game from scratch in the Creative Writers' Room">
-        <span>🚀 New Game from Scratch</span>
+      <button id="btn-trigger-genesis" class="btn-primary btn-genesis-cta" style="padding: 5px 11px; font-size: 11px;" title="Start a brand-new game from scratch in the Creative Writers' Room">
+        <span>🚀 New Game</span>
       </button>
     </div>
   </header>
@@ -1622,25 +1964,47 @@
     Mission Control Disconnected from Studio Daemon. Reconnecting in background with exponential backoff...
   </div>
 
-  <!-- Workspace Navigation Bar -->
-  <nav class="workspace-nav-bar" aria-label="Mission Control Workspaces">
-    <div class="workspace-tabs-group">
-      <button id="ws-tab-telemetry" class="workspace-tab-btn active" type="button">
-        <span>📡 Swarm Telemetry &amp; Playable Preview</span>
+  <!-- Always-Visible Empathetic Live Studio Pulse Ribbon -->
+  <section id="studio-live-pulse-bar" class="studio-pulse-ribbon" role="status" aria-live="polite" aria-label="Live Studio Activity and Pipeline Progress">
+    <div class="pulse-now-playing">
+      <span id="pulse-live-orb" class="pulse-live-orb"></span>
+      <div class="pulse-text-col">
+        <div class="pulse-headline-row">
+          <span id="pulse-phase-badge" class="status-pill status-success" style="font-size: 9.5px;">CO-DESIGN &amp; BUILD</span>
+          <strong id="pulse-game-title" style="color: var(--cyan); font-size: 12px;">Initializing Studio...</strong>
+          <span id="pulse-elapsed-badge" style="font-size: 10px; color: var(--amber); font-family: monospace;">Live</span>
+          <span id="pulse-retry-badge" style="display: none; font-size: 10px; color: var(--yellow); background: rgba(255, 163, 0, 0.18); border: 1px solid var(--amber); padding: 1px 6px; border-radius: 4px;"></span>
+        </div>
+        <div id="pulse-now-playing-text" class="pulse-activity-detail">
+          Listening for live Writers' Room turns, parallel worker fabrications, and Council proof reviews...
+        </div>
+      </div>
+    </div>
+    <div class="progress-track-shell">
+      <div style="display: flex; justify-content: space-between; font-size: 10px; color: var(--light-gray);">
+        <span id="pulse-board-summary-label">Production Board Pipeline</span>
+        <strong id="pulse-board-pct-label" style="color: var(--green);">0 / 0 Approved (0%)</strong>
+      </div>
+      <progress id="studio-board-progress" class="studio-native-progress" max="100" value="0">0%</progress>
+    </div>
+    <div id="pulse-stage-pills" class="pulse-stage-pills" aria-label="Quick Board Filter Pills">
+      <button type="button" class="pulse-stage-pill" onclick="openProductionBoardWithFilter('all')" title="Filter Production Board: All Items">
+        <span>🏗️ Total:</span> <strong id="pulse-count-total">0</strong>
       </button>
-      <button id="ws-tab-bible" class="workspace-tab-btn" type="button">
-        <span>📖 Creative Writers' Room &amp; Living Game Bible</span>
-        <span id="header-bible-turn-count" style="background: var(--navy); padding: 1px 7px; border-radius: 10px; font-size: 10px; color: var(--cyan);">0</span>
-        <span id="ws-bible-badge" class="status-pill status-success" style="font-size: 9px;">LIVE</span>
+      <button type="button" class="pulse-stage-pill active-work" onclick="openProductionBoardWithFilter('in_progress')" title="Filter Production Board: Active Workers">
+        <span>⚡ Active:</span> <strong id="pulse-count-inprog">0</strong>
+      </button>
+      <button type="button" class="pulse-stage-pill awaiting-review" onclick="openProductionBoardWithFilter('awaiting_review')" title="Filter Production Board: Awaiting Council Review">
+        <span>👁️ Review:</span> <strong id="pulse-count-review">0</strong>
+      </button>
+      <button type="button" class="pulse-stage-pill changes-req" onclick="openProductionBoardWithFilter('changes_requested')" title="Filter Production Board: Changes Requested">
+        <span>🔄 Revise:</span> <strong id="pulse-count-changes">0</strong>
+      </button>
+      <button type="button" class="pulse-stage-pill approved-work" onclick="openProductionBoardWithFilter('approved')" title="Filter Production Board: Verified & Approved">
+        <span>✅ Done:</span> <strong id="pulse-count-approved">0</strong>
       </button>
     </div>
-    <div style="display: flex; align-items: center; gap: 14px; font-size: 11px; color: var(--light-gray);">
-      <label style="display: inline-flex; align-items: center; gap: 6px; cursor: pointer;" title="When enabled, the studio pauses after the Writers' Room finishes the Game Bible so you can inspect or steer before coding starts.">
-        <input type="checkbox" id="toggle-pause-greenlight" />
-        <span>Pause for Executive Greenlight Before Coding</span>
-      </label>
-    </div>
-  </nav>
+  </section>
 
   <!-- Native HTML <dialog closedby="any"> Modal for Commissioning a New Game from Scratch -->
   <dialog id="new-game-modal" closedby="any" aria-label="Start New Game from Scratch">
@@ -1666,7 +2030,6 @@
         </div>
       </label>
       <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 4px;">
-        <button id="btn-cancel-new-game" type="button" class="btn-primary" style="background: #0d1630; border-color: var(--slate); color: var(--light-gray);">Cancel</button>
         <button id="btn-confirm-new-game" type="submit" class="btn-primary btn-genesis-cta">
           <span>🚀 Launch Writers' Room &amp; Build</span>
         </button>
@@ -1675,79 +2038,113 @@
   </dialog>
 
   <!-- WORKSPACE 2: Creative Writers' Room & Living Game Bible -->
-  <section id="workspace-game-bible" style="display: none; margin-bottom: 16px;" aria-label="Writers Room and Living Game Bible">
+  <section id="workspace-game-bible" style="display: block; margin-bottom: 12px;" aria-label="Writers Room and Living Game Bible">
     <div id="bible-greenlight-bar" class="bible-greenlight-bar">
-      <div style="display: flex; flex-direction: column; gap: 4px;">
-        <div style="display: flex; align-items: center; gap: 10px;">
-          <span id="bible-header-title" style="font-size: 16px; font-weight: bold; color: var(--cyan);">Living Game Bible</span>
+      <div style="display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 280px;">
+        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+          <span id="bible-header-title" style="font-size: 14.5px; font-weight: bold; color: var(--cyan);">Living Game Bible</span>
           <span id="bible-header-genre" class="genre-chip">Awaiting Concept</span>
           <span id="bible-header-status" class="status-pill status-success">IDLE</span>
         </div>
-        <div id="bible-header-vision" style="font-size: 11.5px; color: var(--light-gray); max-width: 780px;">
+        <div id="bible-header-vision" style="font-size: 11px; color: var(--light-gray); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;">
           Multi-agent creative writers' room where Design, Gameplay, Story, Character, UX, Visual Art, and Audio specialists brainstorm the player experience before writing code.
         </div>
       </div>
       <div class="bible-steering-controls">
-        <input id="input-steering-feedback" class="stream-input" type="text" placeholder="Inject Executive Producer creative direction or critique into the Writers' Room..." />
-        <button id="btn-inject-steering" type="button" class="btn-primary" style="background: rgba(41, 173, 255, 0.2); border-color: var(--cyan); color: var(--cyan); padding: 6px 12px;">
+        <label id="label-pause-greenlight" style="display: inline-flex; align-items: center; gap: 5px; cursor: pointer; font-size: 10.5px; color: var(--light-gray); white-space: nowrap;" title="When enabled, the studio pauses after the Writers' Room finishes the Game Bible so you can inspect or steer before coding starts.">
+          <input type="checkbox" id="toggle-pause-greenlight" />
+          <span>Pause Before Coding</span>
+        </label>
+        <input id="input-steering-feedback" class="stream-input" style="font-size: 11px; padding: 5px 9px;" type="text" placeholder="Inject Executive Producer creative direction or critique into the Writers' Room..." />
+        <button id="btn-inject-steering" type="button" class="btn-primary" style="background: rgba(41, 173, 255, 0.2); border-color: var(--cyan); color: var(--cyan); padding: 5px 10px; font-size: 11px; white-space: nowrap;">
           💬 Steer Room
         </button>
-        <button id="btn-approve-greenlight" type="button" class="btn-primary" style="background: rgba(0, 228, 54, 0.22); border-color: var(--green); color: var(--green); padding: 6px 14px;">
+        <button id="btn-approve-greenlight" type="button" class="btn-primary" style="background: rgba(0, 228, 54, 0.22); border-color: var(--green); color: var(--green); padding: 5px 12px; font-size: 11px; white-space: nowrap;">
           ✅ Greenlight &amp; Build
         </button>
       </div>
     </div>
 
-    <div id="bible-production-progress-banner" style="display: none; margin-bottom: 14px; background: linear-gradient(90deg, rgba(0, 228, 54, 0.1), rgba(41, 173, 255, 0.1)); border: 1px solid var(--green); border-radius: 6px; padding: 12px 16px;"></div>
+    <div id="bible-production-progress-banner" style="display: none; margin-bottom: 10px; background: linear-gradient(90deg, rgba(0, 228, 54, 0.1), rgba(41, 173, 255, 0.1)); border: 1px solid var(--green); border-radius: 6px; padding: 10px 14px;"></div>
 
     <div class="writers-room-grid">
-      <!-- Left Column: Live Multi-Agent Writers' Room Transcript -->
-      <div class="panel">
-        <div class="panel-title">
-          <span>🎙️ Live Writers' Room Conversation</span>
-          <span id="writers-room-turn-counter" style="font-size: 11px; color: var(--amber);">0 Utterances</span>
-        </div>
-        <div id="specialist-roster-bar" class="specialist-roster-bar">
-          <span class="specialist-pill" data-role="CreativeDirector">🎬 CreativeDirector</span>
-          <span class="specialist-pill" data-role="GameplayDesigner">🎮 GameplayDesigner</span>
-          <span class="specialist-pill" data-role="GameplaySystemsEngineer">🛠️ GameplaySystemsEngineer</span>
-          <span class="specialist-pill" data-role="StoryWorldArchitect">🌍 StoryWorldArchitect</span>
-          <span class="specialist-pill" data-role="CharacterDesigner">🎭 CharacterDesigner</span>
-          <span class="specialist-pill" data-role="UXExperienceDesigner">✨ UXExperienceDesigner</span>
-          <span class="specialist-pill" data-role="VisualArtDirector">🎨 VisualArtDirector</span>
-          <span class="specialist-pill" data-role="AudioAtmosphereDesigner">🔊 AudioAtmosphereDesigner</span>
-        </div>
-        <div id="writers-room-transcript-list" class="writers-room-transcript">
-          <div class="blueprint-empty">No Writers' Room utterances recorded yet. Trigger a Genesis Build to watch the specialists brainstorm live.</div>
-        </div>
-      </div>
-
-      <!-- Right Column: Living Game Bible Artifact Tabs -->
-      <div class="panel">
-        <div class="panel-title">
-          <span>📘 Living Game Bible Artifacts</span>
+      <!-- Unified Full-Width Studio Workspace: Production Board, Built Renders, Game Bible & Writers' Room -->
+      <div class="panel" style="padding: 12px 14px;">
+        <div class="bible-subtabs" style="align-items: center; justify-content: space-between;">
+          <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+            <button type="button" class="bible-subtab-btn active" data-bible-tab="board">
+              🏗️ Production Board &amp; Proofs (<span id="bible-count-board">0</span>)
+            </button>
+            <button type="button" class="bible-subtab-btn" data-bible-tab="renders">
+              🎨 Built Assets, Renders &amp; Code (<span id="bible-count-renders">0</span>)
+            </button>
+            <button type="button" class="bible-subtab-btn" data-bible-tab="transcript">
+              🎙️ Writers' Room (<span id="writers-room-turn-counter">0 Utterances</span>)
+            </button>
+            <button type="button" class="bible-subtab-btn" data-bible-tab="mockups">
+              🖼️ 16:9 Concept Mockups (<span id="bible-count-mockups">0</span>)
+            </button>
+            <button type="button" class="bible-subtab-btn" data-bible-tab="evolution">
+              🌱 Evolution &amp; Storyboard (<span id="bible-count-evolution">0</span>)
+            </button>
+            <button type="button" class="bible-subtab-btn" data-bible-tab="characters">
+              🎭 Characters &amp; Voices (<span id="bible-count-characters">0</span>)
+            </button>
+            <button type="button" class="bible-subtab-btn" data-bible-tab="pillars">
+              ⚙️ Pillars &amp; World Spec
+            </button>
+            <button type="button" class="bible-subtab-btn" data-bible-tab="signoff">
+              🛡️ Sign-Off Council (<span id="bible-count-signoff">0/6</span>)
+            </button>
+          </div>
           <span id="bible-updated-timestamp" style="font-size: 10px; color: var(--light-gray);">Live Sync</span>
         </div>
-        <div class="bible-subtabs">
-          <button type="button" class="bible-subtab-btn active" data-bible-tab="evolution">
-            🌱 Evolution &amp; Experience Storyboard (<span id="bible-count-evolution">0</span>)
-          </button>
-          <button type="button" class="bible-subtab-btn" data-bible-tab="mockups">
-            🖼️ 16:9 Visual Mockups &amp; Art (<span id="bible-count-mockups">0</span>)
-          </button>
-          <button type="button" class="bible-subtab-btn" data-bible-tab="characters">
-            🎭 Characters, Cutscenes &amp; Voices (<span id="bible-count-characters">0</span>)
-          </button>
-          <button type="button" class="bible-subtab-btn" data-bible-tab="pillars">
-            ⚙️ Gameplay Pillars &amp; World Spec
-          </button>
-          <button type="button" class="bible-subtab-btn" data-bible-tab="signoff">
-            🛡️ Specialist Sign-Off Council (<span id="bible-count-signoff">0/6</span>)
-          </button>
+
+        <!-- Subtab: Live Multi-Agent Writers' Room Transcript -->
+        <div id="bible-subview-transcript" class="bible-subview">
+          <div id="specialist-roster-bar" class="specialist-roster-bar">
+            <span class="specialist-pill" data-role="CreativeDirector">🎬 CreativeDirector</span>
+            <span class="specialist-pill" data-role="GameplayDesigner">🎮 GameplayDesigner</span>
+            <span class="specialist-pill" data-role="LevelAndProgressionDesigner">🗺️ LevelAndProgressionDesigner</span>
+            <span class="specialist-pill" data-role="GameplaySystemsEngineer">🛠️ GameplaySystemsEngineer</span>
+            <span class="specialist-pill" data-role="StoryWorldArchitect">🌍 StoryWorldArchitect</span>
+            <span class="specialist-pill" data-role="CharacterDesigner">🎭 CharacterDesigner</span>
+            <span class="specialist-pill" data-role="UXExperienceDesigner">✨ UXExperienceDesigner</span>
+            <span class="specialist-pill" data-role="VisualArtDirector">🎨 VisualArtDirector</span>
+            <span class="specialist-pill" data-role="AudioAtmosphereDesigner">🔊 AudioAtmosphereDesigner</span>
+          </div>
+          <div id="writers-room-transcript-list" class="writers-room-transcript">
+            <div class="blueprint-empty">No Writers' Room utterances recorded yet. Trigger a Genesis Build to watch the specialists brainstorm live.</div>
+          </div>
+        </div>
+
+        <!-- Subtab 0: Live Production Board & Proofs (Parallel Co-Design & Fabrication) -->
+        <div id="bible-subview-board" class="bible-subview active">
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; background: #060c1f; border: 1px solid var(--navy); border-radius: 6px; padding: 8px 10px;">
+            <div id="board-filter-pills" style="display: flex; gap: 6px; flex-wrap: wrap;">
+              <button type="button" class="pulse-stage-pill active-work" data-board-filter="all" onclick="setProductionBoardFilter('all')">All Items</button>
+              <button type="button" class="pulse-stage-pill" data-board-filter="in_progress" onclick="setProductionBoardFilter('in_progress')">⚡ In Progress</button>
+              <button type="button" class="pulse-stage-pill" data-board-filter="awaiting_review" onclick="setProductionBoardFilter('awaiting_review')">👁️ Awaiting Review</button>
+              <button type="button" class="pulse-stage-pill" data-board-filter="changes_requested" onclick="setProductionBoardFilter('changes_requested')">🔄 Changes Requested</button>
+              <button type="button" class="pulse-stage-pill" data-board-filter="approved" onclick="setProductionBoardFilter('approved')">✅ Approved</button>
+              <button type="button" class="pulse-stage-pill" data-board-filter="queued" onclick="setProductionBoardFilter('queued')">⏳ Queued / Blocked</button>
+            </div>
+            <input id="board-search-input" type="text" class="stream-input" style="max-width: 220px; font-size: 11px; padding: 4px 8px;" placeholder="Filter items, specs, proofs..." oninput="renderProductionBoardPanel()" />
+          </div>
+          <div id="production-board-cards-container" class="board-items-grid">
+            <div class="blueprint-empty">Loading live Production Board items and verification proofs...</div>
+          </div>
+        </div>
+
+        <!-- Subtab 0b: Built Assets, Renders, Audio & GDScript Showcase -->
+        <div id="bible-subview-renders" class="bible-subview">
+          <div id="built-renders-showcase-container" style="display: flex; flex-direction: column; gap: 12px;">
+            <div class="blueprint-empty">Loading built renders, playtest filmstrips, animation sheets, sprites, audio clips, and GDScript source modules...</div>
+          </div>
         </div>
 
         <!-- Subtab 1: Concept Evolution & Experience Storyboard -->
-        <div id="bible-subview-evolution" class="bible-subview active">
+        <div id="bible-subview-evolution" class="bible-subview">
           <div id="bible-experience-hooks-card" class="blueprint-box" style="margin-top: 0;">
             <div class="blueprint-field"><span class="blueprint-field-label">First 60 Seconds Hook:</span><span id="bible-first-60s">Awaiting UXExperienceDesigner...</span></div>
             <div class="blueprint-field"><span class="blueprint-field-label">Diegetic UI Philosophy (Zero HUD Manuals):</span><span id="bible-diegetic-ui">Awaiting UXExperienceDesigner...</span></div>
@@ -1812,7 +2209,7 @@
     <div id="lightbox-mockup-notes" style="margin-top: 10px; font-size: 12px; color: var(--light-gray); max-width: 84vw;"></div>
   </dialog>
 
-  <div id="workspace-telemetry" class="grid-container">
+  <div id="workspace-telemetry" class="grid-container" style="display: none;">
     <!-- Left Column: Agent Swarm DAG and Telemetry Heatmap -->
     <div style="display: flex; flex-direction: column; gap: 16px;">
       <div class="panel">
@@ -2455,6 +2852,12 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     const activeAgentStates = {};
     let _lastBuildStoppedByErrorOrPromote = false;
     let _resumeOptimisticUntil = 0;
+    let latestProductionBoard = null;
+    let _activeCandidateId = null;
+    let _lastActivityTimestampMs = Date.now();
+    let _lastActivityHeadline = '';
+    let _lastRetryNotice = '';
+    let currentBoardFilter = 'all';
 
     const AGENT_SHORT_LABELS = {
       SteamAndTelemetryAnalystAgent: 'Steam Analyst',
@@ -2471,7 +2874,92 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     function observeEventForBuildActivity(ev) {
       if (!ev) return;
       const evType = (ev.event_type || '').toUpperCase();
+      const evTypeLower = (ev.event_type || '').toLowerCase();
       const agent = ev.agent_name || (ev.payload && ev.payload.agent_name) || '';
+      const p = (ev.payload && typeof ev.payload === 'object') ? ev.payload : {};
+
+      if (ev.build_id && String(ev.build_id).startsWith('build_candidate_')) {
+        const incomingCid = String(ev.build_id).replace(/^build_/, '');
+        const changedCid = incomingCid !== _activeCandidateId;
+        _activeCandidateId = incomingCid;
+        if (!_userPinnedCartridge) {
+          _selectedCartridgeId = incomingCid;
+          if (changedCid) {
+            _gameCatalogCache.delete(incomingCid);
+            if (typeof loadAvailableGames === 'function') loadAvailableGames();
+          }
+        }
+      } else if (ev.build_id && String(ev.build_id).startsWith('candidate_')) {
+        const incomingCid = String(ev.build_id);
+        const changedCid = incomingCid !== _activeCandidateId;
+        _activeCandidateId = incomingCid;
+        if (!_userPinnedCartridge) {
+          _selectedCartridgeId = incomingCid;
+          if (changedCid) {
+            _gameCatalogCache.delete(incomingCid);
+            if (typeof loadAvailableGames === 'function') loadAvailableGames();
+          }
+        }
+      }
+
+      if (ev.timestamp_utc) {
+        const parsedTs = Date.parse(ev.timestamp_utc);
+        if (!Number.isNaN(parsedTs) && parsedTs > _lastActivityTimestampMs) {
+          _lastActivityTimestampMs = parsedTs;
+        }
+      }
+
+      const delibText = String(ev.deliberation || p.deliberation || '');
+      if (delibText.includes('504') || delibText.includes('DEADLINE_EXCEEDED') || delibText.toLowerCase().includes('retrying')) {
+        _lastRetryNotice = '⏳ Upstream LLM timeout detected — automatically retrying in background...';
+      }
+
+      if (evTypeLower === 'backlog_item_started') {
+        _lastBuildStoppedByErrorOrPromote = false;
+        _lastRetryNotice = '';
+        _lastActivityHeadline = `⚡ Worker fabricating ${p.kind || 'item'} "${p.item_id || ''}" (Rev #${(p.revision || 0) + 1})...`;
+      } else if (evTypeLower === 'backlog_item_lead_turn') {
+        _lastBuildStoppedByErrorOrPromote = false;
+        _lastRetryNotice = '';
+        const specAg = p.specialist_agent ? ` → ${p.specialist_agent}` : '';
+        _lastActivityHeadline = `🎯 Task Lead [${p.item_id || ''}] Turn #${(p.turn_index || 0) + 1}${specAg}: ${String(p.current_strategy || p.brief || '').slice(0, 95)}`;
+      } else if (evTypeLower === 'backlog_item_specialist_started') {
+        _lastBuildStoppedByErrorOrPromote = false;
+        _lastRetryNotice = '';
+        _lastActivityHeadline = `🔧 ${p.specialist_agent || 'Specialist'} executing Turn #${(p.turn_index || 0) + 1} for "${p.item_id || ''}"...`;
+      } else if (evTypeLower === 'backlog_item_specialist_completed') {
+        _lastBuildStoppedByErrorOrPromote = false;
+        _lastRetryNotice = '';
+        _lastActivityHeadline = `✓ ${p.specialist_agent || 'Specialist'} finished Turn #${(p.turn_index || 0) + 1} for "${p.item_id || ''}": ${String(p.summary || '').slice(0, 90)}`;
+      } else if (evTypeLower === 'backlog_item_proof_ready') {
+        _lastBuildStoppedByErrorOrPromote = false;
+        _lastRetryNotice = '';
+        _lastActivityHeadline = `👁️ Proof ready for "${p.item_id || ''}" (Rev #${p.revision || 1}) — queued for Specialist Council review`;
+      } else if (evTypeLower === 'backlog_item_approved') {
+        _lastBuildStoppedByErrorOrPromote = false;
+        _lastActivityHeadline = `✅ Council approved "${p.item_id || ''}"!`;
+      } else if (evTypeLower === 'backlog_item_changes_requested') {
+        _lastBuildStoppedByErrorOrPromote = false;
+        _lastActivityHeadline = `🔄 Council requested revision on "${p.item_id || ''}": ${String(p.feedback || '').slice(0, 90)}`;
+      } else if (evTypeLower === 'review_round_completed') {
+        _lastBuildStoppedByErrorOrPromote = false;
+        const revRole = p.reviewer_role || 'Specialist';
+        const appCnt = Array.isArray(p.approved) ? p.approved.length : 0;
+        const chgCnt = Array.isArray(p.changes_requested) ? p.changes_requested.length : 0;
+        _lastActivityHeadline = `🔍 ${revRole} completed proof review (${appCnt} approved, ${chgCnt} revision requested)`;
+      } else if (evTypeLower === 'writers_room_utterance') {
+        _lastBuildStoppedByErrorOrPromote = false;
+        const spk = p.speaker_display_name || p.speaker_role || agent || 'Specialist';
+        const turnNo = p.turn_index ? `Turn #${p.turn_index}` : '';
+        _lastActivityHeadline = `🎙️ Writers' Room ${turnNo} (${spk}): ${String(p.spoken_dialogue || p.message || delibText).slice(0, 95)}`;
+      } else if (evType === 'TOOL_INVOCATION' || evTypeLower === 'tool_call') {
+        const tName = p.tool || p.tool_name || '';
+        if (tName) {
+          _lastBuildStoppedByErrorOrPromote = false;
+          _lastActivityHeadline = `🛠️ ${AGENT_SHORT_LABELS[agent] || agent || 'Worker'} running ${tName} (${p.status || 'active'})`;
+        }
+      }
+
       if (
         evType === 'GENESIS_TRIGGERED' ||
         evType === 'GENESIS_STARTING' ||
@@ -2501,9 +2989,18 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           _resumeOptimisticUntil = 0;
         }
       }
+      if (typeof updateStudioPulseRibbon === 'function') {
+        updateStudioPulseRibbon();
+      }
     }
 
+    let _isBuildPaused = false;
+    let _selectedCartridgeId = '';
+    let _userPinnedCartridge = false;
+    const _gameCatalogCache = new Map();
+
     function isBuildActivelyRunning() {
+      if (_isBuildPaused) return false;
       if (Date.now() < _resumeOptimisticUntil) return true;
       const bible = (typeof cachedGameBible === 'object' && cachedGameBible) ? cachedGameBible : {};
       const bibleSt = (bible.status || '').toLowerCase();
@@ -2514,16 +3011,40 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       if (_lastBuildStoppedByErrorOrPromote) {
         return false;
       }
-      if (bibleSt === 'brainstorming' || orchSt === 'BRAINSTORMING') {
+      if (bible.build_actively_running === true || ['BRAINSTORMING', 'ANALYZING', 'SYNTHESIZING', 'VERIFYING'].includes(orchSt)) {
         return true;
+      }
+      const hasRecentEvent = _lastActivityTimestampMs > 0 && (Date.now() - _lastActivityTimestampMs < 300000);
+      if ((bibleSt === 'brainstorming' || orchSt === 'BRAINSTORMING') && hasRecentEvent) {
+        return true;
+      }
+      if (latestProductionBoard && Array.isArray(latestProductionBoard.items) && latestProductionBoard.items.length > 0) {
+        const hasActiveBoardItems = latestProductionBoard.items.some(it =>
+          ['in_progress', 'awaiting_review'].includes(String(it.status || it.state || '').toLowerCase())
+        );
+        if (hasRecentEvent && hasActiveBoardItems) {
+          return true;
+        }
+        const allApproved = latestProductionBoard.items.every(it =>
+          String(it.status || it.state || '').toLowerCase() === 'approved'
+        );
+        if (allApproved && !hasRecentEvent) {
+          return false;
+        }
+        if (!hasActiveBoardItems && !hasRecentEvent) {
+          return false;
+        }
       }
       const reqResp = (typeof observabilityState === 'object' && observabilityState && observabilityState.cachedRequirementsSpec) || {};
       const specData = (reqResp.has_active_spec || reqResp.has_spec) && reqResp.requirements_spec
         ? reqResp.requirements_spec
         : (reqResp.requirements ? reqResp : null);
       const tracks = (specData && Array.isArray(specData.requirements)) ? specData.requirements : [];
-      if (tracks.some(t => (t.status || '').toLowerCase() === 'in_progress')) {
+      if (hasRecentEvent && tracks.some(t => (t.status || '').toLowerCase() === 'in_progress')) {
         return true;
+      }
+      if (!hasRecentEvent) {
+        return false;
       }
       const activeStates = ['ANALYZING', 'SYNTHESIZING', 'VERIFYING', 'BRAINSTORMING'];
       for (const [ag, st] of Object.entries(activeAgentStates)) {
@@ -2553,13 +3074,32 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const completedCount = tracks.filter(t => ['completed', 'satisfied'].includes((t.status || '').toLowerCase())).length;
       const inProgTrack = tracks.find(t => (t.status || '').toLowerCase() === 'in_progress');
       const running = isBuildActivelyRunning();
+      const pbCounts = (latestProductionBoard && (latestProductionBoard.counts_by_state || latestProductionBoard.counts))
+        ? (latestProductionBoard.counts_by_state || latestProductionBoard.counts)
+        : null;
+      const pbTotal = latestProductionBoard ? (latestProductionBoard.total_items || (pbCounts && pbCounts.total) || 0) : 0;
+      const pbApproved = pbCounts ? (pbCounts.approved || 0) : 0;
+      const pbInProg = pbCounts ? (pbCounts.in_progress || 0) : 0;
+
+      if (_isBuildPaused) {
+        btn.dataset.buildMode = 'paused';
+        btn.style.background = 'rgba(0, 228, 54, 0.2)';
+        btn.style.borderColor = 'var(--green)';
+        btn.style.color = 'var(--green)';
+        btn.title = 'Build is currently paused. Click to resume at will.';
+        const resumeCounts = pbTotal > 0 ? ` (${pbApproved}/${pbTotal} Verified)` : '';
+        setHtmlIfChanged(btn, `<span>▶️ Resume Build — Paused${escapeHtml(resumeCounts)}</span>`);
+        return;
+      }
 
       if (running) {
         let label = '';
-        if (inProgTrack) {
+        if (pbTotal > 0) {
+          label = `⏸️ Pause Build (${pbApproved}/${pbTotal} Done • ${pbInProg} Active)`;
+        } else if (inProgTrack) {
           const rawTitle = inProgTrack.title || '';
           const shortTitle = rawTitle.length > 26 ? rawTitle.slice(0, 24) + '…' : rawTitle;
-          label = `⚙️ Building ${inProgTrack.id} (${completedCount}/${totalTracks}): ${shortTitle}`;
+          label = `⏸️ Pause (${inProgTrack.id} ${completedCount}/${totalTracks}: ${shortTitle})`;
         } else {
           const activeStates = ['ANALYZING', 'SYNTHESIZING', 'VERIFYING', 'BRAINSTORMING'];
           let activeAgentEntry = Object.entries(activeAgentStates).find(
@@ -2570,25 +3110,25 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           }
           const bibleSt = ((typeof cachedGameBible === 'object' && cachedGameBible && cachedGameBible.status) || '').toLowerCase();
           if (bibleSt === 'brainstorming') {
-            label = "⚙️ Writers' Room Brainstorming...";
+            label = "⏸️ Pause Writers' Room";
           } else if (activeAgentEntry) {
             const [agName, agState] = activeAgentEntry;
             const shortAg = AGENT_SHORT_LABELS[agName] || agName;
             const stFormatted = agState.charAt(0).toUpperCase() + agState.slice(1).toLowerCase();
             label = totalTracks > 0
-              ? `⚙️ ${shortAg}: ${stFormatted} (${completedCount}/${totalTracks})`
-              : `⚙️ ${shortAg}: ${stFormatted}...`;
+              ? `⏸️ Pause (${shortAg}: ${stFormatted} ${completedCount}/${totalTracks})`
+              : `⏸️ Pause (${shortAg}: ${stFormatted})`;
           } else {
             label = totalTracks > 0
-              ? `⚙️ Building Game (${completedCount}/${totalTracks} Tracks)...`
-              : '⚙️ Resuming Game Build...';
+              ? `⏸️ Pause Build (${completedCount}/${totalTracks} Tracks)`
+              : '⏸️ Pause Build';
           }
         }
         btn.dataset.buildMode = 'running';
-        btn.style.background = 'rgba(41, 173, 255, 0.18)';
-        btn.style.borderColor = 'var(--cyan)';
-        btn.style.color = 'var(--cyan)';
-        btn.title = 'Build is actively running. Click to inspect live Requirement Tracks & Checkpoints.';
+        btn.style.background = 'rgba(255, 0, 77, 0.16)';
+        btn.style.borderColor = 'var(--neon-red)';
+        btn.style.color = 'var(--pink)';
+        btn.title = 'Build is actively running. Click to pause at any time.';
         setHtmlIfChanged(
           btn,
           `<span class="activity-beacon" style="background: var(--cyan); box-shadow: 0 0 8px var(--cyan);"></span><span>${escapeHtml(label)}</span>`
@@ -2596,14 +3136,22 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         return;
       }
 
-      if (totalTracks > 0 && completedCount === totalTracks) {
-        // All tracks are implemented, but that does NOT mean the quality gates ran or passed.
-        // Keep the button actionable so the quality-gate stage can be re-run via resume.
+      if (pbTotal > 0 && pbApproved === pbTotal) {
         btn.dataset.buildMode = 'completed';
         btn.style.background = 'rgba(0, 228, 54, 0.16)';
         btn.style.borderColor = 'var(--green)';
         btn.style.color = 'var(--green)';
-        btn.title = 'All requirement tracks are implemented. This does not mean quality gates passed. Click to re-run the build from the Quality Gates stage (completed tracks are skipped). Use "Tasks & Handoffs" to inspect tracks and checkpoints.';
+        btn.title = 'All Production Board items are verified. Click to re-run verification or finalize.';
+        setHtmlIfChanged(btn, `<span>▶️ Verified (${pbApproved}/${pbTotal}) — Re-Run / Finalize</span>`);
+        return;
+      }
+
+      if (totalTracks > 0 && completedCount === totalTracks) {
+        btn.dataset.buildMode = 'completed';
+        btn.style.background = 'rgba(0, 228, 54, 0.16)';
+        btn.style.borderColor = 'var(--green)';
+        btn.style.color = 'var(--green)';
+        btn.title = 'All requirement tracks are implemented. Click to re-run quality gates or resume.';
         setHtmlIfChanged(btn, `<span>▶️ Tracks Complete (${completedCount}/${totalTracks}) — Run Quality Gates</span>`);
         return;
       }
@@ -2612,11 +3160,10 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       btn.style.background = 'rgba(255, 163, 0, 0.18)';
       btn.style.borderColor = 'var(--amber)';
       btn.style.color = 'var(--yellow)';
-      const nextTrack = tracks.find(t => !['completed', 'satisfied'].includes((t.status || '').toLowerCase()));
-      const resumeLabel = nextTrack
-        ? `▶️ Resume Build at ${nextTrack.id} (${completedCount}/${totalTracks})`
-        : '▶️ Resume Game Build';
-      btn.title = 'Resume development on the current game from its persisted Game Bible and requirement tracks';
+      const resumeLabel = pbTotal > 0
+        ? `▶️ Resume Build (${pbApproved}/${pbTotal} Done)`
+        : '▶️ Resume Build';
+      btn.title = 'Resume development on the selected game from its persisted Game Bible and Production Board';
       setHtmlIfChanged(btn, `<span>${escapeHtml(resumeLabel)}</span>`);
     }
 
@@ -2722,12 +3269,15 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           return;
         }
 
-        this.ws.onopen = () => {
+        this.ws.onopen = async () => {
           this.retryCount = 0;
           this.setUIStatus('ONLINE', 'ONLINE');
           this.startPolling(2500);
           if (offlineBanner) offlineBanner.style.display = 'none';
 
+          if (!_selectedCartridgeId && typeof loadAvailableGames === 'function') {
+            await loadAvailableGames();
+          }
           loadEventHistory();
           loadSteamDNA();
           loadHeatmap();
@@ -2756,6 +3306,14 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
               if (typeof handleLiveWritersRoomEvent === 'function') {
                 handleLiveWritersRoomEvent(data);
               }
+            }
+            if (evTypeLower.startsWith('backlog_item_') || evTypeLower === 'review_round_completed') {
+              if (typeof fetchLiveProductionBoardFallback === 'function') {
+                fetchLiveProductionBoardFallback();
+              }
+              if (typeof fetchRequirementsBacklog === 'function') fetchRequirementsBacklog();
+              if (typeof fetchTaskHistory === 'function') fetchTaskHistory();
+              if (typeof loadGameBible === 'function') loadGameBible();
             }
             if (data.event_type === 'TOOL_INVOCATION' || data.event_type === 'tool_call' || (data.payload && data.payload.tool)) {
               addToolCard({
@@ -2857,6 +3415,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         this.pollTimer = setInterval(async () => {
           try {
             await loadEventHistory();
+            if (typeof fetchLiveProductionBoardFallback === 'function') fetchLiveProductionBoardFallback();
             if (typeof fetchTaskHistory === 'function') fetchTaskHistory();
             if (typeof fetchRequirementsBacklog === 'function') fetchRequirementsBacklog();
             if (typeof fetchCheckpoints === 'function') fetchCheckpoints();
@@ -2890,6 +3449,19 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       }
 
       _lastBuildStoppedByErrorOrPromote = false;
+      _isBuildPaused = false;
+      _userPinnedCartridge = false;
+      _selectedCartridgeId = '';
+      _activeCandidateId = '';
+      latestProductionBoard = {
+        board_id: 'new_game',
+        game_title: 'New Game Concept (Brainstorming Live...)',
+        counts: computeBoardCounts([]),
+        counts_by_state: computeBoardCounts([]),
+        items: [],
+      };
+      _lastShowcaseSignature = '';
+      _gameCatalogCache.clear();
       _resumeOptimisticUntil = Date.now() + 15000;
 
       // Immediately switch to the Creative Writers' Room & Living Game Bible workspace
@@ -2901,9 +3473,16 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       if (typeof observabilityState === 'object' && observabilityState) {
         observabilityState.cachedRequirementsSpec = null;
         observabilityState.requirements = [];
+        observabilityState.cachedTasks = [];
+        if (typeof updateTaskMetrics === 'function') updateTaskMetrics([]);
+        if (typeof applyTaskFilters === 'function') applyTaskFilters();
+        if (typeof saveObservabilityState === 'function') saveObservabilityState();
       }
-      if (typeof renderRequirementsBacklog === 'function') {
-        renderRequirementsBacklog({ has_active_spec: false, has_spec: false, requirements: [], total_tracks: 0, completed_tracks: 0, progress_percentage: 0 });
+      if (typeof renderProductionBoardPanel === 'function') {
+        renderProductionBoardPanel();
+      }
+      if (typeof renderBacklog === 'function') {
+        renderBacklog({ has_active_spec: false, has_spec: false, requirements: [], total_tracks: 0, completed_tracks: 0, progress_percentage: 0 });
       }
       if (typeof renderGameBible === 'function') {
         renderGameBible({
@@ -2968,26 +3547,74 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       }
     }
 
-    async function triggerResumeGameBuild() {
-      _lastBuildStoppedByErrorOrPromote = false;
-      _resumeOptimisticUntil = Date.now() + 15000;
+    async function pauseActiveGameBuild() {
+      _isBuildPaused = true;
+      _resumeOptimisticUntil = 0;
+      const togglePause = document.getElementById('toggle-pause-greenlight');
+      if (togglePause) togglePause.checked = true;
       updateHeaderBuildStatus();
+      if (typeof updateStudioPulseRibbon === 'function') updateStudioPulseRibbon();
       if (typeof updateBibleProductionBanner === 'function') updateBibleProductionBanner();
 
       addDeliberation({
-        deliberation: 'Resuming current game build from persisted Living Game Bible and requirement tracks...',
+        deliberation: 'Operator paused active build from Mission Control. Worker claims and Writers Room turns will hold until resumed.',
+        agent_name: 'MissionControlGateway',
+        event_type: 'build_paused'
+      });
+      try {
+        await fetch('/api/studio/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deliberation: 'Operator paused active game build at will from Mission Control.',
+            pause_for_greenlight: true,
+            paused: true,
+          }),
+        });
+      } catch (err) {
+        console.warn('Failed to send pause signal:', err);
+      }
+    }
+    window.pauseActiveGameBuild = pauseActiveGameBuild;
+
+    async function triggerResumeGameBuild() {
+      _isBuildPaused = false;
+      _lastBuildStoppedByErrorOrPromote = false;
+      _resumeOptimisticUntil = Date.now() + 15000;
+      const togglePause = document.getElementById('toggle-pause-greenlight');
+      if (togglePause) togglePause.checked = false;
+      updateHeaderBuildStatus();
+      if (typeof updateStudioPulseRibbon === 'function') updateStudioPulseRibbon();
+      if (typeof updateBibleProductionBanner === 'function') updateBibleProductionBanner();
+
+      const targetCand = (_selectedCartridgeId && _selectedCartridgeId !== 'active')
+        ? _selectedCartridgeId
+        : (_activeCandidateId || '');
+
+      addDeliberation({
+        deliberation: `Resuming game build${targetCand ? ` for ${targetCand}` : ''} from persisted Living Game Bible and Production Board...`,
         agent_name: 'MissionControlGateway',
         event_type: 'genesis_triggered'
       });
       try {
+        await fetch('/api/studio/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deliberation: 'Operator resumed game build from Mission Control.',
+            pause_for_greenlight: false,
+            paused: false,
+          }),
+        });
         const res = await fetch('/api/genesis/trigger', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            deliberation: 'Operator requested resume of current game build from Mission Control',
+            deliberation: `Operator requested resume of game build${targetCand ? ` (${targetCand})` : ''} from Mission Control`,
             profile_tag: 'default',
             resume_current: true,
-            reset_active: false
+            reset_active: false,
+            candidate_id: targetCand || undefined,
           })
         });
         const data = await res.json();
@@ -3014,10 +3641,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     document.getElementById('btn-resume-genesis')?.addEventListener('click', (e) => {
       const btn = e.currentTarget;
       const mode = btn ? btn.dataset.buildMode : 'resumable';
-      if (mode === 'running') {
-        if (typeof window.openDrawerToTab === 'function') {
-          window.openDrawerToTab('backlog');
-        }
+      if (mode === 'running' && !_isBuildPaused) {
+        pauseActiveGameBuild();
         return;
       }
       triggerResumeGameBuild();
@@ -3322,14 +3947,19 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     // =========================================================================
     // Multimodal Artifacts, Audio Player & Palette Chips
     // =========================================================================
+    let _latestArtifactsData = null;
+
     async function loadArtifacts() {
       try {
-        const res = await fetch('/api/artifacts');
+        const effCart = _selectedCartridgeId || _activeCandidateId || '';
+        const cartParam = effCart ? `?cartridge=${encodeURIComponent(effCart)}` : '';
+        const res = await fetch(`/api/artifacts${cartParam}`);
         if (!res.ok) return;
         const data = await res.json();
+        _latestArtifactsData = data;
 
         // Audio Clips — only rebuild selector if clip list changed
-        const audioSig = JSON.stringify((data.audio_clips || []).map(c => `${c.filename}:${c.size_bytes}`));
+        const audioSig = `${effCart}::` + JSON.stringify((data.audio_clips || []).map(c => `${c.filename}:${c.size_bytes}`));
         if (audioSig !== _lastAudioClipsSignature) {
           _lastAudioClipsSignature = audioSig;
           const prevSelectedAudio = audioSelector.value;
@@ -3345,7 +3975,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             const targetFile = keepSelection ? prevSelectedAudio : data.audio_clips[0].filename;
             audioSelector.value = targetFile;
             if (audioPlayer.paused) {
-              audioPlayer.src = `/api/artifacts/audio/${targetFile}`;
+              audioPlayer.src = `/api/assets/audio/${encodeURIComponent(targetFile)}${cartParam}`;
             }
           } else {
             const opt = document.createElement('option');
@@ -3358,7 +3988,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
 
         // Code Modules in diffSelector — preserve active selection
         if (data.code_modules && data.code_modules.length > 0) {
-          const modSig = JSON.stringify(data.code_modules);
+          const modSig = `${effCart}::` + JSON.stringify(data.code_modules);
           if (modSig !== _lastCodeModulesSignature) {
             _lastCodeModulesSignature = modSig;
             const prevMod = diffSelector.value;
@@ -3379,7 +4009,10 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         const spritesGallery = document.getElementById('sprites-gallery-container');
         if (spritesGallery) {
           const spritesHtml = (data.sprites || [])
-            .map(s => `<span class="sprite-chip">${escapeHtml(s.filename)}</span>`)
+            .map(s => {
+              const sUrl = resolveVisualAssetUrl(s.filename, effCart);
+              return `<span class="sprite-chip" style="cursor:pointer;" title="Click to preview ${escapeHtml(s.filename)}" onclick="openMockupLightbox('${escapeHtml(sUrl)}', '${escapeHtml(s.filename)}', 'sprite_asset', '')">${escapeHtml(s.filename)}</span>`;
+            })
             .join('');
           setHtmlIfChanged(spritesGallery, spritesHtml);
         }
@@ -3387,8 +4020,12 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         // Artifacts Summary
         const summaryEl = document.getElementById('artifacts-inventory-summary');
         if (summaryEl) {
-          const status = data.exists ? 'Active Cartridge' : 'Uninitialized';
-          summaryEl.textContent = `Status: ${status} | Audio: ${data.audio_clips?.length || 0} | Sprites: ${data.sprites?.length || 0} | Modules: ${data.code_modules?.length || 0}`;
+          const status = data.exists ? (effCart || 'Active Cartridge') : 'Uninitialized';
+          summaryEl.textContent = `Cartridge: ${status} | Audio: ${data.audio_clips?.length || 0} | Visuals/Renders: ${data.sprites?.length || 0} | Modules: ${data.code_modules?.length || 0}`;
+        }
+
+        if (typeof renderBuiltRendersShowcase === 'function') {
+          renderBuiltRendersShowcase(data, effCart);
         }
       } catch (e) {
         // Backend not ready
@@ -3398,14 +4035,18 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     audioSelector.addEventListener('change', () => {
       const track = audioSelector.value;
       if (track) {
-        audioPlayer.src = `/api/artifacts/audio/${track}`;
+        const effCart = _selectedCartridgeId || _activeCandidateId || '';
+        const cartParam = effCart ? `?cartridge=${encodeURIComponent(effCart)}` : '';
+        audioPlayer.src = `/api/assets/audio/${encodeURIComponent(track)}${cartParam}`;
         audioPlayer.load();
       }
     });
 
     async function loadPalette() {
       try {
-        const res = await fetch('/api/assets/palette');
+        const effCart = _selectedCartridgeId || _activeCandidateId || '';
+        const cartParam = effCart ? `?cartridge=${encodeURIComponent(effCart)}` : '';
+        const res = await fetch(`/api/assets/palette${cartParam}`);
         if (!res.ok) return;
         const data = await res.json();
         paletteGrid.innerHTML = '';
@@ -3436,10 +4077,12 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const moduleName = diffSelector.value;
       if (!moduleName) return;
       try {
-        const res = await fetch(`/api/diff?module=${moduleName}`);
+        const effCart = _selectedCartridgeId || _activeCandidateId || '';
+        const cartParam = effCart ? `&cartridge=${encodeURIComponent(effCart)}` : '';
+        const res = await fetch(`/api/diff?module=${encodeURIComponent(moduleName)}${cartParam}`);
         if (!res.ok) return;
         const data = await res.json();
-        const sig = `${moduleName}::${data.diff || ''}`;
+        const sig = `${effCart}::${moduleName}::${data.diff || ''}`;
         if (sig === _lastDiffSignature) return;
         _lastDiffSignature = sig;
         const prevScrollTop = diffContainer.scrollTop;
@@ -3637,10 +4280,10 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       });
       if (inspectorAgentName) inspectorAgentName.textContent = agentName || 'All Agents';
       if (inspectorAgentRole) {
-        inspectorAgentRole.textContent = agentName ? `Filtering tasks executed by ${agentName}` : 'Select an agent node on the DAG or use filters below';
+        inspectorAgentRole.textContent = agentName ? `Filtering tasks executed by ${agentName} (click Reset below to clear)` : 'Select an agent node on the DAG or use filters below';
       }
       if (inspectorClearBtn) {
-        inspectorClearBtn.style.display = agentName ? 'inline-block' : 'none';
+        inspectorClearBtn.style.display = 'none';
       }
     }
 
@@ -4197,8 +4840,22 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
 
       let html = '';
       const reversed = [...checkpoints].reverse();
+      let activeMarked = false;
+      const multipleMarkedActive = reversed.filter(c => c.is_active === true).length > 1;
       reversed.forEach((cp) => {
-        const isActive = cp.is_active === true;
+        let isActive = cp.is_active === true;
+        if (isActive && multipleMarkedActive) {
+          // If legacy server marked all DB checkpoints active, only mark the single checkpoint matching selected/latest
+          const matchesSelected = _selectedCartridgeId && cp.candidate_id === _selectedCartridgeId;
+          if (!activeMarked && (matchesSelected || !_selectedCartridgeId)) {
+            activeMarked = true;
+          } else {
+            isActive = false;
+          }
+        } else if (isActive) {
+          if (activeMarked) isActive = false;
+          activeMarked = true;
+        }
         const verifiedTracksList = (cp.verified_tracks || []).join(', ') || cp.requirement_id;
         const fileCount = (cp.files || []).length;
         const shaCount = Object.keys(cp.sha256_manifest || {}).length;
@@ -4303,12 +4960,6 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       if (tabBtnCheckpoints) {
         tabBtnCheckpoints.addEventListener('click', () => switchDrawerTab('checkpoints'));
       }
-      if (lastCheckpointBadge) {
-        lastCheckpointBadge.addEventListener('click', () => {
-          openDrawer();
-          switchDrawerTab('checkpoints');
-        });
-      }
 
       if (taskSearchInput) {
         taskSearchInput.addEventListener('input', applyTaskFilters);
@@ -4384,17 +5035,20 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const wsBible = document.getElementById('workspace-game-bible');
       const tabTelemetry = document.getElementById('ws-tab-telemetry');
       const tabBible = document.getElementById('ws-tab-bible');
+      const tabRendersShortcut = document.getElementById('ws-tab-renders-shortcut');
       if (workspaceName === 'bible') {
         if (wsTelemetry) wsTelemetry.style.display = 'none';
         if (wsBible) wsBible.style.display = 'block';
         if (tabTelemetry) tabTelemetry.classList.remove('active');
         if (tabBible) tabBible.classList.add('active');
+        if (tabRendersShortcut) tabRendersShortcut.classList.remove('active');
         loadGameBible();
       } else {
         if (wsTelemetry) wsTelemetry.style.display = 'grid';
         if (wsBible) wsBible.style.display = 'none';
         if (tabTelemetry) tabTelemetry.classList.add('active');
         if (tabBible) tabBible.classList.remove('active');
+        if (tabRendersShortcut) tabRendersShortcut.classList.remove('active');
       }
     }
 
@@ -4402,10 +5056,684 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       document.querySelectorAll('.bible-subtab-btn').forEach(btn => {
         btn.classList.toggle('active', btn.getAttribute('data-bible-tab') === subtabName);
       });
-      ['evolution', 'mockups', 'characters', 'pillars', 'signoff'].forEach(name => {
+      ['board', 'renders', 'transcript', 'evolution', 'mockups', 'characters', 'pillars', 'signoff'].forEach(name => {
         const view = document.getElementById(`bible-subview-${name}`);
         if (view) view.classList.toggle('active', name === subtabName);
       });
+      const tabRendersShortcut = document.getElementById('ws-tab-renders-shortcut');
+      if (tabRendersShortcut) {
+        tabRendersShortcut.classList.toggle('active', subtabName === 'renders');
+      }
+      if (subtabName === 'renders' && _latestArtifactsData) {
+        renderBuiltRendersShowcase(_latestArtifactsData, _selectedCartridgeId || _activeCandidateId || '');
+      }
+    }
+
+    window.openBuiltRendersShowcase = function() {
+      switchMainWorkspace('bible');
+      switchBibleSubtab('renders');
+      loadArtifacts();
+    };
+
+    function computeBoardCounts(items) {
+      const counts = {
+        total: 0,
+        approved: 0,
+        awaiting_review: 0,
+        in_progress: 0,
+        changes_requested: 0,
+        ready: 0,
+        blocked: 0,
+        failed: 0,
+        needs_decision: 0,
+      };
+      if (!Array.isArray(items)) return counts;
+      counts.total = items.length;
+      for (const it of items) {
+        if (!it || typeof it !== 'object') continue;
+        const st = String(it.status || it.state || 'ready').toLowerCase();
+        if (st in counts) {
+          counts[st] += 1;
+        }
+      }
+      return counts;
+    }
+
+    function normalizeCartridgeRelativePath(rawPath, candId = '') {
+      if (!rawPath) return '';
+      let s = String(rawPath).trim();
+      if (!s || s.startsWith('/api/')) return s;
+      const effCand = candId || _selectedCartridgeId || _activeCandidateId || '';
+      // Strip absolute filesystem prefix up to /cartridges/<folder>/
+      const cartMatch = s.match(/(?:^|\/)cartridges\/([^/]+)\/(.+)$/);
+      if (cartMatch) {
+        const folder = cartMatch[1];
+        const relInside = cartMatch[2];
+        if (folder === 'active') return relInside;
+        return `../${folder}/${relInside}`;
+      }
+      if (s.startsWith('../')) return s;
+      const cleanRel = s.replace(/^\.?\//, '');
+      if (effCand && effCand !== 'active') {
+        return `../${effCand}/${cleanRel}`;
+      }
+      return cleanRel;
+    }
+
+    function formatHumanText(val) {
+      if (val === null || val === undefined) return '';
+      if (Array.isArray(val)) {
+        return val.map(v => formatHumanText(v)).filter(Boolean).join(' • ');
+      }
+      if (typeof val === 'object') {
+        return Object.entries(val)
+          .map(([k, v]) => `${k.replace(/_/g, ' ')}: ${formatHumanText(v)}`)
+          .join(' • ');
+      }
+      let s = String(val);
+      // Clean inline Python list representations like ['item_a', 'item_b']
+      s = s.replace(/\[(?:'[^']*'(?:,\s*'[^']*')*)\]/g, (m) =>
+        m.slice(1, -1).replace(/'/g, '')
+      );
+      return s;
+    }
+
+    function normalizeBoardItem(rawIt, candId = '') {
+      if (!rawIt || typeof rawIt !== 'object') return rawIt;
+      const effCand = candId || _selectedCartridgeId || _activeCandidateId || '';
+      const idVal = rawIt.id || rawIt.item_id || 'ITEM';
+      const stVal = String(rawIt.status || rawIt.state || 'ready').toLowerCase();
+      const descVal = rawIt.description || rawIt.spec || '';
+      const proofSpecVal = rawIt.proof_spec || '';
+      const ownerVal = rawIt.owner_role || rawIt.raised_by_role || rawIt.claimed_by_worker || 'GameplaySystemsEngineer';
+      const targetFilesVal = Array.isArray(rawIt.target_files)
+        ? rawIt.target_files
+        : (Array.isArray(rawIt.target_modules) ? rawIt.target_modules : []);
+      const depsVal = Array.isArray(rawIt.dependencies)
+        ? rawIt.dependencies
+        : (Array.isArray(rawIt.depends_on) ? rawIt.depends_on : []);
+      const revs = Array.isArray(rawIt.revisions) ? rawIt.revisions : [];
+      const latestRev = revs.length > 0 ? revs[revs.length - 1] : null;
+      const rawProofPaths = Array.isArray(rawIt.proof?.artifact_paths)
+        ? rawIt.proof.artifact_paths
+        : (Array.isArray(rawIt.proof_paths)
+            ? rawIt.proof_paths
+            : (latestRev && Array.isArray(latestRev.proof_paths) ? latestRev.proof_paths : []));
+      const normProofPaths = rawProofPaths.map(p => normalizeCartridgeRelativePath(p, effCand));
+      const workerNotesVal = rawIt.worker_notes || (latestRev && latestRev.worker_notes) || rawIt.proof?.test_Assertion_summary || '';
+      const feedbackVal = rawIt.verdict?.feedback || rawIt.feedback || (latestRev && latestRev.feedback) || '';
+      const reviewerRoleVal = rawIt.verdict?.reviewer_role || (Array.isArray(rawIt.reviewer_roles) && rawIt.reviewer_roles[0]) || 'Council';
+
+      return {
+        ...rawIt,
+        id: idVal,
+        item_id: idVal,
+        status: stVal,
+        state: stVal,
+        description: descVal,
+        spec: descVal,
+        proof_spec: proofSpecVal,
+        owner_role: ownerVal,
+        target_files: targetFilesVal,
+        dependencies: depsVal,
+        attempt_count: rawIt.attempt_count || revs.length || 0,
+        worker_notes: workerNotesVal,
+        feedback: feedbackVal,
+        proof_paths: normProofPaths,
+        proof: {
+          ...(rawIt.proof || {}),
+          artifact_paths: normProofPaths,
+        },
+        verdict: rawIt.verdict || (feedbackVal ? { feedback: feedbackVal, reviewer_role: reviewerRoleVal } : undefined),
+      };
+    }
+
+    function normalizeBoardPayload(rawBoard, candId = '') {
+      if (!rawBoard || typeof rawBoard !== 'object') return null;
+      const effCand = candId || rawBoard.board_id || _selectedCartridgeId || _activeCandidateId || '';
+      const rawItems = Array.isArray(rawBoard.items) ? rawBoard.items : [];
+      const items = rawItems.map(it => normalizeBoardItem(it, effCand));
+      const counts = computeBoardCounts(items);
+      return {
+        has_board: items.length > 0,
+        board_id: effCand || 'production_board',
+        game_title: rawBoard.game_title || (cachedGameBible && cachedGameBible.game_title) || '',
+        revision: Number(rawBoard.revision || items.reduce((acc, it) => acc + (it.attempt_count || 0), 0) || 0),
+        updated_at: rawBoard.updated_at || '',
+        total_items: items.length,
+        counts: counts,
+        counts_by_state: counts,
+        items: items,
+      };
+    }
+
+    async function fetchLiveProductionBoardFallback() {
+      const bibleCand = (cachedGameBible && cachedGameBible.cartridge_id && String(cachedGameBible.cartridge_id).startsWith('candidate_'))
+        ? String(cachedGameBible.cartridge_id)
+        : '';
+      const targetCand = _userPinnedCartridge
+        ? (_selectedCartridgeId || _activeCandidateId || '')
+        : (bibleCand || _activeCandidateId || _selectedCartridgeId || '');
+
+      // If not pinned to a different cartridge and game_bible already provided production_board
+      if (!_userPinnedCartridge && cachedGameBible && cachedGameBible.production_board && Array.isArray(cachedGameBible.production_board.items)) {
+        const pbItems = cachedGameBible.production_board.items;
+        const isBrainstorming = String(cachedGameBible.status || '').toLowerCase() === 'brainstorming';
+        if (pbItems.length > 0 || isBrainstorming) {
+          latestProductionBoard = normalizeBoardPayload(cachedGameBible.production_board, bibleCand || targetCand);
+          if (pbItems.length === 0 && typeof observabilityState === 'object' && observabilityState) {
+            observabilityState.cachedRequirementsSpec = null;
+            observabilityState.requirements = [];
+            observabilityState.cachedTasks = [];
+            if (typeof updateTaskMetrics === 'function') updateTaskMetrics([]);
+            if (typeof applyTaskFilters === 'function') applyTaskFilters();
+          }
+          renderProductionBoardPanel();
+          updateStudioPulseRibbon();
+          return;
+        }
+      }
+
+      // Live fallback for running server instances: load ../<candidate_id>/backlog.json directly via /api/artifacts/content
+      const candidateGuesses = [];
+      if (targetCand) {
+        candidateGuesses.push(targetCand);
+      } else if (!(cachedGameBible && String(cachedGameBible.status || '').toLowerCase() === 'brainstorming' && !bibleCand)) {
+        try {
+          const res = await fetch('/api/events/history');
+          if (res.ok) {
+            const evData = await res.json();
+            const evList = Array.isArray(evData.events) ? evData.events : [];
+            for (let i = evList.length - 1; i >= 0; i--) {
+              const bId = String(evList[i]?.build_id || '');
+              if (bId.startsWith('build_candidate_')) {
+                const cid = bId.replace(/^build_/, '');
+                if (!candidateGuesses.includes(cid)) candidateGuesses.push(cid);
+                break;
+              } else if (bId.startsWith('candidate_')) {
+                if (!candidateGuesses.includes(bId)) candidateGuesses.push(bId);
+                break;
+              }
+            }
+          }
+        } catch (e) {
+          // Ignore
+        }
+      }
+
+      for (const cid of candidateGuesses) {
+        try {
+          const relBacklogPath = cid === 'active' ? 'backlog.json' : `../${cid}/backlog.json`;
+          const bRes = await fetch(`/api/artifacts/content?path=${encodeURIComponent(relBacklogPath)}`);
+          if (!bRes.ok) continue;
+          const bPayload = await bRes.json();
+          if (bPayload && typeof bPayload.content === 'string') {
+            const parsed = JSON.parse(bPayload.content);
+            if (parsed && Array.isArray(parsed.items) && parsed.items.length > 0) {
+              _activeCandidateId = cid;
+              if (!_selectedCartridgeId) {
+                _selectedCartridgeId = cid;
+                const switcher = document.getElementById('studio-game-switcher');
+                if (switcher && Array.from(switcher.options).some(o => o.value === cid)) {
+                  switcher.value = cid;
+                }
+              }
+              latestProductionBoard = normalizeBoardPayload(parsed, cid);
+              const normItems = latestProductionBoard.items;
+
+              // Hydrate cachedRequirementsSpec for the selected game so Backlog drawer & header badges stay synchronized
+              const statusMap = {
+                approved: 'completed',
+                in_progress: 'in_progress',
+                awaiting_review: 'in_progress',
+                changes_requested: 'in_progress',
+                ready: 'pending',
+                blocked: 'pending',
+                failed: 'rejected',
+                needs_decision: 'in_progress',
+              };
+              observabilityState.cachedRequirementsSpec = {
+                has_spec: true,
+                has_active_spec: true,
+                game_title: latestProductionBoard.game_title || (cachedGameBible && cachedGameBible.game_title) || '',
+                core_genre: (cachedGameBible && cachedGameBible.core_genre) || '2d_game',
+                total_count: normItems.length,
+                completed_count: normItems.filter(it => it.status === 'approved').length,
+                production_board: latestProductionBoard,
+                requirements: normItems.map(it => ({
+                  id: it.id,
+                  title: it.title,
+                  category: it.category || 'gameplay',
+                  owner_role: it.owner_role || 'GameplaySystemsEngineer',
+                  status: statusMap[String(it.status || 'ready').toLowerCase()] || 'pending',
+                  board_status: it.status,
+                  attempt_count: it.attempt_count || 0,
+                  target_files: it.target_files || [],
+                  acceptance_criteria: it.acceptance_criteria || (it.proof_spec ? [{ id: `${it.id}-PROOF`, description: it.proof_spec, passed: it.status === 'approved', verification_method: 'council_proof_gate' }] : []),
+                  verification_Note: it.verdict?.feedback || it.worker_notes || '',
+                  proof_paths: it.proof?.artifact_paths || [],
+                })),
+              };
+              if (typeof renderBacklog === 'function') {
+                renderBacklog(observabilityState.cachedRequirementsSpec);
+              }
+
+              // Also hydrate cachedTasks if empty so Agent Swarm Telemetry task history drawer works seamlessly
+              if (!Array.isArray(observabilityState.cachedTasks) || observabilityState.cachedTasks.length === 0 || _selectedCartridgeId === cid) {
+                const taskStatusMap = {
+                  approved: 'completed',
+                  in_progress: 'synthesizing',
+                  awaiting_review: 'verifying',
+                  changes_requested: 'synthesizing',
+                  ready: 'queued',
+                  blocked: 'queued',
+                  failed: 'rejected',
+                  needs_decision: 'synthesizing',
+                };
+                observabilityState.cachedTasks = normItems.map(it => {
+                  const st = String(it.status || 'ready').toLowerCase();
+                  const proofPaths = it.proof?.artifact_paths || [];
+                  const relProofs = proofPaths.map(p => formatProofUrl(p));
+                  return {
+                    task_id: `board_${cid}_${it.id}`,
+                    build_id: `build_${cid}`,
+                    requirement_id: it.id,
+                    agent_name: it.owner_role || 'GameplaySystemsEngineer',
+                    agent_role: it.owner_role || 'GameplaySystemsEngineer',
+                    title: `[${it.id}] ${it.title} (${st.toUpperCase()})`,
+                    action_title: `[${it.id}] ${it.title} (${st.toUpperCase()})`,
+                    status: taskStatusMap[st] || 'queued',
+                    started_at: it.updated_at || parsed.updated_at || new Date().toISOString(),
+                    completed_at: st === 'approved' ? (it.updated_at || parsed.updated_at) : null,
+                    duration_ms: 1500,
+                    prompt_summary: (it.description || it.title || '').slice(0, 500),
+                    deliberation: it.verdict?.deliberation || it.proof?.deliberation || it.deliberation || it.description || '',
+                    output_summary: it.verdict?.feedback || it.worker_notes || `Status: ${st}`,
+                    artifacts: relProofs,
+                    Metadata: {
+                      item_id: it.id,
+                      board_status: st,
+                      attempt_count: it.attempt_count || 0,
+                      proof_paths: proofPaths,
+                      proof_hashes: it.proof?.artifact_hashes || {},
+                    },
+                  };
+                });
+                if (typeof updateTaskMetrics === 'function') {
+                  updateTaskMetrics(observabilityState.cachedTasks);
+                }
+                if (typeof applyTaskFilters === 'function') {
+                  applyTaskFilters();
+                }
+              }
+
+              renderProductionBoardPanel();
+              updateBibleProductionBanner();
+              updateStudioPulseRibbon();
+              if (_latestArtifactsData) {
+                renderBuiltRendersShowcase(_latestArtifactsData, cid);
+              }
+              return;
+            }
+          }
+        } catch (err) {
+          // Ignore individual candidate fetch failure
+        }
+      }
+    }
+
+    window.setProductionBoardFilter = function(filter) {
+      currentBoardFilter = filter || 'all';
+      renderProductionBoardPanel();
+    };
+
+    window.openProductionBoardWithFilter = function(filter) {
+      currentBoardFilter = filter || 'all';
+      switchMainWorkspace('bible');
+      switchBibleSubtab('board');
+      renderProductionBoardPanel();
+    };
+
+    function formatProofUrl(rawPath) {
+      if (!rawPath) return '';
+      const s = String(rawPath);
+      if (s.startsWith('/api/')) return s;
+      const effCand = _selectedCartridgeId || _activeCandidateId || '';
+      const relPath = normalizeCartridgeRelativePath(s, effCand);
+      return `/api/artifacts/content?path=${encodeURIComponent(relPath)}&raw=true`;
+    }
+
+    function renderProductionBoardPanel() {
+      const board = latestProductionBoard;
+      const items = board && Array.isArray(board.items) ? board.items : [];
+      const counts = board && board.counts ? board.counts : computeBoardCounts(items);
+
+      const countBadge = document.getElementById('bible-count-board');
+      if (countBadge) {
+        countBadge.textContent = items.length > 0 ? `${counts.approved || 0}/${items.length}` : '0';
+      }
+
+      const revBadge = document.getElementById('board-revision-badge');
+      if (revBadge && board) {
+        const activeWorkers = items.filter(it => it.status === 'in_progress').map(it => `${it.id} (${it.owner_role})`);
+        const reviewItems = items.filter(it => it.status === 'awaiting_review').map(it => it.id);
+        const parts = [`Rev #${board.revision || 0}`];
+        if (activeWorkers.length > 0) parts.push(`🔨 Working: ${activeWorkers.join(', ')}`);
+        if (reviewItems.length > 0) parts.push(`🔍 In Review: ${reviewItems.join(', ')}`);
+        revBadge.textContent = parts.join(' • ');
+      }
+
+      const pillsRow = document.getElementById('board-filter-pills');
+      if (pillsRow) {
+        const filters = [
+          { key: 'all', label: `All Items (${counts.total || 0})`, col: 'var(--cyan)' },
+          { key: 'active', label: `⚡ Active Now (${(counts.in_progress || 0) + (counts.awaiting_review || 0) + (counts.changes_requested || 0)})`, col: 'var(--yellow)' },
+          { key: 'in_progress', label: `🔨 In Progress (${counts.in_progress || 0})`, col: 'var(--cyan)' },
+          { key: 'awaiting_review', label: `🔍 Awaiting Review (${counts.awaiting_review || 0})`, col: 'var(--amber)' },
+          { key: 'changes_requested', label: `🛠️ Changes Requested (${counts.changes_requested || 0})`, col: 'var(--pink)' },
+          { key: 'approved', label: `✅ Approved (${counts.approved || 0})`, col: 'var(--green)' },
+          { key: 'queued', label: `⏳ Queued / Blocked (${(counts.ready || 0) + (counts.blocked || 0)})`, col: 'var(--light-gray)' },
+        ];
+        const pillsHtml = filters.map(f => {
+          const isAct = currentBoardFilter === f.key;
+          return `
+            <button type="button" onclick="setProductionBoardFilter('${f.key}')" style="background: ${isAct ? 'rgba(41, 173, 255, 0.22)' : '#060c1e'}; border: 1px solid ${isAct ? f.col : 'var(--navy)'}; color: ${isAct ? 'var(--white)' : f.col}; border-radius: 999px; padding: 3px 10px; font-size: 10.5px; font-weight: 700; cursor: pointer;">
+              ${escapeHtml(f.label)}
+            </button>
+          `;
+        }).join('');
+        setHtmlIfChanged(pillsRow, pillsHtml);
+      }
+
+      const grid = document.getElementById('production-board-cards-container');
+      if (!grid) return;
+
+      if (items.length === 0) {
+        setHtmlIfChanged(grid, '<div class="blueprint-empty">Production Board is initializing... Specialists are decomposing the Game Bible into concrete work items with visual &amp; waveform proof gates.</div>');
+        return;
+      }
+
+      const searchInput = document.getElementById('board-search-input');
+      const searchQuery = searchInput ? String(searchInput.value || '').trim().toLowerCase() : '';
+
+      // Sort items so active items (in_progress, awaiting_review, changes_requested) appear first!
+      const statusPriority = {
+        in_progress: 1,
+        awaiting_review: 2,
+        changes_requested: 3,
+        needs_decision: 4,
+        failed: 5,
+        ready: 6,
+        blocked: 7,
+        approved: 8,
+      };
+
+      const filtered = items.filter(it => {
+        const st = String(it.status || 'ready').toLowerCase();
+        if (currentBoardFilter === 'active' && !['in_progress', 'awaiting_review', 'changes_requested', 'needs_decision'].includes(st)) return false;
+        if ((currentBoardFilter === 'ready' || currentBoardFilter === 'queued') && !['ready', 'blocked'].includes(st)) return false;
+        if (!['all', 'active', 'ready', 'queued'].includes(currentBoardFilter) && st !== currentBoardFilter) return false;
+        if (searchQuery) {
+          const hay = `${it.id || ''} ${it.title || ''} ${it.description || ''} ${it.owner_role || ''} ${it.worker_notes || ''} ${it.verdict?.feedback || ''}`.toLowerCase();
+          if (!hay.includes(searchQuery)) return false;
+        }
+        return true;
+      }).sort((a, b) => {
+        const pa = statusPriority[String(a.status || 'ready').toLowerCase()] || 9;
+        const pb = statusPriority[String(b.status || 'ready').toLowerCase()] || 9;
+        if (pa !== pb) return pa - pb;
+        return (a.priority || 10) - (b.priority || 10);
+      });
+
+      if (filtered.length === 0) {
+        setHtmlIfChanged(grid, `<div class="blueprint-empty">No work items match filter "${escapeHtml(currentBoardFilter)}". Click "All Items" above to inspect all ${items.length} items.</div>`);
+        return;
+      }
+
+      const statusBadgeConfig = {
+        in_progress: { icon: '🔨', label: 'IN PROGRESS (GENERATING)', col: 'var(--cyan)', bg: 'rgba(41, 173, 255, 0.18)' },
+        awaiting_review: { icon: '🔍', label: 'AWAITING COUNCIL REVIEW', col: 'var(--amber)', bg: 'rgba(255, 163, 0, 0.2)' },
+        changes_requested: { icon: '🛠️', label: 'CHANGES REQUESTED', col: 'var(--pink)', bg: 'rgba(255, 119, 168, 0.18)' },
+        approved: { icon: '✅', label: 'APPROVED WITH PROOF', col: 'var(--green)', bg: 'rgba(0, 228, 54, 0.16)' },
+        ready: { icon: '⏳', label: 'READY FOR CLAIM', col: 'var(--light-gray)', bg: 'rgba(255,255,255,0.06)' },
+        blocked: { icon: '🔒', label: 'WAITING ON DEPENDENCY', col: 'var(--slate)', bg: 'rgba(255,255,255,0.04)' },
+        failed: { icon: '❌', label: 'FAILED', col: 'var(--neon-red)', bg: 'rgba(255, 0, 77, 0.18)' },
+        needs_decision: { icon: '🧠', label: 'ESCALATED TO WRITERS ROOM', col: 'var(--yellow)', bg: 'rgba(255, 236, 39, 0.18)' },
+      };
+
+      const cardsHtml = filtered.map(it => {
+        const st = String(it.status || 'ready').toLowerCase();
+        const cfg = statusBadgeConfig[st] || statusBadgeConfig.ready;
+        const proofPaths = Array.isArray(it.proof?.artifact_paths)
+          ? it.proof.artifact_paths
+          : (Array.isArray(it.proof_paths) ? it.proof_paths : []);
+        const imageProofs = proofPaths.filter(p => /\.(png|jpg|jpeg|webp)$/i.test(String(p)));
+        const audioProofs = proofPaths.filter(p => /\.(wav|mp3|ogg)$/i.test(String(p)));
+        const deps = Array.isArray(it.dependencies) && it.dependencies.length > 0
+          ? `Depends on: ${it.dependencies.join(', ')}`
+          : '';
+        const reviewers = Array.isArray(it.reviewer_roles) && it.reviewer_roles.length > 0
+          ? it.reviewer_roles.join(', ')
+          : 'Specialist Council';
+        const feedback = formatHumanText(it.verdict?.feedback || it.feedback || '');
+        const reqChanges = Array.isArray(it.verdict?.required_changes) ? it.verdict.required_changes : [];
+        const workerNotes = formatHumanText(it.worker_notes || it.proof?.test_Assertion_summary || '');
+        const metricsObj = it.proof?.measured_metrics || {};
+        const metricsKeys = Object.keys(metricsObj);
+
+        const thumbsHtml = imageProofs.length > 0 ? `
+          <div class="board-proof-strip">
+            ${imageProofs.map(p => {
+              const url = formatProofUrl(p);
+              const fname = String(p).split('/').pop();
+              return `
+                <div class="board-proof-thumb" onclick="openMockupLightbox('${escapeHtml(url)}', '${escapeHtml(it.id + ': ' + it.title)}', '${escapeHtml(fname)}', '${escapeHtml(workerNotes || feedback || '')}')" title="Click to inspect proof artifact: ${escapeHtml(fname)}">
+                  <img src="${escapeHtml(url)}" alt="${escapeHtml(fname)}" loading="lazy" onerror="this.parentElement.style.display='none'" />
+                  <div class="proof-caption">📸 ${escapeHtml(fname)}</div>
+                </div>
+              `;
+            }).join('')}
+          </div>
+        ` : '';
+
+        const audioHtml = audioProofs.length > 0 ? `
+          <div style="display: flex; flex-direction: column; gap: 4px; margin-top: 4px;">
+            ${audioProofs.map(p => {
+              const url = formatProofUrl(p);
+              const fname = String(p).split('/').pop();
+              return `
+                <div style="display: flex; align-items: center; gap: 8px; background: #040917; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--navy);">
+                  <span style="font-size: 10px; color: var(--peach); font-family: monospace;">🔊 ${escapeHtml(fname)}</span>
+                  <audio controls preload="metadata" style="height: 24px; flex: 1;" src="${escapeHtml(url)}" onerror="this.parentElement.style.display='none'"></audio>
+                </div>
+              `;
+            }).join('')}
+          </div>
+        ` : '';
+
+        return `
+          <div class="board-item-card status-${escapeHtml(st)}">
+            <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+              <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                <span style="font-family: monospace; font-weight: 800; font-size: 12px; color: var(--cyan); background: rgba(41,173,255,0.12); padding: 2px 6px; border-radius: 4px;">${escapeHtml(it.id)}</span>
+                <strong style="color: var(--white); font-size: 12.5px;">${escapeHtml(it.title || '')}</strong>
+                <span class="task-badge-role" style="font-size: 9.5px;">👤 ${escapeHtml(it.owner_role || 'Worker')}</span>
+                <span style="font-size: 10px; color: var(--slate);">🔍 Reviewers: ${escapeHtml(reviewers)}</span>
+              </div>
+              <div style="display: flex; align-items: center; gap: 6px;">
+                ${it.attempt_count ? `<span style="font-size: 10px; color: var(--amber); font-family: monospace;">Attempt #${escapeHtml(it.attempt_count)}</span>` : ''}
+                <span style="padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 800; color: ${cfg.col}; background: ${cfg.bg}; border: 1px solid ${cfg.col};">
+                  ${cfg.icon} ${escapeHtml(cfg.label)}
+                </span>
+              </div>
+            </div>
+            ${it.description ? `<div style="font-size: 11px; color: var(--light-gray); line-height: 1.4;">${escapeHtml(it.description)}</div>` : ''}
+            ${workerNotes ? `
+              <div style="font-size: 10.5px; color: var(--cyan); background: rgba(41, 173, 255, 0.07); border-left: 2px solid var(--cyan); padding: 4px 8px; border-radius: 3px;">
+                <strong>🔧 Worker Proof Summary:</strong> ${escapeHtml(workerNotes)}
+              </div>
+            ` : ''}
+            ${feedback ? `
+              <div style="font-size: 10.5px; color: ${st === 'approved' ? 'var(--green)' : 'var(--pink)'}; background: rgba(255, 119, 168, 0.08); border-left: 2px solid ${st === 'approved' ? 'var(--green)' : 'var(--pink)'}; padding: 5px 8px; border-radius: 3px;">
+                <strong>⚖️ Council Review Verdict (${escapeHtml(it.verdict?.reviewer_role || 'Council')}):</strong> ${escapeHtml(feedback)}
+                ${reqChanges.length > 0 ? `<ul style="margin: 3px 0 0 16px; padding: 0; color: var(--yellow);">${reqChanges.map(c => `<li>${escapeHtml(c)}</li>`).join('')}</ul>` : ''}
+              </div>
+            ` : ''}
+            ${thumbsHtml}
+            ${audioHtml}
+            <div style="display: flex; justify-content: space-between; align-items: center; font-size: 10px; color: var(--slate); flex-wrap: wrap; gap: 6px;">
+              <span>📁 Target Files: <code>${escapeHtml((it.target_files || []).join(', ') || 'cartridge')}</code></span>
+              ${metricsKeys.length > 0 ? `<span>📊 Metrics: ${escapeHtml(metricsKeys.map(k => `${k}=${JSON.stringify(metricsObj[k])}`).join(' | ').slice(0, 120))}</span>` : ''}
+              ${deps ? `<span>🔗 ${escapeHtml(deps)}</span>` : ''}
+            </div>
+          </div>
+        `;
+      }).join('');
+
+      setHtmlIfChanged(grid, cardsHtml);
+    }
+
+    function updateStudioPulseRibbon() {
+      const ribbon = document.getElementById('studio-live-pulse-bar');
+      if (!ribbon) return;
+
+      const orb = document.getElementById('pulse-live-orb');
+      const phaseChip = document.getElementById('pulse-phase-badge');
+      const headlineEl = document.getElementById('pulse-game-title');
+      const subtextEl = document.getElementById('pulse-now-playing-text');
+      const retryBadge = document.getElementById('pulse-retry-badge');
+      const progEl = document.getElementById('studio-board-progress');
+      const pctLabel = document.getElementById('pulse-board-pct-label');
+      const countsLabel = document.getElementById('pulse-board-summary-label');
+      const heartbeatEl = document.getElementById('pulse-elapsed-badge');
+
+      const countTotal = document.getElementById('pulse-count-total');
+      const countWorking = document.getElementById('pulse-count-inprog');
+      const countReview = document.getElementById('pulse-count-review');
+      const countRevising = document.getElementById('pulse-count-changes');
+      const countApproved = document.getElementById('pulse-count-approved');
+
+      const bible = cachedGameBible || {};
+      const transcript = Array.isArray(bible.writers_room_transcript) ? bible.writers_room_transcript : [];
+
+      const board = latestProductionBoard || bible.production_board || (observabilityState.cachedRequirementsSpec && observabilityState.cachedRequirementsSpec.production_board) || null;
+      const items = board && Array.isArray(board.items) ? board.items : [];
+      const counts = board && board.counts ? board.counts : computeBoardCounts(items);
+
+      const inProgItems = items.filter(it => it.status === 'in_progress');
+      const reviewItems = items.filter(it => it.status === 'awaiting_review');
+      const changesItems = items.filter(it => it.status === 'changes_requested');
+      const approvedCount = counts.approved || 0;
+      const totalCount = counts.total || items.length || 0;
+
+      if (countTotal) countTotal.textContent = String(totalCount);
+      if (countWorking) countWorking.textContent = String(inProgItems.length);
+      if (countReview) countReview.textContent = String(reviewItems.length);
+      if (countRevising) countRevising.textContent = String(changesItems.length);
+      if (countApproved) countApproved.textContent = `${approvedCount}/${totalCount}`;
+
+      const running = typeof isBuildActivelyRunning === 'function' ? isBuildActivelyRunning() : false;
+      const hasActiveWork = running || inProgItems.length > 0 || reviewItems.length > 0;
+
+      ribbon.classList.toggle('is-working', hasActiveWork);
+      if (orb) {
+        orb.classList.toggle('idle', !hasActiveWork && !(totalCount > 0 && approvedCount === totalCount));
+        orb.classList.toggle('warning', Boolean(_lastRetryNotice && (Date.now() - _lastRetryNotice.ts < 45000)));
+      }
+
+      // Progress bar (weighted so in_progress/awaiting_review/changes_requested show partial progress rather than 0%)
+      if (progEl) {
+        if (totalCount > 0) {
+          const weightedDone =
+            approvedCount * 1.0 +
+            reviewItems.length * 0.75 +
+            changesItems.length * 0.55 +
+            inProgItems.length * 0.35;
+          const pct = Math.min(100, Math.max(2, Math.round((weightedDone / totalCount) * 100)));
+          progEl.setAttribute('max', '100');
+          progEl.setAttribute('value', String(pct));
+          if (pctLabel) pctLabel.textContent = `${approvedCount}/${totalCount} Verified (${pct}% Weighted)`;
+          if (countsLabel) {
+            countsLabel.textContent = `${inProgItems.length} working · ${reviewItems.length} in review · ${changesItems.length} revising · ${(counts.ready || 0) + (counts.blocked || 0)} queued`;
+          }
+        } else if (hasActiveWork) {
+          // Indeterminate state when brainstorming before board items exist
+          progEl.removeAttribute('value');
+          if (pctLabel) pctLabel.textContent = 'Brainstorming Concept...';
+          if (countsLabel) countsLabel.textContent = `${transcript.length} Writers' Room turns`;
+        } else {
+          progEl.setAttribute('max', '100');
+          progEl.setAttribute('value', '0');
+          if (pctLabel) pctLabel.textContent = '0 / 0 Approved (0%)';
+          if (countsLabel) countsLabel.textContent = 'Production Board Pipeline';
+        }
+      }
+
+      // Empathetic Headline & Subtext explaining EXACTLY what is happening right now
+      const gameTitle = bible.game_title || (board && board.game_title) || 'Autonomous Cartridge';
+      if (inProgItems.length > 0 || reviewItems.length > 0 || changesItems.length > 0) {
+        if (phaseChip) {
+          phaseChip.textContent = inProgItems.length > 0
+            ? `⚡ PARALLEL BUILD & PROOF SYNTHESIS`
+            : (reviewItems.length > 0 ? `🔍 COUNCIL REVIEWING PROOFS` : `🛠️ ITERATING ON FEEDBACK`);
+        }
+        const activeSummaries = [];
+        for (const it of inProgItems) {
+          activeSummaries.push(`🔨 ${it.owner_role} is building [${it.id}] "${it.title}" (Attempt #${it.attempt_count || 1})`);
+        }
+        for (const it of reviewItems) {
+          const revs = Array.isArray(it.reviewer_roles) ? it.reviewer_roles.join(' & ') : 'Council';
+          activeSummaries.push(`🔍 ${revs} reviewing proof for [${it.id}] "${it.title}"`);
+        }
+        for (const it of changesItems.slice(0, 2)) {
+          activeSummaries.push(`🛠️ [${it.id}] "${it.title}" queued for revision (${it.verdict?.reviewer_role || 'Council'} requested changes)`);
+        }
+        if (headlineEl) {
+          headlineEl.textContent = activeSummaries[0] || _lastActivityHeadline || `Building "${gameTitle}"`;
+        }
+        if (subtextEl) {
+          const extra = activeSummaries.length > 1
+            ? `${activeSummaries.slice(1).join('  •  ')}  |  `
+            : '';
+          subtextEl.textContent = `${extra}${approvedCount} of ${totalCount} items verified with proof artifacts in "${gameTitle}". Click "🏗️ Live Production Board & Proofs" below to inspect live PNG sheets & waveforms.`;
+        }
+      } else if (hasActiveWork) {
+        if (phaseChip) phaseChip.textContent = '💬 WRITERS ROOM ACTIVE';
+        if (headlineEl) headlineEl.textContent = _lastActivityHeadline || `Specialists are brainstorming "${gameTitle}"...`;
+        if (subtextEl) subtextEl.textContent = `${transcript.length} utterances recorded in the Living Game Bible.`;
+      } else if (totalCount > 0 && approvedCount < totalCount) {
+        if (phaseChip) phaseChip.textContent = '⏸️ PRODUCTION BOARD READY';
+        if (headlineEl) headlineEl.textContent = `"${gameTitle}" — ${approvedCount}/${totalCount} items verified (${totalCount - approvedCount} remaining)`;
+        if (subtextEl) subtextEl.textContent = `Click "▶️ Resume Game" in the top bar or inspect the Production Board below.`;
+      } else if (totalCount > 0 && approvedCount === totalCount) {
+        if (phaseChip) phaseChip.textContent = '✅ ALL ITEMS APPROVED';
+        if (headlineEl) headlineEl.textContent = `🎉 All ${totalCount} Production Board items for "${gameTitle}" verified with proof!`;
+        if (subtextEl) subtextEl.textContent = `Inspect final sign-off and playtest captures below.`;
+      }
+
+      // Transient 504 / Retry reassurance badge
+      if (retryBadge) {
+        if (_lastRetryNotice && (Date.now() - _lastRetryNotice.ts < 60000)) {
+          const agoSec = Math.max(1, Math.round((Date.now() - _lastRetryNotice.ts) / 1000));
+          retryBadge.style.display = 'inline-flex';
+          retryBadge.textContent = `${_lastRetryNotice.message} (${agoSec}s ago)`;
+        } else {
+          retryBadge.style.display = 'none';
+        }
+      }
+
+      if (heartbeatEl) {
+        if (_lastActivityTimestampMs > 0) {
+          const secAgo = Math.max(0, Math.round((Date.now() - _lastActivityTimestampMs) / 1000));
+          heartbeatEl.textContent = secAgo <= 2 ? 'Live: just now' : `Last event: ${secAgo}s ago`;
+        } else if (board && board.updated_at) {
+          const dt = Date.parse(board.updated_at);
+          if (!Number.isNaN(dt)) {
+            const secAgo = Math.max(0, Math.round((Date.now() - dt) / 1000));
+            heartbeatEl.textContent = `Board updated: ${secAgo}s ago`;
+          }
+        }
+      }
     }
 
     window.openMockupLightbox = function(url, title, sceneType, notes) {
@@ -4443,13 +5771,18 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
 
       let artifactBadge = '';
       if (utt.bible_updates_summary) {
-        artifactBadge += `<div style="margin-top: 4px; font-size: 10.5px; color: var(--cyan); background: rgba(41, 173, 255, 0.1); border-left: 2px solid var(--cyan); padding: 4px 8px; border-radius: 3px;">📘 <strong>Bible Update:</strong> ${escapeHtml(utt.bible_updates_summary)}</div>`;
+        const cleanSummary = formatHumanText(utt.bible_updates_summary);
+        if (cleanSummary) {
+          artifactBadge += `<div style="margin-top: 4px; font-size: 10.5px; color: var(--cyan); background: rgba(41, 173, 255, 0.1); border-left: 2px solid var(--cyan); padding: 4px 8px; border-radius: 3px;">📘 <strong>Bible Update:</strong> ${escapeHtml(cleanSummary)}</div>`;
+        }
       }
       if (utt.artifact_emitted && typeof utt.artifact_emitted === 'object') {
         const aType = utt.artifact_emitted.type || 'artifact';
         if (aType === 'mockup') {
           const fname = (utt.artifact_emitted.file_path || utt.artifact_emitted.image_path || '').split('/').pop();
-          const mUrl = `/api/assets/mockups/${encodeURIComponent(fname)}`;
+          const effCart = _selectedCartridgeId || _activeCandidateId || '';
+          const cartQ = effCart ? `?cartridge=${encodeURIComponent(effCart)}` : '';
+          const mUrl = `/api/assets/mockups/${encodeURIComponent(fname)}${cartQ}`;
           const mTitle = utt.artifact_emitted.title || fname;
           artifactBadge += `
             <div style="margin-top: 6px; background: #040814; border: 1px solid var(--navy); border-radius: 4px; padding: 6px;">
@@ -4491,6 +5824,31 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     function renderGameBible(bible) {
       if (!bible) return;
       cachedGameBible = bible;
+      if (!_userPinnedCartridge && bible.cartridge_id && String(bible.cartridge_id).startsWith('candidate_')) {
+        const newCid = String(bible.cartridge_id);
+        const changed = newCid !== _selectedCartridgeId || newCid !== _activeCandidateId;
+        _activeCandidateId = newCid;
+        _selectedCartridgeId = newCid;
+        if (changed) {
+          _gameCatalogCache.delete(newCid);
+          if (!bible.production_board || !Array.isArray(bible.production_board.items) || bible.production_board.items.length === 0) {
+            latestProductionBoard = normalizeBoardPayload({ items: [], game_title: bible.game_title || '' }, newCid);
+            if (typeof observabilityState === 'object' && observabilityState) {
+              observabilityState.cachedRequirementsSpec = null;
+              observabilityState.requirements = [];
+              observabilityState.cachedTasks = [];
+              if (typeof updateTaskMetrics === 'function') updateTaskMetrics([]);
+              if (typeof applyTaskFilters === 'function') applyTaskFilters();
+            }
+            _latestArtifactsData = null;
+            _lastShowcaseSignature = '';
+          }
+          if (typeof loadAvailableGames === 'function') loadAvailableGames();
+          if (typeof loadArtifacts === 'function') loadArtifacts();
+          if (typeof fetchTaskHistory === 'function') fetchTaskHistory();
+          if (typeof fetchRequirementsBacklog === 'function') fetchRequirementsBacklog();
+        }
+      }
 
       const togglePause = document.getElementById('toggle-pause-greenlight');
       if (togglePause && typeof bible.pause_for_greenlight === 'boolean') {
@@ -4630,8 +5988,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           ? '<div class="blueprint-empty">No concept evolution pivots logged yet.</div>'
           : evolutions.map(ev => {
               const author = ev.triggered_by_role || ev.author_role || 'Specialist';
-              const premise = ev.evolved_premise || ev.hypothesis || '';
-              const prevPremise = ev.previous_premise || '';
+              const premise = String(ev.evolved_premise || ev.hypothesis || '').trim();
+              const prevPremise = String(ev.previous_premise || '').trim();
+              const showPrev = Boolean(prevPremise && prevPremise !== premise);
               const pivotReason = ev.pivot_reason || ev.critique_or_pivot_reason || '';
               return `
                 <div class="evolution-card">
@@ -4639,7 +5998,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
                     <span style="font-weight: bold; color: var(--green); font-size: 11px;">v${escapeHtml(ev.version || 1)} — ${escapeHtml(author)}</span>
                     <span style="font-size: 10px; color: var(--slate);">Turn #${escapeHtml(ev.turn_index || 1)}</span>
                   </div>
-                  ${prevPremise ? `<div style="font-size: 10.5px; color: var(--slate); margin-bottom: 3px;"><em>From:</em> ${escapeHtml(prevPremise)}</div>` : ''}
+                  ${showPrev ? `<div style="font-size: 10.5px; color: var(--slate); margin-bottom: 3px;"><em>From:</em> ${escapeHtml(prevPremise)}</div>` : ''}
                   <div style="font-weight: bold; color: var(--white); font-size: 12px; margin-bottom: 4px;">${escapeHtml(premise)}</div>
                   <div style="font-size: 11px; color: var(--peach);"><strong>Pivot / Critique Rationale:</strong> ${escapeHtml(pivotReason)}</div>
                 </div>
@@ -4674,6 +6033,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       }
 
       // 3. 16:9 Visual Mockups & Style Guides
+      const effCartForBible = _selectedCartridgeId || _activeCandidateId || '';
+      const cartQueryForBible = effCartForBible ? `?cartridge=${encodeURIComponent(effCartForBible)}` : '';
       const mockGallery = document.getElementById('bible-mockups-gallery');
       if (mockGallery) {
         const mockHtml = mockups.length === 0
@@ -4681,8 +6042,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           : mockups.map(m => {
               const rawPath = m.image_path || m.file_path || '';
               const fname = rawPath.split('/').pop();
-              const mUrl = rawPath.startsWith('/api/') ? rawPath : `/api/assets/mockups/${encodeURIComponent(fname)}`;
-              const mNotes = m.ui_callout_notes || m.diegetic_ui_notes || m.scene_description || m.composition_prompt || '';
+              const mUrl = rawPath.startsWith('/api/') ? rawPath : `/api/assets/mockups/${encodeURIComponent(fname)}${cartQueryForBible}`;
+              const rawNotes = m.ui_callout_notes || m.diegetic_ui_notes || m.scene_description || m.composition_prompt || '';
+              const mNotes = formatHumanText(rawNotes);
               return `
                 <div class="mockup-card" onclick="openMockupLightbox('${escapeHtml(mUrl)}', '${escapeHtml(m.title || '')}', '${escapeHtml(m.scene_type || 'gameplay_scene')}', '${escapeHtml(mNotes)}')">
                   <img src="${escapeHtml(mUrl)}" alt="${escapeHtml(m.title || '16:9 Mockup')}" loading="lazy" />
@@ -4691,7 +6053,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
                       <strong style="color: var(--white); font-size: 12px;">${escapeHtml(m.title || fname)}</strong>
                       <span class="genre-chip" style="font-size: 9px;">${escapeHtml(m.scene_type || '16:9')}</span>
                     </div>
-                    <div style="font-size: 10.5px; color: var(--light-gray); line-height: 1.35;">${escapeHtml(mNotes)}</div>
+                    <div style="font-size: 10.5px; color: var(--light-gray); line-height: 1.4;">${escapeHtml(mNotes)}</div>
                   </div>
                 </div>
               `;
@@ -4701,17 +6063,26 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
 
       const styleAudioBox = document.getElementById('bible-style-audio-guides');
       if (styleAudioBox) {
-        const vsg = bible.visual_style_guide || {};
-        const adg = bible.audio_direction_guide || {};
+        const vsg = bible.visual_style_guide || '';
+        const adg = bible.audio_direction_guide || '';
+        const renderGuideBlock = (guideVal, emptyMsg) => {
+          if (!guideVal || (typeof guideVal === 'object' && Object.keys(guideVal).length === 0)) {
+            return `<div style="color: var(--slate); font-size: 11px;">${escapeHtml(emptyMsg)}</div>`;
+          }
+          if (typeof guideVal === 'string') {
+            return `<div style="background: #040918; border: 1px solid var(--navy); border-radius: 5px; padding: 10px 12px; font-size: 11.5px; line-height: 1.55; color: var(--white); white-space: pre-wrap;">${escapeHtml(guideVal.replace(/\\n/g, '\n'))}</div>`;
+          }
+          return `<div style="background: #040918; border: 1px solid var(--navy); border-radius: 5px; padding: 10px 12px; font-size: 11.5px; line-height: 1.5; color: var(--white); display: flex; flex-direction: column; gap: 4px;">${Object.entries(guideVal).map(([k, v]) => `<div><strong style="color: var(--cyan);">${escapeHtml(k.replace(/_/g, ' '))}:</strong> ${escapeHtml(formatHumanText(v))}</div>`).join('')}</div>`;
+        };
         const styleAudioHtml = `
-          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px;">
             <div>
               <h5 style="color: var(--yellow); font-size: 11px; text-transform: uppercase; margin-bottom: 6px;">🎨 Visual Style Guide</h5>
-              <pre class="json-dump" style="max-height: 140px;">${escapeHtml(JSON.stringify(vsg, null, 2))}</pre>
+              ${renderGuideBlock(vsg, 'No visual style guide locked yet.')}
             </div>
             <div>
               <h5 style="color: var(--peach); font-size: 11px; text-transform: uppercase; margin-bottom: 6px;">🔊 Audio Direction Guide</h5>
-              <pre class="json-dump" style="max-height: 140px;">${escapeHtml(JSON.stringify(adg, null, 2))}</pre>
+              ${renderGuideBlock(adg, 'No audio direction guide locked yet.')}
             </div>
           </div>
         `;
@@ -4726,7 +6097,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           : characters.map(c => {
               const rawPortrait = c.portrait_asset || c.portrait_file || `portrait_${c.character_id}.png`;
               const pFile = rawPortrait.split('/').pop();
-              const pUrl = `/api/assets/sprites/${encodeURIComponent(pFile)}`;
+              const pUrl = `/api/assets/sprites/${encodeURIComponent(pFile)}${cartQueryForBible}`;
               const traits = Array.isArray(c.personality_traits) ? c.personality_traits.join(', ') : '';
               const vp = c.voice_profile || {};
               const voiceDesc = c.voice_timbre || vp.voice_description || '';
@@ -4755,7 +6126,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
                   <div style="font-size: 11px; color: var(--light-gray); line-height: 1.4;">${escapeHtml(c.backstory || '')}</div>
                   ${voiceDesc ? `<div style="font-size: 10px; color: var(--cyan);">🎙️ <strong>Voice (${escapeHtml(voiceName)}):</strong> ${escapeHtml(voiceDesc)}</div>` : ''}
                   ${barkLine ? `<div style="font-size: 10.5px; color: var(--peach); font-style: italic; border-left: 2px solid var(--cyan); padding-left: 8px; margin-top: 2px;">"${escapeHtml(barkLine)}"</div>` : ''}
-                  ${audioFile ? `<audio controls preload="metadata" style="width: 100%; height: 28px; margin-top: 4px;" src="/api/assets/audio/${encodeURIComponent(audioFile)}" onerror="this.style.display='none'"></audio>` : ''}
+                  ${audioFile ? `<audio controls preload="metadata" style="width: 100%; height: 28px; margin-top: 4px;" src="/api/assets/audio/${encodeURIComponent(audioFile)}${cartQueryForBible}" onerror="this.style.display='none'"></audio>` : ''}
                 </div>
               `;
             }).join('');
@@ -4816,7 +6187,25 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           ${Object.keys(ws).length > 0 ? `
             <div>
               <h5 style="color: var(--cyan); font-size: 11px; text-transform: uppercase; margin-bottom: 6px;">🌍 Locked World Spec Blueprint</h5>
-              <pre class="json-dump" style="max-height: 320px;">${escapeHtml(JSON.stringify(ws, null, 2))}</pre>
+              <div style="background: #070e22; border: 1px solid rgba(41, 173, 255, 0.3); border-radius: 6px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; font-size: 11.5px;">
+                ${ws.thematic_premise ? `<div><strong style="color: var(--cyan);">Thematic Premise:</strong> ${escapeHtml(ws.thematic_premise)}</div>` : ''}
+                ${ws.world_lore ? `<div><strong style="color: var(--purple);">World Lore:</strong> ${escapeHtml(ws.world_lore)}</div>` : ''}
+                ${ws.conflict_narrative ? `<div><strong style="color: var(--amber);">Conflict Narrative (${escapeHtml(ws.conflict_tone || '')}):</strong> ${escapeHtml(ws.conflict_narrative)}</div>` : ''}
+                ${ws.aesthetic_style ? `<div><strong style="color: var(--yellow);">Aesthetic &amp; Palette:</strong> ${escapeHtml(ws.aesthetic_style)} ${ws.palette_mood ? `(${escapeHtml(ws.palette_mood)})` : ''}</div>` : ''}
+                ${ws.camera_style || ws.gameplay_pacing ? `<div><strong style="color: var(--green);">Camera &amp; Pacing:</strong> Camera: <code>${escapeHtml(ws.camera_style || 'scrolling')}</code> • Pacing: <code>${escapeHtml(ws.gameplay_pacing || 'balanced')}</code> (Difficulty: ${escapeHtml(ws.target_difficulty ?? 0.6)})</div>` : ''}
+                ${Array.isArray(ws.mechanics_guidelines) && ws.mechanics_guidelines.length > 0 ? `
+                  <div>
+                    <strong style="color: var(--peach);">Mechanics Guidelines:</strong>
+                    <ul style="margin: 4px 0 0 18px; padding: 0; display: flex; flex-direction: column; gap: 3px;">
+                      ${ws.mechanics_guidelines.map(mg => `<li>${escapeHtml(mg)}</li>`).join('')}
+                    </ul>
+                  </div>
+                ` : ''}
+                <details style="margin-top: 4px;">
+                  <summary style="cursor: pointer; color: var(--slate); font-size: 10px;">Inspect Raw World Spec JSON</summary>
+                  <pre class="json-dump" style="max-height: 220px; margin-top: 6px;">${escapeHtml(JSON.stringify(ws, null, 2))}</pre>
+                </details>
+              </div>
             </div>
           ` : ''}
         `;
@@ -4824,7 +6213,10 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       }
 
       // 6. Multi-Agent Final Sign-Off Council
-      const signoffReport = bible.sign_off_report || null;
+      let signoffReport = bible.sign_off_report || null;
+      if (signoffReport && signoffReport.candidate_id && effCartForBible && effCartForBible !== 'active' && signoffReport.candidate_id !== effCartForBible) {
+        signoffReport = null;
+      }
       const signoffCountEl = document.getElementById('bible-count-signoff');
       const signoffContainer = document.getElementById('bible-signoff-container');
       if (signoffReport && Array.isArray(signoffReport.verdicts) && signoffReport.verdicts.length > 0) {
@@ -4888,6 +6280,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             `;
           }).join('');
 
+          const pt0Url = `/api/assets/sprites/playtest_t0.png${cartQueryForBible}`;
+          const ptEndUrl = `/api/assets/sprites/playtest_tend.png${cartQueryForBible}`;
           const signoffHtml = `
             <div style="background: ${bannerBg}; border: 1px solid ${bannerCol}; border-radius: 6px; padding: 12px 14px; margin-bottom: 12px;">
               <div style="font-weight: bold; color: ${bannerCol}; font-size: 13px; margin-bottom: 4px;">${statusTitle}</div>
@@ -4899,12 +6293,12 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             <div style="margin-bottom: 12px;">
               <h5 style="color: var(--cyan); font-size: 11px; text-transform: uppercase; margin-bottom: 8px;">📸 Playtest Viewport Captures Inspected by Council</h5>
               <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
-                <div class="mockup-card" onclick="openMockupLightbox('/api/artifacts/content?filename=playtest_t0.png', 'Playtest Startup Capture (t=0s)', 'playtest_capture', 'Startup viewport frame inspected by VisualArtDirector & UXExperienceDesigner')">
-                  <img src="/api/artifacts/content?filename=playtest_t0.png" alt="Playtest t=0s Capture" loading="lazy" onerror="this.parentElement.style.display='none'" />
+                <div class="mockup-card" onclick="openMockupLightbox('${escapeHtml(pt0Url)}', 'Playtest Startup Capture (t=0s)', 'playtest_capture', 'Startup viewport frame inspected by VisualArtDirector & UXExperienceDesigner')">
+                  <img src="${escapeHtml(pt0Url)}" alt="Playtest t=0s Capture" loading="lazy" onerror="this.parentElement.style.display='none'" />
                   <div style="padding: 6px 10px; font-size: 10.5px; color: var(--light-gray);">Startup Viewport Frame (<code>playtest_t0.png</code>)</div>
                 </div>
-                <div class="mockup-card" onclick="openMockupLightbox('/api/artifacts/content?filename=playtest_tend.png', 'Playtest Post-Action Capture (t=end)', 'playtest_capture', 'Active gameplay frame after simulated player inputs')">
-                  <img src="/api/artifacts/content?filename=playtest_tend.png" alt="Playtest t=end Capture" loading="lazy" onerror="this.parentElement.style.display='none'" />
+                <div class="mockup-card" onclick="openMockupLightbox('${escapeHtml(ptEndUrl)}', 'Playtest Post-Action Capture (t=end)', 'playtest_capture', 'Active gameplay frame after simulated player inputs')">
+                  <img src="${escapeHtml(ptEndUrl)}" alt="Playtest t=end Capture" loading="lazy" onerror="this.parentElement.style.display='none'" />
                   <div style="padding: 6px 10px; font-size: 10.5px; color: var(--light-gray);">Active Gameplay Frame (<code>playtest_tend.png</code>)</div>
                 </div>
               </div>
@@ -4916,16 +6310,37 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           setHtmlIfChanged(signoffContainer, signoffHtml);
         }
       } else {
-        if (signoffCountEl) signoffCountEl.textContent = '0/6';
+        const pbItems = (latestProductionBoard && Array.isArray(latestProductionBoard.items)) ? latestProductionBoard.items : [];
+        const pbApproved = pbItems.filter(it => it.status === 'approved').length;
+        if (signoffCountEl) {
+          signoffCountEl.textContent = pbItems.length > 0 ? `${pbApproved}/${pbItems.length}` : '0/6';
+        }
+        if (signoffContainer) {
+          setHtmlIfChanged(
+            signoffContainer,
+            `<div class="blueprint-empty">No final promotion Sign-Off Council report recorded yet for <code>${escapeHtml(effCartForBible || 'active')}</code>.${pbItems.length > 0 ? ` (${pbApproved}/${pbItems.length} Production Board work items have passed per-item Specialist Council proof review.)` : ''}</div>`
+          );
+        }
+      }
+
+      if (bible.production_board && Array.isArray(bible.production_board.items) && !_userPinnedCartridge && (bible.production_board.items.length > 0 || String(bible.status || '').toLowerCase() === 'brainstorming')) {
+        latestProductionBoard = normalizeBoardPayload(bible.production_board, bible.cartridge_id || _activeCandidateId);
+        renderProductionBoardPanel();
+      } else {
+        fetchLiveProductionBoardFallback();
       }
 
       renderGameBlueprintPanel(latestHeatmapData, cachedGameBible);
       updateBibleProductionBanner();
+      updateStudioPulseRibbon();
     }
 
     function updateBibleProductionBanner() {
       if (typeof updateHeaderBuildStatus === 'function') {
         updateHeaderBuildStatus();
+      }
+      if (typeof updateStudioPulseRibbon === 'function') {
+        updateStudioPulseRibbon();
       }
       const bannerEl = document.getElementById('bible-production-progress-banner');
       const btnApprove = document.getElementById('btn-approve-greenlight');
@@ -4935,19 +6350,29 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const reqResp = observabilityState.cachedRequirementsSpec || {};
       const hasReqSpec = Boolean((reqResp.has_active_spec || reqResp.has_spec) && Array.isArray(reqResp.requirements) && reqResp.requirements.length > 0);
       const tracks = hasReqSpec ? reqResp.requirements : [];
+      const board = latestProductionBoard || bible.production_board || reqResp.production_board || null;
+      const boardItems = board && Array.isArray(board.items) ? board.items : [];
       const running = typeof isBuildActivelyRunning === 'function' ? isBuildActivelyRunning() : false;
+
+      const labelPauseGreenlight = document.getElementById('label-pause-greenlight');
+      const isAlreadyGreenlitOrBuilt = (st === 'locked' || st === 'greenlit' || boardItems.length > 0);
+      if (labelPauseGreenlight) {
+        labelPauseGreenlight.style.display = isAlreadyGreenlitOrBuilt ? 'none' : 'inline-flex';
+      }
 
       if (btnApprove) {
         if (st === 'awaiting_greenlight' || orchState === 'AWAITING_GREENLIGHT') {
           btnApprove.disabled = false;
           btnApprove.innerHTML = '✅ Greenlight &amp; Build';
           btnApprove.style.opacity = '1';
-        } else if (st === 'locked' || st === 'greenlit') {
-          const allDone = tracks.length > 0 && tracks.every(t => (t.status || '').toLowerCase() === 'completed' || (t.status || '').toLowerCase() === 'satisfied');
+        } else if (st === 'locked' || st === 'greenlit' || boardItems.length > 0) {
+          const allDone = boardItems.length > 0
+            ? boardItems.every(it => String(it.status || it.state || '').toLowerCase() === 'approved')
+            : (tracks.length > 0 && tracks.every(t => ['completed', 'satisfied'].includes((t.status || '').toLowerCase())));
           btnApprove.disabled = true;
           btnApprove.innerHTML = allDone
             ? '✅ Greenlit — Cartridge Built'
-            : (running ? '⚙️ Greenlit — Building Game...' : '⏸️ Greenlit — Ready to Resume');
+            : (_isBuildPaused ? '⏸️ Build Paused' : (running ? '⚙️ Greenlit — Building Game...' : '⏸️ Greenlit — Ready to Resume'));
           btnApprove.style.opacity = '0.85';
         } else {
           btnApprove.disabled = false;
@@ -4958,11 +6383,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
 
       if (!bannerEl) return;
 
-      if (st === 'brainstorming') {
-        bannerEl.style.display = 'none';
-        return;
-      }
-
+      // Eliminate redundancy: #studio-live-pulse-bar already shows live board progress & active workers!
+      // Only show #bible-production-progress-banner when paused for Executive Greenlight.
       if (st === 'awaiting_greenlight' || (orchState === 'AWAITING_GREENLIGHT' && st !== 'idle')) {
         bannerEl.style.display = 'block';
         bannerEl.style.borderColor = 'var(--yellow)';
@@ -4978,89 +6400,6 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         return;
       }
 
-      if (st === 'locked' || st === 'greenlit' || orchState === 'SYNTHESIZING' || orchState === 'VERIFYING' || hasReqSpec) {
-        bannerEl.style.display = 'block';
-        bannerEl.style.borderColor = running ? 'var(--cyan)' : 'var(--green)';
-        const completedCount = tracks.filter(t => ['completed', 'satisfied'].includes((t.status || '').toLowerCase())).length;
-        const inProgTrack = tracks.find(t => (t.status || '').toLowerCase() === 'in_progress');
-        const nextTrack = tracks.find(t => !['completed', 'satisfied'].includes((t.status || '').toLowerCase()));
-        const totalTracks = tracks.length;
-        const pct = totalTracks > 0 ? Math.round((completedCount / totalTracks) * 100) : 0;
-
-        const pillsHtml = tracks.map(t => {
-          const tSt = (t.status || 'pending').toLowerCase();
-          let icon = '⏳';
-          let borderCol = 'var(--navy)';
-          let bgCol = '#060b19';
-          let textCol = 'var(--light-gray)';
-          if (tSt === 'completed' || tSt === 'satisfied') {
-            icon = '✅';
-            borderCol = 'var(--green)';
-            bgCol = 'rgba(0, 228, 54, 0.14)';
-            textCol = 'var(--green)';
-          } else if (tSt === 'in_progress') {
-            icon = '🔄';
-            borderCol = 'var(--cyan)';
-            bgCol = 'rgba(41, 173, 255, 0.18)';
-            textCol = 'var(--cyan)';
-          } else if (tSt === 'rejected') {
-            icon = '❌';
-            borderCol = 'var(--neon-red)';
-            bgCol = 'rgba(255, 0, 77, 0.15)';
-            textCol = 'var(--neon-red)';
-          }
-          return `<span style="display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: 4px; border: 1px solid ${borderCol}; background: ${bgCol}; color: ${textCol}; font-size: 11px; font-weight: 600;">${icon} ${escapeHtml(t.id)}: ${escapeHtml(t.title || '')}</span>`;
-        }).join('');
-
-        let statusHeadline = '';
-        if (running && inProgTrack) {
-          statusHeadline = `⚙️ Actively Implementing ${escapeHtml(inProgTrack.id)}: "${escapeHtml(inProgTrack.title || '')}"`;
-        } else if (running) {
-          statusHeadline = `⚙️ Living Game Bible Locked — Synthesizing Requirements, Code & Assets (${orchState})`;
-        } else if (totalTracks > 0 && completedCount === totalTracks) {
-          statusHeadline = `🎉 All ${totalTracks} Requirement Tracks Implemented & Verified!`;
-        } else if (nextTrack) {
-          statusHeadline = `⏸️ Build Ready to Resume at ${escapeHtml(nextTrack.id)}: "${escapeHtml(nextTrack.title || '')}"`;
-        } else {
-          statusHeadline = `⏸️ Living Game Bible Locked — Ready to Resume Development`;
-        }
-
-        const prodHtml = `
-          <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: ${totalTracks > 0 ? '8px' : '0'};">
-            <div style="flex: 1; min-width: 280px;">
-              <div style="display: flex; align-items: center; gap: 8px;">
-                <span style="font-weight: bold; color: ${running ? 'var(--cyan)' : 'var(--green)'}; font-size: 13px;">${statusHeadline}</span>
-                ${totalTracks > 0 ? `<span class="status-pill status-success" style="font-size: 10px;">${completedCount} / ${totalTracks} Tracks (${pct}%)</span>` : ''}
-              </div>
-              <div style="font-size: 11px; color: var(--light-gray); margin-top: 3px;">
-                The Writers' Room has handed off the locked Game Bible to the 9-agent engineering &amp; art swarm.
-              </div>
-            </div>
-            <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-              ${(!running && (totalTracks === 0 || completedCount < totalTracks)) ? `
-                <button type="button" class="btn-primary" onclick="triggerResumeGameBuild()" style="background: rgba(255, 163, 0, 0.22); border-color: var(--amber); color: var(--yellow); padding: 6px 12px; font-size: 11px;">
-                  ▶️ Resume Development${nextTrack ? ` (${escapeHtml(nextTrack.id)})` : ''}
-                </button>
-              ` : ''}
-              <button type="button" class="btn-primary" onclick="switchMainWorkspace('telemetry')" style="background: rgba(41, 173, 255, 0.2); border-color: var(--cyan); color: var(--cyan); padding: 6px 12px; font-size: 11px;">
-                🕸️ Watch Live Agent Swarm &amp; Code Diffs
-              </button>
-              <button type="button" class="btn-primary" onclick="openDrawerToTab('backlog')" style="background: rgba(0, 228, 54, 0.2); border-color: var(--green); color: var(--green); padding: 6px 12px; font-size: 11px;">
-                📋 Open Requirements &amp; Checkpoints (${completedCount}/${totalTracks || 0})
-              </button>
-            </div>
-          </div>
-          ${totalTracks > 0 ? `
-            <div class="backlog-progress-bar-container" style="margin-bottom: 8px; height: 6px;">
-              <div class="backlog-progress-bar-fill" style="width: ${pct}%;"></div>
-            </div>
-            <div style="display: flex; gap: 6px; flex-wrap: wrap;">${pillsHtml}</div>
-          ` : ''}
-        `;
-        setHtmlIfChanged(bannerEl, prodHtml);
-        return;
-      }
-
       bannerEl.style.display = 'none';
     }
 
@@ -5071,12 +6410,486 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
 
     async function loadGameBible() {
       try {
-        const res = await fetch('/api/studio/game-bible');
+        const effCart = _userPinnedCartridge ? (_selectedCartridgeId || '') : '';
+        const cartParam = effCart ? `?cartridge=${encodeURIComponent(effCart)}` : '';
+        const res = await fetch(`/api/studio/game-bible${cartParam}`);
         if (!res.ok) return;
         const data = await res.json();
         renderGameBible(data);
       } catch (e) {
         // Ignore transient fetch errors
+      }
+    }
+
+    // =========================================================================
+    // Multi-Game Switcher & Built Assets / Renders / Code Showcase
+    // =========================================================================
+    function resolveVisualAssetUrl(filename, cartId) {
+      const f = String(filename || '');
+      const effCart = cartId || _selectedCartridgeId || _activeCandidateId || 'active';
+      const cartQ = effCart ? `?cartridge=${encodeURIComponent(effCart)}` : '';
+      const prefix = effCart === 'active' ? '' : `../${effCart}/`;
+      if (f.startsWith('plate_') || f.startsWith('anim_sheet_')) {
+        return `/api/artifacts/content?path=${encodeURIComponent(`${prefix}artifacts/renders/${f}`)}&raw=true`;
+      }
+      if (f.startsWith('filmstrip_')) {
+        return `/api/artifacts/content?path=${encodeURIComponent(`${prefix}assets/playtest_captures/${f}`)}&raw=true`;
+      }
+      if (f.endsWith('_backdrop.png')) {
+        return `/api/artifacts/content?path=${encodeURIComponent(`${prefix}assets/backdrops/${f}`)}&raw=true`;
+      }
+      if (f.startsWith('mockup_')) {
+        return `/api/assets/mockups/${encodeURIComponent(f)}${cartQ}`;
+      }
+      return `/api/assets/sprites/${encodeURIComponent(f)}${cartQ}`;
+    }
+
+    window.inspectSourceCodeModule = async function(moduleName, cartId) {
+      const effCart = cartId || _selectedCartridgeId || _activeCandidateId || 'active';
+      const viewerEl = document.getElementById('built-source-code-viewer');
+      const titleEl = document.getElementById('built-source-code-title');
+      if (!viewerEl) return;
+      if (titleEl) titleEl.textContent = `📄 ${moduleName} (${effCart})`;
+      viewerEl.textContent = `Loading ${moduleName}...`;
+      try {
+        const relPath = effCart === 'active' ? moduleName : `../${effCart}/${moduleName}`;
+        const res = await fetch(`/api/artifacts/content?path=${encodeURIComponent(relPath)}`);
+        if (!res.ok) {
+          viewerEl.textContent = `Could not load ${moduleName} (HTTP ${res.status}).`;
+          return;
+        }
+        const data = await res.json();
+        viewerEl.textContent = data.content || `// Empty file: ${moduleName}`;
+      } catch (err) {
+        viewerEl.textContent = `Failed loading ${moduleName}: ${err.message}`;
+      }
+    };
+
+    let _lastShowcaseSignature = '';
+    async function renderBuiltRendersShowcase(artifactsData, cartId) {
+      const container = document.getElementById('built-renders-showcase-container');
+      const countTabEl = document.getElementById('bible-count-renders');
+      const countPulseEl = document.getElementById('pulse-count-renders');
+      const countNavEl = document.getElementById('header-renders-count');
+      if (!artifactsData) return;
+
+      const effCart = cartId || _selectedCartridgeId || _activeCandidateId || 'active';
+      const rawSpritesList = Array.isArray(artifactsData.sprites) ? artifactsData.sprites : [];
+      const seenSpriteNames = new Set();
+      const spritesList = [];
+      for (const sp of rawSpritesList) {
+        const fn = String(sp && sp.filename || '');
+        if (!fn || seenSpriteNames.has(fn)) continue;
+        seenSpriteNames.add(fn);
+        spritesList.push(sp);
+      }
+      const audioList = Array.isArray(artifactsData.audio_clips) ? artifactsData.audio_clips : [];
+      const codeModules = Array.isArray(artifactsData.code_modules) ? artifactsData.code_modules : [];
+
+      const boardItems = (latestProductionBoard && Array.isArray(latestProductionBoard.items))
+        ? latestProductionBoard.items
+        : [];
+      const boardProofImages = [];
+      const seenProofFiles = new Set(seenSpriteNames);
+      for (const it of boardItems) {
+        const pList = Array.isArray(it.proof?.artifact_paths) ? it.proof.artifact_paths : (it.proof_paths || []);
+        for (const p of pList) {
+          if (/\.(png|jpg|jpeg|webp)$/i.test(String(p))) {
+            const fn = String(p).split('/').pop();
+            if (!fn || seenProofFiles.has(fn)) continue;
+            seenProofFiles.add(fn);
+            boardProofImages.push({
+              path: p,
+              url: formatProofUrl(p),
+              filename: fn,
+              itemId: it.id,
+              itemTitle: it.title,
+              ownerRole: it.owner_role,
+              status: it.status,
+            });
+          }
+        }
+      }
+
+      const totalBuiltCount = spritesList.length + audioList.length + codeModules.length;
+      if (countTabEl) countTabEl.textContent = String(totalBuiltCount);
+      if (countPulseEl) countPulseEl.textContent = String(totalBuiltCount);
+      if (countNavEl) countNavEl.textContent = String(totalBuiltCount);
+
+      if (!container) return;
+
+      const sig = `${effCart}::${spritesList.length}::${audioList.length}::${codeModules.length}::${boardProofImages.length}`;
+      if (sig === _lastShowcaseSignature && container.children.length > 1) return;
+      _lastShowcaseSignature = sig;
+
+      // Categorize visual artifacts
+      const playtestCaptures = [];
+      const inspectionPlatesAndSheets = [];
+      const backdropsAndMockups = [];
+      const entitySpritesAndPortraits = [];
+
+      for (const sp of spritesList) {
+        const fn = String(sp.filename || '');
+        if (!fn) continue;
+        if (fn.startsWith('playtest_') || fn.startsWith('filmstrip_')) {
+          playtestCaptures.push(sp);
+        } else if (fn.startsWith('plate_') || fn.startsWith('anim_sheet_')) {
+          inspectionPlatesAndSheets.push(sp);
+        } else if (fn.endsWith('_backdrop.png') || fn.startsWith('mockup_') || fn.includes('hud') || fn.includes('ui_')) {
+          backdropsAndMockups.push(sp);
+        } else {
+          entitySpritesAndPortraits.push(sp);
+        }
+      }
+
+      const gameTitle = (cachedGameBible && cachedGameBible.game_title) || (latestProductionBoard && latestProductionBoard.game_title) || effCart;
+      const cartQ = effCart ? `?cartridge=${encodeURIComponent(effCart)}` : '';
+      const prefix = effCart === 'active' ? '' : `../${effCart}/`;
+
+      const renderCardHtml = (sp, categoryLabel, isPixelSprite = false) => {
+        const fn = String(sp.filename || '');
+        const primaryUrl = resolveVisualAssetUrl(fn, effCart);
+        const fallbackUrl = `/api/artifacts/content?path=${encodeURIComponent(`${prefix}assets/sprites/${fn}`)}&raw=true`;
+        const kb = ((sp.size_bytes || 0) / 1024).toFixed(1);
+        return `
+          <div class="built-render-card ${isPixelSprite ? 'sprite-card' : ''}" onclick="openMockupLightbox('${escapeHtml(primaryUrl)}', '${escapeHtml(fn)}', '${escapeHtml(categoryLabel)}', '${escapeHtml(gameTitle + ' — ' + kb + ' KB')}')">
+            <img src="${escapeHtml(primaryUrl)}" alt="${escapeHtml(fn)}" loading="lazy" onerror="if(!this.dataset.retried){this.dataset.retried='1';this.src='${escapeHtml(fallbackUrl)}';}else{this.parentElement.style.display='none';}" />
+            <div style="padding: 6px 8px; display: flex; justify-content: space-between; align-items: center; gap: 4px; font-size: 10px;">
+              <strong style="color: var(--white); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(fn)}">${escapeHtml(fn)}</strong>
+              <span style="color: var(--slate); font-family: monospace; flex-shrink: 0;">${kb}KB</span>
+            </div>
+          </div>
+        `;
+      };
+
+      const html = `
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; background: linear-gradient(90deg, rgba(41, 173, 255, 0.14), rgba(0, 228, 54, 0.12)); border: 1px solid var(--cyan); border-radius: 6px; padding: 10px 14px;">
+          <div>
+            <strong style="color: var(--cyan); font-size: 13px;">🎨 Built Artifacts &amp; Renders for "${escapeHtml(gameTitle)}" (<code>${escapeHtml(effCart)}</code>)</strong>
+            <div style="font-size: 11px; color: var(--light-gray); margin-top: 2px;">
+              Click any render, filmstrip, animation sheet, or sprite to inspect full-resolution in the lightbox.
+            </div>
+          </div>
+          <div style="display: flex; gap: 8px; flex-wrap: wrap; font-size: 11px;">
+            <span class="status-pill status-success">🎬 ${playtestCaptures.length} Playtest Renders</span>
+            <span class="status-pill" style="background: rgba(41,173,255,0.2); color: var(--cyan); border: 1px solid var(--cyan);">🔬 ${inspectionPlatesAndSheets.length + boardProofImages.length} Proof Sheets &amp; Plates</span>
+            <span class="status-pill" style="background: rgba(255,236,39,0.16); color: var(--yellow); border: 1px solid var(--yellow);">👾 ${entitySpritesAndPortraits.length + backdropsAndMockups.length} Sprites &amp; Backdrops</span>
+            <span class="status-pill" style="background: rgba(255,119,168,0.16); color: var(--peach); border: 1px solid var(--pink);">🔊 ${audioList.length} Audio Clips</span>
+          </div>
+        </div>
+
+        <section class="deferred-asset-section">
+          <h4 style="color: var(--green); font-size: 12px; text-transform: uppercase; margin-bottom: 4px;">
+            🎬 Playtest Viewport Captures, Collision Overlays &amp; Action Filmstrips (${playtestCaptures.length})
+          </h4>
+          <div style="font-size: 10.5px; color: var(--light-gray);">Headless Godot 4 viewport renders captured during automated playtesting and physics/collision verification.</div>
+          ${playtestCaptures.length > 0
+            ? `<div class="built-renders-grid">${playtestCaptures.map(sp => renderCardHtml(sp, 'playtest_render')).join('')}</div>`
+            : '<div class="blueprint-empty" style="margin-top:6px;">No playtest viewport captures recorded yet for this cartridge.</div>'}
+        </section>
+
+        <section class="deferred-asset-section">
+          <h4 style="color: var(--cyan); font-size: 12px; text-transform: uppercase; margin-bottom: 4px;">
+            🔬 Animation Sheets, Inspection Plates &amp; Work Item Proofs (${inspectionPlatesAndSheets.length + boardProofImages.length})
+          </h4>
+          <div style="font-size: 10.5px; color: var(--light-gray);">Multi-frame animation contact sheets, silhouette/contrast inspection plates, and work-item proof captures verified by the Specialist Council.</div>
+          <div class="built-renders-grid">
+            ${inspectionPlatesAndSheets.map(sp => renderCardHtml(sp, 'inspection_plate')).join('')}
+            ${boardProofImages.map(bp => `
+              <div class="built-render-card" onclick="openMockupLightbox('${escapeHtml(bp.url)}', '${escapeHtml(bp.itemId + ': ' + bp.itemTitle)}', 'work_item_proof', 'Verified proof artifact for ${escapeHtml(bp.itemId)} (${escapeHtml(bp.ownerRole)})')">
+                <img src="${escapeHtml(bp.url)}" alt="${escapeHtml(bp.filename)}" loading="lazy" onerror="this.parentElement.style.display='none'" />
+                <div style="padding: 6px 8px; font-size: 10px;">
+                  <div style="color: var(--cyan); font-weight: bold;">[${escapeHtml(bp.itemId)}] ${escapeHtml(bp.itemTitle)}</div>
+                  <div style="color: var(--light-gray); font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">📸 ${escapeHtml(bp.filename)}</div>
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        </section>
+
+        <section class="deferred-asset-section">
+          <h4 style="color: var(--yellow); font-size: 12px; text-transform: uppercase; margin-bottom: 4px;">
+            🌆 Parallax Backdrops, 16:9 Concept Mockups &amp; Diegetic UI (${backdropsAndMockups.length})
+          </h4>
+          ${backdropsAndMockups.length > 0
+            ? `<div class="built-renders-grid">${backdropsAndMockups.map(sp => renderCardHtml(sp, 'backdrop_or_mockup')).join('')}</div>`
+            : '<div class="blueprint-empty" style="margin-top:6px;">No backdrops or mockups found.</div>'}
+        </section>
+
+        <section class="deferred-asset-section">
+          <h4 style="color: var(--amber); font-size: 12px; text-transform: uppercase; margin-bottom: 4px;">
+            👾 Synthesized Entity Sprites, Tiles &amp; Character Portraits (${entitySpritesAndPortraits.length})
+          </h4>
+          ${entitySpritesAndPortraits.length > 0
+            ? `<div class="built-sprites-grid">${entitySpritesAndPortraits.map(sp => renderCardHtml(sp, 'sprite_asset', true)).join('')}</div>`
+            : '<div class="blueprint-empty" style="margin-top:6px;">No entity sprites generated yet.</div>'}
+        </section>
+
+        <section class="deferred-asset-section">
+          <h4 style="color: var(--peach); font-size: 12px; text-transform: uppercase; margin-bottom: 6px;">
+            🔊 Synthesized Voice Acting Clips &amp; Procedural SFX (${audioList.length})
+          </h4>
+          ${audioList.length > 0 ? `
+            <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 8px;">
+              ${audioList.map(clip => {
+                const aUrl = `/api/assets/audio/${encodeURIComponent(clip.filename)}${cartQ}`;
+                const kb = ((clip.size_bytes || 0) / 1024).toFixed(1);
+                return `
+                  <div style="background: #040917; border: 1px solid var(--navy); border-radius: 5px; padding: 6px 10px; display: flex; flex-direction: column; gap: 4px;">
+                    <div style="display: flex; justify-content: space-between; font-size: 10.5px;">
+                      <strong style="color: var(--peach); font-family: monospace;">🎵 ${escapeHtml(clip.filename)}</strong>
+                      <span style="color: var(--slate);">${kb} KB</span>
+                    </div>
+                    <audio controls preload="metadata" style="width: 100%; height: 26px;" src="${escapeHtml(aUrl)}"></audio>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          ` : '<div class="blueprint-empty">No audio clips synthesized yet.</div>'}
+        </section>
+
+        <section class="deferred-asset-section">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 8px;">
+            <h4 style="color: var(--cyan); font-size: 12px; text-transform: uppercase;">
+              💻 Generated Godot 4 Source Modules (${codeModules.length})
+            </h4>
+            <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+              ${codeModules.map(mod => `
+                <button type="button" class="pulse-stage-pill" onclick="inspectSourceCodeModule('${escapeHtml(mod)}', '${escapeHtml(effCart)}')" style="font-family: monospace;">
+                  📄 ${escapeHtml(mod)}
+                </button>
+              `).join('')}
+              <button type="button" class="pulse-stage-pill" onclick="inspectSourceCodeModule('level_layout.json', '${escapeHtml(effCart)}')" style="font-family: monospace;">
+                🗺️ level_layout.json
+              </button>
+            </div>
+          </div>
+          <div id="built-source-code-title" style="font-size: 11px; color: var(--yellow); font-family: monospace; margin-bottom: 4px;">Click any module above to inspect its generated source code</div>
+          <pre id="built-source-code-viewer" class="json-dump" style="max-height: 360px; font-size: 11px; line-height: 1.45;">Select a GDScript module (${escapeHtml(codeModules.join(', '))}) above to inspect the generated code for ${escapeHtml(gameTitle)}.</pre>
+        </section>
+      `;
+
+      setHtmlIfChanged(container, html);
+      if (codeModules.includes('main.gd')) {
+        inspectSourceCodeModule('main.gd', effCart);
+      }
+    }
+
+    let _loadAvailableGamesPromise = null;
+    async function loadAvailableGames() {
+      if (_loadAvailableGamesPromise) return _loadAvailableGamesPromise;
+      _loadAvailableGamesPromise = (async () => {
+        const switcher = document.getElementById('studio-game-switcher');
+        if (!switcher) return;
+        try {
+          const res = await fetch('/api/cartridges');
+          if (!res.ok) return;
+          const data = await res.json();
+          const rawFolders = Array.isArray(data.cartridges) ? data.cartridges : [];
+          const serverGames = Array.isArray(data.games) ? data.games : [];
+
+          if (!_activeCandidateId) {
+            try {
+              const evRes = await fetch('/api/events/history');
+              if (evRes.ok) {
+                const evData = await evRes.json();
+                const evList = Array.isArray(evData.events) ? evData.events : [];
+                for (let i = evList.length - 1; i >= 0; i--) {
+                  const bId = String(evList[i]?.build_id || '');
+                  if (bId.startsWith('build_candidate_')) {
+                    _activeCandidateId = bId.replace(/^build_/, '');
+                    break;
+                  } else if (bId.startsWith('candidate_')) {
+                    _activeCandidateId = bId;
+                    break;
+                  }
+                }
+              }
+            } catch (e) {}
+          }
+
+          const validFolders = rawFolders.filter(folder =>
+            folder &&
+            folder !== 'checkpoints' &&
+            folder !== 'candidate' &&
+            !folder.startsWith('checkpoint_') &&
+            !folder.startsWith('.')
+          );
+          const sortedFolders = [...validFolders].sort((a, b) => {
+            if (a === _activeCandidateId) return -1;
+            if (b === _activeCandidateId) return 1;
+            if (a === 'active') return -1;
+            if (b === 'active') return 1;
+            return b.localeCompare(a);
+          });
+          let uncachedProbeCount = 0;
+          const gameEntries = await Promise.all(sortedFolders.map(async (folder) => {
+            if (_gameCatalogCache.has(folder)) {
+              return _gameCatalogCache.get(folder);
+            }
+            const srvMatch = serverGames.find(g => g.cartridge_id === folder);
+            if (srvMatch && srvMatch.game_title) {
+              _gameCatalogCache.set(folder, srvMatch);
+              return srvMatch;
+            }
+            let gameTitle = folder === 'active' ? 'Active Cartridge' : folder;
+            let coreGenre = '';
+            let approvedItems = 0;
+            let totalItems = 0;
+            if (uncachedProbeCount < 6) {
+              uncachedProbeCount++;
+              if (folder === _activeCandidateId) {
+                try {
+                  const blPath = folder === 'active' ? 'backlog.json' : `../${folder}/backlog.json`;
+                  const blRes = await fetch(`/api/artifacts/content?path=${encodeURIComponent(blPath)}`);
+                  if (blRes.ok) {
+                    const blJson = await blRes.json();
+                    if (blJson && blJson.content) {
+                      const bl = JSON.parse(blJson.content);
+                      if (Array.isArray(bl.items)) {
+                        totalItems = bl.items.length;
+                        approvedItems = bl.items.filter(it => String(it.state || it.status || '').toLowerCase() === 'approved').length;
+                        if (bl.game_title) gameTitle = bl.game_title;
+                      }
+                    }
+                  }
+                } catch (e) {}
+              }
+              if (folder !== 'active' && (!gameTitle || gameTitle === folder)) {
+                try {
+                  const gbPath = `../${folder}/game_bible.json`;
+                  const gbRes = await fetch(`/api/artifacts/content?path=${encodeURIComponent(gbPath)}`);
+                  if (gbRes.ok) {
+                    const gbJson = await gbRes.json();
+                    if (gbJson && gbJson.content) {
+                      const gb = JSON.parse(gbJson.content);
+                      if (gb.game_title) gameTitle = gb.game_title;
+                      if (gb.core_genre) coreGenre = gb.core_genre;
+                    }
+                  }
+                } catch (e) {}
+              } else if (folder === 'active') {
+                try {
+                  const wsRes = await fetch('/api/artifacts/content?path=world_spec.json');
+                  if (wsRes.ok) {
+                    const wsJson = await wsRes.json();
+                    if (wsJson && wsJson.content) {
+                      const ws = JSON.parse(wsJson.content);
+                      if (ws.game_title) gameTitle = ws.game_title;
+                      if (ws.core_genre) coreGenre = ws.core_genre;
+                    }
+                  }
+                } catch (e) {}
+              }
+            }
+            const entry = {
+              cartridge_id: folder,
+              game_title: gameTitle,
+              core_genre: coreGenre,
+              approved_items: approvedItems,
+              total_items: totalItems,
+              is_active: folder === 'active',
+            };
+            _gameCatalogCache.set(folder, entry);
+            return entry;
+          }));
+
+        // Sort: active/live candidate first, then candidates with Production Board items (by approved count desc), then active, then others
+        const liveCand = (cachedGameBible && cachedGameBible.cartridge_id && String(cachedGameBible.cartridge_id).startsWith('candidate_'))
+          ? String(cachedGameBible.cartridge_id)
+          : _activeCandidateId;
+        gameEntries.sort((a, b) => {
+          if (liveCand) {
+            if (a.cartridge_id === liveCand && b.cartridge_id !== liveCand) return -1;
+            if (b.cartridge_id === liveCand && a.cartridge_id !== liveCand) return 1;
+          }
+          if ((b.total_items || 0) !== (a.total_items || 0)) return (b.total_items || 0) - (a.total_items || 0);
+          if ((b.approved_items || 0) !== (a.approved_items || 0)) return (b.approved_items || 0) - (a.approved_items || 0);
+          if (a.cartridge_id === 'active') return -1;
+          if (b.cartridge_id === 'active') return 1;
+          return b.cartridge_id.localeCompare(a.cartridge_id);
+        });
+
+        const currentChoice = _userPinnedCartridge
+          ? (_selectedCartridgeId || liveCand || (gameEntries[0] && gameEntries[0].cartridge_id) || 'active')
+          : (liveCand || _selectedCartridgeId || (gameEntries[0] && gameEntries[0].cartridge_id) || 'active');
+        switcher.innerHTML = gameEntries.map(g => {
+          const badge = g.total_items > 0
+            ? `[${g.approved_items}/${g.total_items} Verified]`
+            : (g.is_active ? '[Promoted Active]' : (g.cartridge_id === liveCand ? '[Live Build]' : '[Prototype]'));
+          const shortId = g.cartridge_id === 'active' ? 'active' : g.cartridge_id.replace('candidate_genesis_', '#');
+          return `<option value="${escapeHtml(g.cartridge_id)}">${escapeHtml(g.game_title)} ${escapeHtml(badge)} (${escapeHtml(shortId)})</option>`;
+        }).join('');
+
+          if (gameEntries.some(g => g.cartridge_id === currentChoice)) {
+            switcher.value = currentChoice;
+            if (!_userPinnedCartridge || !_selectedCartridgeId) {
+              _selectedCartridgeId = currentChoice;
+            }
+          }
+        } catch (err) {
+          console.warn('Failed to load available games:', err);
+        } finally {
+          _loadAvailableGamesPromise = null;
+        }
+      })();
+      return _loadAvailableGamesPromise;
+    }
+
+    async function switchSelectedGame(cartridgeId) {
+      if (!cartridgeId) return;
+      _userPinnedCartridge = true;
+      _selectedCartridgeId = cartridgeId;
+      _activeCandidateId = cartridgeId;
+      _lastShowcaseSignature = '';
+      _lastAudioClipsSignature = null;
+      _lastCodeModulesSignature = null;
+      _lastDiffSignature = null;
+      latestProductionBoard = null;
+
+      addDeliberation({
+        deliberation: `Switched Mission Control view to game cartridge "${cartridgeId}". Loading Game Bible, Production Board, Assets, Renders, and GDScript...`,
+        agent_name: 'MissionControlGateway',
+        event_type: 'cartridge_switched'
+      });
+
+      await Promise.all([
+        loadGameBible(),
+        fetchLiveProductionBoardFallback(),
+        loadArtifacts(),
+        loadPalette(),
+        loadDiff(),
+      ]);
+      updateHeaderBuildStatus();
+      updateStudioPulseRibbon();
+    }
+    window.switchSelectedGame = switchSelectedGame;
+
+    async function activateSelectedGame() {
+      const targetId = _selectedCartridgeId || _activeCandidateId;
+      if (!targetId || targetId === 'active') return;
+      const btn = document.getElementById('btn-activate-selected-game');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = '⏳ Activating...';
+      }
+      try {
+        const res = await fetch(`/api/checkpoints/${encodeURIComponent(targetId)}/activate`, { method: 'POST' });
+        const data = await res.json();
+        addDeliberation({
+          deliberation: data.deliberation || `Activated game cartridge ${targetId} as cartridges/active.`,
+          agent_name: 'MissionControlGateway',
+          event_type: 'checkpoint_activated'
+        });
+        _gameCatalogCache.delete('active');
+        await loadAvailableGames();
+      } catch (err) {
+        console.warn('Failed to activate selected game:', err);
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = '⭐ Set Active';
+        }
       }
     }
 
@@ -5211,6 +7024,14 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       document.getElementById('btn-inject-steering')?.addEventListener('click', () => submitGreenlightDecision(false));
       document.getElementById('btn-approve-greenlight')?.addEventListener('click', () => submitGreenlightDecision(true));
 
+      document.getElementById('studio-game-switcher')?.addEventListener('change', (e) => {
+        const val = e.target && e.target.value;
+        if (val) switchSelectedGame(val);
+      });
+      document.getElementById('btn-activate-selected-game')?.addEventListener('click', () => {
+        activateSelectedGame();
+      });
+
       const togglePause = document.getElementById('toggle-pause-greenlight');
       if (togglePause) {
         togglePause.addEventListener('change', async () => {
@@ -5230,15 +7051,20 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       }
     }
 
-    // Initialize UI components
-    loadSteamDNA();
-    loadHeatmap();
-    loadPalette();
-    loadArtifacts();
-    loadDiff();
+    // Initialize UI components (await game catalog first so _selectedCartridgeId is set before asset/bible fetches)
     initTaskObservability();
     initWritersRoomWorkspace();
-    loadGameBible();
+    loadSteamDNA();
+    loadHeatmap();
+    loadAvailableGames().finally(() => {
+      loadGameBible();
+      fetchLiveProductionBoardFallback();
+      loadArtifacts();
+      loadPalette();
+      loadDiff();
+      updateStudioPulseRibbon();
+    });
+    setInterval(updateStudioPulseRibbon, 1000);
   </script>
 </body>
 </html>

@@ -8,7 +8,12 @@ The system is an autonomous, requirement-driven multi-agent game studio swarm th
   - `orchestrator.py`: Meta-planning DAG and iterative requirement-by-requirement (`R1..Rn`) execution loop with verified checkpointing (`cartridges/checkpoints/`).
   - `models.py`: Epistemic data models (Pydantic models inheriting from `BaseEpistemicModel` with `deliberation` strictly at field index 0).
   - `director.py`: Concept (`GenesisWorldSpec`) & Game Requirements (`GameRequirementsSpec`) authoring from `SteamPlayerDNA` / `EvolutionHypothesisReport`.
-  - `writers_room.py`: 8-specialist `CreativeWritersRoom` (including `GameplaySystemsEngineer`) that builds the Living Game Bible (`GameBibleSpec`), including the `technical_architecture_blueprint` (`MechanicEngineeringSpec` list: Godot node/collider topology, unsolved-at-t=0 state machines, required assets, test invariants) that downstream agents consume.
+  - `writers_room.py`: 9-specialist `CreativeWritersRoom` (including `GameplaySystemsEngineer` and `LightingVFXDirector`) that runs **Emergent Concept Genesis** (`pitch_and_greenlight_concept`), builds the Living Game Bible (`GameBibleSpec`) with `technical_architecture_blueprint` and `rendering_strategy` (`RenderingStrategySpec`), authors and dependency-orders the unified `production_backlog` (`BacklogItem` DAG), conducts multimodal Specialist Review & Council Cap Moderation (`review_backlog_item`, `council_cap_moderation`), and executes live mid-session Executive Producer steering (`apply_live_steering`, `steer_backlog`).
+  - `production_board.py`: Continuous `ProductionBoard` DAG scheduler that claims unblocked `BacklogItem` work across concurrent workers, manages atomic `code_lock` critical sections for `.gd` scene mutations, routes items through specialist execution -> multimodal review -> rework/council moderation, triggers mid-sprint replanning, and verifies live steering pivots.
+  - `workers.py`: Iterative Task Lead Strategist (`run_task_lead`) and 4 autonomous domain specialists (`visual_artist`, `audio_designer`, `swe_engineer`, `qa_test_engineer`). Replaces fixed action menus with rationale-first strategic planning (`TaskLeadDecision`, `VisualCreationStrategy`, `AudioDesignStrategy`, `LevelGenerationStrategy`, `GoalSpec`, `CodeImplementationPlan`, `FilmstripPlan`) and task-ID-scoped asset/proof isolation.
+  - `proofs.py`: Multimodal proof rendering (`render_filmstrip_proof`, `render_level_map_proof`, `render_waveform_proof`, `render_sprite_sheet_proof`) producing task-ID-scoped visual inspection artifacts (`proofs/filmstrip_{item_id}_rev{rev}.png`, etc.) with counterfactual zero-input verification.
+  - `rendering.py`: Per-game `RenderingStrategySpec` validation and Godot 4.3 rendering/shader/post-process synthesis (`LightingVFXDirector` strategies, custom `.gdshader` pipelines, normal-map lighting, and particle blueprints).
+  - `sfx_synth.py`: Parametric multi-layered DSP sound effects synthesizer (`SFXLayerSpec`, `SFXPatchSpec`) with ADSR envelopes, filter sweeps, FM/ring modulation, pitch envelopes, and resonator banks.
   - `swe.py`: Iterative multi-module Godot 4.3 GDScript (`project.godot`, `main.tscn`, `main.gd`, `scenes.gd`, `mechanics.gd`, `entities.gd`, `ui_hud.gd`) and Python code synthesis, upfront production strategy (`formulate_production_strategy`), per-scene multimodal critique & iterative refinement (`analyze_scene_and_restrategize`, `execute_scene_strategy_and_refine_loop`), atomic work-unit decomposition and Godot test synthesis (`decompose_track_into_atomic_units`, `synthesize_atomic_godot_test`), and 2-hop scoped Plan-Execute-Verify surgical patching (`debug_and_patch_pev_cycle`) via `LeadGameplaySWEAgent`.
   - `asset_library.py`: Concept-grounded asset catalog (`CartridgeAssetLibrary`, `assets/asset_library.json`) with concept decomposition (flat structured-output schema, engineer-requested assets), portrait-vs-world-sprite separation, and baseline asset derivation from the Game Bible.
   - `visual.py`: Gemini sprite, portrait, and tile synthesis via `VisualArtSpriteDesignerAgent`: `rembg` + perimeter flood-fill alpha matting, continuous UV-displacement keyframe animation (`cv2.remap`), non-mirrored toroidal tiles, and Tier 1 / Tier 2 vision verification (`verify_rendered_asset`, `verify_rendered_animation`) that fail fast with `StudioAgentError`.
@@ -56,6 +61,12 @@ The system is an autonomous, requirement-driven multi-agent game studio swarm th
 | 22 | Atomic Godot TDD & Collision-Overlay Verification | `GodotAtomicTestRunner`, `AtomicWorkUnit` decomposition, passive auto-win / unbounded-sky Challenger checks | M9 | Follow-up |
 | 23 | Neural Alpha Matting & Keyframe Animation | `rembg` matting, continuous UV-displacement keyframe sheets, non-mirrored toroidal tiles, Tier 1/2 vision verification with no silent fallbacks | M9 | Follow-up |
 | 24 | Resumable Quality-Gate Stage | UI "Run Quality Gates" action when all tracks are complete; orchestrator `self.agents` lookups; `audit_simulation` `cpath` fix | M9 | Follow-up |
+| 25 | 9-Specialist Emergent Concept Genesis & Rendering Strategy | `LightingVFXDirector` specialist, `pitch_and_greenlight_concept` council pitch/greenlight, and per-game `RenderingStrategySpec` (`engine/studio/rendering.py`) | M10 | Follow-up |
+| 26 | Continuous Production Board & Council Backlog Review | `ProductionBoard` DAG scheduler (`engine/studio/production_board.py`), `BacklogItem` lifecycle, multimodal proof verification, and `council_cap_moderation` | M10 | Follow-up |
+| 27 | Iterative Task Lead Strategist & Autonomous Domain Specialists | `run_task_lead` orchestrating `visual_artist`, `audio_designer`, `swe_engineer`, and `qa_test_engineer` with open-ended strategic plans (`LevelGenerationStrategy`, `GoalSpec`, `CodeImplementationPlan`, `FilmstripPlan`) | M10 | Follow-up, Rule 2, Rule 4 |
+| 28 | Counterfactual QA Filmstrips & Task-ID-Scoped Proof Isolation | Counterfactual zero-input vs. scripted-input verification (`counterfactual_verified`), `QASetupCall`/`QAStateAssertion` execution in `godot_harness.gd`, and task-ID-scoped proofs (`filmstrip_{item_id}_rev{rev}.png`) | M10 | Follow-up |
+| 29 | Parametric Multi-Layered DSP Sound Effects Synthesis | `SFXPatchSpec` / `SFXLayerSpec` synthesis in `engine/studio/sfx_synth.py` integrated with `VoiceActingAudioProducerAgent` and `audio_designer` | M10 | Follow-up |
+| 30 | Live Executive Producer Steering & Authoritative Build Status | Durable `.pending_steering.json` mid-session steering pivot (`steer_backlog`), clean new-game state isolation, and authoritative `build_actively_running` heartbeat in Mission Control | M10 | Follow-up |
 
 ## Milestones
 | # | Name | Scope | Dependencies | Status |
@@ -70,7 +81,8 @@ The system is an autonomous, requirement-driven multi-agent game studio swarm th
 | M6 | Final Milestone & Live Genesis Verification | Phase 1 (100% E2E tests pass), Phase 2 (Tier 5 hardening), live Genesis build, pytest | E2E, M1–M5, M_UI | DONE |
 | M7 | Godot 4.3 Transition & SQLite WAL Persistence | Code-First Godot 4.3 Engine, GDScript 4 Synthesis, Headless Verification, SQLite WAL & Checkpoints | M6 | DONE |
 | M8 | Live WAL Streaming, Gemini Sprites & Designer Signoff Gate | Real-time `/ws/swarm` SQLite WAL tailing, live Gemini sprite synthesis, HiDPI mouse & `AudioStreamWAV` repair, and Designer UX Signoff | M7 | DONE |
-| M9 | Systems Engineer, Atomic TDD & Asset Quality | `GameplaySystemsEngineer`, `engine/sim/atomic_runner.py`, `rembg`/keyframe asset pipeline, quality-gate resume | M8 | DONE (live-run quality verification ongoing) |
+| M9 | Systems Engineer, Atomic TDD & Asset Quality | `GameplaySystemsEngineer`, `engine/sim/atomic_runner.py`, `rembg`/keyframe asset pipeline, quality-gate resume | M8 | DONE |
+| M10 | Continuous Production Board, Task Lead Strategist & Multimodal Proofs | `production_board.py`, `workers.py`, `proofs.py`, `rendering.py`, `sfx_synth.py`, counterfactual QA filmstrips, live room steering | M9 | DONE |
 
 ## Interface Contracts
 
@@ -108,10 +120,16 @@ The system is an autonomous, requirement-driven multi-agent game studio swarm th
 - `engine/sim/godot_harness.gd`: Headless Godot 4.3 scene-tree auditor (`_audit_scene_tree`), exploratory input driver, and telemetry bridge.
 - `engine/sim/godot_verifier.py`: Godot 4.3 stderr compiler parser (`parse_godot_stderr`, `verify_godot_cartridge_syntax`) and `GodotHeadlessSimulator`.
 - `engine/studio/director.py`: Concept (`GenesisWorldSpec`) & Requirements (`GameRequirementsSpec`) authoring.
-- `engine/studio/orchestrator.py`: Swarm DAG, iterative requirement execution loop, and checkpoint manager.
+- `engine/studio/writers_room.py`: 9-specialist `CreativeWritersRoom`, Emergent Concept Genesis, backlog authoring, review, and live steering.
+- `engine/studio/production_board.py`: Continuous `ProductionBoard` DAG scheduler and parallel specialist dispatch.
+- `engine/studio/workers.py`: Iterative Task Lead Strategist (`run_task_lead`) and 4 autonomous domain specialists (`visual_artist`, `audio_designer`, `swe_engineer`, `qa_test_engineer`).
+- `engine/studio/proofs.py`: Task-ID-scoped multimodal proof rendering (counterfactual filmstrips, level maps, waveforms, sprite sheets).
+- `engine/studio/rendering.py`: Per-game `RenderingStrategySpec` validation and Godot 4.3 rendering/shader synthesis.
+- `engine/studio/sfx_synth.py`: Parametric multi-layered DSP sound effects synthesizer (`SFXPatchSpec`, `SFXLayerSpec`).
+- `engine/studio/orchestrator.py`: Swarm DAG, continuous production board driver, and checkpoint manager.
 - `engine/studio/swe.py`: Multi-module GDScript 4.3 / Python synthesis and holistic self-healing (`repair_godot_cartridge_holistic`).
 - `engine/studio/visual.py`: Live Gemini pixel-art sprite & portrait generator with background-to-alpha transparency.
-- `engine/studio/audio.py`: Live Gemini TTS voice & sound generator.
+- `engine/studio/audio.py`: Live Gemini TTS voice & sound generator + parametric DSP SFX synthesis.
 - `engine/supervisor/challenger.py`: Gate F Adversarial Design Critic & Game Designer Signoff (`CandidateASTInspector`, `ChallengerGate`).
 - `engine/supervisor/supervisor.py`: 6-Gate `BuildSupervisor` and self-healing loop.
 - `engine/ui/server.py`: Starlette WebSocket server & SQLite WAL live tailing (`SwarmEventBus`).

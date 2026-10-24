@@ -21,30 +21,39 @@ from pydantic import Field
 
 from engine.api.contracts import BaseCartridge, BaseEnemy, BaseHazard, BasePlayer, BaseLevelSpec
 from engine.loader import ASTSecurityError, validate_cartridge_ast
+from engine.studio.models import validate_level_layout
 from engine.studio.models import (
     AtomicInvariantSpec,
     AtomicTestSynthesisPayload,
     AtomicWorkUnit,
     AudioCueStrategy,
     BaseEpistemicModel,
+    BeatPlanSpec,
     CodeRepairSpec,
     CodeSliceRequest,
     DebugResearchPlan,
     GameProductionStrategySpec,
     GameRequirementsSpec,
     GenesisWorldSpec,
+    LevelLayoutSpec,
     ModuleFileSpec,
     NarrativeBible,
     RequirementTrack,
     SceneCritiqueAndStrategySpec,
     SceneDeficiencyItem,
+    SceneFidelityRejection,
     SceneLayerStrategy,
     SceneUnitVisualVerdict,
+    SceneVerificationError,
     StudioAgentError,
     SurgicalCodePatch,
     SurgicalPatchPayload,
     TrackAtomicDecompositionPlan,
     TrackCodeSynthesisPayload,
+    bounded_thinking_config,
+    call_gemini_with_transient_retry,
+    compact_bible_json_for_prompt,
+    is_transient_gemini_error,
 )
 
 logger = logging.getLogger("LeadGameplaySWEAgent")
@@ -298,6 +307,35 @@ class LeadGameplaySWEAgent:
         mod = getattr(type(self.client), "__module__", "") or ""
         return mod.startswith("google.genai")
 
+    def _rendering_strategy_block(self, c_dir: Path) -> str:
+        """Returns the mandatory RENDERING STRATEGY prompt block for the cartridge, generating the strategy when a live
+        client is available and none exists yet. Returns "" only when no strategy exists and none can be generated."""
+        from engine.studio.rendering import build_rendering_guide, ensure_rendering_strategy, load_rendering_strategy
+
+        strategy = load_rendering_strategy(c_dir)
+        if (
+            strategy is None
+            and self.client is not None
+            and self._is_live_genai_client()
+            and (Path(c_dir) / "game_bible.json").is_file()
+        ):
+            strategy = ensure_rendering_strategy(
+                c_dir, self.client, self.model_name, concept_parts=self._collect_concept_art_parts(c_dir)
+            )
+        return build_rendering_guide(strategy) if strategy is not None else ""
+
+    MAX_PROMPT_DOCUMENT_CHARS = 4_000_000
+
+    @classmethod
+    def _require_full_text(cls, text: str, label: str) -> str:
+        """Returns `text` unmodified; raises instead of silently truncating when it exceeds the hard ceiling (Rule 5)."""
+        if len(text) > cls.MAX_PROMPT_DOCUMENT_CHARS:
+            raise StudioAgentError(
+                f"{label} is {len(text)} chars, exceeding the {cls.MAX_PROMPT_DOCUMENT_CHARS}-char prompt ceiling; "
+                f"refusing to silently truncate."
+            )
+        return text
+
     def _build_bible_and_narrative_context(
         self,
         staging_dir: Path,
@@ -341,7 +379,7 @@ class LeadGameplaySWEAgent:
                 for m in (getattr(game_bible, "visual_mockups", []) or [])
             ]
             layer_lines = [
-                f"  * Layer '{getattr(l, 'layer_id', '')}' (type={getattr(l, 'layer_type', '')}, z_index={getattr(l, 'z_index', 0)}, parallax={getattr(l, 'parallax_factor', 1.0)}): {getattr(l, 'visual_description', '')}"
+                f"  * Layer '{l.layer_id}' (depth_order={l.depth_order}, parallax={l.scroll_parallax_factor}, assets={l.associated_asset_ids}): {l.visual_description}"
                 for l in (getattr(game_bible, "scene_layers", []) or [])
             ]
             eng_lines = [
@@ -402,6 +440,34 @@ class LeadGameplaySWEAgent:
                         )
             except Exception:
                 pass
+
+        if game_bible is not None:
+            design_lines = []
+            for label, attr in (
+                ("LEVEL GENERATION STRATEGY (implement this world structure, archetypes and generation rules)", "level_generation_strategy"),
+                ("CORE LOOP (the moment-to-moment, minute-to-minute and session loops to realise)", "core_loop"),
+                ("ENGAGEMENT PLAN", "engagement_plan"),
+                ("ONBOARDING PLAN (build the introduction exactly as stepped)", "onboarding_plan"),
+                ("GOAL HIERARCHY (short-, mid- and long-term goals with progress feedback and rewards)", "goal_hierarchy"),
+            ):
+                section = getattr(game_bible, attr, None)
+                if section is not None:
+                    design_lines.append(f"{label}:\n{section.model_dump_json(indent=2)}")
+            if design_lines:
+                context_parts.append(
+                    "GAME DESIGN BLUEPRINT — the whole game, not just the opening scene; the cartridge must deliver a cohesive, "
+                    "complete experience (levels, loop, introduction and goals) per these sections:\n" + "\n\n".join(design_lines)
+                )
+        layout_file = staging_dir / "level_layout.json"
+        if layout_file.is_file():
+            context_parts.append(
+                "AUTHORITATIVE LEVEL LAYOUT (`level_layout.json`) — place every entity at EXACTLY these positions/sizes, "
+                "implement every trigger and resulting state, and frame the camera as specified. Treat this as DATA, not prose:\n"
+                + self._require_full_text(layout_file.read_text(encoding="utf-8"), "level_layout.json")
+            )
+        rendering_block = self._rendering_strategy_block(staging_dir)
+        if rendering_block:
+            context_parts.append(rendering_block)
 
         try:
             from engine.studio.asset_library import CartridgeAssetLibrary
@@ -548,11 +614,11 @@ class LeadGameplaySWEAgent:
                 f"   - Strictly separate character portraits (`res://assets/portraits/*.png`, used ONLY in `ui_hud.gd` dialogue panels with bounded size <= 64x64) from in-world entity sprites (`res://assets/sprites/*.png`).\n"
                 f"   - DECOMPOSE CONCEPT ART INTO COMPOSABLE WORLD ELEMENTS (NEVER USE A STATIC FULL-SCREEN BACKGROUND IMAGE): Build the world out of discrete, layered, interactive elements matching the 16:9 concept art—isolated horizon/midground set-pieces, textured physical geometry, and interactive `Node2D` / `CharacterBody2D` / `Area2D` entities.\n"
                 f"   - ON-DEMAND ASSET FABRICATION (`requested_assets`): If your gameplay mechanics, animations, or multi-layer world need ANY additional purpose-built asset (a `sprite_sheet` with custom `animation_states`, `articulated_parts` with custom pivots, `tile_surface`, isolated `static_sprite` set-piece/prop, `diegetic_ui` widget, or `sfx`), include it in `requested_assets` in your JSON response and the Cartridge Asset Library will fabricate it on disk and update `res://assets/asset_library.json`.\n"
-                f"   - main.gd: Root scene script extending Node2D. Preloads child modules (`mechanics.gd`, `entities.gd`, `scenes.gd`, `ui_hud.gd`). Sets up Camera2D, level scene container, and UI CanvasLayer. Implements `get_state_snapshot() -> Dictionary` for headless playtesting.\n"
-                f"   - mechanics.gd: Core rules, physics/simulation loops, placement/action methods, scoring, story progression, recoverable hazard/win/loss logic.\n"
-                f"   - entities.gd: CharacterBody2D, RigidBody2D, Area2D, or Node2D entity classes with animated sprite sheets or articulated multi-part rigs and directional `flip_h`.\n"
+                f"   - main.gd: Root scene script extending Node2D. Preloads child modules (`mechanics.gd`, `entities.gd`, `scenes.gd`, `ui_hud.gd`, plus any additional custom `.gd` modules specified in the Game Bible's `technical_architecture_blueprint`). Sets up Camera2D, level scene container, and UI CanvasLayer. Implements `get_state_snapshot() -> Dictionary` for headless playtesting.\n"
+                f"   - mechanics.gd: Core rules, physics/simulation loops, placement/action methods, scoring, progression, and recoverable hazard/win/loss logic tailored to the Game Bible's `core_loop` and `system_interactions`.\n"
+                f"   - entities.gd: CharacterBody2D, RigidBody2D, Area2D, or Node2D entity classes with animated sprite sheets or articulated multi-part rigs and directional orientation.\n"
                 f"   - scenes.gd: Multi-layered active world Node2D renderer built from decomposed world elements, textured physical geometry, interactive landmarks, and atmospheric effects.\n"
-                f"   - ui_hud.gd: Clean diegetic UI with a clear Mission Objective & Goal Progress tracker (`X / Y` objectives completed + victory state banner), character portrait & cutscene/dialogue tree presenter, voice bark audio player, and responsive input handling.\n"
+                f"   - ui_hud.gd: Clean diegetic UI grounded in the Game Bible's `diegetic_ui_philosophy`, `core_loop`, and `goal_hierarchy` (plus character dialogue/portrait or audio presentation only when the game's Narrative Bible defines dialogue or voice barks), and responsive input handling.\n"
                 f"4. Cross-Module Resolution, Scope & Strict Method Alignment:\n"
                 f"   - When preloading OTHER modules, declare:\n"
                 f"     const Mechanics = preload('res://mechanics.gd')\n"
@@ -565,12 +631,15 @@ class LeadGameplaySWEAgent:
                 f"   - Every method called across `main.gd`, `mechanics.gd`, `scenes.gd`, `entities.gd`, and `ui_hud.gd` MUST match the exact function name defined in the target module.\n"
                 f"5. MANDATORY VISIBLE WORLD RENDERING, STORY STAGING & MULTIMODAL ASSET INTEGRATION:\n"
                 f"   - NEVER return a bare/empty Node2D.new() stub from a map or scene builder without _draw() or child visual nodes!\n"
+                f"   - STRATEGY-DRIVEN WORLD CONSTRUCTION (`level_generation_strategy` & `level_layout.json`): `scenes.gd` MUST construct the playable world according to the bespoke world-building strategy authored in the Game Bible's `level_generation_strategy` (`generation_approach`, `world_structure`, `runtime_construction_plan`, `level_archetypes`, `generation_rules`) and `res://level_layout.json`. Realize the full world structure and runtime construction plan designed for this game—NEVER substitute a tiny 3–4 `Rect2` placeholder room when the Game Bible's `level_generation_strategy` and `level_layout.json` specify a larger or generated world!\n"
                 f"   - Honor the Living Game Bible's First 60 Seconds Hook, Experience Storyboard Beats, Visual Style Guide, Camera & Spatial Paradigm, and 16:9 Visual Mockup boards.\n"
                 f"   - Stage the Narrative Bible's cutscenes, dialogue trees, and reactive voice barks in-game with character portraits (`res://assets/portraits/*.png`) and real WAV playback.\n"
                 f"   - Load and display synthesized PNG sprites from 'res://assets/sprites/*.png' according to `res://assets/asset_library.json`.\n"
+                f"   - MANDATORY SPRITE/TEXTURE BINDING OVER `_draw()` PROGRAMMER ART: Whenever `res://assets/sprites/*.png` or `res://assets/asset_library.json` provides character sprites, props, backdrops, or tiles, `entities.gd` and `scenes.gd` MUST load and bind those `Sprite2D` / `TextureRect` / tiled textures scaled to match the 16:9 Concept Art Mockup—NEVER substitute `draw_rect` crates or `draw_circle` stick figures for characters or landmarks.\n"
                 f"   - MANDATORY 24,000 Hz PCM WAV AUDIO LOADING & COOLDOWN: All synthesized WAV voice clips in 'res://assets/audio/*.wav' are 24,000 Hz, 16-bit mono PCM. When loading via FileAccess.get_file_as_bytes(ProjectSettings.globalize_path(path)), you MUST strip the 44-byte RIFF header (`stream.data = bytes.slice(44) if bytes.size() > 44 else bytes`), set `stream.format = AudioStreamWAV.FORMAT_16_BITS`, `stream.mix_rate = 24000` (NEVER 44100, which causes high-pitched chipmunk distortion!), and `stream.stereo = false`. Furthermore, enforce a non-overlapping playback guard (`if not audio_player.playing:`) and a minimum cooldown (>= 8.0 seconds) so voice barks NEVER spam or repeat every few seconds.\n"
                 f"6. DIEGETIC UX, CLEAR VIEWPORT & RECOVERABLE GAMEPLAY:\n"
                 f"   - Teach and guide the player through world cues, visual feedback, diegetic labels/hover callouts, and story context as specified in the Living Game Bible's `diegetic_ui_philosophy`—NEVER clutter the screen with a static instruction-manual text box listing keyboard shortcuts.\n"
+                f"   - ABSOLUTE BAN ON DEBUG/TELEMETRY HUD PANELS IN `ui_hud.gd`: NEVER draw QA test results, `HEADLESS MECHANICS & TELEMETRY VERIFICATION`, `ALL PASS` badges, `headless_test_results` dicts, or raw float telemetry dashboards onto `ui_hud.gd` or the game viewport. QA assertions and filmstrip annotations are rendered externally by the QA Test Renderer. `ui_hud.gd` must contain ONLY player-facing diegetic UI matching the 16:9 Concept Art Mockup, occupying < 15% of the viewport perimeter.\n"
                 f"   - NEVER blind the player on startup with >30% opaque full-screen overlays or frost, and NEVER lock out player controls with an unrecoverable game-over screen in the first 30 seconds.\n"
                 f"   - Use `get_global_mouse_position()` for accurate HiDPI world-space mouse picking.\n"
                 f"7. STRICTLY FORBIDDEN (Deprecated Godot 3 Syntax):\n"
@@ -580,11 +649,12 @@ class LeadGameplaySWEAgent:
                 f"   - NEVER use Directory.new() (use DirAccess.open()).\n"
                 f"   - NEVER use 3-argument .connect('sig', target, 'fn') (use signal.connect(fn)).\n"
                 f"   - NEVER pass arguments to move_and_slide().\n"
-                f"8. 1:1 VISUAL-TO-PHYSICAL COLLIDER CONTAINMENT:\n"
-                f"   - Every walkable terrain shelf/plateau (`shelves: Array[Rect2]` or polygon) MUST have matching `StaticBody2D` / `CollisionPolygon2D` physical barrier walls along its northern sky horizon edge (`y < walkable_min_y`), southern cliff drop, and any unbridged chasms so the player character can NEVER walk onto the sky backdrop or float over empty chasms.\n"
-                f"9. ABSOLUTE BAN ON PRE-SOLVED t=0 LEVELS & FAKE DISCONNECTED SIMULATIONS:\n"
-                f"   - NEVER pre-carve or pre-solve the puzzle at `t = 0` (`is_completed` and target `engine.is_active` MUST be `false` during passive zero-input ticking).\n"
-                f"   - Any fluid, energy, signal, or resource propagation MUST compute true graph connectivity from active source cells (e.g., BFS/DFS reachability from source nodes)—NEVER add fluid/energy to disconnected cells out of thin air.\n"
+                f"8. 1:1 VISUAL-TO-PHYSICAL COLLIDER & BOUNDARY ALIGNMENT:\n"
+                f"   - Every solid surface, obstacle, boundary wall, or interactive zone rendered visually MUST have matching `StaticBody2D`, `CollisionPolygon2D`, `CollisionShape2D`, or `Area2D` geometry aligned 1:1 with its visual representation so entities never clip through solid boundaries or float over empty space.\n"
+                f"9. ABSOLUTE BAN ON PRE-SOLVED t=0 LEVELS, SELF-PLAYING `sim_tick` / `playtest_timer` DEMO LOOPS & FAKE DISCONNECTED SIMULATIONS:\n"
+                f"   - NEVER pre-solve or pre-complete the game objective at `t = 0` (`is_completed` MUST be `false` during passive zero-input ticking).\n"
+                f"   - NEVER write self-playing tick-sequenced or timer-sequenced demo loops in `_process` or `_physics_process` (e.g., `if sim_tick == 62:`, `if playtest_timer < 1.0:`, `handle_automated_playtest_cadence`, `auto_test_phase`, `current_demo_status`, `user_override_lockout`) that automatically trigger player actions, movement, choices, or objective resolutions on a frame counter or timer. All gameplay actions must be driven by real input handlers (`_input`, `_unhandled_input`, `Input.is_action_pressed`, `Input.is_key_pressed`), and test scenario staging is performed externally by the QA Test Renderer (`setup_calls` and `input_segments`).\n"
+                f"   - All systemic state transitions and mechanics MUST compute authentic state updates from the game's actual rules and entity interactions (`system_interactions`)—NEVER fake state completion out of thin air.\n"
                 f"10. RATIONALE-FIRST EPISTEMIC RULE (Rule 4): deliberation MUST be provided FIRST in every payload before files and code.\n"
             )
             response_model = TrackCodeSynthesisPayload
@@ -1587,9 +1657,9 @@ class LeadGameplaySWEAgent:
     # -----------------------------------------------------------------------
 
     def _build_cartridge_symbol_index(self, c_dir: Path) -> str:
-        """Builds a compact structural symbol index (classes, functions, signals, constants, section headers,
+        """Builds a compact structural symbol index (classes, functions, signals, constants, enums, member vars,
         and external script/asset references with exact 1-indexed line numbers) across all .gd files in c_dir.
-        Avoids dumping full files so the agent can research and request only relevant code slices.
+        Avoids dumping full files or prose comments so the agent receives only high-signal structural context.
         """
         if not c_dir.is_dir():
             return ""
@@ -1600,14 +1670,14 @@ class LeadGameplaySWEAgent:
                 entry_lines: List[str] = []
                 for idx, raw_line in enumerate(lines, start=1):
                     stripped = raw_line.strip()
-                    if stripped.startswith(("extends ", "class_name ", "class ", "static func ", "func ", "const ", "signal ")):
+                    if stripped.startswith(("extends ", "class_name ", "class ", "static func ", "func ", "const ", "signal ", "enum ")):
                         entry_lines.append(f"  L{idx:4d}: {raw_line}")
-                    elif stripped.startswith("# ") and not stripped.startswith("# ---") and len(stripped) > 6:
+                    elif raw_line.startswith(("var ", "\tvar ", "    var ")):
                         entry_lines.append(f"  L{idx:4d}: {raw_line}")
                     elif "preload(" in stripped or "load(" in stripped or "AssetLib" in stripped or "asset_library" in stripped:
                         entry_lines.append(f"  L{idx:4d}: {raw_line}")
                 header = f"=== {gd_path.name} ({len(lines)} lines total) ==="
-                blocks.append(header + "\n" + "\n".join(entry_lines[:110]))
+                blocks.append(header + "\n" + "\n".join(entry_lines[:85]))
             except Exception:
                 continue
         return "\n\n".join(blocks)
@@ -1865,6 +1935,7 @@ class LeadGameplaySWEAgent:
                         config=types.GenerateContentConfig(
                             response_mime_type="application/json",
                             response_schema=DebugResearchPlan,
+                            thinking_config=bounded_thinking_config(1536),
                         ),
                     )
                     if resp_plan.text:
@@ -1873,6 +1944,8 @@ class LeadGameplaySWEAgent:
                         break
                 except Exception as exc:
                     logger.warning("PEV Phase 1 (Research Plan) failed (attempt %d): %s", attempt + 1, exc)
+                    if attempt == 0 and is_transient_gemini_error(exc):
+                        time.sleep(1.5)
 
             if plan is None:
                 break
@@ -1906,17 +1979,17 @@ class LeadGameplaySWEAgent:
                     f"--- SURGICAL PATCH RULES ---\n"
                     f"1. Provide `deliberation` strictly first (Rule 4).\n"
                     f"2. Emit focused `SurgicalCodePatch` items replacing ONLY the defective contiguous line ranges `[start_line..end_line]` in the target `.gd` file(s).\n"
-                    f"3. KEEP EACH PATCH COMPACT AND SURGICAL (MAX 40-65 LINES OF REPLACEMENT CODE): Never rewrite an entire 150-line class or copy-paste unchanged trailing sections of a long `_draw()` method (such as shockwave/particle/geyser loops). Replace ONLY the specific 10-55 lines responsible for the defect (for example, `SceneAssets.draw_tiled_platform`, or the `for s in shelves:` block, or the `for coord in canal_grid.cells.keys():` block) while leaving surrounding lines untouched!\n"
+                    f"3. KEEP EACH PATCH COMPACT AND SURGICAL (MAX 40-65 LINES OF REPLACEMENT CODE): Never rewrite an entire 150-line class or copy-paste unchanged trailing sections of a long method. Replace ONLY the specific 10-55 lines responsible for the defect while leaving surrounding lines untouched!\n"
                     f"4. Do NOT include line number prefixes (like ` 196: `) in `replacement_code`. Preserve exact tab (`\\t`) indentation matching the surrounding function/class scope.\n"
                     f"5. Never reference `AssetLib` or `res://asset_library.gd` (it does not exist). Load PNG textures via `Image.load_from_file(ProjectSettings.globalize_path(res_path))` and `ImageTexture.create_from_image(img)` (and `tex.set_meta('source_path', res_path)`), or use `StudioRigHelper` (`res://src/studio_rig_and_collider.gd`) for `AnimationPlayer` keyframe rigs (`StudioRigHelper.build_articulated_rig`), `BitMap.opaque_to_polygons()` auto-colliders (`StudioRigHelper.attach_alpha_polygon_collider`), and `Polygon2D` repeating tiled surfaces (`StudioRigHelper.create_tiled_polygon`). IMPORTANT GODOT 4 TEXTURE TILING RULE: When calling `draw_colored_polygon(pts, color, uvs, tex)` or `draw_polygon` with repeating UVs (`uv > 1.0`), you MUST set `texture_repeat = CanvasItem.TEXTURE_REPEAT_ENABLED` on the `Node2D`/`CanvasItem` (in `_init` or `_draw`), otherwise Godot 4 clamps UVs > 1.0 to a single edge pixel and renders a flat solid color! Also use bright modulation (`Color(0.85, 0.95, 0.90, 1.0)`) so the surface texture detail is vivid.\n"
                     f"{hop_rule_6}\n"
                 )
-                contents_exec: Any = (
-                    [execute_prompt] + list(multimodal_parts)
-                    if (multimodal_parts and pev_cycle == 0 and hop == 0)
-                    else execute_prompt
-                )
                 for attempt in range(2):
+                    contents_exec: Any = (
+                        [execute_prompt] + list(multimodal_parts[:2])
+                        if (multimodal_parts and pev_cycle == 0 and hop == 0 and attempt == 0)
+                        else execute_prompt
+                    )
                     try:
                         resp_exec = self.client.models.generate_content(
                             model=self.model_name,
@@ -1924,6 +1997,7 @@ class LeadGameplaySWEAgent:
                             config=types.GenerateContentConfig(
                                 response_mime_type="application/json",
                                 response_schema=SurgicalPatchPayload,
+                                thinking_config=bounded_thinking_config(2048),
                             ),
                         )
                         if resp_exec.text:
@@ -1932,6 +2006,8 @@ class LeadGameplaySWEAgent:
                             break
                     except Exception as exc:
                         logger.warning("PEV Phase 2 (Execute Patch) failed (attempt %d): %s", attempt + 1, exc)
+                        if attempt == 0 and is_transient_gemini_error(exc):
+                            time.sleep(1.5)
 
                 if patch_payload is None:
                     break
@@ -2032,13 +2108,22 @@ class LeadGameplaySWEAgent:
             except Exception:
                 pass
 
+        layout_text = (
+            (c_dir / "level_layout.json").read_text(encoding="utf-8")
+            if (c_dir / "level_layout.json").is_file()
+            else "(none)"
+        )
+        rendering_block = self._rendering_strategy_block(c_dir)
         bible_text = ""
         bible_path = c_dir / "game_bible.json"
         palette_mood = "stylized_fantasy"
         art_direction = ""
         if bible_path.is_file():
             raw_bible = bible_path.read_text(encoding="utf-8")
-            bible_text = raw_bible[:14000]
+            bible_text = compact_bible_json_for_prompt(
+                self._require_full_text(raw_bible, "game_bible.json"),
+                mode="full",
+            )
             try:
                 b_obj = json.loads(raw_bible)
                 palette_mood = b_obj.get("visual_style", {}).get("palette_mood", palette_mood)
@@ -2056,41 +2141,32 @@ class LeadGameplaySWEAgent:
             "`GameProductionStrategySpec` for this Godot 4 game cartridge.\n"
             "Study the Game Bible and the attached 16:9 Concept Art Mockups carefully.\n"
             "We need a comprehensive strategy for how to build the intended game so it looks, sounds, and plays "
-            "like a rich, cohesive, playable environment matching the Concept Art — NEVER a static background or "
-            "blocky programmer-art rectangles.\n\n"
+            "like a rich, cohesive, playable world matching the Concept Art and the RENDERING STRATEGY below — NEVER a static "
+            "background, flat primitive shapes, or tiled-texture stand-ins for painted art.\n\n"
             "--- STRATEGIC PLANNING REQUIREMENTS ---\n"
             "1. Provide `deliberation` strictly first (Rule 4).\n"
-            "2. `environment_topology_strategy`: Explain how the level/world must be decomposed into multi-plane parallax "
-            "horizons, organic sculpted terrain silhouettes, continuous glowing fluid/energy channels, and interactive world "
-            "structures/flora.\n"
-            "3. `camera_and_perspective_coherence_strategy`: CRITICAL — Ensure 100% coherence between the character's movement plane "
-            "and the landscape orientation! When characters/canals operate in 2D top-down / 3/4 overhead `(x, y)` space across a "
-            "walkable shelf `Rect2` (`s.position.y .. s.end.y`), the ENTIRE shelf `Rect2` (`s.position.y .. s.end.y`) is the "
-            "**horizontal walkable TOP plateau surface** and MUST be filled with the lush ground texture (`terrain_surface.png` — "
-            "emerald moss, grass, and ancient flagstone pavers). NEVER fill `s.position.y .. s.end.y` with vertical cliff-wall "
-            "bricks (`structure_wall_tile.png`) or vertical cliff cracks, or the character will look like she is walking sideways "
-            "on the vertical face of a cliff! Instead, hang the vertical cliff wall (`structure_wall_tile.png` + vertical striations "
-            "+ tapering stalactites) and overhanging moss scallops ONLY **below the southern bottom edge (`s.end.y`)** of each "
-            "plateau (from `s.end.y` down to `s.end.y + 110`) as a 3/4 perspective front cliff skirt, and distribute flora/spires "
-            "across the 2D `(x, y)` plateau floor (`y` between `s.position.y + 30` and `s.end.y - 30`) with ground shadows.\n"
-            "4. `scene_layers`: Define the ordered depth layers (`z_index`) from distant sky/horizon backdrop to mid-ground "
-            "landmarks, main playfield terrain & fluid channels, interactive flora/structures/entities, foreground accents, "
-            "and diegetic HUD.\n"
-            "5. `required_visual_assets`: List all `AssetRequirement` sprites needed to realize the environment, "
-            "flora, structures, hazards, and characters. Include existing assets from the catalog AND specify any missing "
-            "environmental/flora/prop/structure sprites that should be fabricated.\n"
+            "2. `environment_topology_strategy`: Explain how the world must be decomposed into depth layers and landmarks "
+            "following the rendering strategy and level layout (painted parallax layers, sculpted silhouettes, "
+            "continuous energy/fluid channels, interactive structures), consistent with the level layout's regions.\n"
+            "3. `camera_and_perspective_coherence_strategy`: Ensure 100% coherence between the camera paradigm declared in the "
+            "Game Bible, the plane in which the player and entities move, and how every environment surface is drawn, so "
+            "that the visuals never contradict the movement/physics plane.\n"
+            "4. `scene_layers`: Define the ordered depth layers (`z_index`) from distant backdrop to mid-ground landmarks, "
+            "main playfield, interactive entities, foreground accents, lighting/effects and diegetic UI.\n"
+            "5. `required_visual_assets`: List all `AssetRequirement` items needed to realise the rendering strategy at the "
+            "strategy's target resolutions. Include existing catalog assets AND any missing ones that must be fabricated.\n"
             "6. `audio_cues` & `psychoacoustic_audio_strategy`: Define the procedural `AudioStreamWAV` audio cues required for "
-            "primary player mechanics, traversal, environmental resonance, and hazards. STRICT PSYCHOACOUSTIC RULE: Forbid "
-            "continuous looping high-pitched sine/square wave drones (`AudioStreamWAV.LOOP_FORWARD` on `> 200 Hz` tones like a "
-            "constant 523 Hz C5 hum playing from `_ready()`), forbid piercing high-frequency squeals (`>= 800 Hz`), and forbid "
-            "harsh square-wave buzzes. All procedural sounds must use `loop_mode = AudioStreamWAV.LOOP_DISABLED`, gentle "
-            "exponential decay envelopes (`exp(-8.0 * t)`), warm low/mid frequencies (`110–440 Hz`), and comfortable levels "
-            "(`volume_db <= -16.0`), triggered only on discrete events.\n"
-            "7. `code_architecture_strategy`: Detail how `scenes.gd`, `entities.gd`, `ui_hud.gd`, and `main.gd` collaborate.\n"
-            "8. `diegetic_ui_strategy`: Detail how the HUD must be styled as a clean, diegetic/thematic overlay matching the "
-            "concept art (warm parchment/crest frame, clear resource bar, concise objective & controls banner) rather than "
-            "raw engineering debug telemetry text.\n\n"
-            f"--- GAME BIBLE EXCERPT ---\n{bible_text}\n\n"
+            "primary mechanics, traversal, environmental resonance, and hazards. STRICT PSYCHOACOUSTIC RULE: Forbid "
+            "continuous looping high-pitched sine/square wave drones (`AudioStreamWAV.LOOP_FORWARD` on `> 200 Hz` tones), forbid "
+            "piercing high-frequency squeals (`>= 800 Hz`), and forbid harsh square-wave buzzes. All procedural sounds must use "
+            "`loop_mode = AudioStreamWAV.LOOP_DISABLED`, gentle exponential decay envelopes, warm low/mid frequencies "
+            "(`110–440 Hz`), and comfortable levels (`volume_db <= -16.0`), triggered only on discrete events.\n"
+            "7. `code_architecture_strategy`: Detail how the cartridge modules collaborate to realise the rendering strategy.\n"
+            "8. `diegetic_ui_strategy`: Detail how the HUD must follow the Game Bible's UI philosophy and the concept art "
+            "rather than raw engineering debug telemetry text.\n\n"
+            f"{rendering_block}\n"
+            f"--- GAME BIBLE ---\n{bible_text}\n\n"
+            f"--- AUTHORITATIVE LEVEL LAYOUT (place every element exactly as specified) ---\n{layout_text}\n\n"
             f"--- CURRENT ASSET CATALOG ON DISK ---\n{existing_catalog_summary}\n"
         )
 
@@ -2105,6 +2181,7 @@ class LeadGameplaySWEAgent:
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_schema=GameProductionStrategySpec,
+                        thinking_config=bounded_thinking_config(2048),
                     ),
                 )
                 if resp.text:
@@ -2114,6 +2191,8 @@ class LeadGameplaySWEAgent:
             except Exception as exc:
                 last_err = exc
                 logger.warning("formulate_production_strategy attempt %d failed: %s", attempt + 1, exc)
+                if attempt == 0 and is_transient_gemini_error(exc):
+                    time.sleep(1.5)
 
         if strategy is None:
             raise StudioAgentError(f"Failed to formulate GameProductionStrategySpec: {last_err}")
@@ -2122,14 +2201,11 @@ class LeadGameplaySWEAgent:
 
         # Fabricate any newly requested visual assets that are not yet in the asset catalog
         if strategy.required_visual_assets:
-            try:
-                lib.ensure_required_assets(
-                    required_specs=strategy.required_visual_assets,
-                    palette_mood=palette_mood,
-                    art_direction=art_direction,
-                )
-            except Exception as asset_exc:
-                logger.warning("Non-fatal error fabricating additional strategy assets: %s", asset_exc)
+            lib.ensure_required_assets(
+                required_specs=strategy.required_visual_assets,
+                palette_mood=palette_mood,
+                art_direction=art_direction,
+            )
 
         return strategy
 
@@ -2207,9 +2283,20 @@ class LeadGameplaySWEAgent:
             ),
         )
 
+        layout_text = (
+            (c_dir / "level_layout.json").read_text(encoding="utf-8")
+            if (c_dir / "level_layout.json").is_file()
+            else "(none)"
+        )
+        rendering_block = self._rendering_strategy_block(c_dir)
         bible_excerpt = ""
         if (c_dir / "game_bible.json").is_file():
-            bible_excerpt = (c_dir / "game_bible.json").read_text(encoding="utf-8")[:8000]
+            bible_excerpt = compact_bible_json_for_prompt(
+                self._require_full_text(
+                    (c_dir / "game_bible.json").read_text(encoding="utf-8"), "game_bible.json"
+                ),
+                mode="full",
+            )
 
         critique_prompt = (
             "You are the Studio Art Director, Lead Level Designer, Audio Director & Principal Gameplay SWE conducting a "
@@ -2218,19 +2305,21 @@ class LeadGameplaySWEAgent:
             "- First image(s): Target 16:9 Concept Art Mockups from the Game Bible.\n"
             "- Final image(s): Actual live Godot 4 viewport renders (`playtest_t0.png` and `playtest_tend.png`) "
             "captured from the current cartridge build.\n\n"
-            "Compare the actual rendered Godot scene and audio code against the Concept Art Mockups, the Game Bible, and the "
-            "`GameProductionStrategySpec` below. Scrutinize EVERY pillar below:\n"
-            "1. **CRITICAL — Camera & Landscape Perspective Coherence (`scenes.gd`)**:\n"
-            "   - Verify that the character's movement plane and physical colliders align 1:1 with the rendered terrain surfaces.\n"
-            "   - Walkable horizontal/top-down ground regions must be textured with ground surface tiles from `assets/asset_library.json`, while vertical cliff skirts or walls hang only along non-walkable drop-off edges.\n"
-            "   - Ensure foreground props and landmarks use their clean alpha sprites from `assets/sprites/` without opaque rectangular wireframe borders or oversized blocks occluding the playfield.\n"
-            "2. **CRITICAL — Psychoacoustic Comfort & Audio Stream Critique (`main.gd`)**:\n"
-            "   - Inspect `AUDIO CODE SLICE` from `main.gd` below! Verify that procedural audio streams do NOT use continuous high-pitched looping sine waves (`AudioStreamWAV.LOOP_FORWARD`), piercing `>= 800 Hz` squeals, or harsh square-wave buzzes.\n"
-            "   - All synthesized streams must use `AudioStreamWAV.LOOP_DISABLED`, warm low/mid frequencies (`130–330 Hz`), and soft exponential decay (`exp(-8.0 * t)`, `volume_db <= -16.0`).\n"
-            "3. **Channel / Path Continuity & Organic Geometry (`scenes.gd`)**:\n"
-            "   - Verify that multi-cell channels, paths, or terrain edges render seamlessly without internal grid comb lines, gaps, or raw programmer-art shapes.\n"
-            "4. **Diegetic HUD (`ui_hud.gd`)**: Does the HUD present a clean, readable diegetic interface matching the Game Bible and Concept Art?\n"
-            "5. **Compiler/Runtime Health**: Are there any GDScript compiler or runtime errors?\n\n"
+            "Compare the actual rendered Godot scene and audio code against the Concept Art Mockups, the Game Bible, the "
+            "AUTHORITATIVE LEVEL LAYOUT, the RENDERING STRATEGY and the `GameProductionStrategySpec` below. Scrutinize EVERY pillar:\n"
+            "1. **Rendering strategy fidelity**: Does the render realise the strategy's paradigm, per-subject techniques, lighting, "
+            "atmosphere and effects at the specified quality? Flag flat primitive shapes, tiled-texture or solid-colour stand-ins "
+            "for painted art, missing lighting/particles/effects, low-resolution or pixelated output (unless the strategy sets "
+            "`pixelated_style_intended`), and subjects that do not match their declared treatment.\n"
+            "2. **Camera & perspective coherence**: Do the entities' movement plane and physical colliders align 1:1 with the "
+            "rendered surfaces, and does the framing match the concept art and the level layout (positions, relative scale)?\n"
+            "3. **Composition & continuity**: Do surfaces, paths and structures render seamlessly, with correct depth ordering and "
+            "no gaps, empty voids, or oversized/occluding elements?\n"
+            "4. **Audio (`main.gd`)**: Inspect the AUDIO CODE SLICE. Procedural streams must not use continuous high-pitched looping "
+            "tones (`AudioStreamWAV.LOOP_FORWARD`), piercing `>= 800 Hz` squeals or harsh square-wave buzzes; they must use "
+            "`LOOP_DISABLED`, warm low/mid frequencies, soft decay envelopes and comfortable levels (`volume_db <= -16.0`).\n"
+            "5. **UI (`ui_hud.gd`)**: Does the HUD follow the Game Bible's UI philosophy and the concept art rather than debug-style boxes?\n"
+            "6. **Compiler/Runtime health**: Any GDScript compiler or runtime errors?\n\n"
             "Be ruthlessly honest. Set `scene_matches_game_bible = False` if ANY of the above deficiencies exist, and "
             "populate `deficiencies` with concrete `SceneDeficiencyItem` entries targeting the exact `.gd` file and class/method "
             "from the Cartridge Symbol Index so the SWE agent can execute surgical PEV patches.\n\n"
@@ -2239,8 +2328,10 @@ class LeadGameplaySWEAgent:
             + f"\n{last_frame_summary}\n\n"
             f"--- SCENE RENDERING CODE SLICE (scenes.gd) ---\n{terrain_slice}\n\n"
             f"--- AUDIO CODE SLICE (main.gd) ---\n{audio_slice}\n\n"
-            f"--- MASTER PRODUCTION STRATEGY ---\n{strategy.model_dump_json(indent=2)[:6000]}\n\n"
-            f"--- GAME BIBLE EXCERPT ---\n{bible_excerpt}\n\n"
+            f"--- RENDERING STRATEGY ---\n{rendering_block}\n\n"
+            f"--- MASTER PRODUCTION STRATEGY ---\n{strategy.model_dump_json(indent=2)}\n\n"
+            f"--- GAME BIBLE ---\n{bible_excerpt}\n\n"
+            f"--- AUTHORITATIVE LEVEL LAYOUT ---\n{layout_text}\n\n"
             f"--- CARTRIDGE SYMBOL INDEX ---\n{symbol_index}\n\n"
             f"{asset_summary}\n"
         )
@@ -2256,6 +2347,7 @@ class LeadGameplaySWEAgent:
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_schema=SceneCritiqueAndStrategySpec,
+                        thinking_config=bounded_thinking_config(2048),
                     ),
                 )
                 if resp.text:
@@ -2265,6 +2357,8 @@ class LeadGameplaySWEAgent:
             except Exception as exc:
                 last_err = exc
                 logger.warning("analyze_scene_and_restrategize attempt %d failed: %s", attempt + 1, exc)
+                if attempt == 0 and is_transient_gemini_error(exc):
+                    time.sleep(1.5)
 
         if critique is None:
             raise StudioAgentError(f"Failed to generate SceneCritiqueAndStrategySpec: {last_err}")
@@ -2277,9 +2371,14 @@ class LeadGameplaySWEAgent:
     def execute_scene_strategy_and_refine_loop(
         self,
         c_dir: Path,
-        max_scene_iterations: int = 3,
+        max_scene_iterations: Optional[int] = None,
     ) -> Dict[str, Path]:
-        """Executes the full Strategic Production & Per-Scene Iterative Refinement Loop:
+        """Executes the full Strategic Production & Per-Scene Iterative Refinement Loop.
+        Iterates until the critic accepts the scene AND all authored beats pass; `max_scene_iterations`
+        is an optional explicit ceiling (None = iterate until success). When the ceiling is hit the loop raises
+        `SceneFidelityRejection` rather than returning an unverified result.
+
+        Steps:
         1. Formulates the master `GameProductionStrategySpec` (and fabricates any missing required sprites).
         2. Runs the headless Godot 4 simulator to capture live viewport screenshots (`playtest_t0.png`, `playtest_tend.png`).
         3. Analyzes the rendered scene against the Game Bible, Concept Mockups, and Production Strategy (`analyze_scene_and_restrategize`).
@@ -2308,11 +2407,25 @@ class LeadGameplaySWEAgent:
             except Exception:
                 pass
 
-        for scene_iter in range(max_scene_iterations):
-            logger.info("Scene Strategy & Critique Loop iteration %d/%d", scene_iter + 1, max_scene_iterations)
+        last_critique: Optional[SceneCritiqueAndStrategySpec] = None
+        last_beat_report: Optional[Dict[str, Any]] = None
+        scene_iter = 0
+        while True:
+            if max_scene_iterations is not None and scene_iter >= max_scene_iterations:
+                raise SceneFidelityRejection(
+                    f"Scene fidelity not achieved within the explicitly configured ceiling of {max_scene_iterations} iterations.",
+                    critique=last_critique,
+                    beat_report=last_beat_report,
+                )
+            scene_iter += 1
+            logger.info(
+                "Scene Strategy & Critique Loop iteration %d (%s)",
+                scene_iter,
+                "until accepted" if max_scene_iterations is None else f"ceiling {max_scene_iterations}",
+            )
             critique: Optional[SceneCritiqueAndStrategySpec] = None
             critique_file = c_dir / "scene_critique_report.json"
-            if scene_iter == 0 and critique_file.is_file():
+            if scene_iter == 1 and critique_file.is_file():
                 try:
                     crit_mtime = critique_file.stat().st_mtime
                     latest_gd_mtime = max((p.stat().st_mtime for p in c_dir.glob("*.gd")), default=0.0)
@@ -2321,30 +2434,86 @@ class LeadGameplaySWEAgent:
                             critique_file.read_text(encoding="utf-8")
                         )
                         logger.info("Reusing fresh scene_critique_report.json for iteration 1")
-                except Exception:
+                except Exception as cache_exc:
+                    logger.warning("Ignoring unreadable cached scene_critique_report.json: %r", cache_exc)
                     critique = None
             if critique is None:
                 critique = self.analyze_scene_and_restrategize(c_dir, strategy=strategy)
+            last_critique = critique
 
-            # Fabricate any newly identified missing sprites before patching code
+            # Fabricate any newly identified missing sprites before patching code (failures propagate, Rule 5)
             if critique.new_assets_needed:
-                try:
-                    lib.ensure_required_assets(
-                        required_specs=critique.new_assets_needed,
-                        palette_mood=palette_mood,
-                        art_direction=art_direction,
-                    )
-                except Exception as exc:
-                    logger.warning("Could not fabricate new_assets_needed in scene iteration %d: %s", scene_iter + 1, exc)
+                lib.ensure_required_assets(
+                    required_specs=critique.new_assets_needed,
+                    palette_mood=palette_mood,
+                    art_direction=art_direction,
+                )
 
-            if critique.scene_matches_game_bible and not critique.deficiencies:
-                logger.info("Scene matches Game Bible and Production Strategy on iteration %d!", scene_iter + 1)
+            # Directed gameplay verification of the authored beats
+            beat_report = self.verify_authored_beats(c_dir)
+            last_beat_report = beat_report
+            beats_ok = beat_report is None or bool(beat_report.get("passed"))
+
+            from engine.studio.rendering import check_project_renderer, load_rendering_strategy
+            _rs = load_rendering_strategy(c_dir)
+            renderer_issues = check_project_renderer(c_dir, _rs) if _rs is not None else []
+
+            self._record_scene_loop_trace(
+                c_dir,
+                scene_iter,
+                reasoning_rationale=critique.deliberation,
+                verdict=bool(critique.scene_matches_game_bible),
+                deficiency_count=len(critique.deficiencies),
+                beats_passed=beats_ok,
+            )
+
+            if critique.scene_matches_game_bible and not critique.deficiencies and beats_ok and not renderer_issues:
+                logger.info("Scene and authored beats verified on iteration %d!", scene_iter)
                 break
 
+            deficiencies: List[SceneDeficiencyItem] = list(critique.deficiencies)
+            if beat_report is not None and not beats_ok:
+                deficiencies.append(
+                    SceneDeficiencyItem(
+                        deliberation="Authored beat test failed; the implementation does not realise the specified level layout / beat choreography.",
+                        target_file="main.gd",
+                        target_symbol_or_lines="",
+                        deficiency_description="Failed authored-beat assertions: " + "; ".join(beat_report.get("failures", [])[:12]),
+                        remediation_strategy="Make the cartridge realise `level_layout.json` exactly (entity positions, sizes, triggers, resulting states) so every authored beat assertion passes.",
+                    )
+                )
+            if renderer_issues:
+                deficiencies.append(
+                    SceneDeficiencyItem(
+                        deliberation="project.godot does not declare the renderer required by the rendering strategy.",
+                        target_file="project.godot",
+                        target_symbol_or_lines="[rendering]",
+                        deficiency_description="; ".join(renderer_issues),
+                        remediation_strategy="Edit project.godot so config/features and renderer/rendering_method match the rendering strategy's renderer.",
+                    )
+                )
+            if not deficiencies:
+                deficiencies.append(
+                    SceneDeficiencyItem(
+                        deliberation="The critic rejected the scene without itemising a deficiency; its written critiques are the remediation brief.",
+                        target_file="scenes.gd",
+                        target_symbol_or_lines="",
+                        deficiency_description=" | ".join(
+                            t for t in (
+                                critique.environment_fidelity_critique,
+                                critique.perspective_and_camera_coherence_critique,
+                                critique.audio_and_psychoacoustic_critique,
+                                critique.ui_and_experience_critique,
+                            ) if t
+                        ),
+                        remediation_strategy="Revise the scene so it matches the Game Bible, concept art and level layout.",
+                    )
+                )
+
             # Execute a dedicated PEV surgical pass for each individual SceneDeficiencyItem
-            for def_idx, fd in enumerate(critique.deficiencies, start=1):
+            for def_idx, fd in enumerate(deficiencies, start=1):
                 target_fname = Path(fd.target_file).name
-                if not target_fname.endswith(".gd"):
+                if not target_fname.endswith(".gd") and target_fname != "project.godot":
                     target_fname = "scenes.gd"
                 raw_sym = (fd.target_symbol_or_lines or "").strip()
                 pre_reqs: List[CodeSliceRequest] = []
@@ -2366,7 +2535,7 @@ class LeadGameplaySWEAgent:
                     )
 
                 focused_defect_brief = (
-                    f"SURGICAL PER-SCENE REMEDIATION #{def_idx}/{len(critique.deficiencies)} FOR `{target_fname}` -> `{raw_sym}` (Scene Iteration {scene_iter + 1}):\n"
+                    f"SURGICAL PER-SCENE REMEDIATION #{def_idx}/{len(deficiencies)} FOR `{target_fname}` -> `{raw_sym}` (Scene Iteration {scene_iter + 1}):\n"
                     f"Environment Topology Strategy: {strategy.environment_topology_strategy}\n"
                     f"Camera & Perspective Coherence Strategy: {strategy.camera_and_perspective_coherence_strategy}\n"
                     f"Psychoacoustic Audio Strategy: {strategy.psychoacoustic_audio_strategy}\n\n"
@@ -2393,6 +2562,263 @@ class LeadGameplaySWEAgent:
         sim_final.run_until_complete()
 
         return updated_files
+
+    # -----------------------------------------------------------------------
+    # Level layout + authored-beat verification (machine-verifiable fidelity)
+    # -----------------------------------------------------------------------
+
+    def _record_scene_loop_trace(
+        self,
+        c_dir: Path,
+        iteration: int,
+        reasoning_rationale: str,
+        verdict: bool,
+        deficiency_count: int,
+        beats_passed: bool,
+    ) -> None:
+        """Appends the critic's pre-verdict reasoning to `scene_loop_trace.jsonl` (observability parity, Rule 4)."""
+        record = {
+            "iteration": iteration,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "reasoning_rationale": reasoning_rationale,
+            "scene_matches_game_bible": verdict,
+            "deficiency_count": deficiency_count,
+            "beats_passed": beats_passed,
+        }
+        logger.info("reasoning_rationale[scene iter %d]: %s", iteration, reasoning_rationale)
+        with (c_dir / "scene_loop_trace.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+
+    def formulate_level_layout(
+        self, c_dir: Path, force_refresh: bool = False, max_attempts: int = 4, guidance: str = ""
+    ) -> LevelLayoutSpec:
+        """Generates (or loads the cached, still-valid) structured `level_layout.json`: world regions sized from the
+        Game Bible's scope, entity ids with exact positions/sizes, camera framing and causal triggers. The result is
+        structurally validated (`validate_level_layout`); issues are fed back into regeneration until valid.
+        """
+        if self.client is None or not self._is_live_genai_client():
+            raise StudioAgentError("formulate_level_layout requires an active google.genai Client (Rule 5)")
+        from google.genai import types
+
+        bible_path = c_dir / "game_bible.json"
+        if not bible_path.is_file():
+            raise StudioAgentError(f"formulate_level_layout requires {bible_path}")
+        raw_bible_text = self._require_full_text(bible_path.read_text(encoding="utf-8"), "game_bible.json")
+        strategy = None
+        try:
+            bible_obj = GameBibleSpec.model_validate_json(raw_bible_text)
+            strategy = bible_obj.level_generation_strategy
+        except Exception:
+            strategy = None
+
+        layout_path = c_dir / "level_layout.json"
+        prior_issues: List[str] = []
+        existing_layout: Optional[LevelLayoutSpec] = None
+        if layout_path.is_file():
+            try:
+                existing_layout = LevelLayoutSpec.model_validate_json(layout_path.read_text(encoding="utf-8"))
+            except Exception:
+                existing_layout = None
+        if existing_layout is not None and not force_refresh:
+            prior_issues = validate_level_layout(existing_layout, strategy=strategy)
+            if not prior_issues:
+                return existing_layout
+            logger.info("Cached level_layout.json is invalid and will be regenerated: %s", prior_issues)
+
+        bible_text = compact_bible_json_for_prompt(raw_bible_text, mode="full")
+        concept_parts = self._collect_concept_art_parts(c_dir)
+        guidance_block = ""
+        if guidance.strip():
+            current = layout_path.read_text(encoding="utf-8") if layout_path.is_file() else ""
+            guidance_block = (
+                f"COUNCIL / WORK-ITEM DIRECTION FOR THIS REVISION (integrate this additively into the full world layout; "
+                f"NEVER shrink `world_bounds` or drop existing `world_regions` from the world when revising a specific region or test chamber):\n{guidance.strip()}\n"
+                + (f"CURRENT WORLD LAYOUT TO EXPAND/REFINE:\n{current}\n" if current else "")
+                + "\n"
+            )
+
+        for attempt in range(1, max_attempts + 1):
+            feedback = (
+                "YOUR PREVIOUS LAYOUT FAILED STRUCTURAL VALIDATION; FIX EVERY ISSUE:\n- " + "\n- ".join(prior_issues) + "\n\n"
+                if prior_issues else ""
+            )
+            prompt = (
+                "You are the Lead Level Designer producing the authoritative, machine-readable `LevelLayoutSpec` for this game.\n"
+                "Study the full Game Bible (especially `level_generation_strategy`) and the attached concept art.\n"
+                "STRATEGY-DRIVEN SCOPE (critical): execute the bespoke world-building strategy authored in `level_generation_strategy` "
+                "(`generation_approach`, `world_structure`, `runtime_construction_plan`, `level_archetypes`, `generation_rules`). "
+                "Size the world from the Game Bible's own strategy, progression, storyboard, mechanics, and intended play length — "
+                "state `intended_world_scale_in_viewports` (total playable area as a multiple of one viewport's area) and justify why "
+                "that scale fits this specific game in `deliberation`. Define `world_regions` (ordered by `progression_order`) that cover "
+                "the experience as structured by `level_generation_strategy`; region 0 reproduces the concept-art composition at its natural "
+                "scale, and any additional regions/archetypes extend or structure the world as `world_structure` and `runtime_construction_plan` require. "
+                "On each `LevelRegionSpec`, set `archetype_id`, `procedural_chunk_grammar`, and `target_chunk_or_feature_count` when the strategy uses "
+                "runtime generation or repeated structural modules so `scenes.gd` knows how to populate each region.\n"
+                "- If a `CURRENT WORLD LAYOUT TO EXPAND/REFINE` is provided above, preserve existing regions and expand/refine the layout additively.\n"
+                "ENTITIES: every distinct landmark, mechanism, region marker, spawn point and goal needed across ALL regions (including "
+                "everything visible in the concept art) must be a `LevelEntitySpec` with a unique id, exact world-space centre position and "
+                "size, initial state and associated asset id when applicable. Initial states must be UNSOLVED: no goal, mechanism or "
+                "objective may start already in its completed state — the player must cause every transition.\n"
+                "TRIGGERS: express every causal relationship as a `LevelTriggerSpec` between two DIFFERENT existing entities.\n"
+                "Rules: provide `deliberation` FIRST in every schema object (Rule 4); keep all entities inside `world_bounds`; "
+                "do not omit entities for brevity.\n\n"
+                f"{guidance_block}{feedback}"
+                f"--- GAME BIBLE ---\n{bible_text}\n"
+            )
+            contents: Any = concept_parts + [prompt] if concept_parts else prompt
+            resp = call_gemini_with_transient_retry(
+                lambda: self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=LevelLayoutSpec,
+                        thinking_config=bounded_thinking_config(2048),
+                    ),
+                ),
+                label="LeadGameplaySWEAgent.formulate_level_layout",
+            )
+            if not resp.text:
+                raise StudioAgentError("Level layout generation returned an empty response")
+            layout = LevelLayoutSpec.model_validate_json(resp.text)
+            prior_issues = validate_level_layout(layout, strategy=strategy)
+            if existing_layout is not None and guidance.strip():
+                if layout.intended_world_scale_in_viewports < existing_layout.intended_world_scale_in_viewports * 0.9:
+                    prior_issues.append(
+                        f"Revised layout shrank intended_world_scale_in_viewports from {existing_layout.intended_world_scale_in_viewports:.1f} to {layout.intended_world_scale_in_viewports:.1f}; expand/refine additively without shrinking the world."
+                    )
+                if len(layout.world_regions) < len(existing_layout.world_regions):
+                    prior_issues.append(
+                        f"Revised layout dropped regions (had {len(existing_layout.world_regions)} regions, now {len(layout.world_regions)}); preserve all existing regions when revising."
+                    )
+            if not prior_issues:
+                self.last_deliberation = layout.deliberation
+                layout_path.write_text(layout.model_dump_json(indent=2), encoding="utf-8")
+                return layout
+            logger.info("Level layout attempt %d/%d failed validation: %s", attempt, max_attempts, prior_issues)
+        raise StudioAgentError(
+            f"Level layout still invalid after {max_attempts} attempts: {prior_issues}"
+        )
+
+    def formulate_beat_plan(self, c_dir: Path, layout: LevelLayoutSpec, force_refresh: bool = False) -> Optional[BeatPlanSpec]:
+        """Translates the Game Bible storyboard into executable `BeatTestSpec`s BEFORE implementation, so success
+        criteria are never invented after seeing the implementation. Returns None when the bible has no storyboard.
+        """
+        if self.client is None or not self._is_live_genai_client():
+            raise StudioAgentError("formulate_beat_plan requires an active google.genai Client (Rule 5)")
+        from google.genai import types
+
+        plan_path = c_dir / "beat_plan.json"
+        if plan_path.is_file() and not force_refresh:
+            return BeatPlanSpec.model_validate_json(plan_path.read_text(encoding="utf-8"))
+
+        bible_obj = json.loads(self._require_full_text((c_dir / "game_bible.json").read_text(encoding="utf-8"), "game_bible.json"))
+        storyboard = bible_obj.get("experience_storyboard") or []
+        onboarding = bible_obj.get("onboarding_plan") or {}
+        goals = (bible_obj.get("goal_hierarchy") or {}).get("goals") or []
+        if not storyboard and not (onboarding or {}).get("steps"):
+            return None
+
+        prompt = (
+            "You are the Lead QA Designer converting the Game Bible's experience storyboard into executable, falsifiable "
+            "`BeatTestSpec`s, written BEFORE the game is implemented.\n"
+            "For each storyboard beat AND each onboarding step produce ordered `BeatStepSpec`s: the exact scripted input (actions held, duration in "
+            "physics frames) and the entity states, as a list of (`entity_id` from the level layout, `expected_state`) entries, that MUST hold afterwards.\n"
+            "Rules:\n"
+            "1. Provide `deliberation` FIRST in every schema object (Rule 4).\n"
+            "2. Use only entity ids and states that exist in the level layout (initial states and trigger resulting states).\n"
+            "3. Include a step proving the beat's precondition is NOT already satisfied at t=0 (no passive auto-completion).\n"
+            "4. Expected states must be observable by a headless test inspecting the running game.\n\n"
+            f"--- LEVEL LAYOUT ---\n{layout.model_dump_json(indent=2)}\n\n"
+            f"--- EXPERIENCE STORYBOARD ---\n{json.dumps(storyboard, indent=2)}\n\n"
+            f"--- ONBOARDING PLAN (each step must have a beat proving the player can learn and perform that concept) ---\n{json.dumps(onboarding, indent=2)}\n\n"
+            f"--- GOALS (include beats showing the player can complete at least the immediate and short-term goals) ---\n{json.dumps(goals, indent=2)}\n"
+        )
+        resp = self.client.models.generate_content(
+            model=self.model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=BeatPlanSpec,
+            ),
+        )
+        if not resp.text:
+            raise StudioAgentError("Beat plan generation returned an empty response")
+        plan = BeatPlanSpec.model_validate_json(resp.text)
+        self.last_deliberation = plan.deliberation
+        plan_path.write_text(plan.model_dump_json(indent=2), encoding="utf-8")
+        return plan
+
+    _BEAT_TEST_DEFECT_IDS = ("SYNTAX_CHECK", "SCRIPT_MISSING", "NO_ASSERTIONS_EMITTED")
+
+    def verify_authored_beats(self, c_dir: Path, max_test_script_attempts: int = 4) -> Optional[Dict[str, Any]]:
+        """Runs the authored beat tests headlessly against the real cartridge.
+        Returns None when no beats are defined, otherwise `{"passed": bool, "failures": [...], "total": int}`.
+        Defects in the *test script itself* (compile errors / no assertions) are regenerated; failed assertions
+        are genuine game defects and are reported, never masked.
+        """
+        if self.client is None or not self._is_live_genai_client() or not (c_dir / "game_bible.json").is_file():
+            return None
+        from google.genai import types
+        from engine.sim.atomic_runner import GodotAtomicTestRunner
+
+        layout = self.formulate_level_layout(c_dir)
+        plan = self.formulate_beat_plan(c_dir, layout)
+        if plan is None or not plan.beats:
+            return None
+
+        rel_path = "tests/test_authored_beats.gd"
+        dest = c_dir / rel_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        prior_error = ""
+        for attempt in range(1, max_test_script_attempts + 1):
+            if prior_error or not dest.is_file():
+                prompt = (
+                    "You are the Lead Godot 4 Test Engineer writing ONE headless `extends SceneTree` test "
+                    f"(`{rel_path}`) that executes the authored beats against the REAL game.\n\n"
+                    f"--- LEVEL LAYOUT ---\n{layout.model_dump_json(indent=2)}\n\n"
+                    f"--- BEAT PLAN ---\n{plan.model_dump_json(indent=2)}\n\n"
+                    f"{('PREVIOUS TEST SCRIPT ERROR TO FIX:' + chr(10) + prior_error + chr(10) + chr(10)) if prior_error else ''}"
+                    f"CARTRIDGE SYMBOL INDEX:\n{self._build_cartridge_symbol_index(c_dir)}\n\n"
+                    "RULES:\n"
+                    "1. Start with `extends SceneTree`; run inside `func _initialize() -> void:`; instantiate `load(\"res://main.tscn\").instantiate()` and add it to `root`.\n"
+                    "2. For each beat step, apply the scripted input (e.g. `Input.action_press`/`Input.action_release`/direct calls) for `duration_frames` physics frames (`await physics_frame`), then check every `expected_entity_states` entry against REAL game state located via the entity id.\n"
+                    "3. For each check print `[ATOMIC_ASSERT_PASS] <beat_id>/<step_id>/<entity_id> | beat | details` or `[ATOMIC_ASSERT_FAIL] ...` — guarded by a real condition; NEVER hardcode a pass.\n"
+                    "4. If an entity from the layout cannot be located in the running game, that is a FAIL assertion.\n"
+                    "4b. Add a containment assertion: drive the player toward each edge of `world_bounds` for enough frames to reach it and assert the player stays within `world_bounds` (blocked or turned back), printing `[ATOMIC_ASSERT_PASS/FAIL] world_bounds_containment | boundary | details`.\n"
+                    "5. Use `var x = ...` (no `:=` on untyped expressions) and tab indentation. Call `quit(0)` if all passed else `quit(1)`.\n"
+                    "6. Provide `deliberation` FIRST (Rule 4)."
+                )
+                resp = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=AtomicTestSynthesisPayload,
+                    ),
+                )
+                if not resp.text:
+                    raise StudioAgentError("Beat test synthesis returned an empty response")
+                payload = AtomicTestSynthesisPayload.model_validate_json(resp.text)
+                code = payload.test_gdscript_code.strip()
+                if code.startswith("```"):
+                    code = re.sub(r"^```[a-zA-Z]*\s*", "", code)
+                    code = re.sub(r"\s*```$", "", code).strip()
+                dest.write_text(code + "\n", encoding="utf-8")
+
+            result = GodotAtomicTestRunner.run_atomic_test(c_dir, rel_path, unit_id="authored_beats", timeout=60.0)
+            test_defects = [a for a in result.failed_assertions if a.invariant_id in self._BEAT_TEST_DEFECT_IDS]
+            if test_defects:
+                prior_error = "\n".join(f"{a.invariant_id}: {a.message}" for a in test_defects)
+                logger.info("Authored beat test script defect (attempt %d/%d): %s", attempt, max_test_script_attempts, prior_error)
+                continue
+            failures = [f"{a.invariant_id}: {a.message}" for a in result.failed_assertions]
+            report = {"passed": bool(result.passed), "failures": failures, "total": len(result.assertions)}
+            (c_dir / "beat_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+            return report
+        raise StudioAgentError(
+            f"Could not produce a valid authored-beat test script after {max_test_script_attempts} attempts: {prior_error}"
+        )
 
     # -----------------------------------------------------------------------
     # Recursive Hierarchical Decomposition + Atomic Godot TDD & 4-Tier Render Verification
@@ -2670,7 +3096,14 @@ class LeadGameplaySWEAgent:
                             verdict.state_progression_visibility_passed = False
                     return verdict
             except Exception as exc:
-                logger.warning("Multimodal scene unit verification warning for '%s': %s", unit.unit_id, exc)
+                raise SceneVerificationError(
+                    f"Multimodal scene verification failed for unit '{unit.unit_id}': {exc!r}"
+                ) from exc
+
+        if self._is_live_genai_client():
+            raise SceneVerificationError(
+                f"Multimodal verifier returned no verdict, or no clean render was available, for unit '{unit.unit_id}'; refusing to fabricate a visual verdict."
+            )
 
         passed = len(defects) == 0
         return SceneUnitVisualVerdict(
@@ -2908,7 +3341,7 @@ class LeadGameplaySWEAgent:
             if self._is_live_genai_client() and (c_dir / "game_bible.json").is_file():
                 scene_refined = self.execute_scene_strategy_and_refine_loop(
                     c_dir=c_dir,
-                    max_scene_iterations=2,
+                    max_scene_iterations=None,
                 )
                 results.update(scene_refined)
 

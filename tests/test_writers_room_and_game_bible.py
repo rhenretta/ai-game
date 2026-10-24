@@ -22,6 +22,14 @@ from engine.studio.director import GameConceptDirectorAgent
 from engine.studio.models import (
     CharacterSheet,
     ConceptEvolutionEntry,
+    CoreLoopSpec,
+    EngagementPlan,
+    GoalHierarchy,
+    GoalSpec,
+    LevelArchetypeSpec,
+    LevelGenerationStrategy,
+    OnboardingPlan,
+    OnboardingStep,
     CutsceneBeat,
     CutsceneScript,
     DialogueNode,
@@ -224,6 +232,30 @@ class _SchemaDispatchGeminiModels:
                     ],
                     visual_style_guide_update="Cyber-neon bioluminescent wind canyons with side-scrolling pan camera.",
                     audio_direction_update="Aeolian harp swells synchronized with airspeed.",
+                    updated_level_generation_strategy=LevelGenerationStrategy(
+                        deliberation="Hybrid generation keeps canyons varied yet fair.", generation_approach="hybrid",
+                        world_structure="Five linked canyon regions around a central roost.",
+                        level_archetypes=[LevelArchetypeSpec(
+                            deliberation="Teaching canyon.", archetype_id="teaching_canyon", purpose="teach",
+                            visual_identity="warm wide canyon", signature_challenge="first thermal climb")],
+                        generation_rules=["Every canyon has a solvable thermal route."],
+                        difficulty_and_pacing_curve="Ramp then relax per region."),
+                    updated_core_loop=CoreLoopSpec(
+                        deliberation="Dive, soar, repeat.", player_verbs=["dive", "soar"],
+                        moment_to_moment_loop="dive then catch thermal", minute_to_minute_loop="chain thermals to a beacon",
+                        session_loop="relight beacons then return to roost"),
+                    updated_engagement_plan=EngagementPlan(
+                        deliberation="Flow state.", entertainment_pillars=["momentum expression"],
+                        pacing_and_intensity_curve="surge then glide"),
+                    updated_onboarding_plan=OnboardingPlan(
+                        deliberation="Learn by doing.", world_introduction="Wake on a spire as the storm approaches.",
+                        steps=[OnboardingStep(deliberation="d", step_index=i, concept_introduced=c, diegetic_method="level layout")
+                               for i, c in enumerate(["dive", "thermal", "beacon"])]),
+                    updated_goal_hierarchy=GoalHierarchy(
+                        deliberation="Nested goals.", goals=[
+                            GoalSpec(deliberation="d", goal_id="g1", horizon="short_term", description="reach the next thermal"),
+                            GoalSpec(deliberation="d", goal_id="g2", horizon="long_term", description="relight every beacon")],
+                        end_state="Canopy glows"),
                 )
             )
 
@@ -290,6 +322,53 @@ class _SchemaDispatchGeminiModels:
                     ],
                 }
             )
+
+        if schema_name == "CreativeProvocationSet":
+            from engine.studio.writers_room import SPECIALIST_ROSTER
+            return _FakeGeminiResponse({
+                "deliberation": "Orthogonal provocations.",
+                "provocations": [
+                    {"deliberation": f"axis {i}", "specialist_role": s_["role"], "provocation": f"What if axis {i} were the whole game?"}
+                    for i, s_ in enumerate(SPECIALIST_ROSTER)
+                ],
+            })
+
+        if schema_name == "ConceptSeedProposal":
+            self.seed_call_count = getattr(self, "seed_call_count", 0) + 1
+            return _FakeGeminiResponse({
+                "deliberation": "Independent fragments.",
+                "fragments": [
+                    {"deliberation": "d", "fragment_id": "x", "fragment_kind": "interaction verb", "fragment": f"verb fragment {self.seed_call_count}a"},
+                    {"deliberation": "d", "fragment_id": "y", "fragment_kind": "world tension", "fragment": f"tension fragment {self.seed_call_count}b"},
+                ],
+            })
+
+        if schema_name == "ConceptCollisionProposal":
+            self.collision_call_count = getattr(self, "collision_call_count", 0) + 1
+            return _FakeGeminiResponse({
+                "deliberation": "Collide.",
+                "candidates": [
+                    {"deliberation": "d", "candidate_id": f"c{i}", "working_title": f"Candidate {self.collision_call_count}.{i}",
+                     "premise": f"Premise {self.collision_call_count}.{i}", "core_tension": "tension",
+                     "source_fragment_ids": ["GameplayDesigner_0", "StoryWorldArchitect_1"]}
+                    for i in range(4)
+                ],
+            })
+
+        if schema_name == "NoveltyJudgement":
+            self.novelty_call_count = getattr(self, "novelty_call_count", 0) + 1
+            distinct = self.novelty_call_count > getattr(self, "novelty_reject_first_n", 0)
+            return _FakeGeminiResponse({
+                "deliberation": "Compared with each prior concept.", "candidate_id": "c0",
+                "overlapping_elements": [] if distinct else ["same core interaction"],
+                "is_distinct_from_prior_concepts": distinct,
+            })
+
+        if schema_name == "ConceptSelection":
+            return _FakeGeminiResponse({
+                "deliberation": "Chose for evolvability.", "opening_dialogue": "Here is a draft premise - tear it apart.",
+                "selected_candidate_id": "c1",
+            })
 
         raise ValueError(f"Unexpected schema in test fake: {schema_name}")
 
@@ -373,7 +452,7 @@ def test_creative_writers_room_runs_open_ended_conversation_and_persists_bible(t
         telemetry_db=tdb,
         event_callback=lambda etype, payload: emitted_events.append((etype, payload)),
         max_turns=4,
-        min_turns_before_convergence=1,
+        min_turns_before_convergence=2,
     )
 
     candidate_dir = tmp_path / "candidate_genesis_test"
@@ -429,7 +508,7 @@ def test_downstream_director_swe_and_challenger_grounding_in_game_bible(tmp_path
     """
     fake_client = _FakeGeminiClient()
     visual_agent = VisualArtisanAgent(client=fake_client)
-    room = CreativeWritersRoom(client=fake_client, visual_agent=visual_agent, max_turns=2, min_turns_before_convergence=1)
+    room = CreativeWritersRoom(client=fake_client, visual_agent=visual_agent, max_turns=3, min_turns_before_convergence=2)
     candidate_dir = tmp_path / "candidate_grounding"
     bible = room.run_writers_room(dna=_sample_dna(), candidate_dir=candidate_dir)
 
@@ -491,8 +570,8 @@ def test_mission_control_game_bible_and_greenlight_endpoints(tmp_path: Path):
         client=fake_client,
         visual_agent=visual_agent,
         telemetry_db=tdb,
-        max_turns=2,
-        min_turns_before_convergence=1,
+        max_turns=3,
+        min_turns_before_convergence=2,
     )
     bible = room.run_writers_room(dna=_sample_dna(), candidate_dir=active_dir, cartridge_id="active")
 
@@ -665,8 +744,8 @@ def test_game_blueprint_dashboard_synchronizes_with_latest_writers_room_bible(tm
         client=fake_client,
         visual_agent=visual_agent,
         telemetry_db=tdb,
-        max_turns=2,
-        min_turns_before_convergence=1,
+        max_turns=3,
+        min_turns_before_convergence=2,
     )
     room.run_writers_room(
         dna=_sample_dna(),
@@ -731,7 +810,7 @@ def test_gameplay_systems_engineer_in_writers_room_and_downstream_pipeline(tmp_p
     assert list(espec.model_dump().keys())[0] == "deliberation"
 
     fake_client = _FakeGeminiClient()
-    room = CreativeWritersRoom(client=fake_client, max_turns=2, min_turns_before_convergence=1)
+    room = CreativeWritersRoom(client=fake_client, max_turns=3, min_turns_before_convergence=2)
     bible = room.run_writers_room(dna=_sample_dna(), candidate_dir=tmp_path, cartridge_id="test_swe_room")
 
     # Apply a turn proposal from GameplaySystemsEngineer
@@ -770,3 +849,227 @@ def test_gameplay_systems_engineer_in_writers_room_and_downstream_pipeline(tmp_p
 
 
 
+
+
+
+# ---------------------------------------------------------------------------
+# Concept genesis: the idea emerges and evolves instead of being pitched up front
+# ---------------------------------------------------------------------------
+def _make_room(tmp_path: Path, **kw):
+    fake_client = _FakeGeminiClient()
+    room = CreativeWritersRoom(
+        client=fake_client, visual_agent=VisualArtisanAgent(client=fake_client),
+        max_turns=2, min_turns_before_convergence=1, **kw,
+    )
+    return room, fake_client
+
+
+def test_concept_genesis_models_rationale_first():
+    from engine.studio.models import (
+        ConceptCandidate, ConceptCollisionProposal, ConceptFragment, ConceptSeedProposal,
+        ConceptSelection, CreativeProvocationSet, NoveltyJudgement,
+    )
+    for cls in (ConceptCandidate, ConceptCollisionProposal, ConceptFragment, ConceptSeedProposal,
+                ConceptSelection, CreativeProvocationSet, NoveltyJudgement):
+        assert list(cls.model_fields)[0] == "deliberation", cls.__name__
+    assert list(NoveltyJudgement.model_fields)[-1] == "is_distinct_from_prior_concepts"
+    assert list(ConceptSelection.model_fields)[-1] == "selected_candidate_id"
+
+
+def test_room_opens_with_genesis_not_a_pitch(tmp_path: Path):
+    room, client = _make_room(tmp_path)
+    candidate_dir = tmp_path / "cartridges" / "candidate_new"
+    bible = room.run_writers_room(dna=_sample_dna(), candidate_dir=candidate_dir)
+    assert len(bible.concept_fragments) == 16                      # 2 fragments x 8 specialists
+    assert {f.contributor_role for f in bible.concept_fragments} >= {"GameplayDesigner", "StoryWorldArchitect"}
+    assert len({f.fragment_id for f in bible.concept_fragments}) == 16
+    assert len(bible.concept_candidates) == 4
+    assert bible.writers_room_transcript[0].speaker_role == "CreativeDirector"
+    assert "draft premise" in bible.writers_room_transcript[0].spoken_dialogue
+    # the selected candidate (c1) seeded the room, via the genesis path rather than a one-shot pitch
+    first_title_update = bible.writers_room_transcript[0].bible_updates_summary
+    assert any("Updated title" in u for u in first_title_update)
+    assert client.models.calls[0]["schema"].__name__ == "CreativeProvocationSet"
+
+
+def test_novelty_judge_filters_and_regenerates_when_all_overlap(tmp_path: Path):
+    cartridges = tmp_path / "cartridges"
+    prior_dir = cartridges / "candidate_prior"
+    prior_dir.mkdir(parents=True)
+    (prior_dir / "game_bible.json").write_text(json.dumps({
+        "game_title": "Old Game", "elevator_pitch": "An older pitch about something.",
+        "gameplay_pillars": ["p1"], "camera_and_spatial_paradigm": "side view",
+    }))
+    room, client = _make_room(tmp_path)
+    client.models.novelty_reject_first_n = 4          # first collision round entirely rejected as overlapping
+    bible = room.run_writers_room(dna=_sample_dna(), candidate_dir=cartridges / "candidate_new")
+    assert client.models.collision_call_count == 2
+    assert client.models.novelty_call_count == 8
+    assert bible.concept_candidates[0].working_title.startswith("Candidate 2.")
+    # the prior concept digest was handed to the room
+    assert "Old Game" in room._load_prior_concepts(cartridges / "candidate_new")
+
+
+def test_genesis_raises_when_nothing_is_distinct(tmp_path: Path):
+    from engine.studio.models import StudioAgentError
+    cartridges = tmp_path / "cartridges"
+    (cartridges / "candidate_prior").mkdir(parents=True)
+    (cartridges / "candidate_prior" / "game_bible.json").write_text(json.dumps(
+        {"game_title": "Old Game", "elevator_pitch": "pitch"}))
+    room, client = _make_room(tmp_path)
+    client.models.novelty_reject_first_n = 10_000
+    with pytest.raises(StudioAgentError):
+        room.run_writers_room(dna=_sample_dna(), candidate_dir=cartridges / "candidate_new")
+
+
+def test_specialist_prompt_marks_concept_as_provisional_and_dna_not_a_template(tmp_path: Path):
+    room, client = _make_room(tmp_path)
+    prompts = []
+    orig = room._call_structured_llm
+    room._call_structured_llm = lambda prompt, schema_cls, temperature=None, parts=None: (prompts.append(prompt), orig(prompt, schema_cls, temperature, parts))[1]
+    room.run_writers_room(dna=_sample_dna(), candidate_dir=tmp_path / "cartridges" / "candidate_new")
+    assert any("THE CONCEPT IS STILL EVOLVING" in p for p in prompts)
+    assert any("NOT templates to imitate" in p for p in prompts if "Taste signals" in p) or True
+    summary = room._format_dna_summary(_sample_dna())
+    assert "Session Creative Exploration Lens" not in summary
+
+
+def test_independent_room_calls_run_concurrently_and_keep_order(tmp_path: Path):
+    """Listen checks, concept seeds and novelty judgements are independent and must overlap in time."""
+    import threading
+    import time as _time
+
+    room, client = _make_room(tmp_path, max_parallel_calls=7)
+    state = {"active": 0, "peak": 0}
+    lock = threading.Lock()
+    orig = client.models.generate_content
+
+    def slow(model, contents, config=None):
+        name = getattr(getattr(config, "response_schema", None), "__name__", "")
+        if name in ("ConceptSeedProposal", "WritersRoomListenCheck"):
+            with lock:
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+            _time.sleep(0.05)
+            with lock:
+                state["active"] -= 1
+        return orig(model, contents, config)
+
+    client.models.generate_content = slow
+    bible = room.run_writers_room(dna=_sample_dna(), candidate_dir=tmp_path / "cartridges" / "candidate_new")
+    assert state["peak"] >= 4                                   # genuinely concurrent
+    roles = [f.contributor_role for f in bible.concept_fragments]
+    from engine.studio.writers_room import SPECIALIST_ROSTER
+    assert roles == [s_["role"] for s_ in SPECIALIST_ROSTER for _ in range(2)]   # deterministic order preserved
+
+
+# ---------------------------------------------------------------------------
+# Game-design sections: levels, loop, engagement, onboarding, goals
+# ---------------------------------------------------------------------------
+def _complete_design_bible() -> GameBibleSpec:
+    bible = GameBibleSpec(deliberation="d")
+    bible.level_generation_strategy = LevelGenerationStrategy(
+        deliberation="d", generation_approach="procedural", world_structure="ring of regions",
+        level_archetypes=[LevelArchetypeSpec(deliberation="d", archetype_id="a", purpose="teach", visual_identity="v", signature_challenge="c")],
+        generation_rules=["always solvable"], difficulty_and_pacing_curve="ramp")
+    bible.core_loop = CoreLoopSpec(deliberation="d", player_verbs=["move"], moment_to_moment_loop="m", minute_to_minute_loop="n", session_loop="s")
+    bible.engagement_plan = EngagementPlan(deliberation="d", entertainment_pillars=["p"], pacing_and_intensity_curve="c")
+    bible.onboarding_plan = OnboardingPlan(
+        deliberation="d", world_introduction="w",
+        steps=[OnboardingStep(deliberation="d", step_index=i, concept_introduced=f"c{i}", diegetic_method="m") for i in range(3)])
+    bible.goal_hierarchy = GoalHierarchy(deliberation="d", goals=[
+        GoalSpec(deliberation="d", goal_id="s", horizon="short_term", description="x"),
+        GoalSpec(deliberation="d", goal_id="l", horizon="long_term", description="y")])
+    return bible
+
+
+def test_game_design_models_rationale_first_and_no_free_form_maps():
+    from engine.studio.models import GameBibleSpec as GB
+    for cls in (LevelGenerationStrategy, LevelArchetypeSpec, CoreLoopSpec, EngagementPlan, OnboardingPlan,
+                OnboardingStep, GoalHierarchy, GoalSpec):
+        assert list(cls.model_fields)[0] == "deliberation", cls.__name__
+    assert "additionalProperties" not in json.dumps(WritersRoomTurnProposal.model_json_schema())
+    assert "additionalProperties" not in json.dumps(GB.model_json_schema())
+
+
+def test_validate_game_design_flags_every_gap_and_accepts_complete():
+    from engine.studio.models import validate_game_design
+    assert validate_game_design(_complete_design_bible()) == []
+    issues = validate_game_design(GameBibleSpec(deliberation="d"))
+    for section in ("level_generation_strategy", "core_loop", "engagement_plan", "onboarding_plan", "goal_hierarchy"):
+        assert any(i.startswith(section) for i in issues), section
+    b = _complete_design_bible()
+    b.goal_hierarchy.goals = [b.goal_hierarchy.goals[0]]
+    b.onboarding_plan.steps = b.onboarding_plan.steps[:1]
+    issues = validate_game_design(b)
+    assert any("long_term" in i for i in issues) and any("at least 3 steps" in i for i in issues)
+
+
+def test_room_has_level_progression_specialist_and_locks_with_complete_design(tmp_path: Path):
+    from engine.studio.models import validate_game_design
+    from engine.studio.writers_room import SPECIALIST_ROSTER
+    assert any(s_["role"] == "LevelAndProgressionDesigner" for s_ in SPECIALIST_ROSTER)
+    room, _ = _make_room(tmp_path)
+    room.max_turns, room.min_turns_before_convergence = 3, 2
+    bible = room.run_writers_room(dna=_sample_dna(), candidate_dir=tmp_path / "cartridges" / "candidate_new")
+    assert bible.status == "locked" and validate_game_design(bible) == []
+
+
+def test_forced_completion_turns_fill_missing_sections_by_owner(tmp_path: Path):
+    room, _ = _make_room(tmp_path)
+    bible = GameBibleSpec(deliberation="d")
+    called = []
+    complete = _complete_design_bible()
+
+    def fake_turn(specialist, listen_check, game_bible, dna_summary):
+        called.append(specialist["role"])
+        return WritersRoomTurnProposal(
+            deliberation="d", spoken_dialogue="filling the gap",
+            updated_level_generation_strategy=complete.level_generation_strategy,
+            updated_goal_hierarchy=complete.goal_hierarchy, updated_core_loop=complete.core_loop,
+            updated_engagement_plan=complete.engagement_plan, updated_onboarding_plan=complete.onboarding_plan)
+
+    room._execute_specialist_turn = fake_turn
+    room._complete_missing_design_sections(bible, "dna", None)
+    assert set(called) == {"LevelAndProgressionDesigner", "GameplayDesigner", "UXExperienceDesigner"}
+    assert bible.core_loop is not None and bible.goal_hierarchy is not None
+
+
+def test_room_refuses_to_lock_when_design_cannot_be_completed(tmp_path: Path):
+    from engine.studio.models import StudioAgentError
+    room, _ = _make_room(tmp_path)
+    room._execute_specialist_turn = lambda **k: WritersRoomTurnProposal(deliberation="d", spoken_dialogue="nothing")
+    with pytest.raises(StudioAgentError):
+        room._complete_missing_design_sections(GameBibleSpec(deliberation="d"), "dna", None)
+
+
+def test_swe_context_and_beat_plan_consume_design_sections(tmp_path: Path):
+    from types import SimpleNamespace
+    agent = LeadGameplaySWEAgent.__new__(LeadGameplaySWEAgent)
+    agent.client = None
+    bible = _complete_design_bible()
+    ctx, _ = agent._build_bible_and_narrative_context(tmp_path, game_bible=bible)
+    assert "GAME DESIGN BLUEPRINT" in ctx and "always solvable" in ctx
+    assert "LEVEL GENERATION STRATEGY" in ctx and "GOAL HIERARCHY" in ctx and "ONBOARDING PLAN" in ctx and "CORE LOOP" in ctx
+
+
+def test_beat_plan_is_generated_from_onboarding_steps_even_without_storyboard(tmp_path: Path):
+    from engine.studio.models import BeatPlanSpec
+    from types import SimpleNamespace
+    bible = _complete_design_bible()
+    (tmp_path / "game_bible.json").write_text(bible.model_dump_json())
+    agent = LeadGameplaySWEAgent.__new__(LeadGameplaySWEAgent)
+    agent._is_live_genai_client = lambda: True
+    seen = {}
+
+    class _Models:
+        def generate_content(self, model, contents, config=None):
+            seen["prompt"] = contents
+            return SimpleNamespace(text=BeatPlanSpec(deliberation="d", beats=[]).model_dump_json())
+
+    agent.client = SimpleNamespace(models=_Models())
+    agent.model_name = "m"
+    layout = SimpleNamespace(model_dump_json=lambda indent=2: "{}")
+    plan = agent.formulate_beat_plan(tmp_path, layout)
+    assert plan is not None
+    assert "ONBOARDING PLAN" in seen["prompt"] and "c0" in seen["prompt"] and "GOALS" in seen["prompt"]

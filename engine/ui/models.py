@@ -692,6 +692,10 @@ class StudioSettingsUpdateRequest(BaseModel):
         default=False,
         description="When True, pause at AWAITING_GREENLIGHT after the Writers' Room locks the Game Bible.",
     )
+    paused: Optional[bool] = Field(
+        default=None,
+        description="When True, pauses active build workers and Writers' Room turns until resumed.",
+    )
 
 
 

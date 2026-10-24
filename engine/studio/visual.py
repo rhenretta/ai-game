@@ -1040,7 +1040,7 @@ class VisualArtSpriteDesignerAgent:
         elif is_actor:
             aspect = "1:1"
             full_prompt = (
-                f"SINGLE solitary full-body 2D in-game animated subject sprite in a clean grounded neutral readiness pose: {prompt}.{style_clause} "
+                f"SINGLE solitary full-body high-resolution illustrated in-game subject in a clean neutral readiness pose: {prompt}.{style_clause} "
                 f"Strictly ONE single isolated full-body figure centered on a solid flat bright magenta (#FF00FF) chroma-key background with complete silhouette and grounded base. "
                 f"STRICTLY ONLY ONE single subject instance — NEVER multiple figures, NEVER a multi-angle turnaround chart, NEVER a sprite grid, "
                 f"NO detached environment terrain slab, NO ground pedestal, NO cast shadow on the floor, NO background scenery, NOT a bust portrait, NO border frame, NO text."
@@ -1048,7 +1048,7 @@ class VisualArtSpriteDesignerAgent:
         else:
             aspect = "1:1"
             full_prompt = (
-                f"Single isolated 2D in-game architectural structure or interactive prop sprite: {prompt}.{style_clause} "
+                f"Single isolated high-resolution illustrated in-game structure or interactive prop: {prompt}.{style_clause} "
                 f"Centered on a solid flat bright magenta (#FF00FF) chroma-key background. "
                 f"STRICTLY ONLY the single discrete object/structure itself — NO ground slab, NO pedestal, "
                 f"NO cast shadow on the floor, NO background sky/scenery, NO border frame, NO picture box, NO text, "

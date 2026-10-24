@@ -52,6 +52,21 @@ class StudioAgentError(Exception):
     deliberation: str = "Authentic epistemic failure surfaced to observability traces."
 
 
+class SceneVerificationError(StudioAgentError):
+    """Raised when a scene/visual verifier cannot produce an authentic verdict (Rule 5: no fabricated passes)."""
+    deliberation: str = "Scene verification could not be completed; no verdict may be fabricated."
+
+
+class SceneFidelityRejection(StudioAgentError):
+    """Raised when scene/beat fidelity could not be achieved within an explicitly configured iteration ceiling."""
+    deliberation: str = "Scene fidelity was not achieved within the configured iteration ceiling."
+
+    def __init__(self, message: str, critique: Any = None, beat_report: Any = None) -> None:
+        super().__init__(message)
+        self.critique = critique
+        self.beat_report = beat_report
+
+
 class StudioAgentConfigurationError(StudioAgentError):
     """Raised when an agent is invoked without required credentials or configuration."""
     deliberation: str = "Raised when agent configuration or required client is missing."
@@ -171,6 +186,12 @@ class StudioOrchestratorConfig(BaseEpistemicModel):
         default=False,
         description="When True, pause at AWAITING_GREENLIGHT after the Writers' Room locks the Game Bible.",
     )
+    continuous_production: Optional[bool] = Field(
+        default=None,
+        description="Run the council and the implementation side as one continuous loop (backlog, workers, proof review). None = enabled whenever a live Gemini client is used.",
+    )
+    board_workers: int = Field(default=2, description="Maximum concurrent Production Board workers.")
+    max_item_revisions: int = Field(default=5, description="Default revision cap per backlog item before the council must decide.")
 
 
 class AgentPlan(BaseEpistemicModel):
@@ -757,7 +778,7 @@ class PartKeyframeTrackSpec(BaseEpistemicModel):
     Defines an ordered sequence of KeyframeTransformSpecs for a specific body/mechanism part.
     """
     deliberation: str = Field(..., description="MANDATORY FIRST: Why this part's keyframe curve communicates the state's motion.")
-    part_id: str = Field(..., description="Target part_id ('root', 'torso', 'head', 'arm_l', 'arm_r', 'leg_l', 'leg_r', 'appendage').")
+    part_id: str = Field(..., description="Target component or part_id within the articulated rig or entity.")
     keyframes: List[KeyframeTransformSpec] = Field(default_factory=list, description="Ordered keyframes from t=0.0 to t=1.0.")
 
 
@@ -766,10 +787,10 @@ class AnimationStateSpec(BaseEpistemicModel):
     Defines an agent-authored animation state or pose sequence for a sprite sheet / animated asset.
     """
     deliberation: str = Field(..., description="MANDATORY FIRST: Rationale for why this animation state is needed for gameplay/visual feedback.")
-    state_name: str = Field(..., description="Animation state identifier (e.g. 'idle', 'move', 'jump', 'interact', 'active', 'damaged').")
-    motion_profile: Literal["idle", "locomotion", "aerial", "action"] = Field(
+    state_name: str = Field(..., description="Animation state identifier tailored to this entity.")
+    motion_profile: str = Field(
         default="idle",
-        description="Explicit kinematic articulation profile: 'idle' | 'locomotion' | 'aerial' | 'action'."
+        description="Kinematic articulation or motion profile tailored to this entity and state (devised for the subject rather than restricted to a fixed list)."
     )
     frame_count: int = Field(default=4, ge=1, le=12, description="Number of frames in this animation state.")
     fps: float = Field(default=8.0, description="Playback rate in frames per second.")
@@ -1178,8 +1199,11 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
                 fabricated = lib.fabricate_assets(self.requested_assets)
                 results.update(fabricated)
             lib.save_catalog()
-        except Exception:
-            pass
+        except Exception as exc:
+            # Rule 5: required-asset fabrication failures must never be silently swallowed.
+            raise StudioAgentError(
+                f"On-demand asset fabrication failed for cartridge '{target_dir}': {exc!r}"
+            ) from exc
 
         # 1. Ensure minimal main.tscn exists
         main_tscn = target_dir / "main.tscn"
@@ -1749,6 +1773,12 @@ class WritersRoomTurnProposal(BaseEpistemicModel):
     added_or_updated_engineering_specs: List[MechanicEngineeringSpec] = Field(default_factory=list)
     visual_style_guide_update: Optional[str] = Field(default=None)
     audio_direction_update: Optional[str] = Field(default=None)
+    updated_level_generation_strategy: Optional[LevelGenerationStrategy] = Field(default=None)
+    updated_core_loop: Optional[CoreLoopSpec] = Field(default=None)
+    updated_engagement_plan: Optional[EngagementPlan] = Field(default=None)
+    updated_onboarding_plan: Optional[OnboardingPlan] = Field(default=None)
+    updated_goal_hierarchy: Optional[GoalHierarchy] = Field(default=None)
+    backlog_additions: List[WorkItemProposal] = Field(default_factory=list, description="Requirements for the implementation side (assets, level maps, animations, mechanics, code) with dependencies.")
 
 
 class DirectorConvergenceCheck(BaseEpistemicModel):
@@ -1776,6 +1806,206 @@ class DirectorConvergenceCheck(BaseEpistemicModel):
         default="",
         description="If not ready, the Director's next challenge or question to the room."
     )
+
+
+class CreativeProvocation(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    One divergent creative provocation assigned to a single specialist.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this provocation opens a distinct creative direction.")
+    specialist_role: str = Field(..., description="Exact specialist role this provocation is for.")
+    provocation: str = Field(..., description="An open-ended creative prompt, constraint or question, unrelated to any existing game or genre label.")
+
+
+class CreativeProvocationSet(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4)."""
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: How these provocations span orthogonal creative axes and differ from prior concepts.")
+    provocations: List[CreativeProvocation] = Field(default_factory=list)
+
+
+class ConceptFragment(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    A single independent creative fragment from one specialist's domain; NOT a complete game idea.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this fragment is surprising and worth building a game around.")
+    fragment_id: str = Field(..., description="Unique identifier within the room.")
+    contributor_role: str = Field(default="", description="Specialist role that authored the fragment.")
+    fragment_kind: str = Field(..., description="Free-form kind such as an interaction verb/system, a world tension, an emotional experience, a constraint, or a sensory signature.")
+    fragment: str = Field(..., description="The fragment itself, concrete and vivid.")
+
+
+class ConceptSeedProposal(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4)."""
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: How the assigned provocation was interpreted from this specialist's domain.")
+    fragments: List[ConceptFragment] = Field(default_factory=list)
+
+
+class ConceptCandidate(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    A candidate premise formed by colliding fragments from different specialists.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: How the colliding fragments produce something none of them implied alone.")
+    candidate_id: str = Field(..., description="Unique candidate identifier.")
+    working_title: str = Field(..., description="Evocative provisional title.")
+    premise: str = Field(..., description="Provisional premise (a starting point that the room will evolve, not a finished design).")
+    source_fragment_ids: List[str] = Field(default_factory=list, description="Fragments combined; must come from at least two different contributors.")
+    core_tension: str = Field(default="", description="The central tension or question that makes the premise generative.")
+
+
+class ConceptCollisionProposal(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4)."""
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Strategy for colliding fragments into distinct candidates.")
+    candidates: List[ConceptCandidate] = Field(default_factory=list)
+
+
+class NoveltyJudgement(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Judges whether a candidate concept is genuinely distinct from previously produced concepts.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Element-by-element comparison of the candidate against each prior concept (core interaction, setting, tone, structure).")
+    candidate_id: str = Field(..., description="Candidate being judged.")
+    overlapping_elements: List[str] = Field(default_factory=list, description="Core elements shared with prior concepts.")
+    is_distinct_from_prior_concepts: bool = Field(..., description="Decision (strictly last): True only if the candidate's core interaction AND setting/tone are meaningfully different from every prior concept.")
+
+
+class ConceptSelection(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4)."""
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Director's comparison of the candidates by potential for evolution, freshness and buildability.")
+    opening_dialogue: str = Field(..., description="What the Creative Director says to open the room with the chosen provisional premise, inviting specialists to challenge and reshape it.")
+    selected_candidate_id: str = Field(..., description="Decision (strictly last): the chosen candidate_id.")
+
+
+class LevelArchetypeSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    One recurring kind of level / region / area the game is built from.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this archetype exists and what it adds to the experience.")
+    archetype_id: str = Field(..., description="Unique snake_case identifier.")
+    purpose: str = Field(..., description="Its role in the player's journey (teach, test, reward, surprise, rest, climax...).")
+    visual_identity: str = Field(..., description="What it looks, sounds and feels like, and how it differs from other archetypes.")
+    signature_challenge: str = Field(..., description="The characteristic challenge or activity found here.")
+    building_blocks: List[str] = Field(default_factory=list, description="Reusable elements it is assembled from (terrain features, hazards, mechanisms, set pieces).")
+    introduced_at_progression_order: int = Field(default=0, description="0 = encountered first; larger values appear later.")
+
+
+class LevelGenerationStrategy(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    How the game's levels/world are produced and what they look like, invented specifically for this game.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this bespoke world-building strategy, structure, and scale suit this specific game's loop, scope and replayability.")
+    generation_approach: str = Field(..., description="Bespoke strategy for how this game's world/levels are constructed and populated (devised specifically for this game rather than chosen from a fixed menu).")
+    world_structure: str = Field(..., description="How the world is organised and scaled for this specific game, how its spaces connect or evolve, and why that scale serves the core loop.")
+    runtime_construction_plan: str = Field(
+        default="",
+        description="Concrete technical plan for how scenes.gd and mechanics.gd construct, generate, or stream the world at runtime.",
+    )
+    level_archetypes: List[LevelArchetypeSpec] = Field(default_factory=list, description="The kinds of spaces, stages, or biomes the game is built from.")
+    generation_rules: List[str] = Field(default_factory=list, description="Concrete constraints, grammar, or invariants: guaranteed elements, placement/connectivity rules, solvability and fairness guarantees.")
+    difficulty_and_pacing_curve: str = Field(..., description="How challenge and intensity ramp and relax across the experience.")
+    variety_and_replayability: str = Field(default="", description="What keeps the world from feeling repetitive across a session.")
+
+
+class CoreLoopSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    The gameplay loop at three time scales.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this loop is compelling and how its scales reinforce one another.")
+    player_verbs: List[str] = Field(default_factory=list, description="The actions the player performs.")
+    moment_to_moment_loop: str = Field(..., description="Seconds-scale loop: act -> world response -> feedback -> next decision.")
+    minute_to_minute_loop: str = Field(..., description="Minutes-scale loop: objectives, encounters, resource flow.")
+    session_loop: str = Field(..., description="Whole-session loop: how a play session starts, builds and ends, and why the player returns.")
+    feedback_and_juice: str = Field(default="", description="How the game communicates success, failure and progress through visuals, audio and motion.")
+    reward_cadence: str = Field(default="", description="When and how the player is rewarded.")
+    failure_and_recovery: str = Field(default="", description="What failure costs and how the player recovers without frustration.")
+
+
+class EngagementPlan(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    How the player is kept entertained over time.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: What will make a player want to keep playing, and the evidence for it in the design.")
+    entertainment_pillars: List[str] = Field(default_factory=list, description="The distinct sources of enjoyment (e.g. expression, mastery, discovery, tension and release).")
+    variety_injectors: List[str] = Field(default_factory=list, description="Mechanisms that change the experience (new abilities, twists, set pieces, events).")
+    pacing_and_intensity_curve: str = Field(..., description="Rise and fall of intensity across a session.")
+    surprise_and_discovery: str = Field(default="", description="What the player discovers and how surprises are staged.")
+    mastery_and_expression: str = Field(default="", description="How skill growth and personal style are supported and rewarded.")
+    emotional_arc: str = Field(default="", description="The feelings the experience moves through.")
+
+
+class OnboardingStep(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4)."""
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this is the right next thing to teach or reveal.")
+    step_index: int = Field(..., description="Order within the introduction (0 first).")
+    concept_introduced: str = Field(..., description="The single mechanic, rule or world fact introduced here.")
+    diegetic_method: str = Field(..., description="How it is taught through the world, level design or feedback rather than text walls.")
+    player_proof_of_learning: str = Field(default="", description="How the game can tell the player understood.")
+    world_reveal: str = Field(default="", description="What the player learns about the world at this step.")
+
+
+class OnboardingPlan(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    How the player is introduced to the world and the mechanics.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: How the introduction builds understanding, curiosity and confidence.")
+    world_introduction: str = Field(..., description="How the player first meets the world, their role and the stakes.")
+    steps: List[OnboardingStep] = Field(default_factory=list, description="Ordered teaching steps, each introducing one concept.")
+    confusion_recovery: str = Field(default="", description="How a stuck or lost player is gently helped.")
+
+
+class GoalSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4)."""
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why the player will care about this goal.")
+    goal_id: str = Field(..., description="Unique identifier.")
+    horizon: str = Field(..., description="Time scale or cadence of the goal (devised for this game's loop, e.g. immediate, short_term, per_round, session, mastery, long_term).")
+    description: str = Field(..., description="What the player is trying to achieve.")
+    motivation: str = Field(default="", description="Why it matters (emotional / mechanical stakes).")
+    progress_feedback: str = Field(default="", description="How the player sees progress toward it.")
+    reward: str = Field(default="", description="What achieving it gives the player.")
+
+
+class GoalHierarchy(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    The player's short-term, mid-term and long-term goals and how they connect.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: How the goals nest so that short-term play always serves the long-term arc.")
+    goals: List[GoalSpec] = Field(default_factory=list, description="Goals across all horizons (immediate through endgame).")
+    progression_structure: str = Field(default="", description="How the player advances (unlocks, abilities, story, mastery).")
+    end_state: str = Field(default="", description="What completion, or an endless-play equilibrium, looks like.")
+
+
+def validate_game_design(bible: "GameBibleSpec") -> List[str]:
+    """Structural completeness of the game-design sections. Returns issues (empty = complete)."""
+    issues: List[str] = []
+    lg, loop, eng, onb, gh = (
+        bible.level_generation_strategy, bible.core_loop, bible.engagement_plan,
+        bible.onboarding_plan, bible.goal_hierarchy,
+    )
+    if lg is None:
+        issues.append("level_generation_strategy is missing.")
+    else:
+        if not lg.level_archetypes:
+            issues.append("level_generation_strategy needs at least one level archetype.")
+        if not lg.generation_rules:
+            issues.append("level_generation_strategy needs generation_rules.")
+    if loop is None:
+        issues.append("core_loop is missing.")
+    elif not loop.player_verbs:
+        issues.append("core_loop needs player_verbs.")
+    if eng is None:
+        issues.append("engagement_plan is missing.")
+    elif not eng.entertainment_pillars:
+        issues.append("engagement_plan needs entertainment_pillars.")
+    if onb is None:
+        issues.append("onboarding_plan is missing.")
+    elif len(onb.steps) < 3:
+        issues.append("onboarding_plan needs at least 3 steps.")
+    if gh is None:
+        issues.append("goal_hierarchy is missing.")
+    else:
+        horizons = {g.horizon.strip() for g in gh.goals if g.horizon and g.horizon.strip()}
+        if len(horizons) < 2:
+            issues.append("goal_hierarchy needs at least two distinct goal horizons (e.g. short_term and long_term).")
+    return issues
 
 
 class GameBibleSpec(BaseEpistemicModel):
@@ -1828,6 +2058,13 @@ class GameBibleSpec(BaseEpistemicModel):
     visual_style_guide: str = Field(default="")
     audio_direction_guide: str = Field(default="")
     concept_evolution: List[ConceptEvolutionEntry] = Field(default_factory=list)
+    level_generation_strategy: Optional[LevelGenerationStrategy] = Field(default=None, description="How levels are generated and what they look like.")
+    core_loop: Optional[CoreLoopSpec] = Field(default=None, description="Moment-to-moment, minute-to-minute and session loops.")
+    engagement_plan: Optional[EngagementPlan] = Field(default=None, description="How the player stays entertained.")
+    onboarding_plan: Optional[OnboardingPlan] = Field(default=None, description="How the player is introduced to the world and mechanics.")
+    goal_hierarchy: Optional[GoalHierarchy] = Field(default=None, description="Short-, mid- and long-term goals.")
+    concept_fragments: List[ConceptFragment] = Field(default_factory=list, description="Independent divergent fragments contributed before any concept was chosen.")
+    concept_candidates: List[ConceptCandidate] = Field(default_factory=list, description="Candidate premises formed by colliding fragments (the selected one seeds the room).")
     writers_room_transcript: List[WritersRoomUtterance] = Field(default_factory=list)
     experience_storyboard: List[ExperienceStoryboardBeat] = Field(default_factory=list)
     visual_mockups: List[VisualMockupArtifact] = Field(default_factory=list)
@@ -2060,6 +2297,592 @@ class AtomicTestSynthesisPayload(BaseEpistemicModel):
         ...,
         description="Complete valid Godot 4 GDScript code (`extends SceneTree`) that instantiates the target classes/scene, executes each invariant check, prints `[ATOMIC_ASSERT_PASS]` / `[ATOMIC_ASSERT_FAIL]` lines, and calls `quit(0)` or `quit(1)`."
     )
+
+
+class SubjectRenderTreatment(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    How ONE subject (environment element, character, effect) is rendered.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this technique suits this subject given the Game Bible's camera, tone and mechanics.")
+    subject_id: str = Field(..., description="Identifier of the environment element, character, mechanism or effect.")
+    technique: str = Field(..., description="Bespoke rendering technique devised for this subject (not restricted to a fixed menu).")
+    target_resolution: Tuple[int, int] = Field(..., description="Pixel resolution at which the source art for this subject is produced.")
+    notes: str = Field(default="", description="Specific guidance (layer depth, parts breakdown, motion cues, lighting interaction).")
+
+
+class RenderingStrategySpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Per-game rendering approach decided by the model from the Game Bible. Drives asset decomposition and
+    fabrication, SWE rendering code, and critic criteria.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: How the Bible's experience, camera, tone and mechanics imply a modern rendering approach.")
+    rendering_paradigm: str = Field(..., description="Overall rendering paradigm devised specifically for this game.")
+    renderer: Literal["compatibility", "mobile", "forward_plus"] = Field(..., description="Godot renderer. 'compatibility' is the most portable but has NO WorldEnvironment glow.")
+    uses_environment_glow: bool = Field(default=False, description="Whether WorldEnvironment glow/bloom is used. Must be False when renderer is 'compatibility'.")
+    pixelated_style_intended: bool = Field(default=False, description="True ONLY if the Game Bible explicitly calls for a pixel-art / low-resolution aesthetic.")
+    treatments: List[SubjectRenderTreatment] = Field(default_factory=list, description="Treatment for every significant subject.")
+    lighting_and_atmosphere: str = Field(default="", description="Lights, fog, colour grading and atmospheric depth plan.")
+    effects_stack: List[str] = Field(default_factory=list, description="Concrete Godot features to use (particles, shaders, light nodes, trails, post-processing).")
+    asset_resolution_policy: str = Field(default="", description="How source-art resolution scales with on-screen size and camera zoom.")
+
+
+WorkItemKind = Literal[
+    "visual_asset", "audio_asset", "level_map", "animation", "mechanic_code", "integration", "ui", "narrative", "other",
+]
+WorkItemState = Literal[
+    "blocked", "ready", "in_progress", "awaiting_review", "changes_requested",
+    "needs_decision", "approved", "failed", "cancelled",
+]
+
+
+class QASetupCall(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    A scenario-setup action executed by the QA test harness at a specific tick (outside production _physics_process)
+    to position actors, spawn a hazard, or trigger an interaction precondition for proof capture.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this scenario setup call is needed to test/prove the work item.")
+    at_tick: int = Field(default=1, description="Tick at which to invoke this setup hook (1 <= at_tick <= 900).")
+    target_node_or_property: str = Field(
+        default="",
+        description="Node name/path or root property on main scene (empty string targets main scene root directly).",
+    )
+    method_name: str = Field(..., description="Method to call on the target node (or 'set_property' to assign a property).")
+    args_json: str = Field(default="[]", description="JSON-encoded list of arguments to pass to method_name.")
+
+
+class QAStateAssertion(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    An observable state assertion evaluated at a specific tick during the QA filmstrip run.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this state condition proves the asset/mechanic works.")
+    at_tick: int = Field(..., description="Tick at which to check the assertion.")
+    snapshot_key: str = Field(..., description="Key in get_state_snapshot() or entity property to inspect.")
+    expected_value_or_change: str = Field(..., description="Expected value or transition description.")
+
+
+class InputSegment(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Actions held down for a range of physics ticks during a scripted proof run.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: What this input segment demonstrates.")
+    from_tick: int = Field(..., description="First tick (1-based) the actions are held.")
+    to_tick: int = Field(..., description="Last tick (inclusive) the actions are held.")
+    actions: List[str] = Field(default_factory=list, description="Input action names or KEY_* names, chosen only from the game's available actions.")
+    mouse_click_pos: Optional[Tuple[float, float]] = Field(
+        default=None,
+        description="Optional (x, y) viewport coordinate to click at from_tick and release at to_tick.",
+    )
+
+
+class FilmstripPlan(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    How to demonstrate a built mechanic/level/UI to the council: scripted inputs, scenario setup hooks, state assertions, plus the ticks to capture.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why these inputs, scenario setup calls, and frames best prove the item meets its spec and the council's proof request.")
+    capture_ticks: List[int] = Field(default_factory=list, description="Ticks at which to capture a frame (1 to 12 frames).")
+    input_segments: List[InputSegment] = Field(default_factory=list, description="Scripted inputs; empty means no input is applied.")
+    setup_calls: List[QASetupCall] = Field(
+        default_factory=list,
+        description="Optional QA scenario setup calls invoked by the test harness to stage hazards/interactions without hardcoding demo timers in main.gd.",
+    )
+    state_assertions: List[QAStateAssertion] = Field(
+        default_factory=list,
+        description="Observable state assertions verified by the QA harness across the captured ticks.",
+    )
+    frame_expectations: List[str] = Field(default_factory=list, description="What each captured frame is expected to show, in tick order.")
+
+
+class WorkItemProposal(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    A backlog requirement raised by the council for the implementation side to build.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this is needed, what it unblocks, and why its dependencies are what they are.")
+    item_id: str = Field(..., description="Unique snake_case identifier.")
+    kind: WorkItemKind = Field(..., description="Kind of work; selects the worker that builds it.")
+    title: str = Field(..., description="Concise title.")
+    spec: str = Field(..., description="Exactly what must be built, with the details the implementer needs.")
+    proof_spec: str = Field(..., description="The evidence (image or images) the council wants to see to judge the result, e.g. which views, states or frames.")
+    depends_on: List[str] = Field(default_factory=list, description="item_ids that must be approved before this can start.")
+    target_modules: List[str] = Field(default_factory=list, description="Code modules or files this will modify (used for exclusive-access locking).")
+    max_revisions: Optional[int] = Field(default=None, description="Optional per-item revision cap override.")
+
+
+class ReviewDecision(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    The council's review of an item that has returned with proof.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Close examination of the proof images against the spec and the game's design.")
+    item_id: str = Field(..., description="Item under review.")
+    feedback: str = Field(default="", description="Concrete, actionable changes required (empty when approving).")
+    verdict: Literal["approve", "request_changes"] = Field(..., description="Decision (strictly last).")
+
+
+class CapDecision(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    The council's explicit decision for an item that hit its revision cap or stalled.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Review of the full revision history and why this resolution is right.")
+    item_id: str = Field(..., description="Item needing a decision.")
+    replacement_spec: str = Field(default="", description="New spec when action is 'rewrite_spec'.")
+    split_items: List[WorkItemProposal] = Field(default_factory=list, description="Smaller replacement items when action is 'split'.")
+    action: Literal["accept_as_is", "rewrite_spec", "split", "cancel"] = Field(..., description="Resolution (strictly last).")
+
+
+class ReviewBatch(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    One reviewer's decisions for every item currently waiting on them.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Overall assessment of the proofs presented in this round.")
+    review_decisions: List[ReviewDecision] = Field(default_factory=list, description="One decision per item awaiting review.")
+    cap_decisions: List[CapDecision] = Field(default_factory=list, description="One decision per item that hit its revision cap or stalled.")
+
+
+class RevisionRecord(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    One build attempt of a work item: what the worker produced and how the council responded.
+    """
+    deliberation: str = Field(default="Worker attempt recorded.", description="Why this revision exists.")
+    revision_index: int = Field(default=0)
+    worker_notes: str = Field(default="")
+    proof_paths: List[str] = Field(default_factory=list)
+    proof_hashes: List[str] = Field(default_factory=list)
+    feedback: str = Field(default="", description="Council feedback on this revision.")
+    verdict: str = Field(default="", description="'approve' | 'request_changes' | ''")
+    timestamp_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class WorkItem(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    A backlog item on the Production Board with its full life-cycle state.
+    """
+    deliberation: str = Field(..., description="Why this item exists.")
+    item_id: str
+    kind: WorkItemKind
+    title: str
+    spec: str
+    proof_spec: str = Field(default="")
+    depends_on: List[str] = Field(default_factory=list)
+    target_modules: List[str] = Field(default_factory=list)
+    raised_by_role: str = Field(default="")
+    design_revision: int = Field(default=0, description="Number of Game Bible updates when this item was raised.")
+    state: WorkItemState = Field(default="blocked")
+    max_revisions: int = Field(default=5)
+    spec_resets: int = Field(default=0)
+    cap_base_index: int = Field(default=0, description="Revisions before this index do not count against the cap (set when the spec is rewritten).")
+    revisions: List[RevisionRecord] = Field(default_factory=list)
+    accepted_compromise: str = Field(default="", description="Set when the council accepted the item as-is after the cap/stall.")
+    failure: str = Field(default="", description="Full error text of the last worker failure.")
+    failure_count: int = Field(default=0, description="Number of worker failures so far.")
+    priority: int = Field(default=0)
+    decision_reason: str = Field(default="", description="Why the item is in needs_decision.")
+
+
+class SpecialistReport(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Result returned by an autonomous domain specialist to the Task Lead Agent on a single delegation turn.
+    """
+    deliberation: str = Field(default="Specialist execution completed.", description="MANDATORY FIRST PROPERTY: Specialist's reasoning or execution notes.")
+    turn_index: int = Field(default=0, description="Turn index within the current board revision.")
+    specialist_agent: str = Field(..., description="Specialist identifier ('visual_artist', 'audio_designer', 'swe_engineer', 'qa_test_engineer').")
+    brief: str = Field(..., description="The natural-language brief delegated by the Task Lead.")
+    summary: str = Field(default="", description="Concrete summary of what the specialist created, modified, or verified.")
+    touched_files: List[str] = Field(default_factory=list, description="Paths of assets, data files, or GDScript modules created or modified.")
+    proof_images: List[str] = Field(default_factory=list, description="Proof image paths generated during this specialist step.")
+
+
+class TaskLeadDecision(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    One turn of the Task Lead Agent's iterative Observe -> Strategize -> Delegate -> Inspect loop.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Step-by-step evaluation of the task requirements, current cartridge state, prior Council feedback (if any), and the results returned by specialists on previous turns.",
+    )
+    current_strategy: str = Field(
+        ...,
+        description="Bespoke, evolving strategy for accomplishing this task and proving it to the Council (including any pivot from prior revisions or earlier turns).",
+    )
+    specialist_agent: str = Field(
+        default="",
+        description="When action == 'delegate', the domain specialist to brief: 'visual_artist', 'audio_designer', 'swe_engineer', or 'qa_test_engineer'.",
+    )
+    brief: str = Field(
+        default="",
+        description="When action == 'delegate', open-ended natural-language brief instructing the specialist what to build, modify, or test and why.",
+    )
+    target_paths: List[str] = Field(
+        default_factory=list,
+        description="Optional file paths or GDScript modules the specialist should create, modify, or inspect.",
+    )
+    submission_summary: str = Field(
+        default="",
+        description="When action == 'submit_to_council', comprehensive summary for the Council explaining the strategy executed, specialist contributions, and how Council feedback was addressed.",
+    )
+    selected_proof_paths: List[str] = Field(
+        default_factory=list,
+        description="When action == 'submit_to_council', paths of the proof images generated during this session to submit to the Council.",
+    )
+    action: Literal["delegate", "submit_to_council"] = Field(
+        ...,
+        description="Decision (strictly last): 'delegate' to outsource a step to a specialist agent and inspect its result on the next turn; 'submit_to_council' when work and visual proof are complete and verified.",
+    )
+
+
+
+class LevelEntitySpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    A single concrete entity (landmark, mechanism, spawn point, hazard, goal, region) placed in the level.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this entity exists, why it sits at this position/size, and how it supports the authored experience.")
+    entity_id: str = Field(..., description="Unique snake_case identifier referenced by triggers and beats.")
+    entity_kind: str = Field(..., description="Free-form role such as 'spawn', 'mechanism', 'landmark', 'region', 'goal', 'hazard', 'collectible'.")
+    position: Tuple[float, float] = Field(..., description="World-space (x, y) centre in the game's coordinate system.")
+    size: Tuple[float, float] = Field(default=(0.0, 0.0), description="World-space (width, height) extent; (0, 0) for point entities.")
+    visual_description: str = Field(default="", description="What this entity must look like when rendered.")
+    asset_id: str = Field(default="", description="Associated asset id from the asset library, if any.")
+    initial_state: str = Field(default="dormant", description="State at t=0 (e.g. 'dormant', 'locked', 'active').")
+
+
+class LevelTriggerSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    A causal relation: when `condition` holds on `source_entity_id`, `target_entity_id` transitions to `resulting_state`.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this causal link exists in the authored experience.")
+    trigger_id: str = Field(..., description="Unique trigger identifier.")
+    source_entity_id: str = Field(..., description="Entity whose interaction/state change fires the trigger.")
+    condition: str = Field(..., description="Precise, testable condition (e.g. 'player overlaps region while speed >= threshold').")
+    target_entity_id: str = Field(..., description="Entity whose state changes in response.")
+    resulting_state: str = Field(..., description="State the target must enter, observable by the game.")
+    delay_seconds: float = Field(default=0.0, description="Delay between firing and the observable transition.")
+
+
+class LevelRegionSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    A named area of the world. The concept-art composition is ONE region (the opening), not the whole world.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this region exists, how large it must be, and its role in the Game Bible's progression.")
+    region_id: str = Field(..., description="Unique snake_case identifier.")
+    bounds: Tuple[float, float, float, float] = Field(..., description="(x, y, width, height) world rectangle of this region.")
+    progression_order: int = Field(default=0, description="0 = opening region; increasing values are reached later in the experience.")
+    purpose: str = Field(default="", description="What the player does / experiences here.")
+    archetype_id: str = Field(default="", description="Matching LevelArchetypeSpec.archetype_id from level_generation_strategy, if applicable.")
+    procedural_chunk_grammar: str = Field(
+        default="",
+        description="When generation_approach is procedural or hybrid, rules/parameters used by scenes.gd to populate this region with dense terrain, platforms, hazards, and collectibles at runtime.",
+    )
+    target_chunk_or_feature_count: int = Field(
+        default=1,
+        description="Number of procedural chunks or repeated structural modules to generate inside this region at runtime.",
+    )
+
+
+class LevelLayoutSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Machine-readable level layout consumed as DATA by the SWE agent (instead of improvising layout from prose).
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Spatial reasoning translating the Game Bible (scope, progression, storyboard, concept art) into a concrete world layout.")
+    viewport_size: Tuple[float, float] = Field(default=(1280.0, 720.0), description="(width, height) of one screen in world units.")
+    intended_world_scale_in_viewports: float = Field(default=0.0, description="Total playable area expressed as a multiple of one viewport's area, justified by the Game Bible's scope and progression (NOT by the size of a single concept image).")
+    world_bounds: Tuple[float, float, float, float] = Field(..., description="(x, y, width, height) bounding rectangle of the ENTIRE playable world; must contain every region.")
+    world_regions: List[LevelRegionSpec] = Field(default_factory=list, description="Ordered regions covering the whole experience; region 0 reproduces the concept-art opening scene.")
+    camera_framing: str = Field(..., description="Camera behaviour; the opening framing must reproduce the concept art composition.")
+    entities: List[LevelEntitySpec] = Field(default_factory=list, description="Every entity required across ALL regions, with exact positions and sizes.")
+    triggers: List[LevelTriggerSpec] = Field(default_factory=list, description="Causal relations between entities.")
+
+
+def validate_level_layout(
+    layout: "LevelLayoutSpec",
+    strategy: Optional["LevelGenerationStrategy"] = None,
+) -> List[str]:
+    """Structural validation of a LevelLayoutSpec. Returns human-readable issues (empty list = valid).
+    Purely structural/arithmetic consistency checks against the model's OWN declared intent; no content heuristics.
+    """
+    issues: List[str] = []
+    bx, by, bw, bh = layout.world_bounds
+    vw, vh = layout.viewport_size
+    if bw <= 0 or bh <= 0 or vw <= 0 or vh <= 0:
+        issues.append("world_bounds and viewport_size must have positive width/height.")
+        return issues
+
+    def inside(rect_or_pt, outer, label):
+        ox, oy, ow, oh = outer
+        if len(rect_or_pt) == 2:
+            x, y = rect_or_pt; w = h = 0.0
+        else:
+            x, y, w, h = rect_or_pt
+        if x - w / 2 < ox or y - h / 2 < oy or x + w / 2 > ox + ow or y + h / 2 > oy + oh:
+            issues.append(f"{label} extends outside {outer}.")
+
+    actual_scale = (bw * bh) / (vw * vh)
+    declared = layout.intended_world_scale_in_viewports
+    if declared <= 0:
+        issues.append("intended_world_scale_in_viewports must be declared (> 0) and justified by the Game Bible's scope.")
+    elif actual_scale < declared * 0.8:
+        issues.append(
+            f"world_bounds cover only {actual_scale:.1f} viewports but intended_world_scale_in_viewports={declared:.1f}."
+        )
+    if not layout.world_regions:
+        issues.append("world_regions is empty; the layout must cover the whole experience, not only the opening scene.")
+    ids = {e.entity_id for e in layout.entities}
+    if len(ids) != len(layout.entities):
+        issues.append("Duplicate entity_id values.")
+    for r in layout.world_regions:
+        rx, ry, rw, rh = r.bounds
+        if rx < bx or ry < by or rx + rw > bx + bw or ry + rh > by + bh:
+            issues.append(f"Region '{r.region_id}' extends outside world_bounds.")
+    for e in layout.entities:
+        inside((e.position[0], e.position[1], e.size[0], e.size[1]), layout.world_bounds, f"Entity '{e.entity_id}'")
+    for t in layout.triggers:
+        for ref in (t.source_entity_id, t.target_entity_id):
+            if ref not in ids:
+                issues.append(f"Trigger '{t.trigger_id}' references unknown entity '{ref}'.")
+        if t.source_entity_id == t.target_entity_id:
+            issues.append(f"Trigger '{t.trigger_id}' targets its own source entity.")
+    return issues
+
+
+class EntityStateExpectation(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    One expected (entity, state) pair. A list of these replaces a free-form dict, which structured-output schemas handle poorly.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this entity must be in this state at this point.")
+    entity_id: str = Field(..., description="entity_id from the level layout.")
+    expected_state: str = Field(..., description="State the entity must be in.")
+
+
+class BeatStepSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    One timed step of an authored beat: scripted input then an expected observable state.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this input produces this expected state.")
+    step_id: str = Field(..., description="Unique step identifier.")
+    scripted_input: str = Field(..., description="Exact input to apply (actions held, frames/duration), phrased so a headless test can execute it.")
+    duration_frames: int = Field(default=30, description="Physics frames to simulate for this step.")
+    expected_entity_states: List["EntityStateExpectation"] = Field(default_factory=list, description="Entity states (by entity_id) that must hold after this step.")
+
+
+class BeatTestSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Executable specification of one authored experience beat, derived from the storyboard BEFORE implementation.
+    """
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this beat is the correct falsifiable translation of the storyboard beat.")
+    beat_id: str = Field(..., description="Unique beat identifier, e.g. 'beat_1'.")
+    storyboard_beat_index: int = Field(default=0, description="Index of the storyboard beat this verifies.")
+    steps: List[BeatStepSpec] = Field(default_factory=list, description="Ordered scripted steps with expected states.")
+
+
+class BeatPlanSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4)."""
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: How the storyboard maps onto executable beat tests.")
+    beats: List[BeatTestSpec] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Context Hygiene & Transient Gemini Resilience Helpers
+# ---------------------------------------------------------------------------
+
+_BIBLE_HISTORICAL_KEYS = frozenset({
+    "writers_room_transcript",
+    "concept_fragments",
+    "concept_candidates",
+    "concept_evolution",
+    "final_signoff_report",
+    "production_board",
+    "created_at_utc",
+    "updated_at_utc",
+})
+
+_BIBLE_VISUAL_ASSET_KEYS = frozenset({
+    "game_title",
+    "core_genre",
+    "elevator_pitch",
+    "core_fantasy",
+    "camera_and_spatial_paradigm",
+    "color_palette_hex",
+    "visual_style_guide",
+    "diegetic_ui_philosophy",
+    "scene_layers",
+    "visual_mockups",
+    "world_spec",
+})
+
+_BIBLE_AUDIO_ASSET_KEYS = frozenset({
+    "game_title",
+    "core_genre",
+    "elevator_pitch",
+    "core_fantasy",
+    "audio_direction_guide",
+    "first_60_seconds_hook",
+    "gameplay_pillars",
+    "experience_storyboard",
+    "world_spec",
+})
+
+_BIBLE_RENDERING_KEYS = frozenset({
+    "game_title",
+    "core_genre",
+    "elevator_pitch",
+    "core_fantasy",
+    "camera_and_spatial_paradigm",
+    "color_palette_hex",
+    "visual_style_guide",
+    "scene_layers",
+    "visual_mockups",
+    "gameplay_pillars",
+    "first_60_seconds_hook",
+    "diegetic_ui_philosophy",
+    "level_generation_strategy",
+    "experience_storyboard",
+    "world_spec",
+})
+
+
+def _strip_nested_deliberations(obj: Any) -> Any:
+    """Recursively strips historical per-object `deliberation` fields and empty placeholders from a serialized Game Bible dict."""
+    if isinstance(obj, dict):
+        out: Dict[str, Any] = {}
+        for k, v in obj.items():
+            if k == "deliberation":
+                continue
+            cleaned_v = _strip_nested_deliberations(v)
+            if cleaned_v not in (None, "", [], {}):
+                out[k] = cleaned_v
+        return out
+    if isinstance(obj, list):
+        items = [_strip_nested_deliberations(x) for x in obj]
+        return [x for x in items if x not in (None, "", [], {})]
+    return obj
+
+
+def compact_bible_json_for_prompt(raw_bible_text: str, *, mode: str = "full") -> str:
+    """Compacts a raw `game_bible.json` string for LLM prompts by stripping historical brainstorming bloat
+    (`writers_room_transcript`, `concept_fragments`, `concept_candidates`, `concept_evolution`, nested `deliberation` essays)
+    while preserving 100% of the authoritative design specification needed for `mode` ('full' | 'rendering' | 'visual_asset' | 'audio_asset').
+    Returns `raw_bible_text` unchanged if it is not a JSON object.
+    """
+    if not raw_bible_text or not raw_bible_text.strip():
+        return raw_bible_text
+    try:
+        parsed = json.loads(raw_bible_text)
+    except Exception:
+        return raw_bible_text
+    if not isinstance(parsed, dict) or not parsed:
+        return raw_bible_text
+
+    cleaned: Dict[str, Any] = {}
+    allowed_keys: Optional[frozenset] = None
+    if mode == "visual_asset":
+        allowed_keys = _BIBLE_VISUAL_ASSET_KEYS
+    elif mode == "audio_asset":
+        allowed_keys = _BIBLE_AUDIO_ASSET_KEYS
+    elif mode == "rendering":
+        allowed_keys = _BIBLE_RENDERING_KEYS
+
+    for k, v in parsed.items():
+        if k in _BIBLE_HISTORICAL_KEYS or k == "deliberation":
+            continue
+        if allowed_keys is not None and k not in allowed_keys:
+            if k == "narrative_bible" and isinstance(v, dict):
+                chars = v.get("characters") or []
+                if chars and mode in ("visual_asset", "rendering"):
+                    cleaned["characters"] = [
+                        {
+                            ck: cv
+                            for ck, cv in c.items()
+                            if ck in ("character_id", "name", "role", "visual_description", "portrait_asset") and cv
+                        }
+                        for c in chars
+                        if isinstance(c, dict)
+                    ]
+                elif chars and mode == "audio_asset":
+                    cleaned["characters"] = [
+                        {
+                            ck: cv
+                            for ck, cv in c.items()
+                            if ck in ("character_id", "name", "role", "voice_profile") and cv
+                        }
+                        for c in chars
+                        if isinstance(c, dict)
+                    ]
+                    barks = v.get("dialogue_barks") or []
+                    if barks:
+                        cleaned["dialogue_barks"] = _strip_nested_deliberations(barks[:16])
+            continue
+        stripped_v = _strip_nested_deliberations(v)
+        if stripped_v not in (None, "", [], {}):
+            cleaned[k] = stripped_v
+
+    if not cleaned:
+        return raw_bible_text
+    return json.dumps(cleaned, ensure_ascii=False)
+
+
+def bounded_thinking_config(budget: int = 2048) -> Any:
+    """Returns a `google.genai.types.ThinkingConfig(thinking_budget=budget)` when supported by the SDK,
+    preventing unbounded internal reasoning stalls on structured schemas that already generate `deliberation` first.
+    """
+    try:
+        from google.genai import types
+        thinking_cls = getattr(types, "ThinkingConfig", None)
+        if thinking_cls is not None:
+            return thinking_cls(thinking_budget=int(budget))
+    except Exception:
+        pass
+    return None
+
+
+def is_transient_gemini_error(exc: BaseException) -> bool:
+    """Returns True if `exc` is a transient upstream deadline, rate-limit, or overload error (504/503/429)."""
+    msg = f"{type(exc).__name__}: {exc}".upper()
+    return any(
+        token in msg
+        for token in (
+            "504",
+            "DEADLINE_EXCEEDED",
+            "DEADLINE EXPIRED",
+            "503",
+            "UNAVAILABLE",
+            "429",
+            "RESOURCE_EXHAUSTED",
+            "READTIMEOUT",
+            "CONNECTTIMEOUT",
+            "TIMED OUT",
+        )
+    )
+
+
+def call_gemini_with_transient_retry(
+    call_fn: Any,
+    *,
+    max_transient_retries: int = 2,
+    base_delay_s: float = 1.5,
+    label: str = "generate_content",
+) -> Any:
+    """Executes `call_fn()` with jittered exponential backoff strictly for transient 504/503/429 errors.
+    Non-transient errors or exhausted retries immediately raise the authentic underlying exception (Rule 5).
+    """
+    import logging as _logging
+    import random as _random
+    import time as _time
+
+    _log = _logging.getLogger("GeminiRetry")
+    for attempt in range(max_transient_retries + 1):
+        try:
+            return call_fn()
+        except Exception as exc:
+            if attempt < max_transient_retries and is_transient_gemini_error(exc):
+                delay = base_delay_s * (2 ** attempt) + _random.uniform(0.0, 0.35)
+                _log.warning(
+                    "%s transient error (attempt %d/%d), backing off %.2fs: %s",
+                    label,
+                    attempt + 1,
+                    max_transient_retries + 1,
+                    delay,
+                    exc,
+                )
+                _time.sleep(delay)
+                continue
+            raise
 
 
 def __getattr__(name: str) -> Any:

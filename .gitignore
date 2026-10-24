@@ -35,6 +35,7 @@ cartridges/backup_*/
 cartridges/episode_*/
 cartridges/genesis/
 cartridges/.no_cold_boot
+cartridges/.studio_paused.json
 
 # Godot 4 Portable Runtime & Engine Cache
 .godot_runtime/

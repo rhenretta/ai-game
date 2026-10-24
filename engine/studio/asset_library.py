@@ -34,6 +34,7 @@ from engine.studio.models import (
     CharacterSheet,
     GameBibleSpec,
     GameRequirementsSpec,
+    StudioAgentError,
 )
 
 logger = logging.getLogger("CartridgeAssetLibrary")
@@ -274,9 +275,38 @@ static func create_tiled_surface(
                         refs.append(mp)
         return refs[:2]
 
+    def get_rendering_strategy(self, require: bool = False) -> Optional[Any]:
+        """Returns the cartridge's RenderingStrategySpec. When `require` is True and none exists yet, generates it
+        (live client required; failures raise, Rule 5)."""
+        from engine.studio.rendering import ensure_rendering_strategy, load_rendering_strategy
+
+        strategy = load_rendering_strategy(self.cartridge_dir)
+        if strategy is not None or not require:
+            return strategy
+        client = getattr(self.visual_agent, "client", None) if self.visual_agent is not None else self.client
+        text_model = getattr(self.visual_agent, "text_model_name", "gemini-3.8-flash") if self.visual_agent else "gemini-3.8-flash"
+        concept_parts = []
+        try:
+            from google.genai import types
+            for rp in self.get_concept_reference_images()[:2]:
+                if rp.is_file():
+                    concept_parts.append(types.Part.from_bytes(data=rp.read_bytes(), mime_type="image/png"))
+        except ImportError:
+            pass
+        return ensure_rendering_strategy(self.cartridge_dir, client, text_model, concept_parts=concept_parts)
+
     def get_style_guide(self, for_environment: bool = False) -> str:
         bible = self._load_game_bible_dict()
         parts: List[str] = []
+        _rs = self.get_rendering_strategy()
+        if _rs is not None:
+            parts.append(
+                "Pixel-art / low-resolution aesthetic as specified by the Game Bible"
+                if _rs.pixelated_style_intended
+                else "High-resolution, polished, modern illustrated rendering; NOT pixel art, NOT low-resolution"
+            )
+            if _rs.lighting_and_atmosphere:
+                parts.append(f"Lighting & atmosphere: {_rs.lighting_and_atmosphere}")
         raw_style = str(bible.get("visual_style_guide") or "")
         if raw_style and not for_environment:
             parts.append(raw_style)
@@ -369,7 +399,15 @@ static func create_tiled_surface(
         mockups = bible_dict.get("visual_mockups") or []
         mockup_desc = mockups[0].get("scene_description", "") if mockups and isinstance(mockups[0], dict) else ""
 
-        # 1. Character portraits (in assets/portraits/) AND full-body animated sprite sheets (in assets/sprites/)
+        # 1. Character portraits (in assets/portraits/) when characters are defined in the Narrative Bible;
+        # in-world actor representations (sprites, sheets, or rigs) are planned by the LLM decomposition contract below
+        # according to the game's RenderingStrategySpec rather than a hardcoded humanoid platformer template.
+        client = getattr(self.visual_agent, "client", None) if self.visual_agent is not None else self.client
+        is_live = (
+            getattr(self.visual_agent, "_is_live_genai_client", lambda: False)()
+            if self.visual_agent is not None
+            else (client is not None and getattr(type(client), "__module__", "").startswith("google.genai"))
+        )
         for idx, char in enumerate(characters):
             if not isinstance(char, dict):
                 char = char.model_dump() if hasattr(char, "model_dump") else {}
@@ -378,100 +416,37 @@ static func create_tiled_surface(
             crole = str(char.get("role") or "character")
             cdesc = str(char.get("visual_description") or f"{cname} ({crole})")
 
-            # Portrait requirement
-            derived.append(
-                AssetRequirement(
-                    deliberation=f"Dialogue bust portrait for {cname} ({crole}) isolated in assets/portraits/.",
-                    asset_id=f"{cid}_portrait",
-                    name=f"{cid}_portrait.png",
-                    asset_type="portrait",
-                    fabrication_mode="portrait",
-                    purpose=f"UI dialogue bust portrait for {cname}",
-                    concept_reference_id=cid,
-                    target_path=f"assets/portraits/{cid}_portrait.png",
-                    description=f"Dialogue bust portrait of {cname}: {cdesc}",
-                    visual_prompt_or_text=f"Expressive bust portrait of {cname} ({crole}): {cdesc}. {style_guide}",
-                    dimensions=(256, 256),
-                )
-            )
-
-            # Full-body in-world animated sprite sheet requirement
-            states = [
-                AnimationStateSpec(
-                    deliberation=f"Idle breathing animation for {cname}.",
-                    state_name="idle",
-                    motion_profile="idle",
-                    frame_count=4,
-                    fps=6.0,
-                    loop=True,
-                    pose_progression_prompt=f"Full-body {cname} standing alert with rhythmic breathing",
-                ),
-                AnimationStateSpec(
-                    deliberation=f"Locomotion stride animation for {cname}.",
-                    state_name="move",
-                    motion_profile="locomotion",
-                    frame_count=4,
-                    fps=10.0,
-                    loop=True,
-                    pose_progression_prompt=f"Full-body {cname} running/moving with dynamic limb stride",
-                ),
-                AnimationStateSpec(
-                    deliberation=f"Jump / aerial traversal animation for {cname}.",
-                    state_name="jump",
-                    motion_profile="aerial",
-                    frame_count=3,
-                    fps=8.0,
-                    loop=False,
-                    pose_progression_prompt=f"Full-body {cname} leaping mid-air with dynamic silhouette",
-                ),
-                AnimationStateSpec(
-                    deliberation=f"Primary interaction / ability animation for {cname}.",
-                    state_name="action",
-                    motion_profile="action",
-                    frame_count=4,
-                    fps=10.0,
-                    loop=False,
-                    pose_progression_prompt=f"Full-body {cname} activating signature ability or tool",
-                ),
-            ]
-            derived.append(
-                AssetRequirement(
-                    deliberation=f"Full-body in-world animated sprite sheet for {cname} ({crole}).",
-                    asset_id=cid,
-                    name=f"{cid}.png",
-                    asset_type="sprite_sheet",
-                    fabrication_mode="sprite_sheet",
-                    purpose=f"Playable/NPC in-world animated actor sprite for {cname}",
-                    concept_reference_id=cid,
-                    target_path=f"assets/sprites/{cid}.png",
-                    description=f"Full-body grounded standing 2D game character sprite of {cname} ({crole}): {cdesc}",
-                    visual_prompt_or_text=(
-                        f"SINGLE solitary full-body 2D in-game character sprite (strictly ONE single figure standing upright head to toe with grounded base, "
-                        f"NEVER a multi-angle turnaround chart, NO detached ground pedestal beneath feet, NOT a bust portrait) of {cname} ({crole}): {cdesc}. {style_guide}"
-                    ),
-                    dimensions=(72, 72) if idx == 0 else (64, 64),
-                    animation_states=states,
-                )
-            )
-
-            if idx == 0 and cid != "hero":
+            if char.get("portrait_asset") or bible_dict.get("narrative_bible", {}).get("dialogue_trees"):
                 derived.append(
                     AssetRequirement(
-                        deliberation=f"Canonical 'hero' alias full-body animated sprite sheet for protagonist {cname}.",
-                        asset_id="hero",
-                        name="hero.png",
-                        asset_type="sprite_sheet",
-                        fabrication_mode="sprite_sheet",
-                        purpose=f"Primary player CharacterBody2D sprite for protagonist {cname}",
+                        deliberation=f"Dialogue portrait for {cname} ({crole}) isolated in assets/portraits/.",
+                        asset_id=f"{cid}_portrait",
+                        name=f"{cid}_portrait.png",
+                        asset_type="portrait",
+                        fabrication_mode="portrait",
+                        purpose=f"UI dialogue portrait for {cname}",
                         concept_reference_id=cid,
-                        target_path="assets/sprites/hero.png",
-                        description=f"Full-body grounded standing 2D protagonist sprite of {cname}: {cdesc}",
-                        visual_prompt_or_text=(
-                            f"SINGLE solitary full-body 2D in-game protagonist sprite (strictly ONE single figure standing upright head to toe with grounded base, "
-                            f"NEVER a multi-angle turnaround chart, NO detached ground pedestal beneath feet, NOT a bust portrait) of {cname}: {cdesc}. {style_guide}"
-                        ),
-                        dimensions=(72, 72),
-                        animation_states=states,
+                        target_path=f"assets/portraits/{cid}_portrait.png",
+                        description=f"Portrait of {cname}: {cdesc}",
+                        visual_prompt_or_text=f"Expressive portrait of {cname} ({crole}): {cdesc}. {style_guide}",
+                        dimensions=(256, 256),
+                    )
+                )
+
+            if not is_live:
+                derived.append(
+                    AssetRequirement(
+                        deliberation=f"In-world actor visual asset for {cname} ({crole}).",
+                        asset_id=cid,
+                        name=f"{cid}.png",
+                        asset_type="prop",
+                        fabrication_mode="static_sprite",
+                        purpose=f"In-world actor asset for {cname}",
+                        concept_reference_id=cid,
+                        target_path=f"assets/sprites/{cid}.png",
+                        description=f"In-game actor asset of {cname} ({crole}): {cdesc}",
+                        visual_prompt_or_text=f"Single isolated 2D in-game actor sprite of {cname} ({crole}): {cdesc}. {style_guide}",
+                        dimensions=(96, 96),
                     )
                 )
 
@@ -500,14 +475,16 @@ static func create_tiled_surface(
         from pydantic import BaseModel, Field
 
         class DecomposedElementItemSpec(BaseModel):
-            deliberation: str = Field(description="Reasoning for isolating this modular world element or repeatable tile surface.")
-            asset_id: str = Field(description="Snake_case identifier for this asset (e.g. 'terrace_stone_tile', 'prism_channel_tile', 'resonance_pylon', 'harmonic_flora').")
-            asset_type: Literal["tile", "prop", "sprite_sheet"] = Field(description="'tile' for repeatable surfaces, 'prop' for discrete structures, 'sprite_sheet' for animated flora/mechanisms.")
-            fabrication_mode: Literal["tile_surface", "static_sprite", "sprite_sheet"] = Field(description="Fabrication pipeline mode matching asset_type.")
+            deliberation: str = Field(description="Reasoning for isolating this modular world element, actor, or surface.")
+            asset_id: str = Field(description="Snake_case identifier for this asset.")
+            asset_type: str = Field(description="Asset category suited to this subject (e.g. 'backdrop', 'tile', 'prop', 'sprite_sheet', 'articulated_rig', 'diegetic_ui').")
+            fabrication_mode: str = Field(description="Fabrication pipeline mode matching the subject's rendering strategy ('parallax_layer', 'tile_surface', 'static_sprite', 'sprite_sheet', 'articulated_parts', 'diegetic_ui').")
             purpose: str = Field(description="In-world gameplay/visual role of this asset.")
-            visual_prompt: str = Field(description="Detailed visual prompt for synthesizing this isolated asset or full-bleed material texture.")
-            width: int = Field(default=64, description="Target display width in pixels (64 to 128).")
-            height: int = Field(default=64, description="Target display height in pixels (64 to 128).")
+            visual_prompt: str = Field(description="Detailed visual prompt for synthesizing this asset.")
+            width: int = Field(default=1024, description="Source-art width in pixels, following the rendering strategy's target_resolution for this subject.")
+            height: int = Field(default=1024, description="Source-art height in pixels, following the rendering strategy's target_resolution for this subject.")
+            animation_states: List[AnimationStateSpec] = Field(default_factory=list, description="When fabrication_mode is 'sprite_sheet', the custom animation states tailored to this subject's verbs.")
+            articulated_parts: List[ArticulatedPartSpec] = Field(default_factory=list, description="When fabrication_mode is 'articulated_parts', the independently movable parts.")
 
         class DecomposedConceptManifestSpec(BaseModel):
             deliberation: str = Field(description="Architectural decomposition plan breaking the 16:9 concept scene into modular tiles, props, and animated elements.")
@@ -611,6 +588,8 @@ static func create_tiled_surface(
             for rp in ref_imgs[:2]:
                 if rp.is_file():
                     contents.append(types.Part.from_bytes(data=rp.read_bytes(), mime_type="image/png"))
+            from engine.studio.rendering import build_rendering_guide
+            rendering_block = build_rendering_guide(self.get_rendering_strategy(require=True))
             eng_context_str = (
                 f"GameplaySystemsEngineer Required Mechanic Assets:\n  " + "\n  ".join(eng_asset_notes) + "\n"
                 if eng_asset_notes
@@ -625,10 +604,16 @@ static func create_tiled_surface(
                 f"Visual Style Guide: {style_guide}\n"
                 f"Concept Scene Description: {mockup_desc}\n"
                 f"{eng_context_str}\n"
-                f"Decompose the environment into 5 modular, reusable visual assets in `elements`:\n"
-                f"- 2 repeatable surface/material tiles (`asset_type='tile'`, `fabrication_mode='tile_surface'`, width=64, height=64) for walkable terrain and channels/surfaces.\n"
-                f"- 2 discrete, single-object architectural pillars, arches, or interactive mechanisms (`asset_type='prop'`, `fabrication_mode='static_sprite'`, width=96, height=96).\n"
-                f"- 1 animated reactive environmental flora or mechanism (`asset_type='sprite_sheet'`, `fabrication_mode='sprite_sheet'`, width=64, height=64).\n"
+                f"{rendering_block}\n"
+                f"Decompose the game's visuals into the assets required to realise the RENDERING STRATEGY above in `elements`. "
+                f"Be EXHAUSTIVE: every distinct visual element visible in the concept art or required by the Game Bible must be covered; "
+                f"do not collapse the scene into a handful of generic pieces.\n"
+                f"- Follow each subject's `technique`: 'painted_parallax_layer' -> `asset_type='backdrop'`, `fabrication_mode='parallax_layer'` (full-frame painted layer); "
+                f"'single_painted_image_procedural_motion' -> `asset_type='prop'`, `fabrication_mode='static_sprite'` (one high-resolution painted image); "
+                f"'layered_cutout_rig' -> `asset_type='articulated_rig'`, `fabrication_mode='articulated_parts'` with `articulated_parts` filled in; "
+                f"'sprite_sheet' -> `asset_type='sprite_sheet'`, `fabrication_mode='sprite_sheet'`; repeatable surfaces -> 'tile'.\n"
+                f"- Use the strategy's `target_resolution` for `width`/`height`; do not shrink assets to icon size. "
+                f"Effects the strategy implements with particles, shaders or lights need no image asset unless they require a texture.\n"
                 f"MANDATORY (Rule 4): Provide `deliberation` FIRST in every schema object."
             )
             contents.append(prompt)
@@ -647,8 +632,8 @@ static func create_tiled_surface(
                 for item in manifest_spec.elements:
                     aid_clean = str(item.asset_id).strip().lower().replace(".png", "").removesuffix("_sheet")
                     if aid_clean and aid_clean not in existing_ids:
-                        w_clamped = max(48, min(128, int(item.width or 64)))
-                        h_clamped = max(48, min(128, int(item.height or 64)))
+                        w_clamped = max(16, min(8192, int(item.width or 1024)))
+                        h_clamped = max(16, min(8192, int(item.height or 1024)))
                         elements.append(
                             AssetRequirement(
                                 deliberation=item.deliberation,
@@ -661,6 +646,8 @@ static func create_tiled_surface(
                                 description=item.purpose,
                                 visual_prompt_or_text=f"{item.visual_prompt}. {style_guide}",
                                 dimensions=(w_clamped, h_clamped),
+                                animation_states=list(item.animation_states or []),
+                                articulated_parts=list(item.articulated_parts or []),
                             )
                         )
                         existing_ids.add(aid_clean)
@@ -717,20 +704,24 @@ static func create_tiled_surface(
         # Audio asset handling
         if fmode in ("audio_bark", "sfx", "ambient_loop") or atype in ("audio_bark", "sfx", "ambient_loop"):
             if not dest_path.is_file() or force_regenerate:
-                if self.voice_agent is not None:
-                    try:
-                        if fmode == "audio_bark" and hasattr(self.voice_agent, "synthesize_bark"):
-                            self.voice_agent.synthesize_bark(
-                                text=req.visual_prompt_or_text or req.description,
-                                output_path=dest_path,
-                            )
-                        elif hasattr(self.voice_agent, "generate_sfx"):
-                            self.voice_agent.generate_sfx(
-                                prompt=req.visual_prompt_or_text or req.description,
-                                output_path=dest_path,
-                            )
-                    except Exception as exc:
-                        logger.warning("Audio fabrication warning for '%s': %s", req.asset_id, exc)
+                if self.voice_agent is None:
+                    raise StudioAgentError(f"No voice/audio agent configured; cannot fabricate audio '{req.asset_id}'.")
+                if fmode == "audio_bark" and hasattr(self.voice_agent, "synthesize_voice_line"):
+                    self.voice_agent.synthesize_voice_line(bark=req, output_path=dest_path)
+                elif hasattr(self.voice_agent, "generate_sfx"):
+                    self.voice_agent.generate_sfx(
+                        prompt=req.visual_prompt_or_text or req.description,
+                        output_path=dest_path,
+                        kind=fmode,
+                        purpose=req.purpose,
+                        loop=(fmode == "ambient_loop"),
+                    )
+                else:
+                    raise StudioAgentError(
+                        f"Voice agent {type(self.voice_agent).__name__} has no capability to fabricate "
+                        f"'{fmode}' audio for '{req.asset_id}' (needs synthesize_voice_line for audio_bark "
+                        f"or generate_sfx for sfx/ambient_loop)."
+                    )
             if dest_path.is_file():
                 self.catalog.entries[req.asset_id] = AssetLibraryEntry(
                     deliberation=req.deliberation,

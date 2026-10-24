@@ -18,6 +18,8 @@ from engine.studio.models import (
     UpdateWorldSpec,
     GameRequirementsSpec,
     StudioAgentError,
+    bounded_thinking_config,
+    call_gemini_with_transient_retry,
 )
 
 logger = logging.getLogger("GameConceptDirectorAgent")
@@ -67,14 +69,18 @@ class GameConceptDirectorAgent:
                 f"The world can span any genre or paradigm (action, puzzle, strategy, simulation, automation, adventure) without hardcoded arena constraints. "
                 f"You MUST provide reasoning/deliberation FIRST before any other field."
             )
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=GenesisWorldSpec,
-                    temperature=self.creative_temperature,
+            response = call_gemini_with_transient_retry(
+                lambda: self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=GenesisWorldSpec,
+                        temperature=self.creative_temperature,
+                        thinking_config=bounded_thinking_config(2048),
+                    ),
                 ),
+                label="GameConceptDirectorAgent.generate_genesis_world",
             )
             if not response.text:
                 raise StudioAgentError("Empty response returned from Gemini worldbuilding call")
@@ -104,14 +110,18 @@ class GameConceptDirectorAgent:
                 f"Player telemetry hypotheses:\n{hypotheses_text}\n"
                 f"Provide deliberation first, followed by story progression, clamped difficulty adjustments, and mechanics directives."
             )
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=UpdateWorldSpec,
-                    temperature=self.creative_temperature,
+            response = call_gemini_with_transient_retry(
+                lambda: self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=UpdateWorldSpec,
+                        temperature=self.creative_temperature,
+                        thinking_config=bounded_thinking_config(2048),
+                    ),
                 ),
+                label="GameConceptDirectorAgent.generate_episodic_update_world",
             )
             if not response.text:
                 raise StudioAgentError("Empty response returned from Gemini update worldbuilding call")
@@ -267,14 +277,18 @@ class GameConceptDirectorAgent:
             )
 
             contents_payload: Any = (mockup_image_parts + [prompt]) if mockup_image_parts else prompt
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=contents_payload,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=GameRequirementsSpec,
-                    temperature=1.0,
+            response = call_gemini_with_transient_retry(
+                lambda: self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=contents_payload,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=GameRequirementsSpec,
+                        temperature=1.0,
+                        thinking_config=bounded_thinking_config(2048),
+                    ),
                 ),
+                label="GameConceptDirectorAgent.generate_requirements_spec",
             )
             if not response.text:
                 raise StudioAgentError("Empty response returned from Gemini requirements authoring call")

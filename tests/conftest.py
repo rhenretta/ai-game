@@ -13,6 +13,8 @@ import pytest
 os.environ["SDL_VIDEODRIVER"] = "dummy"
 os.environ["SDL_AUDIODRIVER"] = "dummy"
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
+# Keep Writers' Room LLM call ordering deterministic for scripted fakes (parallelism is tested explicitly).
+os.environ["STUDIO_ROOM_PARALLELISM"] = "1"
 
 # Hermetically isolate all pytest database & studio data paths away from production data/telemetry.db
 _PYTEST_DATA_DIR = Path(tempfile.mkdtemp(prefix="pytest_studio_data_"))
@@ -555,3 +557,45 @@ def stash_active_cartridge():
                 pass
 
 
+
+
+# ---------------------------------------------------------------------------
+# Retry-backoff sleeps in agent code (Gemini retry loops) must never slow tests down.
+# Only the `time` / `asyncio` references inside these engine modules are proxied, so tests that
+# rely on real timing elsewhere (launcher signal sweeps, WAL concurrency) are unaffected.
+# ---------------------------------------------------------------------------
+class _NoSleepTime:
+    def __init__(self, real):
+        self._real = real
+
+    def sleep(self, _seconds=0):
+        return None
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class _NoSleepAsyncio:
+    def __init__(self, real):
+        self._real = real
+
+    async def sleep(self, _seconds=0, result=None):
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_backoff_sleeps(monkeypatch):
+    import importlib
+
+    for mod_name, attr, proxy in (
+        ("engine.studio.swe", "time", _NoSleepTime),
+        ("engine.studio.visual", "time", _NoSleepTime),
+        ("engine.studio.audio", "time", _NoSleepTime),
+        ("engine.studio.orchestrator", "asyncio", _NoSleepAsyncio),
+    ):
+        mod = importlib.import_module(mod_name)
+        monkeypatch.setattr(mod, attr, proxy(getattr(mod, attr)))
+    yield

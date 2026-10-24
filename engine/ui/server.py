@@ -201,6 +201,75 @@ class SwarmEventBus:
                 else:
                     self._game_bible = dict(payload)
 
+        elif str(etype).startswith("backlog_item_"):
+            item_id = str(payload.get("item_id") or "").strip()
+            if item_id:
+                tid = f"task_board_{item_id}"
+                kind = str(payload.get("kind") or "work_item")
+                board_st = str(payload.get("state") or "").lower()
+                status_map = {
+                    "approved": "COMPLETED",
+                    "in_progress": "IN_PROGRESS",
+                    "awaiting_review": "IN_PROGRESS",
+                    "changes_requested": "REJECTED",
+                    "failed": "FAILED",
+                    "needs_decision": "REJECTED",
+                }
+                mapped_status = status_map.get(board_st, "IN_PROGRESS")
+                kind_role_map = {
+                    "visual_asset": ("VisualArtSpriteDesignerAgent", "VisualDesigner", "ASSET_SYNTHESIS"),
+                    "audio_asset": ("VoiceActingAudioProducerAgent", "AudioProducer", "ASSET_SYNTHESIS"),
+                    "shader": ("VisualArtSpriteDesignerAgent", "VisualDesigner", "CODE_IMPLEMENTATION"),
+                    "mechanic_code": ("LeadGameplaySWEAgent", "GameplaySWE", "CODE_IMPLEMENTATION"),
+                    "level_layout": ("LeadGameplaySWEAgent", "GameplaySWE", "CODE_IMPLEMENTATION"),
+                    "integration": ("LeadGameplaySWEAgent", "GameplaySWE", "CODE_IMPLEMENTATION"),
+                }
+                ag_role, ag_name, t_type = kind_role_map.get(
+                    kind,
+                    ("LeadGameplaySWEAgent", "GameplaySWE", "EXECUTION"),
+                )
+                proof_paths = payload.get("proof_paths") if isinstance(payload.get("proof_paths"), list) else []
+                outputs = [
+                    {
+                        "deliberation": f"Proof artifact for {item_id}",
+                        "artifact_id": f"art_{item_id}_{i}",
+                        "artifact_name": Path(str(pp)).name,
+                        "artifact_type": "sprite" if str(pp).endswith(".png") else ("audio" if str(pp).endswith(".wav") else "artifact"),
+                        "file_path": str(pp),
+                        "sha256_hash": "",
+                        "sha256": "",
+                        "source_agent": ag_role,
+                        "target_agent": "CreativeDirectorWorldbuilderAgent",
+                    }
+                    for i, pp in enumerate(proof_paths)
+                ]
+                existing = self._task_records.get(tid, {})
+                ts_now = ev.get("timestamp_utc") or datetime.now(timezone.utc).isoformat()
+                t_record = {
+                    "deliberation": ev.get("deliberation") or payload.get("deliberation") or f"ProductionBoard item {item_id} ({board_st}).",
+                    "task_id": tid,
+                    "agent_role": ag_role,
+                    "agent_name": ag_name,
+                    "requirement_id": item_id,
+                    "track_title": str(payload.get("title") or existing.get("track_title") or item_id),
+                    "task_type": t_type,
+                    "status": mapped_status,
+                    "start_time_utc": existing.get("start_time_utc") or ts_now,
+                    "end_time_utc": ts_now if mapped_status in ("COMPLETED", "REJECTED", "FAILED") else None,
+                    "input_artifacts": existing.get("input_artifacts", []),
+                    "output_artifacts": outputs or existing.get("output_artifacts", []),
+                    "verification_verdict": {
+                        "passed": mapped_status == "COMPLETED",
+                        "board_state": board_st or etype,
+                        "revision": payload.get("revision", 0),
+                    },
+                    "diagnostic_trace": {"error": payload.get("feedback") or payload.get("error")} if (payload.get("feedback") or payload.get("error")) else None,
+                    "summary": ev.get("deliberation") or f"{item_id}: {board_st}",
+                }
+                self._task_records[tid] = t_record
+                if tid not in self._task_order:
+                    self._task_order.append(tid)
+
     def reset_for_new_genesis_build(self, build_id: str, creative_prompt: str = "") -> Dict[str, Any]:
         """Resets in-memory task/requirement/bible state for a fresh Genesis build from scratch."""
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -829,7 +898,8 @@ class SwarmEventBus:
                         return db_tasks
                 except Exception as e:
                     logger.debug("Failed querying studio_tasks from DB: %s", e)
-                return [self._task_records[tid] for tid in self._task_order if tid in self._task_records]
+                if self._task_records:
+                    return [self._task_records[tid] for tid in self._task_order if tid in self._task_records]
 
             self._sync_from_disk()
             if self._task_records:
@@ -837,23 +907,32 @@ class SwarmEventBus:
 
         # Cartridge fallback hydration
         c_root = cartridges_root or (config.PROJECT_ROOT / "cartridges")
-        target_dir = cartridge_dir or active_cartridge
-        if target_dir is None or not target_dir.exists():
-            c_active = c_root / "active"
-            if c_active.exists() and c_active.is_dir():
-                target_dir = c_active
-            elif c_root.exists() and c_root.is_dir():
-                candidates = sorted(
-                    [d for d in c_root.glob("candidate_*") if d.is_dir()],
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-                if candidates:
-                    target_dir = candidates[0]
+        active_bible = self.get_game_bible(build_id=build_id) if cartridge_dir is None else None
+        bible_cid = str((active_bible or {}).get("cartridge_id") or "").strip()
+        bible_status = str((active_bible or {}).get("status") or "").lower()
+        if cartridge_dir is None and active_bible and (bible_status in ("brainstorming", "awaiting_greenlight") or bible_cid.startswith(("candidate_", "build_"))):
+            if bible_cid.startswith("candidate_") and (c_root / bible_cid).is_dir():
+                target_dir = c_root / bible_cid
+            else:
+                return []
+        else:
+            target_dir = cartridge_dir or active_cartridge
+            if target_dir is None or not target_dir.exists():
+                c_active = c_root / "active"
+                if c_active.exists() and c_active.is_dir():
+                    target_dir = c_active
+                elif c_root.exists() and c_root.is_dir():
+                    candidates = sorted(
+                        [d for d in c_root.glob("candidate_*") if d.is_dir()],
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                    if candidates:
+                        target_dir = candidates[0]
+                    else:
+                        target_dir = config.PROJECT_ROOT / "cartridges" / "active"
                 else:
                     target_dir = config.PROJECT_ROOT / "cartridges" / "active"
-            else:
-                target_dir = config.PROJECT_ROOT / "cartridges" / "active"
 
         if target_dir.exists():
             th_file = target_dir / "task_history.json"
@@ -912,26 +991,45 @@ class SwarmEventBus:
                         return db_tasks
                 except Exception as e:
                     logger.debug("Failed querying active build tasks from DB: %s", e)
-                return [self._task_records[tid] for tid in self._task_order if tid in self._task_records]
+                if self._task_records:
+                    return [self._task_records[tid] for tid in self._task_order if tid in self._task_records]
 
             self._sync_from_disk()
             if self._task_records:
                 return [self._task_records[tid] for tid in self._task_order if tid in self._task_records]
 
         c_root = cartridges_root or (config.PROJECT_ROOT / "cartridges")
-        target_dir = cartridge_dir or active_cartridge
-        if target_dir is None or not target_dir.exists():
-            if (c_root / "active").is_dir() and (c_root / "active" / "manifest.json").is_file():
-                target_dir = c_root / "active"
-            elif c_root.is_dir():
-                candidates = sorted(
-                    [d for d in c_root.glob("candidate_*") if d.is_dir()],
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-                target_dir = candidates[0] if candidates else c_root / "active"
+        active_bible = self.get_game_bible(build_id=build_id) if cartridge_dir is None else None
+        bible_cid = str((active_bible or {}).get("cartridge_id") or "").strip()
+        bible_status = str((active_bible or {}).get("status") or "").lower()
+        if cartridge_dir is None and active_bible and (bible_status in ("brainstorming", "awaiting_greenlight") or bible_cid.startswith(("candidate_", "build_"))):
+            if bible_cid.startswith("candidate_") and (c_root / bible_cid).is_dir():
+                target_dir = c_root / bible_cid
             else:
-                target_dir = c_root / "active"
+                return []
+        else:
+            target_dir = cartridge_dir or active_cartridge
+            target_bid_str = str(build_id or self.get_active_build_id() or "").strip()
+            if target_bid_str.startswith("build_"):
+                cand_from_bid = c_root / target_bid_str[len("build_"):]
+                if cand_from_bid.is_dir() and (cand_from_bid / "backlog.json").is_file():
+                    target_dir = cand_from_bid
+            elif target_bid_str.startswith("candidate_"):
+                cand_from_bid = c_root / target_bid_str
+                if cand_from_bid.is_dir() and (cand_from_bid / "backlog.json").is_file():
+                    target_dir = cand_from_bid
+            if target_dir is None or not target_dir.exists():
+                if (c_root / "active").is_dir() and (c_root / "active" / "manifest.json").is_file():
+                    target_dir = c_root / "active"
+                elif c_root.is_dir():
+                    candidates = sorted(
+                        [d for d in c_root.glob("candidate_*") if d.is_dir()],
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                    target_dir = candidates[0] if candidates else c_root / "active"
+                else:
+                    target_dir = c_root / "active"
 
         tasks: List[Dict[str, Any]] = []
         if target_dir.exists():
@@ -1000,6 +1098,91 @@ class SwarmEventBus:
                 while chunk := f.read(65536):
                     h.update(chunk)
             return h.hexdigest()
+
+        # 0. ProductionBoard backlog.json task records
+        backlog_path = cart_dir / "backlog.json"
+        if backlog_path.is_file():
+            try:
+                b_raw = json.loads(backlog_path.read_text(encoding="utf-8"))
+                b_items = b_raw.get("items", []) if isinstance(b_raw, dict) else []
+                kind_role_map = {
+                    "visual_asset": ("VisualArtSpriteDesignerAgent", "VisualDesigner", "ASSET_SYNTHESIS"),
+                    "audio_asset": ("VoiceActingAudioProducerAgent", "AudioProducer", "ASSET_SYNTHESIS"),
+                    "shader": ("VisualArtSpriteDesignerAgent", "VisualDesigner", "CODE_IMPLEMENTATION"),
+                    "mechanic_code": ("LeadGameplaySWEAgent", "GameplaySWE", "CODE_IMPLEMENTATION"),
+                    "level_layout": ("LeadGameplaySWEAgent", "GameplaySWE", "CODE_IMPLEMENTATION"),
+                    "integration": ("LeadGameplaySWEAgent", "GameplaySWE", "CODE_IMPLEMENTATION"),
+                }
+                status_map = {
+                    "approved": "COMPLETED",
+                    "in_progress": "IN_PROGRESS",
+                    "awaiting_review": "IN_PROGRESS",
+                    "changes_requested": "REJECTED",
+                    "failed": "FAILED",
+                    "needs_decision": "REJECTED",
+                }
+                for item in b_items:
+                    if not isinstance(item, dict):
+                        continue
+                    st = str(item.get("state") or "ready").lower()
+                    revs = item.get("revisions") if isinstance(item.get("revisions"), list) else []
+                    if st in ("ready", "blocked", "cancelled") and not revs:
+                        continue
+                    iid = str(item.get("item_id") or f"item_{len(tasks)}")
+                    kind = str(item.get("kind") or "mechanic_code")
+                    ag_role, ag_name, t_type = kind_role_map.get(
+                        kind,
+                        ("LeadGameplaySWEAgent", "GameplaySWE", "EXECUTION"),
+                    )
+                    mapped_st = status_map.get(st, "IN_PROGRESS")
+                    latest_rev = revs[-1] if revs and isinstance(revs[-1], dict) else {}
+                    proof_paths = latest_rev.get("proof_paths") if isinstance(latest_rev.get("proof_paths"), list) else []
+                    proof_hashes = latest_rev.get("proof_hashes") if isinstance(latest_rev.get("proof_hashes"), list) else []
+                    outputs = []
+                    for idx_p, pp in enumerate(proof_paths):
+                        p_obj = Path(str(pp))
+                        h_val = proof_hashes[idx_p] if idx_p < len(proof_hashes) else (_file_hash(p_obj) if p_obj.is_file() else "")
+                        outputs.append({
+                            "deliberation": f"Verification proof for {item.get('title') or iid}",
+                            "artifact_id": f"art_proof_{iid}_{idx_p}",
+                            "artifact_name": p_obj.name,
+                            "artifact_type": "sprite" if p_obj.suffix.lower() == ".png" else ("audio" if p_obj.suffix.lower() == ".wav" else "artifact"),
+                            "file_path": str(p_obj),
+                            "sha256_hash": h_val,
+                            "sha256": h_val,
+                            "byte_size": p_obj.stat().st_size if p_obj.is_file() else 0,
+                            "created_at_utc": latest_rev.get("timestamp_utc") or datetime.now(timezone.utc).isoformat(),
+                            "source_agent": ag_role,
+                            "target_agent": item.get("raised_by_role") or "CreativeDirectorWorldbuilderAgent",
+                            "metadata_summary": {"kind": kind, "state": st, "revision": latest_rev.get("revision_index", 0)},
+                        })
+                    ts_iso = latest_rev.get("timestamp_utc") or datetime.fromtimestamp(backlog_path.stat().st_mtime, timezone.utc).isoformat()
+                    tasks.append({
+                        "deliberation": latest_rev.get("worker_notes") or item.get("deliberation") or item.get("spec") or f"ProductionBoard item {iid}",
+                        "task_id": f"task_board_{iid}",
+                        "agent_role": ag_role,
+                        "agent_name": ag_name,
+                        "requirement_id": iid,
+                        "track_title": str(item.get("title") or iid),
+                        "task_type": t_type,
+                        "status": mapped_st,
+                        "start_time_utc": ts_iso,
+                        "end_time_utc": ts_iso if mapped_st in ("COMPLETED", "REJECTED", "FAILED") else None,
+                        "duration_ms": 4200.0,
+                        "input_artifacts": [],
+                        "output_artifacts": outputs,
+                        "verification_verdict": {
+                            "passed": st == "approved",
+                            "board_state": st,
+                            "revisions": len(revs),
+                            "council_verdict": latest_rev.get("verdict") or ("pending_review" if st == "awaiting_review" else st),
+                            "council_feedback": latest_rev.get("feedback") or "",
+                        },
+                        "diagnostic_trace": {"error": latest_rev.get("feedback") or item.get("failure")} if (latest_rev.get("feedback") or item.get("failure")) else None,
+                        "summary": latest_rev.get("worker_notes") or item.get("spec") or str(item.get("title") or iid),
+                    })
+            except Exception as exc:
+                logger.debug("Failed hydrating tasks from backlog.json: %s", exc)
 
         # 1. Director task
         world_spec_path = cart_dir / "world_spec.json"
@@ -1589,6 +1772,14 @@ def resolve_asset_safe(
                     return cand_assets
             except (ValueError, RuntimeError, OSError):
                 pass
+            # Check artifacts/renders/ direct
+            try:
+                cand_renders = root / "artifacts" / "renders" / filename
+                if cand_renders.is_file():
+                    cand_renders.resolve().relative_to(root.resolve())
+                    return cand_renders
+            except (ValueError, RuntimeError, OSError):
+                pass
     except OSError:
         return None
     return None
@@ -1753,11 +1944,66 @@ def create_app(
         return JSONResponse(resp.model_dump())
 
     async def cartridges_handler(request):
-        """F28.4: Lists all available game cartridges."""
+        """F28.4: Lists all available game cartridges and their game titles/metadata."""
         cartridges = []
+        games_meta = []
         if target_cartridges.exists():
-            cartridges = [p.name for p in target_cartridges.iterdir() if p.is_dir() and not p.name.startswith(".")]
-        return JSONResponse({"cartridges": sorted(cartridges)})
+            dirs = [p for p in target_cartridges.iterdir() if p.is_dir() and not p.name.startswith(".")]
+            cartridges = sorted([p.name for p in dirs])
+            for p in sorted(dirs, key=lambda d: d.stat().st_mtime, reverse=True):
+                if p.name in ("checkpoints", "candidate"):
+                    continue
+                g_title = ""
+                g_genre = ""
+                g_status = "built"
+                gb_file = p / "game_bible.json"
+                ws_file = p / "world_spec.json"
+                mf_file = p / "manifest.json"
+                bl_file = p / "backlog.json"
+                if gb_file.is_file():
+                    try:
+                        gb = json.loads(gb_file.read_text(encoding="utf-8"))
+                        g_title = gb.get("game_title") or ""
+                        g_genre = gb.get("core_genre") or ""
+                        g_status = gb.get("status") or "locked"
+                    except Exception:
+                        pass
+                if not g_title and ws_file.is_file():
+                    try:
+                        ws = json.loads(ws_file.read_text(encoding="utf-8"))
+                        g_title = ws.get("game_title") or ""
+                        g_genre = ws.get("core_genre") or ""
+                    except Exception:
+                        pass
+                if not g_title and mf_file.is_file():
+                    try:
+                        mf = json.loads(mf_file.read_text(encoding="utf-8"))
+                        g_title = mf.get("game_title") or mf.get("title") or ""
+                        g_genre = mf.get("genre") or mf.get("core_genre") or ""
+                    except Exception:
+                        pass
+                approved_cnt = 0
+                total_cnt = 0
+                if bl_file.is_file():
+                    try:
+                        bl = json.loads(bl_file.read_text(encoding="utf-8"))
+                        bl_items = [i for i in bl.get("items", []) if isinstance(i, dict) and i.get("state") != "cancelled"]
+                        total_cnt = len(bl_items)
+                        approved_cnt = sum(1 for i in bl_items if i.get("state") == "approved")
+                    except Exception:
+                        pass
+                if g_title or total_cnt > 0 or (p / "project.godot").is_file() or (p / "mechanics.py").is_file():
+                    games_meta.append({
+                        "cartridge_id": p.name,
+                        "game_title": g_title or p.name,
+                        "core_genre": g_genre or "Game",
+                        "status": g_status,
+                        "has_backlog": bl_file.is_file(),
+                        "approved_items": approved_cnt,
+                        "total_items": total_cnt,
+                        "updated_at_utc": datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat(),
+                    })
+        return JSONResponse({"cartridges": cartridges, "games": games_meta})
 
     async def active_cartridge_handler(request):
         """GET /api/cartridges/active: Metadata and asset inventory for the active cartridge."""
@@ -1861,13 +2107,16 @@ def create_app(
                 db = TelemetryDB(target_db)
                 active_bid = target_bus.get_active_build_id()
                 db_cps = db.get_studio_checkpoints(build_id=active_bid)
+                active_cp_id = None
+                if target_active.exists() and (target_active / "checkpoint_metadata.json").is_file():
+                    try:
+                        active_cp_id = json.loads((target_active / "checkpoint_metadata.json").read_text(encoding="utf-8")).get("checkpoint_id")
+                    except Exception:
+                        active_cp_id = None
                 for cp in db_cps:
                     c_path = Path(cp.get("checkpoint_path", ""))
-                    is_active = target_active.exists() and (
-                        (target_active / "project.godot").is_file()
-                        or (target_active / "main.gd").is_file()
-                        or (target_active / "mechanics.py").is_file()
-                    )
+                    cp_id_str = str(cp.get("checkpoint_id") or "")
+                    is_active = bool(active_cp_id and cp_id_str == active_cp_id)
                     files = []
                     if c_path.exists() and c_path.is_dir():
                         files = sorted([f.name for f in c_path.iterdir() if f.is_file() and not f.name.startswith(".")])
@@ -1924,48 +2173,82 @@ def create_app(
                     except Exception as e:
                         logger.warning("Failed to parse checkpoint metadata for %s: %s", c_dir.name, e)
 
-        # Fallback: scan candidate_* directories with completed tracks if no explicit checkpoints exist
-        if not records:
-            for cand in target_cartridges.glob("candidate*"):
-                cand_has_code = (
-                    cand.is_dir()
-                    and not cand.name.startswith(".")
-                    and (
-                        (cand / "project.godot").is_file()
-                        or (cand / "main.gd").is_file()
-                        or (cand / "mechanics.py").is_file()
-                    )
+        # Also scan candidate_* directories with verified Production Board items or completed tracks not yet in records
+        seen_candidates = {r.candidate_id for r in records if r.candidate_id}
+        for cand in target_cartridges.glob("candidate*"):
+            if cand.name in seen_candidates:
+                continue
+            cand_has_code = (
+                cand.is_dir()
+                and not cand.name.startswith(".")
+                and (
+                    (cand / "project.godot").is_file()
+                    or (cand / "main.gd").is_file()
+                    or (cand / "mechanics.py").is_file()
                 )
-                if cand_has_code:
-                    req_file = cand / "requirements_spec.json"
-                    if req_file.is_file():
-                        try:
-                            req_data = json.loads(req_file.read_text(encoding="utf-8"))
-                            completed = [r for r in req_data.get("requirements", []) if r.get("status") == "completed"]
-                            if completed:
-                                last_track = completed[-1]
-                                files = sorted([f.name for f in cand.iterdir() if f.is_file() and not f.name.startswith(".")])
-                                is_active = target_active.exists() and (
-                                    (target_active / "project.godot").is_file()
-                                    or (target_active / "main.gd").is_file()
-                                    or (target_active / "mechanics.py").is_file()
-                                )
-                                record = VerifiedCheckpointRecord(
-                                    deliberation=f"Verified candidate checkpoint in {cand.name} for track {last_track.get('id')}: '{last_track.get('title')}'.",
-                                    checkpoint_id=f"{cand.name}_{last_track.get('id')}",
-                                    candidate_id=cand.name,
-                                    requirement_id=last_track.get("id", "R1"),
-                                    track_title=last_track.get("title", ""),
-                                    created_at_utc=datetime.fromtimestamp(cand.stat().st_mtime, tz=timezone.utc).isoformat(),
-                                    verified_tracks=[r.get("id") for r in completed],
-                                    cartridge_path=str(cand),
-                                    is_active=is_active,
-                                    files=files,
-                                    sha256_manifest={},
-                                )
-                                records.append(record)
-                        except Exception as e:
-                            logger.warning("Failed to parse candidate requirements in %s: %s", cand.name, e)
+            )
+            if not cand_has_code:
+                continue
+            backlog_file = cand / "backlog.json"
+            req_file = cand / "requirements_spec.json"
+            if backlog_file.is_file():
+                try:
+                    bl_data = json.loads(backlog_file.read_text(encoding="utf-8"))
+                    approved_items = [
+                        it for it in bl_data.get("items", [])
+                        if str(it.get("state") or it.get("status") or "").lower() == "approved"
+                    ]
+                    if approved_items:
+                        last_item = approved_items[-1]
+                        last_id = str(last_item.get("item_id") or last_item.get("id") or "board")
+                        last_title = str(last_item.get("title") or last_id)
+                        files = sorted([f.name for f in cand.iterdir() if f.is_file() and not f.name.startswith(".")])
+                        record = VerifiedCheckpointRecord(
+                            deliberation=f"Verified Production Board checkpoint in {cand.name} ({len(approved_items)} items approved; latest: {last_id} '{last_title}').",
+                            checkpoint_id=f"{cand.name}_{last_id}",
+                            candidate_id=cand.name,
+                            requirement_id=last_id,
+                            track_title=last_title,
+                            created_at_utc=datetime.fromtimestamp(backlog_file.stat().st_mtime, tz=timezone.utc).isoformat(),
+                            verified_tracks=[str(it.get("item_id") or it.get("id")) for it in approved_items],
+                            cartridge_path=str(cand),
+                            is_active=False,
+                            files=files,
+                            sha256_manifest={},
+                        )
+                        records.append(record)
+                        seen_candidates.add(cand.name)
+                        continue
+                except Exception as e:
+                    logger.warning("Failed to parse candidate backlog in %s: %s", cand.name, e)
+            if req_file.is_file():
+                try:
+                    req_data = json.loads(req_file.read_text(encoding="utf-8"))
+                    completed = [r for r in req_data.get("requirements", []) if r.get("status") == "completed"]
+                    if completed:
+                        last_track = completed[-1]
+                        files = sorted([f.name for f in cand.iterdir() if f.is_file() and not f.name.startswith(".")])
+                        is_active = target_active.exists() and (
+                            (target_active / "project.godot").is_file()
+                            or (target_active / "main.gd").is_file()
+                            or (target_active / "mechanics.py").is_file()
+                        )
+                        record = VerifiedCheckpointRecord(
+                            deliberation=f"Verified candidate checkpoint in {cand.name} for track {last_track.get('id')}: '{last_track.get('title')}'.",
+                            checkpoint_id=f"{cand.name}_{last_track.get('id')}",
+                            candidate_id=cand.name,
+                            requirement_id=last_track.get("id", "R1"),
+                            track_title=last_track.get("title", ""),
+                            created_at_utc=datetime.fromtimestamp(cand.stat().st_mtime, tz=timezone.utc).isoformat(),
+                            verified_tracks=[r.get("id") for r in completed],
+                            cartridge_path=str(cand),
+                            is_active=is_active,
+                            files=files,
+                            sha256_manifest={},
+                        )
+                        records.append(record)
+                except Exception as e:
+                    logger.warning("Failed to parse candidate requirements in %s: %s", cand.name, e)
 
         # Sort chronologically
         records.sort(key=lambda r: r.created_at_utc)
@@ -2241,7 +2524,7 @@ def create_app(
 
         resolved = resolve_asset_safe(
             filename,
-            ["sprites", "portraits", "portrait", "characters", "mockups", "tiles"],
+            ["sprites", "portraits", "portrait", "characters", "mockups", "tiles", "playtest_captures", "backdrops", "ui", "vfx"],
             search_roots,
         )
         if not resolved:
@@ -2506,8 +2789,25 @@ def create_app(
         pause_for_greenlight = body.get("pause_for_greenlight")
         reset_active = bool(body.get("reset_active", False))
         resume_current = bool(body.get("resume_current", False))
+        candidate_id = str(body.get("candidate_id", "") or "").strip() or None
         job_id = f"gen_{uuid.uuid4().hex[:8]}"
         build_id = f"build_{job_id}"
+
+        target_bus._build_paused = False
+        if target_bus is not swarm_bus:
+            swarm_bus._build_paused = False
+        try:
+            pause_sentinel = target_cartridges / ".studio_paused.json"
+            if pause_sentinel.is_file():
+                pause_sentinel.unlink()
+        except Exception:
+            pass
+        orch_active = getattr(target_bus, "_active_orchestrator", None)
+        if orch_active is not None and getattr(orch_active, "_board_scheduler", None) is not None:
+            try:
+                orch_active._board_scheduler.resume()
+            except Exception:
+                pass
 
         if pause_for_greenlight is not None:
             target_bus._pause_for_greenlight = bool(pause_for_greenlight)
@@ -2521,6 +2821,7 @@ def create_app(
                 rehydrated_dir = rehydrate_resumable_candidate_from_db(
                     db_path=target_db,
                     cartridges_root=target_cartridges,
+                    preferred_candidate_id=candidate_id,
                 )
                 if rehydrated_dir is not None:
                     resumed_cand_name = rehydrated_dir.name
@@ -2624,6 +2925,7 @@ def create_app(
                             db_path=target_db,
                             creative_prompt=creative_prompt or None,
                             resume_current=resume_current,
+                            resume_candidate_id=candidate_id or resumed_cand_name,
                         )
                         daemon_inst = StudioDaemon(config_obj=cfg, event_bus=target_bus)
                         daemon_inst.run_genesis_cycle()
@@ -2787,10 +3089,19 @@ def create_app(
             return None
         b_title = str(bible_obj.get("game_title") or "").strip()
         b_cid = str(bible_obj.get("cartridge_id") or "").strip()
+        b_id = str(bible_obj.get("bible_id") or "").strip()
         if b_cid and b_cid != "active":
             cand_direct = target_cartridges / b_cid
             if cand_direct.is_dir():
                 return cand_direct
+            if b_cid.startswith(("candidate_", "build_")):
+                return None
+        placeholder_titles = {
+            "",
+            "untitled concept",
+            "convening writers' room...",
+            "new game concept (brainstorming live...)",
+        }
         try:
             candidates = sorted(
                 [d for d in target_cartridges.glob("candidate_*") if d.is_dir()],
@@ -2798,6 +3109,16 @@ def create_app(
                 reverse=True,
             )
             for cand in candidates:
+                gb_fp = cand / "game_bible.json"
+                if b_id and gb_fp.is_file():
+                    try:
+                        d = json.loads(gb_fp.read_text(encoding="utf-8"))
+                        if d.get("bible_id") == b_id:
+                            return cand
+                    except Exception:
+                        pass
+                if b_title.lower() in placeholder_titles:
+                    continue
                 for fn in ("game_bible.json", "world_spec.json", "manifest.json"):
                     fp = cand / fn
                     if fp.is_file():
@@ -3003,13 +3324,21 @@ def create_app(
         elif matched_cand is not None:
             cart_dir = matched_cand
             exists = cart_dir.exists() and cart_dir.is_dir()
-        elif live_bible and live_bible.get("game_title") and live_bible.get("game_title") != "Untitled Concept":
+        elif live_bible:
             # Check if target_active actually belongs to this game_bible
             active_matches = False
-            if target_active.exists() and (target_active / "world_spec.json").is_file():
+            b_title = str(live_bible.get("game_title") or "").strip()
+            b_status = str(live_bible.get("status") or "").lower()
+            if (
+                b_title
+                and b_title.lower() not in ("untitled concept", "convening writers' room...", "new game concept (brainstorming live...)")
+                and b_status not in ("brainstorming", "awaiting_greenlight")
+                and target_active.exists()
+                and (target_active / "world_spec.json").is_file()
+            ):
                 try:
                     act_ws = json.loads((target_active / "world_spec.json").read_text(encoding="utf-8"))
-                    active_matches = (act_ws.get("game_title") == live_bible.get("game_title"))
+                    active_matches = (act_ws.get("game_title") == b_title)
                 except Exception:
                     active_matches = False
             cart_dir = target_active
@@ -3615,6 +3944,74 @@ def create_app(
         )
         return JSONResponse(resp.model_dump())
 
+    def _load_production_board_summary(cart_dir: Optional[Path]) -> Optional[Dict[str, Any]]:
+        if not cart_dir or not cart_dir.is_dir():
+            return None
+        backlog_file = cart_dir / "backlog.json"
+        if not backlog_file.is_file():
+            return None
+        try:
+            from urllib.parse import quote
+            raw_board = json.loads(backlog_file.read_text(encoding="utf-8"))
+            if not isinstance(raw_board, dict):
+                return None
+            items = raw_board.get("items")
+            if not isinstance(items, list):
+                return None
+            design_rev = int(raw_board.get("design_revision") or 0)
+            counts: Dict[str, int] = {
+                "approved": 0,
+                "in_progress": 0,
+                "awaiting_review": 0,
+                "changes_requested": 0,
+                "ready": 0,
+                "blocked": 0,
+                "failed": 0,
+                "needs_decision": 0,
+                "cancelled": 0,
+            }
+            enriched_items: List[Dict[str, Any]] = []
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                st = str(it.get("state") or "ready").lower()
+                counts[st] = counts.get(st, 0) + 1
+                it_copy = dict(it)
+                revs = it_copy.get("revisions") if isinstance(it_copy.get("revisions"), list) else []
+                enriched_revs = []
+                latest_proof_urls: List[str] = []
+                for rv in revs:
+                    if not isinstance(rv, dict):
+                        continue
+                    rv_copy = dict(rv)
+                    p_paths = rv_copy.get("proof_paths") if isinstance(rv_copy.get("proof_paths"), list) else []
+                    p_urls = [
+                        f"/api/artifacts/content?path={quote(str(pp))}&raw=true"
+                        for pp in p_paths
+                        if pp
+                    ]
+                    rv_copy["proof_urls"] = p_urls
+                    if p_urls:
+                        latest_proof_urls = p_urls
+                    enriched_revs.append(rv_copy)
+                it_copy["revisions"] = enriched_revs
+                it_copy["latest_proof_urls"] = latest_proof_urls
+                enriched_items.append(it_copy)
+            active_items = [i for i in enriched_items if str(i.get("state") or "").lower() != "cancelled"]
+            is_drained = bool(active_items) and all(str(i.get("state") or "").lower() == "approved" for i in active_items)
+            return {
+                "deliberation": f"Loaded ProductionBoard backlog from {cart_dir.name} (revision {design_rev}, {len(active_items)} active items).",
+                "cartridge_id": cart_dir.name,
+                "design_revision": design_rev,
+                "total_items": len(active_items),
+                "counts_by_state": counts,
+                "is_drained": is_drained,
+                "items": enriched_items,
+            }
+        except Exception as exc:
+            logger.debug("Failed loading production board backlog.json: %s", exc)
+            return None
+
     async def requirements_handler(request):
         """GET /api/requirements: Live GameRequirementsSpec backlog and status."""
         cart_override = request.query_params.get("cartridge")
@@ -3661,6 +4058,90 @@ def create_app(
             and isinstance(spec_data.get("requirements"), list)
             and all(isinstance(r, dict) for r in spec_data.get("requirements"))
         )
+
+        # If legacy requirements_spec.json is not present, check if ProductionBoard backlog.json exists
+        if not valid_spec:
+            pb_dir: Optional[Path] = None
+            if sanitized_cart and (sanitized_cart / "backlog.json").is_file():
+                pb_dir = sanitized_cart
+            elif active_bible:
+                matched_cand = _resolve_matching_candidate_for_bible(active_bible)
+                if matched_cand and (matched_cand / "backlog.json").is_file():
+                    pb_dir = matched_cand
+            elif cart_dir and cart_dir.is_dir() and (cart_dir / "backlog.json").is_file():
+                pb_dir = cart_dir
+            elif not sanitized_cart and target_cartridges.exists():
+                for cand_d in sorted(
+                    [d for d in target_cartridges.glob("candidate_*") if d.is_dir()],
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                ):
+                    if (cand_d / "backlog.json").is_file():
+                        pb_dir = cand_d
+                        break
+            pb_summary = _load_production_board_summary(pb_dir) if pb_dir else None
+            if pb_summary and pb_summary.get("items"):
+                board_tracks = []
+                state_to_req_status = {
+                    "approved": "completed",
+                    "in_progress": "in_progress",
+                    "awaiting_review": "in_progress",
+                    "changes_requested": "rejected",
+                    "failed": "rejected",
+                    "needs_decision": "rejected",
+                    "ready": "pending",
+                    "blocked": "pending",
+                }
+                for item in pb_summary["items"]:
+                    if str(item.get("state") or "").lower() == "cancelled":
+                        continue
+                    iid = str(item.get("item_id") or "")
+                    st = str(item.get("state") or "ready").lower()
+                    revs = item.get("revisions") if isinstance(item.get("revisions"), list) else []
+                    latest_rev = revs[-1] if revs and isinstance(revs[-1], dict) else {}
+                    criteria = [
+                        {
+                            "deliberation": "Proof verification requirement.",
+                            "id": f"{iid}:proof",
+                            "description": item.get("proof_spec") or item.get("spec") or "Executable and visual proof verified.",
+                            "verification_method": f"{item.get('kind', 'work_item')} ({st})",
+                            "passed": st == "approved",
+                        }
+                    ]
+                    if latest_rev.get("feedback"):
+                        criteria.append({
+                            "deliberation": "Specialist Council review feedback.",
+                            "id": f"{iid}:review_rev{latest_rev.get('revision_index', 0)}",
+                            "description": f"Council Feedback: {latest_rev.get('feedback')}",
+                            "verification_method": "council_review",
+                            "passed": latest_rev.get("verdict") == "approve",
+                        })
+                    board_tracks.append({
+                        "deliberation": item.get("deliberation") or item.get("spec") or item.get("title") or iid,
+                        "id": iid,
+                        "title": item.get("title") or iid,
+                        "description": item.get("spec") or "",
+                        "kind": item.get("kind") or "mechanic_code",
+                        "board_state": st,
+                        "raised_by_role": item.get("raised_by_role") or "CreativeDirector",
+                        "target_modules": item.get("target_modules") or [],
+                        "depends_on": item.get("depends_on") or [],
+                        "revisions": revs,
+                        "latest_proof_urls": item.get("latest_proof_urls") or [],
+                        "status": state_to_req_status.get(st, "pending"),
+                        "acceptance_criteria": criteria,
+                    })
+                if board_tracks:
+                    spec_data = {
+                        "deliberation": pb_summary["deliberation"],
+                        "spec_id": f"board_{pb_summary['cartridge_id']}_rev{pb_summary['design_revision']}",
+                        "game_title": (active_bible or {}).get("game_title") or pb_summary["cartridge_id"],
+                        "genre_paradigm": (active_bible or {}).get("core_genre") or "Continuous Production Board",
+                        "target_episode": 0,
+                        "requirements": board_tracks,
+                        "production_board": pb_summary,
+                    }
+                    valid_spec = True
 
         if valid_spec:
             req_tracks = spec_data.get("requirements", [])
@@ -3870,7 +4351,11 @@ def create_app(
             return FileResponse(str(target_file))
 
         if suffix in (".png", ".jpg", ".jpeg", ".gif", ".bmp"):
-            raw_url = f"/api/artifacts/content?filename={quote(target_file.name)}&raw=true"
+            raw_url = (
+                f"/api/artifacts/content?path={quote(raw_path)}&raw=true"
+                if raw_path
+                else f"/api/artifacts/content?filename={quote(target_file.name)}&raw=true"
+            )
             return JSONResponse({
                 "is_image": True,
                 "url": raw_url,
@@ -3878,7 +4363,11 @@ def create_app(
                 "size_bytes": size_bytes,
             })
         elif suffix in (".wav", ".ogg", ".mp3"):
-            raw_url = f"/api/artifacts/content?filename={quote(target_file.name)}&raw=true"
+            raw_url = (
+                f"/api/artifacts/content?path={quote(raw_path)}&raw=true"
+                if raw_path
+                else f"/api/artifacts/content?filename={quote(target_file.name)}&raw=true"
+            )
             return JSONResponse({
                 "is_audio": True,
                 "url": raw_url,
@@ -3943,9 +4432,11 @@ def create_app(
                 except Exception as exc:
                     logger.debug("TelemetryDB game_bible lookup error: %s", exc)
 
-        # 3. Check candidate_* and active cartridge directories for game_bible.json
+        # 3. Check candidate_* and active cartridge directories for game_bible.json (newest first when not overridden)
         if bible_data is None:
-            search_dirs = [cart_dir, target_active]
+            search_dirs: List[Path] = []
+            if sanitized_cart:
+                search_dirs.append(sanitized_cart)
             if target_cartridges.exists():
                 try:
                     search_dirs.extend(
@@ -3957,6 +4448,7 @@ def create_app(
                     )
                 except OSError:
                     pass
+            search_dirs.extend([cart_dir, target_active])
             for sdir in search_dirs:
                 gb_file = sdir / "game_bible.json"
                 if gb_file.is_file():
@@ -4044,33 +4536,56 @@ def create_app(
                     "updated_at_utc": now_iso,
                 }
 
-        # Discover sign_off_report.json from active or latest candidate directory
+        # Discover sign_off_report.json from requested cartridge (or matching bible candidate)
         sign_off_report: Optional[Dict[str, Any]] = None
-        sign_off_search_dirs = [cart_dir, target_active]
-        if target_cartridges.exists():
-            try:
-                sign_off_search_dirs.extend(
-                    sorted(
-                        [d for d in target_cartridges.glob("candidate_*") if d.is_dir()],
-                        key=lambda p: p.stat().st_mtime,
-                        reverse=True,
+        if sanitized_cart is not None:
+            sign_off_search_dirs = [sanitized_cart]
+        elif bible_data is not None:
+            matched_so_dir = _resolve_matching_candidate_for_bible(bible_data)
+            sign_off_search_dirs = [matched_so_dir] if matched_so_dir else []
+            if not sign_off_search_dirs and str(bible_data.get("cartridge_id") or "") == "active":
+                sign_off_search_dirs = [target_active]
+        else:
+            sign_off_search_dirs = [cart_dir, target_active]
+            if target_cartridges.exists():
+                try:
+                    sign_off_search_dirs.extend(
+                        sorted(
+                            [d for d in target_cartridges.glob("candidate_*") if d.is_dir()],
+                            key=lambda p: p.stat().st_mtime,
+                            reverse=True,
+                        )
                     )
-                )
-            except OSError:
-                pass
+                except OSError:
+                    pass
         for sdir in sign_off_search_dirs:
             if sdir and (sdir / "sign_off_report.json").is_file():
                 try:
-                    sign_off_report = json.loads((sdir / "sign_off_report.json").read_text(encoding="utf-8"))
+                    candidate_report = json.loads((sdir / "sign_off_report.json").read_text(encoding="utf-8"))
+                    rep_cid = str(candidate_report.get("candidate_id") or "")
+                    if sanitized_cart is not None and rep_cid and rep_cid != sanitized_cart.name and sanitized_cart.name != "active":
+                        continue
+                    sign_off_report = candidate_report
                     break
                 except Exception:
                     continue
 
-        orch = getattr(target_bus, "_active_orchestrator", None)
+        orch = getattr(target_bus, "_active_orchestrator", None) or getattr(swarm_bus, "_active_orchestrator", None)
         orch_state = getattr(getattr(orch, "state", None), "value", "IDLE") if orch else "IDLE"
         pause_greenlight = bool(
             getattr(target_bus, "_pause_for_greenlight", False)
             or (orch and getattr(getattr(orch, "config", None), "pause_for_greenlight", False))
+        )
+        try:
+            from engine.studio.daemon import _genesis_build_lock
+            lock_held = _genesis_build_lock.locked()
+        except Exception:
+            lock_held = False
+        is_paused_sentinel = bool(target_cartridges and (target_cartridges / ".studio_paused.json").is_file())
+        build_actively_running = bool(
+            not is_paused_sentinel
+            and orch_state != "AWAITING_GREENLIGHT"
+            and (lock_held or orch_state in ("BRAINSTORMING", "ANALYZING", "SYNTHESIZING", "VERIFYING"))
         )
 
         if bible_data:
@@ -4096,11 +4611,43 @@ def create_app(
             resp_payload.setdefault("deliberation", f"Retrieved Living Game Bible for '{resp_payload.get('game_title', 'Active Game')}'.")
             resp_payload["has_bible"] = True
             resp_payload["pause_for_greenlight"] = pause_greenlight
+            resp_payload["build_actively_running"] = build_actively_running
             if str(resp_payload.get("status", "")).lower() == "brainstorming" and orch_state == "AWAITING_GREENLIGHT":
                 resp_payload["orchestrator_state"] = "BRAINSTORMING"
             else:
                 resp_payload["orchestrator_state"] = orch_state
             resp_payload["sign_off_report"] = sign_off_report
+            if sanitized_cart is not None:
+                matched_pb_dir = sanitized_cart
+            else:
+                matched_pb_dir = _resolve_matching_candidate_for_bible(resp_payload)
+                if matched_pb_dir is None and str(resp_payload.get("cartridge_id") or "") == "active":
+                    matched_pb_dir = cart_dir
+            pb_summary = _load_production_board_summary(matched_pb_dir)
+            if pb_summary is None:
+                cid_name = matched_pb_dir.name if matched_pb_dir else str(resp_payload.get("cartridge_id") or "active")
+                pb_summary = {
+                    "deliberation": f"Initialized empty ProductionBoard for '{cid_name}'.",
+                    "cartridge_id": cid_name,
+                    "design_revision": 0,
+                    "total_items": 0,
+                    "counts_by_state": {
+                        "approved": 0,
+                        "in_progress": 0,
+                        "awaiting_review": 0,
+                        "changes_requested": 0,
+                        "ready": 0,
+                        "blocked": 0,
+                        "failed": 0,
+                        "needs_decision": 0,
+                        "cancelled": 0,
+                    },
+                    "is_drained": False,
+                    "items": [],
+                }
+            resp_payload["production_board"] = pb_summary
+            if pb_summary and pb_summary.get("cartridge_id"):
+                resp_payload["active_candidate_id"] = pb_summary["cartridge_id"]
             return JSONResponse(resp_payload)
 
         return JSONResponse({
@@ -4185,6 +4732,23 @@ def create_app(
             })
             if isinstance(bible_data, dict):
                 bible_data.setdefault("writers_room_transcript", []).append(utt)
+                matched_cand = _resolve_matching_candidate_for_bible(bible_data)
+                if matched_cand and matched_cand.is_dir():
+                    try:
+                        sf = matched_cand / ".pending_steering.json"
+                        existing_sf: List[str] = []
+                        if sf.is_file():
+                            try:
+                                raw_sf = json.loads(sf.read_text(encoding="utf-8"))
+                                if isinstance(raw_sf, list):
+                                    existing_sf = [str(x).strip() for x in raw_sf if str(x).strip()]
+                            except Exception:
+                                existing_sf = []
+                        if req.feedback.strip() not in existing_sf:
+                            existing_sf.append(req.feedback.strip())
+                        sf.write_text(json.dumps(existing_sf, indent=2), encoding="utf-8")
+                    except Exception as sf_exc:
+                        logger.debug("Failed writing .pending_steering.json from greenlight handler: %s", sf_exc)
 
         if isinstance(bible_data, dict):
             bible_data["status"] = "locked" if req.approved else "brainstorming"
@@ -4247,13 +4811,44 @@ def create_app(
             if orch is not None and hasattr(orch, "config"):
                 orch.config.pause_for_greenlight = bool(req.pause_for_greenlight)
 
+            if req.paused is not None:
+                paused_flag = bool(req.paused)
+                target_bus._build_paused = paused_flag
+                if swarm_bus is not target_bus:
+                    swarm_bus._build_paused = paused_flag
+                pause_sentinel = target_cartridges / ".studio_paused.json"
+                try:
+                    if paused_flag:
+                        target_cartridges.mkdir(parents=True, exist_ok=True)
+                        pause_sentinel.write_text(
+                            json.dumps({"paused": True, "timestamp_utc": datetime.now(timezone.utc).isoformat()}),
+                            encoding="utf-8",
+                        )
+                    elif pause_sentinel.is_file():
+                        pause_sentinel.unlink()
+                except Exception:
+                    pass
+                if orch is not None and getattr(orch, "_board_scheduler", None) is not None:
+                    try:
+                        if paused_flag:
+                            orch._board_scheduler.pause()
+                        else:
+                            orch._board_scheduler.resume()
+                    except Exception:
+                        pass
+
         pause_val = bool(
             getattr(target_bus, "_pause_for_greenlight", False)
             or (orch and getattr(getattr(orch, "config", None), "pause_for_greenlight", False))
         )
+        paused_val = bool(
+            getattr(target_bus, "_build_paused", False)
+            or (target_cartridges / ".studio_paused.json").is_file()
+        )
         return JSONResponse({
-            "deliberation": f"Studio orchestration configuration: pause_for_greenlight={pause_val}.",
+            "deliberation": f"Studio orchestration configuration: pause_for_greenlight={pause_val}, paused={paused_val}.",
             "pause_for_greenlight": pause_val,
+            "paused": paused_val,
         })
 
     routes = [

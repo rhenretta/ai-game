@@ -271,6 +271,7 @@ class VoiceActingAudioProducerAgent:
         voice_map: Optional[Dict[str, str]] = None,
     ):
         self.model_name = model_name
+        self.client = client
         self.character_voices: Dict[str, str] = dict(voice_map or {})
         if backend is not None:
             self.backend = backend
@@ -432,6 +433,42 @@ class VoiceActingAudioProducerAgent:
             )
 
         return result
+
+    def generate_sfx(
+        self,
+        prompt: str,
+        output_path: Union[Path, str],
+        kind: str = "sfx",
+        purpose: str = "",
+        loop: bool = False,
+        design_model_name: str = "gemini-3.8-flash",
+    ) -> AudioSynthesisResult:
+        """Designs (LLM recipe) and renders (deterministic DSP) a sound effect or ambient loop to a .wav."""
+        from engine.studio.sfx_synth import SFX_SAMPLE_RATE, SfxSynthesisDesigner, render_recipe, write_wav
+
+        if self.client is None:
+            raise StudioAgentError(
+                f"generate_sfx requires a google.genai Client to design '{kind}' audio; "
+                "this agent was built with an explicit backend only (Rule 5)."
+            )
+        output_path = Path(output_path)
+        recipe = SfxSynthesisDesigner(self.client, model_name=design_model_name).design(
+            prompt=prompt, kind=kind, purpose=purpose, loop=loop
+        )
+        write_wav(render_recipe(recipe), output_path)
+        valid, err, duration = validate_wav_file(output_path)
+        if not valid:
+            raise VoiceSynthesisError(f"Rendered SFX WAV validation failed for '{output_path.name}': {err}")
+        data = output_path.read_bytes()
+        return AudioSynthesisResult(
+            deliberation=recipe.deliberation,
+            bark_id=output_path.stem,
+            file_path=str(output_path),
+            sample_rate=SFX_SAMPLE_RATE,
+            duration_seconds=duration,
+            file_size_bytes=len(data),
+            sha256_hash=hashlib.sha256(data).hexdigest(),
+        )
 
     def generate_character_barks(
         self,

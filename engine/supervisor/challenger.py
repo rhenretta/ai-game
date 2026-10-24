@@ -1077,9 +1077,13 @@ class MultiAgentSignOffCouncil:
         if self._is_live_genai_client(active_client):
             try:
                 from google.genai import types
+                from engine.studio.models import compact_bible_json_for_prompt
                 bible_text = ""
                 if (c_dir / "game_bible.json").is_file():
-                    bible_text = (c_dir / "game_bible.json").read_text(encoding="utf-8", errors="replace")[:12000]
+                    bible_text = compact_bible_json_for_prompt(
+                        (c_dir / "game_bible.json").read_text(encoding="utf-8", errors="replace"),
+                        mode="full",
+                    )
 
                 prompt = (
                     f"You are the Multi-Agent Final Sign-Off Council for candidate build '{candidate_id}'.\n"

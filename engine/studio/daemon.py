@@ -58,6 +58,7 @@ class StudioDaemonConfig(BaseModel):
     min_disk_space_mb: float = Field(default=100.0, description="Minimum free disk space threshold in MB")
     creative_prompt: Optional[str] = Field(default=None, description="Optional Executive Producer creative seed/prompt for Genesis")
     resume_current: bool = Field(default=False, description="Resume the latest in-progress or failed Genesis candidate from its persisted Game Bible and Requirements")
+    resume_candidate_id: Optional[str] = Field(default=None, description="Optional explicit candidate directory name to resume")
 
 
 _lock_mutex = threading.Lock()
@@ -67,6 +68,7 @@ _genesis_build_lock = threading.Lock()
 def rehydrate_resumable_candidate_from_db(
     db_path: Path,
     cartridges_root: Path,
+    preferred_candidate_id: Optional[str] = None,
 ) -> Optional[Path]:
     """Rehydrates a resumable candidate_genesis_* directory from SQLite if missing or incomplete on disk."""
     from engine.studio.models import (
@@ -84,7 +86,20 @@ def rehydrate_resumable_candidate_from_db(
     req_rows: List[Dict[str, Any]] = []
     cand_name: Optional[str] = None
 
-    if db_path and db_path.exists():
+    if preferred_candidate_id:
+        clean_pref = preferred_candidate_id.strip()
+        if clean_pref.startswith("build_"):
+            clean_pref = clean_pref[len("build_"):]
+        if clean_pref and clean_pref != "active" and (cartridges_root / clean_pref).is_dir():
+            cand_name = clean_pref
+            gb_p = cartridges_root / clean_pref / "game_bible.json"
+            if gb_p.is_file():
+                try:
+                    bible_dict = json.loads(gb_p.read_text(encoding="utf-8"))
+                except Exception:
+                    bible_dict = None
+
+    if not cand_name and db_path and db_path.exists():
         try:
             db = TelemetryDB(db_path)
             bible_dict = db.get_latest_game_bible()
@@ -504,6 +519,7 @@ class StudioDaemon:
                 resumed_dir = rehydrate_resumable_candidate_from_db(
                     db_path=self.config.db_path,
                     cartridges_root=self.config.cartridges_root,
+                    preferred_candidate_id=self.config.resume_candidate_id,
                 )
 
             if resumed_dir is not None:

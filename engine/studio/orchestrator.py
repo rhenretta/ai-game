@@ -234,6 +234,8 @@ class StudioOrchestrator:
         self.client = client if client is not None else self._init_gemini_client(self.api_key, timeout_seconds=self.config.timeout_seconds)
         self.enable_writers_room = enable_writers_room
         self.active_game_bible: Optional[GameBibleSpec] = None
+        self.production_board: Optional[Any] = None
+        self._continuous_active: bool = False
         self._greenlight_decision: Optional[Dict[str, Any]] = None
         self._greenlight_event: threading.Event = threading.Event()
         self._abort_requested: bool = False
@@ -403,10 +405,13 @@ class StudioOrchestrator:
 
     def submit_greenlight_decision(self, approved: bool = True, feedback: str = "") -> Dict[str, Any]:
         """Allows Mission Control UI to approve the Living Game Bible or inject steering feedback."""
+        clean_fb = (feedback or "").strip()
         self._greenlight_decision = {
             "approved": bool(approved),
-            "feedback": (feedback or "").strip(),
+            "feedback": clean_fb,
         }
+        if clean_fb and hasattr(self, "writers_room") and hasattr(self.writers_room, "enqueue_user_steering"):
+            self.writers_room.enqueue_user_steering(clean_fb, candidate_dir=getattr(self, "_active_staging_dir", None))
         if self._greenlight_event is not None:
             try:
                 self._greenlight_event.set()
@@ -415,9 +420,99 @@ class StudioOrchestrator:
         return {
             "deliberation": "Greenlight decision recorded for StudioOrchestrator.",
             "approved": bool(approved),
-            "feedback": (feedback or "").strip(),
+            "feedback": clean_fb,
             "state": self.state.value,
         }
+
+    def _continuous_production_enabled(self) -> bool:
+        flag = getattr(self.config, "continuous_production", None)
+        return bool(flag) if flag is not None else self._is_live_genai_client()
+
+    def _build_production_board(self, c_dir: Path) -> Optional[Any]:
+        """Creates the Production Board, its worker handlers and the scheduler for this build (None when disabled)."""
+        if not self._continuous_production_enabled():
+            return None
+        from engine.studio.production_board import BoardScheduler, ProductionBoard
+        from engine.studio.workers import WorkerContext, default_handlers
+
+        def _board_event(event_type: str, payload: Dict[str, Any]) -> None:
+            self._publish_event(event_type, "ProductionBoard", payload.get("deliberation", event_type), payload)
+            if event_type == "backlog_item_approved" and (c_dir / "project.godot").is_file():
+                try:
+                    item_id = str(payload.get("item_id") or "board")
+                    approved_ids = [it.item_id for it in board.items() if it.state == "approved"]
+                    item_obj = next((it for it in board.items() if it.item_id == item_id), None)
+                    cp_track = RequirementTrack(
+                        deliberation=payload.get("deliberation") or f"Council approved Production Board item {item_id}.",
+                        id=item_id,
+                        title=getattr(item_obj, "title", item_id),
+                        description=getattr(item_obj, "spec", "") or item_id,
+                        status="completed",
+                    )
+                    self._persist_verified_checkpoint(c_dir, cp_track, approved_ids, mirror_to_active=False)
+                except Exception as cp_exc:
+                    logger.debug("Board checkpoint persistence skipped for %s: %s", c_dir.name, cp_exc)
+
+        board = ProductionBoard(
+            c_dir / "backlog.json",
+            default_max_revisions=getattr(self.config, "max_item_revisions", 5),
+            event_callback=_board_event,
+        )
+        if not (c_dir / "backlog.json").is_file():
+            board._persist()
+        swe_agent = self.agents["LeadGameplaySWEAgent"]
+        swe_agent.visual_agent = self.agents.get("VisualArtSpriteDesignerAgent")
+        swe_agent.voice_agent = self.agents.get("VoiceActingAudioProducerAgent")
+
+        def _verify(cartridge_dir: Path, track: Any) -> None:
+            self._verify_track_smoke_check(cartridge_dir, track, swe_agent=swe_agent)
+
+        ctx = WorkerContext(
+            cartridge_dir=c_dir,
+            client=self.client,
+            visual_agent=self.agents.get("VisualArtSpriteDesignerAgent"),
+            voice_agent=self.agents.get("VoiceActingAudioProducerAgent"),
+            swe_agent=swe_agent,
+            model_name=self.config.model_name,
+            code_verify=_verify,
+            event_callback=_board_event,
+        )
+        scheduler = BoardScheduler(board, default_handlers(ctx), max_workers=getattr(self.config, "board_workers", 2))
+        self.production_board = board
+        self._board_scheduler = scheduler
+        return board
+
+    def _reconcile_requirements_with_board(self, req_spec: Any) -> Any:
+        """In continuous mode the council's backlog is the source of truth for code requirements: approved code items
+        become completed tracks (so the legacy loop skips them), and the remaining pipeline only runs final gates."""
+        board = self.production_board
+        if board is None or not self._continuous_active or not board.items():
+            return req_spec
+        from engine.studio.models import AcceptanceCriterion
+
+        tracks: List[RequirementTrack] = []
+        for it in board.items():
+            if it.kind not in ("mechanic_code", "ui", "integration"):
+                continue
+            tracks.append(
+                RequirementTrack(
+                    deliberation=it.deliberation,
+                    id=it.item_id,
+                    title=it.title,
+                    description=it.spec,
+                    target_modules=list(it.target_modules) or ["main.gd"],
+                    acceptance_criteria=[
+                        AcceptanceCriterion(
+                            deliberation="Council proof request.", id=f"AC-{it.item_id}",
+                            description=it.proof_spec or it.spec, verification_method="headless_playtest",
+                        )
+                    ],
+                    status="completed" if it.state == "approved" else ("pending" if it.state != "cancelled" else "completed"),
+                )
+            )
+        req_spec.requirements = tracks
+        req_spec.asset_manifest = []  # assets were built, reviewed and approved through the board
+        return req_spec
 
     def run_writers_room_session(
         self,
@@ -426,20 +521,34 @@ class StudioOrchestrator:
         staging_dir: Optional[Union[Path, str]] = None,
         target_episode: int = 0,
         creative_prompt: Optional[str] = None,
+        existing_bible: Optional[GameBibleSpec] = None,
     ) -> GameBibleSpec:
-        """Executes the open-ended CreativeWritersRoom session to produce a locked GameBibleSpec."""
+        """Executes the open-ended CreativeWritersRoom session to produce a locked GameBibleSpec.
+
+        When `existing_bible` is provided (resumed builds), the room continues that Living Game Bible
+        instead of initializing a fresh 'Untitled Concept'."""
         c_dir = Path(staging_dir) if staging_dir else (PROJECT_ROOT / "cartridges" / f"candidate_genesis_{uuid.uuid4().hex[:6]}")
         c_dir.mkdir(parents=True, exist_ok=True)
+        self._active_staging_dir = c_dir
         self.writers_room.telemetry_db = self._get_telemetry_db()
         seed = creative_prompt or getattr(self, "_creative_prompt", None)
-        bible = self.writers_room.run_writers_room(
-            dna=dna,
-            hypothesis_report=hypothesis_report,
-            candidate_dir=c_dir,
-            target_episode=target_episode,
-            cartridge_id=c_dir.name,
-            creative_prompt=seed,
-        )
+        board = self._build_production_board(c_dir)
+        self.writers_room.board = board
+        self.writers_room.scheduler = getattr(self, "_board_scheduler", None) if board is not None else None
+        self._continuous_active = board is not None
+        try:
+            bible = self.writers_room.run_writers_room(
+                dna=dna,
+                hypothesis_report=hypothesis_report,
+                candidate_dir=c_dir,
+                target_episode=target_episode,
+                cartridge_id=c_dir.name,
+                creative_prompt=seed,
+                existing_bible=existing_bible,
+            )
+        finally:
+            if self.writers_room.scheduler is not None:
+                self.writers_room.scheduler.stop()
         self.active_game_bible = bible
         return bible
 
@@ -907,6 +1016,7 @@ class StudioOrchestrator:
                         hypothesis_report=evolution_report,
                         staging_dir=staging_dir,
                         target_episode=plan.target_episode,
+                        existing_bible=game_bible,
                     )
                     _sync_bible_to_plan_and_staging(game_bible)
                     # Optional Greenlight Pause Gate
@@ -1050,7 +1160,7 @@ class StudioOrchestrator:
                         req_spec = GameRequirementsSpec.model_validate_json(
                             (staging_dir / "requirements_spec.json").read_text(encoding="utf-8")
                         )
-                        if req_spec and not req_spec.asset_manifest and (game_bible is not None or (staging_dir / "game_bible.json").is_file()):
+                        if req_spec and not req_spec.asset_manifest and not self._continuous_active and (game_bible is not None or (staging_dir / "game_bible.json").is_file()):
                             try:
                                 from engine.studio.asset_library import CartridgeAssetLibrary
                                 temp_lib = CartridgeAssetLibrary(cartridge_dir=staging_dir)
@@ -1061,9 +1171,18 @@ class StudioOrchestrator:
                         req_spec = None
 
                 if req_spec is None:
+                    has_board_items = bool(
+                        self._continuous_active
+                        and self.production_board is not None
+                        and self.production_board.items()
+                    )
                     has_mock = hasattr(self.client, "_responses")
                     call_agent = False
-                    if not has_mock:
+                    if has_board_items:
+                        # Production Board already decomposed & verified the backlog during continuous co-design;
+                        # skip redundant generate_requirements_spec LLM call that _reconcile_requirements_with_board overwrites.
+                        call_agent = False
+                    elif not has_mock:
                         call_agent = True
                     elif len(self.client._responses) > 0:
                         next_resp = self.client._responses[0]
@@ -1120,6 +1239,7 @@ class StudioOrchestrator:
                             asset_manifest=[],
                         )
 
+                req_spec = self._reconcile_requirements_with_board(req_spec)
                 (staging_dir / "requirements_spec.json").write_text(req_spec.model_dump_json(indent=2), encoding="utf-8")
                 context.raw_outputs["requirements_spec"] = req_spec
                 context.raw_outputs["GameRequirementsSpec"] = req_spec
@@ -1280,7 +1400,7 @@ class StudioOrchestrator:
                 )
 
                 # If requirements_spec has an empty asset_manifest and a GameBible exists, derive baseline assets now
-                if req_spec is not None and not getattr(req_spec, "asset_manifest", None) and (game_bible_obj is not None or (staging_dir / "game_bible.json").is_file()):
+                if req_spec is not None and not getattr(req_spec, "asset_manifest", None) and not self._continuous_active and (game_bible_obj is not None or (staging_dir / "game_bible.json").is_file()):
                     req_spec.asset_manifest = asset_lib.derive_baseline_assets_from_bible(game_bible_obj)
                     (staging_dir / "requirements_spec.json").write_text(req_spec.model_dump_json(indent=2), encoding="utf-8")
 
@@ -1617,22 +1737,42 @@ class StudioOrchestrator:
         tracks = req_spec.requirements
         completed_track_ids: List[str] = [t.id for t in tracks if t.status == "completed"]
 
-        # 0. Formulate master GameProductionStrategySpec before building tracks (when live Gemini + Game Bible present)
+        # 0. Ensure the per-game RenderingStrategySpec exists (normally created before asset fabrication; cached here).
+        if (
+            self._is_live_genai_client()
+            and (staging_dir / "game_bible.json").is_file()
+            and hasattr(agent, "_rendering_strategy_block")
+        ):
+            agent._rendering_strategy_block(staging_dir)
+
+        # 0a. Formulate the machine-readable LevelLayoutSpec (data the SWE agent consumes, not prose) before building tracks
+        if (
+            self._is_live_genai_client()
+            and (staging_dir / "game_bible.json").is_file()
+            and hasattr(agent, "formulate_level_layout")
+        ):
+            layout = agent.formulate_level_layout(staging_dir)
+            self._publish_event(
+                "AGENT_STREAM",
+                "LeadGameplaySWEAgent",
+                layout.deliberation,
+                {"phase": "formulate_level_layout", "entities": len(layout.entities), "triggers": len(layout.triggers)},
+            )
+
+        # 0b. Formulate master GameProductionStrategySpec before building tracks (when live Gemini + Game Bible present).
+        # Failures are fatal and propagate with their full stack trace (Rule 5).
         if (
             self._is_live_genai_client()
             and (staging_dir / "game_bible.json").is_file()
             and hasattr(agent, "formulate_production_strategy")
         ):
-            try:
-                strat = agent.formulate_production_strategy(staging_dir)
-                self._publish_event(
-                    "AGENT_STREAM",
-                    "LeadGameplaySWEAgent",
-                    strat.deliberation,
-                    {"phase": "formulate_production_strategy", "scene_layers": len(strat.scene_layers)},
-                )
-            except Exception as strat_exc:
-                logger.warning("Non-fatal error formulating production strategy: %s", strat_exc)
+            strat = agent.formulate_production_strategy(staging_dir)
+            self._publish_event(
+                "AGENT_STREAM",
+                "LeadGameplaySWEAgent",
+                strat.deliberation,
+                {"phase": "formulate_production_strategy", "scene_layers": len(strat.scene_layers)},
+            )
 
         for track_idx, track in enumerate(tracks):
             # 1. Skip Completed Tracks on Resume
@@ -1919,14 +2059,12 @@ class StudioOrchestrator:
             and (staging_dir / "game_bible.json").is_file()
             and hasattr(agent, "execute_scene_strategy_and_refine_loop")
         ):
-            try:
-                refined = agent.execute_scene_strategy_and_refine_loop(
-                    staging_dir,
-                    max_scene_iterations=2,
-                )
-                results.update(refined)
-            except Exception as refine_exc:
-                logger.warning("Non-fatal error during post-track scene critique & refine loop: %s", refine_exc)
+            # Iterates until the critic accepts the scene AND authored beats pass. Rejections/errors propagate (Rule 5).
+            refined = agent.execute_scene_strategy_and_refine_loop(
+                staging_dir,
+                max_scene_iterations=None,
+            )
+            results.update(refined)
 
         for code_pattern in ["*.py", "*.gd", "*.tscn", "project.godot"]:
             for p in staging_dir.glob(code_pattern):
@@ -2080,6 +2218,111 @@ class StudioOrchestrator:
         )
         return checkpoint_dir
 
+    @staticmethod
+    def _check_godot_gameplay_and_asset_gates(
+        staging_dir: Path,
+        track: RequirementTrack,
+        scene_audit: Dict[str, Any],
+    ) -> None:
+        """Enforces authentic gameplay (no self-playing sim_tick demo loops), clean diegetic HUDs (no debug test-runner
+        dashboards or center-occluding panels), and mandatory Sprite2D/TextureRect asset binding when sprites exist."""
+        if scene_audit.get("passive_auto_win_detected"):
+            reason = scene_audit.get("passive_win_reason") or "Game auto-solved with zero player input."
+            raise RuntimeError(f"Passive auto-win violation in '{track.id}': {reason}")
+
+        if scene_audit.get("fullscreen_occlusion_detected"):
+            raise RuntimeError(
+                f"Fullscreen viewport occlusion detected in '{track.id}'. Do not cover the 1280x720 game viewport with opaque panels or overlays."
+            )
+
+        occluding = scene_audit.get("center_occluding_panels") or []
+        if occluding:
+            raise RuntimeError(
+                f"HUD center-occlusion violation in '{track.id}': UI panels {occluding} cover the playable center of the viewport. "
+                "Keep all HUD elements compact around the screen perimeter (<15% viewport area)."
+            )
+
+        # Check for hardcoded sim_tick / frame-counter / playtest_timer demo sequencers in main.gd and scenes.gd
+        import re as _re
+
+        tick_branch_re = _re.compile(
+            r"\b(?:if|elif)\s+(?:sim_tick|sim_t|frame_count|tick_count|demo_tick|playtest_timer|auto_test_timer|demo_timer)\s*(?:==|>=|<=|>|<)\s*(\d+(?:\.\d+)?)\s*:"
+        )
+        for mod_name in ("main.gd", "scenes.gd"):
+            mod_path = staging_dir / mod_name
+            if not mod_path.is_file():
+                continue
+            src = mod_path.read_text(encoding="utf-8")
+            tick_vals = {float(m.group(1)) for m in tick_branch_re.finditer(src) if float(m.group(1)) >= 1.0}
+            if len(tick_vals) >= 2 or "handle_automated_playtest" in src:
+                raise RuntimeError(
+                    f"Self-playing demo loop detected in {mod_name} (hardcoded tick/timer branches at {sorted(tick_vals)}). "
+                    "NEVER sequence gameplay actions, winching, cleating, dialogue choices, or state overrides on a sim_tick or playtest_timer in production code; "
+                    "bind all actions to real player inputs (_input / Input.is_action_pressed / Input.is_key_pressed) and let the external QA Test Renderer stage proof scenarios."
+                )
+
+        # Check that scenes.gd realizes multi-region / procedural level layouts rather than a tiny 1-screen Rect2 placeholder box
+        target_mods = set(getattr(track, "target_modules", []) or [])
+        layout_path = staging_dir / "level_layout.json"
+        scenes_path = staging_dir / "scenes.gd"
+        if "scenes.gd" in target_mods and layout_path.is_file() and scenes_path.is_file():
+            try:
+                layout_data = json.loads(layout_path.read_text(encoding="utf-8"))
+                intended_scale = float(layout_data.get("intended_world_scale_in_viewports", 1.0) or 1.0)
+                regions = layout_data.get("world_regions") or []
+            except Exception:
+                intended_scale = 1.0
+                regions = []
+            if intended_scale >= 2.0 and len(regions) >= 2:
+                scenes_src = scenes_path.read_text(encoding="utf-8")
+                loads_layout = "level_layout.json" in scenes_src
+                rect_coords = [
+                    (float(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4)))
+                    for m in _re.finditer(
+                        r"Rect2\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)",
+                        scenes_src,
+                    )
+                ]
+                max_extent_x = max((x + w for x, _y, w, _h in rect_coords), default=0.0)
+                max_extent_y = max((y + h for _x, y, _w, h in rect_coords), default=0.0)
+                if not loads_layout and rect_coords and len(rect_coords) <= 6 and max_extent_x <= 1920.0 and max_extent_y <= 1080.0:
+                    raise RuntimeError(
+                        f"Tiny placeholder level detected in scenes.gd for '{track.id}': level_layout.json specifies "
+                        f"{len(regions)} regions across ~{intended_scale:.1f} viewports ({layout_data.get('world_bounds')}), "
+                        f"but scenes.gd only hardcodes {len(rect_coords)} Rect2 shapes inside a single screen ({max_extent_x:.0f}x{max_extent_y:.0f}). "
+                        "Load res://level_layout.json and/or execute the procedural/hybrid chunk grammar across all regions."
+                    )
+
+        # Check ui_hud.gd for internal debug/test-runner telemetry dashboards
+        hud_path = staging_dir / "ui_hud.gd"
+        if hud_path.is_file():
+            hud_src = hud_path.read_text(encoding="utf-8")
+            if "headless_test_results" in hud_src or "HEADLESS MECHANICS" in hud_src.upper() or "TELEMETRY VERIFICATION" in hud_src.upper():
+                raise RuntimeError(
+                    f"Debug telemetry dashboard detected in ui_hud.gd for '{track.id}'. "
+                    "NEVER render headless_test_results, 'HEADLESS MECHANICS', or QA verification tables inside the player's HUD; "
+                    "QA telemetry is rendered externally by the QA Test Renderer."
+                )
+
+        # Check mandatory sprite/texture binding when synthesized sprites exist on disk
+        sprites_dir = staging_dir / "assets" / "sprites"
+        sprite_pngs = sorted(sprites_dir.glob("*.png")) if sprites_dir.is_dir() else []
+        target_mods = set(getattr(track, "target_modules", []) or [])
+        touches_visual_code = bool(target_mods & {"main.gd", "entities.gd", "scenes.gd"}) or not target_mods
+        if (
+            sprite_pngs
+            and touches_visual_code
+            and ((staging_dir / "entities.gd").is_file() or (staging_dir / "scenes.gd").is_file())
+            and "textures_loaded_count" in scene_audit
+            and int(scene_audit.get("textures_loaded_count", 0)) == 0
+        ):
+            sprite_names = [p.name for p in sprite_pngs[:8]]
+            raise RuntimeError(
+                f"Unbound sprite assets in '{track.id}': {len(sprite_pngs)} synthesized PNG sprite(s) exist in res://assets/sprites/ "
+                f"({sprite_names}), but textures_loaded_count is 0 in the live scene tree. Load and bind the actual Sprite2D/TextureRect "
+                "textures from res://assets/asset_library.json instead of drawing untextured programmer-art shapes."
+            )
+
     def _verify_track_smoke_check(
         self,
         staging_dir: Path,
@@ -2147,6 +2390,7 @@ class StudioOrchestrator:
                         break
             if not res.success:
                 raise RuntimeError(f"Godot headless smoke check failed: {res.error_message or res.stderr}")
+            self._check_godot_gameplay_and_asset_gates(staging_dir, track, getattr(sim, "scene_audit", None) or {})
             return
 
         from engine.loader import validate_cartridge_ast
@@ -2209,6 +2453,7 @@ class StudioOrchestrator:
         """Topologically executes specialists in parallel tiers/waves, passing sealed artifacts,
         and hands the compiled cartridge to BuildSupervisor for 5-gate validation and promotion.
         """
+        self._continuous_active = False  # re-armed only if this build's Writers' Room runs with a Production Board
         staging_dir = Path(staging_dir).resolve()
         staging_dir.mkdir(parents=True, exist_ok=True)
         candidate_id = staging_dir.name

@@ -254,12 +254,18 @@ class GodotHeadlessSimulator:
         session_id: Optional[str] = None,
         episode_id: Optional[str] = None,
         capture_viewport: bool = False,
+        capture_ticks: Optional[List[int]] = None,
+        input_script: Optional[List[Dict[str, Any]]] = None,
+        setup_script: Optional[List[Dict[str, Any]]] = None,
         **kwargs: Any,
     ):
         self.cartridge_path = Path(cartridge_path).resolve()
         self.telemetry_mode = telemetry_mode
         self.max_ticks = max_frames or ticks or max_ticks
         self.capture_viewport = capture_viewport
+        self.capture_ticks = sorted(set(int(t) for t in (capture_ticks or [])))
+        self.input_script = input_script
+        self.setup_script = setup_script
         self.viewport_captured = False
         self.step_count = 0
         self.elapsed_time = 0.0
@@ -277,6 +283,9 @@ class GodotHeadlessSimulator:
         self.player_vel: Tuple[float, float] = (0.0, 0.0)
         self.player_health: float = 100.0
         self.scene_audit: Dict[str, Any] = {}
+        self.final_snapshot: Dict[str, Any] = {}
+        self.tick_snapshots: Dict[int, Dict[str, Any]] = {}
+        self.qa_setup_calls: List[Dict[str, Any]] = []
 
         # Initialize telemetry recorder
         if telemetry_mode in ("sqlite", "wal"):
@@ -314,7 +323,22 @@ class GodotHeadlessSimulator:
         import shutil
 
         limit = max_steps or self.max_ticks
+        if self.capture_ticks:
+            limit = max(limit, max(self.capture_ticks))
         use_viewport = self.capture_viewport if capture_viewport is None else bool(capture_viewport)
+        extra_args: List[str] = []
+        if self.capture_ticks:
+            extra_args += ["--capture-ticks", ",".join(str(t) for t in self.capture_ticks)]
+        if self.input_script is not None:
+            script_path = self.cartridge_path / "assets" / "playtest_captures" / "_input_script.json"
+            script_path.parent.mkdir(parents=True, exist_ok=True)
+            script_path.write_text(json.dumps(self.input_script), encoding="utf-8")
+            extra_args += ["--input-script", str(script_path)]
+        if self.setup_script:
+            setup_path = self.cartridge_path / "assets" / "playtest_captures" / "_setup_script.json"
+            setup_path.parent.mkdir(parents=True, exist_ok=True)
+            setup_path.write_text(json.dumps(self.setup_script), encoding="utf-8")
+            extra_args += ["--setup-script", str(setup_path)]
         godot_bin = ensure_godot_binary()
 
         if use_viewport:
@@ -342,7 +366,7 @@ class GodotHeadlessSimulator:
                 "--path", str(self.cartridge_path),
                 "-s", str(HARNESS_SCRIPT_PATH),
                 "--max-ticks", str(limit),
-            ])
+            ] + extra_args)
         else:
             cmd = [
                 str(godot_bin),
@@ -350,7 +374,7 @@ class GodotHeadlessSimulator:
                 "--path", str(self.cartridge_path),
                 "-s", str(HARNESS_SCRIPT_PATH),
                 "--max-ticks", str(limit),
-            ]
+            ] + extra_args
 
         logger.info("Executing Godot playtest harness: %s", " ".join(cmd))
         proc = subprocess.Popen(
@@ -400,6 +424,7 @@ class GodotHeadlessSimulator:
                     raw_json = stripped[len("[STATE_SNAPSHOT] "):]
                     try:
                         snap = json.loads(raw_json)
+                        self.final_snapshot = snap
                         pos = snap.get("player_pos", [0.0, 0.0])
                         vel = snap.get("player_vel", [0.0, 0.0])
                         self.player_pos = (float(pos[0]), float(pos[1]))
@@ -407,6 +432,23 @@ class GodotHeadlessSimulator:
                         self.player_health = float(snap.get("player_health", 100.0))
                     except Exception as err:
                         logger.debug("Failed parsing state snapshot: %s", err)
+
+                elif stripped.startswith("[QA_TICK_SNAPSHOT] "):
+                    raw_json = stripped[len("[QA_TICK_SNAPSHOT] "):]
+                    try:
+                        tsnap = json.loads(raw_json)
+                        t_num = int(tsnap.get("tick", 0))
+                        if t_num > 0:
+                            self.tick_snapshots[t_num] = tsnap
+                    except Exception as err:
+                        logger.debug("Failed parsing QA tick snapshot: %s", err)
+
+                elif stripped.startswith("[QA_SETUP_CALL] "):
+                    raw_json = stripped[len("[QA_SETUP_CALL] "):]
+                    try:
+                        self.qa_setup_calls.append(json.loads(raw_json))
+                    except Exception as err:
+                        logger.debug("Failed parsing QA setup call: %s", err)
 
                 elif stripped.startswith("[SCENE_AUDIT] "):
                     raw_json = stripped[len("[SCENE_AUDIT] "):]

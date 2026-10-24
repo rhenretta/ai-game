@@ -146,3 +146,31 @@ class TestMissionControlSinglePageApp:
         content = INDEX_PATH.read_text(encoding="utf-8")
         assert "No Active Game Built Yet — Commission Genesis Build" in content
 
+    def test_empathetic_live_pulse_ribbon_and_production_board_subtab(self):
+        """Verifies Always-Visible Live Studio Pulse Ribbon and Live Production Board & Proofs subtab."""
+        content = INDEX_PATH.read_text(encoding="utf-8")
+        assert 'id="studio-live-pulse-bar"' in content
+        assert 'id="studio-board-progress"' in content
+        assert 'data-bible-tab="board"' in content
+        assert 'id="bible-subview-board"' in content
+        assert 'id="production-board-cards-container"' in content
+        assert "fetchLiveProductionBoardFallback" in content
+        assert "renderProductionBoardPanel" in content
+        assert "updateStudioPulseRibbon" in content
+
+    def test_game_switcher_pause_resume_and_built_renders_showcase(self):
+        """Verifies Game Switcher dropdown, Pause/Resume controls, and Built Assets/Renders/Code showcase."""
+        content = INDEX_PATH.read_text(encoding="utf-8")
+        assert 'id="studio-game-switcher"' in content
+        assert 'id="btn-activate-selected-game"' in content
+        assert 'id="btn-resume-genesis"' in content
+        assert 'data-bible-tab="renders"' in content
+        assert 'id="bible-subview-renders"' in content
+        assert 'id="built-renders-showcase-container"' in content
+        assert "renderBuiltRendersShowcase" in content
+        assert "switchSelectedGame" in content
+        assert "pauseActiveGameBuild" in content
+        assert "normalizeBoardItem" in content
+
+
+
