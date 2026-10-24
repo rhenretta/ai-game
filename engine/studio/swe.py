@@ -145,20 +145,26 @@ class LeadGameplaySWEAgent:
         self.last_deliberation: Optional[str] = None
 
     def _discover_sealed_assets(self, staging_dir: Path) -> Dict[str, List[str]]:
-        """Discovers visual sprites, character portraits, visual mockups, and audio clips sealed upstream into staging_dir/assets/."""
+        """Discovers visual sprites, tiles, backgrounds, UI widgets, character portraits, visual mockups, and audio clips sealed upstream into staging_dir/assets/."""
         assets: Dict[str, List[str]] = {"sprites": [], "portraits": [], "mockups": [], "audio": []}
-        sprites_dir = staging_dir / "assets" / "sprites"
-        if sprites_dir.is_dir():
-            assets["sprites"] = sorted([f"assets/sprites/{p.name}" for p in sprites_dir.glob("*.png")])
+        sprite_files: List[str] = []
+        for sub_name in ("sprites", "tiles", "backgrounds", "ui"):
+            sub_dir = staging_dir / "assets" / sub_name
+            if sub_dir.is_dir():
+                for p in sorted(sub_dir.rglob("*.png")):
+                    rel = p.relative_to(staging_dir).as_posix()
+                    if rel not in sprite_files:
+                        sprite_files.append(rel)
+        assets["sprites"] = sprite_files
         portraits_dir = staging_dir / "assets" / "portraits"
         if portraits_dir.is_dir():
-            assets["portraits"] = sorted([f"assets/portraits/{p.name}" for p in portraits_dir.glob("*.png")])
+            assets["portraits"] = sorted([p.relative_to(staging_dir).as_posix() for p in portraits_dir.rglob("*.png")])
         mockups_dir = staging_dir / "assets" / "mockups"
         if mockups_dir.is_dir():
-            assets["mockups"] = sorted([f"assets/mockups/{p.name}" for p in mockups_dir.glob("*.png")])
+            assets["mockups"] = sorted([p.relative_to(staging_dir).as_posix() for p in mockups_dir.rglob("*.png")])
         audio_dir = staging_dir / "assets" / "audio"
         if audio_dir.is_dir():
-            assets["audio"] = sorted([f"assets/audio/{p.name}" for p in audio_dir.glob("*.wav")])
+            assets["audio"] = sorted([p.relative_to(staging_dir).as_posix() for p in audio_dir.rglob("*.wav")])
         return assets
 
     def synthesize_cartridge_code(
@@ -611,6 +617,7 @@ class LeadGameplaySWEAgent:
                 f"   - Drive multi-state sprite sheet animations (`hframes`, `vframes`, `frame`) and articulated child `Sprite2D` rigs according to the entity's live state (idle, locomotion, aerial, action) and scale sprites to their intended `display_size` from `assets/asset_library.json`.\n"
                 f"   - Render physical platforms, ground surfaces, and structures using tiled textures (`draw_texture_rect` with `tile=true` on a `CanvasItem` with `texture_repeat = CanvasItem.TEXTURE_REPEAT_ENABLED`) rather than flat untextured programmer-art `draw_rect` rectangles.\n"
                 f"   - Keep `z_index < 0` background/horizon layers visible: never paint a full-viewport opaque `draw_rect` at `z_index >= 0` that covers your `z_index < 0` sky/backdrop layers.\n"
+                f"   - NEVER OCCLUDE THE PLAYFIELD WITH AN OPAQUE FULL-SCREEN FRAME/BORDER: If you render a decorative border or frame texture (`diegetic_ui` or backdrop frame) whose center is opaque, you MUST either place it at the lowest background layer (`z_index <= -10`, behind floor tiles and `CharacterBody2D`/`Sprite2D` actors) or clear its interior playfield rectangle to transparent (`alpha = 0`) before placing it on a foreground `CanvasLayer`, so floor tiles and character sprites are always clearly visible.\n"
                 f"   - Strictly separate character portraits (`res://assets/portraits/*.png`, used ONLY in `ui_hud.gd` dialogue panels with bounded size <= 64x64) from in-world entity sprites (`res://assets/sprites/*.png`).\n"
                 f"   - DECOMPOSE CONCEPT ART INTO COMPOSABLE WORLD ELEMENTS (NEVER USE A STATIC FULL-SCREEN BACKGROUND IMAGE): Build the world out of discrete, layered, interactive elements matching the 16:9 concept art—isolated horizon/midground set-pieces, textured physical geometry, and interactive `Node2D` / `CharacterBody2D` / `Area2D` entities.\n"
                 f"   - ON-DEMAND ASSET FABRICATION (`requested_assets`): If your gameplay mechanics, animations, or multi-layer world need ANY additional purpose-built asset (a `sprite_sheet` with custom `animation_states`, `articulated_parts` with custom pivots, `tile_surface`, isolated `static_sprite` set-piece/prop, `diegetic_ui` widget, or `sfx`), include it in `requested_assets` in your JSON response and the Cartridge Asset Library will fabricate it on disk and update `res://assets/asset_library.json`.\n"
@@ -634,8 +641,9 @@ class LeadGameplaySWEAgent:
                 f"   - STRATEGY-DRIVEN WORLD CONSTRUCTION (`level_generation_strategy` & `level_layout.json`): `scenes.gd` MUST construct the playable world according to the bespoke world-building strategy authored in the Game Bible's `level_generation_strategy` (`generation_approach`, `world_structure`, `runtime_construction_plan`, `level_archetypes`, `generation_rules`) and `res://level_layout.json`. Realize the full world structure and runtime construction plan designed for this game—NEVER substitute a tiny 3–4 `Rect2` placeholder room when the Game Bible's `level_generation_strategy` and `level_layout.json` specify a larger or generated world!\n"
                 f"   - Honor the Living Game Bible's First 60 Seconds Hook, Experience Storyboard Beats, Visual Style Guide, Camera & Spatial Paradigm, and 16:9 Visual Mockup boards.\n"
                 f"   - Stage the Narrative Bible's cutscenes, dialogue trees, and reactive voice barks in-game with character portraits (`res://assets/portraits/*.png`) and real WAV playback.\n"
-                f"   - Load and display synthesized PNG sprites from 'res://assets/sprites/*.png' according to `res://assets/asset_library.json`.\n"
-                f"   - MANDATORY SPRITE/TEXTURE BINDING OVER `_draw()` PROGRAMMER ART: Whenever `res://assets/sprites/*.png` or `res://assets/asset_library.json` provides character sprites, props, backdrops, or tiles, `entities.gd` and `scenes.gd` MUST load and bind those `Sprite2D` / `TextureRect` / tiled textures scaled to match the 16:9 Concept Art Mockup—NEVER substitute `draw_rect` crates or `draw_circle` stick figures for characters or landmarks.\n"
+                f"   - Load and display synthesized PNG sprites and tiles from 'res://assets/sprites/*.png', 'res://assets/tiles/*.png', and 'res://assets/backgrounds/*.png' according to `res://assets/asset_library.json`.\n"
+                f"   - MANDATORY SPRITE/TEXTURE BINDING OVER `_draw()` OR `Image.create` + `set_pixel` PROGRAMMER ART: Whenever `res://assets/sprites/*.png`, `res://assets/tiles/*.png`, or `res://assets/asset_library.json` provides character sprite sheets, props, backdrops, or tiles, `entities.gd` and `scenes.gd` MUST load those PNG files via `Image.load_from_file(ProjectSettings.globalize_path(res_path))` and `ImageTexture.create_from_image(img)`—NEVER invent procedural `Image.create(...)` + `img.set_pixel(...)` replacement textures, and NEVER substitute flat `draw_rect` checkerboard squares or `draw_circle` stick figures for fabricated PNG tiles, characters, or landmarks.\n"
+                f"   - SPRITE SHEET & TILE ATLAS DIMENSION FIDELITY: When binding a `sprite_sheet` entry from `res://assets/asset_library.json`, load its `sheet` path (`*_sheet.png`) and set `sprite.hframes` and `sprite.vframes` to the exact `hframes` and `vframes` recorded in `asset_library.json` (or use `StudioRigHelper.attach_sprite_sheet_animation_player`). When slicing a tile strip/atlas PNG with `TileSetAtlasSource`, derive `texture_region_size` from `tex.get_size()` (e.g., a `256x64` strip of 4 tiles has `texture_region_size = Vector2i(64, 64)`, NOT hardcoded `32x32`).\n"
                 f"   - MANDATORY 24,000 Hz PCM WAV AUDIO LOADING & COOLDOWN: All synthesized WAV voice clips in 'res://assets/audio/*.wav' are 24,000 Hz, 16-bit mono PCM. When loading via FileAccess.get_file_as_bytes(ProjectSettings.globalize_path(path)), you MUST strip the 44-byte RIFF header (`stream.data = bytes.slice(44) if bytes.size() > 44 else bytes`), set `stream.format = AudioStreamWAV.FORMAT_16_BITS`, `stream.mix_rate = 24000` (NEVER 44100, which causes high-pitched chipmunk distortion!), and `stream.stereo = false`. Furthermore, enforce a non-overlapping playback guard (`if not audio_player.playing:`) and a minimum cooldown (>= 8.0 seconds) so voice barks NEVER spam or repeat every few seconds.\n"
                 f"6. DIEGETIC UX, CLEAR VIEWPORT & RECOVERABLE GAMEPLAY:\n"
                 f"   - Teach and guide the player through world cues, visual feedback, diegetic labels/hover callouts, and story context as specified in the Living Game Bible's `diegetic_ui_philosophy`—NEVER clutter the screen with a static instruction-manual text box listing keyboard shortcuts.\n"
@@ -692,13 +700,17 @@ class LeadGameplaySWEAgent:
         )
         for g_attempt in range(1, max_gemini_retries + 1):
             try:
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=contents_payload,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=response_model,
+                response = call_gemini_with_transient_retry(
+                    lambda: self.client.models.generate_content(
+                        model=self.model_name,
+                        contents=contents_payload,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=response_model,
+                            thinking_config=bounded_thinking_config(2048),
+                        ),
                     ),
+                    label=f"implement_requirement_track[{track.id}:a{g_attempt}]",
                 )
                 if not response.text:
                     raise CodeVerificationError(f"Empty response returned from Gemini for requirement track {track.id}")
@@ -2231,7 +2243,7 @@ class LeadGameplaySWEAgent:
 
         # 1. Run syntax check + live 60-tick Godot headless simulation with GPU viewport capture
         is_valid, syntax_diags = verify_godot_cartridge_syntax(c_dir)
-        sim = GodotHeadlessSimulator(c_dir, capture_viewport=True, max_ticks=60)
+        sim = GodotHeadlessSimulator(c_dir, capture_viewport=True, max_ticks=60, telemetry_mode="in_memory")
         sim_state = sim.run_until_complete()
 
         diag_summary_lines = [
@@ -2558,7 +2570,7 @@ class LeadGameplaySWEAgent:
             updated_files.update(healed)
 
         # Final 60-tick simulation capture so playtest_t0.png, playtest_tend.png, and playtest_collision_overlay.png are fresh
-        sim_final = GodotHeadlessSimulator(c_dir, capture_viewport=True, max_ticks=60)
+        sim_final = GodotHeadlessSimulator(c_dir, capture_viewport=True, max_ticks=60, telemetry_mode="in_memory")
         sim_final.run_until_complete()
 
         return updated_files

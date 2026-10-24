@@ -38,6 +38,24 @@ MAX_SPEC_RESETS = 2
 BACKLOG_FILENAME = "backlog.json"
 RUNNABLE_STATES = ("ready", "changes_requested")
 TERMINAL_STATES = ("approved", "cancelled")
+CODE_LOCK_KINDS = ("mechanic_code", "level_map", "ui", "integration")
+ASSET_KINDS = ("visual_asset", "animation", "audio_asset")
+
+_SCHEDULER_TLS = threading.local()
+
+
+def is_in_board_scheduler() -> bool:
+    """Returns True when the current thread is executing inside `BoardScheduler._run_item`."""
+    return bool(getattr(_SCHEDULER_TLS, "active", False))
+
+
+class WorkerYielded(Exception):
+    """Raised by a worker when an exclusive resource (e.g. `code_lock`) is held by another worker,
+    allowing `BoardScheduler` to pause this task and immediately assign the worker to another runnable task."""
+
+    def __init__(self, reason: str = "code_lock_busy") -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 class BoardValidationError(StudioAgentError):
@@ -78,6 +96,8 @@ class ProductionBoard:
         self._lock = threading.RLock()
         self._items: Dict[str, WorkItem] = {}
         self._design_revision = 0
+        self._yielded_on_code_lock: Set[str] = set()
+        self._active_resumed_code_lock_item: Optional[str] = None
         if self.path is not None and self.path.is_file():
             self._load()
 
@@ -330,6 +350,9 @@ class ProductionBoard:
                 raise BoardValidationError(f"Item '{item_id}' is already approved and cannot be cancelled.")
             item.state = "cancelled"
             item.decision_reason = reason or item.decision_reason
+            self._yielded_on_code_lock.discard(item_id)
+            if self._active_resumed_code_lock_item == item_id:
+                self._active_resumed_code_lock_item = None
             self._refresh()
             self._persist()
             self._emit("backlog_item_cancelled", item, reason=reason)
@@ -351,31 +374,139 @@ class ProductionBoard:
         return self._items[item_id]
 
     # ------------------------------------------------------------------ worker side
-    def claim_ready(self, limit: int = 1, locked_modules: Optional[Set[str]] = None) -> List[WorkItem]:
+    def claim_ready(
+        self,
+        limit: int = 1,
+        locked_modules: Optional[Set[str]] = None,
+        code_lock_busy: bool = False,
+        prefer_parallel_assets: bool = False,
+    ) -> List[WorkItem]:
         """Atomically claims up to `limit` runnable items, never two that share a target module, and none that
-        touch a module in `locked_modules` (held by in-progress work)."""
+        touch a module in `locked_modules` (held by in-progress work).
+
+        When `prefer_parallel_assets` or `_yielded_on_code_lock` is active:
+        - Items parked in `_yielded_on_code_lock` are skipped while `code_lock_busy` is True.
+        - Once `code_lock_busy` is False, at most one item from `_yielded_on_code_lock` is resumed first.
+        - When `prefer_parallel_assets` is True and a code item is already in progress (or `code_lock_busy`),
+          runnable asset tasks (`ASSET_KINDS`) are claimed ahead of additional code tasks so free worker slots
+          stay productive instead of contending on `code_lock`.
+        """
         with self._lock:
             self._refresh()
+            if (
+                self._active_resumed_code_lock_item is not None
+                and (
+                    self._active_resumed_code_lock_item not in self._items
+                    or self._items[self._active_resumed_code_lock_item].state != "in_progress"
+                )
+            ):
+                self._active_resumed_code_lock_item = None
+
             busy: Set[str] = set(locked_modules or set())
+            in_progress_code_count = 0
             for i in self._items.values():
                 if i.state == "in_progress":
                     busy.update(i.target_modules)
+                    if i.kind in CODE_LOCK_KINDS:
+                        in_progress_code_count += 1
+
+            effective_code_busy = bool(code_lock_busy or self._active_resumed_code_lock_item is not None)
             claimed: List[WorkItem] = []
+            order_index = {item_id: idx for idx, item_id in enumerate(self._items)}
             runnable = [i for i in self._items.values() if i.state in RUNNABLE_STATES and self._deps_satisfied(i)]
-            runnable.sort(key=lambda i: (-i.priority, list(self._items).index(i.item_id)))
-            for item in runnable:
-                if len(claimed) >= limit:
+            runnable.sort(key=lambda i: (-i.priority, order_index[i.item_id]))
+
+            if not prefer_parallel_assets and not self._yielded_on_code_lock and not effective_code_busy:
+                for item in runnable:
+                    if len(claimed) >= limit:
+                        break
+                    mods = set(item.target_modules)
+                    if mods & busy:
+                        continue
+                    item.state = "in_progress"
+                    busy.update(mods)
+                    claimed.append(item.model_copy(deep=True))
+                    self._emit("backlog_item_started", item, revision=len(item.revisions))
+                if claimed:
+                    self._persist()
+                return claimed
+
+            code_claimed_in_call = 0
+            resumed_code_claimed_in_call = False
+            remaining = list(runnable)
+
+            while len(claimed) < limit and remaining:
+                eligible: List[WorkItem] = []
+                for cand in remaining:
+                    if set(cand.target_modules) & busy:
+                        continue
+                    if cand.item_id in self._yielded_on_code_lock and (
+                        effective_code_busy or resumed_code_claimed_in_call
+                    ):
+                        continue
+                    eligible.append(cand)
+                if not eligible:
                     break
-                mods = set(item.target_modules)
-                if mods & busy:
-                    continue
-                item.state = "in_progress"
-                busy.update(mods)
-                claimed.append(item.model_copy(deep=True))
-                self._emit("backlog_item_started", item, revision=len(item.revisions))
+
+                chosen: Optional[WorkItem] = None
+                if not effective_code_busy and not resumed_code_claimed_in_call:
+                    for cand in eligible:
+                        if cand.item_id in self._yielded_on_code_lock:
+                            chosen = cand
+                            break
+
+                if chosen is None:
+                    code_active = effective_code_busy or (in_progress_code_count + code_claimed_in_call) >= 1
+                    if prefer_parallel_assets and code_active:
+                        for cand in eligible:
+                            if cand.kind in ASSET_KINDS:
+                                chosen = cand
+                                break
+                    if chosen is None:
+                        chosen = eligible[0]
+
+                remaining.remove(chosen)
+                was_yielded = chosen.item_id in self._yielded_on_code_lock
+                self._yielded_on_code_lock.discard(chosen.item_id)
+                if was_yielded:
+                    self._active_resumed_code_lock_item = chosen.item_id
+                    resumed_code_claimed_in_call = True
+                    effective_code_busy = True
+                if chosen.kind in CODE_LOCK_KINDS:
+                    code_claimed_in_call += 1
+
+                chosen.state = "in_progress"
+                busy.update(chosen.target_modules)
+                claimed.append(chosen.model_copy(deep=True))
+                self._emit(
+                    "backlog_item_started",
+                    chosen,
+                    revision=len(chosen.revisions),
+                    resumed=was_yielded,
+                )
+
             if claimed:
                 self._persist()
             return claimed
+
+    def yield_item(self, item_id: str, reason: str = "") -> WorkItem:
+        """Pauses an in-progress item back to its runnable state so the worker slot can execute another item."""
+        with self._lock:
+            item = self._require(item_id)
+            if self._active_resumed_code_lock_item == item_id:
+                self._active_resumed_code_lock_item = None
+            if item.state == "in_progress":
+                item.state = "changes_requested" if item.revisions and item.revisions[-1].feedback else "ready"
+            self._yielded_on_code_lock.add(item_id)
+            self._refresh()
+            self._persist()
+            self._emit(
+                "backlog_item_yielded",
+                item,
+                reason=reason or "code_lock_busy",
+                revision=len(item.revisions),
+            )
+            return item.model_copy(deep=True)
 
     def submit_result(self, item_id: str, result: WorkerResult) -> WorkItem:
         with self._lock:
@@ -385,6 +516,9 @@ class ProductionBoard:
             missing = [p for p in result.proof_images if not Path(p).is_file()]
             if missing:
                 raise BoardValidationError(f"Worker for '{item_id}' reported proof images that do not exist: {missing}")
+            self._yielded_on_code_lock.discard(item_id)
+            if self._active_resumed_code_lock_item == item_id:
+                self._active_resumed_code_lock_item = None
             item.revisions.append(
                 RevisionRecord(
                     revision_index=len(item.revisions),
@@ -403,6 +537,9 @@ class ProductionBoard:
         """Records a worker failure with its full error text; the item stays visible until re-queued (Rule 5)."""
         with self._lock:
             item = self._require(item_id)
+            self._yielded_on_code_lock.discard(item_id)
+            if self._active_resumed_code_lock_item == item_id:
+                self._active_resumed_code_lock_item = None
             item.state = "failed"
             item.failure = error_text
             item.failure_count += 1
@@ -526,11 +663,13 @@ class BoardScheduler:
         handlers: Dict[str, Handler],
         max_workers: int = 2,
         poll_interval: float = 0.05,
+        code_lock: Optional[Any] = None,
     ) -> None:
         self.board = board
         self.handlers = handlers
         self.max_workers = max(1, int(max_workers))
         self.poll_interval = poll_interval
+        self.code_lock = code_lock
         self._pool = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="board-worker")
         self._running = 0
         self._cv = threading.Condition()
@@ -538,6 +677,32 @@ class BoardScheduler:
         self._stop = threading.Event()
         self._paused = threading.Event()
         self.peak_running = 0
+
+    def _get_code_lock(self) -> Optional[Any]:
+        if self.code_lock is not None:
+            return self.code_lock
+        for handler in self.handlers.values():
+            lock = getattr(handler, "_code_lock", None)
+            if lock is not None:
+                self.code_lock = lock
+                return lock
+        return None
+
+    def is_code_lock_busy(self) -> bool:
+        lock = self._get_code_lock()
+        if lock is None:
+            return False
+        locked_fn = getattr(lock, "locked", None)
+        if callable(locked_fn):
+            try:
+                return bool(locked_fn())
+            except Exception:
+                pass
+        acquired = lock.acquire(blocking=False)
+        if acquired:
+            lock.release()
+            return False
+        return True
 
     def pause(self) -> None:
         """Pauses new worker claims while allowing in-flight worker tasks to finish."""
@@ -567,6 +732,7 @@ class BoardScheduler:
 
     # -- worker execution
     def _run_item(self, item: WorkItem) -> None:
+        _SCHEDULER_TLS.active = True
         try:
             handler = self.handlers.get(item.kind)
             if handler is None:
@@ -575,11 +741,15 @@ class BoardScheduler:
             if not isinstance(result, WorkerResult):
                 raise StudioAgentError(f"Worker for '{item.kind}' returned {type(result).__name__}, expected WorkerResult.")
             self.board.submit_result(item.item_id, result)
+        except WorkerYielded as wy:
+            logger.info("Worker yielded item %s: %s", item.item_id, wy.reason)
+            self.board.yield_item(item.item_id, reason=wy.reason)
         except Exception:
             err = traceback.format_exc()
             logger.error("Worker failed for %s:\n%s", item.item_id, err)
             self.board.fail_item(item.item_id, err)
         finally:
+            _SCHEDULER_TLS.active = False
             with self._cv:
                 self._running -= 1
                 self._cv.notify_all()
@@ -592,7 +762,11 @@ class BoardScheduler:
             free = self.max_workers - self._running
         if free <= 0:
             return 0
-        claimed = self.board.claim_ready(limit=free)
+        claimed = self.board.claim_ready(
+            limit=free,
+            code_lock_busy=self.is_code_lock_busy(),
+            prefer_parallel_assets=True,
+        )
         for item in claimed:
             with self._cv:
                 self._running += 1

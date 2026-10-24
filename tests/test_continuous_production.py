@@ -1004,6 +1004,286 @@ def test_asset_tasks_cannot_clobber_shared_scene_and_code_lock_spans_swe_and_qa_
     assert req.target_path == "assets/sprites/task_two_shared_name.png"
 
 
+def test_task_lead_yields_on_busy_code_lock_persists_pending_decision_and_resumes_exact_turn(tmp_path):
+    """Verifies that a `run_task_lead` worker running inside `BoardScheduler`:
+    1. Can complete non-code turns (e.g. `visual_artist` on Turn 0) even while `code_lock` is held.
+    2. When it reaches a `swe_engineer` turn (Turn 1) and `code_lock` is busy, persists Turn 0 + Turn 1's
+       `pending_decision` (`status="yielded"`) to `lead_trace_rev0.json` and yields the worker slot.
+    3. Allows the freed worker slot to build another ready task (`vis_prop`) while `code_lock` remains busy.
+    4. Once `code_lock` is released, resumes at Turn 1 from `pending_decision` without re-running Turn 0
+       (`visual_artist`) or repeating the Turn 1 Task Lead planning LLM call."""
+    import threading
+    from engine.studio.workers import default_handlers
+
+    (tmp_path / "game_bible.json").write_text(json.dumps({"game_title": "YieldResumeGame"}))
+    (tmp_path / "project.godot").write_text("[input]\nui_right={}\n")
+
+    swe = FakeSwe()
+    code_lock = threading.Lock()
+    lead_planning_calls = {"code_enemy_ai": 0, "vis_prop": 0}
+    visual_fab_calls = []
+
+    enemy_lead_turns = iter([
+        # Call 1 (Turn 0): fabricate enemy sprite (does NOT need code_lock)
+        _lead_json(
+            "delegate",
+            strategy="Turn 0: Fabricate enemy sprite first",
+            specialist_agent="visual_artist",
+            brief="Draw enemy sprite",
+            target_paths=["assets/sprites/enemy.png"],
+        ),
+        # Call 2 (Turn 1): implement enemy AI in mechanics.gd (needs code_lock -> will yield if lock held, then resume without a 3rd call for Turn 1)
+        _lead_json(
+            "delegate",
+            strategy="Turn 1: Implement enemy AI in mechanics.gd",
+            specialist_agent="swe_engineer",
+            brief="Write enemy AI in mechanics.gd",
+            target_paths=["mechanics.gd"],
+        ),
+        # Call 3 (Turn 2): capture QA filmstrip
+        _lead_json(
+            "delegate",
+            strategy="Turn 2: Capture QA filmstrip",
+            specialist_agent="qa_test_engineer",
+            brief="Capture enemy movement filmstrip",
+        ),
+        # Call 4 (Turn 3): submit to council
+        _lead_json(
+            "submit_to_council",
+            strategy="All turns verified",
+            submission_summary="Enemy sprite, code, and QA filmstrip complete",
+        ),
+    ])
+
+    vis_prop_lead_turns = iter([
+        _lead_json(
+            "delegate",
+            strategy="Fabricate prop sprite",
+            specialist_agent="visual_artist",
+            brief="Draw crate prop",
+            target_paths=["assets/sprites/crate.png"],
+        ),
+        _lead_json(
+            "submit_to_council",
+            strategy="Prop ready",
+            submission_summary="Crate sprite plate ready",
+        ),
+    ])
+
+    yielded_event = threading.Event()
+    vis_prop_done_event = threading.Event()
+
+    def responder(contents):
+        text = contents if isinstance(contents, str) else "\n".join(c for c in contents if isinstance(c, str))
+        if "Task Lead Strategist" in text:
+            if "[code_enemy_ai]" in text:
+                lead_planning_calls["code_enemy_ai"] += 1
+                return next(enemy_lead_turns)
+            if "[vis_prop]" in text:
+                lead_planning_calls["vis_prop"] += 1
+                return next(vis_prop_lead_turns)
+        if "Visual/Audio Production Lead" in text or "autonomous Visual Artist specialist" in text:
+            if "[enemy]" in text or "[code_enemy_ai]" in text:
+                visual_fab_calls.append("code_enemy_ai")
+                return bw.req_json("enemy", mode="static_sprite", target="assets/sprites/enemy.png")
+            if "[vis_prop]" in text:
+                visual_fab_calls.append("vis_prop")
+                return bw.req_json("vis_prop", mode="static_sprite", target="assets/sprites/crate.png")
+        return plan_json(ticks=(5, 20), segs=[(1, 20, ["ui_right"])])
+
+    events = []
+
+    def on_event(et, payload):
+        events.append((et, payload.get("item_id"), dict(payload)))
+        if et == "backlog_item_yielded" and payload.get("item_id") == "code_enemy_ai":
+            yielded_event.set()
+        if et == "backlog_item_proof_ready" and payload.get("item_id") == "vis_prop":
+            vis_prop_done_event.set()
+
+    board = ProductionBoard(path=tmp_path / "backlog.json", event_callback=on_event)
+    board.add_items(
+        [
+            WorkItemProposal(
+                deliberation="d",
+                item_id="code_enemy_ai",
+                kind="mechanic_code",
+                title="Enemy AI",
+                spec="Build enemy sprite and AI",
+                proof_spec="Show enemy moving",
+                target_modules=["mechanics.gd"],
+            )
+        ],
+        "GameplaySystemsDesigner",
+    )
+
+    ctx = WorkerContext(
+        cartridge_dir=tmp_path,
+        client=bw.make_client(responder),
+        swe_agent=swe,
+        library_factory=bw.FakeLibrary,
+        filmstrip_fn=lambda d, ticks, out_path, input_script=None: (Image.new("RGB", (24, 8)).save(out_path), Path(out_path))[1],
+        code_lock=code_lock,
+        event_callback=on_event,
+    )
+
+    # Acquire code_lock externally to simulate Worker 1 busy in SWE/QA on another code task
+    assert code_lock.acquire(blocking=False)
+    sch = BoardScheduler(board, default_handlers(ctx), max_workers=1, poll_interval=0.01, code_lock=code_lock)
+    sch.start()
+    try:
+        # Wait for code_enemy_ai to finish Turn 0 (visual_artist), plan Turn 1 (swe_engineer), see code_lock busy, and yield
+        assert yielded_event.wait(timeout=5.0), "code_enemy_ai did not yield when code_lock was held"
+
+        # Inspect persisted trace right after yield: Turn 0 is saved and Turn 1 is saved as pending_decision
+        trace_file = tmp_path / "artifacts" / "work_items" / "code_enemy_ai" / "lead_trace_rev0.json"
+        assert trace_file.is_file()
+        trace_after_yield = json.loads(trace_file.read_text(encoding="utf-8"))
+        assert trace_after_yield["status"] == "yielded"
+        assert len(trace_after_yield["turns"]) == 1
+        assert trace_after_yield["turns"][0]["specialist_agent"] == "visual_artist"
+        assert trace_after_yield["pending_decision"]["specialist_agent"] == "swe_engineer"
+        assert lead_planning_calls["code_enemy_ai"] == 2
+
+        # Add a parallel visual_asset item while code_lock is STILL held; the single worker slot must build vis_prop immediately
+        board.add_items(
+            [
+                WorkItemProposal(
+                    deliberation="d",
+                    item_id="vis_prop",
+                    kind="visual_asset",
+                    title="Crate Prop",
+                    spec="Draw crate",
+                    proof_spec="Show crate plate",
+                )
+            ],
+            "VisualArtDirectionLead",
+        )
+        assert vis_prop_done_event.wait(timeout=5.0), "Worker did not move on to vis_prop while code_enemy_ai was paused"
+        assert board.get("vis_prop").state == "awaiting_review"
+        assert board.get("code_enemy_ai").state == "ready"
+
+        # Now release code_lock so code_enemy_ai can resume from Turn 1
+        code_lock.release()
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and board.get("code_enemy_ai").state != "awaiting_review":
+            time.sleep(0.02)
+
+        assert board.get("code_enemy_ai").state == "awaiting_review"
+        # Turn 0 visual_artist was NOT re-run on resume, and Turn 1 planning call was NOT repeated (4 calls total: Turn 0, Turn 1, Turn 2, Submit)
+        assert visual_fab_calls.count("code_enemy_ai") == 1
+        assert lead_planning_calls["code_enemy_ai"] == 4
+
+        final_trace = json.loads(trace_file.read_text(encoding="utf-8"))
+        assert final_trace["status"] == "submitted"
+        assert "pending_decision" not in final_trace
+        assert [t["specialist_agent"] for t in final_trace["turns"]] == [
+            "visual_artist",
+            "swe_engineer",
+            "qa_test_engineer",
+        ]
+    finally:
+        if code_lock.locked():
+            try:
+                code_lock.release()
+            except RuntimeError:
+                pass
+        sch.stop()
+
+
+def test_council_filmstrip_contact_sheet_guidance_and_task_lead_multimodal_proof_inspection(tmp_path):
+    """Verifies that:
+    1. Every Council reviewer (`GameplayDesigner`, `VisualArtDirector`, `UXExperienceDesigner`, `CreativeDirector`)
+       receives the explicit `HOW TO READ filmstrip_*.png QA CONTACT SHEETS` instructions and `[QA CONTACT SHEET: ...]`
+       part labels so external QA margin strips (`[QA] tick ...`, `[QA] pos=...`) are never mistaken for in-game debug text.
+    2. `_build_task_lead_multimodal_parts` attaches the reference 16:9 Concept Art Mockup and the latest `collected_proofs`
+       image bytes so the Task Lead Strategist visually inspects captured proofs before submitting to the Council."""
+    from engine.studio.models import GameBibleSpec, ReviewBatch, ReviewDecision, VisualMockupArtifact
+    from engine.studio.production_board import WorkerResult
+    from engine.studio.workers import _build_task_lead_multimodal_parts
+    from engine.studio.writers_room import CreativeWritersRoom
+
+    mockup_path = tmp_path / "artifacts" / "mockups" / "concept.png"
+    mockup_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (64, 36), (20, 40, 80)).save(mockup_path)
+
+    filmstrip_path = tmp_path / "artifacts" / "work_items" / "code_item_1" / "filmstrip_rev0.png"
+    filmstrip_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (128, 72), (10, 20, 30)).save(filmstrip_path)
+
+    bible = GameBibleSpec(
+        deliberation="d",
+        bible_id="b1",
+        cartridge_id="c1",
+        game_title="ContactSheetTest",
+        core_genre="Action",
+        visual_mockups=[
+            VisualMockupArtifact(
+                deliberation="d",
+                mockup_id="m1",
+                title="Concept",
+                scene_description="desc",
+                ui_callout_notes=["notes"],
+                image_path=str(mockup_path),
+            )
+        ],
+    )
+    (tmp_path / "game_bible.json").write_text(bible.model_dump_json(indent=2), encoding="utf-8")
+
+    ctx = WorkerContext(cartridge_dir=tmp_path)
+    mm_parts = _build_task_lead_multimodal_parts(ctx, [str(filmstrip_path)])
+    str_labels = [p for p in mm_parts if isinstance(p, str)]
+    assert any("REFERENCE 16:9 CONCEPT ART MOCKUP" in s for s in str_labels)
+    assert any("CAPTURED PROOF IMAGE (filmstrip_rev0.png)" in s for s in str_labels)
+    assert len(mm_parts) == 4  # 2 text labels + 2 image Part objects
+
+    board = ProductionBoard()
+    board.add_items(
+        [
+            WorkItemProposal(
+                deliberation="d",
+                item_id="code_item_1",
+                kind="mechanic_code",
+                title="Controller",
+                spec="Build controller",
+                proof_spec="Show filmstrip",
+                target_modules=["mechanics.gd"],
+            )
+        ],
+        "GameplayDesigner",
+    )
+    claimed = board.claim_ready(1)
+    assert len(claimed) == 1
+    board.submit_result("code_item_1", WorkerResult(proof_images=[str(filmstrip_path)], notes="Built controller"))
+
+    captured_prompts = []
+
+    def fake_call(prompt, schema_cls, temperature=0.7, parts=None):
+        captured_prompts.append((prompt, parts))
+        return ReviewBatch(
+            deliberation="Reviewed with QA contact sheet telemetry.",
+            review_decisions=[
+                ReviewDecision(deliberation="ok", item_id="code_item_1", feedback="", verdict="approve")
+            ],
+            cap_decisions=[],
+        )
+
+    room = CreativeWritersRoom(client=None, board=board)
+    room._call_structured_llm = fake_call
+
+    for role in ("GameplayDesigner", "VisualArtDirector", "UXExperienceDesigner", "CreativeDirector"):
+        captured_prompts.clear()
+        room._review_as(role, board.awaiting_review(), [], bible, "dna", tmp_path)
+        assert len(captured_prompts) == 1
+        prompt_text, parts_list = captured_prompts[0]
+        assert "HOW TO READ `filmstrip_*.png` QA CONTACT SHEETS" in prompt_text
+        assert "[QA] pos=(...)" in prompt_text
+        part_strings = [p for p in (parts_list or []) if isinstance(p, str)]
+        assert any("QA CONTACT SHEET:" in s for s in part_strings)
+
+
+
+
 
 
 

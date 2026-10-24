@@ -34,7 +34,7 @@ from engine.studio.models import (
     call_gemini_with_transient_retry,
     compact_bible_json_for_prompt,
 )
-from engine.studio.production_board import WorkerResult
+from engine.studio.production_board import WorkerResult, WorkerYielded, is_in_board_scheduler
 
 logger = logging.getLogger("BoardWorkers")
 
@@ -136,6 +136,9 @@ def plan_asset_requirement(
             f"Set `asset_id` to exactly '{item.item_id}'. `fabrication_mode` must be one of {list(allowed_modes)}; `asset_type`, `target_path` "
             f"(under assets/), `dimensions` (the rendering strategy's resolution for this subject), `visual_prompt_or_text` and, for rigs, "
             f"`articulated_parts` must be consistent with it and with the style, camera and palette in the Game Bible.\n"
+            f"CRITICAL PROMPT SEPARATION RULE FOR `visual_prompt_or_text`:\n"
+            f"- When `fabrication_mode == 'sprite_sheet'`, `visual_prompt_or_text` is sent to the image generator to synthesize the SINGLE canonical neutral standing/idle figure, and our biomechanical keyframe engine then generates the multi-row, multi-frame sprite sheet (`*_sheet.png`) from `animation_states`. Therefore, `visual_prompt_or_text` MUST describe ONLY ONE single isolated subject in a neutral readiness pose (appearance, proportions, attire/materials, silhouette, palette) and MUST NEVER ask the image generator to draw multiple poses, multiple rows/columns, frame numbers, or a grid layout inside `visual_prompt_or_text`! Put all multi-state/row/frame breakdowns into `animation_states`.\n"
+            f"- When `fabrication_mode == 'static_sprite'`, `visual_prompt_or_text` MUST describe ONLY ONE single isolated object/prop in its canonical intact state — NEVER a 3x3 or multi-state variation grid.\n"
             f"Provide `deliberation` FIRST.\n\n{rendering_block}\n--- GAME BIBLE ---\n{bible_text}\n"
         )
         resp = call_gemini_with_transient_retry(
@@ -224,8 +227,17 @@ def _fabricate_visual(ctx: WorkerContext, item: WorkItem, allowed_modes: tuple) 
     proofs = _collect_proofs(renders, req.asset_id, Path(out))
     if not proofs:
         raise StudioAgentError(f"Fabrication of '{item.item_id}' produced no proof images.")
+    entry = lib.catalog.entries.get(req.asset_id)
+    sheet_meta_note = ""
+    if entry is not None and getattr(entry, "fabrication_mode", "") == "sprite_sheet":
+        sheet_meta_note = (
+            f" (sheet_res_path='{getattr(entry, 'res_path', '')}', "
+            f"hframes={getattr(entry, 'hframes', 1)}, vframes={getattr(entry, 'vframes', 1)}, "
+            f"tex_size={getattr(entry, 'texture_pixel_size', ())}, "
+            f"display_size={getattr(entry, 'target_display_size', req.dimensions)})"
+        )
     notes = (
-        f"Fabricated '{req.asset_id}' as {req.fabrication_mode} ({req.asset_type}) at {req.dimensions} -> {req.target_path}. "
+        f"Fabricated '{req.asset_id}' as {req.fabrication_mode} ({req.asset_type}) at {req.dimensions} -> {req.target_path}{sheet_meta_note}. "
         f"Planning rationale: {req.deliberation[:400]}"
     )
     return WorkerResult(proof_images=proofs, notes=notes)
@@ -355,7 +367,12 @@ def level_map_handler(ctx: WorkerContext) -> Callable[[WorkItem], WorkerResult]:
                 requirements=[track],
                 asset_manifest=[],
             )
-            with lock:
+            if is_in_board_scheduler():
+                if not lock.acquire(blocking=False):
+                    raise WorkerYielded(f"Waiting for code_lock on level_map '{item.item_id}'")
+            else:
+                lock.acquire()
+            try:
                 snap = _snapshot_modules(ctx.cartridge_dir, modules + ["project.godot", "main.tscn"])
                 try:
                     agent.implement_requirement_track(track=track, staging_dir=ctx.cartridge_dir, requirements_spec=req_spec)
@@ -400,8 +417,11 @@ def level_map_handler(ctx: WorkerContext) -> Callable[[WorkItem], WorkerResult]:
                 except Exception:
                     _restore_modules(ctx.cartridge_dir, snap)
                     raise
+            finally:
+                lock.release()
         return WorkerResult(proof_images=proof_images, notes=notes)
 
+    setattr(handler, "_code_lock", lock)
     return handler
 
 
@@ -611,7 +631,12 @@ def code_item_handler(ctx: WorkerContext) -> Callable[[WorkItem], WorkerResult]:
             except ValueError:
                 pass
         req_spec = GameRequirementsSpec(deliberation="Board-driven single-item requirement", game_title=bible_title, requirements=[track], asset_manifest=[])
-        with lock:
+        if is_in_board_scheduler():
+            if not lock.acquire(blocking=False):
+                raise WorkerYielded(f"Waiting for code_lock on code item '{item.item_id}'")
+        else:
+            lock.acquire()
+        try:
             snap = _snapshot_modules(ctx.cartridge_dir, modules + ["project.godot", "main.tscn"])
             try:
                 agent.implement_requirement_track(track=track, staging_dir=ctx.cartridge_dir, requirements_spec=req_spec)
@@ -654,6 +679,8 @@ def code_item_handler(ctx: WorkerContext) -> Callable[[WorkItem], WorkerResult]:
             except Exception:
                 _restore_modules(ctx.cartridge_dir, snap)
                 raise
+        finally:
+            lock.release()
         extra_qa = ""
         if setup_calls:
             extra_qa += f" Setup calls: {[c['method_name'] for c in setup_calls]}."
@@ -665,6 +692,7 @@ def code_item_handler(ctx: WorkerContext) -> Callable[[WorkItem], WorkerResult]:
         )
         return WorkerResult(proof_images=[str(strip)], notes=notes)
 
+    setattr(handler, "_code_lock", lock)
     return handler
 
 
@@ -1026,6 +1054,42 @@ class _LegacyFakeClientDirectPayload(Exception):
     directly instead of a TaskLeadDecision schema."""
 
 
+def _build_task_lead_multimodal_parts(ctx: WorkerContext, collected_proofs: List[str]) -> List[Any]:
+    """Builds multimodal image parts (reference 16:9 Concept Art Mockup + latest collected proof images)
+    so the Task Lead Strategist can visually inspect captured proofs before submitting to the Council."""
+    if not collected_proofs:
+        return []
+    from google.genai import types
+
+    parts: List[Any] = []
+    bible_path = Path(ctx.cartridge_dir) / "game_bible.json"
+    if bible_path.is_file():
+        try:
+            bible_data = json.loads(bible_path.read_text(encoding="utf-8"))
+            mockups = bible_data.get("visual_mockups") if isinstance(bible_data, dict) else None
+            if isinstance(mockups, list) and mockups:
+                rel = str(mockups[0].get("image_path") or "").strip()
+                if rel:
+                    mpath = Path(rel) if Path(rel).is_absolute() else (Path(ctx.cartridge_dir) / rel)
+                    if mpath.is_file():
+                        mime = "image/jpeg" if mpath.suffix.lower() in (".jpg", ".jpeg") else "image/png"
+                        parts.append(f"REFERENCE 16:9 CONCEPT ART MOCKUP ({mpath.name}):")
+                        parts.append(types.Part.from_bytes(data=mpath.read_bytes(), mime_type=mime))
+        except Exception:
+            pass
+
+    for p_str in collected_proofs[-3:]:
+        p = Path(p_str)
+        if not p.is_file():
+            continue
+        mime = "image/jpeg" if p.suffix.lower() in (".jpg", ".jpeg") else "image/png"
+        parts.append(
+            f"CAPTURED PROOF IMAGE ({p.name}) — inspect this image carefully before choosing submit_to_council:"
+        )
+        parts.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime))
+    return parts
+
+
 def plan_task_lead_turn(
     ctx: WorkerContext,
     item: WorkItem,
@@ -1034,7 +1098,7 @@ def plan_task_lead_turn(
     attempts: int = 3,
 ) -> TaskLeadDecision:
     """Runs one turn of the Task Lead Strategist: inspects the task, cartridge state, prior Council revision
-    feedback, and specialist reports from earlier turns, then returns a validated `TaskLeadDecision`."""
+    feedback, and specialist reports + multimodal proof images from earlier turns, then returns a validated `TaskLeadDecision`."""
     if not _is_live(ctx.client):
         raise StudioAgentError("Task Lead planning requires an active google.genai Client (Rule 5)")
     from google.genai import types
@@ -1098,6 +1162,9 @@ def plan_task_lead_turn(
         ),
     }
     available_spec_lines = "".join(spec_descriptions[s] for s in specialists if s in spec_descriptions)
+    multimodal_parts: List[Any] = []
+    if collected_proofs and getattr(type(ctx.client), "__module__", "") != "google.genai.fake":
+        multimodal_parts = _build_task_lead_multimodal_parts(ctx, collected_proofs)
 
     issues: List[str] = []
     for attempt in range(1, attempts + 1):
@@ -1114,13 +1181,18 @@ def plan_task_lead_turn(
             f"{prior_revision_block}{turns_block}\n"
             f"INSTRUCTIONS:\n"
             f"1. Formulate your bespoke `current_strategy` for accomplishing and proving this task (and pivoting if the Council requested changes).\n"
-            f"2. Choose `action = 'delegate'` to send an open-ended natural-language `brief` to one of {specialists}, OR choose `action = 'submit_to_council'` ONLY after all required assets/code are built AND at least one proof image in `COLLECTED PROOF IMAGES SO FAR` visually proves the requirement.\n"
+            f"2. If `COLLECTED PROOF IMAGES SO FAR` is non-empty, visually inspect the attached proof image(s) before choosing `submit_to_council`:\n"
+            f"   - In `filmstrip_*.png` contact sheets, the top (`[QA] tick N in:[...]`) and bottom (`[QA] pos=(...) ...`) bands outside each 16:9 frame border are external QA test-harness annotations—use them to verify coordinates/state, and never mistake them for in-game debug text.\n"
+            f"   - Verify that the active gameplay entities (`CharacterBody2D` / `Sprite2D` actors and floor/world tiles) are visibly rendered inside the 16:9 viewport and are NOT hidden behind an opaque full-screen background/border frame drawn at a higher `z_index` or foreground `CanvasLayer`.\n"
+            f"   - If the proof image shows an occluded character, missing floor tiles, or a visual/functional defect, delegate back to `swe_engineer` (or `visual_artist`) to fix it right now before submitting to the Council.\n"
+            f"3. Choose `action = 'delegate'` to send an open-ended natural-language `brief` to one of {specialists}, OR choose `action = 'submit_to_council'` ONLY after all required assets/code are built AND at least one proof image in `COLLECTED PROOF IMAGES SO FAR` visually proves the requirement.\n"
             f"Provide `deliberation` FIRST and `action` LAST."
         )
+        contents_arg: Any = ([prompt] + multimodal_parts) if multimodal_parts else prompt
         resp = call_gemini_with_transient_retry(
             lambda: ctx.client.models.generate_content(
                 model=ctx.model_name,
-                contents=prompt,
+                contents=contents_arg,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=TaskLeadDecision,
@@ -1209,30 +1281,60 @@ def run_task_lead(
     last_strategy = ""
     submission_summary = ""
     selected_proofs: List[str] = []
+    pending_decision: Optional[TaskLeadDecision] = None
     trace_path = _item_dir(ctx, item) / f"lead_trace_rev{len(item.revisions)}.json"
 
-    def _persist_trace() -> None:
-        trace_data = {
+    if trace_path.is_file():
+        try:
+            existing_trace = json.loads(trace_path.read_text(encoding="utf-8"))
+            if (
+                isinstance(existing_trace, dict)
+                and existing_trace.get("status", "in_progress") in ("in_progress", "yielded")
+                and not existing_trace.get("submission_summary")
+            ):
+                for raw_turn in existing_trace.get("turns", []):
+                    turn_history.append(SpecialistReport.model_validate(raw_turn))
+                for p in existing_trace.get("collected_proofs", []):
+                    if isinstance(p, str) and Path(p).is_file() and p not in collected_proofs:
+                        collected_proofs.append(p)
+                last_strategy = str(existing_trace.get("current_strategy") or "")
+                raw_pending = existing_trace.get("pending_decision")
+                if isinstance(raw_pending, dict):
+                    pending_decision = TaskLeadDecision.model_validate(raw_pending)
+        except Exception:
+            logger.debug("Could not hydrate existing lead trace at %s", trace_path, exc_info=True)
+
+    def _persist_trace(status: str = "in_progress", pending: Optional[TaskLeadDecision] = None) -> None:
+        trace_data: Dict[str, Any] = {
             "item_id": item.item_id,
             "revision": len(item.revisions),
+            "status": status,
             "current_strategy": last_strategy,
             "submission_summary": submission_summary,
             "collected_proofs": list(collected_proofs),
             "turns": [t.model_dump() for t in turn_history],
         }
+        if pending is not None:
+            trace_data["pending_decision"] = pending.model_dump()
         trace_path.write_text(json.dumps(trace_data, indent=2), encoding="utf-8")
 
     code_lock = ctx.code_lock if ctx.code_lock is not None else threading.Lock()
     code_lock_held = False
     try:
-        for turn_idx in range(max_turns):
-            try:
-                decision = plan_task_lead_turn(ctx, item, turn_history, collected_proofs)
-            except _LegacyFakeClientDirectPayload:
-                return _fallback_for_legacy_fake_client(ctx, item)
+        for turn_idx in range(len(turn_history), max_turns):
+            resumed_from_pending = False
+            if pending_decision is not None:
+                decision = pending_decision
+                pending_decision = None
+                resumed_from_pending = True
+            else:
+                try:
+                    decision = plan_task_lead_turn(ctx, item, turn_history, collected_proofs)
+                except _LegacyFakeClientDirectPayload:
+                    return _fallback_for_legacy_fake_client(ctx, item)
 
             last_strategy = decision.current_strategy
-            if ctx.event_callback is not None:
+            if not resumed_from_pending and ctx.event_callback is not None:
                 try:
                     ctx.event_callback(
                         "backlog_item_lead_turn",
@@ -1254,12 +1356,20 @@ def run_task_lead(
                 submission_summary = decision.submission_summary or decision.current_strategy
                 chosen = [p for p in decision.selected_proof_paths if Path(p).is_file()]
                 selected_proofs = chosen if chosen else list(collected_proofs)
-                _persist_trace()
+                _persist_trace(status="submitted", pending=None)
                 break
 
             if decision.specialist_agent in ("swe_engineer", "qa_test_engineer") and not code_lock_held:
-                code_lock.acquire()
+                if is_in_board_scheduler():
+                    if not code_lock.acquire(blocking=False):
+                        _persist_trace(status="yielded", pending=decision)
+                        raise WorkerYielded(
+                            f"Waiting for code_lock to run {decision.specialist_agent} on turn {turn_idx + 1} of '{item.item_id}'"
+                        )
+                else:
+                    code_lock.acquire()
                 code_lock_held = True
+                _persist_trace(status="in_progress", pending=None)
 
             if ctx.event_callback is not None:
                 try:
@@ -1288,7 +1398,7 @@ def run_task_lead(
             for p in report.proof_images:
                 if p not in collected_proofs and Path(p).is_file():
                     collected_proofs.append(p)
-            _persist_trace()
+            _persist_trace(status="in_progress", pending=None)
             if ctx.event_callback is not None:
                 try:
                     ctx.event_callback(
@@ -1313,6 +1423,7 @@ def run_task_lead(
                 )
             selected_proofs = list(collected_proofs)
             submission_summary = submission_summary or last_strategy
+            _persist_trace(status="submitted", pending=None)
     finally:
         if code_lock_held:
             code_lock.release()
@@ -1341,7 +1452,11 @@ def run_task_lead(
 
 def task_lead_handler(ctx: WorkerContext, max_turns: int = 6) -> Callable[[WorkItem], WorkerResult]:
     """Handler that delegates any `WorkItem` to the iterative Task Lead Strategist loop."""
-    return lambda item: run_task_lead(ctx, item, max_turns=max_turns)
+    if ctx.code_lock is None:
+        ctx.code_lock = threading.Lock()
+    fn = lambda item: run_task_lead(ctx, item, max_turns=max_turns)
+    setattr(fn, "_code_lock", ctx.code_lock)
+    return fn
 
 
 def default_handlers(ctx: WorkerContext) -> Dict[str, Callable[[WorkItem], WorkerResult]]:

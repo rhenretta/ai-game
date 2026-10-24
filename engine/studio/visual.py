@@ -601,13 +601,16 @@ class VisualArtSpriteDesignerAgent:
         pad_ratio: float = 0.06,
         target_dimensions: Optional[Tuple[int, int]] = None,
         size: Optional[Tuple[int, int]] = None,
+        isolate_single_subject: bool = True,
         **_kwargs: Any,
     ) -> Image.Image:
         """Extracts a clean 32-bit RGBA foreground cutout from a synthesized image.
-        1. Uses neural salient-object segmentation (`rembg` U2-Net) + perimeter-connected background flood-fill
+        1. Uses multi-tone perimeter-connected background flood-fill (handling both solid backdrops and
+           baked-in 2-tone transparency checkerboards) + neural salient-object segmentation (`rembg` U2-Net)
            to isolate the foreground subject without hand-rolled interior white/eye hole-punching heuristics.
         2. Clears any residual pure chroma-key (`#FF00FF`) background pockets if a chroma backdrop was used.
-        3. Auto-crops to the tight non-transparent foreground bounding box and centers inside `target_size`.
+        3. When `isolate_single_subject=True`, detects multi-pose collages or multi-item grids via morphological
+           subject clustering and isolates the primary single subject before tight bounding-box cropping.
         """
         if isinstance(raw_img, (bytes, bytearray)):
             raw_img = Image.open(io.BytesIO(raw_img))
@@ -617,7 +620,7 @@ class VisualArtSpriteDesignerAgent:
         work_img = raw_img.convert("RGBA").resize((work_w, work_h), Image.Resampling.LANCZOS)
         px = work_img.load()
 
-        # Step 1: Perimeter seed collection for outer background connected component
+        # Step 1: Perimeter seed collection across all 4 edges for outer background connected component
         seed_coords: List[Tuple[int, int]] = []
         for x in range(0, work_w, 4):
             seed_coords.append((x, 0))
@@ -646,12 +649,61 @@ class VisualArtSpriteDesignerAgent:
                     seed_coords.extend(inset_pts)
 
         bg_samples: List[Tuple[int, int, int]] = []
-        for sx, sy in seed_coords[:32]:
+        for sx, sy in seed_coords:
             r, g, b, a = px[sx, sy]
             if a > 0:
                 bg_samples.append((r, g, b))
         if not bg_samples:
             bg_samples = [(0, 0, 0)]
+
+        # Cluster perimeter samples into dominant perimeter background tones (supports solid backgrounds
+        # AND 2-tone alternating transparency checkerboards around the perimeter).
+        cluster_sums: List[List[int]] = []
+        cluster_counts: List[int] = []
+        cluster_centers: List[Tuple[int, int, int]] = []
+        cluster_rad_sq = 24 * 24
+        for sr, sg, sb in bg_samples:
+            matched_idx = -1
+            for c_idx, (cr, cg, cb) in enumerate(cluster_centers):
+                if (sr - cr) ** 2 + (sg - cg) ** 2 + (sb - cb) ** 2 <= cluster_rad_sq:
+                    matched_idx = c_idx
+                    break
+            if matched_idx >= 0:
+                cluster_sums[matched_idx][0] += sr
+                cluster_sums[matched_idx][1] += sg
+                cluster_sums[matched_idx][2] += sb
+                cluster_counts[matched_idx] += 1
+                cnt = cluster_counts[matched_idx]
+                cluster_centers[matched_idx] = (
+                    cluster_sums[matched_idx][0] // cnt,
+                    cluster_sums[matched_idx][1] // cnt,
+                    cluster_sums[matched_idx][2] // cnt,
+                )
+            else:
+                cluster_sums.append([sr, sg, sb])
+                cluster_counts.append(1)
+                cluster_centers.append((sr, sg, sb))
+
+        min_cluster_hits = max(3, int(len(bg_samples) * 0.04))
+        ranked_clusters = sorted(
+            zip(cluster_counts, cluster_centers),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        bg_palette: List[Tuple[int, int, int]] = [
+            center for cnt, center in ranked_clusters if cnt >= min_cluster_hits
+        ][:6]
+        if not bg_palette:
+            bg_palette = [ranked_clusters[0][1]] if ranked_clusters else [(0, 0, 0)]
+
+        # Detect whether the outer perimeter is a 2-tone neutral/achromatic checkerboard
+        top2_coverage = sum(cnt for cnt, _ in ranked_clusters[:2]) / float(max(1, len(bg_samples)))
+        is_perimeter_checkerboard = (
+            len(ranked_clusters) >= 2
+            and ranked_clusters[1][0] >= max(4, int(len(bg_samples) * 0.08))
+            and top2_coverage >= 0.72
+            and all((max(c) - min(c)) <= 28 for _, c in ranked_clusters[:2])
+        )
 
         # Step 2: Perimeter-connected flood fill (never punches disconnected interior eyes/highlights)
         visited = set()
@@ -677,13 +729,15 @@ class VisualArtSpriteDesignerAgent:
             dist_local_sq = (r - ref_rgb[0]) ** 2 + (g - ref_rgb[1]) ** 2 + (b - ref_rgb[2]) ** 2
             dist_global_sq = min(
                 (r - br) ** 2 + (g - bg) ** 2 + (b - bb) ** 2
-                for br, bg, bb in bg_samples[:8]
+                for br, bg, bb in bg_palette
             )
-            effective_dist_sq = max(dist_local_sq, dist_global_sq)
+            # If the pixel matches ANY dominant perimeter background tone (e.g., stepping between light and dark
+            # squares of a perimeter-connected checkerboard), allow flood propagation via dist_global_sq.
+            effective_dist_sq = dist_global_sq if dist_global_sq <= tol_hard_sq else max(dist_local_sq, dist_global_sq)
 
             if effective_dist_sq <= tol_hard_sq:
                 px[cx, cy] = (0, 0, 0, 0)
-                next_ref = (
+                next_ref = (r, g, b) if dist_global_sq <= tol_hard_sq else (
                     (ref_rgb[0] * 3 + r) // 4,
                     (ref_rgb[1] * 3 + g) // 4,
                     (ref_rgb[2] * 3 + b) // 4,
@@ -715,22 +769,26 @@ class VisualArtSpriteDesignerAgent:
 
         rgba_np = np.array(work_img, dtype=np.uint8)
 
-        # Step 2c: If the outer perimeter was a uniform synthetic studio background, clear only enclosed
-        # interior pockets between limbs/handles (where an opaque foreground ring encloses background color)
-        # while protecting internal facial/head features.
-        c_tl = np.array(bg_samples[0], dtype=np.float32)
-        bg_uniform = all(float(np.linalg.norm(np.array(s, dtype=np.float32) - c_tl)) < 25.0 for s in bg_samples[:8])
-        if bg_uniform:
+        # Step 2c: If the outer perimeter was a uniform synthetic studio background or 2-tone checkerboard,
+        # clear enclosed interior background pockets while protecting internal facial/head features.
+        c_tl = np.array(bg_palette[0], dtype=np.float32)
+        bg_uniform = all(float(np.linalg.norm(np.array(s, dtype=np.float32) - c_tl)) < 25.0 for s in bg_samples[:16])
+        if bg_uniform or is_perimeter_checkerboard:
             rgb_f = rgba_np[:, :, :3].astype(np.float32)
-            dist_sq = np.sum((rgb_f - c_tl[None, None, :]) ** 2, axis=-1)
-            cand = ((rgba_np[:, :, 3] > 0) & (dist_sq <= 14.0 * 14.0)).astype(np.uint8)
+            min_dist_sq = np.full((work_h, work_w), 1e9, dtype=np.float32)
+            for b_rgb in bg_palette[:2]:
+                b_vec = np.array(b_rgb, dtype=np.float32)
+                d_sq = np.sum((rgb_f - b_vec[None, None, :]) ** 2, axis=-1)
+                min_dist_sq = np.minimum(min_dist_sq, d_sq)
+            tol_pocket = 18.0 if is_perimeter_checkerboard else 14.0
+            cand = ((rgba_np[:, :, 3] > 0) & (min_dist_sq <= tol_pocket * tol_pocket)).astype(np.uint8)
             num_lbl, lbls, stats, centroids = cv2.connectedComponentsWithStats(cand, connectivity=8)
             for lbl in range(1, num_lbl):
                 area = int(stats[lbl, cv2.CC_STAT_AREA])
                 cy_cent = float(centroids[lbl][1])
-                # Only clear mid/lower-body enclosed background loops (e.g. between arm and torso or arch opening),
-                # never small specular highlights or upper-head eye sclera
-                if 28 <= area <= int(work_w * work_h * 0.10) and cy_cent > work_h * 0.36:
+                if is_perimeter_checkerboard and 24 <= area <= int(work_w * work_h * 0.25):
+                    rgba_np[lbls == lbl] = [0, 0, 0, 0]
+                elif 28 <= area <= int(work_w * work_h * 0.10) and cy_cent > work_h * 0.36:
                     rgba_np[lbls == lbl] = [0, 0, 0, 0]
 
         # Step 2d: Neural salient-object matting (`rembg`) when perimeter flood-fill leaves a non-uniform background
@@ -745,7 +803,7 @@ class VisualArtSpriteDesignerAgent:
                 rgba_np[:, :, 3] = np.minimum(rgba_np[:, :, 3], rembg_np[:, :, 3])
                 rgba_np[rgba_np[:, :, 3] == 0] = [0, 0, 0, 0]
 
-        # Step 2e: Strip tiny detached noise specks (< 1% of primary subject area)
+        # Step 2e: Strip tiny detached noise specks (< 1.5% of primary subject area)
         fg_mask = (rgba_np[:, :, 3] > 24).astype(np.uint8)
         num_fg, fg_labels, fg_stats, _ = cv2.connectedComponentsWithStats(fg_mask, connectivity=8)
         if num_fg > 2:
@@ -755,6 +813,72 @@ class VisualArtSpriteDesignerAgent:
             for lbl in range(1, num_fg):
                 if int(fg_stats[lbl, cv2.CC_STAT_AREA]) < min_keep_area:
                     rgba_np[fg_labels == lbl] = [0, 0, 0, 0]
+
+        # Step 2f: Single-subject isolation — if the image model synthesized a multi-pose collage or
+        # multi-item variation grid (2+ spatially disjoint subject clusters), isolate the primary single subject.
+        if isolate_single_subject:
+            fg_clean = (rgba_np[:, :, 3] > 24).astype(np.uint8)
+            # Dilate by 9x9 (~3.5% of 256px canvas) so closely attached parts of ONE character/prop merge together
+            kernel = np.ones((9, 9), dtype=np.uint8)
+            dilated_fg = cv2.dilate(fg_clean, kernel, iterations=1)
+            num_cl, cl_labels, cl_stats, cl_centroids = cv2.connectedComponentsWithStats(dilated_fg, connectivity=8)
+            if num_cl > 2:
+                cluster_true_areas: Dict[int, int] = {}
+                for c_idx in range(1, num_cl):
+                    cluster_true_areas[c_idx] = int(np.count_nonzero((cl_labels == c_idx) & (fg_clean > 0)))
+                max_cl_area = max(cluster_true_areas.values()) if cluster_true_areas else 0
+                major_clusters = [
+                    c_idx
+                    for c_idx, c_area in cluster_true_areas.items()
+                    if c_area >= max(100, int(max_cl_area * 0.16))
+                ]
+                if len(major_clusters) >= 2:
+                    # Check whether the major clusters have non-overlapping bounding boxes (side-by-side poses or grid cells)
+                    candidates = [c_idx for c_idx in major_clusters if cluster_true_areas[c_idx] >= int(max_cl_area * 0.25)]
+                    if not candidates:
+                        candidates = major_clusters
+                    best_cl = max(
+                        candidates,
+                        key=lambda c_idx: (
+                            (cluster_true_areas[c_idx] / float(max(1, max_cl_area)))
+                            - 0.25 * (
+                                math.hypot(
+                                    float(cl_centroids[c_idx][0]) - work_w * 0.5,
+                                    float(cl_centroids[c_idx][1]) - work_h * 0.5,
+                                )
+                                / (work_w * 0.5)
+                            )
+                        ),
+                    )
+                    bx = int(cl_stats[best_cl, cv2.CC_STAT_LEFT])
+                    by = int(cl_stats[best_cl, cv2.CC_STAT_TOP])
+                    bw_c = int(cl_stats[best_cl, cv2.CC_STAT_WIDTH])
+                    bh_c = int(cl_stats[best_cl, cv2.CC_STAT_HEIGHT])
+                    # Verify at least one other major cluster is laterally or vertically disjoint from best_cl
+                    has_disjoint_sibling = False
+                    for other_cl in major_clusters:
+                        if other_cl == best_cl:
+                            continue
+                        ox = int(cl_stats[other_cl, cv2.CC_STAT_LEFT])
+                        oy = int(cl_stats[other_cl, cv2.CC_STAT_TOP])
+                        ow_c = int(cl_stats[other_cl, cv2.CC_STAT_WIDTH])
+                        oh_c = int(cl_stats[other_cl, cv2.CC_STAT_HEIGHT])
+                        overlap_x = max(0, min(bx + bw_c, ox + ow_c) - max(bx, ox))
+                        overlap_y = max(0, min(by + bh_c, oy + oh_c) - max(by, oy))
+                        if overlap_x < min(bw_c, ow_c) * 0.35 or overlap_y < min(bh_c, oh_c) * 0.35:
+                            has_disjoint_sibling = True
+                            break
+                    if has_disjoint_sibling:
+                        keep_mask = cl_labels == best_cl
+                        # Keep any tiny detail cluster within 10px of best_cl's bounding box
+                        pad_detail = 10
+                        for c_idx, c_area in cluster_true_areas.items():
+                            if c_idx == best_cl or c_idx in major_clusters:
+                                continue
+                            cx_c, cy_c = float(cl_centroids[c_idx][0]), float(cl_centroids[c_idx][1])
+                            if (bx - pad_detail) <= cx_c <= (bx + bw_c + pad_detail) and (by - pad_detail) <= cy_c <= (by + bh_c + pad_detail):
+                                keep_mask = keep_mask | (cl_labels == c_idx)
+                        rgba_np[~keep_mask] = [0, 0, 0, 0]
 
         work_img = Image.fromarray(rgba_np)
 
@@ -1040,17 +1164,19 @@ class VisualArtSpriteDesignerAgent:
         elif is_actor:
             aspect = "1:1"
             full_prompt = (
-                f"SINGLE solitary full-body high-resolution illustrated in-game subject in a clean neutral readiness pose: {prompt}.{style_clause} "
-                f"Strictly ONE single isolated full-body figure centered on a solid flat bright magenta (#FF00FF) chroma-key background with complete silhouette and grounded base. "
-                f"STRICTLY ONLY ONE single subject instance — NEVER multiple figures, NEVER a multi-angle turnaround chart, NEVER a sprite grid, "
+                f"SINGLE solitary full-body high-resolution illustrated in-game subject in ONE clean neutral readiness pose: {prompt}.{style_clause} "
+                f"Strictly ONE single isolated full-body figure centered on a solid flat uniform bright magenta (#FF00FF) chroma-key background with complete silhouette and grounded base. "
+                f"CRITICAL: Draw STRICTLY ONLY ONE single subject instance in ONE pose — NEVER multiple figures, NEVER multiple poses or animation frames, "
+                f"NEVER a multi-angle turnaround chart, NEVER a sprite sheet grid, NEVER a gray-and-white transparency checkerboard pattern, "
                 f"NO detached environment terrain slab, NO ground pedestal, NO cast shadow on the floor, NO background scenery, NOT a bust portrait, NO border frame, NO text."
             )
         else:
             aspect = "1:1"
             full_prompt = (
-                f"Single isolated high-resolution illustrated in-game structure or interactive prop: {prompt}.{style_clause} "
-                f"Centered on a solid flat bright magenta (#FF00FF) chroma-key background. "
-                f"STRICTLY ONLY the single discrete object/structure itself — NO ground slab, NO pedestal, "
+                f"SINGLE isolated high-resolution illustrated in-game structure or interactive prop in ONE canonical intact state: {prompt}.{style_clause} "
+                f"Centered on a solid flat uniform bright magenta (#FF00FF) chroma-key background. "
+                f"CRITICAL: Draw STRICTLY ONLY ONE single discrete object/structure instance — NEVER multiple variations, NEVER a 3x3 or multi-state grid, "
+                f"NEVER a gray-and-white transparency checkerboard pattern, NO ground slab, NO pedestal, "
                 f"NO cast shadow on the floor, NO background sky/scenery, NO border frame, NO picture box, NO text, "
                 f"crisp readable silhouette and vibrant details."
             )
@@ -1660,9 +1786,14 @@ class VisualArtSpriteDesignerAgent:
         ]
 
         base_dims = (cell_w * 2, cell_h * 2)
+        raw_base_prompt = asset_req.visual_prompt_or_text or asset_req.description or asset_req.asset_id
+        single_base_prompt = (
+            f"SINGLE CANONICAL NEUTRAL STANDING/IDLE FIGURE ONLY (the animation engine will articulate all other rows/frames "
+            f"from this one base image — do NOT draw multiple poses, rows, frames, or a sprite sheet grid): {raw_base_prompt}"
+        )
         if self._is_live_genai_client():
             base_img = self._generate_gemini_sprite_image(
-                prompt=asset_req.visual_prompt_or_text or asset_req.description or asset_req.asset_id,
+                prompt=single_base_prompt,
                 asset_type=asset_req.asset_type or "sprite_sheet",
                 dimensions=base_dims,
                 reference_images=reference_images,

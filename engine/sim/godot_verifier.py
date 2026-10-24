@@ -496,6 +496,7 @@ class GodotHeadlessSimulator:
             use_viewport
             and (self.cartridge_path / "assets" / "playtest_captures" / "playtest_t0.png").is_file()
         )
+        self.close()
 
         if returncode != 0:
             raise RuntimeError(f"Godot headless simulation failed with code {returncode}: {stderr_full}")

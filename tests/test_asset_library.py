@@ -415,3 +415,89 @@ def test_production_strategy_and_scene_critique_schemas_and_asset_fabrication(tm
     assert critique.deficiencies[0].target_symbol_or_lines == "TerraceRenderer._draw"
 
 
+def test_extract_clean_alpha_sprite_strips_two_tone_checkerboard_and_isolates_single_subject(tmp_path: Path):
+    """Verifies that extract_clean_alpha_sprite:
+    1. Floods out a baked-in 2-tone alternating gray/white transparency checkerboard around the perimeter.
+    2. Isolates a single primary subject when the source image contains a 3x3 variation grid or 5-pose collage.
+    3. Indexes assets in assets/tiles/, assets/backgrounds/, and assets/ui/ without duplicating catalog entries.
+    """
+    import cv2
+    import numpy as np
+    from PIL import ImageDraw
+
+    # 1. Synthesize a 256x256 image with a 16px alternating gray/white checkerboard background
+    # and a 3x3 grid of 9 separate vibrant cyan/gold crystal props
+    raw = Image.new("RGBA", (256, 256), (255, 255, 255, 255))
+    draw = ImageDraw.Draw(raw)
+    sq = 16
+    for y in range(0, 256, sq):
+        for x in range(0, 256, sq):
+            c = (236, 236, 236, 255) if ((x // sq) + (y // sq)) % 2 == 0 else (188, 188, 188, 255)
+            draw.rectangle([x, y, x + sq - 1, y + sq - 1], fill=c)
+
+    for gy in (52, 128, 204):
+        for gx in (52, 128, 204):
+            r = 18 if (gx == 128 and gy == 128) else 15
+            draw.polygon(
+                [(gx, gy - r), (gx + r, gy), (gx, gy + r), (gx - r, gy)],
+                fill=(30, 210, 240, 255),
+                outline=(245, 200, 50, 255),
+            )
+
+    cleaned = VisualArtSpriteDesignerAgent.extract_clean_alpha_sprite(raw, target_size=(64, 64))
+    assert cleaned.size == (64, 64)
+    arr = np.array(cleaned, dtype=np.uint8)
+    # All 4 corners must be transparent (2-tone checkerboard stripped)
+    assert arr[0, 0, 3] == 0
+    assert arr[0, 63, 3] == 0
+    assert arr[63, 0, 3] == 0
+    assert arr[63, 63, 3] == 0
+    # Center must be opaque (the single isolated subject scaled to fill the 64x64 cell)
+    assert arr[32, 32, 3] > 200
+    fg_mask = (arr[:, :, 3] > 24).astype(np.uint8)
+    num_cc, _, _, _ = cv2.connectedComponentsWithStats(fg_mask, connectivity=8)
+    # Exactly 1 foreground connected component (plus background label 0 -> num_cc == 2)
+    assert num_cc == 2
+
+    # 2. Synthesize a 5-pose horizontal collage on a magenta backdrop and verify single-subject isolation
+    collage = Image.new("RGBA", (256, 256), (255, 0, 255, 255))
+    cdraw = ImageDraw.Draw(collage)
+    for idx, cx in enumerate((32, 80, 128, 176, 224)):
+        h_half = 26 if idx == 2 else 22
+        cdraw.ellipse([cx - 12, 128 - h_half, cx + 12, 128 + h_half], fill=(220, 70, 40, 255))
+
+    cleaned_collage = VisualArtSpriteDesignerAgent.extract_clean_alpha_sprite(collage, target_size=(64, 64))
+    carr = np.array(cleaned_collage, dtype=np.uint8)
+    assert carr[0, 0, 3] == 0
+    assert carr[32, 32, 3] > 200
+    num_cc_collage, _, _, _ = cv2.connectedComponentsWithStats((carr[:, :, 3] > 24).astype(np.uint8), connectivity=8)
+    assert num_cc_collage == 2
+
+    # 3. Verify CartridgeAssetLibrary and LeadGameplaySWEAgent._discover_sealed_assets index tiles, backgrounds, and ui
+    tiles_dir = tmp_path / "assets" / "tiles" / "sub"
+    bg_dir = tmp_path / "assets" / "backgrounds"
+    ui_dir = tmp_path / "assets" / "ui"
+    tiles_dir.mkdir(parents=True, exist_ok=True)
+    bg_dir.mkdir(parents=True, exist_ok=True)
+    ui_dir.mkdir(parents=True, exist_ok=True)
+
+    cleaned.save(tiles_dir / "floor_strip.png", "PNG")
+    cleaned.save(bg_dir / "vista_frame.png", "PNG")
+    cleaned.save(ui_dir / "hud_gauge.png", "PNG")
+
+    lib = CartridgeAssetLibrary(cartridge_dir=tmp_path)
+    summary = lib.build_prompt_summary_for_swe()
+    assert "floor_strip" in lib.catalog.entries
+    assert "vista_frame" in lib.catalog.entries
+    assert "hud_gauge" in lib.catalog.entries
+    assert "res://assets/tiles/sub/floor_strip.png" in summary
+
+    from engine.studio.swe import LeadGameplaySWEAgent
+    swe = LeadGameplaySWEAgent(client=None)
+    discovered = swe._discover_sealed_assets(tmp_path)
+    assert "assets/tiles/sub/floor_strip.png" in discovered["sprites"]
+    assert "assets/backgrounds/vista_frame.png" in discovered["sprites"]
+    assert "assets/ui/hud_gauge.png" in discovered["sprites"]
+
+
+

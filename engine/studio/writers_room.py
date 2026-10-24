@@ -1170,7 +1170,17 @@ class CreativeWritersRoom:
                 raise StudioAgentError(f"Proof image for item '{item.item_id}' is missing on disk: {path}")
             suffix = path.suffix.lower()
             mime = "image/jpeg" if suffix in (".jpg", ".jpeg") else "image/png"
-            parts.append(f"PROOF IMAGE for item '{item.item_id}' (revision {latest.revision_index + 1}, file {path.name}):")
+            is_filmstrip = "filmstrip" in path.name.lower()
+            filmstrip_note = (
+                " [QA CONTACT SHEET: Each cell shows the 16:9 game viewport inside a thin slate border; the top strip ('[QA] tick N in:[...]') "
+                "and bottom strip ('[QA] pos=(...) ...') outside each 16:9 frame are external QA test-harness annotations provided FOR THE COUNCIL "
+                "to verify simulation ticks, inputs, and live engine state—they are NOT inside the game viewport and must NEVER be flagged as in-game debug text]"
+                if is_filmstrip
+                else ""
+            )
+            parts.append(
+                f"PROOF IMAGE for item '{item.item_id}' (revision {latest.revision_index + 1}, file {path.name}){filmstrip_note}:"
+            )
             parts.append(types.Part.from_bytes(data=path.read_bytes(), mime_type=mime))
         if not latest.proof_paths:
             parts.append(f"NOTE: item '{item.item_id}' returned NO proof images.")
@@ -1196,20 +1206,23 @@ class CreativeWritersRoom:
                 "ROLE MANDATE (UXExperienceDesigner): You have VETO power over UI/UX quality. Immediately `request_changes` if a proof shows "
                 "developer debug/telemetry panels (e.g. 'HEADLESS MECHANICS', 'ALL PASS', raw float dumps) drawn INSIDE the 16:9 game viewport, "
                 "text-manual overlays, or HUD boxes occluding the playable center (>15% viewport area). "
-                "IMPORTANT: The thin dark 22px header bar ('tick N | in:[...]') and 20px footer bar ('pos=...') outside each 16:9 frame in `filmstrip_*_rev*.png` "
-                "are external QA Test Harness frame labels added by the test runner—do NOT flag those external frame caption bars as in-game HUD defects.\n"
+                "IMPORTANT: The thin header bar ('[QA] tick N in:[...]') and footer bar ('[QA] pos=...') outside each 16:9 frame in `filmstrip_*.png` "
+                "are external QA Test Harness contact-sheet margins added FOR THE COUNCIL—do NOT flag those external frame caption bars as in-game HUD defects.\n"
             )
         if role == "VisualArtDirector":
             return (
                 "ROLE MANDATE (VisualArtDirector): You have VETO power over visual fidelity. Compare the proof directly against the 16:9 Concept Art "
                 "Mockup and Game Bible Visual Style Guide. Immediately `request_changes` if characters, landmarks, or world surfaces are drawn as "
                 "geometric programmer art (`draw_rect` crates, stick-figure circles/lines, wireframe graphs) instead of bound Sprite2D/TextureRect "
-                "assets at proper camera scale.\n"
+                "assets at proper camera scale, or if an opaque background/frame layer hides the character sprites and world floor tiles. "
+                "Do NOT flag the external QA contact-sheet header/footer strips ('[QA] tick ...', '[QA] pos=...') outside each 16:9 frame as in-game text.\n"
             )
         if role in ("GameplayDesigner", "GameplaySystemsEngineer"):
             return (
                 f"ROLE MANDATE ({role}): You have VETO power over gameplay authenticity. Immediately `request_changes` if the proof filmstrip shows "
-                "static/non-interactive frames where an action should occur, or if state transitions are not causally driven by player inputs.\n"
+                "static/non-interactive frames where an action should occur, or if state transitions are not causally driven by player inputs. "
+                "Use the external QA contact-sheet header/footer strips ('[QA] tick ... in:[...]', '[QA] pos=(...) ...') above and below each 16:9 frame "
+                "as ground-truth engine telemetry to verify coordinates and state changes—never flag those external QA margin strips as in-game debug text.\n"
             )
         return ""
 
@@ -1233,9 +1246,17 @@ class CreativeWritersRoom:
         deciding_ids = {i.item_id for i in deciding}
         by_id = {i.item_id: i for i in awaiting + deciding}
         mandate = self._role_review_mandate(role)
+        filmstrip_guide = (
+            "HOW TO READ `filmstrip_*.png` QA CONTACT SHEETS:\n"
+            "- Each `filmstrip_*.png` proof is a multi-frame grid captured by the external QA Test Harness.\n"
+            "- Above each 16:9 game frame, the test harness prints the simulation tick and injected controller inputs (`[QA] tick N  in:[...]`).\n"
+            "- Below each 16:9 game frame, the test harness prints the live engine state snapshot (`[QA] pos=(...) ...`) specifically FOR YOU (the Council) to verify coordinates and state variables.\n"
+            "- These top and bottom margin bands outside the 16:9 frame border are external QA contact-sheet annotations—they are NOT rendered inside the game viewport and must NEVER be rejected as 'developer debug text overlays'.\n\n"
+        )
         prompt = (
             f"You are {who} reviewing work built by the implementation team for the game being designed.\n"
             f"{mandate}"
+            f"{filmstrip_guide}"
             f"{self._format_bible_snapshot(game_bible)}\n"
             f"ITEMS AWAITING YOUR REVIEW (proof images are attached above):\n"
             + ("\n".join(self._format_item_for_review(i) for i in awaiting) or "  (none)")
@@ -1444,6 +1465,15 @@ class CreativeWritersRoom:
         if self.scheduler is not None:
             self.scheduler.start()
         deadline = time.monotonic() + self.drain_timeout_s
+
+        def _board_progress_sig() -> Tuple[int, int]:
+            all_items = self.board.items()
+            return (
+                sum(len(i.revisions) for i in all_items),
+                sum(1 for i in all_items if i.state in ("approved", "cancelled")),
+            )
+
+        last_progress_sig = _board_progress_sig()
         while True:
             paused_dur = self._wait_if_paused(candidate_dir)
             if paused_dur > 0:
@@ -1455,6 +1485,10 @@ class CreativeWritersRoom:
             applied = self._run_review_round(game_bible, dna_summary, candidate_dir)
             if self.board.is_drained():
                 return
+            cur_progress_sig = _board_progress_sig()
+            if applied > 0 or steered or cur_progress_sig != last_progress_sig:
+                last_progress_sig = cur_progress_sig
+                deadline = max(deadline, time.monotonic() + self.drain_timeout_s)
             active = [
                 i for i in self.board.items()
                 if i.state in ("ready", "in_progress", "changes_requested", "awaiting_review", "needs_decision")

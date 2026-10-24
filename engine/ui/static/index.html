@@ -2917,7 +2917,12 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       if (evTypeLower === 'backlog_item_started') {
         _lastBuildStoppedByErrorOrPromote = false;
         _lastRetryNotice = '';
-        _lastActivityHeadline = `⚡ Worker fabricating ${p.kind || 'item'} "${p.item_id || ''}" (Rev #${(p.revision || 0) + 1})...`;
+        const resumedTag = p.resumed ? 'Resuming' : 'Worker fabricating';
+        _lastActivityHeadline = `⚡ ${resumedTag} ${p.kind || 'item'} "${p.item_id || ''}" (Rev #${(p.revision || 0) + 1})...`;
+      } else if (evTypeLower === 'backlog_item_yielded') {
+        _lastBuildStoppedByErrorOrPromote = false;
+        _lastRetryNotice = '';
+        _lastActivityHeadline = `⏸️ Worker paused "${p.item_id || ''}" (${p.reason || 'code_lock busy'}) to execute parallel work...`;
       } else if (evTypeLower === 'backlog_item_lead_turn') {
         _lastBuildStoppedByErrorOrPromote = false;
         _lastRetryNotice = '';

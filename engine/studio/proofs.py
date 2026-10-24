@@ -199,19 +199,26 @@ def capture_filmstrip(
     label_h = 18
     footer_h = 18 if tick_snaps else 0
     row_h = cell[1] + label_h + footer_h
-    strip = Image.new("RGB", (cols * cell[0], rows * row_h), (10, 10, 14))
+    strip = Image.new("RGB", (cols * cell[0], rows * row_h), (24, 28, 36))
     draw = ImageDraw.Draw(strip)
     for i, (t, p) in enumerate(frames):
         with Image.open(p) as im:
             thumb = im.convert("RGB").resize(cell, Image.Resampling.LANCZOS)
         x, y = (i % cols) * cell[0], (i // cols) * row_h
         strip.paste(thumb, (x, y + label_h))
-        header_txt = f"tick {t}  {_active_inputs_at_tick(t, input_script, setup_script)}"
+        # Draw a crisp 1px frame outline around the 16:9 game viewport so reviewers clearly distinguish
+        # the in-game viewport from the external QA contact-sheet margin strips above/below it.
+        draw.rectangle(
+            [x, y + label_h, x + cell[0] - 1, y + label_h + cell[1] - 1],
+            outline=(90, 105, 130),
+            width=1,
+        )
+        header_txt = f"[QA] tick {t}  {_active_inputs_at_tick(t, input_script, setup_script)}"
         draw.text((x + 6, y + 3), header_txt[:62], fill=(240, 240, 240))
         if footer_h > 0:
             snap_txt = _format_snapshot_footer(tick_snaps.get(t))
             if snap_txt:
-                draw.text((x + 6, y + label_h + cell[1] + 2), snap_txt, fill=(140, 215, 245))
+                draw.text((x + 6, y + label_h + cell[1] + 2), f"[QA] {snap_txt}"[:62], fill=(140, 215, 245))
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     strip.save(out_path, "PNG")

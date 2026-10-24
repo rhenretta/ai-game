@@ -1364,13 +1364,17 @@ static func create_tiled_surface(
         return results
 
     def index_existing_files_on_disk(self) -> None:
-        """Scans assets/portraits/, assets/sprites/, and assets/audio/ to ensure any pre-existing files
-        are registered in assets/asset_library.json.
+        """Scans assets/portraits/, assets/sprites/, assets/tiles/, assets/backgrounds/, assets/ui/, and assets/audio/
+        to ensure any pre-existing files on disk are registered in assets/asset_library.json.
         """
+        existing_file_paths = {
+            str(e.file_path) for e in self.catalog.entries.values() if getattr(e, "file_path", None)
+        }
+
         for pfile in sorted(self.portraits_dir.glob("*.png")):
             aid = pfile.stem
-            if aid not in self.catalog.entries:
-                rel = f"assets/portraits/{pfile.name}"
+            rel = f"assets/portraits/{pfile.name}"
+            if aid not in self.catalog.entries and rel not in existing_file_paths:
                 self.catalog.entries[aid] = AssetLibraryEntry(
                     deliberation=f"Indexed existing portrait '{aid}' from disk.",
                     asset_id=aid,
@@ -1383,13 +1387,14 @@ static func create_tiled_surface(
                     texture_pixel_size=self._read_image_size(pfile),
                     sha256_hash=self._compute_sha256(pfile),
                 )
+                existing_file_paths.add(rel)
 
         for sfile in sorted(self.sprites_dir.glob("*.png")):
             if "portrait" in sfile.stem.lower() or sfile.stem.endswith("_sheet"):
                 continue
             aid = sfile.stem
-            if aid not in self.catalog.entries:
-                rel = f"assets/sprites/{sfile.name}"
+            rel = f"assets/sprites/{sfile.name}"
+            if aid not in self.catalog.entries and rel not in existing_file_paths:
                 tex_sz = self._read_image_size(sfile)
                 self.catalog.entries[aid] = AssetLibraryEntry(
                     deliberation=f"Indexed existing sprite '{aid}' from disk.",
@@ -1403,11 +1408,40 @@ static func create_tiled_surface(
                     texture_pixel_size=tex_sz,
                     sha256_hash=self._compute_sha256(sfile),
                 )
+                existing_file_paths.add(rel)
 
-        for afile in sorted(self.audio_dir.glob("*.wav")):
+        extra_visual_dirs = (
+            ("tiles", "tile", "tile_surface"),
+            ("backgrounds", "backdrop", "parallax_layer"),
+            ("ui", "diegetic_ui", "diegetic_ui"),
+        )
+        for subdir_name, default_atype, default_fmode in extra_visual_dirs:
+            sub_dir = self.assets_dir / subdir_name
+            if not sub_dir.is_dir():
+                continue
+            for vfile in sorted(sub_dir.rglob("*.png")):
+                aid = vfile.stem
+                rel = vfile.relative_to(self.cartridge_dir).as_posix()
+                if aid not in self.catalog.entries and rel not in existing_file_paths:
+                    tex_sz = self._read_image_size(vfile)
+                    self.catalog.entries[aid] = AssetLibraryEntry(
+                        deliberation=f"Indexed existing {default_atype} '{aid}' from {rel}.",
+                        asset_id=aid,
+                        asset_type=default_atype,
+                        fabrication_mode=default_fmode,
+                        purpose=f"In-world {default_atype} {aid}",
+                        res_path=f"res://{rel}",
+                        file_path=rel,
+                        target_display_size=tex_sz,
+                        texture_pixel_size=tex_sz,
+                        sha256_hash=self._compute_sha256(vfile),
+                    )
+                    existing_file_paths.add(rel)
+
+        for afile in sorted(self.audio_dir.rglob("*.wav")):
             aid = afile.stem
-            if aid not in self.catalog.entries:
-                rel = f"assets/audio/{afile.name}"
+            rel = afile.relative_to(self.cartridge_dir).as_posix()
+            if aid not in self.catalog.entries and rel not in existing_file_paths:
                 self.catalog.entries[aid] = AssetLibraryEntry(
                     deliberation=f"Indexed existing audio clip '{aid}' from disk.",
                     asset_id=aid,
@@ -1420,6 +1454,7 @@ static func create_tiled_surface(
                     texture_pixel_size=(0, 0),
                     sha256_hash=self._compute_sha256(afile),
                 )
+                existing_file_paths.add(rel)
 
     def build_prompt_summary_for_swe(self) -> str:
         """Formats a concise, high-signal summary of all available assets in the Cartridge Asset Library

@@ -13,6 +13,8 @@ from engine.studio.production_board import (
     BoardValidationError,
     ProductionBoard,
     WorkerResult,
+    WorkerYielded,
+    is_in_board_scheduler,
 )
 
 
@@ -298,3 +300,82 @@ def test_scheduler_background_mode_picks_up_items_added_later(tmp_path):
         assert b.get("late").state == "awaiting_review"
     finally:
         sch.stop()
+
+
+def test_worker_yields_on_busy_code_lock_and_runs_other_tasks_then_resumes(tmp_path):
+    """When Worker 1 holds `code_lock` on a code task, Worker 2 must NOT sit blocked waiting for `code_lock`:
+    it pauses/yields any code task that contends on `code_lock`, immediately executes ready parallel tasks
+    (such as `visual_asset` items), and resumes the paused code task once `code_lock` is released."""
+    events = []
+    b = ProductionBoard(event_callback=lambda et, p: events.append((et, p["item_id"], p.get("state"))))
+    b.add_items(
+        [
+            P("c1", kind="mechanic_code", modules=["a.gd"]),
+            P("c2", kind="mechanic_code", modules=["b.gd"]),
+        ],
+        "GameplaySystemsDesigner",
+    )
+
+    code_lock = threading.Lock()
+    c1_entered_lock = threading.Event()
+    release_c1 = threading.Event()
+    v_completed_while_c1_held_lock = []
+
+    def code_handler(item):
+        assert is_in_board_scheduler()
+        if item.item_id == "c1":
+            assert code_lock.acquire(blocking=False)
+            try:
+                c1_entered_lock.set()
+                # Wait until both visual asset tasks finish on Worker 2 while Worker 1 holds code_lock
+                assert release_c1.wait(timeout=5.0), "Worker 2 did not complete visual tasks while c1 held code_lock"
+                return WorkerResult(proof_images=[proof(tmp_path, "c1.png")], notes="c1 done")
+            finally:
+                code_lock.release()
+        else:
+            if not code_lock.acquire(blocking=False):
+                raise WorkerYielded("code_lock held by c1")
+            try:
+                return WorkerResult(proof_images=[proof(tmp_path, f"{item.item_id}.png")], notes="c2 done")
+            finally:
+                code_lock.release()
+
+    def visual_handler(item):
+        # Verify c1 is still holding code_lock while Worker 2 builds this visual asset
+        assert code_lock.locked()
+        res = WorkerResult(proof_images=[proof(tmp_path, f"{item.item_id}.png")], notes="asset done")
+        v_completed_while_c1_held_lock.append(item.item_id)
+        if len(v_completed_while_c1_held_lock) >= 2:
+            release_c1.set()
+        return res
+
+    sch = BoardScheduler(
+        b,
+        {"mechanic_code": code_handler, "visual_asset": visual_handler},
+        max_workers=2,
+        poll_interval=0.01,
+        code_lock=code_lock,
+    )
+    sch.start()
+    try:
+        assert c1_entered_lock.wait(timeout=5.0)
+        # Add two visual assets after c1 & c2 were initially dispatched so c2 has to yield its slot
+        b.add_items([P("v1", kind="visual_asset"), P("v2", kind="visual_asset")], "VisualArtDirectionLead")
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            states = {i.item_id: i.state for i in b.items()}
+            if all(st == "awaiting_review" for st in states.values()):
+                break
+            time.sleep(0.02)
+        states = {i.item_id: i.state for i in b.items()}
+        assert states == {
+            "c1": "awaiting_review",
+            "c2": "awaiting_review",
+            "v1": "awaiting_review",
+            "v2": "awaiting_review",
+        }
+        assert set(v_completed_while_c1_held_lock) == {"v1", "v2"}
+        assert any(et == "backlog_item_yielded" and iid == "c2" for et, iid, _ in events)
+    finally:
+        sch.stop()
+
