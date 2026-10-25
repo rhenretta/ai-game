@@ -935,6 +935,7 @@ def test_asset_tasks_cannot_clobber_shared_scene_and_code_lock_spans_swe_and_qa_
     assert set(available_specialists(ctx, mech_item)) == {
         "visual_artist",
         "audio_designer",
+        "script_writer",
         "swe_engineer",
         "qa_test_engineer",
     }
@@ -1280,6 +1281,984 @@ def test_council_filmstrip_contact_sheet_guidance_and_task_lead_multimodal_proof
         assert "[QA] pos=(...)" in prompt_text
         part_strings = [p for p in (parts_list or []) if isinstance(p, str)]
         assert any("QA CONTACT SHEET:" in s for s in part_strings)
+
+
+def test_context_curator_semantic_search_and_role_tailored_curation(tmp_path):
+    """Verifies that:
+    1. `CartridgeSemanticIndex` extracts discrete chunks across `asset` (concept art mockups & catalog sprites),
+       `council_utterance` (`writers_room_transcript`), `design_spec` (`game_bible.json` & `rendering_strategy.json`
+       per-subject treatments), `board_item`, and `code_module` (`bound_assets`).
+    2. `semantic_search` embeds texts via `client.models.embed_content`, caches vectors by SHA-256 in
+       `artifacts/context_index.json`, and ranks semantically matching chunks highest by cosine similarity.
+    3. `ContextCuratorAgent.curate_context` enforces Rule 4 (`deliberation` at field index 0 on `ContextCuratorDecision`),
+       assembles `CuratedContextPack` with selected text chunks + multimodal `Part` image attachments, and writes
+       `artifacts/work_items/<item_id>/context_pack_<role>.json`.
+    4. `_build_task_lead_multimodal_parts` attaches the 16:9 Concept Art Mockup even on Turn 0 (`collected_proofs=[]`),
+       and Council `_review_as` attaches the 16:9 Concept Art Mockup when reviewing `level_map` items."""
+    from types import SimpleNamespace
+    from engine.studio.context_curator import (
+        CartridgeSemanticIndex,
+        ContextChunk,
+        ContextCuratorAgent,
+        ContextCuratorDecision,
+    )
+    from engine.studio.models import (
+        GameBibleSpec,
+        ReviewBatch,
+        ReviewDecision,
+        VisualMockupArtifact,
+        WritersRoomUtterance,
+    )
+    from engine.studio.workers import _build_task_lead_multimodal_parts
+    from engine.studio.writers_room import CreativeWritersRoom
+
+    # Rule 4 check: deliberation must be at index 0
+    assert list(ContextChunk.model_fields.keys())[0] == "deliberation"
+    assert list(ContextCuratorDecision.model_fields.keys())[0] == "deliberation"
+
+    # Set up cartridge files on disk
+    mockup_path = tmp_path / "assets" / "mockups" / "mockup_spindle.png"
+    mockup_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (64, 36), (180, 120, 40)).save(mockup_path)
+
+    sprite_path = tmp_path / "assets" / "sprites" / "surveyor_platform_rig.png"
+    sprite_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGBA", (32, 32), (100, 110, 120, 255)).save(sprite_path)
+
+    bible = GameBibleSpec(
+        deliberation="d",
+        bible_id="b_spindle",
+        cartridge_id="c_spindle",
+        game_title="Omega Spindle",
+        core_genre="Precision Platformer",
+        visual_style_guide="Ornate astronomical brass clockwork with vitreous enamel spokes and crumbling masonry.",
+        visual_mockups=[
+            VisualMockupArtifact(
+                deliberation="d",
+                mockup_id="m_spindle",
+                title="Spindle Ascent Mockup",
+                scene_description="Three interlocking brass clockwork gears above a crumbling stone surveyor platform.",
+                ui_callout_notes=["Diegetic astrolabe dial"],
+                image_path="assets/mockups/mockup_spindle.png",
+            )
+        ],
+        writers_room_transcript=[
+            WritersRoomUtterance(
+                deliberation="d",
+                utterance_id="u1",
+                turn_index=1,
+                speaker_role="VisualArtDirector",
+                speaker_display_name="Visual Art Director",
+                spoken_dialogue="The Sector Primus gears must use layered ornate brass rim textures with enamel cutouts, never flat primitive circles.",
+                addressed_to=["GameplayDesigner"],
+                bible_updates_summary=["Defined brass clockwork gear visual direction"],
+            )
+        ],
+    )
+    (tmp_path / "game_bible.json").write_text(bible.model_dump_json(indent=2), encoding="utf-8")
+
+    (tmp_path / "rendering_strategy.json").write_text(
+        json.dumps(
+            {
+                "deliberation": "d",
+                "rendering_paradigm": "2.5D painterly clockwork",
+                "renderer": "forward_plus",
+                "treatments": [
+                    {
+                        "deliberation": "d",
+                        "subject_id": "interactive_gear_trains",
+                        "technique": "Layered Sprite2D nodes rotated procedurally with custom thermal shader.",
+                        "target_resolution": [1024, 1024],
+                        "notes": "Outer cycloidal tooth ring and enamel spokes.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    (tmp_path / "assets" / "asset_library.json").write_text(
+        json.dumps(
+            {
+                "entries": {
+                    "primus_crumbling_platform_prop": {
+                        "asset_id": "primus_crumbling_platform_prop",
+                        "asset_type": "prop",
+                        "fabrication_mode": "static_sprite",
+                        "res_path": "res://assets/sprites/surveyor_platform_rig.png",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    (tmp_path / "scenes.gd").write_text(
+        "extends Node2D\nclass ClockworkGear:\n\tpass\nfunc build_arena():\n\tvar p = 'res://assets/sprites/surveyor_platform_rig.png'\n",
+        encoding="utf-8",
+    )
+
+    board = ProductionBoard()
+    board.add_items(
+        [
+            WorkItemProposal(
+                deliberation="d",
+                item_id="sector_primus_gear_arena",
+                kind="level_map",
+                title="Sector Primus 3-Gear Clockwork Arena",
+                spec="Construct the 3-gear clockwork arena and lower surveyor platform.",
+                proof_spec="Filmstrip showing rotating gears and platform.",
+                target_modules=["scenes.gd"],
+            )
+        ],
+        "GameplayDesigner",
+    )
+
+    # Verify Turn 0 Task Lead multimodal parts include the 16:9 Concept Art Mockup even when collected_proofs is empty
+    ctx_turn0 = WorkerContext(cartridge_dir=tmp_path)
+    turn0_parts = _build_task_lead_multimodal_parts(ctx_turn0, [])
+    assert len(turn0_parts) == 2
+    assert "REFERENCE 16:9 CONCEPT ART MOCKUP" in turn0_parts[0]
+
+    # Create a mock live google.genai client with deterministic keyword-sensitive embeddings
+    embed_calls = []
+
+    class _LiveGenAIClientStub:
+        __module__ = "google.genai.client"
+
+        def __init__(self):
+            self.models = self
+
+        def embed_content(self, *, model, contents, config=None):
+            embed_calls.append(list(contents))
+            vecs = []
+            for text in contents:
+                tl = text.lower()
+                v = [0.1] * 256
+                if "gear" in tl or "clockwork" in tl or "enamel" in tl:
+                    v[0] = 0.95
+                if "platform" in tl or "surveyor" in tl:
+                    v[1] = 0.90
+                if "mockup" in tl or "concept" in tl:
+                    v[2] = 0.85
+                vecs.append(SimpleNamespace(values=v))
+            return SimpleNamespace(embeddings=vecs)
+
+        def generate_content(self, *, model, contents, config=None):
+            decision = ContextCuratorDecision(
+                deliberation="Selecting the concept art mockup, gear rendering treatment, VisualArtDirector utterance, and surveyor platform sprite for the Task Lead.",
+                search_queries_used=["clockwork gear arena", "brass enamel gear rendering"],
+                role_tailored_synthesis="Use the ornate brass/enamel gear aesthetic from the Concept Art Mockup and bind `surveyor_platform_rig.png` for the surveyor platform.",
+                selected_chunk_ids=[
+                    "asset:concept_mockup:0",
+                    "design:rendering:treatment:interactive_gear_trains",
+                    "council:utterance:turn_1_VisualArtDirector",
+                    "asset:catalog:primus_crumbling_platform_prop",
+                ],
+                selected_image_paths=[str(mockup_path)],
+            )
+            return SimpleNamespace(text=decision.model_dump_json())
+
+    live_client = _LiveGenAIClientStub()
+    curator_events = []
+    curator = ContextCuratorAgent(
+        cartridge_dir=tmp_path,
+        client=live_client,
+        board=board,
+        game_bible=bible,
+        event_callback=lambda et, pl: curator_events.append((et, pl)),
+    )
+
+    chunks = curator.semantic_index.extract_corpus_chunks(board=board, game_bible=bible)
+    chunk_ids = {c.chunk_id for c in chunks}
+    assert "asset:concept_mockup:0" in chunk_ids
+    assert "asset:catalog:primus_crumbling_platform_prop" in chunk_ids
+    assert "council:utterance:turn_1_VisualArtDirector" in chunk_ids
+    assert "design:rendering:treatment:interactive_gear_trains" in chunk_ids
+    assert "board:item:sector_primus_gear_arena" in chunk_ids
+    assert "code:module:scenes.gd" in chunk_ids
+
+    pack = curator.curate_context(
+        target_agent_role="task_lead",
+        task_request="Sector Primus 3-Gear Clockwork Arena: Construct the 3-gear clockwork arena and lower surveyor platform.",
+        item_id="sector_primus_gear_arena",
+        item_kind="level_map",
+    )
+    assert "SEMANTICALLY CURATED STUDIO CONTEXT" in pack.prompt_block
+    assert "interactive_gear_trains" in pack.prompt_block
+    assert "council:utterance:turn_1_VisualArtDirector" in pack.prompt_block
+    assert "surveyor_platform_rig.png" in pack.prompt_block
+    assert len(pack.multimodal_parts) == 2
+    assert "mockup_spindle.png" in pack.multimodal_parts[0]
+    assert (tmp_path / "artifacts" / "work_items" / "sector_primus_gear_arena" / "context_pack_task_lead.json").is_file()
+    assert any(et == "context_curator_packed" for et, _ in curator_events)
+
+    # Verify SHA-256 embedding cache prevents re-embedding unchanged corpus chunks on a second call with the same query
+    calls_before = len(embed_calls)
+    curator.curate_context(
+        target_agent_role="task_lead",
+        task_request="Sector Primus 3-Gear Clockwork Arena: Construct the 3-gear clockwork arena and lower surveyor platform.",
+        item_id="sector_primus_gear_arena",
+        item_kind="level_map",
+    )
+    assert len(embed_calls) == calls_before  # 100% cache hit in artifacts/context_index.json!
+
+
+def test_world_bg_color_rect_not_flagged_as_fullscreen_occlusion_and_snapshot_restores_all_gd(tmp_path):
+    """Verifies that:
+    1. `godot_harness.gd` does not falsely classify a world-space background `ColorRect` (`z_index <= 0` outside a
+       foreground `CanvasLayer`) or a background `CanvasLayer` (`layer < 0`) as `current_in_ui = true` /
+       `fullscreen_occlusion_detected = true`.
+    2. `_snapshot_modules` and `_restore_modules` snapshot and restore all `.gd` files in `cartridge_dir` (even those
+       not listed in `target_modules`), preventing a failed SWE verification from leaving side-effect `.gd` edits on disk."""
+    from pathlib import Path
+    from engine.studio.workers import _restore_modules, _snapshot_modules
+
+    harness_src = (Path(__file__).resolve().parent.parent / "engine" / "sim" / "godot_harness.gd").read_text(encoding="utf-8")
+    assert "var is_world_bg_color_rect = (node is ColorRect) and (not in_ui) and (node.z_index <= 0)" in harness_src
+    assert "var is_bg_canvas_layer = (node is CanvasLayer) and (node.layer < 0)" in harness_src
+
+    (tmp_path / "entities.gd").write_text("extends Node2D\n# original entities\n", encoding="utf-8")
+    (tmp_path / "scenes.gd").write_text("extends Node2D\n# original scenes\n", encoding="utf-8")
+
+    # Even if `modules` only lists `["entities.gd"]`, `_snapshot_modules` captures `scenes.gd` and removes newly created `.gd` files
+    snap = _snapshot_modules(tmp_path, ["entities.gd"])
+    (tmp_path / "entities.gd").write_text("extends Node2D\n# modified entities\n", encoding="utf-8")
+    (tmp_path / "scenes.gd").write_text("extends Node2D\n# modified scenes side-effect\n", encoding="utf-8")
+    (tmp_path / "extra_untracked.gd").write_text("extends Node2D\n", encoding="utf-8")
+
+    _restore_modules(tmp_path, snap)
+    assert (tmp_path / "entities.gd").read_text(encoding="utf-8") == "extends Node2D\n# original entities\n"
+    assert (tmp_path / "scenes.gd").read_text(encoding="utf-8") == "extends Node2D\n# original scenes\n"
+    assert not (tmp_path / "extra_untracked.gd").exists()
+
+
+def test_curated_multimodal_context_and_anti_workaround_gates(tmp_path):
+    """Verifies the 6 coordinated fixes that prevent agent context loss and superficial workarounds:
+    1. `ContextCuratorAgent` loads `backlog.json` when `board` is None, includes `hframes`/`vframes`/`tex_size` in
+       `asset:catalog:*` titles, and guarantees `board:item:{item_id}` + its prior proof image are included.
+    2. `CartridgeAssetLibrary.build_prompt_summary_for_swe` reports `hframes`, `vframes`, and `tex_size` for every mode
+       including `articulated_parts` (`hframes=1, vframes=1`).
+    3. `StudioOrchestrator._check_godot_gameplay_and_asset_gates` distinguishes `early_failure_state_detected` from
+       `fullscreen_occlusion_detected` and rejects `empty_sprite_frame_nodes` (`hframes > 1` on a single-frame texture).
+    4. `run_swe_engineer_specialist` passes prior revision `proof_paths` (`extra_image_paths`) and `board` to
+       `implement_requirement_track`.
+    5. `CreativeWritersRoom._format_item_for_review` marks `worker_notes` as `UNVERIFIED_WORKER_CLAIMS`.
+    """
+    from engine.studio.asset_library import CartridgeAssetLibrary
+    from engine.studio.context_curator import ContextCuratorAgent
+    from engine.studio.models import AssetLibraryCatalog, AssetLibraryEntry, RequirementTrack, RevisionRecord, WorkItem
+    from engine.studio.orchestrator import StudioOrchestrator
+    from engine.studio.workers import run_swe_engineer_specialist
+    from engine.studio.writers_room import CreativeWritersRoom
+
+    # 1. ContextCuratorAgent reads backlog.json when board=None and includes asset hframes/vframes
+    proof_img = tmp_path / "artifacts" / "work_items" / "mc_tether" / "filmstrip_mc_tether_rev0.png"
+    proof_img.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (64, 36), (40, 50, 60)).save(proof_img)
+
+    backlog_payload = {
+        "items": [
+            {
+                "deliberation": "d",
+                "item_id": "mc_tether",
+                "kind": "mechanic_code",
+                "title": "Player Tether Controller",
+                "spec": "Bind player rig and anchor.",
+                "proof_spec": "4-frame filmstrip.",
+                "state": "in_progress",
+                "revisions": [
+                    {
+                        "revision_index": 0,
+                        "proof_paths": [str(proof_img)],
+                        "worker_notes": "Claimed fixed",
+                        "verdict": "request_changes",
+                        "feedback": "Fix clipped sprite.",
+                    }
+                ],
+            }
+        ]
+    }
+    (tmp_path / "backlog.json").write_text(json.dumps(backlog_payload), encoding="utf-8")
+
+    assets_dir = tmp_path / "assets"
+    sprites_dir = assets_dir / "sprites"
+    sprites_dir.mkdir(parents=True, exist_ok=True)
+    rig_png = sprites_dir / "va_kaelen_rig.png"
+    Image.new("RGBA", (352, 512), (200, 120, 80, 255)).save(rig_png)
+
+    cat = AssetLibraryCatalog(
+        deliberation="d",
+        cartridge_id="test_cart",
+        entries={
+            "va_kaelen_rig": AssetLibraryEntry(
+                deliberation="d",
+                asset_id="va_kaelen_rig",
+                asset_type="sprite_sheet",
+                fabrication_mode="articulated_parts",
+                file_path="assets/sprites/va_kaelen_rig.png",
+                res_path="res://assets/sprites/va_kaelen_rig.png",
+                texture_pixel_size=[352, 512],
+                hframes=1,
+                vframes=1,
+            )
+        },
+    )
+    (assets_dir / "asset_library.json").write_text(cat.model_dump_json(indent=2), encoding="utf-8")
+
+    curator = ContextCuratorAgent(cartridge_dir=tmp_path, client=None, board=None)
+    chunks = curator.semantic_index.extract_corpus_chunks(board=None)
+    chunk_ids = {c.chunk_id for c in chunks}
+    assert "board:item:mc_tether" in chunk_ids
+    asset_chunk = next(c for c in chunks if c.chunk_id == "asset:catalog:va_kaelen_rig")
+    assert "hframes=1, vframes=1" in asset_chunk.title
+    assert "mode=articulated_parts" in asset_chunk.title
+
+    # 2. CartridgeAssetLibrary.build_prompt_summary_for_swe explicitly warns articulated_parts has hframes=1, vframes=1
+    lib = CartridgeAssetLibrary(cartridge_dir=tmp_path)
+    swe_summary = lib.build_prompt_summary_for_swe()
+    assert "hframes=1, vframes=1" in swe_summary
+    assert "NEVER set hframes>1 or vframes>1 on this composite!" in swe_summary
+
+    # 3. StudioOrchestrator gates: early_failure_state_detected vs fullscreen_occlusion_detected + empty_sprite_frame_nodes
+    orch = StudioOrchestrator.__new__(StudioOrchestrator)
+    track = RequirementTrack(
+        deliberation="d",
+        track_id="mc_tether",
+        title="Player Tether",
+        category="Core Mechanics",
+        description="Spec",
+        target_modules=["entities.gd"],
+    )
+    with pytest.raises(RuntimeError, match="Unrecoverable early failure state"):
+        orch._check_godot_gameplay_and_asset_gates(
+            tmp_path,
+            track,
+            {"fullscreen_occlusion_detected": False, "early_failure_state_detected": True},
+        )
+    with pytest.raises(RuntimeError, match="Invisible / mis-sliced Sprite2D frame detected"):
+        orch._check_godot_gameplay_and_asset_gates(
+            tmp_path,
+            track,
+            {
+                "fullscreen_occlusion_detected": False,
+                "early_failure_state_detected": False,
+                "empty_sprite_frame_nodes": ["Silt Skiff(res://assets/sprites/va_kaelen_rig.png, frame=0, hframes=4, vframes=1)"],
+            },
+        )
+    with pytest.raises(RuntimeError, match="Severe GPU SubViewport frame-rate thrashing detected"):
+        orch._check_godot_gameplay_and_asset_gates(
+            tmp_path,
+            track,
+            {
+                "fullscreen_occlusion_detected": False,
+                "early_failure_state_detected": False,
+                "subviewport_thrashing_nodes": ["CompactionMaskViewport (size=(1920, 1080), UPDATE_ALWAYS + CLEAR_MODE_NEVER)"],
+            },
+        )
+
+    # 4. run_swe_engineer_specialist forwards prior revision proof_paths and board to implement_requirement_track
+    captured_swe_kwargs = {}
+
+    class RecordingSwe:
+        def implement_requirement_track(self, track, staging_dir, requirements_spec=None, prior_error=None, **kwargs):
+            captured_swe_kwargs.update(kwargs)
+            for m in track.target_modules:
+                (Path(staging_dir) / m).write_text("extends Node2D\n", encoding="utf-8")
+
+    item_with_rev = WorkItem.model_validate(backlog_payload["items"][0])
+    ctx = WorkerContext(
+        cartridge_dir=tmp_path,
+        client=bw.make_client(lambda _c: "{}"),
+        swe_agent=RecordingSwe(),
+        board="sentinel_board",
+    )
+    run_swe_engineer_specialist(ctx, item_with_rev, "Fix sprite slicing", ["entities.gd"])
+    assert captured_swe_kwargs.get("extra_image_paths") == [str(proof_img)]
+    assert captured_swe_kwargs.get("board") == "sentinel_board"
+
+    # 5. CreativeWritersRoom labels worker_notes as UNVERIFIED_WORKER_CLAIMS
+    formatted = CreativeWritersRoom._format_item_for_review(item_with_rev)
+    assert "UNVERIFIED_WORKER_CLAIMS='Claimed fixed'" in formatted
+
+
+def test_multi_region_layout_validation_specialist_participation_and_level_filmstrip_gates(tmp_path):
+    """Verifies the 4 architectural guardrails against tiny single-screen programmer-art games:
+    1. `validate_level_layout` rejects a cramped 1-region / 1-screen layout when `LevelGenerationStrategy`
+       defines multiple `level_archetypes`.
+    2. `CreativeWritersRoom` seats un-spoken essential domain specialists (`UXExperienceDesigner`,
+       `AudioAtmosphereDesigner`, `LevelAndProgressionDesigner`, `GameplaySystemsEngineer`) and ensures
+       every required board specialist contributes before locking a full Production Board build.
+    3. `validate_task_lead_decision` blocks `submit_to_council` on a `level_map` task when only a 2D wireframe
+       `level_map_*.png` has been collected and `qa_test_engineer` is available, requiring a live Godot
+       `filmstrip_*.png` / `level_filmstrip_*.png`, and `VisualArtDirector` reviews `level_map` items.
+    4. `GodotHeadlessSimulator.run_until_complete` includes `--fixed-fps 60` in the Godot CLI command.
+    """
+    import inspect
+    from engine.sim.godot_verifier import GodotHeadlessSimulator
+    from engine.studio.models import (
+        LevelArchetypeSpec,
+        LevelEntitySpec,
+        LevelGenerationStrategy,
+        LevelLayoutSpec,
+        LevelRegionSpec,
+        LevelTriggerSpec,
+        TaskLeadDecision,
+        WorkItem,
+        validate_level_layout,
+    )
+    from engine.studio.production_board import ProductionBoard
+    from engine.studio.workers import validate_task_lead_decision
+    from engine.studio.writers_room import CreativeWritersRoom
+
+    # 1. Multi-archetype LevelGenerationStrategy rejects cramped 1-screen / 1-region LevelLayoutSpec
+    strategy = LevelGenerationStrategy(
+        deliberation="Three-tier vertical world.",
+        generation_approach="hybrid",
+        world_structure="Three linked vertical strata with scrolling camera.",
+        runtime_construction_plan="Procedural strata with textured polygons and multiple nodes.",
+        level_archetypes=[
+            LevelArchetypeSpec(
+                deliberation="Upper tier.",
+                archetype_id="tier_1_crust",
+                purpose="Acclimation",
+                visual_identity="Rime crust",
+                signature_challenge="First conduit",
+            ),
+            LevelArchetypeSpec(
+                deliberation="Mid tier.",
+                archetype_id="tier_2_cavern",
+                purpose="Pressure routing",
+                visual_identity="Deep cavern",
+                signature_challenge="Multi-junction split",
+            ),
+        ],
+        generation_rules=["Connect all tiers via vertical shafts."],
+        difficulty_and_pacing_curve="Escalates with depth.",
+    )
+    cramped_layout = LevelLayoutSpec(
+        deliberation="Shrunk to one 1280x720 screen.",
+        world_bounds=(0.0, 0.0, 1280.0, 720.0),
+        viewport_size=(1280, 720),
+        intended_world_scale_in_viewports=1.0,
+        camera_framing="fixed",
+        world_regions=[
+            LevelRegionSpec(
+                deliberation="Single screen.",
+                region_id="r0",
+                label="R0",
+                purpose="All in one box",
+                bounds=(0.0, 0.0, 1280.0, 720.0),
+                progression_order=0,
+            )
+        ],
+        entities=[
+            LevelEntitySpec(
+                deliberation="Spawn.",
+                entity_id="player",
+                label="Player",
+                entity_kind="spawn",
+                region_id="r0",
+                position=(200.0, 360.0),
+                size=(48.0, 48.0),
+            ),
+            LevelEntitySpec(
+                deliberation="Pipe.",
+                entity_id="pipe_1",
+                label="Pipe",
+                entity_kind="mechanism",
+                region_id="r0",
+                position=(640.0, 360.0),
+                size=(120.0, 48.0),
+                initial_state="broken",
+            ),
+            LevelEntitySpec(
+                deliberation="Well.",
+                entity_id="well_1",
+                label="Well",
+                entity_kind="goal",
+                region_id="r0",
+                position=(960.0, 360.0),
+                size=(96.0, 96.0),
+                initial_state="dormant",
+            ),
+        ],
+        triggers=[
+            LevelTriggerSpec(
+                deliberation="Pipe feeds well.",
+                trigger_id="t1",
+                source_entity_id="pipe_1",
+                target_entity_id="well_1",
+                condition="repaired",
+                resulting_state="active",
+            )
+        ],
+        progression_path=["r0"],
+    )
+    layout_issues = validate_level_layout(cramped_layout, strategy=strategy)
+    assert any("world_regions only defines 1 region" in i for i in layout_issues)
+    assert any("intended_world_scale_in_viewports" in i for i in layout_issues)
+    assert any(">= 4 entities" in i for i in layout_issues)
+
+    # 2. Level map review panel includes VisualArtDirector, and Task Lead cannot submit wireframe-only proof
+    lvl_item = WorkItem(
+        deliberation="Build world map",
+        item_id="world_layout",
+        title="World Layout",
+        kind="level_map",
+        spec="Multi-region world",
+    )
+    assert "VisualArtDirector" in CreativeWritersRoom._reviewers_for(lvl_item)
+
+    submit_decision = TaskLeadDecision.model_validate_json(
+        _lead_json("submit_to_council", strategy="Submit wireframe only", submission_summary="Done")
+    )
+    specialists = ["visual_artist", "swe_engineer", "qa_test_engineer"]
+    wireframe_only = [str(tmp_path / "level_map_world_layout_rev0.png")]
+    Path(wireframe_only[0]).write_bytes(b"png")
+    lead_issues = validate_task_lead_decision(
+        submit_decision,
+        specialists,
+        wireframe_only,
+        item_kind="level_map",
+    )
+    assert any("Cannot submit_to_council for a 'level_map' task with only a 2D wireframe diagram" in i for i in lead_issues)
+
+    with_filmstrip = wireframe_only + [str(tmp_path / "level_filmstrip_world_layout_rev0.png")]
+    Path(with_filmstrip[1]).write_bytes(b"png")
+    assert validate_task_lead_decision(submit_decision, specialists, with_filmstrip, item_kind="level_map") == []
+
+    # 3. Essential domain specialists are polled once conversation is underway, and required on full board builds
+    client = cb.base._FakeGeminiClient()
+    board = ProductionBoard(tmp_path / "backlog.json")
+    room = CreativeWritersRoom(client=client, max_turns=6, min_turns_before_convergence=2, board=board)
+    bible = room.run_writers_room(dna=cb.base._sample_dna(), candidate_dir=tmp_path)
+    spoken_roles = {u.speaker_role for u in bible.writers_room_transcript}
+    for required_role in (
+        "GameplayDesigner",
+        "LevelAndProgressionDesigner",
+        "GameplaySystemsEngineer",
+        "VisualArtDirector",
+        "UXExperienceDesigner",
+        "AudioAtmosphereDesigner",
+    ):
+        assert required_role in spoken_roles, f"Expected {required_role} to speak before locking a full board build"
+
+    # 4. GodotHeadlessSimulator enforces --fixed-fps 60
+    sim_src = inspect.getsource(GodotHeadlessSimulator.run_until_complete)
+    assert '"--fixed-fps", "60"' in sim_src
+
+
+def test_qa_error_recovery_in_task_lead_and_failed_item_escalation(tmp_path):
+    """Verifies that:
+    1. When `qa_test_engineer` raises a `StudioAgentError` on an early turn inside `run_task_lead`,
+       the error is caught and reported back to the Task Lead in `turn_history` (`verification_passed=False`)
+       so the Task Lead can delegate a fix to `swe_engineer` and re-run QA without crashing the item to `failed`.
+    2. `ProductionBoard.escalate_failed_to_decision` transitions a `failed` item to `needs_decision` with the
+       worker failure reason, and `apply_cap_decision(action='rewrite_spec')` resets `failure_count=0` and `failure=''`.
+    """
+    from engine.studio.models import CapDecision, StudioAgentError, WorkItemProposal
+    from engine.studio.production_board import ProductionBoard
+    from engine.studio.workers import task_lead_handler
+    from engine.studio.writers_room import CreativeWritersRoom
+
+    (tmp_path / "game_bible.json").write_text(json.dumps({"game_title": "RecoveryGame"}))
+    (tmp_path / "project.godot").write_text("[input]\ndive={}\n")
+
+    lead_turns = iter([
+        _lead_json("delegate", strategy="Turn 0: Implement spawner", specialist_agent="swe_engineer", brief="Implement spawner", target_paths=["mechanics.gd"]),
+        _lead_json("delegate", strategy="Turn 1: Run QA filmstrip", specialist_agent="qa_test_engineer", brief="Test spawner"),
+        _lead_json("delegate", strategy="Turn 2: QA failed; wire spawner into main.gd", specialist_agent="swe_engineer", brief="Wire spawner into main.gd", target_paths=["main.gd"]),
+        _lead_json("delegate", strategy="Turn 3: Re-run QA filmstrip", specialist_agent="qa_test_engineer", brief="Re-test spawner"),
+        _lead_json("submit_to_council", strategy="Turn 4: Submit after self-correcting QA error", submission_summary="Fixed wiring after QA error"),
+    ])
+    qa_attempts = {"n": 0}
+
+    def flaky_filmstrip(d, ticks, out_path, input_script=None):
+        qa_attempts["n"] += 1
+        if qa_attempts["n"] == 1:
+            raise StudioAgentError("QA filmstrip capture failed: spawner node not active")
+        Image.new("RGB", (24, 8)).save(out_path)
+        return Path(out_path)
+
+    def responder(contents):
+        text = contents if isinstance(contents, str) else "\n".join(c for c in contents if isinstance(c, str))
+        if "Task Lead Strategist" in text:
+            return next(lead_turns)
+        return plan_json(ticks=(5, 25), segs=[(1, 25, ["dive"])])
+
+    swe = FakeSwe()
+    ctx = WorkerContext(
+        cartridge_dir=tmp_path,
+        client=bw.make_client(responder),
+        swe_agent=swe,
+        filmstrip_fn=flaky_filmstrip,
+    )
+    res = task_lead_handler(ctx)(code_item(item_id="mechanic_airspace_generator", modules=["mechanics.gd"]))
+    assert qa_attempts["n"] == 2
+    assert len(swe.calls) == 2
+    assert "Fixed wiring after QA error" in res.notes
+
+    # Verify board escalation of failed items -> needs_decision -> rewrite_spec resets failure_count
+    board = ProductionBoard(tmp_path / "esc_backlog.json")
+    board.add_items(
+        [
+            WorkItemProposal(
+                deliberation="d",
+                item_id="shader_caustic",
+                kind="mechanic_code",
+                title="Caustic Shader",
+                spec="Old spec",
+                proof_spec="Show shader",
+                target_modules=["scenes.gd"],
+            )
+        ],
+        "VisualArtDirector",
+    )
+    board.claim_ready(limit=1)
+    board.fail_item("shader_caustic", "Error 1")
+    board.requeue_failed("shader_caustic")
+    board.claim_ready(limit=1)
+    board.fail_item("shader_caustic", "Error 2: shader uniform mismatch")
+    assert board.get("shader_caustic").failure_count == 2
+
+    escalated = board.escalate_failed_to_decision("shader_caustic")
+    assert escalated.state == "needs_decision"
+    assert "worker failed 2 times" in escalated.decision_reason
+    assert "last_worker_failure" in CreativeWritersRoom._format_item_for_review(escalated)
+
+    rewritten = board.apply_cap_decision(
+        CapDecision(
+            deliberation="Simplify shader spec",
+            item_id="shader_caustic",
+            action="rewrite_spec",
+            replacement_spec="Simplified CanvasItem shader spec",
+        )
+    )
+    assert rewritten.state == "ready"
+    assert rewritten.failure_count == 0
+    assert rewritten.failure == ""
+
+
+def test_prefix_cache_ordering_curator_reuse_and_token_usage_telemetry(tmp_path):
+    """Verifies that:
+    1. `call_gemini_with_transient_retry` records `usage_metadata` (`prompt_token_count`, `cached_content_token_count`,
+       `candidates_token_count`, `thoughts_token_count`) in `TOKEN_USAGE_TRACKER`.
+    2. `ContextCuratorAgent.curate_context` reuses the persisted pack for the same `(item_id, revision, normalized_role)`
+       across multi-turn `task_lead` calls, `swe_engineer` retries, and parallel `council_reviewer:*` panelists without
+       making redundant `ContextCuratorDecision` LLM calls.
+    3. `CreativeWritersRoom._evaluate_specialist_listen` places the shared `PLAYER DNA & STUDIO CONTEXT` + `bible_snapshot`
+       at byte 0 so parallel listener evaluations share an identical prefix.
+    4. `plan_task_lead_turn` places static instructions + curated context + prior revision history before turn-volatile
+       state and validation retries so Turns 0..N share an identical prefix at byte 0.
+    """
+    from types import SimpleNamespace
+    from engine.studio.context_curator import ContextCuratorAgent, ContextCuratorDecision
+    from engine.studio.models import (
+        GameBibleSpec,
+        TOKEN_USAGE_TRACKER,
+        WorkItem,
+        WorkItemProposal,
+        WritersRoomListenCheck,
+        call_gemini_with_transient_retry,
+    )
+    from engine.studio.production_board import ProductionBoard
+    from engine.studio.workers import WorkerContext, plan_task_lead_turn
+    from engine.studio.writers_room import CreativeWritersRoom, SPECIALIST_ROSTER
+
+    # 1. Verify TOKEN_USAGE_TRACKER captures usage_metadata
+    TOKEN_USAGE_TRACKER.reset()
+    fake_resp = SimpleNamespace(
+        text="ok",
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=4000,
+            cached_content_token_count=3200,
+            candidates_token_count=300,
+            thoughts_token_count=200,
+            total_token_count=4500,
+        ),
+    )
+    call_gemini_with_transient_retry(lambda: fake_resp, label="plan_task_lead_turn[item_1:t1]")
+    summary = TOKEN_USAGE_TRACKER.get_summary()
+    assert summary["total_calls"] == 1
+    assert summary["calls_with_cache_hit"] == 1
+    assert summary["total_prompt_tokens"] == 4000
+    assert summary["total_cached_tokens"] == 3200
+    assert summary["cached_token_share_pct"] == 80.0
+    assert summary["by_label"]["plan_task_lead_turn"]["cached_tokens"] == 3200
+
+    # 2. Verify ContextCuratorAgent reuses cached pack across turns and across parallel council_reviewer:* roles
+    board = ProductionBoard(tmp_path / "backlog.json")
+    board.add_items(
+        [
+            WorkItemProposal(
+                deliberation="d",
+                item_id="mech_valve",
+                kind="mechanic_code",
+                title="Thermal Valve",
+                spec="Build interactive valve.",
+                proof_spec="Filmstrip of valve rotation.",
+                target_modules=["mechanics.gd"],
+            )
+        ],
+        "GameplayDesigner",
+    )
+    curator_llm_calls = []
+
+    class _CuratorLiveStub:
+        __module__ = "google.genai.client"
+
+        def __init__(self):
+            self.models = self
+
+        def embed_content(self, *, model, contents, config=None):
+            return SimpleNamespace(embeddings=[SimpleNamespace(values=[0.2] * 256) for _ in contents])
+
+        def generate_content(self, *, model, contents, config=None):
+            curator_llm_calls.append(contents)
+            dec = ContextCuratorDecision(
+                deliberation="Selected valve context.",
+                search_queries_used=["thermal valve"],
+                role_tailored_synthesis="Synthesized valve context.",
+                selected_chunk_ids=["board:item:mech_valve"],
+                selected_image_paths=[],
+            )
+            return SimpleNamespace(text=dec.model_dump_json())
+
+    curator = ContextCuratorAgent(cartridge_dir=tmp_path, client=_CuratorLiveStub(), board=board)
+    pack_r1 = curator.curate_context("council_reviewer:VisualArtDirector", "Review valve", item_id="mech_valve", item_kind="mechanic_code")
+    pack_r2 = curator.curate_context("council_reviewer:GameplayDesigner", "Review valve", item_id="mech_valve", item_kind="mechanic_code")
+    pack_r3 = curator.curate_context("council_reviewer:UXExperienceDesigner", "Review valve", item_id="mech_valve", item_kind="mechanic_code")
+    assert len(curator_llm_calls) == 1  # All 3 reviewers shared 1 curation call!
+    assert pack_r1.prompt_block == pack_r2.prompt_block == pack_r3.prompt_block
+
+    # 3. Verify _evaluate_specialist_listen puts shared DNA + Bible snapshot at byte 0 across specialists
+    listen_prompts = []
+    bible = GameBibleSpec(deliberation="d", game_title="PrefixCacheGame", elevator_pitch="A deep systemic world.")
+    room = CreativeWritersRoom(client=cb.base._FakeGeminiClient())
+    room._call_structured_llm = lambda prompt, schema_cls, **kw: (
+        listen_prompts.append(prompt),
+        WritersRoomListenCheck(deliberation="d", should_interject=False, urgency_score=0.1, intended_contribution_summary=""),
+    )[1]
+    for sp in SPECIALIST_ROSTER[:4]:
+        room._evaluate_specialist_listen(sp, bible, "Shared DNA summary block")
+    assert len(listen_prompts) == 4
+    shared_prefix_len = len("PLAYER DNA & STUDIO CONTEXT:\nShared DNA summary block\n\n" + room._format_bible_snapshot(bible))
+    assert shared_prefix_len > 200
+    first_prefix = listen_prompts[0][:shared_prefix_len]
+    for p in listen_prompts[1:]:
+        assert p.startswith(first_prefix)
+
+    # 4. Verify plan_task_lead_turn shares byte-0 prefix across Turn 0 and Turn 1
+    lead_prompts = []
+
+    def lead_responder(contents):
+        text = contents if isinstance(contents, str) else "\n".join(c for c in contents if isinstance(c, str))
+        lead_prompts.append(text)
+        return _lead_json("delegate", strategy="Delegate to SWE", specialist_agent="swe_engineer", brief="Implement valve", target_paths=["mechanics.gd"])
+
+    ctx = WorkerContext(cartridge_dir=tmp_path, client=bw.make_client(lead_responder), swe_agent=FakeSwe(), board=board)
+    item = board.get("mech_valve")
+    plan_task_lead_turn(ctx, item, turn_history=[], collected_proofs=[])
+    from engine.studio.models import SpecialistReport
+    plan_task_lead_turn(
+        ctx,
+        item,
+        turn_history=[
+            SpecialistReport(
+                deliberation="d",
+                turn_index=0,
+                specialist_agent="swe_engineer",
+                brief="Implement valve",
+                summary="Implemented valve",
+                touched_files=["mechanics.gd"],
+                verification_passed=True,
+            )
+        ],
+        collected_proofs=[],
+    )
+    assert len(lead_prompts) == 2
+    common_instr_idx = lead_prompts[0].index("CARTRIDGE SYMBOLS & FILES:")
+    assert common_instr_idx > 2500
+    assert lead_prompts[0][:common_instr_idx] == lead_prompts[1][:common_instr_idx]
+
+
+def test_ai_cost_optimizations_without_quality_loss(tmp_path):
+    """Verifies the 6 AI token & call optimizations:
+    1. Standalone single-specialist asset tasks (`visual_asset`, `animation`, `audio_asset`) in `run_task_lead`
+       skip the redundant 3-call Task Lead wrapper in live mode (`is_real_genai_client`) and execute directly
+       while writing `lead_trace_rev0.json`.
+    2. `LeadGameplaySWEAgent._summarize_non_target_gd_module` condenses large non-target `.gd` modules to their
+       cross-module API signature + `get_state_snapshot` contract instead of dumping 20KB+ of implementation body.
+    3. `plan_filmstrip` reuses `context_pack_task_lead.json` when present on disk (0 extra curation calls), and
+       `_build_task_lead_multimodal_parts` attaches only the latest filmstrip when multiple filmstrips exist.
+    4. `CreativeWritersRoom._select_next_speaker` in live mode narrows `WritersRoomListenCheck` polling to
+       `addressed_to` specialists (plus at most 1 unheard essential specialist).
+    5. `ProductionBoard.snapshot_text` compacts terminal (`approved` / `cancelled`) items when board size > 8.
+    """
+    from types import SimpleNamespace
+    from engine.studio.context_curator import ContextCuratorDecision
+    from engine.studio.models import GameBibleSpec, ReviewDecision, WorkItemProposal, WritersRoomListenCheck
+    from engine.studio.production_board import ProductionBoard, WorkerResult
+    from engine.studio.swe import LeadGameplaySWEAgent
+    from engine.studio.workers import _build_task_lead_multimodal_parts, plan_filmstrip, run_task_lead
+    from engine.studio.writers_room import CreativeWritersRoom
+
+    (tmp_path / "game_bible.json").write_text(
+        GameBibleSpec(deliberation="d", bible_id="b1", cartridge_id="c1", game_title="OptGame", core_genre="Sim").model_dump_json()
+    )
+    (tmp_path / "project.godot").write_text("[input]\ndive={}\n")
+
+    # 1. Direct single-specialist execution for standalone visual_asset in live mode
+    llm_schemas_called = []
+
+    class _LiveOptClient:
+        __module__ = "google.genai.client"
+
+        def __init__(self):
+            self.models = self
+
+        def embed_content(self, *, model, contents, config=None):
+            return SimpleNamespace(embeddings=[SimpleNamespace(values=[0.2] * 256) for _ in contents])
+
+        def generate_content(self, *, model, contents, config=None):
+            schema = getattr(config, "response_schema", None)
+            sname = getattr(schema, "__name__", str(schema))
+            llm_schemas_called.append(sname)
+            if sname == "ContextCuratorDecision":
+                return SimpleNamespace(
+                    text=ContextCuratorDecision(
+                        deliberation="d",
+                        search_queries_used=["q"],
+                        role_tailored_synthesis="synth",
+                        selected_chunk_ids=[],
+                        selected_image_paths=[],
+                    ).model_dump_json()
+                )
+            if sname == "AssetRequirement":
+                return SimpleNamespace(text=bw.req_json("crate_prop"))
+            if sname == "FilmstripPlan":
+                return SimpleNamespace(text=plan_json(ticks=(5, 20), segs=[(1, 20, ["dive"])]))
+            if sname == "WritersRoomListenCheck":
+                return SimpleNamespace(
+                    text=WritersRoomListenCheck(
+                        deliberation="d",
+                        should_interject=True,
+                        urgency_score=0.8,
+                        intended_contribution_summary="s",
+                    ).model_dump_json()
+                )
+            raise AssertionError(f"Unexpected schema {sname}")
+
+    live_client = _LiveOptClient()
+    ctx = WorkerContext(
+        cartridge_dir=tmp_path,
+        client=live_client,
+        library_factory=bw.FakeLibrary,
+    )
+    vis_item = bw.item("crate_prop", kind="visual_asset")
+    res = run_task_lead(ctx, vis_item)
+    assert "TaskLeadDecision" not in llm_schemas_called
+    assert "AssetRequirement" in llm_schemas_called
+    trace_file = tmp_path / "artifacts" / "work_items" / "crate_prop" / "lead_trace_rev0.json"
+    assert trace_file.is_file()
+    assert json.loads(trace_file.read_text(encoding="utf-8"))["status"] == "submitted"
+    assert res.proof_images
+
+    # 2. _summarize_non_target_gd_module extracts API signatures + get_state_snapshot without dumping method bodies
+    long_gd = (
+        "extends Node2D\nclass_name BigEntities\nsignal valve_opened(pressure: float)\nconst MAX_PRESSURE: float = 100.0\n"
+        "var current_pressure: float = 12.5\n"
+        "func apply_impulse_step(delta: float, force: Vector2) -> void:\n"
+        + "".join(f"\tvar local_calc_{i} = delta * {i}\n" for i in range(120))
+        + "func get_state_snapshot() -> Dictionary:\n\treturn {'pressure': current_pressure, 'max': MAX_PRESSURE}\n"
+    )
+    assert len(long_gd) > 2500
+    sig = LeadGameplaySWEAgent._summarize_non_target_gd_module("entities.gd", long_gd)
+    assert len(sig) < 500
+    assert "signal valve_opened" in sig
+    assert "func apply_impulse_step(delta: float, force: Vector2) -> void:" in sig
+    assert "local_calc_50" not in sig
+    assert "func get_state_snapshot() -> Dictionary:" in sig
+    assert "'pressure': current_pressure" in sig
+
+    # 3. plan_filmstrip reuses context_pack_task_lead.json when present (0 extra ContextCuratorDecision calls)
+    mech = code_item(item_id="mech_reuse", modules=["mechanics.gd"])
+    from engine.studio.context_curator import ContextCuratorAgent
+    curator = ContextCuratorAgent(cartridge_dir=tmp_path, client=live_client)
+    curator.curate_context(
+        target_agent_role="task_lead",
+        task_request="Build mech_reuse",
+        item_id="mech_reuse",
+        item_kind="mechanic_code",
+    )
+    llm_schemas_called.clear()
+    fplan = plan_filmstrip(ctx, mech)
+    assert fplan.capture_ticks == [5, 20]
+    assert "ContextCuratorDecision" not in llm_schemas_called
+    assert llm_schemas_called == ["FilmstripPlan"]
+
+    # Deduplicating multiple filmstrips in _build_task_lead_multimodal_parts keeps only the latest filmstrip
+    f1 = tmp_path / "filmstrip_turn1.png"
+    f2 = tmp_path / "filmstrip_turn3.png"
+    plate = tmp_path / "plate_hero.png"
+    for p in (f1, f2, plate):
+        Image.new("RGB", (16, 16), (10, 20, 30)).save(p)
+    mm_parts = _build_task_lead_multimodal_parts(ctx, [str(plate), str(f1), str(f2)])
+    mm_labels = [p for p in mm_parts if isinstance(p, str)]
+    assert any("plate_hero.png" in s for s in mm_labels)
+    assert any("filmstrip_turn3.png" in s for s in mm_labels)
+    assert not any("filmstrip_turn1.png" in s for s in mm_labels)
+
+    # 4. CreativeWritersRoom._select_next_speaker narrows polling to invited specialists (+ 1 unheard essential if invited already spoke)
+    llm_schemas_called.clear()
+    room = CreativeWritersRoom(client=live_client)
+    bible = GameBibleSpec(deliberation="d", bible_id="b1", cartridge_id="c1", game_title="OptGame", core_genre="Sim")
+    room._select_next_speaker(
+        last_speaker_role="CreativeDirector",
+        addressed_to=["GameplayDesigner"],
+        game_bible=bible,
+        dna_summary="dna",
+        spoken_counts={"CreativeDirector": 1, "VisualArtDirector": 1},
+    )
+    # GameplayDesigner is unheard and explicitly invited -> only 1 call instead of 7
+    assert len(llm_schemas_called) == 1
+
+    llm_schemas_called.clear()
+    room._select_next_speaker(
+        last_speaker_role="CreativeDirector",
+        addressed_to=["GameplayDesigner"],
+        game_bible=bible,
+        dna_summary="dna",
+        spoken_counts={"CreativeDirector": 1, "GameplayDesigner": 1},
+    )
+    # GameplayDesigner already spoke -> polls GameplayDesigner + 1 unheard essential specialist (2 calls instead of 7)
+    assert len(llm_schemas_called) == 2
+
+    # 5. ProductionBoard.snapshot_text compacts approved items when board has > 8 items
+    board = ProductionBoard()
+    proposals = [
+        WorkItemProposal(
+            deliberation="d",
+            item_id=f"item_{i}",
+            kind="visual_asset" if i < 7 else "mechanic_code",
+            title=f"Task Number {i}",
+            spec="Spec",
+            proof_spec="Proof",
+        )
+        for i in range(10)
+    ]
+    board.add_items(proposals, "GameplayDesigner")
+    board.claim_ready(limit=6)
+    for i in range(6):
+        board.submit_result(f"item_{i}", WorkerResult(notes="ok"))
+        board.apply_review(ReviewDecision(deliberation="ok", item_id=f"item_{i}", verdict="approve"))
+    snap = board.snapshot_text()
+    assert "- APPROVED ITEMS (6):" in snap
+    assert "[item_0] (visual_asset)" in snap
+    assert "- [item_8] mechanic_code 'Task Number 8' state=ready" in snap
+
+
 
 
 

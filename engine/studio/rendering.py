@@ -153,14 +153,16 @@ def ensure_rendering_strategy(
 
 
 _COMMON_GUIDE = (
-    "GODOT 4.3 RENDERING EXECUTION GUIDE (realize the game's specific `RenderingStrategySpec`; never substitute flat untextured programmer-art rectangles for authored visuals):\n"
-    "- World & Stage Surfaces: construct the environment according to `rendering_paradigm` and each subject's `technique` in `treatments` "
-    "(e.g. multi-plane layers, top-down/isometric surfaces, single-screen stage compositions, or procedural/shader canvases); use `Sprite2D` "
+    "GODOT 4.3 RENDERING EXECUTION GUIDE (realize the game's specific `RenderingStrategySpec`; combine procedural generation with fabricated textures/sprites and never substitute flat untextured programmer-art polygons or bare lines for authored visuals):\n"
+    "- Hybrid Procedural + Generated World Surfaces: construct the environment according to `rendering_paradigm` and each subject's `technique` in `treatments` "
+    "by combining procedural geometry (noise/cellular-automata/spline `Polygon2D` & `Line2D` contours) with fabricated seamless `tile_surface` textures "
+    "(`StudioRigHelper.create_tiled_polygon(points, tex)` / `texture_repeat = CanvasItem.TEXTURE_REPEAT_ENABLED`), `Line2D` repeatable strip textures "
+    "(`texture_mode = Line2D.LINE_TEXTURE_TILE`), custom `CanvasItem` `ShaderMaterial`s, and scattered environmental `Sprite2D` decals/landmarks; use `Sprite2D` "
     "with `texture_filter = TEXTURE_FILTER_LINEAR` (smooth, not pixelated) unless `pixelated_style_intended` is True.\n"
     "- Lighting: `CanvasModulate` for ambient tone, `PointLight2D`/`DirectionalLight2D` with soft gradient textures for emissive sources.\n"
-    "- Effects: `GPUParticles2D` + `ParticleProcessMaterial`, `Line2D` trails, `CanvasItem` shaders, additive blending via `CanvasItemMaterial.blend_mode = BLEND_MODE_ADD`.\n"
-    "- Actors & Entities: follow the per-subject `treatment` in `rendering_strategy.json` — sprite sheets, articulated multi-part rigs, or procedural/shader motion.\n"
-    "- Camera: configure `Camera2D` (or fixed stage framing) to match the Game Bible's `camera_and_spatial_paradigm` and `world_bounds`.\n"
+    "- Effects: `GPUParticles2D` + `ParticleProcessMaterial`, textured/shader `Line2D` trails, `CanvasItem` shaders, additive blending via `CanvasItemMaterial.blend_mode = BLEND_MODE_ADD`.\n"
+    "- Actors & Interactive Structures: follow the per-subject `treatment` in `rendering_strategy.json` — bind fabricated sprite sheets, articulated multi-part rigs, and coherently layered structure sprites.\n"
+    "- Camera & HUD Separation: configure an active `Camera2D` to track the player/focus across `world_bounds` according to `camera_and_spatial_paradigm`, and isolate all HUD/UI gauges and prompts on a screen-space `CanvasLayer`.\n"
     "- 3D (when the strategy uses 3D): `SubViewport`/`Node3D` scenes with `MeshInstance3D`, `DirectionalLight3D`, `Environment`.\n"
 )
 

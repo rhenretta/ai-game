@@ -105,12 +105,17 @@ class ProductionBoard:
     def _load(self) -> None:
         data = json.loads(self.path.read_text(encoding="utf-8"))
         self._design_revision = int(data.get("design_revision", 0))
+        dirty = False
         for raw in data.get("items", []):
             item = WorkItem.model_validate(raw)
-            if item.state == "in_progress":  # worker died with the process: re-queue
+            if item.state in ("in_progress", "failed"):  # worker died with the process or build was resumed: re-queue
                 item.state = "changes_requested" if item.revisions and item.revisions[-1].feedback else "ready"
+                item.failure_count = 0
+                dirty = True
             self._items[item.item_id] = item
         self._refresh()
+        if dirty:
+            self._persist()
 
     def _persist(self) -> None:
         if self.path is None:
@@ -170,6 +175,19 @@ class ProductionBoard:
         with self._lock:
             return all(i.state in TERMINAL_STATES for i in self._items.values())
 
+    def items_for_slice(self, slice_id: str) -> List[WorkItem]:
+        """Returns all board items belonging to `slice_id` (or all items if `slice_id` is empty)."""
+        with self._lock:
+            if not slice_id:
+                return [i.model_copy(deep=True) for i in self._items.values()]
+            return [i.model_copy(deep=True) for i in self._items.values() if i.slice_id == slice_id]
+
+    def is_slice_drained(self, slice_id: str) -> bool:
+        """True when every item belonging to `slice_id` is approved or cancelled."""
+        with self._lock:
+            target = [i for i in self._items.values() if not slice_id or i.slice_id == slice_id]
+            return all(i.state in TERMINAL_STATES for i in target)
+
     def unresolved(self) -> List[WorkItem]:
         with self._lock:
             return [i.model_copy(deep=True) for i in self._items.values() if i.state not in TERMINAL_STATES]
@@ -208,10 +226,30 @@ class ProductionBoard:
             for i in self._items.values():
                 counts[i.state] = counts.get(i.state, 0) + 1
             lines = [f"PRODUCTION BOARD ({len(self._items)} items; states={counts}; drained={self.is_drained()}):"]
+            approved_items = [i for i in self._items.values() if i.state == "approved"]
+            cancelled_items = [i for i in self._items.values() if i.state == "cancelled"]
+            compact_terminals = len(self._items) > 8 and (len(approved_items) + len(cancelled_items)) >= 4
+            if compact_terminals:
+                if approved_items:
+                    lines.append(
+                        f"- APPROVED ITEMS ({len(approved_items)}): "
+                        + ", ".join(f"[{i.item_id}] ({i.kind})" for i in approved_items)
+                    )
+                if cancelled_items:
+                    lines.append(
+                        f"- CANCELLED ITEMS ({len(cancelled_items)}): "
+                        + ", ".join(f"[{i.item_id}] ({i.kind})" for i in cancelled_items)
+                    )
             for i in self._items.values():
+                if compact_terminals and i.state in ("approved", "cancelled"):
+                    continue
                 extra = ""
+                if i.slice_id:
+                    extra += f" slice={i.slice_id}"
+                if i.spawned_by_item_id:
+                    extra += f" spawned_by={i.spawned_by_item_id}"
                 if i.state == "needs_decision":
-                    extra = f" REASON={i.decision_reason}"
+                    extra += f" REASON={i.decision_reason}"
                 if i.accepted_compromise:
                     extra += " [accepted compromise]"
                 lines.append(
@@ -244,10 +282,19 @@ class ProductionBoard:
                     issues.append(f"Item '{p.item_id}' depends on unknown item '{d}'.")
             if p.item_id in p.depends_on:
                 issues.append(f"Item '{p.item_id}' depends on itself.")
-        # cycle detection over (existing + batch)
+            for b in getattr(p, "blocks_items", None) or []:
+                if b not in known:
+                    issues.append(f"Item '{p.item_id}' blocks_items references unknown item '{b}'.")
+                if b == p.item_id:
+                    issues.append(f"Item '{p.item_id}' cannot block itself in blocks_items.")
+        # cycle detection over (existing + batch + blocks_items edges)
         graph: Dict[str, List[str]] = {i.item_id: list(i.depends_on) for i in self._items.values()}
         for p in proposals:
             graph[p.item_id] = list(p.depends_on)
+        for p in proposals:
+            for b in getattr(p, "blocks_items", None) or []:
+                if b in graph and p.item_id not in graph[b]:
+                    graph[b].append(p.item_id)
         indegree = {n: 0 for n in graph}
         children: Dict[str, List[str]] = {n: [] for n in graph}
         for n, deps in graph.items():
@@ -270,7 +317,12 @@ class ProductionBoard:
         return issues
 
     # ------------------------------------------------------------------ mutations
-    def add_items(self, proposals: List[WorkItemProposal], raised_by_role: str = "") -> List[WorkItem]:
+    def add_items(
+        self,
+        proposals: List[WorkItemProposal],
+        raised_by_role: str = "",
+        slice_id: str = "",
+    ) -> List[WorkItem]:
         """Adds a validated batch atomically; raises BoardValidationError (with every issue) otherwise."""
         with self._lock:
             issues = self._validate_batch(proposals, existing=set(self._items))
@@ -288,16 +340,139 @@ class ProductionBoard:
                     depends_on=list(p.depends_on),
                     target_modules=list(p.target_modules),
                     raised_by_role=raised_by_role,
+                    slice_id=p.slice_id or slice_id,
                     design_revision=self._design_revision,
                     state="blocked",
                     max_revisions=p.max_revisions or self.default_max_revisions,
                 )
                 self._items[item.item_id] = item
                 added.append(item)
+            for p in proposals:
+                for b_id in getattr(p, "blocks_items", None) or []:
+                    tgt = self._items.get(b_id)
+                    if tgt is not None and tgt.state not in TERMINAL_STATES and p.item_id not in tgt.depends_on:
+                        tgt.depends_on.append(p.item_id)
             self._refresh()
             self._persist()
             for item in added:
-                self._emit("backlog_item_created", self._items[item.item_id], depends_on=item.depends_on)
+                self._emit(
+                    "backlog_item_created",
+                    self._items[item.item_id],
+                    depends_on=item.depends_on,
+                    slice_id=item.slice_id,
+                )
+            return [self._items[i.item_id].model_copy(deep=True) for i in added]
+
+    def spawn_tasks_from_item(
+        self,
+        parent_item_id: str,
+        proposals: List[WorkItemProposal],
+        wait_for_spawned: bool = True,
+    ) -> List[WorkItem]:
+        """Atomically spawns new tasks discovered by an executing task onto the ProductionBoard.
+
+        When `wait_for_spawned` is True, the newly spawned task IDs are added to `parent.depends_on`
+        and `parent` transitions back to `blocked` until those spawned tasks are built and approved,
+        enabling emergent just-in-time asset & sub-mechanic discovery (`Tasks -> More Tasks`).
+        """
+        with self._lock:
+            parent = self._require(parent_item_id)
+            if not proposals:
+                raise BoardValidationError("spawn_tasks_from_item requires at least one WorkItemProposal.")
+            sanitized_proposals: List[WorkItemProposal] = []
+            existing_wait_ids: List[str] = []
+            for raw_p in proposals:
+                p = raw_p.model_copy(deep=True)
+                if wait_for_spawned and parent_item_id in p.depends_on:
+                    p.depends_on = [d for d in p.depends_on if d != parent_item_id]
+                if wait_for_spawned and p.item_id in self._items and p.item_id != parent_item_id:
+                    if p.item_id not in existing_wait_ids:
+                        existing_wait_ids.append(p.item_id)
+                    continue
+                if p.kind == "level_map" and "level_layout.json" not in p.target_modules:
+                    p.target_modules.append("level_layout.json")
+                elif p.kind in ASSET_KINDS:
+                    p.target_modules = [m for m in p.target_modules if not str(m).endswith(".gd")]
+                sanitized_proposals.append(p)
+
+            issues = self._validate_batch(sanitized_proposals, existing=set(self._items)) if sanitized_proposals else []
+            if wait_for_spawned and not issues:
+                batch_map = {p.item_id: list(p.depends_on) for p in sanitized_proposals}
+                check_roots = [(p.item_id, list(p.depends_on)) for p in sanitized_proposals] + [
+                    (eid, list(self._items[eid].depends_on)) for eid in existing_wait_ids
+                ]
+                for root_id, root_deps in check_roots:
+                    stack = list(root_deps)
+                    seen: Set[str] = set()
+                    while stack:
+                        n = stack.pop()
+                        if n == parent_item_id:
+                            issues.append(
+                                f"Spawned/linked prerequisite task '{root_id}' cannot depend (directly or transitively) on parent '{parent_item_id}' when wait_for_spawned=True."
+                            )
+                            break
+                        if n in seen:
+                            continue
+                        seen.add(n)
+                        if n in batch_map:
+                            stack.extend(batch_map[n])
+                        elif n in self._items:
+                            stack.extend(self._items[n].depends_on)
+            if issues:
+                raise BoardValidationError("; ".join(issues))
+
+            added: List[WorkItem] = []
+            for p in sanitized_proposals:
+                item = WorkItem(
+                    deliberation=p.deliberation,
+                    item_id=p.item_id,
+                    kind=p.kind,
+                    title=p.title,
+                    spec=p.spec,
+                    proof_spec=p.proof_spec,
+                    depends_on=list(p.depends_on),
+                    target_modules=list(p.target_modules),
+                    raised_by_role=parent.raised_by_role or "TaskLead",
+                    slice_id=p.slice_id or parent.slice_id,
+                    spawned_by_item_id=parent.item_id,
+                    design_revision=self._design_revision,
+                    state="blocked",
+                    max_revisions=p.max_revisions or self.default_max_revisions,
+                    priority=(parent.priority + 1) if wait_for_spawned else parent.priority,
+                )
+                self._items[item.item_id] = item
+                added.append(item)
+            for p in sanitized_proposals:
+                for b_id in getattr(p, "blocks_items", None) or []:
+                    tgt = self._items.get(b_id)
+                    if tgt is not None and tgt.state not in TERMINAL_STATES and p.item_id not in tgt.depends_on:
+                        tgt.depends_on.append(p.item_id)
+
+            if wait_for_spawned:
+                for wait_id in [i.item_id for i in added] + existing_wait_ids:
+                    if wait_id not in parent.depends_on:
+                        parent.depends_on.append(wait_id)
+                self._yielded_on_code_lock.discard(parent.item_id)
+                if self._active_resumed_code_lock_item == parent.item_id:
+                    self._active_resumed_code_lock_item = None
+                parent.state = "blocked"
+
+            self._refresh()
+            self._persist()
+            for item in added:
+                self._emit(
+                    "backlog_item_created",
+                    self._items[item.item_id],
+                    depends_on=item.depends_on,
+                    slice_id=item.slice_id,
+                    spawned_by=parent.item_id,
+                )
+            self._emit(
+                "backlog_item_spawned_tasks",
+                parent,
+                spawned_item_ids=[i.item_id for i in added],
+                wait_for_spawned=wait_for_spawned,
+            )
             return [self._items[i.item_id].model_copy(deep=True) for i in added]
 
     def update_item(
@@ -366,6 +541,21 @@ class ProductionBoard:
                 raise BoardValidationError(f"Item '{item_id}' is {item.state}, not failed.")
             item.state = "ready" if self._deps_satisfied(item) else "blocked"
             self._persist()
+            return item.model_copy(deep=True)
+
+    def escalate_failed_to_decision(self, item_id: str) -> WorkItem:
+        """Escalates a repeatedly failed item (`failure_count >= 2`) to `needs_decision` so the Council can
+        rewrite its spec, accept as-is, or cancel & unblock dependents instead of aborting the whole build."""
+        with self._lock:
+            item = self._require(item_id)
+            if item.state != "failed":
+                raise BoardValidationError(f"Item '{item_id}' is {item.state}, not failed.")
+            short_err = (item.failure.strip().splitlines()[-1] if item.failure.strip() else "worker error")[:240]
+            reason = f"worker failed {item.failure_count} times ({short_err})"
+            item.state = "needs_decision"
+            item.decision_reason = reason
+            self._persist()
+            self._emit("backlog_item_needs_decision", item, reason=reason)
             return item.model_copy(deep=True)
 
     def _require(self, item_id: str) -> WorkItem:
@@ -490,14 +680,21 @@ class ProductionBoard:
             return claimed
 
     def yield_item(self, item_id: str, reason: str = "") -> WorkItem:
-        """Pauses an in-progress item back to its runnable state so the worker slot can execute another item."""
+        """Pauses an in-progress item back to its runnable or blocked state so the worker slot can execute another item."""
         with self._lock:
             item = self._require(item_id)
             if self._active_resumed_code_lock_item == item_id:
                 self._active_resumed_code_lock_item = None
+            deps_ok = self._deps_satisfied(item)
             if item.state == "in_progress":
-                item.state = "changes_requested" if item.revisions and item.revisions[-1].feedback else "ready"
-            self._yielded_on_code_lock.add(item_id)
+                if not deps_ok:
+                    item.state = "blocked"
+                else:
+                    item.state = "changes_requested" if item.revisions and item.revisions[-1].feedback else "ready"
+            if reason == "spawned_prerequisite_tasks" or not deps_ok:
+                self._yielded_on_code_lock.discard(item_id)
+            else:
+                self._yielded_on_code_lock.add(item_id)
             self._refresh()
             self._persist()
             self._emit(
@@ -615,6 +812,8 @@ class ProductionBoard:
                 item.spec_resets += 1
                 item.cap_base_index = len(item.revisions)
                 item.decision_reason = ""
+                item.failure_count = 0
+                item.failure = ""
                 item.state = "ready" if self._deps_satisfied(item) else "blocked"
                 self._persist()
                 self._emit("backlog_item_spec_rewritten", item, spec_resets=item.spec_resets)
@@ -630,7 +829,8 @@ class ProductionBoard:
                     self._items[p.item_id] = WorkItem(
                         deliberation=p.deliberation, item_id=p.item_id, kind=p.kind, title=p.title, spec=p.spec,
                         proof_spec=p.proof_spec, depends_on=deps, target_modules=list(p.target_modules),
-                        raised_by_role=item.raised_by_role, design_revision=self._design_revision, state="blocked",
+                        raised_by_role=item.raised_by_role, slice_id=p.slice_id or item.slice_id,
+                        design_revision=self._design_revision, state="blocked",
                         max_revisions=p.max_revisions or self.default_max_revisions,
                     )
                 for other in self._items.values():  # dependents now wait for every split piece
@@ -667,6 +867,10 @@ class BoardScheduler:
     ) -> None:
         self.board = board
         self.handlers = handlers
+        for h in handlers.values():
+            w_ctx = getattr(h, "_worker_ctx", None)
+            if w_ctx is not None and getattr(w_ctx, "board", None) is None:
+                w_ctx.board = board
         self.max_workers = max(1, int(max_workers))
         self.poll_interval = poll_interval
         self.code_lock = code_lock

@@ -8,6 +8,7 @@ var max_ticks: int = 60
 var current_tick: int = 0
 var main_scene_node: Node = null
 var frame_times_usec: Array[int] = []
+var last_frame_end_usec: int = 0
 var initial_snapshot: Dictionary = {}
 var passive_idle_snapshot: Dictionary = {}
 var final_snapshot: Dictionary = {}
@@ -67,6 +68,7 @@ func _load_setup_script(path: String) -> void:
 	setup_script = parsed
 
 func _initialize() -> void:
+	Engine.max_physics_steps_per_frame = 1
 	if script_error != "":
 		printerr("CRITICAL: " + script_error)
 		quit(1)
@@ -100,6 +102,7 @@ func _initialize() -> void:
 func _process(_delta: float) -> bool:
 	var t0 = Time.get_ticks_usec()
 	current_tick += 1
+	var inter_frame_usec: int = (t0 - last_frame_end_usec) if last_frame_end_usec > 0 else 0
 
 	var passive_window_end = min(16, max(2, int(max_ticks / 4)))
 
@@ -133,6 +136,7 @@ func _process(_delta: float) -> bool:
 		if py > max_player_y_reached:
 			max_player_y_reached = py
 
+	var t_before_capture = Time.get_ticks_usec()
 	if capture_ticks.has(current_tick):
 		_try_capture_viewport("res://assets/playtest_captures/filmstrip_%04d.png" % current_tick)
 		print("[QA_TICK_SNAPSHOT] " + JSON.stringify(live_snap))
@@ -141,8 +145,13 @@ func _process(_delta: float) -> bool:
 	if current_tick == 2:
 		_try_capture_viewport("res://assets/playtest_captures/playtest_t0.png")
 
-	var dt_usec = Time.get_ticks_usec() - t0
-	frame_times_usec.append(dt_usec)
+	var harness_cpu_usec = t_before_capture - t0
+	# Record true inter-frame wall-clock time (game _physics_process + _process + _draw + SubViewport + GPU)
+	# excluding any screenshot disk-save time from the previous tick.
+	if current_tick > 3 and inter_frame_usec > 0:
+		frame_times_usec.append(inter_frame_usec + harness_cpu_usec)
+	else:
+		frame_times_usec.append(harness_cpu_usec)
 
 	if current_tick >= max_ticks:
 		_try_capture_viewport("res://assets/playtest_captures/playtest_tend.png")
@@ -151,6 +160,7 @@ func _process(_delta: float) -> bool:
 		_emit_summary_and_exit()
 		return true
 
+	last_frame_end_usec = Time.get_ticks_usec()
 	return false
 
 func _check_snapshot_for_auto_win(snap: Dictionary, tick_num: int) -> void:
@@ -785,6 +795,11 @@ func _audit_scene_tree(node: Node, in_ui: bool = false) -> Dictionary:
 		"audio_mix_rates": [],
 		"center_occluding_panels": [],
 		"fullscreen_occlusion_detected": false,
+		"fullscreen_occlusion_nodes": [],
+		"early_failure_state_detected": false,
+		"bound_sprites_audit": [],
+		"empty_sprite_frame_nodes": [],
+		"subviewport_thrashing_nodes": [],
 		"portrait_misused_on_world_sprite": false,
 		"portrait_misused_nodes": [],
 		"oversized_ui_portraits": [],
@@ -804,15 +819,75 @@ func _audit_scene_tree(node: Node, in_ui: bool = false) -> Dictionary:
 
 	var init_occlusion = float(initial_snapshot.get("viewport_occlusion", 0.0))
 	var final_failed = bool(final_snapshot.get("is_failed", false))
-	if init_occlusion >= 0.80 or final_failed:
+	if init_occlusion >= 0.80:
 		report["fullscreen_occlusion_detected"] = true
+		report["fullscreen_occlusion_nodes"].append("initial_snapshot.viewport_occlusion=" + str(init_occlusion))
+	if final_failed:
+		report["early_failure_state_detected"] = true
 	return report
 
+func _is_sprite_frame_cell_empty(tex: Texture2D, hframes: int, vframes: int, frame_idx: int) -> bool:
+	if tex == null or (hframes <= 1 and vframes <= 1):
+		return false
+	var img = tex.get_image()
+	if img == null or img.is_empty():
+		return false
+	if img.is_compressed():
+		img.decompress()
+	var tw = img.get_width()
+	var th = img.get_height()
+	if tw <= 0 or th <= 0:
+		return false
+	var cw = int(max(1, tw / max(1, hframes)))
+	var ch = int(max(1, th / max(1, vframes)))
+	var col_idx = clampi(frame_idx % max(1, hframes), 0, max(0, hframes - 1))
+	var row_idx = clampi(frame_idx / max(1, hframes), 0, max(0, vframes - 1))
+	var x0 = col_idx * cw
+	var y0 = row_idx * ch
+	var x1 = min(tw, x0 + cw)
+	var y1 = min(th, y0 + ch)
+	var step_x = int(max(1, (x1 - x0) / 16))
+	var step_y = int(max(1, (y1 - y0) / 16))
+	var cell_has_alpha = false
+	for y in range(y0, y1, step_y):
+		for x in range(x0, x1, step_x):
+			if img.get_pixel(x, y).a > 0.02:
+				cell_has_alpha = true
+				break
+		if cell_has_alpha:
+			break
+	if cell_has_alpha:
+		return false
+	var tex_has_alpha = false
+	var full_sx = int(max(1, tw / 16))
+	var full_sy = int(max(1, th / 16))
+	for y in range(0, th, full_sy):
+		for x in range(0, tw, full_sx):
+			if img.get_pixel(x, y).a > 0.02:
+				tex_has_alpha = true
+				break
+		if tex_has_alpha:
+			break
+	return tex_has_alpha
+
 func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
-	var current_in_ui = in_ui or (node is CanvasLayer) or (node is Control)
+	var is_fg_canvas_layer = (node is CanvasLayer) and (node.layer >= 0)
+	var is_bg_canvas_layer = (node is CanvasLayer) and (node.layer < 0)
+	var is_world_bg_color_rect = (node is ColorRect) and (not in_ui) and (node.z_index <= 0)
+	var current_in_ui = false if is_bg_canvas_layer else (in_ui or is_fg_canvas_layer or ((node is Control) and not is_world_bg_color_rect))
 	if node is Camera2D:
 		report["camera_found"] = true
 		report["camera_pos"] = [node.position.x, node.position.y]
+	if node is SubViewport:
+		var sv_sz: Vector2i = node.size
+		if (
+			sv_sz.x * sv_sz.y >= 500000
+			and node.render_target_update_mode == SubViewport.UPDATE_ALWAYS
+			and node.render_target_clear_mode == SubViewport.CLEAR_MODE_NEVER
+		):
+			report["subviewport_thrashing_nodes"].append(
+				str(node.name) + " (size=" + str(sv_sz) + ", UPDATE_ALWAYS + CLEAR_MODE_NEVER causes severe GPU tile-memory stalls; use UPDATE_ONCE triggered only when painting)"
+			)
 	if (node is AudioStreamPlayer) or (node is AudioStreamPlayer2D):
 		report["audio_players_found"] = int(report["audio_players_found"]) + 1
 		if node.stream != null:
@@ -822,10 +897,30 @@ func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
 	if (node is Sprite2D and node.texture != null) or (node is TextureRect and node.texture != null):
 		report["textures_loaded_count"] = int(report["textures_loaded_count"]) + 1
 		if node is Sprite2D and not current_in_ui:
-			var tpath = _resolve_texture_path(node, node.texture).to_lower()
+			var orig_tpath = _resolve_texture_path(node, node.texture)
+			var tpath = orig_tpath.to_lower()
 			if tpath.find("portrait") != -1:
 				report["portrait_misused_on_world_sprite"] = true
 				report["portrait_misused_nodes"].append(str(node.name) + ":" + tpath)
+			var tw_s = node.texture.get_width()
+			var th_s = node.texture.get_height()
+			var empty_cell = _is_sprite_frame_cell_empty(node.texture, node.hframes, node.vframes, node.frame)
+			report["bound_sprites_audit"].append({
+				"node": str(node.name),
+				"tex_path": orig_tpath,
+				"tex_size": [tw_s, th_s],
+				"hframes": int(node.hframes),
+				"vframes": int(node.vframes),
+				"frame": int(node.frame),
+				"visible": bool(node.is_visible_in_tree()),
+				"empty_frame_cell": empty_cell
+			})
+			if node.is_visible_in_tree() and empty_cell:
+				report["empty_sprite_frame_nodes"].append(
+					str(node.name) + " (tex=" + orig_tpath + " " + str(tw_s) + "x" + str(th_s)
+					+ ", hframes=" + str(node.hframes) + ", vframes=" + str(node.vframes)
+					+ ", frame=" + str(node.frame) + " crops a 100% transparent empty corner! Set hframes=1, vframes=1 for single-frame/composite sprites)"
+				)
 		if node is TextureRect and current_in_ui:
 			var sz = node.size
 			if sz.x <= 1.0 or sz.y <= 1.0:
@@ -844,6 +939,9 @@ func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
 					report["center_occluding_panels"].append(str(node.name) + "@" + str(p))
 			if node is ColorRect and node.visible and node.size.x >= 1100.0 and node.size.y >= 650.0 and node.color.a >= 0.80:
 				report["fullscreen_occlusion_detected"] = true
+				report["fullscreen_occlusion_nodes"].append(
+					str(node.name) + " (size=" + str(node.size) + ", alpha=" + str(snapped(node.color.a, 0.01)) + ")"
+				)
 	else:
 		var has_custom_draw = (node is CanvasItem and node.get_script() != null and node.has_method("_draw"))
 		var is_visual_primitive = (

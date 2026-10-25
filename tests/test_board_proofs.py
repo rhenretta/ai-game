@@ -114,8 +114,11 @@ func _process(_d: float) -> void:
 '''
 
 
-def _red_centroid_x(strip: Image.Image, col: int, cell_w: int = 426) -> float:
-    arr = np.asarray(strip.convert("RGB").crop((col * cell_w, 18, (col + 1) * cell_w, strip.height))).astype(int)
+def _red_centroid_x(strip: Image.Image, idx: int, cell_w: int = 640, cell_h: int = 360, cols: int = 2) -> float:
+    row_h = strip.height // 2 if strip.height > (cell_h + 40) else strip.height
+    col, row = idx % cols, idx // cols
+    x0, y0 = col * cell_w, row * row_h + 18
+    arr = np.asarray(strip.convert("RGB").crop((x0, y0, x0 + cell_w, y0 + cell_h))).astype(int)
     mask = (arr[:, :, 0] > 200) & (arr[:, :, 1] < 60) & (arr[:, :, 2] < 60)
     xs = np.nonzero(mask)[1]
     assert xs.size > 20, "red mover not visible in this frame"
@@ -143,7 +146,7 @@ def test_filmstrip_shows_scripted_input_moving_the_game_and_idle_script_does_not
     assert xs[0] + 20 < xs[1] < xs[2] - 20                                # the held action visibly moves the actor
     ix = [_red_centroid_x(idl, i) for i in range(3)]
     assert max(ix) - min(ix) < 5                                          # an empty script means no input at all
-    assert mv.width == 3 * 426
+    assert mv.width == 2 * 640
 
 
 def test_filmstrip_requires_ticks_and_never_fabricates_missing_frames(tmp_path, monkeypatch):
@@ -204,8 +207,8 @@ func get_state_snapshot() -> Dictionary:
         )
         im = Image.open(strip_path)
         xs = [_red_centroid_x(im, i) for i in range(3)]
-        assert xs[0] < 80 < xs[1] < 220 < xs[2]
-        assert im.height == 240 + 18 + 18  # includes external QA telemetry header + footer
+        assert xs[0] < 120 < xs[1] < 330 < xs[2]
+        assert im.height == 2 * (360 + 18 + 18)  # 2 rows of 640x360 cells with external QA telemetry header + footer
 
         # Now replace main.gd with a self-playing sim_tick demo loop that ignores input
         fake_demo = '''extends Node2D

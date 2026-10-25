@@ -205,7 +205,7 @@ class GameConceptDirectorAgent:
                     f"- First 60 Seconds Hook: {getattr(game_bible, 'first_60_seconds_hook', '')}",
                     f"- Camera & Spatial Paradigm: {getattr(game_bible, 'camera_and_spatial_paradigm', '')}",
                     f"- Color Palette Hex: {getattr(game_bible, 'color_palette_hex', [])}",
-                    f"- Intuitive UI & Onboarding Philosophy (clean readable HUD + responsive world cues): {getattr(game_bible, 'diegetic_ui_philosophy', '')}",
+                    f"- UI, HUD & Onboarding Philosophy: {getattr(game_bible, 'diegetic_ui_philosophy', '')}",
                     f"- Gameplay Pillars: {getattr(game_bible, 'gameplay_pillars', [])}",
                     f"- Visual Style Guide: {getattr(game_bible, 'visual_style_guide', '')}",
                     f"- Audio Direction Guide: {getattr(game_bible, 'audio_direction_guide', '')}",
@@ -259,17 +259,17 @@ class GameConceptDirectorAgent:
                 f"1. RATIONALE-FIRST MANDATE (Rule 4): You MUST provide 'deliberation' FIRST before any decision tokens, spec details, or requirement lists.\n"
                 f"2. PURE GENERALIZABILITY MANDATE (Rule 1): Zero hardcoded genre, mechanic, character count, or arena prescriptions. "
                 f"The game can be any genre or camera perspective conceived by the Writers' Room.\n"
-                f"3. EXPERIENCE & MOCKUP-TO-SCENE FIDELITY: Your `high_concept_summary` and `RequirementTrack` items MUST explicitly lock the camera perspective and visual scene staging from the 16:9 Writers' Room concept mockup (layered sky/backdrop, parallax midground, sculpted/textured terrain or platforms, animated characters/entities, interactive props, atmospheric particles, and diegetic UI).\n"
+                f"3. EXPERIENCE & MOCKUP-TO-SCENE FIDELITY: Your `high_concept_summary` and `RequirementTrack` items MUST explicitly lock the camera perspective and visual scene staging from the 16:9 Writers' Room concept mockup (layered sky/backdrop, parallax midground, procedural or textured terrain/platforms, animated characters/entities, interactive props, atmospheric particles/shaders, and UI/HUD).\n"
                 f"4. PLAYABLE-WORLD-FIRST DECOMPOSITION: Decompose the game into ordered, discrete RequirementTrack items ('R1', 'R2', ...). "
                 f"Track 'R1' MUST ALWAYS establish the multi-layered visual environment (`scenes.gd`), animated player/entity actors (`entities.gd`), and core movement/traversal loop (`main.gd`, `mechanics.gd`) matching the 16:9 mockup.\n"
                 f"   Target modules MUST be Godot 4 GDScript modules chosen from ['main.gd', 'mechanics.gd', 'entities.gd', 'scenes.gd', 'ui_hud.gd'], NEVER Python (.py) files.\n"
                 f"5. ZERO BLIND VIEWPORTS OR INSTANT LOCKOUTS: Never specify opaque full-screen overlays (>40% startup occlusion) that blind the player at boot, and never specify unrecoverable failure/game-over lockouts within the first 30 seconds of play.\n"
                 f"6. VERIFIABLE ACCEPTANCE CRITERIA: Each criterion must declare a concrete verification_method ('ast_inspection', 'runtime_telemetry', 'headless_playtest', 'multi_modal', or 'design_critic') and explicit expected behavior.\n"
-                f"7. DECOMPOSE CONCEPT ART INTO COMPOSABLE WORLD ELEMENTS (`asset_manifest`): NEVER slap a static full-screen background painting behind the game. Instead, decompose the 16:9 Writers' Room concept mockup into discrete, buildable game elements in `asset_manifest`:\n"
-                f"   - Use `fabrication_mode='tile_surface'` for repeatable terrain, platform, and structural wall materials (`terrain_surface`, `structure_wall_tile`) used to texture physical level geometry in `assets/sprites/`.\n"
-                f"   - Use `fabrication_mode='static_sprite'` for isolated alpha-transparent horizon/midground set-pieces (`horizon_setpiece_1`, `midground_setpiece_1`) and interactive world landmarks/props placed independently across depth layers.\n"
-                f"   - Use `fabrication_mode='articulated_parts'` when an entity, machine, turbine, or boss needs independently rotating/moving parts.\n"
-                f"   - Use `fabrication_mode='sprite_sheet'` (with `animation_states` such as 'idle', 'move', 'jump', 'action') for full-body in-world characters, companions, and reactive props in `assets/sprites/`.\n"
+                f"7. DECOMPOSE CONCEPT ART INTO COMPOSABLE WORLD ELEMENTS (`asset_manifest`) & PROCEDURAL RENDERING: NEVER slap a static full-screen background painting behind the game. Combine Godot 4 procedural rendering (`Polygon2D`, `Line2D`, custom `CanvasItem` shaders / `ShaderMaterial`, `GPUParticles2D`, `PointLight2D`) for dynamic fluids, energy beams, conduits, and sculpted terrain with discrete visual assets in `asset_manifest` where appropriate:\n"
+                f"   - Use `fabrication_mode='static_sprite'` for isolated alpha-transparent world props, machines, platforms with silhouettes, and horizon/midground set-pieces.\n"
+                f"   - Use `fabrication_mode='articulated_parts'` when an entity, character, or machine needs independently rotating/moving parts.\n"
+                f"   - Use `fabrication_mode='sprite_sheet'` (with `animation_states` such as 'idle', 'move', 'jump', 'action') for frame-animated in-world characters, companions, and reactive props in `assets/sprites/`.\n"
+                f"   - Use `fabrication_mode='tile_surface'` ONLY for uniform, borderless interior fill materials—never for fluids, beams, channels, or objects with silhouettes/edges.\n"
                 f"   - Use `fabrication_mode='portrait'` STRICTLY for UI dialogue busts in `assets/portraits/` (NEVER use portraits as in-world sprites).\n"
                 f"8. 1:1 VISUAL-TO-PHYSICAL COLLIDER CONTAINMENT: Track 'R1' MUST mandate that physical `StaticBody2D` / `CollisionPolygon2D` boundaries align 1:1 with the visual walkable terrain edges so the player character can NEVER walk into sky backdrops, across unbridged chasms, or off walkable shelves.\n"
                 f"9. ABSOLUTE BAN ON PRE-SOLVED t=0 LEVELS & FAKE SIMULATIONS: Every mechanic and stage MUST initialize in an UNSOLVED state at t=0 (zero pre-completed paths or self-winning demo loops). Simulation propagation (e.g. fluid, energy, signals, logistics) MUST require true graph/source connectivity from a source to a target, and levels must feature genuine multi-stage obstacles and progression depth.\n"

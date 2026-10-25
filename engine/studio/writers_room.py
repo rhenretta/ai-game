@@ -40,6 +40,7 @@ from engine.studio.models import (
     DirectorConvergenceCheck,
     ExperienceStoryboardBeat,
     GameBibleSpec,
+    GameSliceSpec,
     GenesisWorldSpec,
     MechanicEngineeringSpec,
     NarrativeBible,
@@ -53,6 +54,7 @@ from engine.studio.models import (
     WritersRoomUtterance,
     bounded_thinking_config,
     call_gemini_with_transient_retry,
+    is_real_genai_client,
 )
 
 from engine.studio.production_board import MAX_SPEC_RESETS, BoardScheduler, ProductionBoard
@@ -60,61 +62,51 @@ from engine.studio.production_board import MAX_SPEC_RESETS, BoardScheduler, Prod
 logger = logging.getLogger("CreativeWritersRoom")
 
 
-SPECIALIST_ROSTER: List[Dict[str, str]] = [
+CORE_COUNCIL_ROSTER: List[Dict[str, Any]] = [
     {
         "role": "GameplayDesigner",
         "display_name": "Lead Gameplay & Systems Designer",
+        "tier": "lead",
+        "subagents": ["LevelAndProgressionDesigner", "GameplaySystemsEngineer"],
         "focus": (
             "Tactile feel, core game loop, emergent mechanical depth, moment-to-moment player agency, "
-            "and why the mechanics are genuinely fun and immediately playable in a 2D viewport."
-        ),
-    },
-    {
-        "role": "GameplaySystemsEngineer",
-        "display_name": "Lead Gameplay & Godot Systems Engineer",
-        "focus": (
-            "Translating creative gameplay pillars, spatial camera staging, and story interactions into concrete "
-            "Godot 4 node architectures (CharacterBody2D, StaticBody2D, Area2D, AnimatedSprite2D), 1:1 visual-to-physical "
-            "collider alignment, deterministic state machines (unsolved at t=0), required sprite/tile assets (banning "
-            "geometric programmer art), and falsifiable headless test invariants."
+            "and why the mechanics are genuinely fun and immediately playable in a 2D viewport. "
+            "Can call on sub-agents LevelAndProgressionDesigner and GameplaySystemsEngineer whenever progression, "
+            "world structure, or Godot 4 systems engineering strategy is needed."
         ),
     },
     {
         "role": "StoryWorldArchitect",
         "display_name": "Story & World Lore Architect",
+        "tier": "lead",
+        "subagents": ["ScriptwriterAgent", "CharacterDesigner"],
         "focus": (
             "Imaginative world-building, central dramatic conflict, environmental storytelling, "
-            "narrative stakes, and cutscenes that pull the player into a vivid, living world."
-        ),
-    },
-    {
-        "role": "CharacterDesigner",
-        "display_name": "Character & Dialogue Designer",
-        "focus": (
-            "Memorable characters or entities with distinct silhouettes, personalities, motivations, "
-            "branching dialogue trees, and reactive voice barks."
-        ),
-    },
-    {
-        "role": "UXExperienceDesigner",
-        "display_name": "Player Experience & UX Designer",
-        "focus": (
-            "The player's emotional and sensory journey (Experience Storyboard), the First 60 Seconds Hook, "
-            "and Intuitive Onboarding & Readable UI—combining clean, legible HUD elements with responsive "
-            "in-world visual cues so the player immediately understands their goal and controls."
+            "narrative stakes, and narrative beats that pull the player into a vivid, living world. "
+            "Can call on sub-agents ScriptwriterAgent (for scene scripts, dialogue writing, and dramatic pacing) "
+            "and CharacterDesigner (for character sheets, motivations, and casting) whenever needed."
         ),
     },
     {
         "role": "VisualArtDirector",
         "display_name": "Visual Art & Mockup Director",
+        "tier": "lead",
+        "subagents": ["UXExperienceDesigner", "AudioAtmosphereDesigner"],
         "focus": (
-            "Cohesive visual identity, color mood, lighting, camera staging, and authoring 16:9 full-screen "
-            "VisualMockupArtifact boards that show an unobstructed, vibrant, readable 2D game world and clean UI."
+            "Cohesive visual identity, color mood, lighting, camera staging, procedural/shader vs. sprite art direction, "
+            "and authoring 16:9 full-screen VisualMockupArtifact boards that show an unobstructed, readable game world and UI. "
+            "Can call on sub-agents UXExperienceDesigner and AudioAtmosphereDesigner whenever player experience, onboarding/UI, "
+            "or audio/voice atmosphere strategy is needed."
         ),
     },
+]
+
+SUBAGENT_ROSTER: List[Dict[str, Any]] = [
     {
         "role": "LevelAndProgressionDesigner",
         "display_name": "Level, Progression & Goals Designer",
+        "tier": "subagent",
+        "parent_lead": "GameplayDesigner",
         "focus": (
             "Strategizing a bespoke world and level construction plan tailored specifically to this game (`generation_approach`, "
             "`world_structure`, and `runtime_construction_plan` in `scenes.gd` — devising whatever world structure, scale, or "
@@ -122,13 +114,66 @@ SPECIALIST_ROSTER: List[Dict[str, str]] = [
         ),
     },
     {
+        "role": "GameplaySystemsEngineer",
+        "display_name": "Lead Gameplay & Godot Systems Engineer",
+        "tier": "subagent",
+        "parent_lead": "GameplayDesigner",
+        "focus": (
+            "Translating creative gameplay pillars, spatial camera staging, and interactions into concrete "
+            "Godot 4 node architectures (CharacterBody2D, StaticBody2D, Area2D, Polygon2D/Line2D/ShaderMaterial, AnimatedSprite2D), "
+            "1:1 visual-to-physical collider alignment, deterministic state machines (unsolved at t=0), procedural rendering vs. discrete assets, "
+            "and falsifiable headless test invariants."
+        ),
+    },
+    {
+        "role": "ScriptwriterAgent",
+        "display_name": "Lead Scriptwriter & Narrative Dramatist",
+        "tier": "subagent",
+        "parent_lead": "StoryWorldArchitect",
+        "focus": (
+            "Dramatic scene writing, screenplay structure, sharp character dialogue, branching conversational trees, "
+            "contextual/reactive barks, subtext, comedic or dramatic timing, and how story moments play out on screen "
+            "when the game calls for scripted scenes, dialogue, or character voice."
+        ),
+    },
+    {
+        "role": "CharacterDesigner",
+        "display_name": "Character & Dialogue Designer",
+        "tier": "subagent",
+        "parent_lead": "StoryWorldArchitect",
+        "focus": (
+            "Memorable characters or entities with distinct silhouettes, personalities, motivations, "
+            "relationships, and reactive voice signatures when appropriate to the game."
+        ),
+    },
+    {
+        "role": "UXExperienceDesigner",
+        "display_name": "Player Experience & UX Designer",
+        "tier": "subagent",
+        "parent_lead": "VisualArtDirector",
+        "focus": (
+            "Empathetic new-player experience (putting yourself in the shoes of a brand-new player who has zero prior context "
+            "and must intuitively figure out who they are, how the world works, what can be interacted with, and what their goal is), "
+            "the First 60 Seconds Hook, Experience Storyboard, and cohesive UI/HUD/feedback architecture."
+        ),
+    },
+    {
         "role": "AudioAtmosphereDesigner",
         "display_name": "Audio & Voice Atmosphere Designer",
+        "tier": "subagent",
+        "parent_lead": "VisualArtDirector",
         "focus": (
             "Acoustic atmosphere, reactive sound design, character voice casting, and emotional cadence."
         ),
     },
 ]
+
+SPECIALIST_ROSTER: List[Dict[str, Any]] = CORE_COUNCIL_ROSTER + SUBAGENT_ROSTER
+
+COUNCIL_HIERARCHY: Dict[str, List[str]] = {
+    lead["role"]: list(lead.get("subagents", []))
+    for lead in CORE_COUNCIL_ROSTER
+}
 
 
 def _normalize_char_tokens(text: str, drop_generic: bool = False) -> set[str]:
@@ -404,6 +449,28 @@ class CreativeWritersRoom:
             except Exception as exc:
                 logger.warning("Event callback failed for '%s': %s", event_type, exc)
 
+    def _emit_activity(
+        self,
+        agent_role: str,
+        status_text: str,
+        active_agents: Optional[List[str]] = None,
+        phase: str = "brainstorming",
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Emits a live real-time observability event (`writers_room_activity`) so Mission Control
+        displays exactly which Council Lead(s) or Sub-Agent(s) are running right now and what they are doing."""
+        payload: Dict[str, Any] = {
+            "deliberation": f"Live agent activity update ({phase}): {status_text}",
+            "agent_role": agent_role,
+            "status_text": status_text,
+            "active_agents": list(active_agents) if active_agents is not None else [agent_role],
+            "phase": phase,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        if extra:
+            payload.update(extra)
+        self._emit_event("writers_room_activity", payload)
+
     def _persist_bible(self, game_bible: GameBibleSpec, candidate_dir: Optional[Path] = None) -> None:
         """Saves game_bible.json (and world_spec.json / narrative_bible.json if populated) to disk and upserts to SQLite studio_game_bibles."""
         game_bible.updated_at_utc = datetime.now(timezone.utc).isoformat()
@@ -489,7 +556,11 @@ class CreativeWritersRoom:
 
         effective_temp = self.creative_temperature if temperature is None else float(temperature)
         schema_name = getattr(schema_cls, "__name__", str(schema_cls))
-        thinking_budget = 1024 if schema_name in ("WritersRoomListenCheck", "NoveltyJudgement") else 2048
+        thinking_budget = (
+            384
+            if schema_name == "WritersRoomListenCheck"
+            else (1024 if schema_name == "NoveltyJudgement" else 2048)
+        )
         response = call_gemini_with_transient_retry(
             lambda: self.client.models.generate_content(
                 model=self.model_name,
@@ -535,7 +606,7 @@ class CreativeWritersRoom:
                 shuffled_genres = top_genres
             lines.extend([
                 f"- Genre Affinities to Explore: {shuffled_genres}",
-                f"- Pacing Preference: {getattr(dna, 'pacing_preference', 'balanced')} (balance thoughtful strategy with satisfying, responsive moment-to-moment movement)",
+                f"- Pacing Preference: {getattr(dna, 'pacing_preference', 'balanced')}",
             ])
             palette_pref = getattr(dna, "preferred_palette_mood", None)
             if palette_pref:
@@ -591,6 +662,18 @@ class CreativeWritersRoom:
             f"{e.mechanic_id} ({e.title}) -> nodes={e.godot_node_and_collider_architecture[:80]}, assets={e.required_sprite_and_tile_assets}"
             for e in getattr(game_bible, "technical_architecture_blueprint", [])
         ]
+        slice_summaries = [
+            f"[{s.slice_id} idx={s.slice_index} status={s.status}] '{s.title}': objective={s.slice_objective[:120]} | focus={s.player_acclimation_and_mechanics_focus[:120]}"
+            for s in getattr(game_bible, "slice_roadmap", [])
+        ]
+        active_slice = game_bible.get_active_slice() if hasattr(game_bible, "get_active_slice") else None
+        active_slice_str = (
+            f"[{active_slice.slice_id} (Iteration #{active_slice.slice_index})] '{active_slice.title}' — "
+            f"Objective: {active_slice.slice_objective} | Acclimation & Mechanics Focus: {active_slice.player_acclimation_and_mechanics_focus} | "
+            f"Expansion: {active_slice.expansion_from_prior_slice} | Scope Boundaries: {active_slice.scope_boundaries}"
+            if active_slice is not None
+            else "(not yet strategized — Slice 0 MUST deliver a complete, cohesive playable vertical slice realizing the world's camera/scale, core loop, new-player onboarding, and audio)"
+        )
         exec_directives = [
             u.spoken_dialogue.strip()
             for u in game_bible.writers_room_transcript
@@ -615,6 +698,8 @@ class CreativeWritersRoom:
             f"- First 60 Seconds Hook: {game_bible.first_60_seconds_hook or '(not yet defined)'}\n"
             f"- Diegetic UI & Onboarding Philosophy: {game_bible.diegetic_ui_philosophy or '(not yet defined)'}\n"
             f"- Gameplay Pillars ({len(game_bible.gameplay_pillars)}): {game_bible.gameplay_pillars}\n"
+            f"- Iterative Slice Roadmap ({len(slice_summaries)} slices): {slice_summaries}\n"
+            f"- Active Slice right now: {active_slice_str}\n"
             f"- Technical Architecture Blueprint ({len(eng_specs)}): {eng_specs}\n"
             f"- Visual Style Guide: {(game_bible.visual_style_guide or '(not yet defined)')[:1200]}\n"
             f"- Audio Direction Guide: {(game_bible.audio_direction_guide or '(not yet defined)')[:1200]}\n"
@@ -667,13 +752,15 @@ class CreativeWritersRoom:
             game_bible.camera_and_spatial_paradigm = proposal.updated_camera_and_spatial_paradigm.strip()
             updates_summary.append(f"Locked spatial/camera paradigm: {game_bible.camera_and_spatial_paradigm[:60]}")
 
-        if proposal.updated_color_palette_hex:
-            game_bible.color_palette_hex = [str(c).strip() for c in proposal.updated_color_palette_hex if str(c).strip()]
+        updated_palette = getattr(proposal, "updated_color_palette_hex", None)
+        if updated_palette:
+            game_bible.color_palette_hex = [str(c).strip() for c in updated_palette if str(c).strip()]
             updates_summary.append(f"Updated color palette ({len(game_bible.color_palette_hex)} hex swatches)")
 
-        if proposal.added_or_updated_scene_layers:
+        updated_layers = getattr(proposal, "added_or_updated_scene_layers", None)
+        if updated_layers:
             layers_by_id = {l.layer_id: l for l in game_bible.scene_layers}
-            for layer in proposal.added_or_updated_scene_layers:
+            for layer in updated_layers:
                 layers_by_id[layer.layer_id] = layer
             game_bible.scene_layers = sorted(layers_by_id.values(), key=lambda x: x.depth_order)
             updates_summary.append(f"Defined {len(game_bible.scene_layers)} visual scene depth layers")
@@ -769,7 +856,7 @@ class CreativeWritersRoom:
             if game_bible.elevator_pitch:
                 game_bible.narrative_bible.setting_summary = game_bible.elevator_pitch
 
-        # Characters & Portrait synthesis (with domain-agnostic deduplication across turns, isolated in assets/portraits/)
+        # Characters (stored as lightweight metadata in the Bible; portraits are fabricated just-in-time by slice tasks when needed)
         char_alias_map: Dict[str, str] = {}
         if proposal.added_or_updated_characters:
             for char_sheet in proposal.added_or_updated_characters:
@@ -782,19 +869,6 @@ class CreativeWritersRoom:
                 game_bible.narrative_bible.characters,
                 proposal.added_or_updated_characters,
             )
-            for char_sheet in proposal.added_or_updated_characters:
-                if self.visual_agent is not None and candidate_dir is not None and getattr(self.visual_agent, "client", None) is not None:
-                    try:
-                        portrait_dest = Path(candidate_dir) / char_sheet.portrait_asset
-                        if not portrait_dest.is_file():
-                            self.visual_agent.generate_portrait(
-                                character=char_sheet,
-                                output_path=portrait_dest,
-                                dimensions=(256, 256),
-                                style_guide=game_bible.visual_style_guide,
-                            )
-                    except Exception as exc:
-                        logger.warning("Writers' Room portrait synthesis warning for '%s': %s", char_sheet.name, exc)
             game_bible.narrative_bible.characters = merged_chars
             updates_summary.append(
                 f"Added/updated character(s): {[c.name for c in proposal.added_or_updated_characters]}"
@@ -816,7 +890,7 @@ class CreativeWritersRoom:
             game_bible.narrative_bible.dialogue_trees = list(existing_trees.values())
             updates_summary.append(f"Authored {len(proposal.added_or_updated_dialogue_trees)} dialogue tree(s)")
 
-        # Dialogue barks & Voice Audition synthesis
+        # Dialogue barks (stored as lightweight metadata in the Bible; audio WAVs are fabricated just-in-time by slice tasks when needed)
         if proposal.added_or_updated_barks:
             existing_barks = {b.bark_id: b for b in game_bible.narrative_bible.dialogue_barks}
             chars_by_id = {c.character_id: c for c in game_bible.narrative_bible.characters}
@@ -827,7 +901,6 @@ class CreativeWritersRoom:
                     bark.voice_clip = f"assets/audio/{bark.bark_id}.wav"
                 char_obj = chars_by_id.get(bark.speaker_id)
                 if char_obj is None and game_bible.narrative_bible.characters:
-                    # Match by normalized speaker tokens if speaker_id differed slightly
                     spk_tokens = _normalize_char_tokens(bark.speaker_id, drop_generic=True)
                     for c_cand in game_bible.narrative_bible.characters:
                         c_tokens = _normalize_char_tokens(c_cand.name, drop_generic=True) | _normalize_char_tokens(c_cand.character_id, drop_generic=True)
@@ -835,32 +908,58 @@ class CreativeWritersRoom:
                             char_obj = c_cand
                             bark.speaker_id = c_cand.character_id
                             break
-                v_name = char_obj.gemini_voice_name if char_obj else "Aoede"
-                if candidate_dir is not None:
-                    wav_dest = Path(candidate_dir) / bark.voice_clip
-                    try:
-                        if self.audio_agent is not None and hasattr(self.audio_agent, "synthesize_voice_line"):
-                            self.audio_agent.synthesize_voice_line(
-                                bark=bark,
-                                output_path=wav_dest,
-                                character=char_obj,
-                                voice_name=v_name,
-                            )
-                        elif (
-                            self.narrative_agent is not None
-                            and getattr(self.narrative_agent, "client", None) is not None
-                            and hasattr(self.narrative_agent, "synthesize_bark_audio")
-                        ):
-                            self.narrative_agent.synthesize_bark_audio(
-                                bark=bark,
-                                output_path=wav_dest,
-                                voice_name=v_name,
-                            )
-                    except Exception as exc:
-                        logger.warning("Writers' Room voice audition synthesis warning for '%s': %s", bark.bark_id, exc)
                 existing_barks[bark.bark_id] = bark
             game_bible.narrative_bible.dialogue_barks = list(existing_barks.values())
             updates_summary.append(f"Added {len(proposal.added_or_updated_barks)} voice bark(s)")
+
+        # Iterative Slice Roadmap updates
+        if proposal.added_or_updated_slices:
+            by_key: Dict[str, GameSliceSpec] = {}
+            for s in game_bible.slice_roadmap:
+                by_key[s.slice_id or f"idx_{s.slice_index}"] = s
+            for new_s in proposal.added_or_updated_slices:
+                matched_key = None
+                for k, cur_s in by_key.items():
+                    if cur_s.slice_id == new_s.slice_id or cur_s.slice_index == new_s.slice_index:
+                        matched_key = k
+                        break
+                if matched_key is not None:
+                    by_key[matched_key] = new_s
+                else:
+                    by_key[new_s.slice_id or f"idx_{new_s.slice_index}"] = new_s
+            merged_slices = sorted(by_key.values(), key=lambda x: x.slice_index)
+            explicit_active = [new_s for new_s in proposal.added_or_updated_slices if new_s.status == "active"]
+            if explicit_active:
+                game_bible.active_slice_index = explicit_active[-1].slice_index
+            if merged_slices and not any(s.status == "active" for s in merged_slices):
+                active_idx = max(0, min(game_bible.active_slice_index, len(merged_slices) - 1))
+                merged_slices[active_idx].status = "active"
+            game_bible.slice_roadmap = merged_slices
+            updates_summary.append(
+                f"Strategized {len(proposal.added_or_updated_slices)} game slice(s): {[s.slice_id for s in proposal.added_or_updated_slices]}"
+            )
+            self._emit_event(
+                "bible_slice_roadmap_updated",
+                {
+                    "deliberation": proposal.deliberation,
+                    "speaker_role": speaker_role,
+                    "slice_count": len(game_bible.slice_roadmap),
+                    "active_slice_index": game_bible.active_slice_index,
+                    "slices": [s.model_dump() for s in game_bible.slice_roadmap],
+                },
+            )
+
+        active_slice_idx_update = getattr(proposal, "active_slice_index_update", None)
+        if active_slice_idx_update is not None:
+            game_bible.active_slice_index = max(0, int(active_slice_idx_update))
+            for idx_s, s in enumerate(game_bible.slice_roadmap):
+                if idx_s < game_bible.active_slice_index:
+                    s.status = "completed"
+                elif idx_s == game_bible.active_slice_index:
+                    s.status = "active"
+                else:
+                    s.status = "planned"
+            updates_summary.append(f"Set active_slice_index={game_bible.active_slice_index}")
 
         # Game-design sections (levels, loop, engagement, onboarding, goals)
         for attr, label in (
@@ -879,12 +978,18 @@ class CreativeWritersRoom:
         if proposal.backlog_additions:
             if self.board is None:
                 raise StudioAgentError("A backlog_additions proposal arrived but no Production Board is attached.")
+            active_slice_obj = game_bible.get_active_slice()
+            default_slice_id = active_slice_obj.slice_id if active_slice_obj is not None else ""
             for prop in proposal.backlog_additions:  # level maps all rewrite the shared layout file: serialise them
                 if prop.kind == "level_map" and "level_layout.json" not in prop.target_modules:
                     prop.target_modules.append("level_layout.json")
                 elif prop.kind in ("visual_asset", "animation", "audio_asset"):
                     prop.target_modules = [m for m in prop.target_modules if not str(m).endswith(".gd")]
-            added = self.board.add_items(proposal.backlog_additions, raised_by_role=speaker_role)
+            added = self.board.add_items(
+                proposal.backlog_additions,
+                raised_by_role=speaker_role,
+                slice_id=default_slice_id,
+            )
             updates_summary.append(f"Raised {len(added)} backlog item(s): {[a.item_id for a in added]}")
 
         # 16:9 Visual Mockup Board synthesis
@@ -900,6 +1005,12 @@ class CreativeWritersRoom:
             if mockup.scene_layers and not game_bible.scene_layers:
                 game_bible.scene_layers = list(mockup.scene_layers)
             if self.visual_agent is not None and candidate_dir is not None and getattr(self.visual_agent, "client", None) is not None:
+                self._emit_activity(
+                    agent_role=speaker_role,
+                    status_text=f"Synthesizing 16:9 Concept Art Mockup '{mockup.title}'...",
+                    active_agents=[speaker_role, "VisualTasksAgent"],
+                    phase="mockup_synthesis",
+                )
                 mockup_dest = Path(candidate_dir) / mockup.image_path
                 self.visual_agent.generate_concept_mockup(
                     mockup=mockup,
@@ -950,35 +1061,49 @@ class CreativeWritersRoom:
 
     def _evaluate_specialist_listen(
         self,
-        specialist: Dict[str, str],
+        specialist: Dict[str, Any],
         game_bible: GameBibleSpec,
         dna_summary: str,
     ) -> WritersRoomListenCheck:
-        """Asks a listening specialist if they want to interject into the Writers' Room right now."""
+        """Asks a listening Council Lead (or invited Sub-Agent) if they want to speak or call in a Sub-Agent right now."""
         role = specialist["role"]
         display_name = specialist["display_name"]
         focus = specialist["focus"]
+        subagents = specialist.get("subagents") or []
         bible_snapshot = self._format_bible_snapshot(game_bible)
 
+        subagent_clause = ""
+        if subagents:
+            sub_details = []
+            for sr in subagents:
+                sp_obj = next((s for s in SPECIALIST_ROSTER if s["role"] == sr), None)
+                if sp_obj:
+                    sub_details.append(f"- `{sr}` ({sp_obj['display_name']}): {sp_obj['focus']}")
+            subagent_clause = (
+                "SUB-AGENTS UNDER YOUR DOMAIN (call on them when their specialized craft will best advance this game):\n"
+                + "\n".join(sub_details)
+                + "\nIf you believe one of your Sub-Agents should chime in right now instead of (or to deepen) your domain, "
+                f"set `consult_subagent_role` to one of {subagents} and provide `subagent_brief` explaining what you want them to address "
+                "(or leave `consult_subagent_role = null` to speak yourself).\n\n"
+            )
+
         prompt = (
+            f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n\n"
+            f"{bible_snapshot}\n\n"
             f"You are the {display_name} ({role}) sitting in an open-ended Game Studio Writers' Room.\n"
             f"Your specialty focus: {focus}\n\n"
-            f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n\n"
-            f"{bible_snapshot}\n"
+            f"{subagent_clause}"
             f"Listen to the conversation above and inspect the Living Game Bible.\n"
-            f"Decide whether you should interject right now to:\n"
-            f"1. Challenge a generic/boring 'Hello World' idea and pitch a much richer experiential hook,\n"
-            f"2. Answer a colleague who called on you, or\n"
-            f"3. Contribute missing artifacts in your domain (e.g., Experience Storyboard & Diegetic UI for UXExperienceDesigner, "
-            f"16:9 Visual Mockup for VisualArtDirector, Characters/Dialogue/Barks for CharacterDesigner, World Lore/Cutscenes for StoryWorldArchitect, "
-            f"or Technical Architecture Blueprints, Godot 4 Node/Collider strategies, Required Assets, and Falsifiable Test Invariants for GameplaySystemsEngineer).\n"
-            f"Return your structured WritersRoomListenCheck with deliberation FIRST."
+            f"Strategize what this specific game needs most right now from your domain (or from one of your Sub-Agents if applicable): "
+            f"whether challenging a weak or generic idea, answering a colleague who called on you, or shaping the game's design, world, "
+            f"script/dialogue, visuals, onboarding/UI, progression, audio, or technical architecture.\n"
+            f"Return your structured WritersRoomListenCheck with `deliberation` FIRST."
         )
         return self._call_structured_llm(prompt, WritersRoomListenCheck)
 
     def _execute_specialist_turn(
         self,
-        specialist: Dict[str, str],
+        specialist: Dict[str, Any],
         listen_check: WritersRoomListenCheck,
         game_bible: GameBibleSpec,
         dna_summary: str,
@@ -987,92 +1112,145 @@ class CreativeWritersRoom:
         role = specialist["role"]
         display_name = specialist["display_name"]
         focus = specialist["focus"]
+        subagents = specialist.get("subagents") or []
+        parent_lead = specialist.get("parent_lead")
         bible_snapshot = self._format_bible_snapshot(game_bible)
+
+        self._emit_activity(
+            agent_role=role,
+            status_text=(
+                f"{display_name} ({role}) is formulating their Writers' Room contribution"
+                + (f": {listen_check.intended_contribution_summary[:110]}" if listen_check.intended_contribution_summary else "...")
+            ),
+            active_agents=[role],
+            phase="speaking",
+            extra={
+                "speaker_display_name": display_name,
+                "tier": specialist.get("tier", "lead"),
+                "parent_lead": parent_lead,
+                "intended_contribution": listen_check.intended_contribution_summary,
+            },
+        )
+
+        hierarchy_note = ""
+        if subagents:
+            hierarchy_note = (
+                f"COUNCIL HIERARCHY: You are a Core Council Domain Lead. Your specialized Sub-Agents are {subagents}. "
+                f"Whenever you want one of your Sub-Agents (or another Council member) to chime in next, include their role name in `addressed_to`.\n"
+            )
+        elif parent_lead:
+            hierarchy_note = (
+                f"COUNCIL HIERARCHY: You are a specialized Sub-Agent working with `{parent_lead}` and the Core Council. "
+                f"Bring your specialized craft to bear on what is best for THIS game, and name `{parent_lead}` or any colleague in `addressed_to` when handing back.\n"
+            )
 
         domain_instructions = ""
         if role == "UXExperienceDesigner":
             domain_instructions = (
-                "As UXExperienceDesigner, you MUST populate `updated_first_60_seconds_hook`, "
-                "`updated_diegetic_ui_philosophy` (explaining how crisp, readable HUD indicators and responsive in-world visual cues work together without obscuring the playable 2D world), "
-                "`updated_onboarding_plan` (how the player is introduced to the world, role and stakes, plus at least 3 ordered `OnboardingStep`s that each introduce ONE concept diegetically and say how the game knows it was learned), "
-                "and `added_or_updated_storyboard_beats` (at least 3-4 ExperienceStoryboardBeat items covering the emotional & sensory arc)."
+                "Domain Craft & Bible Fields (UXExperienceDesigner): Put yourself in the shoes of a brand-new player booting this game for the first time "
+                "with zero external documentation. Strategize how the player immediately understands their role in the world, what objects are interactive "
+                "and how they connect, what their active objective is, and how the world responds to their actions—without cluttering the screen with "
+                "generic debug labels. Shape `updated_first_60_seconds_hook`, `updated_diegetic_ui_philosophy` (identifying the exact HUD/CanvasLayer "
+                "isolation, visual affordances, and feedback cues that fit THIS game), `updated_onboarding_plan` (how the player is introduced to the "
+                "world, role, and stakes, plus ordered `OnboardingStep`s), and `added_or_updated_storyboard_beats`. When a Production Board is attached, "
+                "raise concrete `ui` / onboarding `backlog_additions` so your new-player experience strategy is actually built in code."
             )
         elif role == "VisualArtDirector":
             domain_instructions = (
-                "As VisualArtDirector, you MUST populate `visual_style_guide_update` AND propose a `mockup_to_generate` "
-                "(VisualMockupArtifact with a rich 16:9 `scene_description` showing a clear, unobstructed 2D gameplay viewport and specific `ui_callout_notes`) so the studio synthesizes a visual concept board right now."
+                "Domain Craft & Bible Fields (VisualArtDirector): You can shape `visual_style_guide_update`, `updated_camera_and_spatial_paradigm`, "
+                "`updated_color_palette_hex`, `added_or_updated_scene_layers`, and propose a `mockup_to_generate` "
+                "(VisualMockupArtifact with a rich 16:9 `scene_description` showing a clear, readable gameplay viewport and `ui_callout_notes`). "
+                "When strategizing visual rendering in Godot 4, champion the best of both worlds—combining procedural generation (noise/cellular-automata/spline "
+                "geometry, custom `CanvasItem` `ShaderMaterial`, `GPUParticles2D`, `PointLight2D`) with generated visual assets (`tile_surface` seamless textures "
+                "mapped onto procedural `Polygon2D`s via `StudioRigHelper.create_tiled_polygon` or `Line2D` strip textures, environmental decals/landmarks, "
+                "and discrete `sprite_sheet`/`articulated_parts` rigs for characters and interactive structures) so the game never relies on flat untextured "
+                "`Polygon2D` slabs or bare programmer-art `Line2D` strokes. "
+                "You can also call on your Sub-Agents `UXExperienceDesigner` and `AudioAtmosphereDesigner` via `addressed_to`."
+            )
+        elif role == "ScriptwriterAgent":
+            domain_instructions = (
+                "Domain Craft & Bible Fields (ScriptwriterAgent): As Lead Scriptwriter & Narrative Dramatist, strategize whether and how scripted scenes, "
+                "sharp dialogue, or contextual voice barks can elevate THIS game. When appropriate for the game, author or refine "
+                "`added_or_updated_cutscenes` (scene scripts with dramatic staging and line-by-line dialogue), `added_or_updated_dialogue_trees` "
+                "(branching conversations, player choices, and consequence flags), `added_or_updated_barks` (reactive in-gameplay lines), "
+                "or enrich character voices in `added_or_updated_characters`."
             )
         elif role == "CharacterDesigner":
             domain_instructions = (
-                "As CharacterDesigner, strategize the actors, entities, or personas that fit THIS game's setting and loop in "
-                "`added_or_updated_characters` (each with a unique `character_id`, distinct visual identity, and audio/voice signature; "
-                "when updating an existing entry already listed in the Bible, reuse their exact `character_id` rather than creating a duplicate), "
-                "plus `added_or_updated_dialogue_trees` and `added_or_updated_barks` as appropriate to the game's narrative style."
+                "Domain Craft & Bible Fields (CharacterDesigner): Strategize the actors, entities, or personas that fit THIS game's setting and loop in "
+                "`added_or_updated_characters` (each with a unique `character_id`, distinct visual silhouette, motivation, and voice signature; "
+                "reuse existing `character_id`s when refining a character already in the Bible), plus `added_or_updated_dialogue_trees` or `added_or_updated_barks` where fitting."
             )
         elif role == "StoryWorldArchitect":
             domain_instructions = (
-                "As StoryWorldArchitect, you MUST deepen `updated_core_fantasy`, `updated_elevator_pitch`, "
-                "log a `concept_evolution_milestone` showing how the world and narrative framing elevated the premise, "
-                "and author `added_or_updated_cutscenes` or narrative beats suited to this game."
+                "Domain Craft & Bible Fields (StoryWorldArchitect): Shape the world lore, dramatic stakes, and narrative framing via "
+                "`updated_core_fantasy`, `updated_elevator_pitch`, `concept_evolution_milestone`, and `added_or_updated_cutscenes`. "
+                "You can call on your Sub-Agents `ScriptwriterAgent` (to write scene scripts, dialogue trees, and barks) and `CharacterDesigner` "
+                "(to design characters and personas) via `addressed_to` whenever their craft will strengthen the game."
             )
         elif role == "GameplayDesigner":
             domain_instructions = (
-                "As GameplayDesigner, you MUST challenge any shallow prototype mechanics, add concrete tactile pillars in "
-                "`gameplay_pillars_additions` that are genuinely fun to play, and log a `concept_evolution_milestone` explaining how the gameplay loop evolved. "
-                "You MUST also populate `updated_core_loop` (player verbs plus the moment-to-moment, minute-to-minute and session loops, feedback, reward cadence, "
-                "failure and recovery) and `updated_engagement_plan` (entertainment pillars, variety injectors, pacing and intensity curve, surprise and discovery, "
-                "mastery and expression, emotional arc), refining them whenever the premise, levels or goals change."
+                "Domain Craft & Bible Fields (GameplayDesigner): Pressure-test the mechanics for genuine fun and agency, and shape "
+                "`gameplay_pillars_additions`, `updated_core_loop` (player verbs plus moment-to-moment, minute-to-minute, and session loops, feedback, reward cadence, "
+                "failure and recovery), `updated_engagement_plan` (entertainment pillars, variety injectors, pacing curve, mastery), `added_or_updated_slices`, and "
+                "`concept_evolution_milestone`. You can call on your Sub-Agents `LevelAndProgressionDesigner` and `GameplaySystemsEngineer` via `addressed_to`."
             )
         elif role == "GameplaySystemsEngineer":
             domain_instructions = (
-                "As GameplaySystemsEngineer, you MUST consult with the designers and translate the pitched gameplay pillars, "
-                "camera/spatial paradigm, and visual mockups into concrete Godot 4 engineering strategies in `added_or_updated_engineering_specs` "
-                "(at least 2-3 `MechanicEngineeringSpec` items). Specifically:\n"
-                "1. Strategize the spatial representation, physics/simulation model, and 1:1 visual-to-physical collision rules suited to this game's camera and mechanics,\n"
-                "2. Discretize abstract creative verbs into deterministic state machines (`state_machine_and_input_contract`) that initialize UNSOLVED at t=0 and require true causal player-driven progression,\n"
-                "3. Inventory every required visual asset in `required_sprite_and_tile_assets` formatted as `'<asset_id>:<asset_type>:<visual description>'` so downstream GDScript synthesis binds real authored assets rather than geometric programmer-art,\n"
-                "4. Define concrete `falsifiable_test_invariants` (`unsolved_baseline` at t=0, `spatial_boundary`/`negative_counterfactual`, and `positive_causal`) for headless Godot verification."
+                "Domain Craft & Bible Fields (GameplaySystemsEngineer): Translate the game's mechanics, camera/spatial paradigm, and visual direction into "
+                "concrete Godot 4 engineering strategies in `added_or_updated_engineering_specs` (`MechanicEngineeringSpec` items covering node/collider architecture, "
+                "hybrid procedural + generated texture/sprite/rig rendering, active `Camera2D` tracking across world bounds with HUD isolated on a `CanvasLayer`, "
+                "deterministic state machines that start unsolved at t=0, and falsifiable headless test invariants)."
             )
         elif role == "LevelAndProgressionDesigner":
             domain_instructions = (
-                "As LevelAndProgressionDesigner, you MUST populate `updated_level_generation_strategy` (bespoke `generation_approach`, `world_structure`, "
-                "`runtime_construction_plan`, `level_archetypes` each with its own visual identity and signature challenge, concrete `generation_rules` "
-                "guaranteeing solvability and fairness, a difficulty and pacing curve, and what keeps play varied) AND `updated_goal_hierarchy` "
-                "(goals across multiple distinct horizons suited to this game's loop, each with motivation, progress feedback and reward, "
-                "plus the progression structure and end state). Strategize the world scale and spatial structure that genuinely serves THIS game's "
-                "core loop (whether a single high-density arena/stage, discrete stages, a continuous world, or a procedurally generated expanse) "
-                "and justify why. Log a `concept_evolution_milestone` if this reshapes the premise."
+                "Domain Craft & Bible Fields (LevelAndProgressionDesigner): Strategize the game's world and progression in `updated_level_generation_strategy` "
+                "(bespoke `generation_approach`, `world_structure`, `runtime_construction_plan`, `level_archetypes`, `generation_rules`, and difficulty curve), "
+                "`updated_goal_hierarchy` (goals across multiple horizons, progression structure, and end state), and `added_or_updated_slices` "
+                "(where Slice 0 delivers a complete, cohesive playable vertical slice across the world's intended scale, camera movement, and progression loop, "
+                "rather than a cramped single-object test room)."
             )
         elif role == "AudioAtmosphereDesigner":
             domain_instructions = (
-                "As AudioAtmosphereDesigner, you MUST define `audio_direction_update` and contribute atmospheric or reactive `added_or_updated_barks`."
+                "Domain Craft & Bible Fields (AudioAtmosphereDesigner): Shape the game's acoustic identity and reactive soundscape in "
+                "`audio_direction_update`, contribute reactive or atmospheric `added_or_updated_barks` where suited to this game, and when a Production Board "
+                "is attached, raise `audio_asset` `backlog_additions` so the game's ambient and mechanical soundscape is fabricated and wired."
             )
 
         prompt = (
+            f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n\n"
+            f"{bible_snapshot}\n\n"
             f"You are the {display_name} ({role}) speaking in the Game Studio Writers' Room.\n"
             f"Your specialty focus: {focus}\n"
-            f"Why you raised your hand to interject: {listen_check.intended_contribution_summary}\n\n"
-            f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n\n"
-            f"{bible_snapshot}\n"
+            f"{hierarchy_note}"
+            f"Context for your turn: {listen_check.intended_contribution_summary}\n\n"
             f"{domain_instructions}\n"
+            f"STRATEGIZE WHAT IS BEST FOR THIS GAME (NO PRESCRIPTIONS): Do not follow rote templates. Reason from first principles about what mechanics, "
+            f"world structure, empathetic new-player onboarding/UI, narrative/script moments, hybrid visual rendering (combining procedural geometry/shaders/particles "
+            f"with generated surface textures, decals, and sprite/rig assets), and iterative vertical slices (`added_or_updated_slices`) best serve THIS specific game.\n"
             f"THE CONCEPT IS STILL EVOLVING: the premise above is provisional. Do not merely decorate it. Pressure-test it from your domain; "
             f"if your contribution exposes a weakness or a better direction, change it (title, pitch, core fantasy, mechanics) via the `updated_*` "
             f"fields and log a `concept_evolution_milestone` explaining what changed and why. Keep what is alive, replace what is generic.\n"
             f"Speak naturally, creatively, and passionately to your fellow designers in `spoken_dialogue` (never recite raw telemetry floats), "
-            f"call out specific colleagues in `addressed_to`, and contribute your concrete updates to the Living Game Bible. Provide `deliberation` FIRST."
+            f"call out specific colleagues or Sub-Agents in `addressed_to`, and contribute your concrete updates to the Living Game Bible. Provide `deliberation` FIRST."
         )
         if self.board is None:
             return self._call_structured_llm(prompt, WritersRoomTurnProposal)
         board_block = (
             f"{self.board.snapshot_text()}\n"
-            f"BUILD BACKLOG: the implementation side builds in parallel while you design. For every asset, level map, animation, mechanic or code "
-            f"module that must be built, add a `backlog_additions` item with a unique `item_id`, a precise `spec`, `depends_on` listing the item_ids it "
-            f"needs (items start only after those are APPROVED — any `mechanic_code`, `ui`, or `integration` item that renders characters, props, tiles, "
-            f"or backdrops MUST list the corresponding `visual_asset` / `animation` item_ids in `depends_on` so sprites are fabricated before code binds them), "
-            f"the code files it touches in `target_modules` (leave `target_modules=[]` for standalone `visual_asset`, `animation`, and `audio_asset` items), "
-            f"and a `proof_spec` saying which image(s) you need to see to judge it (asset inspection plates / contact sheets / waveforms for standalone asset "
-            f"items; in-engine Godot gameplay filmstrips for `mechanic_code`, `level_map`, `ui`, and `integration` items). Do not duplicate existing "
-            f"items. The finished work will be shown to the Council panel for approval.\n"
+            f"BUILD BACKLOG (ACTIVE SLICE — EMERGENT TASK & ASSET DISCOVERY): The implementation side builds in parallel while you design. "
+            f"Raise `backlog_additions` needed for the ACTIVE SLICE right now so Slice 0 ships as a complete, cohesive playable vertical slice "
+            f"(world/level traversal with proper camera tracking, core gameplay loop, empathetic new-player onboarding/HUD on a CanvasLayer, visual assets/surfaces, and audio).\n"
+            f"HYBRID PROCEDURAL + GENERATED ASSETS: Do NOT settle for flat untextured `Polygon2D` slabs or bare programmer-art `Line2D` strokes! "
+            f"Raise `visual_asset` tasks (`tile_surface` seamless textures for procedural `Polygon2D`/`Line2D` terrain/conduits, environmental decals/landmarks, "
+            f"and `sprite_sheet`/`articulated_parts` rigs for characters and interactive structures) alongside procedural shaders and particles.\n"
+            f"DEPENDENCY & ASSET BLOCKING RULES (`depends_on` and `blocks_items`):\n"
+            f"- Characters, avatars, creatures, and hero props in `mechanic_code` / `integration` tasks MUST bind actual fabricated sprites or articulated rigs—never primitive `draw_circle`/`draw_rect` stickmen.\n"
+            f"- When you raise a `mechanic_code` or `integration` task that requires a character rig, surface texture, or discrete sprite, either include that `visual_asset` item in `depends_on` (proposing the `visual_asset` item in the same turn if it is not on the board yet), OR let the Task Lead spawn it on Turn 0 with `wait_for_spawned_tasks=True`.\n"
+            f"- Conversely, when you raise a `visual_asset`, `animation`, or foundational system task that an ALREADY-PROPOSED task on the Production Board needs (for example, proposing the player's `visual_asset` character rig after a player controller `mechanic_code` task was already raised on an earlier turn), list those downstream task IDs in `blocks_items` (e.g. `blocks_items=['mechanic_...']`)! Setting `blocks_items` automatically wires your new task into their `depends_on` list and blocks them until your asset/system is fabricated and approved.\n"
+            f"- For each item you raise, provide a unique `item_id`, `slice_id` matching the active slice, a precise `spec`, `depends_on`, `blocks_items`, "
+            f"`target_modules` (leave `target_modules=[]` for standalone `visual_asset`, `animation`, and `audio_asset` items), and a `proof_spec`. "
+            f"Do not duplicate existing items. The finished work will be shown to the Council panel for approval.\n"
             f"Buildable kinds right now: {self._supported_kinds() or 'all'}.\n"
         )
 
@@ -1114,7 +1292,7 @@ class CreativeWritersRoom:
         if item.kind in ("mechanic_code", "ui", "integration"):
             panel = [primary, "GameplayDesigner", "UXExperienceDesigner", "VisualArtDirector"]
         elif item.kind == "level_map":
-            panel = ["CreativeDirector", "LevelAndProgressionDesigner", "UXExperienceDesigner"]
+            panel = ["CreativeDirector", "LevelAndProgressionDesigner", "UXExperienceDesigner", "VisualArtDirector"]
         elif item.kind in ("visual_asset", "animation"):
             panel = [primary, "VisualArtDirector"]
         elif item.kind == "audio_asset":
@@ -1189,32 +1367,44 @@ class CreativeWritersRoom:
     @staticmethod
     def _format_item_for_review(item: Any) -> str:
         history = "\n".join(
-            f"      rev {r.revision_index + 1}: worker_notes={r.worker_notes[:1200]!r} verdict={r.verdict or '(pending)'} feedback={r.feedback[:600]!r}"
+            f"      rev {r.revision_index + 1}: UNVERIFIED_WORKER_CLAIMS={r.worker_notes[:1200]!r} verdict={r.verdict or '(pending)'} feedback={r.feedback[:600]!r}"
             for r in item.revisions
         ) or "      (none)"
+        failure_line = (
+            f"\n    last_worker_failure (attempts={getattr(item, 'failure_count', 0)}): {item.failure[-800:]!r}"
+            if getattr(item, "failure", "")
+            else ""
+        )
         return (
             f"  ITEM [{item.item_id}] kind={item.kind} title={item.title!r} state={item.state}\n"
             f"    spec: {item.spec}\n    proof_spec: {item.proof_spec}\n    depends_on: {item.depends_on}\n"
             f"    revision_cap: {item.max_revisions} (spec rewrites so far: {item.spec_resets}/{MAX_SPEC_RESETS})\n"
-            f"    decision_reason: {item.decision_reason or '-'}\n    history:\n{history}"
+            f"    decision_reason: {item.decision_reason or '-'}{failure_line}\n    history:\n{history}"
         )
 
     @staticmethod
     def _role_review_mandate(role: str) -> str:
         if role == "UXExperienceDesigner":
             return (
-                "ROLE MANDATE (UXExperienceDesigner): You have VETO power over UI/UX quality. Immediately `request_changes` if a proof shows "
-                "developer debug/telemetry panels (e.g. 'HEADLESS MECHANICS', 'ALL PASS', raw float dumps) drawn INSIDE the 16:9 game viewport, "
-                "text-manual overlays, or HUD boxes occluding the playable center (>15% viewport area). "
+                "ROLE MANDATE (UXExperienceDesigner): You have VETO power over UI/UX and new-player legibility. Put yourself in the shoes of a brand-new "
+                "player seeing this screen for the first time: can they tell what their role/goal is, which structures are interactive, and what is "
+                "world vs. HUD? Evaluate the proof against the UI, HUD, and onboarding approach designed in the Game Bible. Immediately `request_changes` "
+                "if HUD widgets are placed in world-space where the player avatar can walk behind or collide with them (HUD must live on a `CanvasLayer`), "
+                "if a proof shows internal QA test-runner strings (e.g. 'HEADLESS MECHANICS', 'ALL PASS') drawn INSIDE the 16:9 game viewport, or if UI "
+                "panels occlude the playable center. "
                 "IMPORTANT: The thin header bar ('[QA] tick N in:[...]') and footer bar ('[QA] pos=...') outside each 16:9 frame in `filmstrip_*.png` "
                 "are external QA Test Harness contact-sheet margins added FOR THE COUNCIL—do NOT flag those external frame caption bars as in-game HUD defects.\n"
             )
         if role == "VisualArtDirector":
             return (
-                "ROLE MANDATE (VisualArtDirector): You have VETO power over visual fidelity. Compare the proof directly against the 16:9 Concept Art "
-                "Mockup and Game Bible Visual Style Guide. Immediately `request_changes` if characters, landmarks, or world surfaces are drawn as "
-                "geometric programmer art (`draw_rect` crates, stick-figure circles/lines, wireframe graphs) instead of bound Sprite2D/TextureRect "
-                "assets at proper camera scale, or if an opaque background/frame layer hides the character sprites and world floor tiles. "
+                "ROLE MANDATE (VisualArtDirector): You have VETO power over visual fidelity and spatial staging. Compare the proof directly against the 16:9 Concept Art "
+                "Mockup, Game Bible Visual Style Guide, and the cartridge's fabricated assets. We demand hybrid procedural + generated visual craft: procedural "
+                "geometry/contours (`Polygon2D`, `Line2D`) MUST be combined with fabricated surface textures (`tile_surface` via `StudioRigHelper.create_tiled_polygon` / "
+                "`TEXTURE_REPEAT_ENABLED`, `Line2D` strip textures with `LINE_TEXTURE_TILE`), custom `ShaderMaterial`s, environmental decals, and `GPUParticles2D`—NEVER "
+                "solid flat-colored untextured `Polygon2D` slabs, blank white/monochrome backgrounds, or bare 8-point `Line2D` programmer-art zigzags! "
+                "Characters, avatars, creatures, and interactive world structures MUST bind actual fabricated sprites or articulated rigs from `res://assets/sprites/*.png` "
+                "and be coherently layered into the environment (not crudely pasted on top of each other). Immediately `request_changes` if a `level_map`, `mechanic_code`, "
+                "or `integration` proof renders untextured flat polygons, bare programmer-art lines, or primitive `draw_circle`/`draw_rect` stickmen/boxes. "
                 "Do NOT flag the external QA contact-sheet header/footer strips ('[QA] tick ...', '[QA] pos=...') outside each 16:9 frame as in-game text.\n"
             )
         if role in ("GameplayDesigner", "GameplaySystemsEngineer"):
@@ -1238,7 +1428,7 @@ class CreativeWritersRoom:
         spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == role), None)
         who = f"the {spec['display_name']} ({role})" if spec else "the Creative Director"
         parts: List[Any] = []
-        if any(it.kind in ("mechanic_code", "ui", "integration", "visual_asset", "animation") for it in awaiting + deciding):
+        if any(it.kind in ("level_map", "mechanic_code", "ui", "integration", "visual_asset", "animation") for it in awaiting + deciding):
             parts.extend(self._concept_mockup_parts(game_bible, candidate_dir))
         for it in awaiting + deciding:
             parts.extend(self._proof_parts(it, candidate_dir))
@@ -1247,18 +1437,60 @@ class CreativeWritersRoom:
         by_id = {i.item_id: i for i in awaiting + deciding}
         mandate = self._role_review_mandate(role)
         filmstrip_guide = (
-            "HOW TO READ `filmstrip_*.png` QA CONTACT SHEETS:\n"
-            "- Each `filmstrip_*.png` proof is a multi-frame grid captured by the external QA Test Harness.\n"
+            "HOW TO READ `filmstrip_*.png` QA CONTACT SHEETS & VERIFY WORKER CLAIMS:\n"
+            "- Each `filmstrip_*.png` proof is a multi-frame grid captured by the external QA Test Harness (640x360 per frame).\n"
             "- Above each 16:9 game frame, the test harness prints the simulation tick and injected controller inputs (`[QA] tick N  in:[...]`).\n"
             "- Below each 16:9 game frame, the test harness prints the live engine state snapshot (`[QA] pos=(...) ...`) specifically FOR YOU (the Council) to verify coordinates and state variables.\n"
-            "- These top and bottom margin bands outside the 16:9 frame border are external QA contact-sheet annotations—they are NOT rendered inside the game viewport and must NEVER be rejected as 'developer debug text overlays'.\n\n"
+            "- These top and bottom margin bands outside the 16:9 frame border are external QA contact-sheet annotations—they are NOT rendered inside the game viewport and must NEVER be rejected as 'developer debug text overlays'.\n"
+            "- SKEPTICAL VISUAL VERIFICATION OF `UNVERIFIED_WORKER_CLAIMS`: The `UNVERIFIED_WORKER_CLAIMS` in an item's revision history are self-reported worker notes and pre-capture expectations—NEVER approve an item because `UNVERIFIED_WORKER_CLAIMS` claims a fix was made! You MUST visually verify every single point of prior revision `feedback` directly in the pixels of the attached proof image (and check any `QA Post-Capture Visual Audit` notes). Immediately `request_changes` if the proof image shows clipped/invisible sprite fragments (from wrong `hframes`/`vframes` slicing), shrunk background rectangles that leave dark void around the play area, or crude procedural polygons where fabricated textures/sprites were requested.\n\n"
         )
+        on_disk_sprites_block = ""
+        curated_review_block = ""
+        if candidate_dir is not None:
+            try:
+                from engine.studio.workers import _summarize_cartridge_for_qa
+                qa_sum = _summarize_cartridge_for_qa(Path(candidate_dir), max_chars=2500)
+                if qa_sum:
+                    on_disk_sprites_block = (
+                        "CARTRIDGE MODULES, BOUND ASSETS & ON-DISK ASSET LIBRARY (`bound_assets` shows which `res://assets/...` files each `.gd` script actually loads):\n"
+                        f"{qa_sum}\n\n"
+                    )
+            except Exception:
+                pass
+            from engine.studio.context_curator import ContextCuratorAgent, is_real_genai_client
+            if is_real_genai_client(self.client):
+                review_items = awaiting + deciding
+                first_item = review_items[0] if review_items else None
+                review_req = "\n".join(
+                    f"[{it.item_id}] ({it.kind}) {it.title}: {it.spec} | proof: {it.proof_spec}"
+                    for it in review_items
+                )
+                curator = ContextCuratorAgent(
+                    cartridge_dir=Path(candidate_dir),
+                    client=self.client,
+                    model_name=self.model_name,
+                    board=self.board,
+                    game_bible=game_bible,
+                    event_callback=self.event_callback,
+                )
+                pack = curator.curate_context(
+                    target_agent_role=f"council_reviewer:{role}",
+                    task_request=review_req,
+                    item_id=(first_item.item_id if first_item is not None else "review_batch"),
+                    item_kind=(first_item.kind if first_item is not None else "review"),
+                )
+                curated_review_block = f"{pack.prompt_block}\n"
+        shared_review_context = (
+            f"{on_disk_sprites_block}"
+            f"{curated_review_block}"
+            f"{self._format_bible_snapshot(game_bible)}\n"
+        )
+        parts.append(shared_review_context)
         prompt = (
             f"You are {who} reviewing work built by the implementation team for the game being designed.\n"
             f"{mandate}"
             f"{filmstrip_guide}"
-            f"{self._format_bible_snapshot(game_bible)}\n"
-            f"ITEMS AWAITING YOUR REVIEW (proof images are attached above):\n"
+            f"ITEMS AWAITING YOUR REVIEW (proof images and Living Game Bible context are attached above):\n"
             + ("\n".join(self._format_item_for_review(i) for i in awaiting) or "  (none)")
             + f"\n\nITEMS THAT HIT THEIR REVISION CAP OR STALLED (you must decide):\n"
             + ("\n".join(self._format_item_for_review(i) for i in deciding) or "  (none)")
@@ -1332,6 +1564,15 @@ class CreativeWritersRoom:
         if not groups:
             return 0
         roles = list(groups)
+        self._emit_activity(
+            agent_role="CouncilReviewPanel",
+            status_text=(
+                f"Council review panel ({', '.join(roles)}) is inspecting proof images for "
+                f"{[it.item_id for it in awaiting_items] or [it.item_id for it in self.board.needing_decision()]}..."
+            ),
+            active_agents=roles,
+            phase="proof_review",
+        )
         batches = self._map_parallel(
             lambda r: self._review_as(r, groups[r][0], groups[r][1], game_bible, dna_summary, candidate_dir), roles
         )
@@ -1389,11 +1630,22 @@ class CreativeWritersRoom:
         return applied
 
     def _handle_failed_items(self) -> None:
-        """Re-queues a failed item once (visible via events/logs); a second failure surfaces the real error (Rule 5)."""
+        """Re-queues a failed item once (visible via events/logs); on a second failure in a live Council build,
+        escalates the item to `needs_decision` so the Council can rewrite its spec or cancel/re-point dependents,
+        or raises the authentic error if spec rewrites are exhausted or in direct unit-test failure probes (Rule 5)."""
         for it in self.board.items():
             if it.state != "failed":
                 continue
             if it.failure_count >= 2:
+                if is_real_genai_client(self.client) and it.spec_resets < MAX_SPEC_RESETS:
+                    logger.warning(
+                        "Escalating item %s to Council needs_decision after %d worker failures:\n%s",
+                        it.item_id,
+                        it.failure_count,
+                        it.failure,
+                    )
+                    self.board.escalate_failed_to_decision(it.item_id)
+                    continue
                 raise StudioAgentError(f"Backlog item '{it.item_id}' failed {it.failure_count} times:\n{it.failure}")
             logger.warning("Re-queueing failed item %s (failure %d):\n%s", it.item_id, it.failure_count, it.failure)
             self.board.requeue_failed(it.item_id)
@@ -1435,9 +1687,9 @@ class CreativeWritersRoom:
                 continue
             listen_check = WritersRoomListenCheck(
                 deliberation=f"Immediate pivot required to honor Executive Producer steering: {combined_steering}",
-                wants_to_speak=True,
+                should_interject=True,
                 urgency_score=1.0,
-                intended_contribution_focus=f"Adapt the Game Bible and update/cancel/create ProductionBoard items to satisfy Executive Producer steering: {combined_steering}",
+                intended_contribution_summary=f"Adapt the Game Bible and update/cancel/create ProductionBoard items to satisfy Executive Producer steering: {combined_steering}",
             )
             proposal = self._execute_specialist_turn(
                 specialist=spec,
@@ -1466,9 +1718,10 @@ class CreativeWritersRoom:
             self.scheduler.start()
         deadline = time.monotonic() + self.drain_timeout_s
 
-        def _board_progress_sig() -> Tuple[int, int]:
+        def _board_progress_sig() -> Tuple[int, int, int]:
             all_items = self.board.items()
             return (
+                len(all_items),
                 sum(len(i.revisions) for i in all_items),
                 sum(1 for i in all_items if i.state in ("approved", "cancelled")),
             )
@@ -1502,6 +1755,29 @@ class CreativeWritersRoom:
             if applied == 0:
                 time.sleep(self.drain_poll_s)
 
+    _ESSENTIAL_DOMAIN_SPECIALISTS = (
+        "LevelAndProgressionDesigner",
+        "GameplaySystemsEngineer",
+        "UXExperienceDesigner",
+        "AudioAtmosphereDesigner",
+    )
+    _REQUIRED_BOARD_SPECIALISTS = (
+        "GameplayDesigner",
+        "LevelAndProgressionDesigner",
+        "GameplaySystemsEngineer",
+        "VisualArtDirector",
+        "UXExperienceDesigner",
+        "AudioAtmosphereDesigner",
+    )
+
+    def _missing_required_board_specialists(self, game_bible: GameBibleSpec) -> List[str]:
+        """When a Production Board is attached in a full Writers' Room session, every core domain specialist
+        must speak at least once so UX, Audio, Level, Systems, Art, and Gameplay all contribute their domain design and tasks."""
+        if self.board is None or (self.max_turns < 6 and not is_real_genai_client(self.client)):
+            return []
+        spoken = {u.speaker_role for u in game_bible.writers_room_transcript}
+        return [role for role in self._REQUIRED_BOARD_SPECIALISTS if role not in spoken]
+
     def _select_next_speaker(
         self,
         last_speaker_role: str,
@@ -1509,45 +1785,108 @@ class CreativeWritersRoom:
         game_bible: GameBibleSpec,
         dna_summary: str,
         spoken_counts: Dict[str, int],
-    ) -> Tuple[Dict[str, str], WritersRoomListenCheck]:
-        """Polls specialists to see who wants to interject next based on the conversation and Game Bible gaps."""
-        candidates: List[Tuple[float, Dict[str, str], WritersRoomListenCheck]] = []
+    ) -> Tuple[Dict[str, Any], WritersRoomListenCheck]:
+        """Polls the Core Council Leads, any Sub-Agents invited via `addressed_to`, and (once the opening
+        core exchange is underway) any essential domain specialists who have not yet spoken.
+        Relies purely on LLM deliberation & urgency (zero hardcoded role score boosts)."""
+        core_roles = {s["role"] for s in CORE_COUNCIL_ROSTER}
+        invited_roles = set(addressed_to or []) - {last_speaker_role}
+        total_spoken = sum(spoken_counts.values()) if spoken_counts else 0
+        unheard_essential = (
+            {r for r in self._ESSENTIAL_DOMAIN_SPECIALISTS if spoken_counts.get(r, 0) == 0}
+            if total_spoken >= 2
+            else set()
+        )
+        invited_specs = [
+            spec
+            for spec in SPECIALIST_ROSTER
+            if spec["role"] != last_speaker_role and spec["role"] in invited_roles
+        ]
+        if is_real_genai_client(self.client) and invited_specs:
+            listeners = list(invited_specs)
+            if unheard_essential and not any(spoken_counts.get(sp["role"], 0) == 0 for sp in listeners):
+                for spec in SPECIALIST_ROSTER:
+                    if (
+                        spec["role"] != last_speaker_role
+                        and spec["role"] in unheard_essential
+                        and spec not in listeners
+                    ):
+                        listeners.append(spec)
+                        break
+        else:
+            listeners = [
+                spec
+                for spec in SPECIALIST_ROSTER
+                if spec["role"] != last_speaker_role
+                and (spec["role"] in core_roles or spec["role"] in invited_roles or spec["role"] in unheard_essential)
+            ]
+        if not listeners:
+            listeners = [spec for spec in SPECIALIST_ROSTER if spec["role"] != last_speaker_role] or list(SPECIALIST_ROSTER)
 
-        listeners = [spec for spec in SPECIALIST_ROSTER if spec["role"] != last_speaker_role]
+        self._emit_activity(
+            agent_role="CouncilTable",
+            status_text=f"Council listening & deliberating next speaker ({', '.join(sp['role'] for sp in listeners)})...",
+            active_agents=[sp["role"] for sp in listeners],
+            phase="listening",
+        )
+
         checks = self._map_parallel(
             lambda sp: self._evaluate_specialist_listen(sp, game_bible, dna_summary), listeners
         )
+        candidates: List[Tuple[int, float, Dict[str, Any], WritersRoomListenCheck]] = []
         for spec, check in zip(listeners, checks):
-            role = spec["role"]
-            effective_score = float(check.urgency_score)
-            if role in (addressed_to or []):
-                effective_score += 0.35
-            if spoken_counts.get(role, 0) == 0:
-                effective_score += 0.25
-            # Boost specialists whose core Bible sections are still empty
-            if role == "UXExperienceDesigner" and (not game_bible.experience_storyboard or game_bible.onboarding_plan is None):
-                effective_score += 0.4
-            elif role == "VisualArtDirector" and not game_bible.visual_mockups:
-                effective_score += 0.4
-            elif role == "GameplaySystemsEngineer" and not game_bible.technical_architecture_blueprint:
-                effective_score += 0.4
-            elif role == "CharacterDesigner" and (not game_bible.narrative_bible or not game_bible.narrative_bible.characters):
-                effective_score += 0.35
-            elif role == "StoryWorldArchitect" and (not game_bible.narrative_bible or not game_bible.narrative_bible.cutscenes):
-                effective_score += 0.3
-            elif role == "GameplayDesigner" and (len(game_bible.gameplay_pillars) < 2 or game_bible.core_loop is None or game_bible.engagement_plan is None):
-                effective_score += 0.3
-            elif role == "LevelAndProgressionDesigner" and (game_bible.level_generation_strategy is None or game_bible.goal_hierarchy is None):
-                effective_score += 0.4
+            candidates.append((1 if check.should_interject else 0, float(check.urgency_score), spec, check))
 
-            candidates.append((effective_score, spec, check))
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        _, _, chosen_spec, chosen_check = candidates[0]
 
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        _, chosen_spec, chosen_check = candidates[0]
+        # If a Core Council Lead chose to call in a specialized Sub-Agent (e.g. StoryWorldArchitect -> ScriptwriterAgent),
+        # route the microphone to that Sub-Agent with the Lead's brief.
+        consult_role = (getattr(chosen_check, "consult_subagent_role", None) or "").strip()
+        if consult_role and consult_role != last_speaker_role:
+            sub_spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == consult_role), None)
+            if sub_spec is not None:
+                sub_brief = (getattr(chosen_check, "subagent_brief", "") or chosen_check.intended_contribution_summary).strip()
+                delegated_check = WritersRoomListenCheck(
+                    deliberation=(
+                        f"Called into the Writers' Room by {chosen_spec['display_name']} ({chosen_spec['role']}): "
+                        f"{chosen_check.deliberation}"
+                    ),
+                    should_interject=True,
+                    urgency_score=chosen_check.urgency_score,
+                    intended_contribution_summary=(
+                        f"[Called in by {chosen_spec['role']}] {sub_brief}"
+                        if sub_brief
+                        else f"Called in by {chosen_spec['role']} to contribute {sub_spec['display_name']} expertise."
+                    ),
+                )
+                self._emit_activity(
+                    agent_role=sub_spec["role"],
+                    status_text=(
+                        f"{chosen_spec['display_name']} ({chosen_spec['role']}) called in Sub-Agent "
+                        f"{sub_spec['display_name']} ({sub_spec['role']})"
+                        + (f": {sub_brief[:100]}" if sub_brief else "")
+                    ),
+                    active_agents=[chosen_spec["role"], sub_spec["role"]],
+                    phase="subagent_handoff",
+                    extra={
+                        "called_by_lead": chosen_spec["role"],
+                        "subagent_role": sub_spec["role"],
+                        "subagent_brief": sub_brief,
+                    },
+                )
+                return sub_spec, delegated_check
+
         return chosen_spec, chosen_check
 
     def _evaluate_convergence(self, game_bible: GameBibleSpec, dna_summary: str) -> DirectorConvergenceCheck:
         """CreativeDirector evaluates whether the Living Game Bible is cohesive and ready to lock."""
+        self._emit_activity(
+            agent_role="CreativeDirector",
+            status_text="Creative Director is evaluating Game Bible cohesion & convergence readiness...",
+            active_agents=["CreativeDirector"],
+            phase="convergence_check",
+        )
         bible_snapshot = self._format_bible_snapshot(game_bible)
         prompt = (
             f"You are the CreativeDirector of the Game Studio Writers' Room.\n"
@@ -1556,11 +1895,11 @@ class CreativeWritersRoom:
             f"Critically evaluate whether the Living Game Bible is ready to lock and enter production.\n"
             f"Do NOT approve a shallow 'Hello World' prototype. To be ready (`is_ready_to_lock_bible = true`), the Bible MUST have:\n"
             f"1. A deeply evocative premise, core fantasy, and a Concept Evolution history showing the premise was genuinely pressure-tested and reshaped by multiple specialists (do not lock a premise that is still its initial draft),\n"
-            f"2. A compelling First 60 Seconds Hook and Intuitive UI & Onboarding Philosophy (clean, readable HUD paired with responsive world cues),\n"
+            f"2. A compelling First 60 Seconds Hook and a clear UI, HUD & Onboarding Philosophy suited to this game,\n"
             f"3. An Experience Storyboard detailing the player's emotional & sensory arc,\n"
             f"4. Synthesized 16:9 Visual Mockup board(s),\n"
-            f"5. Cohesive World Lore, Characters/Entities, Cutscenes, and Audio/Voice direction,\n"
-            f"6. A Technical Architecture Blueprint (`technical_architecture_blueprint`) from GameplaySystemsEngineer translating mechanics into Godot 4 nodes, colliders, required assets, and test invariants.\n"
+            f"5. Cohesive World Lore, Audio direction, and Characters/Entities as appropriate to the game concept,\n"
+            f"6. A Technical Architecture Blueprint (`technical_architecture_blueprint`) from GameplaySystemsEngineer translating mechanics into Godot 4 nodes, procedural/shader or sprite rendering, colliders, and test invariants.\n"
             f"7. A COHESIVE WHOLE GAME, not a single scene: a Level Generation Strategy (how levels are produced and what they look like), a Core Loop at three time scales, "
             f"an Engagement Plan, an Onboarding Plan, and a Goal Hierarchy spanning short-, mid- and long-term goals. They must agree with one another: the onboarding must teach the "
             f"core loop's verbs, the level archetypes must exercise those verbs and escalate difficulty, and every short-term goal must serve a long-term goal. "
@@ -1571,12 +1910,19 @@ class CreativeWritersRoom:
 
     def _synthesize_final_world_spec(self, game_bible: GameBibleSpec, dna: Optional[SteamPlayerDNA], target_episode: int) -> GenesisWorldSpec:
         """Synthesizes the authoritative GenesisWorldSpec grounded in the locked Living Game Bible."""
+        self._emit_activity(
+            agent_role="CreativeDirector",
+            status_text=f"Creative Director is synthesizing authoritative GenesisWorldSpec for '{game_bible.game_title}'...",
+            active_agents=["CreativeDirector"],
+            phase="world_spec_synthesis",
+        )
         bible_snapshot = self._format_bible_snapshot(game_bible)
-        mood_hint = getattr(dna, "preferred_palette_mood", "vibrant_fantasy") if dna is not None else "vibrant_fantasy"
+        mood_hint = getattr(dna, "preferred_palette_mood", None) if dna is not None else None
+        mood_line = f"Preferred Palette Mood Hint: {mood_hint}\n" if mood_hint else ""
         prompt = (
             f"You are the CreativeDirector finalizing the authoritative GenesisWorldSpec from the Writers' Room Living Game Bible.\n"
             f"Target Episode: {target_episode}\n"
-            f"Preferred Palette Mood Hint: {mood_hint}\n\n"
+            f"{mood_line}\n"
             f"{bible_snapshot}\n"
             f"Synthesize the complete GenesisWorldSpec honoring every single pillar, UI & onboarding rule, camera staging, "
             f"and story hook agreed upon by the Writers' Room. Provide `deliberation` FIRST."
@@ -1608,23 +1954,29 @@ class CreativeWritersRoom:
         candidate_dir: Optional[Path],
         max_rounds: int = 2,
     ) -> None:
-        """Gives the owning specialist a mandatory turn for every missing/incomplete game-design section."""
+        """Gives the owning specialist a mandatory turn for every missing/incomplete game-design section
+        and ensures every required domain specialist has contributed before locking a Production Board build."""
         for _round in range(max_rounds):
             issues = validate_game_design(game_bible)
-            if not issues:
+            missing_specialists = self._missing_required_board_specialists(game_bible)
+            if not issues and not missing_specialists:
                 return
             owners: List[str] = []
             for issue in issues:
                 for section, owner in self._DESIGN_SECTION_OWNERS.items():
                     if issue.startswith(section) and owner not in owners:
                         owners.append(owner)
+            for role in missing_specialists:
+                if role not in owners:
+                    owners.append(role)
             for owner in owners:
                 spec = next(sp for sp in SPECIALIST_ROSTER if sp["role"] == owner)
+                gap_summary = "; ".join(issues) if issues else f"Contribute {spec['display_name']} domain strategy and Production Board tasks for Slice 0."
                 check = WritersRoomListenCheck(
-                    deliberation="The Game Bible cannot lock while the game-design sections are incomplete.",
+                    deliberation="The Game Bible cannot lock until all required game-design sections and specialist domain contributions are complete.",
                     should_interject=True,
                     urgency_score=1.0,
-                    intended_contribution_summary="Complete these game-design gaps: " + "; ".join(issues),
+                    intended_contribution_summary="Complete these game-design and domain requirements: " + gap_summary,
                 )
                 proposal = self._execute_specialist_turn(
                     specialist=spec, listen_check=check, game_bible=game_bible, dna_summary=dna_summary
@@ -1661,9 +2013,9 @@ class CreativeWritersRoom:
         issues: List[str] = []
         for attempt in range(1, attempts + 1):
             feedback = (
-                "YOUR PREVIOUS ANSWER FAILED VALIDATION; FIX EVERY ISSUE:\n- " + "\n- ".join(issues) + "\n\n" if issues else ""
+                "\n\nYOUR PREVIOUS ANSWER FAILED VALIDATION; FIX EVERY ISSUE:\n- " + "\n- ".join(issues) if issues else ""
             )
-            result = self._call_structured_llm(feedback + prompt, schema_cls, temperature=temperature, parts=parts)
+            result = self._call_structured_llm(prompt + feedback, schema_cls, temperature=temperature, parts=parts)
             issues = validate(result)
             if not issues:
                 return result
@@ -1719,6 +2071,12 @@ class CreativeWritersRoom:
         prior_clause = f"PRIOR CONCEPTS ALREADY PRODUCED (do NOT repeat or lightly vary any of them):\n{prior}\n"
 
         # 1. Divergent provocations (one per specialist, mutually orthogonal)
+        self._emit_activity(
+            agent_role="CreativeDirector",
+            status_text=f"Concept Genesis (1/4): Creative Director is crafting orthogonal provocations for {len(roles)} specialists...",
+            active_agents=["CreativeDirector"],
+            phase="genesis_provocations",
+        )
         def _validate_prov(ps: CreativeProvocationSet) -> List[str]:
             got = {p.specialist_role for p in ps.provocations}
             missing = [r for r in roles if r not in got]
@@ -1740,6 +2098,12 @@ class CreativeWritersRoom:
         provocation_by_role = {p.specialist_role: p.provocation for p in prov_set.provocations}
 
         # 2. Divergence: each specialist independently contributes fragments (no coordination, no whole game)
+        self._emit_activity(
+            agent_role="CouncilTable",
+            status_text=f"Concept Genesis (2/4): All {len(SPECIALIST_ROSTER)} specialists are seeding divergent concept fragments in parallel...",
+            active_agents=roles,
+            phase="genesis_fragments",
+        )
         def _seed_for(spec: Dict[str, str]) -> ConceptSeedProposal:
             role = spec["role"]
             return self._call_structured_llm(
@@ -1788,6 +2152,12 @@ class CreativeWritersRoom:
             return issues
 
         for _round in range(3):
+            self._emit_activity(
+                agent_role="CreativeDirector",
+                status_text=f"Concept Genesis (3/4): Creative Director is colliding {len(fragments)} fragments into candidate premises (round {_round + 1})...",
+                active_agents=["CreativeDirector"],
+                phase="genesis_collision",
+            )
             collision = self._structured_with_validation(
                 (
                     f"You are the CreativeDirector. The room has contributed these independent fragments:\n{frag_block}\n\n"
@@ -1838,6 +2208,12 @@ class CreativeWritersRoom:
 
         cand_block = "\n".join(
             f"  [{c.candidate_id}] '{c.working_title}': {c.premise} | tension: {c.core_tension}" for c in distinct
+        )
+        self._emit_activity(
+            agent_role="CreativeDirector",
+            status_text=f"Concept Genesis (4/4): Creative Director is selecting the provisional starting premise from {len(distinct)} candidates...",
+            active_agents=["CreativeDirector"],
+            phase="genesis_selection",
         )
         selection = self._structured_with_validation(
             (
@@ -1914,6 +2290,18 @@ class CreativeWritersRoom:
         spoken_counts: Dict[str, int] = {s["role"]: 0 for s in SPECIALIST_ROSTER}
         last_speaker_role = "CreativeDirector"
         last_addressed_to: List[str] = ["GameplayDesigner", "StoryWorldArchitect", "UXExperienceDesigner"]
+        pending_invited_roles: List[str] = list(last_addressed_to)
+        for existing_utt in game_bible.writers_room_transcript[1:]:
+            if existing_utt.speaker_role in spoken_counts:
+                spoken_counts[existing_utt.speaker_role] += 1
+            if existing_utt.speaker_role in pending_invited_roles:
+                pending_invited_roles.remove(existing_utt.speaker_role)
+            last_speaker_role = existing_utt.speaker_role
+            if existing_utt.addressed_to:
+                last_addressed_to = list(existing_utt.addressed_to)
+                for r in existing_utt.addressed_to:
+                    if r not in pending_invited_roles and spoken_counts.get(r, 0) == 0:
+                        pending_invited_roles.append(r)
 
         # Opening pitch/provocation by CreativeDirector if transcript is empty
         if not game_bible.writers_room_transcript:
@@ -1932,20 +2320,30 @@ class CreativeWritersRoom:
                 candidate_dir=candidate_dir,
             )
             last_addressed_to = opening_utt.addressed_to
+            for r in opening_utt.addressed_to:
+                if r not in pending_invited_roles:
+                    pending_invited_roles.append(r)
 
         # Open-ended specialist conversation loop
-        turns_executed = 0
+        turns_executed = sum(spoken_counts.values())
+        if self.board is not None and self.scheduler is not None:
+            if turns_executed >= min(3, self.max_turns) or len(self.board.items()) >= 3:
+                self.scheduler.start()
         while turns_executed < self.max_turns:
             self._wait_if_paused(candidate_dir)
             steered = self._consume_pending_steering(game_bible, candidate_dir=candidate_dir)
             if steered:
                 last_speaker_role = "ExecutiveProducer"
                 last_addressed_to = ["CreativeDirector", "GameplayDesigner", "GameplaySystemsEngineer", "UXExperienceDesigner"]
+                for r in last_addressed_to:
+                    if r not in pending_invited_roles:
+                        pending_invited_roles.append(r)
                 if self.max_turns - turns_executed < 3:
                     self.max_turns = turns_executed + 3
+            effective_addressed_to = list(dict.fromkeys(list(last_addressed_to) + pending_invited_roles))
             chosen_spec, listen_check = self._select_next_speaker(
                 last_speaker_role=last_speaker_role,
-                addressed_to=last_addressed_to,
+                addressed_to=effective_addressed_to,
                 game_bible=game_bible,
                 dna_summary=dna_summary,
                 spoken_counts=spoken_counts,
@@ -1967,12 +2365,21 @@ class CreativeWritersRoom:
                 candidate_dir=candidate_dir,
             )
             spoken_counts[role] = spoken_counts.get(role, 0) + 1
+            if role in pending_invited_roles:
+                pending_invited_roles.remove(role)
             last_speaker_role = role
             last_addressed_to = utterance.addressed_to
+            for r in utterance.addressed_to:
+                if r not in pending_invited_roles and spoken_counts.get(r, 0) == 0:
+                    pending_invited_roles.append(r)
             turns_executed += 1
             if self.board is not None:
-                if self.scheduler is not None:
+                # Wait to start the background worker scheduler until the initial Core Council pass (at least 3 turns
+                # or max_turns if smaller) has completed so VisualArtDirector and fellow Leads can propose foundational
+                # visual_asset rigs and wire `blocks_items` dependencies before mechanic_code workers claim tasks.
+                if self.scheduler is not None and turns_executed >= min(3, self.max_turns):
                     self.scheduler.start()
+                self._handle_failed_items()
                 self._run_review_round(game_bible, dna_summary, candidate_dir)
 
             # Check if live Executive Producer steering arrived during the turn before evaluating convergence
@@ -1980,6 +2387,9 @@ class CreativeWritersRoom:
             if steered_post:
                 last_speaker_role = "ExecutiveProducer"
                 last_addressed_to = ["CreativeDirector", "GameplayDesigner", "GameplaySystemsEngineer", "UXExperienceDesigner"]
+                for r in last_addressed_to:
+                    if r not in pending_invited_roles:
+                        pending_invited_roles.append(r)
                 if self.max_turns - turns_executed < 3:
                     self.max_turns = turns_executed + 3
                 continue
@@ -1987,11 +2397,13 @@ class CreativeWritersRoom:
             # Check convergence once minimum turns have elapsed
             if turns_executed >= self.min_turns_before_convergence:
                 convergence = self._evaluate_convergence(game_bible, dna_summary)
+                missing_board_specialists = self._missing_required_board_specialists(game_bible)
                 has_minimum_artifacts = (
                     bool(game_bible.experience_storyboard)
                     and bool(game_bible.first_60_seconds_hook)
                     and bool(game_bible.diegetic_ui_philosophy)
                     and not validate_game_design(game_bible)
+                    and not missing_board_specialists
                 )
                 if convergence.is_ready_to_lock_bible and has_minimum_artifacts:
                     closing_utt = WritersRoomUtterance(
@@ -2051,6 +2463,39 @@ class CreativeWritersRoom:
 
         # A locked Bible must describe a whole, cohesive game: force-complete any missing design section (Rule 5: never lock silently incomplete).
         self._complete_missing_design_sections(game_bible, dna_summary, candidate_dir)
+        if not game_bible.slice_roadmap:
+            onb_intro = (
+                game_bible.onboarding_plan.world_introduction
+                if game_bible.onboarding_plan and game_bible.onboarding_plan.world_introduction
+                else (game_bible.first_60_seconds_hook or game_bible.elevator_pitch or game_bible.game_title)
+            )
+            verbs_str = (
+                ", ".join(game_bible.core_loop.player_verbs)
+                if game_bible.core_loop and game_bible.core_loop.player_verbs
+                else "core interaction mechanics"
+            )
+            m2m = (
+                game_bible.core_loop.moment_to_moment_loop
+                if game_bible.core_loop and game_bible.core_loop.moment_to_moment_loop
+                else "acclimating to the world and learning the core mechanics"
+            )
+            game_bible.slice_roadmap = [
+                GameSliceSpec(
+                    deliberation=(
+                        "Strategizing Slice 0 from the locked Onboarding Plan and Core Loop so the first iteration "
+                        "focuses on getting the player acclimated to the world and understanding the mechanics."
+                    ),
+                    slice_id="slice_0_acclimation",
+                    slice_index=0,
+                    title=f"{game_bible.game_title} — Slice 0: World Acclimation & Core Mechanics",
+                    slice_objective=onb_intro,
+                    player_acclimation_and_mechanics_focus=f"Player verbs ({verbs_str}) and moment-to-moment loop: {m2m}",
+                    expansion_from_prior_slice="Foundational first slice establishing world acclimation and core mechanics.",
+                    scope_boundaries=["Generate and wire ONLY the assets, animations, and systems required for Slice 0."],
+                    status="active",
+                )
+            ]
+            game_bible.active_slice_index = 0
         # ...and every requirement the council raised must be built and approved (or deliberately cancelled).
         self._drain_backlog(game_bible, dna_summary, candidate_dir)
 
@@ -2058,6 +2503,76 @@ class CreativeWritersRoom:
         game_bible.world_spec = self._synthesize_final_world_spec(game_bible, dna, target_episode)
         if game_bible.world_spec and game_bible.world_spec.core_genre:
             game_bible.core_genre = game_bible.world_spec.core_genre
+        game_bible.status = "locked"
+        self._persist_bible(game_bible, candidate_dir=candidate_dir)
+        return game_bible
+
+    def run_slice_expansion(
+        self,
+        game_bible: GameBibleSpec,
+        dna: Optional[SteamPlayerDNA] = None,
+        candidate_dir: Optional[Path] = None,
+        slice_directive: Optional[str] = None,
+    ) -> GameBibleSpec:
+        """Advances `game_bible` to the next iterative vertical slice (marking the prior slice completed,
+        strategizing or activating the next slice that expands it, seeding only the new slice's high-level
+        tasks on the ProductionBoard, and draining the board for that slice)."""
+        if self.client is None:
+            raise StudioAgentError(
+                "CreativeWritersRoom.run_slice_expansion requires an active google.genai Client (Rule 5)"
+            )
+        dna_summary = self._format_dna_summary(dna)
+        for idx_s, s in enumerate(game_bible.slice_roadmap):
+            if idx_s <= game_bible.active_slice_index and s.status == "active":
+                s.status = "completed"
+        next_idx = (
+            (max(s.slice_index for s in game_bible.slice_roadmap if s.status == "completed") + 1)
+            if any(s.status == "completed" for s in game_bible.slice_roadmap)
+            else (len(game_bible.slice_roadmap) if game_bible.slice_roadmap else 0)
+        )
+        game_bible.active_slice_index = next_idx
+        for s in game_bible.slice_roadmap:
+            if s.slice_index == next_idx:
+                s.status = "active"
+                break
+
+        directive_note = (
+            f" User/Director expansion directive: {slice_directive.strip()}"
+            if slice_directive and slice_directive.strip()
+            else ""
+        )
+        for role_name in ("LevelAndProgressionDesigner", "GameplayDesigner", "GameplaySystemsEngineer"):
+            spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == role_name), None)
+            if spec is None:
+                continue
+            check = WritersRoomListenCheck(
+                deliberation=(
+                    f"Advancing to iterative Slice #{next_idx}: strategizing how this slice expands the prior slice "
+                    f"and raising only the tasks needed for Slice #{next_idx}.{directive_note}"
+                ),
+                should_interject=True,
+                urgency_score=1.0,
+                intended_contribution_summary=(
+                    f"Strategize Slice #{next_idx} in `added_or_updated_slices` (with `slice_index={next_idx}`, `status='active'`, "
+                    f"and `expansion_from_prior_slice` explaining how it expands Slice #{max(0, next_idx - 1)}) and raise `backlog_additions` "
+                    f"ONLY for Slice #{next_idx}.{directive_note}"
+                ),
+            )
+            proposal = self._execute_specialist_turn(
+                specialist=spec,
+                listen_check=check,
+                game_bible=game_bible,
+                dna_summary=dna_summary,
+            )
+            self._apply_turn_proposal(
+                game_bible=game_bible,
+                speaker_role=role_name,
+                speaker_display_name=spec["display_name"],
+                proposal=proposal,
+                candidate_dir=candidate_dir,
+            )
+
+        self._drain_backlog(game_bible, dna_summary, candidate_dir)
         game_bible.status = "locked"
         self._persist_bible(game_bible, candidate_dir=candidate_dir)
         return game_bible

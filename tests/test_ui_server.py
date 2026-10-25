@@ -364,6 +364,22 @@ class TestCartridgesEndpoints:
         assert "hero.png" in data["assets"]["sprites"]
         assert list(data.keys())[0] == "deliberation"
 
+    def test_launch_game_endpoint(self, mock_wal_db: Path, mock_cartridges: Tuple[Path, Path]):
+        cart_root, active_dir = mock_cartridges
+        client = TestClient(create_app(db_path=mock_wal_db, cartridges_root=cart_root, active_cartridge_dir=active_dir))
+        res = client.post("/api/game/launch", json={"deliberation": "Launch current game", "cartridge_id": "active"})
+        assert res.status_code == 200
+        data = res.json()
+        assert list(data.keys())[0] == "deliberation"
+        assert data["status"] == "launched"
+        assert data["game_title"] == "Test Arena Odyssey"
+        assert data["cartridge_id"] == "active"
+
+        # Path traversal attempt on cartridge_id is rejected
+        bad = client.post("/api/game/launch", json={"deliberation": "Traversal check", "cartridge_id": "../etc"})
+        assert bad.status_code == 400
+
+
 
 class TestAssetStreamingAndSecurity:
     """Verifies audio/sprite streaming, directory traversal defense, and palette/diff endpoints."""
@@ -750,6 +766,31 @@ class TestServerForbiddenTokensInvariance:
         for pat in forbidden_patterns:
             assert pat not in server_py, f"Forbidden pattern '{pat}' found in server.py"
             assert pat not in models_py, f"Forbidden pattern '{pat}' found in models.py"
+
+
+class TestSwarmEventBusGameBibleUpdate:
+    """Verifies SwarmEventBus.publish_game_bible_update updates in-memory and SQLite state during resume."""
+
+    def test_publish_game_bible_update_on_bus(self, tmp_path: Path):
+        from engine.ui.server import SwarmEventBus
+
+        bus = SwarmEventBus(log_path=tmp_path / "events.jsonl", db_path=tmp_path / "telemetry.db")
+        bus.set_active_build_id("build_candidate_genesis_test")
+        bible_data = {
+            "deliberation": "Rehydrating Game Bible on resume trigger.",
+            "bible_id": "bible_candidate_genesis_test",
+            "cartridge_id": "candidate_genesis_test",
+            "game_title": "Silt & Tension",
+            "core_genre": "Tactile Physics Puzzle",
+            "status": "production",
+        }
+        bus.publish_game_bible_update(bible_data)
+
+        loaded = bus.get_game_bible(build_id="build_candidate_genesis_test")
+        assert loaded is not None
+        assert loaded["game_title"] == "Silt & Tension"
+        assert loaded["cartridge_id"] == "candidate_genesis_test"
+
 
 
 

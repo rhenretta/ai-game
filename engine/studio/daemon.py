@@ -328,6 +328,14 @@ def rehydrate_resumable_candidate_from_db(
             except Exception as sync_exc:
                 logger.warning("Failed syncing reset requirement status to SQLite: %s", sync_exc)
 
+    backlog_path = staging_dir / "backlog.json"
+    if backlog_path.is_file():
+        try:
+            from engine.studio.production_board import ProductionBoard
+            ProductionBoard(path=backlog_path)
+        except Exception as pb_exc:
+            logger.warning("Failed sanitizing backlog.json during rehydration: %s", pb_exc)
+
     return staging_dir
 
 

@@ -75,6 +75,7 @@ class StudioStatusResponse(BaseModel):
     current_episode: int = Field(default=0, description="Current active or target episode number")
     pev_cycle: Optional[PEVCycleInfo] = Field(default=None, description="Active or last PEV cycle state")
     uptime_seconds: float = Field(default=0.0, description="Uptime in seconds since studio boot")
+    token_usage: Dict[str, Any] = Field(default_factory=dict, description="Cumulative Gemini API token usage and prefix cache hit telemetry")
 
 
 class TelemetryEventsResponse(BaseModel):
@@ -696,6 +697,46 @@ class StudioSettingsUpdateRequest(BaseModel):
         default=None,
         description="When True, pauses active build workers and Writers' Room turns until resumed.",
     )
+
+
+class GameLaunchRequest(BaseModel):
+    """Payload to launch a playable game cartridge in a native Godot 4.3 / game engine window.
+    Strictly declares deliberation as field index 0 (Rule 4).
+    """
+    deliberation: str = Field(
+        default="Launching current game cartridge from Mission Control UI.",
+        min_length=1,
+        description="MANDATORY FIRST PROPERTY: Epistemic rationale for launching the game cartridge",
+    )
+
+    @field_validator("deliberation")
+    @classmethod
+    def validate_deliberation(cls, v: str) -> str:
+        return _validate_deliberation(v)
+
+    cartridge_id: Optional[str] = Field(
+        default=None,
+        description="Optional cartridge or checkpoint identifier to launch (defaults to currently selected or active cartridge)",
+    )
+
+
+class GameLaunchResponse(BaseModel):
+    """Response returned when launching a game cartridge from the Mission Control UI.
+    Strictly declares deliberation as field index 0 (Rule 4).
+    """
+    deliberation: str = Field(..., min_length=1, description="Epistemic summary of the launched game session")
+
+    @field_validator("deliberation")
+    @classmethod
+    def validate_deliberation(cls, v: str) -> str:
+        return _validate_deliberation(v)
+
+    status: str = Field(default="launched", description="Launch status ('launched' or 'error')")
+    cartridge_id: str = Field(default="active", description="Identifier of the launched cartridge")
+    cartridge_path: str = Field(default="", description="Resolved filesystem path of the launched cartridge")
+    game_title: str = Field(default="", description="Human-readable game title")
+    pid: Optional[int] = Field(default=None, description="Spawned game process PID")
+
 
 
 

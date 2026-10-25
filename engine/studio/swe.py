@@ -397,14 +397,14 @@ class LeadGameplaySWEAgent:
                 for e in (getattr(game_bible, "technical_architecture_blueprint", []) or [])
             ]
             context_parts.append(
-                f"LIVING GAME BIBLE (`game_bible.json` — AUTHORITATIVE EXPERIENCE & DIEGETIC UX BLUEPRINT):\n"
+                f"LIVING GAME BIBLE (`game_bible.json` — AUTHORITATIVE EXPERIENCE & UX BLUEPRINT):\n"
                 f"- Game Title: {getattr(game_bible, 'game_title', '')}\n"
                 f"- Elevator Pitch: {getattr(game_bible, 'elevator_pitch', '')}\n"
                 f"- Core Player Fantasy: {getattr(game_bible, 'core_fantasy', '')}\n"
                 f"- Camera & Spatial Paradigm (LOCKED): {getattr(game_bible, 'camera_and_spatial_paradigm', '')}\n"
                 f"- Color Palette Hex (LOCKED): {getattr(game_bible, 'color_palette_hex', [])}\n"
                 f"- First 60 Seconds Hook: {getattr(game_bible, 'first_60_seconds_hook', '')}\n"
-                f"- Diegetic UI & Onboarding Philosophy (NO wall-of-text HUD control manuals!): {getattr(game_bible, 'diegetic_ui_philosophy', '')}\n"
+                f"- UI, HUD & Onboarding Philosophy: {getattr(game_bible, 'diegetic_ui_philosophy', '')}\n"
                 f"- Gameplay Pillars: {getattr(game_bible, 'gameplay_pillars', [])}\n"
                 f"- Visual Style Guide: {getattr(game_bible, 'visual_style_guide', '')}\n"
                 f"- Audio Direction Guide: {getattr(game_bible, 'audio_direction_guide', '')}\n"
@@ -529,6 +529,58 @@ class LeadGameplaySWEAgent:
 
         return ("\n\n".join(context_parts) + "\n\n" if context_parts else ""), multimodal_parts
 
+    @staticmethod
+    def _summarize_non_target_gd_module(mod_name: str, code: str) -> str:
+        """Extracts a compact cross-module API signature & state contract (classes, signals, constants,
+        member variables, function signatures, and get_state_snapshot body) for a non-target GDScript module."""
+        sig_lines: List[str] = []
+        raw_lines = code.splitlines()
+        in_snapshot_fn = False
+        snapshot_lines_captured = 0
+        in_func = False
+        func_indent = 0
+        for line in raw_lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent_tabs = len(line) - len(line.lstrip("\t "))
+            if in_func and indent_tabs <= func_indent and not stripped.startswith(("func ", "static func ")):
+                in_func = False
+            if stripped.startswith(("func get_state_snapshot", "static func get_state_snapshot")):
+                in_snapshot_fn = True
+                snapshot_lines_captured = 0
+                in_func = True
+                func_indent = indent_tabs
+                sig_lines.append(line)
+                continue
+            if in_snapshot_fn:
+                if indent_tabs <= func_indent and stripped.startswith(("func ", "static func ", "class ")):
+                    in_snapshot_fn = False
+                elif snapshot_lines_captured < 35:
+                    sig_lines.append(line)
+                    snapshot_lines_captured += 1
+                    continue
+            if stripped.startswith(("func ", "static func ")):
+                in_func = True
+                func_indent = indent_tabs
+                sig_lines.append(line)
+            elif stripped.startswith(
+                (
+                    "extends ",
+                    "class_name ",
+                    "class ",
+                    "signal ",
+                    "enum ",
+                    "const ",
+                    "@export",
+                    "@onready",
+                )
+            ):
+                sig_lines.append(line)
+            elif not in_func and stripped.startswith("var ") and indent_tabs <= 1:
+                sig_lines.append(line)
+        return "\n".join(sig_lines) if sig_lines else code[:2000]
+
     def implement_requirement_track(
         self,
         track: RequirementTrack,
@@ -538,6 +590,8 @@ class LeadGameplaySWEAgent:
         world_spec: Optional[Any] = None,
         game_bible: Optional[Any] = None,
         prior_error: Optional[str] = None,
+        extra_image_paths: Optional[List[str]] = None,
+        board: Optional[Any] = None,
     ) -> Dict[str, Path]:
         """Iteratively implements or expands cartridge code for a single RequirementTrack.
         Inspects existing code in staging_dir and sealed assets in staging_dir/assets/,
@@ -566,11 +620,58 @@ class LeadGameplaySWEAgent:
             except Exception:
                 pass
 
-        bible_and_narrative_context, multimodal_mockup_parts = self._build_bible_and_narrative_context(
-            staging_dir=staging_dir,
-            narrative_bible=narrative_bible,
-            game_bible=game_bible,
-        )
+        from engine.studio.context_curator import ContextCuratorAgent, is_real_genai_client
+        if is_real_genai_client(self.client):
+            multimodal_mockup_parts = []
+            curator = ContextCuratorAgent(
+                cartridge_dir=staging_dir,
+                client=self.client,
+                model_name=self.model_name,
+                board=board,
+                game_bible=game_bible,
+            )
+            pack = curator.curate_context(
+                target_agent_role="swe_engineer",
+                task_request=(
+                    f"Track [{track.id}] {track.title} (modules={track.target_modules}):\n"
+                    f"{track.description}\n"
+                ),
+                item_id=track.id,
+                item_kind="mechanic_code",
+                extra_image_paths=extra_image_paths,
+            )
+            focused_parts: List[str] = []
+            rendering_block = self._rendering_strategy_block(staging_dir)
+            if rendering_block:
+                focused_parts.append(rendering_block)
+            try:
+                from engine.studio.asset_library import CartridgeAssetLibrary
+                lib = CartridgeAssetLibrary(
+                    cartridge_dir=staging_dir,
+                    visual_agent=getattr(self, "visual_agent", None),
+                    voice_agent=getattr(self, "voice_agent", None),
+                )
+                lib.sanitize_misplaced_portraits_in_sprites_dir()
+                lib.save_catalog()
+                focused_parts.append(lib.build_prompt_summary_for_swe())
+            except Exception as lib_exc:
+                logger.debug("Could not build CartridgeAssetLibrary prompt summary: %s", lib_exc)
+            focused_parts.append(pack.prompt_block)
+            layout_file = staging_dir / "level_layout.json"
+            if layout_file.is_file() and any(m in ("scenes.gd", "main.gd") for m in (track.target_modules or [])):
+                focused_parts.append(
+                    "AUTHORITATIVE LEVEL LAYOUT (`level_layout.json`):\n"
+                    + self._require_full_text(layout_file.read_text(encoding="utf-8"), "level_layout.json")
+                )
+            bible_and_narrative_context = "\n\n".join(focused_parts) + "\n\n"
+            if pack.multimodal_parts:
+                multimodal_mockup_parts = list(pack.multimodal_parts)
+        else:
+            bible_and_narrative_context, multimodal_mockup_parts = self._build_bible_and_narrative_context(
+                staging_dir=staging_dir,
+                narrative_bible=narrative_bible,
+                game_bible=game_bible,
+            )
         sealed_assets = self._discover_sealed_assets(staging_dir)
 
         criteria_lines = [
@@ -579,9 +680,22 @@ class LeadGameplaySWEAgent:
         ]
         criteria_context = "\n".join(criteria_lines) if criteria_lines else "Implement core requirement behavior headlessly."
 
+        target_module_set = {str(m).strip() for m in (getattr(track, "target_modules", None) or []) if str(m).strip()}
         existing_code_summary = []
         for mod_name, code in existing_modules.items():
-            if len(code) > 45000:
+            error_references_mod = bool(prior_error and mod_name in prior_error)
+            if (
+                mod_name.endswith(".gd")
+                and target_module_set
+                and mod_name not in target_module_set
+                and not error_references_mod
+                and len(code) > 2000
+            ):
+                sig_summary = self._summarize_non_target_gd_module(mod_name, code)
+                existing_code_summary.append(
+                    f"--- Existing {mod_name} (Cross-Module API Signature & State Contract; {len(code)} bytes on disk — untouched unless needed) ---\n{sig_summary}"
+                )
+            elif len(code) > 45000:
                 summary = code[:25000] + f"\n\n# ... [{len(code) - 35000} bytes omitted for brevity] ...\n\n" + code[-10000:]
                 existing_code_summary.append(f"--- Existing {mod_name} (summary) ---\n{summary}")
             else:
@@ -596,36 +710,24 @@ class LeadGameplaySWEAgent:
 
         if is_godot:
             prompt = (
-                f"You are the Lead Gameplay SWE AI implementing requirement track {track.id}: '{track.title}' for a Code-First Godot 4.3 game cartridge.\n"
-                f"Description: {track.description}\n"
-                f"Target Modules: {track.target_modules}\n"
-                f"Acceptance Criteria:\n{criteria_context}\n\n"
-                f"{prior_error_block}"
-                f"{bible_and_narrative_context}"
-                f"EXISTING CARTRIDGE CODE IN STAGING:\n{existing_code_block}\n\n"
-                f"SEALED ASSETS AVAILABLE IN STAGING:\n"
-                f"- World & Entity Sprites (ONLY use these for in-world entities/props/tiles): {sealed_assets['sprites']}\n"
-                f"- Character Portraits (STRICTLY FOR DIALOGUE UI IN ui_hud.gd — NEVER use as world entity sprites!): {sealed_assets.get('portraits', [])}\n"
-                f"- 16:9 Visual Mockups (attached multimodally — match this camera perspective, palette, and multi-layer scene composition!): {sealed_assets.get('mockups', [])}\n"
-                f"- Audio: {sealed_assets['audio']}\n\n"
                 f"ARCHITECTURAL, ASSET LIBRARY & EXPERIENCE-FIRST SPECIFICATION:\n"
                 f"1. Target: Godot 4.3-stable (GDScript 2.0). Logical viewport: 1280x720 rendered on a 2560x1440 HiDPI resizable window at 60 FPS.\n"
                 f"2. Code-First Design: Zero complex .tscn files. A minimal 4-line main.tscn binds res://main.gd to root Node2D. You author 100% of the `.gd` modules.\n"
                 f"3. Modular Architecture & Cartridge Asset Library Catalog (`res://assets/asset_library.json`):\n"
-                f"   - The Cartridge Asset Library manifest is stored at `res://assets/asset_library.json` and summarized above, containing metadata for every synthesized sprite sheet (`hframes`, `vframes`, `frame_size`, `animations`), articulated rig (`parts` with `pivot_offset`, `attach_offset`, `z_index_offset`), tile surface, set-piece, portrait, and audio clip.\n"
+                f"   - The Cartridge Asset Library manifest is stored at `res://assets/asset_library.json` and summarized below, containing metadata for every synthesized sprite sheet (`hframes`, `vframes`, `frame_size`, `animations`), articulated rig (`parts` with `pivot_offset`, `attach_offset`, `z_index_offset`), tile surface, set-piece, portrait, and audio clip.\n"
                 f"   - Load PNG textures at runtime without `.import` files via `Image.load_from_file(ProjectSettings.globalize_path(res_path))` and `ImageTexture.create_from_image(img)`. Set `tex.set_meta('source_path', res_path)` so runtime diagnostics can trace loaded textures.\n"
                 f"   - Drive multi-state sprite sheet animations (`hframes`, `vframes`, `frame`) and articulated child `Sprite2D` rigs according to the entity's live state (idle, locomotion, aerial, action) and scale sprites to their intended `display_size` from `assets/asset_library.json`.\n"
-                f"   - Render physical platforms, ground surfaces, and structures using tiled textures (`draw_texture_rect` with `tile=true` on a `CanvasItem` with `texture_repeat = CanvasItem.TEXTURE_REPEAT_ENABLED`) rather than flat untextured programmer-art `draw_rect` rectangles.\n"
+                f"   - Construct physical platforms, ground surfaces, fluids, and structures using hybrid procedural + generated visual craft: combine procedural geometry (`Polygon2D`/`Line2D`/cellular-automata/noise/spline contours) with fabricated `tile_surface` textures (`StudioRigHelper.create_tiled_polygon(points, tex)` / `texture_repeat = CanvasItem.TEXTURE_REPEAT_ENABLED`), `Line2D` repeatable strip textures (`texture_mode = Line2D.LINE_TEXTURE_TILE`), custom `CanvasItem` shaders, `GPUParticles2D`, `PointLight2D`, and discrete environmental decals/sprites—NEVER leave `Polygon2D` terrain as untextured flat-colored slabs or `Line2D` cracks/conduits as bare programmer-art lines.\n"
                 f"   - Keep `z_index < 0` background/horizon layers visible: never paint a full-viewport opaque `draw_rect` at `z_index >= 0` that covers your `z_index < 0` sky/backdrop layers.\n"
-                f"   - NEVER OCCLUDE THE PLAYFIELD WITH AN OPAQUE FULL-SCREEN FRAME/BORDER: If you render a decorative border or frame texture (`diegetic_ui` or backdrop frame) whose center is opaque, you MUST either place it at the lowest background layer (`z_index <= -10`, behind floor tiles and `CharacterBody2D`/`Sprite2D` actors) or clear its interior playfield rectangle to transparent (`alpha = 0`) before placing it on a foreground `CanvasLayer`, so floor tiles and character sprites are always clearly visible.\n"
+                f"   - NEVER OCCLUDE THE PLAYFIELD WITH AN OPAQUE FULL-SCREEN FRAME/BORDER: If you render a decorative border or frame texture whose center is opaque, you MUST either place it at the lowest background layer (`z_index <= -10`, behind floor geometry and `CharacterBody2D`/`Sprite2D` actors) or clear its interior playfield rectangle to transparent (`alpha = 0`) before placing it on a foreground `CanvasLayer`, so the world and character sprites are always clearly visible.\n"
                 f"   - Strictly separate character portraits (`res://assets/portraits/*.png`, used ONLY in `ui_hud.gd` dialogue panels with bounded size <= 64x64) from in-world entity sprites (`res://assets/sprites/*.png`).\n"
-                f"   - DECOMPOSE CONCEPT ART INTO COMPOSABLE WORLD ELEMENTS (NEVER USE A STATIC FULL-SCREEN BACKGROUND IMAGE): Build the world out of discrete, layered, interactive elements matching the 16:9 concept art—isolated horizon/midground set-pieces, textured physical geometry, and interactive `Node2D` / `CharacterBody2D` / `Area2D` entities.\n"
-                f"   - ON-DEMAND ASSET FABRICATION (`requested_assets`): If your gameplay mechanics, animations, or multi-layer world need ANY additional purpose-built asset (a `sprite_sheet` with custom `animation_states`, `articulated_parts` with custom pivots, `tile_surface`, isolated `static_sprite` set-piece/prop, `diegetic_ui` widget, or `sfx`), include it in `requested_assets` in your JSON response and the Cartridge Asset Library will fabricate it on disk and update `res://assets/asset_library.json`.\n"
-                f"   - main.gd: Root scene script extending Node2D. Preloads child modules (`mechanics.gd`, `entities.gd`, `scenes.gd`, `ui_hud.gd`, plus any additional custom `.gd` modules specified in the Game Bible's `technical_architecture_blueprint`). Sets up Camera2D, level scene container, and UI CanvasLayer. Implements `get_state_snapshot() -> Dictionary` for headless playtesting.\n"
+                f"   - DECOMPOSE CONCEPT ART INTO COMPOSABLE WORLD ELEMENTS (NEVER USE A STATIC FULL-SCREEN BACKGROUND IMAGE): Build the world out of discrete, layered, interactive elements matching the 16:9 concept art—horizon/midground layers, procedural/shader + textured physical geometry, and interactive `Node2D` / `CharacterBody2D` / `Area2D` entities.\n"
+                f"   - ON-DEMAND ASSET FABRICATION (`requested_assets`): If your gameplay mechanics, animations, or multi-layer world need an additional discrete asset (a `sprite_sheet` with custom `animation_states`, `articulated_parts` with custom pivots, seamless `tile_surface` texture for procedural polygons, isolated `static_sprite` prop, or `sfx`), include it in `requested_assets` in your JSON response and the Cartridge Asset Library will fabricate it on disk and update `res://assets/asset_library.json`.\n"
+                f"   - main.gd: Root scene script extending Node2D. Preloads child modules (`mechanics.gd`, `entities.gd`, `scenes.gd`, `ui_hud.gd`, plus any additional custom `.gd` modules specified in the Game Bible's `technical_architecture_blueprint`). Sets up an active `Camera2D` tracking the player/focus across `world_bounds` (`limit_left`, `limit_top`, `limit_right`, `limit_bottom`), level scene container, and a separate `CanvasLayer` for `ui_hud.gd` so HUD gauges/prompts never exist in world-space where the player can walk behind or collide with them. Implements `get_state_snapshot() -> Dictionary` for headless playtesting.\n"
                 f"   - mechanics.gd: Core rules, physics/simulation loops, placement/action methods, scoring, progression, and recoverable hazard/win/loss logic tailored to the Game Bible's `core_loop` and `system_interactions`.\n"
-                f"   - entities.gd: CharacterBody2D, RigidBody2D, Area2D, or Node2D entity classes with animated sprite sheets or articulated multi-part rigs and directional orientation.\n"
-                f"   - scenes.gd: Multi-layered active world Node2D renderer built from decomposed world elements, textured physical geometry, interactive landmarks, and atmospheric effects.\n"
-                f"   - ui_hud.gd: Clean diegetic UI grounded in the Game Bible's `diegetic_ui_philosophy`, `core_loop`, and `goal_hierarchy` (plus character dialogue/portrait or audio presentation only when the game's Narrative Bible defines dialogue or voice barks), and responsive input handling.\n"
+                f"   - entities.gd: CharacterBody2D, RigidBody2D, Area2D, or Node2D entity classes with animated sprite sheets, articulated multi-part rigs, or hybrid shader/textured visuals and directional orientation.\n"
+                f"   - scenes.gd: Multi-layered active world Node2D renderer built from hybrid procedural + textured geometry (`StudioRigHelper.create_tiled_polygon`), decomposed world elements, coherently integrated interactive landmarks, and atmospheric effects spanning the full multi-region `level_layout.json`.\n"
+                f"   - ui_hud.gd: Screen-space `CanvasLayer` UI and HUD grounded in the Game Bible's UI & onboarding philosophy (`diegetic_ui_philosophy` and `onboarding_plan`), `core_loop`, and `goal_hierarchy` (plus character dialogue/portrait or audio presentation when the game's Narrative Bible defines dialogue or voice barks), so a brand-new player intuitively understands their role, active objective, and interactive affordances.\n"
                 f"4. Cross-Module Resolution, Scope & Strict Method Alignment:\n"
                 f"   - When preloading OTHER modules, declare:\n"
                 f"     const Mechanics = preload('res://mechanics.gd')\n"
@@ -640,14 +742,20 @@ class LeadGameplaySWEAgent:
                 f"   - NEVER return a bare/empty Node2D.new() stub from a map or scene builder without _draw() or child visual nodes!\n"
                 f"   - STRATEGY-DRIVEN WORLD CONSTRUCTION (`level_generation_strategy` & `level_layout.json`): `scenes.gd` MUST construct the playable world according to the bespoke world-building strategy authored in the Game Bible's `level_generation_strategy` (`generation_approach`, `world_structure`, `runtime_construction_plan`, `level_archetypes`, `generation_rules`) and `res://level_layout.json`. Realize the full world structure and runtime construction plan designed for this game—NEVER substitute a tiny 3–4 `Rect2` placeholder room when the Game Bible's `level_generation_strategy` and `level_layout.json` specify a larger or generated world!\n"
                 f"   - Honor the Living Game Bible's First 60 Seconds Hook, Experience Storyboard Beats, Visual Style Guide, Camera & Spatial Paradigm, and 16:9 Visual Mockup boards.\n"
-                f"   - Stage the Narrative Bible's cutscenes, dialogue trees, and reactive voice barks in-game with character portraits (`res://assets/portraits/*.png`) and real WAV playback.\n"
-                f"   - Load and display synthesized PNG sprites and tiles from 'res://assets/sprites/*.png', 'res://assets/tiles/*.png', and 'res://assets/backgrounds/*.png' according to `res://assets/asset_library.json`.\n"
-                f"   - MANDATORY SPRITE/TEXTURE BINDING OVER `_draw()` OR `Image.create` + `set_pixel` PROGRAMMER ART: Whenever `res://assets/sprites/*.png`, `res://assets/tiles/*.png`, or `res://assets/asset_library.json` provides character sprite sheets, props, backdrops, or tiles, `entities.gd` and `scenes.gd` MUST load those PNG files via `Image.load_from_file(ProjectSettings.globalize_path(res_path))` and `ImageTexture.create_from_image(img)`—NEVER invent procedural `Image.create(...)` + `img.set_pixel(...)` replacement textures, and NEVER substitute flat `draw_rect` checkerboard squares or `draw_circle` stick figures for fabricated PNG tiles, characters, or landmarks.\n"
-                f"   - SPRITE SHEET & TILE ATLAS DIMENSION FIDELITY: When binding a `sprite_sheet` entry from `res://assets/asset_library.json`, load its `sheet` path (`*_sheet.png`) and set `sprite.hframes` and `sprite.vframes` to the exact `hframes` and `vframes` recorded in `asset_library.json` (or use `StudioRigHelper.attach_sprite_sheet_animation_player`). When slicing a tile strip/atlas PNG with `TileSetAtlasSource`, derive `texture_region_size` from `tex.get_size()` (e.g., a `256x64` strip of 4 tiles has `texture_region_size = Vector2i(64, 64)`, NOT hardcoded `32x32`).\n"
+                f"   - Stage the Narrative Bible's cutscenes, dialogue trees, and reactive voice barks in-game with character portraits (`res://assets/portraits/*.png`) and real WAV playback when defined.\n"
+                f"   - Load and display synthesized PNG sprites from 'res://assets/sprites/*.png' and 'res://assets/backgrounds/*.png' according to `res://assets/asset_library.json` and `rendering_strategy.json`.\n"
+                f"   - HYBRID PROCEDURAL + GENERATED ASSET BINDING: Combine procedural algorithms/geometry (`Polygon2D`, `Line2D`, noise/cellular-automata/spline contours, custom `CanvasItem` shaders, `GPUParticles2D`, `PointLight2D`) with fabricated textures and sprites from `res://assets/asset_library.json` (`res://assets/sprites/*.png`)—bind seamless `tile_surface` textures onto procedural `Polygon2D`s via `StudioRigHelper.create_tiled_polygon(points, tex)`, bind repeatable strip textures onto `Line2D`s (`Line2D.LINE_TEXTURE_TILE`), scatter environmental decals, and ALWAYS bind actual PNG sprites/rigs for characters, avatars, creatures, and interactive world structures via `Image.load_from_file(ProjectSettings.globalize_path(res_path))` and `ImageTexture.create_from_image(img)`. NEVER render untextured flat-colored `Polygon2D` slabs, bare 8-point `Line2D` zigzags, or primitive `draw_circle` + `draw_rect` stickmen; layer any procedural effects/shaders coherently with the loaded textures and sprites.\n"
+                f"   - NO PROCEDURAL WORKAROUNDS FOR REVIEWER-REQUESTED TEXTURES/PROPS: When Council feedback asks to replace a crude vector/polygon shape with a textured surface, prop, landmark, or character sprite, bind an actual PNG texture from `res://assets/sprites/` (or request the needed asset in `requested_assets`)—NEVER try to fake a painted texture by drawing wobbly untextured `Polygon2D` vertices or bare `draw_polyline` crack lines in GDScript!\n"
+                f"   - SEAMLESS FULL-VIEWPORT WORLD TERRAIN (`z_index <= 0`): World floor/terrain/fluid background layers in `scenes.gd` (`z_index <= 0`) MUST fill the entire 1280x720 camera viewport and world bounds seamlessly without artificial `pad_x`/`pad_y` inset borders or semi-transparent floor alpha (`alpha < 1.0`) that exposes the grey default clear color around the edges.\n"
+                f"   - SPRITE SHEET & TILE ATLAS DIMENSION FIDELITY: When binding any texture from `res://assets/asset_library.json`, check its exact `hframes` and `vframes` in the catalog summary above! NEVER guess `hframes > 1` or `vframes > 1` just because a filename ends in `_sheet.png`—if the catalog entry states `hframes=1, vframes=1` (such as a single-frame composite for an `articulated_parts` rig or a `static_sprite`), you MUST keep `hframes = 1` and `vframes = 1` (setting `hframes=4, vframes=2` on a single-frame PNG crops an empty transparent corner and makes the sprite 100% invisible!). When slicing a tile strip/atlas PNG with `TileSetAtlasSource`, derive `texture_region_size` from `tex.get_size()`.\n"
+                f"   - 60 FPS RENDERING & SUBVIEWPORT PERFORMANCE INVARIANTS:\n"
+                f"     * NEVER set `render_target_update_mode = SubViewport.UPDATE_ALWAYS` on an accumulation `SubViewport` that uses `render_target_clear_mode = SubViewport.CLEAR_MODE_NEVER` (causes severe GPU tile-memory load/store stalls and <1 FPS frame rates). Instead, use `SubViewport.UPDATE_ONCE` and trigger `render_target_update_mode = SubViewport.UPDATE_ONCE` only when a new stroke is queued.\n"
+                f"     * NEVER call `queue_redraw()` unconditionally every frame inside `_process(delta)` on a node whose `_draw()` loops over a 2D grid or a growing array of strokes/corridors. Only call `queue_redraw()` when grid/stroke state changes, coalesce/deduplicate stroke segments with a minimum distance threshold (`p1.distance_to(p2) >= 8.0`), and let GPU fragment shaders (`u_time`) animate continuous surface waves without CPU `CanvasItem` re-tessellation.\n"
+                f"     * NEVER dynamically allocate and `add_child()` hundreds of individual per-cell `CollisionShape2D` nodes inside `_physics_process()`.\n"
                 f"   - MANDATORY 24,000 Hz PCM WAV AUDIO LOADING & COOLDOWN: All synthesized WAV voice clips in 'res://assets/audio/*.wav' are 24,000 Hz, 16-bit mono PCM. When loading via FileAccess.get_file_as_bytes(ProjectSettings.globalize_path(path)), you MUST strip the 44-byte RIFF header (`stream.data = bytes.slice(44) if bytes.size() > 44 else bytes`), set `stream.format = AudioStreamWAV.FORMAT_16_BITS`, `stream.mix_rate = 24000` (NEVER 44100, which causes high-pitched chipmunk distortion!), and `stream.stereo = false`. Furthermore, enforce a non-overlapping playback guard (`if not audio_player.playing:`) and a minimum cooldown (>= 8.0 seconds) so voice barks NEVER spam or repeat every few seconds.\n"
-                f"6. DIEGETIC UX, CLEAR VIEWPORT & RECOVERABLE GAMEPLAY:\n"
-                f"   - Teach and guide the player through world cues, visual feedback, diegetic labels/hover callouts, and story context as specified in the Living Game Bible's `diegetic_ui_philosophy`—NEVER clutter the screen with a static instruction-manual text box listing keyboard shortcuts.\n"
-                f"   - ABSOLUTE BAN ON DEBUG/TELEMETRY HUD PANELS IN `ui_hud.gd`: NEVER draw QA test results, `HEADLESS MECHANICS & TELEMETRY VERIFICATION`, `ALL PASS` badges, `headless_test_results` dicts, or raw float telemetry dashboards onto `ui_hud.gd` or the game viewport. QA assertions and filmstrip annotations are rendered externally by the QA Test Renderer. `ui_hud.gd` must contain ONLY player-facing diegetic UI matching the 16:9 Concept Art Mockup, occupying < 15% of the viewport perimeter.\n"
+                f"6. UI/UX, CLEAR VIEWPORT & RECOVERABLE GAMEPLAY:\n"
+                f"   - Guide the player and present game state, controls, and feedback according to the Living Game Bible's UI & onboarding philosophy (`diegetic_ui_philosophy` and `onboarding_plan`).\n"
+                f"   - ABSOLUTE BAN ON DEBUG/TELEMETRY HUD PANELS IN `ui_hud.gd`: NEVER draw QA test results, `HEADLESS MECHANICS & TELEMETRY VERIFICATION`, `ALL PASS` badges, `headless_test_results` dicts, or raw float telemetry dashboards onto `ui_hud.gd` or the game viewport. QA assertions and filmstrip annotations are rendered externally by the QA Test Renderer. `ui_hud.gd` must contain ONLY player-facing UI designed for the game.\n"
                 f"   - NEVER blind the player on startup with >30% opaque full-screen overlays or frost, and NEVER lock out player controls with an unrecoverable game-over screen in the first 30 seconds.\n"
                 f"   - Use `get_global_mouse_position()` for accurate HiDPI world-space mouse picking.\n"
                 f"7. STRICTLY FORBIDDEN (Deprecated Godot 3 Syntax):\n"
@@ -663,7 +771,19 @@ class LeadGameplaySWEAgent:
                 f"   - NEVER pre-solve or pre-complete the game objective at `t = 0` (`is_completed` MUST be `false` during passive zero-input ticking).\n"
                 f"   - NEVER write self-playing tick-sequenced or timer-sequenced demo loops in `_process` or `_physics_process` (e.g., `if sim_tick == 62:`, `if playtest_timer < 1.0:`, `handle_automated_playtest_cadence`, `auto_test_phase`, `current_demo_status`, `user_override_lockout`) that automatically trigger player actions, movement, choices, or objective resolutions on a frame counter or timer. All gameplay actions must be driven by real input handlers (`_input`, `_unhandled_input`, `Input.is_action_pressed`, `Input.is_key_pressed`), and test scenario staging is performed externally by the QA Test Renderer (`setup_calls` and `input_segments`).\n"
                 f"   - All systemic state transitions and mechanics MUST compute authentic state updates from the game's actual rules and entity interactions (`system_interactions`)—NEVER fake state completion out of thin air.\n"
-                f"10. RATIONALE-FIRST EPISTEMIC RULE (Rule 4): deliberation MUST be provided FIRST in every payload before files and code.\n"
+                f"10. RATIONALE-FIRST EPISTEMIC RULE (Rule 4): deliberation MUST be provided FIRST in every payload before files and code.\n\n"
+                f"{bible_and_narrative_context}"
+                f"SEALED ASSETS AVAILABLE IN STAGING:\n"
+                f"- World & Entity Sprites (ONLY use these for in-world entities/props/tiles): {sealed_assets['sprites']}\n"
+                f"- Character Portraits (STRICTLY FOR DIALOGUE UI IN ui_hud.gd — NEVER use as world entity sprites!): {sealed_assets.get('portraits', [])}\n"
+                f"- 16:9 Visual Mockups (attached multimodally — match this camera perspective, palette, and multi-layer scene composition!): {sealed_assets.get('mockups', [])}\n"
+                f"- Audio: {sealed_assets['audio']}\n\n"
+                f"You are the Lead Gameplay SWE AI implementing requirement track {track.id}: '{track.title}' for a Code-First Godot 4.3 game cartridge.\n"
+                f"Description: {track.description}\n"
+                f"Target Modules: {track.target_modules}\n"
+                f"Acceptance Criteria:\n{criteria_context}\n\n"
+                f"EXISTING CARTRIDGE CODE IN STAGING:\n{existing_code_block}\n\n"
+                f"{prior_error_block}"
             )
             response_model = TrackCodeSynthesisPayload
         else:
@@ -2659,11 +2779,13 @@ class LeadGameplaySWEAgent:
                 "Study the full Game Bible (especially `level_generation_strategy`) and the attached concept art.\n"
                 "STRATEGY-DRIVEN SCOPE (critical): execute the bespoke world-building strategy authored in `level_generation_strategy` "
                 "(`generation_approach`, `world_structure`, `runtime_construction_plan`, `level_archetypes`, `generation_rules`). "
+                "REMEMBER: The attached 16:9 concept art mockup is a single camera viewport snapshot (1280x720) inside a larger world—do NOT shrink "
+                "the entire `LevelLayoutSpec` down to a single 1280x720 screen with one interactable element when `level_generation_strategy` defines "
+                "multiple `level_archetypes` or a multi-region/scrolling world! "
                 "Size the world from the Game Bible's own strategy, progression, storyboard, mechanics, and intended play length — "
                 "state `intended_world_scale_in_viewports` (total playable area as a multiple of one viewport's area) and justify why "
-                "that scale fits this specific game in `deliberation`. Define `world_regions` (ordered by `progression_order`) that cover "
-                "the experience as structured by `level_generation_strategy`; region 0 reproduces the concept-art composition at its natural "
-                "scale, and any additional regions/archetypes extend or structure the world as `world_structure` and `runtime_construction_plan` require. "
+                "that scale fits this specific game in `deliberation`. Define `world_regions` (ordered by `progression_order`) that realize "
+                "all `level_archetypes` and `world_structure` in `level_generation_strategy`. "
                 "On each `LevelRegionSpec`, set `archetype_id`, `procedural_chunk_grammar`, and `target_chunk_or_feature_count` when the strategy uses "
                 "runtime generation or repeated structural modules so `scenes.gd` knows how to populate each region.\n"
                 "- If a `CURRENT WORLD LAYOUT TO EXPAND/REFINE` is provided above, preserve existing regions and expand/refine the layout additively.\n"

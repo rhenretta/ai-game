@@ -362,6 +362,7 @@ class GodotHeadlessSimulator:
             cmd.extend([
                 str(godot_bin),
                 "--audio-driver", "Dummy",
+                "--fixed-fps", "60",
                 "--position", "-4000,-4000",
                 "--path", str(self.cartridge_path),
                 "-s", str(HARNESS_SCRIPT_PATH),
@@ -371,6 +372,7 @@ class GodotHeadlessSimulator:
             cmd = [
                 str(godot_bin),
                 "--headless",
+                "--fixed-fps", "60",
                 "--path", str(self.cartridge_path),
                 "-s", str(HARNESS_SCRIPT_PATH),
                 "--max-ticks", str(limit),

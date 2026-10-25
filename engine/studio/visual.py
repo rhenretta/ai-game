@@ -14,7 +14,7 @@ import math
 from pathlib import Path
 import random
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw
@@ -1063,15 +1063,14 @@ class VisualArtSpriteDesignerAgent:
             aspect = mockup.aspect_ratio or "16:9"
             callouts = mockup.ui_callout_notes or []
 
-        callout_str = "; ".join(str(c) for c in callouts) if callouts else "Clean diegetic in-world visual feedback, zero instruction-manual text walls"
+        callout_str = "; ".join(str(c) for c in callouts) if callouts else "Clear, readable UI and visual feedback suited to the game's genre"
         style_str = f" Art style direction: {style_guide}." if style_guide else ""
 
         prompt = (
             f"Polished indie video game 16:9 widescreen screenshot mockup: '{title}'. "
             f"Scene staging: {scene_desc}.{style_str} "
             f"UI & visual feedback framing: {callout_str}. "
-            f"Rich atmospheric lighting, cohesive color palette, distinct silhouettes, expressive visual storytelling, "
-            f"no wall-of-text tutorial overlays."
+            f"Rich atmospheric lighting, cohesive color palette, distinct silhouettes, expressive visual storytelling."
         )
 
         max_retries = 3
@@ -1223,6 +1222,15 @@ class VisualArtSpriteDesignerAgent:
 
         raw_img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
         if is_tile:
+            # Only apply full-bleed toroidal tiling when the target is an approximately square surface swatch;
+            # non-square strips (e.g. 96x32 modular segments or thin fluid ribbons) would be smeared by toroidal self-blending.
+            if max(w, h) / max(1, min(w, h)) >= 1.75:
+                return self.extract_clean_alpha_sprite(
+                    raw_img,
+                    target_size=(w, h),
+                    strip_border_frame=True,
+                    pad_ratio=0.02,
+                )
             return self.ensure_full_bleed_tile(raw_img, target_size=(w, h))
         if is_backdrop:
             return raw_img.resize((w, h), Image.Resampling.LANCZOS)
@@ -1696,6 +1704,58 @@ class VisualArtSpriteDesignerAgent:
         total_dx = dx_upper + stride_l_x + stride_r_x + lead_x
         total_dy = dy_upper + stride_l_y + stride_r_y + lead_y
 
+        # 4. Arbitrary / non-humanoid custom part tracks (e.g. radial outriggers, rotors, wings, mechanical appendages)
+        humanoid_ids = {"torso", "leg_left", "leg_right", "arm_lead"}
+        custom_tracks = [t for t in tracks if t.part_id not in humanoid_ids and t.keyframes]
+        if custom_tracks or not any(pid in track_map for pid in humanoid_ids):
+            rx = (xx - cx) / max(2.0, bw * 0.5)
+            ry = (yy - cy) / max(2.0, bh * 0.5)
+            r_norm = np.sqrt(rx ** 2 + ry ** 2)
+            # Smooth peripheral weight: 0 at core center, ramping smoothly to 1 on outer appendages (r >= 0.35)
+            w_periph = np.clip((r_norm - 0.18) / 0.65, 0.0, 1.25) ** 1.35
+
+            c_dx_sum, c_dy_sum = 0.0, 0.0
+            c_rot_sum = 0.0
+            c_sx_prod, c_sy_prod = 1.0, 1.0
+            radial_delta_px = 0.0
+            for ctrk in custom_tracks:
+                (cdx, cdy), crot, (csx, csy) = cls._interpolate_keyframe_track(ctrk, t_norm)
+                (b0_dx, b0_dy), b0_rot, _ = cls._interpolate_keyframe_track(ctrk, 0.0)
+                # Relative frame-to-frame motion within the track
+                rel_dx = cdx - b0_dx
+                rel_dy = cdy - b0_dy
+                c_dx_sum += rel_dx
+                c_dy_sum += rel_dy
+                # Radial extension/retraction: if position_offset_px encodes radial reach (e.g. 50px vs 21px),
+                # convert deviations from nominal 45px radius or relative radial delta into radial scale
+                mag_cur = math.hypot(cdx, cdy)
+                mag_b0 = math.hypot(b0_dx, b0_dy)
+                radial_delta_px += (mag_cur - mag_b0)
+                c_rot_sum += (crot - b0_rot) + crot * 0.25
+                c_sx_prod *= max(0.65, min(1.35, csx))
+                c_sy_prod *= max(0.65, min(1.35, csy))
+
+            phase_angle = 2.0 * math.pi * (float(frame_idx) / float(max(1, frame_count)))
+            # Ensure multi-frame custom animations always exhibit distinct inter-frame motion across columns
+            harmonic_radial = 1.0 + 0.06 * math.sin(phase_angle)
+            harmonic_twist_rad = math.radians(6.5 * math.sin(phase_angle) + c_rot_sum * 0.35)
+
+            eff_sx = max(0.62, min(1.38, c_sx_prod * harmonic_radial + (radial_delta_px / max(16.0, bw * 0.5)) * 0.35))
+            eff_sy = max(0.62, min(1.38, c_sy_prod * harmonic_radial + (radial_delta_px / max(16.0, bh * 0.5)) * 0.35))
+
+            cos_tw = math.cos(harmonic_twist_rad)
+            sin_tw = math.sin(harmonic_twist_rad)
+            rel_x = xx - cx
+            rel_y = yy - cy
+            # Radial scale + rotational twist weighted toward peripheral outriggers/appendages
+            target_rx = (rel_x * cos_tw - rel_y * sin_tw) * eff_sx
+            target_ry = (rel_x * sin_tw + rel_y * cos_tw) * eff_sy
+            custom_dx = (target_rx - rel_x) * w_periph + c_dx_sum * scale_factor * 0.35 * w_periph
+            custom_dy = (target_ry - rel_y) * w_periph + c_dy_sum * scale_factor * 0.35 * w_periph
+
+            total_dx = total_dx + custom_dx
+            total_dy = total_dy + custom_dy
+
         # Inverse mapping coordinates for cv2.remap
         map_x = (xx - total_dx).astype(np.float32)
         map_y = (yy - total_dy).astype(np.float32)
@@ -1817,13 +1877,37 @@ class VisualArtSpriteDesignerAgent:
         sheet_img = Image.new("RGBA", (sheet_w, sheet_h), (0, 0, 0, 0))
 
         states_meta: Dict[str, Dict[str, Any]] = {}
+        has_custom_states = bool(asset_req.animation_states and len(asset_req.animation_states) > 1)
         for row_idx, st in enumerate(states):
             fcount = max(1, int(st.frame_count))
             m_profile = getattr(st, "motion_profile", "idle") or "idle"
             kf_tracks = list(st.keyframe_tracks) if getattr(st, "keyframe_tracks", None) else self.default_keyframe_tracks_for_profile(m_profile)
+            row_base_img = base_img
+            state_pose_desc = (getattr(st, "pose_progression_prompt", "") or getattr(st, "deliberation", "") or "").strip()
+            if (
+                row_idx > 0
+                and has_custom_states
+                and state_pose_desc
+                and self._is_live_genai_client()
+            ):
+                state_prompt = (
+                    f"SINGLE CANONICAL SPRITE ONLY — maintain the exact same character/object identity, core proportions, "
+                    f"color palette, and art style as the provided reference image, rendered in this specific state/pose "
+                    f"({st.state_name}): {state_pose_desc}. Subject context: {raw_base_prompt}. "
+                    f"Do NOT draw multiple poses, rows, frames, or a sprite sheet grid."
+                )
+                row_refs = [base_img] + (list(reference_images) if reference_images else [])
+                row_base_img = self._generate_gemini_sprite_image(
+                    prompt=state_prompt,
+                    asset_type=asset_req.asset_type or "sprite_sheet",
+                    dimensions=base_dims,
+                    reference_images=row_refs,
+                    style_guide=style_guide,
+                    is_animated_actor=True,
+                )
             for col_idx in range(fcount):
                 frame_img = self.fabricate_pose_frame_from_base(
-                    base_sprite=base_img,
+                    base_sprite=row_base_img,
                     state_name=st.state_name,
                     frame_idx=col_idx,
                     frame_count=fcount,
@@ -1857,6 +1941,137 @@ class VisualArtSpriteDesignerAgent:
         }
         return output_path, meta
 
+    @classmethod
+    def _assemble_articulated_rig_frame(
+        cls,
+        parts_with_images: List[Tuple[Dict[str, Any], Image.Image]],
+        canvas_size: Tuple[int, int],
+        phase: Optional[float] = None,
+    ) -> Image.Image:
+        """Assembles an articulated multi-part rig onto `canvas_size` using hierarchical parent anchors,
+        pivot-aligned placement (`pivot_normalized`), z-index sorting (`z_index_offset`), and auto-fitting
+        so multi-part rigs never collapse into a tiny central dot or bury child parts inside the root body.
+        """
+        cw, ch = max(16, int(canvas_size[0])), max(16, int(canvas_size[1]))
+        if not parts_with_images:
+            return Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+
+        part_lookup: Dict[str, Tuple[Dict[str, Any], Image.Image]] = {
+            str(pm.get("part_id", f"part_{i}")): (pm, pimg)
+            for i, (pm, pimg) in enumerate(parts_with_images)
+        }
+
+        # Identify root part radius to ensure radial child parts attached near the rim aren't buried inside the root body
+        root_radius = 0.0
+        for pm, pimg in parts_with_images:
+            if not pm.get("parent_part_id") or str(pm.get("parent_part_id")) not in part_lookup:
+                rw, rh = pimg.size
+                root_radius = max(root_radius, min(rw, rh) * 0.45)
+
+        anchors: Dict[str, Tuple[float, float]] = {}
+
+        def _get_anchor(pid: str, visited: Optional[Set[str]] = None) -> Tuple[float, float]:
+            if pid in anchors:
+                return anchors[pid]
+            if visited is None:
+                visited = set()
+            if pid in visited or pid not in part_lookup:
+                return (0.0, 0.0)
+            visited.add(pid)
+            pm, _ = part_lookup[pid]
+            offs = pm.get("attach_offset_px") or [0.0, 0.0]
+            ox, oy = float(offs[0]), float(offs[1])
+            parent_id = pm.get("parent_part_id")
+            if parent_id and str(parent_id) in part_lookup and str(parent_id) != pid:
+                px, py = _get_anchor(str(parent_id), visited)
+                # If attaching directly to a root part at a non-zero radial offset that falls inside root_radius,
+                # push the attachment anchor out to the root perimeter so radial appendages protrude visibly
+                parent_meta, _ = part_lookup[str(parent_id)]
+                is_parent_root = not parent_meta.get("parent_part_id") or str(parent_meta.get("parent_part_id")) not in part_lookup
+                dist = math.hypot(ox, oy)
+                if is_parent_root and 1.0 < dist < root_radius * 0.92:
+                    scale_out = (root_radius * 0.95) / dist
+                    ox *= scale_out
+                    oy *= scale_out
+                anc = (px + ox, py + oy)
+            else:
+                anc = (ox, oy)
+            anchors[pid] = anc
+            return anc
+
+        for pid in part_lookup:
+            _get_anchor(pid)
+
+        # Compute stable rig-space bounds across all parts (including rotation margin) so scale is invariant across `phase`
+        min_x, min_y = -16.0, -16.0
+        max_x, max_y = 16.0, 16.0
+        for pid, (pm, pimg) in part_lookup.items():
+            ax, ay = anchors[pid]
+            pw, ph = pimg.size
+            diag = math.hypot(pw, ph) * 0.65
+            min_x = min(min_x, ax - diag)
+            max_x = max(max_x, ax + diag)
+            min_y = min(min_y, ay - diag)
+            max_y = max(max_y, ay + diag)
+
+        span_w = max(32.0, (max_x - min_x) * 1.12)
+        span_h = max(32.0, (max_y - min_y) * 1.12)
+        work_w = max(cw, int(math.ceil(span_w)))
+        work_h = max(ch, int(math.ceil(span_h)))
+        center_x = work_w * 0.5 - (min_x + max_x) * 0.5
+        center_y = work_h * 0.5 - (min_y + max_y) * 0.5
+
+        work_canvas = np.zeros((work_h, work_w, 4), dtype=np.uint8)
+        sorted_parts = sorted(
+            parts_with_images,
+            key=lambda item: int(item[0].get("z_index_offset", 0)),
+        )
+        for idx_p, (pm, pimg) in enumerate(sorted_parts):
+            pid = str(pm.get("part_id", f"part_{idx_p}"))
+            ax, ay = anchors.get(pid, (0.0, 0.0))
+            pw, ph = pimg.size
+            piv = pm.get("pivot_normalized") or [0.5, 0.5]
+            piv_x = float(piv[0]) * pw
+            piv_y = float(piv[1]) * ph
+
+            is_child = bool(pm.get("parent_part_id")) and str(pm.get("parent_part_id")) in part_lookup
+            angle = math.sin(phase + idx_p * 0.7) * 22.0 if (phase is not None and is_child) else 0.0
+            rad = math.radians(angle)
+            cos_a = math.cos(rad)
+            sin_a = math.sin(rad)
+
+            target_x = center_x + ax
+            target_y = center_y + ay
+            m00, m01 = cos_a, -sin_a
+            m10, m11 = sin_a, cos_a
+            tx = target_x - (m00 * piv_x + m01 * piv_y)
+            ty = target_y - (m10 * piv_x + m11 * piv_y)
+            mat = np.array([[m00, m01, tx], [m10, m11, ty]], dtype=np.float32)
+
+            p_np = np.array(pimg.convert("RGBA"), dtype=np.uint8)
+            warped = cv2.warpAffine(
+                p_np,
+                mat,
+                (work_w, work_h),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0, 0, 0, 0),
+            )
+            work_canvas = cls._alpha_composite_np(work_canvas, warped)
+
+        assembled_pil = Image.fromarray(work_canvas)
+        # Fit the stable rig bounds cleanly into (cw, ch) so the rig fills the frame consistently across all phases
+        fit_scale = min((cw * 0.88) / max(1.0, span_w), (ch * 0.88) / max(1.0, span_h))
+        if abs(fit_scale - 1.0) > 0.04 or (work_w, work_h) != (cw, ch):
+            scaled_w = max(1, int(round(work_w * fit_scale)))
+            scaled_h = max(1, int(round(work_h * fit_scale)))
+            scaled_pil = assembled_pil.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
+            out_canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+            paste_x = (cw - scaled_w) // 2
+            paste_y = (ch - scaled_h) // 2
+            out_canvas.paste(scaled_pil, (paste_x, paste_y), scaled_pil)
+            return out_canvas
+        return assembled_pil
 
     def fabricate_articulated_rig(
         self,
@@ -1898,8 +2113,8 @@ class VisualArtSpriteDesignerAgent:
         ]
 
         comp_w, comp_h = asset_req.dimensions or (64, 64)
-        composite = Image.new("RGBA", (comp_w, comp_h), (0, 0, 0, 0))
         parts_meta: List[Dict[str, Any]] = []
+        parts_with_images: List[Tuple[Dict[str, Any], Image.Image]] = []
 
         for pspec in parts_specs:
             pw, ph = pspec.dimensions or (48, 48)
@@ -1924,12 +2139,7 @@ class VisualArtSpriteDesignerAgent:
             p_img = p_img.convert("RGBA").resize((pw, ph), Image.Resampling.LANCZOS)
             p_img.save(part_path, "PNG")
 
-            # Paste into composite preview
-            ox = int((comp_w - pw) // 2 + pspec.attach_offset_px[0])
-            oy = int((comp_h - ph) // 2 + pspec.attach_offset_px[1])
-            composite.paste(p_img, (max(0, min(comp_w - pw, ox)), max(0, min(comp_h - ph, oy))), p_img)
-
-            parts_meta.append({
+            pmeta = {
                 "part_id": pspec.part_id,
                 "res_path": f"res://assets/sprites/parts/{part_filename}",
                 "file_path": f"assets/sprites/parts/{part_filename}",
@@ -1938,8 +2148,11 @@ class VisualArtSpriteDesignerAgent:
                 "attach_offset_px": list(pspec.attach_offset_px),
                 "z_index_offset": int(pspec.z_index_offset),
                 "dimensions": [pw, ph],
-            })
+            }
+            parts_meta.append(pmeta)
+            parts_with_images.append((pmeta, p_img))
 
+        composite = self._assemble_articulated_rig_frame(parts_with_images, (comp_w, comp_h), phase=None)
         composite.save(output_path, "PNG")
         return output_path, {
             "texture_pixel_size": (comp_w, comp_h),
@@ -2398,26 +2611,15 @@ class VisualArtSpriteDesignerAgent:
         strip = Image.new("RGBA", (cw * frame_count, ch), (0, 0, 0, 0))
         for f_idx in range(frame_count):
             phase = (2.0 * math.pi * f_idx) / frame_count
-            frame_canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
             if loaded_parts:
-                sorted_parts = sorted(loaded_parts, key=lambda item: int(item[0].get("z_index_offset", 0)))
-                for idx_p, (pmeta, pimg) in enumerate(sorted_parts):
-                    pw, ph = pimg.size
-                    is_child = bool(pmeta.get("parent_part_id")) or idx_p > 0
-                    if is_child:
-                        angle = math.sin(phase + idx_p * 0.7) * 22.0
-                        part_frame = pimg.rotate(angle, resample=Image.Resampling.BICUBIC, expand=False)
-                    else:
-                        part_frame = pimg
-                    offs = pmeta.get("attach_offset_px") or [0.0, 0.0]
-                    ox = int((cw - pw) // 2 + float(offs[0]))
-                    oy = int((ch - ph) // 2 + float(offs[1]))
-                    frame_canvas.paste(part_frame, (max(0, min(cw - pw, ox)), max(0, min(ch - ph, oy))), part_frame)
-            elif Path(composite_path).is_file():
-                with Image.open(composite_path) as cim:
-                    base = cim.convert("RGBA").resize((cw, ch), Image.Resampling.LANCZOS)
-                    rot = base.rotate(math.sin(phase) * 12.0, resample=Image.Resampling.BICUBIC, expand=False)
-                    frame_canvas.paste(rot, (0, 0), rot)
+                frame_canvas = cls._assemble_articulated_rig_frame(loaded_parts, (cw, ch), phase=phase)
+            else:
+                frame_canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+                if Path(composite_path).is_file():
+                    with Image.open(composite_path) as cim:
+                        base = cim.convert("RGBA").resize((cw, ch), Image.Resampling.LANCZOS)
+                        rot = base.rotate(math.sin(phase) * 12.0, resample=Image.Resampling.BICUBIC, expand=False)
+                        frame_canvas.paste(rot, (0, 0), rot)
             strip.paste(frame_canvas, (f_idx * cw, 0), frame_canvas)
 
         states_meta = {

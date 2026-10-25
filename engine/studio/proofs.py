@@ -138,8 +138,8 @@ def capture_filmstrip(
     ticks: List[int],
     out_path: Path,
     input_script: Optional[List[Dict[str, Any]]] = None,
-    cell: Tuple[int, int] = (426, 240),
-    cols: int = 3,
+    cell: Tuple[int, int] = (640, 360),
+    cols: int = 2,
     setup_script: Optional[List[Dict[str, Any]]] = None,
     verify_counterfactual: bool = False,
 ) -> Path:
@@ -158,6 +158,20 @@ def capture_filmstrip(
         setup_script=setup_script, max_ticks=max(ticks), telemetry_mode="in_memory",
     )
     sim.run_until_complete()
+    avg_ms = float(getattr(sim, "avg_frame_time_ms", 0.0) or 0.0)
+    max_ms = float(getattr(sim, "max_frame_time_ms", 0.0) or 0.0)
+    audit_dict = getattr(sim, "scene_audit", None) or {}
+    sv_thrash = audit_dict.get("subviewport_thrashing_nodes") or []
+    if sv_thrash:
+        raise StudioAgentError(
+            f"QA filmstrip capture rejected due to SubViewport GPU thrashing: {sv_thrash}. "
+            "Set `render_target_update_mode = SubViewport.UPDATE_ONCE` on `CLEAR_MODE_NEVER` SubViewports and only trigger `UPDATE_ONCE` when painting new strokes."
+        )
+    if avg_ms > 33.3:
+        raise StudioAgentError(
+            f"QA filmstrip capture failed 60 FPS frame-budget gate: avg_frame_time_ms={avg_ms:.2f}ms ({1000.0 / max(0.1, avg_ms):.1f} FPS, max={max_ms:.2f}ms) exceeds 33.3ms (<30 FPS). "
+            "Eliminate unconditional per-frame `queue_redraw()` on nodes whose `_draw()` iterates over 2D grids or unbounded stroke arrays, and use `SubViewport.UPDATE_ONCE` for accumulation masks."
+        )
     tick_snaps = dict(getattr(sim, "tick_snapshots", {}) or {})
 
     if verify_counterfactual and (input_script or setup_script) and len(set(ticks)) >= 2:
@@ -170,10 +184,41 @@ def capture_filmstrip(
         sorted_t = sorted(set(ticks))
         t_first, t_last = sorted_t[0], sorted_t[-1]
         if t_first in ctrl_snaps and t_last in ctrl_snaps and t_last in tick_snaps:
-            ignore_keys = {"tick", "node_count"}
-            c0 = {k: v for k, v in ctrl_snaps[t_first].items() if k not in ignore_keys}
-            c_end = {k: v for k, v in ctrl_snaps[t_last].items() if k not in ignore_keys}
-            a_end = {k: v for k, v in tick_snaps[t_last].items() if k not in ignore_keys}
+            passive_clock_keys = {
+                "tick",
+                "node_count",
+                "elapsed_time",
+                "time",
+                "time_elapsed",
+                "frame",
+                "fps",
+                "delta",
+                "sim_time",
+                "uptime",
+            }
+
+            def _norm_snap(val: Any) -> Any:
+                if isinstance(val, dict):
+                    return {
+                        k: _norm_snap(v)
+                        for k, v in val.items()
+                        if str(k).lower() not in passive_clock_keys
+                    }
+                if isinstance(val, (list, tuple)):
+                    return [_norm_snap(x) for x in val]
+                if isinstance(val, float):
+                    return int(round(val))
+                if isinstance(val, str) and val.startswith("(") and val.endswith(")") and "," in val:
+                    try:
+                        parts = [float(p.strip()) for p in val[1:-1].split(",")]
+                        return "(" + ", ".join(str(int(round(p))) for p in parts) + ")"
+                    except ValueError:
+                        return val
+                return val
+
+            c0 = _norm_snap(ctrl_snaps[t_first])
+            c_end = _norm_snap(ctrl_snaps[t_last])
+            a_end = _norm_snap(tick_snaps[t_last])
             # If the zero-input control run changed state across ticks AND ended in the exact same state as the scripted run,
             # the game is running a self-playing demo timer rather than responding to the QA input script.
             if c0 != c_end and c_end == a_end:

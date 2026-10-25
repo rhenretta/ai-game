@@ -527,7 +527,7 @@ def test_downstream_director_swe_and_challenger_grounding_in_game_bible(tmp_path
     swe = LeadGameplaySWEAgent(client=fake_client)
     narrative_ctx, mockup_parts = swe._build_bible_and_narrative_context(candidate_dir)
     assert "LIVING GAME BIBLE" in narrative_ctx
-    assert "Diegetic UI & Onboarding Philosophy" in narrative_ctx
+    assert "UI, HUD & Onboarding Philosophy" in narrative_ctx
     assert "The Storm Wall Rises" in narrative_ctx
     assert len(mockup_parts) >= 1
 
@@ -877,12 +877,14 @@ def test_concept_genesis_models_rationale_first():
 
 
 def test_room_opens_with_genesis_not_a_pitch(tmp_path: Path):
+    from engine.studio.writers_room import SPECIALIST_ROSTER
     room, client = _make_room(tmp_path)
     candidate_dir = tmp_path / "cartridges" / "candidate_new"
     bible = room.run_writers_room(dna=_sample_dna(), candidate_dir=candidate_dir)
-    assert len(bible.concept_fragments) == 16                      # 2 fragments x 8 specialists
-    assert {f.contributor_role for f in bible.concept_fragments} >= {"GameplayDesigner", "StoryWorldArchitect"}
-    assert len({f.fragment_id for f in bible.concept_fragments}) == 16
+    expected_fragments = 2 * len(SPECIALIST_ROSTER)
+    assert len(bible.concept_fragments) == expected_fragments      # 2 fragments x 9 specialists (incl. ScriptwriterAgent)
+    assert {f.contributor_role for f in bible.concept_fragments} >= {"GameplayDesigner", "StoryWorldArchitect", "ScriptwriterAgent"}
+    assert len({f.fragment_id for f in bible.concept_fragments}) == expected_fragments
     assert len(bible.concept_candidates) == 4
     assert bible.writers_room_transcript[0].speaker_role == "CreativeDirector"
     assert "draft premise" in bible.writers_room_transcript[0].spoken_dialogue
@@ -1073,3 +1075,173 @@ def test_beat_plan_is_generated_from_onboarding_steps_even_without_storyboard(tm
     plan = agent.formulate_beat_plan(tmp_path, layout)
     assert plan is not None
     assert "ONBOARDING PLAN" in seen["prompt"] and "c0" in seen["prompt"] and "GOALS" in seen["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical Council, ScriptwriterAgent & Real-Time Live Agent Observability
+# ---------------------------------------------------------------------------
+def test_hierarchical_council_roster_and_subagent_handoff(tmp_path: Path):
+    from engine.studio.writers_room import (
+        CORE_COUNCIL_ROSTER,
+        COUNCIL_HIERARCHY,
+        SPECIALIST_ROSTER,
+        SUBAGENT_ROSTER,
+    )
+
+    lead_roles = [s["role"] for s in CORE_COUNCIL_ROSTER]
+    sub_roles = [s["role"] for s in SUBAGENT_ROSTER]
+    assert lead_roles == ["GameplayDesigner", "StoryWorldArchitect", "VisualArtDirector"]
+    assert "ScriptwriterAgent" in sub_roles
+    assert "ScriptwriterAgent" in COUNCIL_HIERARCHY["StoryWorldArchitect"]
+    assert len(SPECIALIST_ROSTER) == 9
+
+    events = []
+    room, _ = _make_room(tmp_path, event_callback=lambda ev_type, payload: events.append({"event_type": ev_type, "payload": payload}))
+    bible = GameBibleSpec(deliberation="d", game_title="Echoes of the Spindle")
+
+    def fake_eval_listen(specialist, game_bible, dna_summary):
+        role = specialist["role"]
+        if role == "StoryWorldArchitect":
+            return WritersRoomListenCheck(
+                deliberation="We need sharp dramatic dialogue and scene staging for the Spindle awakening.",
+                should_interject=True,
+                urgency_score=0.92,
+                intended_contribution_summary="Establish Spindle lore and call ScriptwriterAgent for opening scene.",
+                consult_subagent_role="ScriptwriterAgent",
+                subagent_brief="Write the opening dramatic confrontation and dialogue tree at the Spindle gate.",
+            )
+        return WritersRoomListenCheck(
+            deliberation="Holding back.",
+            should_interject=False,
+            urgency_score=0.1,
+            intended_contribution_summary="",
+        )
+
+    room._evaluate_specialist_listen = fake_eval_listen
+    chosen_spec, chosen_check = room._select_next_speaker(
+        last_speaker_role="CreativeDirector",
+        addressed_to=[],
+        game_bible=bible,
+        dna_summary="dna",
+        spoken_counts={},
+    )
+    assert chosen_spec is not None
+    assert chosen_spec["role"] == "ScriptwriterAgent"
+    assert "[Called in by StoryWorldArchitect]" in chosen_check.intended_contribution_summary
+    assert any(
+        e.get("event_type") == "writers_room_activity"
+        and e.get("payload", {}).get("phase") == "subagent_handoff"
+        and e.get("payload", {}).get("subagent_role") == "ScriptwriterAgent"
+        and e.get("payload", {}).get("called_by_lead") == "StoryWorldArchitect"
+        for e in events
+    )
+
+
+def test_script_writer_worker_specialist_and_proof_plate(tmp_path: Path):
+    from types import SimpleNamespace
+    from engine.studio.models import (
+        CutsceneBeat,
+        CutsceneScript,
+        DialogueBarkSpec,
+        DialogueNode,
+        DialogueTreeSpec,
+        ScriptWritingDeliverable,
+        WorkItem,
+    )
+    from engine.studio.workers import WorkerContext, available_specialists, run_script_writer_specialist
+
+    deliverable = ScriptWritingDeliverable(
+        deliberation="Crafting subtext-rich opening cutscene, branching dialogue tree, and reactive barks.",
+        narrative_notes="Authored 'The Spindle Fracture' cutscene, 1 branching dialogue tree, and 1 reactive bark.",
+        added_or_updated_cutscenes=[
+            CutsceneScript(
+                deliberation="Opening fracture scene.",
+                cutscene_id="spindle_fracture",
+                title="The Spindle Fracture",
+                trigger="on_level_start",
+                beats=[
+                    CutsceneBeat(
+                        deliberation="Vesper warns the player.",
+                        beat_number=1,
+                        action_description="Sparks cascade down the iron loom.",
+                        speaker_id="vesper",
+                        dialogue_line="Hold the thread! If the spindle snaps, the whole ward goes dark.",
+                    )
+                ],
+            )
+        ],
+        added_or_updated_dialogue_trees=[
+            DialogueTreeSpec(
+                deliberation="Branching conversation with Vesper.",
+                root_node_id="vesper_intro",
+                nodes={
+                    "vesper_intro": DialogueNode(
+                        deliberation="Root greeting.",
+                        node_id="vesper_intro",
+                        speaker_id="vesper",
+                        text="You brought the tuning fork?",
+                        choices=[],
+                    )
+                },
+            )
+        ],
+        added_or_updated_barks=[
+            DialogueBarkSpec(
+                deliberation="Low stamina reactive bark.",
+                bark_id="bark_thread_fray",
+                speaker_id="vesper",
+                speaker_name="Vesper",
+                trigger_type="on_thread_fray",
+                text="The tension's too high—slacken the line!",
+                voice_clip="assets/audio/bark_thread_fray.wav",
+            )
+        ],
+    )
+
+    class _ScriptFakeModels:
+        def generate_content(self, model, contents, config=None):
+            return SimpleNamespace(text=deliverable.model_dump_json())
+
+    class _ScriptFakeClient:
+        __module__ = "google.genai.fake"
+
+        def __init__(self):
+            self.models = _ScriptFakeModels()
+
+    fake_client = _ScriptFakeClient()
+    bible = GameBibleSpec(deliberation="d", game_title="Echoes of the Spindle")
+    (tmp_path / "game_bible.json").write_text(bible.model_dump_json(indent=2), encoding="utf-8")
+    item = WorkItem(
+        deliberation="d",
+        item_id="narrative_spindle_script",
+        title="Spindle Opening Script & Barks",
+        kind="narrative",
+        spec="Write the opening cutscene, dialogue tree, and reactive barks.",
+        proof_spec="Visual script sheet proof plate.",
+        raised_by_role="ScriptwriterAgent",
+        owner_role="ScriptwriterAgent",
+    )
+    ctx = WorkerContext(
+        cartridge_dir=tmp_path,
+        client=fake_client,
+    )
+    assert "script_writer" in available_specialists(ctx, item)
+    report = run_script_writer_specialist(ctx, item, "Write the opening Spindle script and barks.", turn_index=1)
+    assert report.specialist_agent == "script_writer"
+    assert any("script_sheet_narrative_spindle_script_t1.png" in p for p in report.proof_images)
+    assert (tmp_path / "narrative.json").exists()
+    persisted_bible = GameBibleSpec.model_validate_json((tmp_path / "game_bible.json").read_text(encoding="utf-8"))
+    assert len(persisted_bible.narrative_bible.cutscenes) == 1
+    assert len(persisted_bible.narrative_bible.dialogue_barks) == 1
+
+
+def test_live_agent_observability_events_emitted(tmp_path: Path):
+    events = []
+    room, _ = _make_room(tmp_path, event_callback=lambda ev_type, payload: events.append({"event_type": ev_type, "payload": payload}))
+    candidate_dir = tmp_path / "cartridges" / "candidate_obs"
+    room.run_writers_room(dna=_sample_dna(), candidate_dir=candidate_dir)
+    activity_events = [e for e in events if e.get("event_type") == "writers_room_activity"]
+    phases = {e.get("payload", {}).get("phase") for e in activity_events}
+    assert {"genesis_provocations", "genesis_fragments", "genesis_collision", "genesis_selection", "listening", "speaking", "convergence_check"} <= phases
+    assert all(isinstance(e.get("payload", {}).get("active_agents"), list) for e in activity_events)
+

@@ -1,7 +1,5 @@
 """engine/core package - engine lifecycle, loop, input, and scenes."""
-from engine.core.engine import Engine
-from engine.core.input import InputManager
-from engine.core.loop import GameLoop
+from typing import Any
 from engine.core.scene import Scene, SceneManager
 
 __all__ = [
@@ -11,3 +9,16 @@ __all__ = [
     "Scene",
     "SceneManager",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name == "Engine":
+        from engine.core.engine import Engine
+        return Engine
+    if name == "InputManager":
+        from engine.core.input import InputManager
+        return InputManager
+    if name == "GameLoop":
+        from engine.core.loop import GameLoop
+        return GameLoop
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

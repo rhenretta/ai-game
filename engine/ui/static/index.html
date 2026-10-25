@@ -1382,28 +1382,203 @@
       width: 100%;
     }
     .specialist-roster-bar {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(225px, 1fr));
+      gap: 10px;
       margin-bottom: 10px;
-      padding-bottom: 8px;
+      padding-bottom: 10px;
       border-bottom: 1px solid var(--navy);
     }
-    .specialist-pill {
-      font-size: 10px;
-      padding: 3px 8px;
-      border-radius: 12px;
-      background: #060b19;
-      border: 1px solid var(--navy);
-      color: var(--light-gray);
-      display: inline-flex;
+    .council-pod {
+      background: linear-gradient(180deg, rgba(11, 21, 48, 0.92), rgba(5, 10, 24, 0.95));
+      border: 1px solid rgba(41, 173, 255, 0.22);
+      border-radius: 8px;
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .council-pod-header {
+      display: flex;
       align-items: center;
+      justify-content: space-between;
+      font-size: 9.5px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: var(--slate);
+      padding-bottom: 4px;
+      border-bottom: 1px solid rgba(29, 43, 83, 0.7);
+    }
+    .council-subagent-tree {
+      display: flex;
+      flex-direction: column;
       gap: 5px;
+      padding-left: 10px;
+      margin-left: 6px;
+      border-left: 1.5px dashed rgba(41, 173, 255, 0.3);
+    }
+    .specialist-pill {
+      font-size: 11px;
+      padding: 5px 8px;
+      border-radius: 6px;
+      background: #060c1e;
+      border: 1px solid rgba(29, 43, 83, 0.95);
+      color: var(--light-gray);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      cursor: pointer;
+      transition: border-color 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
+      user-select: none;
+    }
+    .specialist-pill:hover {
+      border-color: rgba(41, 173, 255, 0.65);
+      background: rgba(41, 173, 255, 0.08);
+    }
+    .specialist-pill.lead-pill {
+      border-color: rgba(41, 173, 255, 0.42);
+      font-weight: 700;
+      color: var(--white);
+      background: rgba(14, 28, 62, 0.75);
+    }
+    .specialist-pill.subagent-pill {
+      font-size: 10.5px;
+      background: rgba(6, 11, 25, 0.75);
+      color: #b8c4d8;
     }
     .specialist-pill.speaking {
+      border-color: rgba(255, 236, 39, 0.75);
+      background: rgba(255, 236, 39, 0.1);
+      color: var(--yellow);
+    }
+    @keyframes councilSeatGlow {
+      0% { box-shadow: 0 0 0 0 rgba(41, 173, 255, 0.35), inset 0 0 8px rgba(41, 173, 255, 0.18); }
+      50% { box-shadow: 0 0 12px 1px rgba(41, 173, 255, 0.55), inset 0 0 12px rgba(41, 173, 255, 0.3); }
+      100% { box-shadow: 0 0 0 0 rgba(41, 173, 255, 0.35), inset 0 0 8px rgba(41, 173, 255, 0.18); }
+    }
+    .specialist-pill.active-thinking {
+      border-color: var(--cyan);
+      color: var(--white);
+      background: rgba(41, 173, 255, 0.18);
+      animation: councilSeatGlow 1.8s infinite;
+    }
+    .specialist-pill.active-speaking {
       border-color: var(--yellow);
       color: var(--yellow);
-      background: rgba(255, 236, 39, 0.12);
+      background: rgba(255, 236, 39, 0.18);
+      box-shadow: 0 0 12px rgba(255, 236, 39, 0.35);
+    }
+    .specialist-pill.filtered-role {
+      outline: 1.5px solid var(--green);
+      background: rgba(0, 228, 54, 0.14);
+    }
+    .seat-left {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .seat-name {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .seat-right {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      flex-shrink: 0;
+    }
+    .seat-status-tag {
+      font-size: 9px;
+      font-weight: 800;
+      padding: 1px 5px;
+      border-radius: 4px;
+      letter-spacing: 0.3px;
+      text-transform: uppercase;
+      background: rgba(29, 43, 83, 0.65);
+      color: var(--slate);
+    }
+    .specialist-pill.active-thinking .seat-status-tag {
+      background: rgba(41, 173, 255, 0.25);
+      color: var(--cyan);
+      border: 1px solid rgba(41, 173, 255, 0.55);
+    }
+    .specialist-pill.active-speaking .seat-status-tag,
+    .specialist-pill.speaking .seat-status-tag {
+      background: rgba(255, 236, 39, 0.22);
+      color: var(--yellow);
+      border: 1px solid rgba(255, 236, 39, 0.55);
+    }
+    .seat-turn-count {
+      font-family: monospace;
+      font-size: 9.5px;
+      padding: 1px 5px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--light-gray);
+    }
+    .live-running-agents-strip {
+      grid-column: 1 / -1;
+      display: none;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 8px;
+      padding-top: 8px;
+      margin-top: 4px;
+      border-top: 1px dashed rgba(41, 173, 255, 0.28);
+    }
+    .live-running-agents-strip.has-agents {
+      display: grid;
+    }
+    .live-agent-lane {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      background: linear-gradient(90deg, rgba(13, 27, 62, 0.9), rgba(7, 15, 36, 0.92));
+      border: 1px solid rgba(41, 173, 255, 0.42);
+      border-left: 3px solid var(--cyan);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 10.5px;
+      color: var(--white);
+      cursor: pointer;
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }
+    .live-agent-lane:hover {
+      border-color: var(--yellow);
+      background: rgba(41, 173, 255, 0.14);
+    }
+    .live-agent-lane-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .live-agent-lane-bottom {
+      color: var(--light-gray);
+      font-size: 10px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .writers-room-live-banner {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      background: linear-gradient(90deg, rgba(41, 173, 255, 0.16), rgba(131, 118, 156, 0.16));
+      border: 1px solid var(--cyan);
+      border-radius: 6px;
+      padding: 7px 12px;
+      margin-bottom: 10px;
+      font-size: 11.5px;
+      color: var(--white);
+    }
+    .writers-room-live-banner.active {
+      display: flex;
     }
     .writers-room-transcript {
       background: #02050e;
@@ -1429,6 +1604,7 @@
     .utterance-card.role-GameplaySystemsEngineer { border-left-color: var(--orange, #ff8c1a); }
     .utterance-card.role-LevelAndProgressionDesigner { border-left-color: var(--cyan); }
     .utterance-card.role-StoryWorldArchitect { border-left-color: var(--purple); }
+    .utterance-card.role-ScriptwriterAgent { border-left-color: #ff77a8; }
     .utterance-card.role-CharacterDesigner { border-left-color: var(--amber); }
     .utterance-card.role-UXExperienceDesigner { border-left-color: var(--cyan); }
     .utterance-card.role-VisualArtDirector { border-left-color: var(--yellow); }
@@ -1926,6 +2102,9 @@
         <button id="btn-activate-selected-game" type="button" class="btn-activate-checkpoint" style="padding: 3px 8px; font-size: 10px;" title="Promote the currently selected game to cartridges/active">
           ⭐ Set Active
         </button>
+        <button id="btn-launch-current-game" type="button" class="btn-primary" style="background: rgba(0, 228, 54, 0.22); border: 1px solid var(--green); color: var(--green); padding: 3px 10px; font-size: 10.5px; font-weight: 800; display: inline-flex; align-items: center; gap: 4px;" title="Launch the currently selected game cartridge in a native Godot 4.3 window">
+          🕹️ Launch Game
+        </button>
       </div>
       <nav class="workspace-nav-bar" style="margin: 0; padding: 0; border: none; background: transparent;" aria-label="Mission Control Workspaces">
         <div class="workspace-tabs-group" style="gap: 6px;">
@@ -2004,6 +2183,7 @@
         <span>✅ Done:</span> <strong id="pulse-count-approved">0</strong>
       </button>
     </div>
+    <div id="pulse-active-agents-strip" class="live-running-agents-strip" aria-label="Currently Running Agents and Workers"></div>
   </section>
 
   <!-- Native HTML <dialog closedby="any"> Modal for Commissioning a New Game from Scratch -->
@@ -2102,16 +2282,94 @@
 
         <!-- Subtab: Live Multi-Agent Writers' Room Transcript -->
         <div id="bible-subview-transcript" class="bible-subview">
-          <div id="specialist-roster-bar" class="specialist-roster-bar">
-            <span class="specialist-pill" data-role="CreativeDirector">🎬 CreativeDirector</span>
-            <span class="specialist-pill" data-role="GameplayDesigner">🎮 GameplayDesigner</span>
-            <span class="specialist-pill" data-role="LevelAndProgressionDesigner">🗺️ LevelAndProgressionDesigner</span>
-            <span class="specialist-pill" data-role="GameplaySystemsEngineer">🛠️ GameplaySystemsEngineer</span>
-            <span class="specialist-pill" data-role="StoryWorldArchitect">🌍 StoryWorldArchitect</span>
-            <span class="specialist-pill" data-role="CharacterDesigner">🎭 CharacterDesigner</span>
-            <span class="specialist-pill" data-role="UXExperienceDesigner">✨ UXExperienceDesigner</span>
-            <span class="specialist-pill" data-role="VisualArtDirector">🎨 VisualArtDirector</span>
-            <span class="specialist-pill" data-role="AudioAtmosphereDesigner">🔊 AudioAtmosphereDesigner</span>
+          <div id="specialist-roster-bar" class="specialist-roster-bar" title="Click any Council member to filter the Writers' Room transcript to their turns">
+            <!-- Pod 1: Executive Chair & Facilitator -->
+            <div class="council-pod">
+              <div class="council-pod-header">
+                <span>🎬 Executive Chair</span>
+                <button id="btn-clear-speaker-filter" type="button" onclick="setWritersRoomRoleFilter(null)" style="display: none; background: rgba(0, 228, 54, 0.18); border: 1px solid var(--green); color: var(--green); font-size: 9px; padding: 1px 6px; border-radius: 4px; cursor: pointer;">Show All</button>
+              </div>
+              <div class="specialist-pill lead-pill" data-role="CreativeDirector" data-default-tag="CHAIR" onclick="setWritersRoomRoleFilter('CreativeDirector')">
+                <span class="seat-left"><span>🎬</span><span class="seat-name">Creative Director</span></span>
+                <span class="seat-right"><span class="seat-status-tag">CHAIR</span><span class="seat-turn-count" data-turn-count="CreativeDirector">0💬</span></span>
+              </div>
+              <div style="font-size: 9.5px; color: var(--slate); line-height: 1.35; padding: 2px 4px;">
+                Sets creative pillars, facilitates Council floor &amp; synthesizes Living Game Bible.
+              </div>
+            </div>
+
+            <!-- Pod 2: Gameplay & Systems Department -->
+            <div class="council-pod">
+              <div class="council-pod-header">
+                <span>🎮 Gameplay &amp; Systems Pod</span>
+                <span>Lead + 2 Sub</span>
+              </div>
+              <div class="specialist-pill lead-pill" data-role="GameplayDesigner" data-default-tag="LEAD" onclick="setWritersRoomRoleFilter('GameplayDesigner')">
+                <span class="seat-left"><span>🎮</span><span class="seat-name">Gameplay Designer</span></span>
+                <span class="seat-right"><span class="seat-status-tag">LEAD</span><span class="seat-turn-count" data-turn-count="GameplayDesigner">0💬</span></span>
+              </div>
+              <div class="council-subagent-tree">
+                <div class="specialist-pill subagent-pill" data-role="LevelAndProgressionDesigner" data-default-tag="ON CALL" onclick="setWritersRoomRoleFilter('LevelAndProgressionDesigner')" title="Sub-Agent of GameplayDesigner: Spatial layout & progression">
+                  <span class="seat-left"><span>🗺️</span><span class="seat-name">Level &amp; Progression</span></span>
+                  <span class="seat-right"><span class="seat-status-tag">ON CALL</span><span class="seat-turn-count" data-turn-count="LevelAndProgressionDesigner">0💬</span></span>
+                </div>
+                <div class="specialist-pill subagent-pill" data-role="GameplaySystemsEngineer" data-default-tag="ON CALL" onclick="setWritersRoomRoleFilter('GameplaySystemsEngineer')" title="Sub-Agent of GameplayDesigner: Godot 4 physics & architecture">
+                  <span class="seat-left"><span>🛠️</span><span class="seat-name">Systems Engineer</span></span>
+                  <span class="seat-right"><span class="seat-status-tag">ON CALL</span><span class="seat-turn-count" data-turn-count="GameplaySystemsEngineer">0💬</span></span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Pod 3: Story, World & Script Department -->
+            <div class="council-pod">
+              <div class="council-pod-header">
+                <span>🌍 Story &amp; Narrative Pod</span>
+                <span>Lead + 2 Sub</span>
+              </div>
+              <div class="specialist-pill lead-pill" data-role="StoryWorldArchitect" data-default-tag="LEAD" onclick="setWritersRoomRoleFilter('StoryWorldArchitect')">
+                <span class="seat-left"><span>🌍</span><span class="seat-name">Story &amp; World Lead</span></span>
+                <span class="seat-right"><span class="seat-status-tag">LEAD</span><span class="seat-turn-count" data-turn-count="StoryWorldArchitect">0💬</span></span>
+              </div>
+              <div class="council-subagent-tree">
+                <div class="specialist-pill subagent-pill" data-role="ScriptwriterAgent" data-default-tag="ON CALL" onclick="setWritersRoomRoleFilter('ScriptwriterAgent')" title="Sub-Agent of StoryWorldArchitect: Dialogue scripts, barks & scene writing">
+                  <span class="seat-left"><span>✍️</span><span class="seat-name">Scriptwriter</span></span>
+                  <span class="seat-right"><span class="seat-status-tag">ON CALL</span><span class="seat-turn-count" data-turn-count="ScriptwriterAgent">0💬</span></span>
+                </div>
+                <div class="specialist-pill subagent-pill" data-role="CharacterDesigner" data-default-tag="ON CALL" onclick="setWritersRoomRoleFilter('CharacterDesigner')" title="Sub-Agent of StoryWorldArchitect: Cast voices, motivations & silhouettes">
+                  <span class="seat-left"><span>🎭</span><span class="seat-name">Character Designer</span></span>
+                  <span class="seat-right"><span class="seat-status-tag">ON CALL</span><span class="seat-turn-count" data-turn-count="CharacterDesigner">0💬</span></span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Pod 4: Visual Art, UX & Audio Department -->
+            <div class="council-pod">
+              <div class="council-pod-header">
+                <span>🎨 Audiovisual &amp; UX Pod</span>
+                <span>Lead + 2 Sub</span>
+              </div>
+              <div class="specialist-pill lead-pill" data-role="VisualArtDirector" data-default-tag="LEAD" onclick="setWritersRoomRoleFilter('VisualArtDirector')">
+                <span class="seat-left"><span>🎨</span><span class="seat-name">Visual Art Lead</span></span>
+                <span class="seat-right"><span class="seat-status-tag">LEAD</span><span class="seat-turn-count" data-turn-count="VisualArtDirector">0💬</span></span>
+              </div>
+              <div class="council-subagent-tree">
+                <div class="specialist-pill subagent-pill" data-role="UXExperienceDesigner" data-default-tag="ON CALL" onclick="setWritersRoomRoleFilter('UXExperienceDesigner')" title="Sub-Agent of VisualArtDirector: Controls, onboarding & readability">
+                  <span class="seat-left"><span>✨</span><span class="seat-name">UX Experience</span></span>
+                  <span class="seat-right"><span class="seat-status-tag">ON CALL</span><span class="seat-turn-count" data-turn-count="UXExperienceDesigner">0💬</span></span>
+                </div>
+                <div class="specialist-pill subagent-pill" data-role="AudioAtmosphereDesigner" data-default-tag="ON CALL" onclick="setWritersRoomRoleFilter('AudioAtmosphereDesigner')" title="Sub-Agent of VisualArtDirector: Soundscape, motifs & acoustic feedback">
+                  <span class="seat-left"><span>🔊</span><span class="seat-name">Audio Atmosphere</span></span>
+                  <span class="seat-right"><span class="seat-status-tag">ON CALL</span><span class="seat-turn-count" data-turn-count="AudioAtmosphereDesigner">0💬</span></span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div id="writers-room-live-activity-banner" class="writers-room-live-banner" role="status" aria-live="polite">
+            <div style="display: flex; align-items: center; gap: 8px; flex: 1;">
+              <span class="activity-beacon" style="background: var(--cyan); box-shadow: 0 0 8px var(--cyan);"></span>
+              <span id="writers-room-live-activity-text">Convening Writers' Room Council...</span>
+            </div>
+            <span id="writers-room-live-activity-elapsed" style="font-family: monospace; font-size: 10.5px; color: var(--amber);">0s</span>
           </div>
           <div id="writers-room-transcript-list" class="writers-room-transcript">
             <div class="blueprint-empty">No Writers' Room utterances recorded yet. Trigger a Genesis Build to watch the specialists brainstorm live.</div>
@@ -2147,7 +2405,7 @@
         <div id="bible-subview-evolution" class="bible-subview">
           <div id="bible-experience-hooks-card" class="blueprint-box" style="margin-top: 0;">
             <div class="blueprint-field"><span class="blueprint-field-label">First 60 Seconds Hook:</span><span id="bible-first-60s">Awaiting UXExperienceDesigner...</span></div>
-            <div class="blueprint-field"><span class="blueprint-field-label">Diegetic UI Philosophy (Zero HUD Manuals):</span><span id="bible-diegetic-ui">Awaiting UXExperienceDesigner...</span></div>
+            <div class="blueprint-field"><span class="blueprint-field-label">UI, HUD &amp; Onboarding Philosophy:</span><span id="bible-diegetic-ui">Awaiting UXExperienceDesigner...</span></div>
           </div>
           <div>
             <h4 style="color: var(--cyan); font-size: 12px; text-transform: uppercase; margin-bottom: 8px;">Concept Evolution Timeline (How the Idea Evolved)</h4>
@@ -2858,6 +3116,13 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     let _lastActivityHeadline = '';
     let _lastRetryNotice = '';
     let currentBoardFilter = 'all';
+    const _liveRunningAgents = {};
+    let _writersRoomLiveStatus = {
+      statusText: '',
+      activeAgents: [],
+      phase: '',
+      startedAtMs: 0,
+    };
 
     const AGENT_SHORT_LABELS = {
       SteamAndTelemetryAnalystAgent: 'Steam Analyst',
@@ -2868,7 +3133,16 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       LeadGameplaySWEAgent: 'Gameplay SWE',
       TelemetryArchitectAgent: 'Telemetry Architect',
       QAPlaytesterBuildSupervisor: 'QA Supervisor',
-      StudioOrchestrator: 'Orchestrator'
+      StudioOrchestrator: 'Orchestrator',
+      ScriptwriterAgent: 'Lead Scriptwriter',
+      LevelAndProgressionDesigner: 'Level & Progression',
+      GameplaySystemsEngineer: 'Systems Engineer',
+      GameplayDesigner: 'Gameplay Lead',
+      StoryWorldArchitect: 'Story Lead',
+      VisualArtDirector: 'Art Lead',
+      CharacterDesigner: 'Character Designer',
+      UXExperienceDesigner: 'UX & Onboarding',
+      AudioAtmosphereDesigner: 'Audio & Atmosphere'
     };
 
     function observeEventForBuildActivity(ev) {
@@ -2914,38 +3188,162 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         _lastRetryNotice = '⏳ Upstream LLM timeout detected — automatically retrying in background...';
       }
 
-      if (evTypeLower === 'backlog_item_started') {
+      if (evTypeLower === 'writers_room_activity') {
+        _lastBuildStoppedByErrorOrPromote = false;
+        _lastRetryNotice = '';
+        const statusTxt = String(p.status_text || delibText || '').trim();
+        const activeList = Array.isArray(p.active_agents) ? p.active_agents : [];
+        const phaseStr = String(p.phase || '').toLowerCase();
+        _writersRoomLiveStatus = {
+          statusText: statusTxt,
+          activeAgents: activeList,
+          phase: phaseStr,
+          startedAtMs: Date.now(),
+        };
+        if (statusTxt) {
+          _lastActivityHeadline = `🎙️ ${statusTxt}`;
+        }
+        if (activeList.length > 0 && phaseStr !== 'locked' && phaseStr !== 'review_done') {
+          const shortRoleNames = activeList.map(r => AGENT_SHORT_LABELS[r] || r);
+          const personaBadge = phaseStr === 'listening'
+            ? `🎧 ${activeList.length} Council Leads Evaluating`
+            : `🎙️ ${shortRoleNames.join(', ')}`;
+          _liveRunningAgents['writers_room'] = {
+            key: 'writers_room',
+            isWritersRoom: true,
+            trackBadge: "🏛️ Writers' Room Council",
+            specialistBadge: personaBadge,
+            agentLabel: shortRoleNames.slice(0, 2).join(', ') + (shortRoleNames.length > 2 ? ` +${shortRoleNames.length - 2}` : ''),
+            action: statusTxt || "Writers' Room deliberating...",
+            startedAtMs: Date.now(),
+          };
+        } else {
+          delete _liveRunningAgents['writers_room'];
+        }
+        if (typeof syncCouncilDeckStatus === 'function') syncCouncilDeckStatus();
+      } else if (evTypeLower === 'backlog_item_started') {
         _lastBuildStoppedByErrorOrPromote = false;
         _lastRetryNotice = '';
         const resumedTag = p.resumed ? 'Resuming' : 'Worker fabricating';
-        _lastActivityHeadline = `⚡ ${resumedTag} ${p.kind || 'item'} "${p.item_id || ''}" (Rev #${(p.revision || 0) + 1})...`;
+        const itemId = p.item_id || '';
+        const ownerRole = p.owner_role || agent || 'TaskLead';
+        _lastActivityHeadline = `⚡ ${resumedTag} ${p.kind || 'item'} "${itemId}" (${ownerRole}, Rev #${(p.revision || 0) + 1})...`;
+        if (itemId) {
+          _liveRunningAgents['item_' + itemId] = {
+            key: 'item_' + itemId,
+            itemId: itemId,
+            ownerRole: ownerRole,
+            specialist: 'TaskLead',
+            turnIndex: 1,
+            agentLabel: `${ownerRole} [${itemId}]`,
+            action: `${resumedTag} ${p.kind || 'work item'} (initializing Task Lead)...`,
+            startedAtMs: Date.now(),
+          };
+        }
+      } else if (evTypeLower === 'backlog_item_lead_planning') {
+        _lastBuildStoppedByErrorOrPromote = false;
+        _lastRetryNotice = '';
+        const itemId = p.item_id || '';
+        const ownerRole = p.owner_role || agent || 'TaskLead';
+        const turnNo = (p.turn_index || 0) + 1;
+        const statusTxt = p.status_text || `Task Lead (${ownerRole}) deliberating Turn #${turnNo} strategy for [${itemId}]...`;
+        _lastActivityHeadline = `🧠 ${statusTxt}`;
+        if (itemId) {
+          _liveRunningAgents['item_' + itemId] = {
+            key: 'item_' + itemId,
+            itemId: itemId,
+            ownerRole: ownerRole,
+            specialist: 'TaskLead (Planning)',
+            turnIndex: turnNo,
+            agentLabel: `${ownerRole} [${itemId}]`,
+            action: `Turn #${turnNo}: Deliberating strategy & selecting specialist...`,
+            startedAtMs: Date.now(),
+          };
+        }
       } else if (evTypeLower === 'backlog_item_yielded') {
         _lastBuildStoppedByErrorOrPromote = false;
         _lastRetryNotice = '';
+        if (p.item_id) delete _liveRunningAgents['item_' + p.item_id];
         _lastActivityHeadline = `⏸️ Worker paused "${p.item_id || ''}" (${p.reason || 'code_lock busy'}) to execute parallel work...`;
       } else if (evTypeLower === 'backlog_item_lead_turn') {
         _lastBuildStoppedByErrorOrPromote = false;
         _lastRetryNotice = '';
+        const itemId = p.item_id || '';
+        const ownerRole = p.owner_role || agent || 'TaskLead';
         const specAg = p.specialist_agent ? ` → ${p.specialist_agent}` : '';
-        _lastActivityHeadline = `🎯 Task Lead [${p.item_id || ''}] Turn #${(p.turn_index || 0) + 1}${specAg}: ${String(p.current_strategy || p.brief || '').slice(0, 95)}`;
+        const turnNo = (p.turn_index || 0) + 1;
+        const strat = String(p.current_strategy || p.brief || '').slice(0, 95);
+        _lastActivityHeadline = `🎯 Task Lead [${itemId}] Turn #${turnNo}${specAg}: ${strat}`;
+        if (itemId) {
+          _liveRunningAgents['item_' + itemId] = {
+            key: 'item_' + itemId,
+            itemId: itemId,
+            ownerRole: ownerRole,
+            specialist: p.specialist_agent || 'TaskLead',
+            turnIndex: turnNo,
+            agentLabel: `${ownerRole}${specAg} [${itemId}]`,
+            action: `Turn #${turnNo}: ${strat || 'Dispatching specialist...'}`,
+            startedAtMs: Date.now(),
+          };
+        }
       } else if (evTypeLower === 'backlog_item_specialist_started') {
         _lastBuildStoppedByErrorOrPromote = false;
         _lastRetryNotice = '';
-        _lastActivityHeadline = `🔧 ${p.specialist_agent || 'Specialist'} executing Turn #${(p.turn_index || 0) + 1} for "${p.item_id || ''}"...`;
+        const itemId = p.item_id || '';
+        const ownerRole = p.owner_role || agent || 'TaskLead';
+        const specName = p.specialist_agent || 'Specialist';
+        const turnNo = (p.turn_index || 0) + 1;
+        const briefTxt = String(p.brief || '').slice(0, 90);
+        _lastActivityHeadline = `🔧 ${specName} executing Turn #${turnNo} for "${itemId}"...`;
+        if (itemId) {
+          _liveRunningAgents['item_' + itemId] = {
+            key: 'item_' + itemId,
+            itemId: itemId,
+            ownerRole: ownerRole,
+            specialist: specName,
+            turnIndex: turnNo,
+            agentLabel: `${ownerRole} → ${specName} [${itemId}]`,
+            action: `Turn #${turnNo} (${specName}): ${briefTxt || 'Synthesizing & verifying...'}`,
+            startedAtMs: Date.now(),
+          };
+        }
       } else if (evTypeLower === 'backlog_item_specialist_completed') {
         _lastBuildStoppedByErrorOrPromote = false;
         _lastRetryNotice = '';
-        _lastActivityHeadline = `✓ ${p.specialist_agent || 'Specialist'} finished Turn #${(p.turn_index || 0) + 1} for "${p.item_id || ''}": ${String(p.summary || '').slice(0, 90)}`;
+        const itemId = p.item_id || '';
+        const ownerRole = p.owner_role || agent || 'TaskLead';
+        const specName = p.specialist_agent || 'Specialist';
+        const turnNo = (p.turn_index || 0) + 1;
+        _lastActivityHeadline = `✓ ${specName} finished Turn #${turnNo} for "${itemId}": ${String(p.summary || '').slice(0, 90)}`;
+        if (itemId && _liveRunningAgents['item_' + itemId]) {
+          _liveRunningAgents['item_' + itemId].action = `Turn #${turnNo}: ${specName} finished — Task Lead evaluating proof...`;
+          _liveRunningAgents['item_' + itemId].startedAtMs = Date.now();
+        }
       } else if (evTypeLower === 'backlog_item_proof_ready') {
         _lastBuildStoppedByErrorOrPromote = false;
         _lastRetryNotice = '';
+        if (p.item_id) delete _liveRunningAgents['item_' + p.item_id];
         _lastActivityHeadline = `👁️ Proof ready for "${p.item_id || ''}" (Rev #${p.revision || 1}) — queued for Specialist Council review`;
       } else if (evTypeLower === 'backlog_item_approved') {
         _lastBuildStoppedByErrorOrPromote = false;
+        if (p.item_id) delete _liveRunningAgents['item_' + p.item_id];
         _lastActivityHeadline = `✅ Council approved "${p.item_id || ''}"!`;
       } else if (evTypeLower === 'backlog_item_changes_requested') {
         _lastBuildStoppedByErrorOrPromote = false;
+        if (p.item_id) delete _liveRunningAgents['item_' + p.item_id];
         _lastActivityHeadline = `🔄 Council requested revision on "${p.item_id || ''}": ${String(p.feedback || '').slice(0, 90)}`;
+      } else if (evTypeLower === 'backlog_item_escalated' || evTypeLower === 'backlog_item_failed') {
+        if (p.item_id) delete _liveRunningAgents['item_' + p.item_id];
+      } else if (evTypeLower === 'context_curator_packed') {
+        _lastBuildStoppedByErrorOrPromote = false;
+        const targetRole = p.target_agent_role || 'Specialist';
+        const itemId = p.item_id || '';
+        const chunkCnt = Array.isArray(p.selected_chunk_ids) ? p.selected_chunk_ids.length : 0;
+        const imgCnt = Array.isArray(p.selected_image_paths) ? p.selected_image_paths.length : 0;
+        _lastActivityHeadline = `🧭 Context Curator packed ${chunkCnt} semantic chunk(s) & ${imgCnt} image(s) for ${targetRole} on "${itemId}"`;
+        if (itemId && _liveRunningAgents['item_' + itemId]) {
+          _liveRunningAgents['item_' + itemId].action = `Context Curator packed ${chunkCnt} chunks & ${imgCnt} images for ${targetRole}...`;
+        }
       } else if (evTypeLower === 'review_round_completed') {
         _lastBuildStoppedByErrorOrPromote = false;
         const revRole = p.reviewer_role || 'Specialist';
@@ -4892,13 +5290,18 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
               </div>
             </div>
 
-            <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 6px; padding-top: 8px; border-top: 1px solid var(--border-subtle);">
+            <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 6px; padding-top: 8px; border-top: 1px solid var(--border-subtle);">
               <div style="font-size: 10px; color: var(--slate); font-family: monospace;">
                 python3 run_game.py --checkpoint ${escapeHtml(cp.checkpoint_id)}
               </div>
-              <button class="btn-activate-checkpoint" data-cp-id="${escapeHtml(cp.checkpoint_id)}" ${isActive ? 'disabled' : ''}>
-                ${isActive ? '✓ Currently Active' : '▶ Activate & Play'}
-              </button>
+              <div style="display: flex; gap: 6px; align-items: center;">
+                <button type="button" class="btn-activate-checkpoint" onclick="launchCurrentGame('${escapeHtml(cp.checkpoint_id)}')" title="Launch this checkpoint directly in a Godot 4.3 window">
+                  🕹️ Launch
+                </button>
+                <button class="btn-activate-checkpoint" data-cp-id="${escapeHtml(cp.checkpoint_id)}" ${isActive ? 'disabled' : ''}>
+                  ${isActive ? '✓ Currently Active' : '▶ Activate & Play'}
+                </button>
+              </div>
             </div>
           </div>
         `;
@@ -4906,7 +5309,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
 
       const changed = setHtmlIfChanged(checkpointsTimelineContainer, html);
       if (changed) {
-        checkpointsTimelineContainer.querySelectorAll('.btn-activate-checkpoint').forEach(btn => {
+        checkpointsTimelineContainer.querySelectorAll('.btn-activate-checkpoint[data-cp-id]').forEach(btn => {
           btn.addEventListener('click', async () => {
             const cpId = btn.getAttribute('data-cp-id');
             if (!cpId) return;
@@ -4925,6 +5328,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
                 });
                 await fetchCheckpoints();
                 loadArtifacts();
+                launchCurrentGame(cpId);
               } else {
                 alert(`Failed to activate checkpoint: ${result.error || result.deliberation}`);
                 btn.disabled = false;
@@ -5573,6 +5977,20 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
               </div>
             </div>
             ${it.description ? `<div style="font-size: 11px; color: var(--light-gray); line-height: 1.4;">${escapeHtml(it.description)}</div>` : ''}
+            ${(st === 'in_progress' && _liveRunningAgents['item_' + it.id]) ? (() => {
+              const liveAg = _liveRunningAgents['item_' + it.id];
+              const elapsedSec = Math.max(1, Math.round((Date.now() - (liveAg.startedAtMs || Date.now())) / 1000));
+              return `
+                <div style="font-size: 11px; color: var(--white); background: linear-gradient(90deg, rgba(41, 173, 255, 0.18), rgba(0, 228, 54, 0.12)); border: 1px solid var(--cyan); padding: 6px 10px; border-radius: 5px; display: flex; justify-content: space-between; align-items: center; gap: 8px;">
+                  <div>
+                    <span class="activity-beacon" style="background: var(--cyan); box-shadow: 0 0 6px var(--cyan); margin-right: 6px;"></span>
+                    <strong style="color: var(--cyan);">${escapeHtml(liveAg.agentLabel || it.owner_role)}:</strong>
+                    <span>${escapeHtml(liveAg.action || 'Executing turn...')}</span>
+                  </div>
+                  <span style="font-family: monospace; color: var(--amber); font-size: 10px;">${elapsedSec}s</span>
+                </div>
+              `;
+            })() : ''}
             ${workerNotes ? `
               <div style="font-size: 10.5px; color: var(--cyan); background: rgba(41, 173, 255, 0.07); border-left: 2px solid var(--cyan); padding: 4px 8px; border-radius: 3px;">
                 <strong>🔧 Worker Proof Summary:</strong> ${escapeHtml(workerNotes)}
@@ -5684,7 +6102,13 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         }
         const activeSummaries = [];
         for (const it of inProgItems) {
-          activeSummaries.push(`🔨 ${it.owner_role} is building [${it.id}] "${it.title}" (Attempt #${it.attempt_count || 1})`);
+          const liveAg = _liveRunningAgents['item_' + it.id];
+          if (liveAg && liveAg.action) {
+            const elapsedSec = Math.max(1, Math.round((Date.now() - (liveAg.startedAtMs || Date.now())) / 1000));
+            activeSummaries.push(`🔨 ${liveAg.agentLabel || it.owner_role} — ${liveAg.action} (${elapsedSec}s)`);
+          } else {
+            activeSummaries.push(`🔨 ${it.owner_role} is building [${it.id}] "${it.title}" (Attempt #${it.attempt_count || 1})`);
+          }
         }
         for (const it of reviewItems) {
           const revs = Array.isArray(it.reviewer_roles) ? it.reviewer_roles.join(' & ') : 'Council';
@@ -5739,6 +6163,94 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           }
         }
       }
+
+      // Update live running agents strip in #studio-live-pulse-bar
+      const stripEl = document.getElementById('pulse-active-agents-strip');
+      if (stripEl) {
+        const nowMs = Date.now();
+        // Prune stale entries (> 180s without update) or items no longer in_progress
+        for (const [k, entry] of Object.entries(_liveRunningAgents)) {
+          if (nowMs - (entry.startedAtMs || 0) > 180000) {
+            delete _liveRunningAgents[k];
+          } else if (entry.itemId && items.length > 0) {
+            const matchingIt = items.find(it => it.id === entry.itemId);
+            if (matchingIt && matchingIt.status !== 'in_progress') {
+              delete _liveRunningAgents[k];
+            }
+          }
+        }
+        // Synthesize fallback entries for any board item in_progress not yet in _liveRunningAgents
+        const activeChips = Object.values(_liveRunningAgents);
+        for (const it of inProgItems) {
+          if (!_liveRunningAgents['item_' + it.id]) {
+            activeChips.push({
+              key: 'item_' + it.id,
+              agentLabel: `${it.owner_role || 'TaskLead'} [${it.id}]`,
+              action: `Building "${it.title || it.id}"...`,
+              startedAtMs: nowMs,
+            });
+          }
+        }
+        if (activeChips.length > 0 && hasActiveWork) {
+          stripEl.classList.add('has-agents');
+          const lanesHtml = activeChips.map(c => {
+            const sec = Math.max(1, Math.round((nowMs - (c.startedAtMs || nowMs)) / 1000));
+            const isWr = Boolean(c.isWritersRoom || c.key === 'writers_room');
+            const trackTitle = isWr
+              ? "🏛️ Writers' Room Council"
+              : `🛠️ ${c.itemId || c.agentLabel || 'Work Track'}`;
+            const personaTag = c.specialistBadge
+              || (c.specialist && c.specialist !== 'TaskLead'
+                ? `${c.specialist}${c.turnIndex ? ` · Turn #${c.turnIndex}` : ''}`
+                : `🧭 Task Lead${c.turnIndex ? ` · Turn #${c.turnIndex}` : ''}`);
+            const cleanAction = String(c.action || 'Working...')
+              .replace(/^Turn #\d+\s*(\([^)]+\))?:\s*/i, '');
+            const clickAttr = isWr
+              ? `onclick="if(typeof switchBibleSubtab==='function') switchBibleSubtab('transcript');"`
+              : `onclick="openProductionBoardWithFilter('in_progress')"`;
+            return `
+              <div class="live-agent-lane" ${clickAttr} title="${escapeHtml(trackTitle + ' — ' + cleanAction)}">
+                <div class="live-agent-lane-top">
+                  <span style="display: inline-flex; align-items: center; gap: 6px; font-weight: 700; color: var(--white);">
+                    <span class="activity-beacon" style="width: 6px; height: 6px; background: var(--cyan); box-shadow: 0 0 5px var(--cyan);"></span>
+                    <span>${escapeHtml(trackTitle)}</span>
+                  </span>
+                  <span style="display: inline-flex; align-items: center; gap: 5px;">
+                    <span style="background: rgba(41, 173, 255, 0.18); border: 1px solid rgba(41, 173, 255, 0.45); color: var(--cyan); font-size: 9.5px; font-weight: 700; padding: 1px 6px; border-radius: 4px;">${escapeHtml(personaTag)}</span>
+                    <span style="font-family: monospace; color: var(--amber); font-size: 9.5px;">${sec}s</span>
+                  </span>
+                </div>
+                <div class="live-agent-lane-bottom">${escapeHtml(cleanAction)}</div>
+              </div>
+            `;
+          }).join('');
+          setHtmlIfChanged(stripEl, lanesHtml);
+        } else {
+          stripEl.classList.remove('has-agents');
+          setHtmlIfChanged(stripEl, '');
+        }
+      }
+
+      // Update live Writers' Room activity banner
+      const wrBanner = document.getElementById('writers-room-live-activity-banner');
+      const wrText = document.getElementById('writers-room-live-activity-text');
+      const wrElapsed = document.getElementById('writers-room-live-activity-elapsed');
+      if (wrBanner && wrText && wrElapsed) {
+        const isWrActive =
+          _writersRoomLiveStatus &&
+          _writersRoomLiveStatus.statusText &&
+          _writersRoomLiveStatus.phase !== 'locked' &&
+          _writersRoomLiveStatus.phase !== 'review_done' &&
+          (Date.now() - (_writersRoomLiveStatus.startedAtMs || 0) < 180000);
+        if (isWrActive) {
+          wrBanner.classList.add('active');
+          wrText.textContent = _writersRoomLiveStatus.statusText;
+          const sec = Math.max(1, Math.round((Date.now() - (_writersRoomLiveStatus.startedAtMs || Date.now())) / 1000));
+          wrElapsed.textContent = `${sec}s`;
+        } else {
+          wrBanner.classList.remove('active');
+        }
+      }
     }
 
     window.openMockupLightbox = function(url, title, sceneType, notes) {
@@ -5758,6 +6270,75 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         dlg.setAttribute('open', 'open');
       }
     };
+
+    let _selectedWritersRoomRoleFilter = null;
+
+    window.setWritersRoomRoleFilter = function(role) {
+      if (!role || _selectedWritersRoomRoleFilter === role) {
+        _selectedWritersRoomRoleFilter = null;
+      } else {
+        _selectedWritersRoomRoleFilter = role;
+      }
+      const clearBtn = document.getElementById('btn-clear-speaker-filter');
+      if (clearBtn) {
+        clearBtn.style.display = _selectedWritersRoomRoleFilter ? 'inline-block' : 'none';
+      }
+      syncCouncilDeckStatus();
+      const transcriptList = document.getElementById('writers-room-transcript-list');
+      if (transcriptList) {
+        transcriptList.querySelectorAll('.utterance-card').forEach(card => {
+          const cardRole = card.getAttribute('data-speaker-role') || '';
+          card.style.display = (!_selectedWritersRoomRoleFilter || cardRole === _selectedWritersRoomRoleFilter) ? '' : 'none';
+        });
+      }
+    };
+
+    function syncCouncilDeckStatus(transcriptArr) {
+      const tx = Array.isArray(transcriptArr)
+        ? transcriptArr
+        : (cachedGameBible && Array.isArray(cachedGameBible.writers_room_transcript) ? cachedGameBible.writers_room_transcript : []);
+      const countsByRole = {};
+      for (const u of tx) {
+        const r = u && u.speaker_role ? String(u.speaker_role) : '';
+        if (r) countsByRole[r] = (countsByRole[r] || 0) + 1;
+      }
+      const lastSpeaker = tx.length > 0 ? tx[tx.length - 1].speaker_role : null;
+      const activeList = (_writersRoomLiveStatus && Array.isArray(_writersRoomLiveStatus.activeAgents))
+        ? _writersRoomLiveStatus.activeAgents
+        : [];
+      const phaseStr = (_writersRoomLiveStatus && _writersRoomLiveStatus.phase) || '';
+
+      document.querySelectorAll('#specialist-roster-bar .specialist-pill').forEach(pill => {
+        const r = pill.getAttribute('data-role') || '';
+        const defaultTag = pill.getAttribute('data-default-tag') || 'SEAT';
+        const isLiveActive = activeList.includes(r) && phaseStr !== 'locked' && phaseStr !== 'review_done';
+        const isLiveSpeaking = isLiveActive && phaseStr === 'speaking';
+        const isLiveEval = isLiveActive && phaseStr !== 'speaking';
+        const isLastSpeaker = r === lastSpeaker;
+
+        pill.classList.toggle('active-thinking', isLiveEval);
+        pill.classList.toggle('active-speaking', isLiveSpeaking);
+        pill.classList.toggle('speaking', isLastSpeaker && !isLiveActive);
+        pill.classList.toggle('filtered-role', Boolean(_selectedWritersRoomRoleFilter && _selectedWritersRoomRoleFilter === r));
+
+        const statusTagEl = pill.querySelector('.seat-status-tag');
+        if (statusTagEl) {
+          if (isLiveSpeaking) {
+            statusTagEl.textContent = '🎙️ FLOOR';
+          } else if (isLiveEval) {
+            statusTagEl.textContent = '🎧 EVAL';
+          } else if (isLastSpeaker) {
+            statusTagEl.textContent = '💬 LAST';
+          } else {
+            statusTagEl.textContent = defaultTag;
+          }
+        }
+        const countEl = pill.querySelector('.seat-turn-count');
+        if (countEl) {
+          countEl.textContent = `${countsByRole[r] || 0}💬`;
+        }
+      });
+    }
 
     function renderUtteranceCard(utt, idx = 0) {
       const role = utt.speaker_role || 'CreativeDirector';
@@ -5804,8 +6385,10 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
 
       const isDelibOpen = openUtteranceDelibIds.has(uttKey);
 
+      const isFilteredOut = Boolean(_selectedWritersRoomRoleFilter && _selectedWritersRoomRoleFilter !== role);
+
       return `
-        <div class="utterance-card role-${escapeHtml(role)}" data-utterance-id="${escapeHtml(uttKey)}">
+        <div class="utterance-card role-${escapeHtml(role)}" data-speaker-role="${escapeHtml(role)}" data-utterance-id="${escapeHtml(uttKey)}" style="${isFilteredOut ? 'display:none;' : ''}">
           <div class="utterance-header">
             <div>
               <span class="utterance-speaker">${escapeHtml(displayName)}</span>
@@ -5932,11 +6515,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         visionEl.textContent = visionText;
       }
 
-      // Highlight last speaker in specialist roster
-      const lastSpeaker = transcript.length > 0 ? transcript[transcript.length - 1].speaker_role : null;
-      document.querySelectorAll('#specialist-roster-bar .specialist-pill').forEach(pill => {
-        pill.classList.toggle('speaking', pill.getAttribute('data-role') === lastSpeaker);
-      });
+      // Highlight last speaker & sync Council Org Deck badges + turn counts
+      syncCouncilDeckStatus(transcript);
 
       // 1. Transcript — Incremental append & smart scroll preservation
       const transcriptList = document.getElementById('writers-room-transcript-list');
@@ -5985,7 +6565,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const first60El = document.getElementById('bible-first-60s');
       if (first60El) first60El.textContent = bible.first_60_seconds_hook || 'Awaiting UXExperienceDesigner...';
       const diegeticEl = document.getElementById('bible-diegetic-ui');
-      if (diegeticEl) diegeticEl.textContent = bible.diegetic_ui_philosophy || 'Diegetic in-world feedback (Zero HUD control manuals).';
+      if (diegeticEl) diegeticEl.textContent = bible.diegetic_ui_philosophy || 'Awaiting UXExperienceDesigner...';
 
       const evoContainer = document.getElementById('concept-evolution-timeline');
       if (evoContainer) {
@@ -6898,6 +7478,61 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       }
     }
 
+    async function launchCurrentGame(cartridgeIdOverride) {
+      const switcher = document.getElementById('studio-game-switcher');
+      const targetId = cartridgeIdOverride || _selectedCartridgeId || (switcher && switcher.value) || _activeCandidateId || 'active';
+      const btn = document.getElementById('btn-launch-current-game');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = '⏳ Launching...';
+      }
+      try {
+        const res = await fetch('/api/game/launch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deliberation: `Launching game cartridge '${targetId}' from Mission Control UI.`,
+            cartridge_id: targetId,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          const errMsg = data.error || data.deliberation || 'Could not launch game cartridge.';
+          addDeliberation({
+            deliberation: `⚠️ Launch failed: ${errMsg}`,
+            agent_name: 'MissionControlGateway',
+            event_type: 'game_launch_failed',
+          });
+          if (btn) {
+            btn.textContent = '⚠️ Not Ready Yet';
+            setTimeout(() => {
+              if (btn) btn.textContent = '🕹️ Launch Game';
+            }, 2500);
+          }
+          return;
+        }
+        addDeliberation({
+          deliberation: data.deliberation || `Launched ${data.game_title || targetId} in native Godot window.`,
+          agent_name: 'MissionControlGateway',
+          event_type: 'game_launched',
+        });
+        if (btn) {
+          btn.textContent = '✅ Window Opened';
+          setTimeout(() => {
+            if (btn) btn.textContent = '🕹️ Launch Game';
+          }, 2200);
+        }
+      } catch (err) {
+        console.warn('Failed to launch game:', err);
+        if (btn) btn.textContent = '🕹️ Launch Game';
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+        }
+      }
+    }
+    window.launchCurrentGame = launchCurrentGame;
+
     function handleLiveWritersRoomEvent(ev) {
       const evType = (ev.event_type || '').toLowerCase();
       const payload = ev.payload || {};
@@ -7035,6 +7670,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       });
       document.getElementById('btn-activate-selected-game')?.addEventListener('click', () => {
         activateSelectedGame();
+      });
+      document.getElementById('btn-launch-current-game')?.addEventListener('click', () => {
+        launchCurrentGame();
       });
 
       const togglePause = document.getElementById('toggle-pause-greenlight');

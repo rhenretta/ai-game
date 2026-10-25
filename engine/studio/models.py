@@ -15,6 +15,13 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 DEFAULT_STUDIO_MODEL = "gemini-3.8-flash"
 
 
+def is_real_genai_client(client: Any) -> bool:
+    """Returns True when `client` is a live `google.genai` Client rather than None or a unit-test fake."""
+    mod = getattr(type(client), "__module__", "") if client is not None else ""
+    return mod.startswith("google.genai") and mod != "google.genai.fake"
+
+
+
 def _sanitize_gemini_json_schema(node: Any) -> Any:
     """Recursively strips 'additionalProperties' and 'prefixItems' for Gemini Developer API compatibility,
     and converts open-ended object dicts (with no explicit properties) to JSON-encoded string fields.
@@ -291,16 +298,16 @@ class CartridgeCompilationResult(BaseEpistemicModel):
 
 
 class CharacterSheet(BaseEpistemicModel):
-    deliberation: str = Field(..., description="Epistemic rationale defining character archetype and voice style.")
-    character_id: str = Field(..., description="Slug identifier: 'hero', 'rival', 'boss', 'npc'.")
+    deliberation: str = Field(..., description="Epistemic rationale defining character or entity identity and role in the game.")
+    character_id: str = Field(..., description="Unique snake_case identifier for this actor or entity.")
     name: str = Field(..., description="Display name.")
-    role: str = Field(..., description="'protagonist' | 'rival' | 'boss' | 'npc' | 'companion'.")
+    role: str = Field(..., description="Role in the game world or narrative (devised for this game).")
     personality_traits: List[str] = Field(default_factory=list)
     backstory: str = Field(default="")
     voice_timbre: str = Field(default="focused")
     gemini_voice_name: str = Field(default="Aoede", description="'Aoede' | 'Puck' | 'Charon' | 'Fenrir' | 'Kore'.")
-    visual_description: str = Field(default="Pixel sprite entity")
-    portrait_asset: str = Field(default="assets/sprites/hero.png")
+    visual_description: str = Field(default="In-game entity")
+    portrait_asset: str = Field(default="")
 
 
 class CutsceneBeat(BaseEpistemicModel):
@@ -389,11 +396,11 @@ class DialogueBarkSpec(BaseEpistemicModel):
     speaker_name: str = Field(...)
     trigger_type: str = Field(
         ...,
-        description="'episode_start' | 'low_health' | 'boss_encounter' | 'kill_streak' | 'exit_unlocked' | 'ambient'."
+        description="Gameplay event or condition that triggers this bark (devised for this game's mechanics)."
     )
     text: str = Field(...)
-    voice_clip: str = Field(..., description="Relative path, e.g. 'assets/audio/hero_bark_start.wav'.")
-    portrait: str = Field(default="assets/sprites/hero.png")
+    voice_clip: str = Field(..., description="Relative path under assets/audio/, e.g. 'assets/audio/bark_01.wav'.")
+    portrait: str = Field(default="")
     priority: int = Field(default=1)
     duration: float = Field(default=4.5)
 
@@ -1423,15 +1430,15 @@ class SurgicalPatchPayload(BaseEpistemicModel):
 
 class SceneLayerStrategy(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
-    Defines how a specific depth layer of the 2D environment is constructed in Godot 4.
+    Defines how a specific depth layer of the environment is constructed in Godot 4.
     """
     deliberation: str = Field(
         ...,
-        description="MANDATORY FIRST PROPERTY: Epistemic rationale explaining how this layer contributes to a cohesive, organic environment matching the Game Bible and concept art."
+        description="MANDATORY FIRST PROPERTY: Epistemic rationale explaining how this layer contributes to a cohesive environment matching the Game Bible and concept art."
     )
     layer_name: str = Field(
         ...,
-        description="Descriptive name of the scene layer (e.g. 'Atmospheric Sky & Floating Horizon', 'Sculpted Floating Terraces & Cliff Undersides', 'Continuous Hydro-Mana River & Geyser Plume', 'Interactive Flora & Mechanical Landmarks')."
+        description="Descriptive name of the scene layer."
     )
     z_index: int = Field(
         default=0,
@@ -1439,11 +1446,11 @@ class SceneLayerStrategy(BaseEpistemicModel):
     )
     construction_technique: str = Field(
         ...,
-        description="Concrete Godot 4 construction technique (e.g. multi-vertex Polygon2D silhouettes with tapered rocky undersides, lush overhanging moss rim polygons, continuous curved Line2D/Polygon2D fluid streams with caustic highlights, animated Sprite2D flora/mechanisms anchored to terrain surfaces—never raw axis-aligned draw_rect blocks or stick-figure lines)."
+        description="Concrete Godot 4 construction technique suited to this layer (e.g. procedural Polygon2D/Line2D geometry, custom CanvasItem shaders, GPUParticles2D, lighting, or sprite/rig nodes)."
     )
     required_asset_ids: List[str] = Field(
         default_factory=list,
-        description="IDs of sprite sheets, tiles, or prop textures required by this layer."
+        description="Optional IDs of discrete sprite sheets, rigs, or prop textures used by this layer (empty if rendered procedurally)."
     )
 
 
@@ -1463,19 +1470,19 @@ class AudioCueStrategy(BaseEpistemicModel):
 class GameProductionStrategySpec(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     Master multi-disciplinary strategy formulated by the agents before and during scene construction,
-    mapping the Game Bible and 16:9 Concept Mockups into concrete assets, environment topology, audio, and code architecture.
+    mapping the Game Bible and 16:9 Concept Mockups into concrete environment topology, rendering techniques, assets, audio, and code architecture.
     """
     deliberation: str = Field(
         ...,
-        description="MANDATORY FIRST PROPERTY: Holistic strategic reasoning decomposing the Game Bible and concept mockups into real multi-layered environments, required assets, audio, and code."
+        description="MANDATORY FIRST PROPERTY: Holistic strategic reasoning decomposing the Game Bible and concept mockups into cohesive environments, procedural rendering/shaders, required assets, audio, and code."
     )
     environment_topology_strategy: str = Field(
         ...,
-        description="Detailed strategy for constructing organic, multi-layered level geometry (sculpted island silhouettes, cliff faces, lush top rims, tapered floating crags, continuous fluid waterways, and surface-anchored landmarks) rather than flat rectangular blocks or isolated sprites."
+        description="Detailed strategy for constructing the game's world and level geometry (using procedural Polygon2D/Line2D meshes, shaders, particles, lighting, or bespoke assets suited to this specific game)."
     )
     camera_and_perspective_coherence_strategy: str = Field(
         default="",
-        description="Strategy ensuring 100% coherence between the gameplay movement plane (e.g. 3/4 top-down 2D plateau where the player moves in X and Y across the shelf Rect2 vs. 2D side-scroller) and terrain rendering (filling the entire walkable Rect2 with top-down ground surface terrain_surface.png, hanging vertical cliff walls structure_wall_tile.png ONLY below the southern bottom edge s.end.y, and distributing flora/landmarks across the 2D plateau floor)."
+        description="Strategy ensuring coherence between the camera perspective, gameplay movement plane, and world rendering."
     )
     scene_layers: List[SceneLayerStrategy] = Field(
         default_factory=list,
@@ -1483,7 +1490,7 @@ class GameProductionStrategySpec(BaseEpistemicModel):
     )
     required_visual_assets: List[AssetRequirement] = Field(
         default_factory=list,
-        description="Purpose-built visual assets (sprite sheets, flora, props, terrain textures, ability icons) required to build the environment without programmer-art primitives."
+        description="Discrete visual assets (sprite sheets, articulated rigs, props) that genuinely benefit from image fabrication rather than procedural/shader rendering."
     )
     audio_cues: List[AudioCueStrategy] = Field(
         default_factory=list,
@@ -1495,11 +1502,11 @@ class GameProductionStrategySpec(BaseEpistemicModel):
     )
     code_architecture_strategy: str = Field(
         ...,
-        description="Cross-module code strategy across mechanics.gd, scenes.gd, entities.gd, ui_hud.gd, and main.gd, including surface coordinate anchoring so every entity/landmark sits naturally on the terrain."
+        description="Cross-module code strategy across mechanics.gd, scenes.gd, entities.gd, ui_hud.gd, and main.gd."
     )
     diegetic_ui_strategy: str = Field(
         ...,
-        description="Strategy for realizing the Game Bible's diegetic UI philosophy and clean fantasy HUD (vitals, objective progress, ability icons, and bottom dialogue bar without raw engineering debug text)."
+        description="Strategy for realizing the Game Bible's UI, HUD, and player feedback design (choosing whatever combination of HUD counters/widgets, text labels, overlays, or in-world visual cues best serves this game)."
     )
 
 
@@ -1517,15 +1524,15 @@ class SceneDeficiencyItem(BaseEpistemicModel):
     )
     target_symbol_or_lines: str = Field(
         ...,
-        description="The specific class, function name (e.g. 'SkyBackdrop._draw', 'TerraceRenderer._draw', 'FernsCluster._init', 'acoustics_hum_setup'), or line range where the deficiency originates."
+        description="The specific class, function name, or line range where the deficiency originates."
     )
     deficiency_description: str = Field(
         ...,
-        description="Concrete description of the deficiency visible in the rendered Godot viewport or audio code (e.g. 'Character moves in 2D top-down space across y=260..700 but TerraceRenderer draws y=260..700 as a vertical side-view cliff wall so she appears to walk on the side of a cliff', 'main.gd plays a constant high-pitched 523Hz looping sine wave drone')."
+        description="Concrete description of the deficiency visible in the rendered Godot viewport or audio code."
     )
     remediation_strategy: str = Field(
         ...,
-        description="Concrete surgical code strategy to replace the deficient rendering/audio logic with perspective-coherent 3/4 plateau rendering or pleasant event-driven audio matching the Game Bible."
+        description="Concrete surgical code strategy to repair the rendering, spatial, UI, or audio deficiency to match the Game Bible."
     )
 
 
@@ -1540,11 +1547,11 @@ class SceneCritiqueAndStrategySpec(BaseEpistemicModel):
     )
     environment_fidelity_critique: str = Field(
         ...,
-        description="Detailed evaluation of the rendered environment topology, island silhouettes, terrain layering, fluid/canal rendering, background vistas, and prop placement."
+        description="Detailed evaluation of the rendered environment topology, visual layering, procedural shaders/effects, lighting, and prop/actor placement."
     )
     perspective_and_camera_coherence_critique: str = Field(
         default="",
-        description="Detailed evaluation of whether the camera perspective and character movement plane match the landscape orientation (e.g., verifying that a top-down/3/4 character walks on a top-down lush plateau surface rather than on the side of a vertical cliff wall)."
+        description="Detailed evaluation of whether the camera perspective and movement plane match the world rendering."
     )
     audio_and_psychoacoustic_critique: str = Field(
         default="",
@@ -1552,7 +1559,7 @@ class SceneCritiqueAndStrategySpec(BaseEpistemicModel):
     )
     ui_and_experience_critique: str = Field(
         ...,
-        description="Detailed evaluation of the HUD against the Game Bible's diegetic UI philosophy and the concept art HUD."
+        description="Detailed evaluation of the HUD and player feedback against the Game Bible's UI philosophy and the concept art."
     )
     deficiencies: List[SceneDeficiencyItem] = Field(
         default_factory=list,
@@ -1560,18 +1567,19 @@ class SceneCritiqueAndStrategySpec(BaseEpistemicModel):
     )
     new_assets_needed: List[AssetRequirement] = Field(
         default_factory=list,
-        description="Any missing visual or audio assets that must be fabricated so the scene does not rely on geometric programmer art."
+        description="Any missing discrete visual or audio assets that must be fabricated."
     )
     scene_matches_game_bible: bool = Field(
         ...,
-        description="Decision verdict (strictly last per Rule 4): True ONLY if the rendered scene genuinely matches the Game Bible and Concept Mockups with coherent camera/landscape perspective (character walking on top of a plateau, never on a cliff side), pleasant non-droney audio, zero blocky slab islands, zero stick-figure/triangle programmer art, and a clean fantasy HUD."
+        description="Decision verdict (strictly last per Rule 4): True ONLY if the rendered scene genuinely matches the Game Bible and Concept Mockups with coherent camera/spatial perspective, pleasant audio, cohesive visual execution, and a clear, readable UI/HUD."
     )
 
 
 class WritersRoomListenCheck(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     Determines whether a specialist agent listening to the Writers' Room has a high-value
-    critique, idea, or artifact to inject at the current moment in the conversation.
+    critique, idea, or artifact to inject at the current moment in the conversation, or whether
+    a Core Council Lead wants to call in one of their specialized Sub-Agents to chime in.
     """
     deliberation: str = Field(
         ...,
@@ -1579,7 +1587,7 @@ class WritersRoomListenCheck(BaseEpistemicModel):
     )
     should_interject: bool = Field(
         ...,
-        description="True if this specialist has an urgent critique, synergy, or creative artifact to contribute right now."
+        description="True if this specialist (or one of their sub-agents) has an urgent critique, synergy, or creative artifact to contribute right now."
     )
     urgency_score: float = Field(
         default=0.0,
@@ -1587,7 +1595,15 @@ class WritersRoomListenCheck(BaseEpistemicModel):
     )
     intended_contribution_summary: str = Field(
         default="",
-        description="Concise 1-sentence summary of what the agent wants to say or propose."
+        description="Concise 1-sentence summary of what the agent (or consulted sub-agent) wants to say or propose."
+    )
+    consult_subagent_role: Optional[str] = Field(
+        default=None,
+        description="Optional sub-agent role under your domain to call in to speak if their specialized craft will best advance this game right now (or None to speak yourself)."
+    )
+    subagent_brief: str = Field(
+        default="",
+        description="If calling in a sub-agent via consult_subagent_role, the creative context or question you want them to address."
     )
 
 
@@ -1619,7 +1635,7 @@ class ExperienceStoryboardBeat(BaseEpistemicModel):
     beat_index: int = Field(...)
     phase_title: str = Field(
         ...,
-        description="E.g., 'First 30 Seconds: Sensory Cold Open', 'Diegetic Discovery', 'Mid-Episode Escalation', 'Climactic Resolution'."
+        description="Concise title for this phase of the player experience."
     )
     player_emotional_state: str = Field(
         ...,
@@ -1631,7 +1647,7 @@ class ExperienceStoryboardBeat(BaseEpistemicModel):
     )
     diegetic_teaching_moment: str = Field(
         ...,
-        description="How the player intuitively discovers or masters an interaction through the world itself without text-manual HUD overlays."
+        description="How the player learns or discovers the interaction or objective at this moment (via UI cues, HUD indicators, environmental feedback, or level design)."
     )
     narrative_integration: str = Field(
         ...,
@@ -1645,16 +1661,16 @@ class VisualMockupArtifact(BaseEpistemicModel):
     """
     deliberation: str = Field(
         ...,
-        description="MANDATORY FIRST PROPERTY: Artistic rationale for composition, palette, lighting, and diegetic UI framing."
+        description="MANDATORY FIRST PROPERTY: Artistic rationale for composition, palette, lighting, and UI/HUD framing."
     )
     mockup_id: str = Field(default_factory=lambda: f"mockup_{uuid.uuid4().hex[:8]}")
-    title: str = Field(..., description="Title of the visual mockup board (e.g., 'Core Gameplay Loop & Diegetic UI', 'Opening Scene Staging').")
+    title: str = Field(..., description="Title of the visual mockup board.")
     scene_description: str = Field(..., description="Detailed visual description and prompt used to synthesize the mockup.")
     image_path: str = Field(..., description="Relative cartridge path, e.g. 'assets/mockups/gameplay_mockup_1.png'.")
     aspect_ratio: str = Field(default="16:9")
     camera_and_spatial_paradigm: str = Field(
         default="",
-        description="Explicit camera angle & spatial movement architecture depicted in this mockup (e.g., '2D side-scrolling platformer with vertical elevation and gravity', '3/4 top-down exploration', 'isometric tactical arena')."
+        description="Explicit camera angle & spatial movement architecture depicted in this mockup."
     )
     color_palette_hex: List[str] = Field(
         default_factory=list,
@@ -1666,7 +1682,7 @@ class VisualMockupArtifact(BaseEpistemicModel):
     )
     ui_callout_notes: List[str] = Field(
         default_factory=list,
-        description="Specific visual callouts for SWE & Challenger (e.g., 'Health is shown via chassis sparks/glow rather than a text label')."
+        description="Specific UI, HUD, and visual feedback callouts designed for this game (whatever HUD widgets, counters, labels, gauges, or in-world visual cues best serve playability)."
     )
     created_at_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -1675,7 +1691,7 @@ class MechanicEngineeringSpec(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     Engineering strategy authored by GameplaySystemsEngineer in the Writers' Room translating
     a creative gameplay pillar or scene element into concrete Godot 4 nodes, state machines,
-    required sprite/tile assets, and falsifiable headless test invariants.
+    procedural rendering or discrete assets, and falsifiable headless test invariants.
     """
     deliberation: str = Field(
         ...,
@@ -1683,7 +1699,7 @@ class MechanicEngineeringSpec(BaseEpistemicModel):
     )
     mechanic_id: str = Field(
         ...,
-        description="Unique snake_case identifier for this mechanic or system slice (e.g., 'player_traversal_and_colliders', 'source_connected_flow_solver', 'companion_interaction_state_machine')."
+        description="Unique snake_case identifier for this mechanic or system slice."
     )
     title: str = Field(
         ...,
@@ -1695,7 +1711,7 @@ class MechanicEngineeringSpec(BaseEpistemicModel):
     )
     godot_node_and_collider_architecture: str = Field(
         ...,
-        description="Concrete Godot 4 node hierarchy, physics body motion_mode, and 1:1 visual-to-physical StaticBody2D/CollisionPolygon2D/Area2D topology."
+        description="Concrete Godot 4 node hierarchy, physics body motion_mode, procedural/shader rendering or sprite nodes, and 1:1 visual-to-physical collider topology."
     )
     state_machine_and_input_contract: str = Field(
         ...,
@@ -1703,7 +1719,7 @@ class MechanicEngineeringSpec(BaseEpistemicModel):
     )
     required_sprite_and_tile_assets: List[str] = Field(
         default_factory=list,
-        description="Explicit asset specs in format '<asset_id>:<tile|prop|sprite_sheet>:<visual description>' required by this mechanic so zero geometric programmer-art shapes are drawn."
+        description="Required visual asset specs in format '<asset_id>:<prop|sprite_sheet|articulated_rig|tile>:<visual description>' combining discrete entity rigs/sprites with seamless surface textures, spline strips, and environmental decals that procedural geometry/terrain generators bind at runtime.",
     )
     falsifiable_test_invariants: List[str] = Field(
         default_factory=list,
@@ -1723,7 +1739,7 @@ class WritersRoomUtterance(BaseEpistemicModel):
     turn_index: int = Field(...)
     speaker_role: str = Field(
         ...,
-        description="'CreativeDirector' | 'GameplayDesigner' | 'GameplaySystemsEngineer' | 'StoryWorldArchitect' | 'CharacterDesigner' | 'UXExperienceDesigner' | 'VisualArtDirector' | 'AudioAtmosphereDesigner' | 'UserSteering'"
+        description="'CreativeDirector' | 'GameplayDesigner' | 'LevelAndProgressionDesigner' | 'GameplaySystemsEngineer' | 'StoryWorldArchitect' | 'ScriptwriterAgent' | 'CharacterDesigner' | 'VisualArtDirector' | 'UXExperienceDesigner' | 'AudioAtmosphereDesigner' | 'UserSteering'"
     )
     speaker_display_name: str = Field(..., description="Human-readable specialist title.")
     spoken_dialogue: str = Field(
@@ -1739,6 +1755,42 @@ class WritersRoomUtterance(BaseEpistemicModel):
         description="Summary of concrete additions/revisions made to the Living Game Bible during this turn."
     )
     timestamp_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class GameSliceSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    A single playable vertical slice of the game strategized by the Council for iterative development.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Strategic rationale for why this slice is scoped this way for this specific game, how it acclimates the player or expands prior slices, and what stays out of scope until later iterations.",
+    )
+    slice_id: str = Field(..., description="Unique snake_case identifier for this slice (e.g. 'slice_1_world_acclimation').")
+    slice_index: int = Field(
+        default=0,
+        description="0-based iteration order (0 = complete playable vertical slice realizing the Game Bible's camera, world progression, core loop, UX onboarding, and audio; 1+ = iterative expansions).",
+    )
+    title: str = Field(..., description="Concise title for this playable slice.")
+    slice_objective: str = Field(
+        ...,
+        description="What this slice achieves as a self-contained, genuinely playable experience in the game (never a 1-object static test box).",
+    )
+    player_acclimation_and_mechanics_focus: str = Field(
+        default="",
+        description="How this slice acclimates the player to the world and teaches/exercises the mechanics in play (devised specifically for this game, never from a fixed menu).",
+    )
+    expansion_from_prior_slice: str = Field(
+        default="",
+        description="For iteration >= 1, how this slice expands the playable world, mechanics, or progression built in the previous slice.",
+    )
+    scope_boundaries: List[str] = Field(
+        default_factory=list,
+        description="Explicit boundaries of what is IN scope for this slice vs deferred to future slices so only the assets and code needed for this slice are built now.",
+    )
+    status: Literal["planned", "active", "completed"] = Field(
+        default="planned",
+        description="Decision/lifecycle status (strictly last per Rule 4): 'planned' | 'active' | 'completed'.",
+    )
 
 
 class WritersRoomTurnProposal(BaseEpistemicModel):
@@ -1760,8 +1812,6 @@ class WritersRoomTurnProposal(BaseEpistemicModel):
     updated_first_60_seconds_hook: Optional[str] = Field(default=None)
     updated_diegetic_ui_philosophy: Optional[str] = Field(default=None)
     updated_camera_and_spatial_paradigm: Optional[str] = Field(default=None)
-    updated_color_palette_hex: List[str] = Field(default_factory=list)
-    added_or_updated_scene_layers: List[VisualSceneLayerSpec] = Field(default_factory=list)
     concept_evolution_milestone: Optional[ConceptEvolutionEntry] = Field(default=None)
     added_or_updated_storyboard_beats: List[ExperienceStoryboardBeat] = Field(default_factory=list)
     added_or_updated_characters: List[CharacterSheet] = Field(default_factory=list)
@@ -1778,7 +1828,11 @@ class WritersRoomTurnProposal(BaseEpistemicModel):
     updated_engagement_plan: Optional[EngagementPlan] = Field(default=None)
     updated_onboarding_plan: Optional[OnboardingPlan] = Field(default=None)
     updated_goal_hierarchy: Optional[GoalHierarchy] = Field(default=None)
-    backlog_additions: List[WorkItemProposal] = Field(default_factory=list, description="Requirements for the implementation side (assets, level maps, animations, mechanics, code) with dependencies.")
+    added_or_updated_slices: List[GameSliceSpec] = Field(
+        default_factory=list,
+        description="Iterative playable slices strategized for this game. Slice 0 must deliver a complete, cohesive playable vertical slice (realizing the Game Bible's camera/scrolling paradigm, multi-node world progression, UX onboarding, and audio); subsequent slices iteratively expand it.",
+    )
+    backlog_additions: List[WorkItemProposal] = Field(default_factory=list, description="High-level requirements for the active slice (tasks can dynamically spawn their own asset/animation/sub-mechanic tasks as needed).")
 
 
 class DirectorConvergenceCheck(BaseEpistemicModel):
@@ -1937,7 +1991,7 @@ class OnboardingStep(BaseEpistemicModel):
     deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this is the right next thing to teach or reveal.")
     step_index: int = Field(..., description="Order within the introduction (0 first).")
     concept_introduced: str = Field(..., description="The single mechanic, rule or world fact introduced here.")
-    diegetic_method: str = Field(..., description="How it is taught through the world, level design or feedback rather than text walls.")
+    diegetic_method: str = Field(..., description="How this concept is taught or communicated to the player (through level design, UI/HUD cues, prompts, or world feedback suited to this game).")
     player_proof_of_learning: str = Field(default="", description="How the game can tell the player understood.")
     world_reveal: str = Field(default="", description="What the player learns about the world at this step.")
 
@@ -2036,7 +2090,7 @@ class GameBibleSpec(BaseEpistemicModel):
     )
     diegetic_ui_philosophy: str = Field(
         default="",
-        description="How state, feedback, and onboarding are communicated naturally through the world and clean visual indicators rather than static instruction text walls."
+        description="UI, HUD, and player feedback philosophy strategized for this game (how state, controls, objectives, and feedback are presented via HUD elements, labels, counters, overlays, or in-world cues)."
     )
     camera_and_spatial_paradigm: str = Field(
         default="",
@@ -2044,7 +2098,7 @@ class GameBibleSpec(BaseEpistemicModel):
     )
     color_palette_hex: List[str] = Field(
         default_factory=list,
-        description="Hex color palette (#RRGGBB) governing sky, terrain, architecture, energy accents, and diegetic UI."
+        description="Hex color palette (#RRGGBB) governing sky, terrain, architecture, energy accents, and UI/HUD."
     )
     scene_layers: List[VisualSceneLayerSpec] = Field(
         default_factory=list,
@@ -2063,6 +2117,14 @@ class GameBibleSpec(BaseEpistemicModel):
     engagement_plan: Optional[EngagementPlan] = Field(default=None, description="How the player stays entertained.")
     onboarding_plan: Optional[OnboardingPlan] = Field(default=None, description="How the player is introduced to the world and mechanics.")
     goal_hierarchy: Optional[GoalHierarchy] = Field(default=None, description="Short-, mid- and long-term goals.")
+    slice_roadmap: List[GameSliceSpec] = Field(
+        default_factory=list,
+        description="Iterative playable vertical slices strategized specifically for this game. Slice 0 focuses on getting the player acclimated to the world and understanding the mechanics; subsequent slices iteratively expand that slice.",
+    )
+    active_slice_index: int = Field(
+        default=0,
+        description="Index in slice_roadmap currently in active production.",
+    )
     concept_fragments: List[ConceptFragment] = Field(default_factory=list, description="Independent divergent fragments contributed before any concept was chosen.")
     concept_candidates: List[ConceptCandidate] = Field(default_factory=list, description="Candidate premises formed by colliding fragments (the selected one seeds the room).")
     writers_room_transcript: List[WritersRoomUtterance] = Field(default_factory=list)
@@ -2072,6 +2134,19 @@ class GameBibleSpec(BaseEpistemicModel):
     narrative_bible: Optional[NarrativeBible] = Field(default=None)
     created_at_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def get_active_slice(self) -> Optional[GameSliceSpec]:
+        """Returns the currently active GameSliceSpec from slice_roadmap, if any."""
+        if not self.slice_roadmap:
+            return None
+        for s in self.slice_roadmap:
+            if s.slice_index == self.active_slice_index:
+                return s
+        for s in self.slice_roadmap:
+            if s.status == "active":
+                return s
+        idx = max(0, min(self.active_slice_index, len(self.slice_roadmap) - 1))
+        return self.slice_roadmap[idx]
 
     def to_dict(self) -> Dict[str, Any]:
         return self.model_dump()
@@ -2301,13 +2376,13 @@ class AtomicTestSynthesisPayload(BaseEpistemicModel):
 
 class SubjectRenderTreatment(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
-    How ONE subject (environment element, character, effect) is rendered.
+    How ONE subject (environment element, character, mechanism, UI, or effect) is rendered.
     """
-    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this technique suits this subject given the Game Bible's camera, tone and mechanics.")
-    subject_id: str = Field(..., description="Identifier of the environment element, character, mechanism or effect.")
-    technique: str = Field(..., description="Bespoke rendering technique devised for this subject (not restricted to a fixed menu).")
-    target_resolution: Tuple[int, int] = Field(..., description="Pixel resolution at which the source art for this subject is produced.")
-    notes: str = Field(default="", description="Specific guidance (layer depth, parts breakdown, motion cues, lighting interaction).")
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this technique (procedural shader/geometry/particles vs. discrete sprite/rig) suits this subject given the Game Bible's camera, tone and mechanics.")
+    subject_id: str = Field(..., description="Identifier of the environment element, character, mechanism, UI, or effect.")
+    technique: str = Field(..., description="Bespoke rendering technique devised for this subject (e.g. procedural Polygon2D/Line2D + CanvasItem shader, GPUParticles2D, custom _draw(), articulated rig, or sprite sheet — prefer procedural/shader rendering over repeating tiles for dynamic, fluid, or geometric elements).")
+    target_resolution: Tuple[int, int] = Field(..., description="On-screen or source-art pixel resolution for this subject.")
+    notes: str = Field(default="", description="Specific implementation guidance (shader uniforms, procedural mesh/curve construction, layer depth, parts breakdown, motion cues, lighting interaction).")
 
 
 class RenderingStrategySpec(BaseEpistemicModel):
@@ -2394,7 +2469,7 @@ class FilmstripPlan(BaseEpistemicModel):
 
 class WorkItemProposal(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
-    A backlog requirement raised by the council for the implementation side to build.
+    A backlog requirement raised by the council or dynamically discovered and spawned by an executing task.
     """
     deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this is needed, what it unblocks, and why its dependencies are what they are.")
     item_id: str = Field(..., description="Unique snake_case identifier.")
@@ -2403,7 +2478,12 @@ class WorkItemProposal(BaseEpistemicModel):
     spec: str = Field(..., description="Exactly what must be built, with the details the implementer needs.")
     proof_spec: str = Field(..., description="The evidence (image or images) the council wants to see to judge the result, e.g. which views, states or frames.")
     depends_on: List[str] = Field(default_factory=list, description="item_ids that must be approved before this can start.")
+    blocks_items: List[str] = Field(
+        default_factory=list,
+        description="Existing item_ids on the board (or in this batch) that require this item first and must be blocked until this item is approved (e.g. a visual_asset rig blocking a mechanic_code controller).",
+    )
     target_modules: List[str] = Field(default_factory=list, description="Code modules or files this will modify (used for exclusive-access locking).")
+    slice_id: str = Field(default="", description="Optional slice_id of the GameSliceSpec this task belongs to (defaults to the active slice).")
     max_revisions: Optional[int] = Field(default=None, description="Optional per-item revision cap override.")
 
 
@@ -2464,6 +2544,8 @@ class WorkItem(BaseEpistemicModel):
     depends_on: List[str] = Field(default_factory=list)
     target_modules: List[str] = Field(default_factory=list)
     raised_by_role: str = Field(default="")
+    slice_id: str = Field(default="", description="Identifier of the GameSliceSpec this item belongs to.")
+    spawned_by_item_id: str = Field(default="", description="If dynamically discovered and spawned by an executing task, the parent item_id.")
     design_revision: int = Field(default=0, description="Number of Game Bible updates when this item was raised.")
     state: WorkItemState = Field(default="blocked")
     max_revisions: int = Field(default=5)
@@ -2483,11 +2565,64 @@ class SpecialistReport(BaseEpistemicModel):
     """
     deliberation: str = Field(default="Specialist execution completed.", description="MANDATORY FIRST PROPERTY: Specialist's reasoning or execution notes.")
     turn_index: int = Field(default=0, description="Turn index within the current board revision.")
-    specialist_agent: str = Field(..., description="Specialist identifier ('visual_artist', 'audio_designer', 'swe_engineer', 'qa_test_engineer').")
+    specialist_agent: str = Field(..., description="Specialist identifier ('visual_artist', 'audio_designer', 'script_writer', 'swe_engineer', 'qa_test_engineer').")
     brief: str = Field(..., description="The natural-language brief delegated by the Task Lead.")
     summary: str = Field(default="", description="Concrete summary of what the specialist created, modified, or verified.")
     touched_files: List[str] = Field(default_factory=list, description="Paths of assets, data files, or GDScript modules created or modified.")
     proof_images: List[str] = Field(default_factory=list, description="Proof image paths generated during this specialist step.")
+
+
+class ScriptWritingDeliverable(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Dramatic scenes, cutscenes, interactive dialogue trees, contextual barks, and character voices authored by the Scriptwriter specialist for a game slice or narrative task.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Dramatic rationale evaluating how these scenes, dialogue lines, or character voices serve this specific game's tone, pacing, and gameplay.",
+    )
+    added_or_updated_characters: List[CharacterSheet] = Field(
+        default_factory=list,
+        description="Characters added or enriched with vocal cadence, motivation, and role.",
+    )
+    added_or_updated_cutscenes: List[CutsceneScript] = Field(
+        default_factory=list,
+        description="Dramatic scene scripts or cinematic/in-engine sequences with line-by-line dialogue, camera staging, and emotional delivery.",
+    )
+    added_or_updated_dialogue_trees: List[DialogueTreeSpec] = Field(
+        default_factory=list,
+        description="Interactive branching dialogue trees with player choices, tone tags, and consequence flags.",
+    )
+    added_or_updated_barks: List[DialogueBarkSpec] = Field(
+        default_factory=list,
+        description="Short contextual in-gameplay lines or barks triggered by specific game events.",
+    )
+    narrative_notes: str = Field(
+        default="",
+        description="Summary of the dramatic writing crafted in this pass and how GDScript or audio systems can hook into it.",
+    )
+
+
+class QAPostCaptureAudit(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Post-capture multimodal visual & behavioral audit performed by `qa_test_engineer` on the actual captured
+    filmstrip frames before reporting back to the Task Lead.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Objective frame-by-frame visual and behavioral inspection of the captured filmstrip image against the 16:9 Concept Art Mockup, task spec, proof spec, and any prior Council rejection feedback.",
+    )
+    observed_frames_summary: str = Field(
+        ...,
+        description="Honest description of what is actually visible in the captured frames (including whether entity sprites/rigs are visibly rendered vs. invisible/primitive shapes, whether terrain fills the viewport without grey borders, and what state transitions occurred).",
+    )
+    unaddressed_defects: List[str] = Field(
+        default_factory=list,
+        description="List of any visual or behavioral defects still visible in the captured frames (e.g., invisible character sprite, crude procedural polygon stand-in where a textured asset was requested, unpadded grey border, or static non-responsive state).",
+    )
+    qa_passed: bool = Field(
+        ...,
+        description="True ONLY if the captured frames visually and behaviorally satisfy the proof_spec and all prior Council feedback without workarounds or missing sprites.",
+    )
 
 
 class TaskLeadDecision(BaseEpistemicModel):
@@ -2500,15 +2635,15 @@ class TaskLeadDecision(BaseEpistemicModel):
     )
     current_strategy: str = Field(
         ...,
-        description="Bespoke, evolving strategy for accomplishing this task and proving it to the Council (including any pivot from prior revisions or earlier turns).",
+        description="Bespoke, evolving strategy for accomplishing this task and proving it to the Council (state explicitly whether this turn will 'delegate' to a specific specialist_agent, 'spawn_tasks', or 'submit_to_council').",
     )
     specialist_agent: str = Field(
         default="",
-        description="When action == 'delegate', the domain specialist to brief: 'visual_artist', 'audio_designer', 'swe_engineer', or 'qa_test_engineer'.",
+        description="REQUIRED non-empty specialist identifier whenever this turn delegates work ('visual_artist', 'audio_designer', 'script_writer', 'swe_engineer', or 'qa_test_engineer'). Because this field appears BEFORE `action` in the JSON schema, you MUST populate `specialist_agent` here whenever you will set `action` to 'delegate'!",
     )
     brief: str = Field(
         default="",
-        description="When action == 'delegate', open-ended natural-language brief instructing the specialist what to build, modify, or test and why.",
+        description="REQUIRED non-empty natural-language instructions for `specialist_agent` whenever this turn delegates work. Because `brief` appears BEFORE `action` in the JSON schema, you MUST write the complete specialist brief here whenever you will set `action` to 'delegate'!",
     )
     target_paths: List[str] = Field(
         default_factory=list,
@@ -2522,9 +2657,17 @@ class TaskLeadDecision(BaseEpistemicModel):
         default_factory=list,
         description="When action == 'submit_to_council', paths of the proof images generated during this session to submit to the Council.",
     )
-    action: Literal["delegate", "submit_to_council"] = Field(
+    spawned_tasks: List[WorkItemProposal] = Field(
+        default_factory=list,
+        description="When action == 'spawn_tasks', new tasks dynamically reasoned out and discovered while working on this task (e.g. a required player sprite, walk animation, jump animation, sound effect, or sub-mechanic task).",
+    )
+    wait_for_spawned_tasks: bool = Field(
+        default=True,
+        description="When action == 'spawn_tasks', True if the current task depends on the newly spawned tasks being built and approved before continuing; False if they are follow-up/parallel tasks.",
+    )
+    action: Literal["delegate", "spawn_tasks", "submit_to_council"] = Field(
         ...,
-        description="Decision (strictly last): 'delegate' to outsource a step to a specialist agent and inspect its result on the next turn; 'submit_to_council' when work and visual proof are complete and verified.",
+        description="Decision (strictly last): 'delegate' to outsource a step to a specialist agent and inspect its result on the next turn; 'spawn_tasks' to dynamically create new tasks on the Production Board discovered while reasoning through this task; 'submit_to_council' when work and visual proof are complete and verified.",
     )
 
 
@@ -2581,11 +2724,11 @@ class LevelLayoutSpec(BaseEpistemicModel):
     Machine-readable level layout consumed as DATA by the SWE agent (instead of improvising layout from prose).
     """
     deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Spatial reasoning translating the Game Bible (scope, progression, storyboard, concept art) into a concrete world layout.")
-    viewport_size: Tuple[float, float] = Field(default=(1280.0, 720.0), description="(width, height) of one screen in world units.")
-    intended_world_scale_in_viewports: float = Field(default=0.0, description="Total playable area expressed as a multiple of one viewport's area, justified by the Game Bible's scope and progression (NOT by the size of a single concept image).")
+    viewport_size: Tuple[float, float] = Field(default=(1280.0, 720.0), description="(width, height) of one camera viewport screen in world units.")
+    intended_world_scale_in_viewports: float = Field(default=0.0, description="Total playable area expressed as a multiple of one viewport's area, justified by the Game Bible's level_generation_strategy and progression (a 16:9 concept mockup is a single camera frame inside the world, NOT the bounding box of the entire world unless a fixed single-screen stage is explicitly specified).")
     world_bounds: Tuple[float, float, float, float] = Field(..., description="(x, y, width, height) bounding rectangle of the ENTIRE playable world; must contain every region.")
-    world_regions: List[LevelRegionSpec] = Field(default_factory=list, description="Ordered regions covering the whole experience; region 0 reproduces the concept-art opening scene.")
-    camera_framing: str = Field(..., description="Camera behaviour; the opening framing must reproduce the concept art composition.")
+    world_regions: List[LevelRegionSpec] = Field(default_factory=list, description="Ordered regions covering the Game Bible's progression across its level archetypes.")
+    camera_framing: str = Field(..., description="Camera behaviour (e.g. Camera2D following the player across world_bounds with HUD isolated on a CanvasLayer, or fixed stage camera when single-screen).")
     entities: List[LevelEntitySpec] = Field(default_factory=list, description="Every entity required across ALL regions, with exact positions and sizes.")
     triggers: List[LevelTriggerSpec] = Field(default_factory=list, description="Causal relations between entities.")
 
@@ -2623,6 +2766,26 @@ def validate_level_layout(
         )
     if not layout.world_regions:
         issues.append("world_regions is empty; the layout must cover the whole experience, not only the opening scene.")
+    if strategy is not None and len(getattr(strategy, "level_archetypes", []) or []) >= 2:
+        num_arch = len(strategy.level_archetypes)
+        arch_ids = [a.archetype_id for a in strategy.level_archetypes]
+        if len(layout.world_regions) < 2:
+            issues.append(
+                f"level_generation_strategy defines {num_arch} distinct level_archetypes ({arch_ids}), "
+                f"but world_regions only defines {len(layout.world_regions)} region; define at least 2 connected world_regions "
+                f"realizing the multi-region progression instead of collapsing the world into a single room."
+            )
+        if declared < 2.0 or actual_scale < 1.6:
+            issues.append(
+                f"level_generation_strategy defines a multi-region progression ({num_arch} archetypes: {arch_ids}), "
+                f"so intended_world_scale_in_viewports ({declared:.1f}) and world_bounds ({layout.world_bounds}, {actual_scale:.1f} viewports) "
+                f"must span multiple screens (>= 2.0 viewports) with Camera2D traversal rather than equating a single 16:9 camera mockup frame with the entire world."
+            )
+        if len(layout.entities) < 4:
+            issues.append(
+                f"Multi-region world layout only defines {len(layout.entities)} entities; populate all regions with the landmarks, "
+                f"interactive mechanisms, hazards, and goals required for a multi-step gameplay progression (>= 4 entities)."
+            )
     ids = {e.entity_id for e in layout.entities}
     if len(ids) != len(layout.entities):
         issues.append("Duplicate entity_id values.")
@@ -2704,6 +2867,8 @@ _BIBLE_VISUAL_ASSET_KEYS = frozenset({
     "scene_layers",
     "visual_mockups",
     "world_spec",
+    "slice_roadmap",
+    "active_slice_index",
 })
 
 _BIBLE_AUDIO_ASSET_KEYS = frozenset({
@@ -2716,6 +2881,8 @@ _BIBLE_AUDIO_ASSET_KEYS = frozenset({
     "gameplay_pillars",
     "experience_storyboard",
     "world_spec",
+    "slice_roadmap",
+    "active_slice_index",
 })
 
 _BIBLE_RENDERING_KEYS = frozenset({
@@ -2734,6 +2901,8 @@ _BIBLE_RENDERING_KEYS = frozenset({
     "level_generation_strategy",
     "experience_storyboard",
     "world_spec",
+    "slice_roadmap",
+    "active_slice_index",
 })
 
 
@@ -2851,6 +3020,107 @@ def is_transient_gemini_error(exc: BaseException) -> bool:
     )
 
 
+class TokenUsageTracker:
+    """Thread-safe tracker for Gemini API `usage_metadata` including implicit prefix cache hits."""
+    deliberation: str = "Tracks cumulative prompt, cached-prefix, output, and thinking token metrics across studio LLM calls."
+
+    def __init__(self) -> None:
+        import threading as _threading
+        self._lock = _threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        with self._lock:
+            self.total_calls: int = 0
+            self.calls_with_cache_hit: int = 0
+            self.total_prompt_tokens: int = 0
+            self.total_cached_tokens: int = 0
+            self.total_output_tokens: int = 0
+            self.total_thought_tokens: int = 0
+            self.total_tokens: int = 0
+            self.by_label: Dict[str, Dict[str, int]] = {}
+
+    def record_response(self, response: Any, label: str = "generate_content") -> Optional[Dict[str, int]]:
+        usage = getattr(response, "usage_metadata", None)
+        if usage is None:
+            return None
+        prompt_tok = int(getattr(usage, "prompt_token_count", 0) or 0)
+        cached_tok = int(getattr(usage, "cached_content_token_count", 0) or 0)
+        output_tok = int(getattr(usage, "candidates_token_count", 0) or 0)
+        thought_tok = int(getattr(usage, "thoughts_token_count", 0) or 0)
+        total_tok = int(getattr(usage, "total_token_count", 0) or (prompt_tok + output_tok + thought_tok))
+        if prompt_tok == 0 and cached_tok == 0 and output_tok == 0 and total_tok == 0:
+            return None
+
+        family = (label or "generate_content").split("[", 1)[0].strip() or "generate_content"
+        with self._lock:
+            self.total_calls += 1
+            if cached_tok > 0:
+                self.calls_with_cache_hit += 1
+            self.total_prompt_tokens += prompt_tok
+            self.total_cached_tokens += cached_tok
+            self.total_output_tokens += output_tok
+            self.total_thought_tokens += thought_tok
+            self.total_tokens += total_tok
+            bucket = self.by_label.setdefault(
+                family,
+                {
+                    "calls": 0,
+                    "cache_hits": 0,
+                    "prompt_tokens": 0,
+                    "cached_tokens": 0,
+                    "output_tokens": 0,
+                    "thought_tokens": 0,
+                    "total_tokens": 0,
+                },
+            )
+            bucket["calls"] += 1
+            if cached_tok > 0:
+                bucket["cache_hits"] += 1
+            bucket["prompt_tokens"] += prompt_tok
+            bucket["cached_tokens"] += cached_tok
+            bucket["output_tokens"] += output_tok
+            bucket["thought_tokens"] += thought_tok
+            bucket["total_tokens"] += total_tok
+
+        return {
+            "prompt_tokens": prompt_tok,
+            "cached_tokens": cached_tok,
+            "output_tokens": output_tok,
+            "thought_tokens": thought_tok,
+            "total_tokens": total_tok,
+        }
+
+    def get_summary(self) -> Dict[str, Any]:
+        with self._lock:
+            hit_rate = (
+                round(100.0 * self.calls_with_cache_hit / self.total_calls, 2)
+                if self.total_calls > 0
+                else 0.0
+            )
+            cached_share = (
+                round(100.0 * self.total_cached_tokens / self.total_prompt_tokens, 2)
+                if self.total_prompt_tokens > 0
+                else 0.0
+            )
+            return {
+                "total_calls": self.total_calls,
+                "calls_with_cache_hit": self.calls_with_cache_hit,
+                "cache_hit_call_rate_pct": hit_rate,
+                "total_prompt_tokens": self.total_prompt_tokens,
+                "total_cached_tokens": self.total_cached_tokens,
+                "uncached_prompt_tokens": max(0, self.total_prompt_tokens - self.total_cached_tokens),
+                "cached_token_share_pct": cached_share,
+                "total_output_tokens": self.total_output_tokens,
+                "total_thought_tokens": self.total_thought_tokens,
+                "total_tokens": self.total_tokens,
+                "by_label": {k: dict(v) for k, v in self.by_label.items()},
+            }
+
+
+TOKEN_USAGE_TRACKER = TokenUsageTracker()
+
+
 def call_gemini_with_transient_retry(
     call_fn: Any,
     *,
@@ -2860,6 +3130,7 @@ def call_gemini_with_transient_retry(
 ) -> Any:
     """Executes `call_fn()` with jittered exponential backoff strictly for transient 504/503/429 errors.
     Non-transient errors or exhausted retries immediately raise the authentic underlying exception (Rule 5).
+    Also captures `usage_metadata` (`prompt_token_count`, `cached_content_token_count`, etc.) in `TOKEN_USAGE_TRACKER`.
     """
     import logging as _logging
     import random as _random
@@ -2868,7 +3139,19 @@ def call_gemini_with_transient_retry(
     _log = _logging.getLogger("GeminiRetry")
     for attempt in range(max_transient_retries + 1):
         try:
-            return call_fn()
+            res = call_fn()
+            stats = TOKEN_USAGE_TRACKER.record_response(res, label=label)
+            if stats is not None and stats["cached_tokens"] > 0:
+                _log.debug(
+                    "%s token usage: prompt=%d cached=%d (%.1f%%) output=%d thoughts=%d",
+                    label,
+                    stats["prompt_tokens"],
+                    stats["cached_tokens"],
+                    (100.0 * stats["cached_tokens"] / max(1, stats["prompt_tokens"])),
+                    stats["output_tokens"],
+                    stats["thought_tokens"],
+                )
+            return res
         except Exception as exc:
             if attempt < max_transient_retries and is_transient_gemini_error(exc):
                 delay = base_delay_s * (2 ** attempt) + _random.uniform(0.0, 0.35)

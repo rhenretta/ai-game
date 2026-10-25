@@ -504,3 +504,88 @@ def test_neural_alpha_matting_and_continuous_uv_keyframe_articulation(tmp_path: 
     assert "AnimationPlayer" in helper_src
 
 
+def test_custom_non_humanoid_part_tracks_and_hierarchical_articulated_rig(tmp_path: Path) -> None:
+    """Verify non-humanoid custom part_id keyframe tracks (e.g. outrigger_arm_0) deform frames across
+    both state rows and columns, and hierarchical articulated rigs with pivot_normalized + negative
+    z_index_offset assemble and scale cleanly without burying child parts inside the root body.
+    """
+    import numpy as np
+    from engine.studio.models import KeyframeTransformSpec, PartKeyframeTrackSpec
+
+    base = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
+    d = ImageDraw.Draw(base)
+    # Central disc + 6 radial arms
+    d.ellipse([44, 44, 84, 84], fill=(210, 160, 60, 255))
+    for angle_deg in range(0, 360, 60):
+        import math
+        rad = math.radians(angle_deg)
+        x_end = int(64 + math.cos(rad) * 52)
+        y_end = int(64 + math.sin(rad) * 52)
+        d.line([(64, 64), (x_end, y_end)], fill=(180, 110, 45, 255), width=6)
+        d.ellipse([x_end - 6, y_end - 6, x_end + 6, y_end + 6], fill=(160, 180, 200, 255))
+
+    deployed_track = PartKeyframeTrackSpec(
+        deliberation="Extended outriggers",
+        part_id="outrigger_arm_0",
+        keyframes=[
+            KeyframeTransformSpec(deliberation="k0", time_normalized=0.0, position_offset_px=(50.0, 0.0), rotation_degrees=0.0, scale_xy=(1.0, 1.0)),
+            KeyframeTransformSpec(deliberation="k1", time_normalized=0.5, position_offset_px=(54.0, 0.0), rotation_degrees=-4.0, scale_xy=(1.04, 1.04)),
+            KeyframeTransformSpec(deliberation="k2", time_normalized=1.0, position_offset_px=(50.0, 0.0), rotation_degrees=0.0, scale_xy=(1.0, 1.0)),
+        ],
+    )
+    retracted_track = PartKeyframeTrackSpec(
+        deliberation="Retracted outriggers",
+        part_id="outrigger_arm_0",
+        keyframes=[
+            KeyframeTransformSpec(deliberation="k0", time_normalized=0.0, position_offset_px=(21.0, 0.0), rotation_degrees=78.0, scale_xy=(0.75, 0.75)),
+            KeyframeTransformSpec(deliberation="k1", time_normalized=0.5, position_offset_px=(23.0, 0.0), rotation_degrees=72.0, scale_xy=(0.78, 0.78)),
+            KeyframeTransformSpec(deliberation="k2", time_normalized=1.0, position_offset_px=(21.0, 0.0), rotation_degrees=78.0, scale_xy=(0.75, 0.75)),
+        ],
+    )
+
+    sheet = Image.new("RGBA", (128 * 4, 128 * 2), (0, 0, 0, 0))
+    for c_idx in range(4):
+        f_dep = VisualArtSpriteDesignerAgent.fabricate_pose_frame_from_base(
+            base, state_name="outriggers_deployed", frame_idx=c_idx, frame_count=4,
+            cell_size=(128, 128), motion_profile="radial_outward_extension", keyframe_tracks=[deployed_track],
+        )
+        f_ret = VisualArtSpriteDesignerAgent.fabricate_pose_frame_from_base(
+            base, state_name="outriggers_retracted", frame_idx=c_idx, frame_count=4,
+            cell_size=(128, 128), motion_profile="compact_radial_inward_fold", keyframe_tracks=[retracted_track],
+        )
+        sheet.paste(f_dep, (c_idx * 128, 0))
+        sheet.paste(f_ret, (c_idx * 128, 128))
+
+    _, metrics = VisualArtSpriteDesignerAgent.render_animation_contact_sheet(
+        sheet_img=sheet,
+        states_meta={
+            "outriggers_deployed": {"row": 0, "frame_count": 4, "fps": 8.0, "loop": True, "motion_profile": "action"},
+            "outriggers_retracted": {"row": 1, "frame_count": 4, "fps": 12.0, "loop": True, "motion_profile": "action"},
+        },
+        cell_size=(128, 128),
+        output_path=tmp_path / "custom_tracks_contact.png",
+    )
+    assert metrics["is_truly_animated"] is True
+    assert metrics["min_interframe_l1_delta"] > 0.25
+    # Verify deployed frame 0 and retracted frame 0 are visually distinct
+    arr_dep = np.array(sheet.crop((0, 0, 128, 128)), dtype=np.float32)
+    arr_ret = np.array(sheet.crop((0, 128, 128, 256)), dtype=np.float32)
+    assert float(np.mean(np.abs(arr_dep - arr_ret))) > 2.0
+
+    # Verify hierarchical articulated rig assembly with pivot_normalized + negative z_index_offset
+    eye_img = Image.new("RGBA", (64, 64), (220, 170, 50, 255))
+    arm_img = Image.new("RGBA", (32, 12), (40, 210, 220, 255))
+    claw_img = Image.new("RGBA", (16, 16), (240, 90, 60, 255))
+    parts_with_images = [
+        ({"part_id": "chassis_eye", "parent_part_id": None, "pivot_normalized": [0.5, 0.5], "attach_offset_px": [0.0, 0.0], "z_index_offset": 0}, eye_img),
+        ({"part_id": "outrigger_arm_0", "parent_part_id": "chassis_eye", "pivot_normalized": [0.1, 0.5], "attach_offset_px": [24.0, 0.0], "z_index_offset": -1}, arm_img),
+        ({"part_id": "caliper_claw_0", "parent_part_id": "outrigger_arm_0", "pivot_normalized": [0.15, 0.5], "attach_offset_px": [28.0, 0.0], "z_index_offset": 1}, claw_img),
+    ]
+    assembled = VisualArtSpriteDesignerAgent._assemble_articulated_rig_frame(parts_with_images, (512, 512), phase=0.0)
+    bbox = assembled.getbbox()
+    assert bbox is not None
+    # Assembled rig auto-fits to fill the 512x512 canvas instead of staying a tiny 64x64 dot
+    assert (bbox[2] - bbox[0]) > 250
+
+
+

@@ -3,8 +3,10 @@ Abstract Scene base class and SceneManager finite state machine.
 """
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
-import pygame
+from typing import TYPE_CHECKING, Any, Dict, Optional
+
+if TYPE_CHECKING:
+    import pygame
 
 
 class Scene(ABC):

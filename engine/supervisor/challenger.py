@@ -31,7 +31,6 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
-import pygame
 from PIL import Image
 
 import config
@@ -748,8 +747,9 @@ class CandidateVisualPlaytester:
     deliberation: str = "Executes diverse synthetic input profiles and captures non-blank canvas snapshots."
 
     @staticmethod
-    def capture_surface_png(surface: pygame.Surface) -> bytes:
+    def capture_surface_png(surface: Any) -> bytes:
         """Captures an in-memory pygame.Surface as raw PNG bytes without display server dependencies."""
+        import pygame
         raw_rgb = pygame.image.tobytes(surface, "RGB")
         pil_img = Image.frombytes("RGB", surface.get_size(), raw_rgb)
         buf = io.BytesIO()
@@ -893,6 +893,7 @@ class CandidateVisualPlaytester:
                 surf = getattr(active_sim, "screen", None)
 
         if surf is None:
+            import pygame
             surf = pygame.Surface((1280, 720))
 
         snapshots = []
@@ -1091,7 +1092,7 @@ class MultiAgentSignOffCouncil:
                     f"(playtest_t0.png, playtest_tend.png, and playtest_collision_overlay.png) SIDE-BY-SIDE against the Writers' Room 16:9 Concept Mockup, "
                     f"source code, audio configuration, and runtime scene audit, and render an independent sign-off verdict:\n"
                     f"1. VisualArtDirector: Compare the rendered game frames side-by-side against the 16:9 Concept Mockup and playtest_collision_overlay.png! CRITICAL PERSPECTIVE & COLLISION CHECK: Does the landscape orientation match the character's movement plane? Are red StaticBody2D collision boundaries aligned 1:1 with the north sky horizon and chasm edges so the player can NEVER walk on the sky or empty void? Are ALL synthesized sprites loaded with clean alpha transparency and proper world scale? Are character portraits strictly isolated in UI dialogue panels?\n"
-                    f"2. UXExperienceDesigner: Is the viewport clear on startup (zero 95% opaque frost or center-occluding panels)? Are controls discoverable via diegetic labels/hover cues?\n"
+                    f"2. UXExperienceDesigner: Is the viewport clear on startup (zero 95% opaque frost or center-occluding panels)? Are controls, HUD elements, and player feedback clear, responsive, and faithful to the Game Bible's UI/UX design?\n"
                     f"3. GameplayDesigner: Is there an active, responsive, navigable world loop with meaningful objectives, zero t=0 pre-solved/pre-carved cheats, recoverable hazards, and coherent spatial navigation where entities are physically bounded by StaticBody2D colliders to walkable plateau surfaces?\n"
                     f"4. StoryWorldArchitect: Are the Narrative Bible's characters, cutscenes, dialogue trees, and voice barks staged in-game?\n"
                     f"5. AudioAtmosphereDesigner: Are WAV files loaded at 24,000 Hz (`mix_rate = 24000`, never 44100 chipmunk distortion) with the 44-byte RIFF header stripped (`bytes.slice(44)`) and non-overlapping cooldown guards? CRITICAL PSYCHOACOUSTIC CHECK: Reject immediately if the game plays a continuous looping high-pitched sine/square wave drone (`AudioStreamWAV.LOOP_FORWARD` on `> 200 Hz` tones like a constant 523 Hz hum) or piercing `>= 800 Hz` squeals!\n"
@@ -1592,10 +1593,10 @@ class ChallengerGate:
             f"t=0 pre-solved/pre-carved state cheats (`passive_auto_win_detected == true`), missing sky/chasm physics colliders (`unbounded_sky_or_void_detected == true`), "
             f"cross-module method name mismatches, unbound sprite/audio assets, missing MOUSE_BUTTON_LEFT placement handlers, "
             f"and scene modules that lack active _draw() or Sprite2D world rendering.\n"
-            f"5. GAME DESIGNER & DIEGETIC UX SIGNOFF MANDATE: Audit the candidate from a human player and Game Designer's perspective:\n"
+            f"5. GAME DESIGNER & UX SIGNOFF MANDATE: Audit the candidate from a human player and Game Designer's perspective:\n"
             f"   - Interactive Playability & Physical Boundaries: Mouse-to-world picking must use accurate canvas transforms (e.g. `get_global_mouse_position()`, never broken `get_viewport().size` math), placement/interaction guides must render on top of the terrain (`z_index > 0`), and `StaticBody2D` colliders in `playtest_collision_overlay.png` must bound the player 1:1 to walkable surfaces.\n"
             f"   - Audio & Voice Playback: Runtime `.wav` files must be loaded into valid `AudioStreamWAV` streams via `FileAccess` at `mix_rate = 24000` with 44-byte RIFF header stripped (`bytes.slice(44)`), and player actions must trigger audible SFX without repeating/spamming.\n"
-            f"   - Visual Clarity, Experience Fidelity & Diegetic Onboarding: The world view must fill the viewport without gray cutoff edges or 95% opaque startup frost, UI panels must not occlude the center playfield (`center_occluding_panels` must be empty), and onboarding/feedback must honor the Living Game Bible's Diegetic UI Philosophy and 16:9 Visual Mockups.\n"
+            f"   - Visual Clarity, Experience Fidelity & UI/Onboarding: The world view must fill the viewport without gray cutoff edges or 95% opaque startup frost, UI panels must not occlude the center playfield (`center_occluding_panels` must be empty), and UI/HUD & onboarding feedback must honor the Living Game Bible and 16:9 Visual Mockups.\n"
             f"6. RETURN STRUCTURE: Emit a ChallengerGateEvaluation object containing deliberation, candidate_id, overall_verdict, "
             f"and evaluated_requirements for every track.\n"
         )

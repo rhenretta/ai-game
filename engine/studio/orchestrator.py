@@ -476,6 +476,7 @@ class StudioOrchestrator:
             model_name=self.config.model_name,
             code_verify=_verify,
             event_callback=_board_event,
+            board=board,
         )
         scheduler = BoardScheduler(board, default_handlers(ctx), max_workers=getattr(self.config, "board_workers", 2))
         self.production_board = board
@@ -1327,7 +1328,22 @@ class StudioOrchestrator:
 
             elif canonical_name == "VoiceActingAudioProducerAgent":
                 audio_dir = staging_dir / "assets" / "audio"
+                audio_dir.mkdir(parents=True, exist_ok=True)
                 existing_wavs = list(audio_dir.glob("*.wav")) if audio_dir.is_dir() else []
+                board_managed = bool(
+                    self._continuous_active
+                    and self.production_board is not None
+                    and self.production_board.items()
+                )
+                if board_managed:
+                    dur_ms = (_time.perf_counter() - t_start) * 1000.0
+                    self._publish_event(
+                        "AGENT_STREAM",
+                        canonical_name,
+                        f"Task-driven slice audio active ({len(existing_wavs)} audio clip(s) fabricated by slice tasks).",
+                        {"clips_count": len(existing_wavs)},
+                    )
+                    return existing_wavs
                 req_spec = context.raw_outputs.get("requirements_spec")
                 manifest_items = getattr(req_spec, "asset_manifest", []) if req_spec else []
                 missing_audio = False
@@ -1345,7 +1361,6 @@ class StudioOrchestrator:
                     return existing_wavs
 
                 narrative = context.raw_outputs.get("Writer") or context.raw_outputs.get("NarrativeCharacterWriterAgent")
-                audio_dir.mkdir(parents=True, exist_ok=True)
                 barks = []
                 if narrative and getattr(narrative, "dialogue_barks", None):
                     barks = list(narrative.dialogue_barks)
@@ -1399,6 +1414,24 @@ class StudioOrchestrator:
                     mood=mood,
                 )
 
+                board_managed = bool(
+                    self._continuous_active
+                    and self.production_board is not None
+                    and self.production_board.items()
+                )
+                if board_managed:
+                    asset_lib.sanitize_misplaced_portraits_in_sprites_dir()
+                    asset_lib.save_catalog()
+                    existing_pngs = [p for p in sprites_dir.glob("*.png") if "portrait" not in p.stem.lower()]
+                    dur_ms = (_time.perf_counter() - t_start) * 1000.0
+                    self._publish_event(
+                        "AGENT_STREAM",
+                        canonical_name,
+                        f"Task-driven slice visual assets active ({len(existing_pngs)} sprite asset(s) fabricated by slice tasks).",
+                        {"portraits": len(existing_pngs)},
+                    )
+                    return existing_pngs
+
                 # If requirements_spec has an empty asset_manifest and a GameBible exists, derive baseline assets now
                 if req_spec is not None and not getattr(req_spec, "asset_manifest", None) and not self._continuous_active and (game_bible_obj is not None or (staging_dir / "game_bible.json").is_file()):
                     req_spec.asset_manifest = asset_lib.derive_baseline_assets_from_bible(game_bible_obj)
@@ -1416,6 +1449,16 @@ class StudioOrchestrator:
                             if not (check_dir / iname).is_file() and not (sprites_dir / iname).is_file():
                                 missing_sprites = True
                                 break
+                chars_check = getattr(narrative, "characters", []) if narrative else []
+                for char_c in chars_check:
+                    p_asset_c = char_c.get("portrait_asset", "") if isinstance(char_c, dict) else getattr(char_c, "portrait_asset", "")
+                    c_name_c = char_c.get("name", "Hero") if isinstance(char_c, dict) else getattr(char_c, "name", "Hero")
+                    p_fname_c = Path(p_asset_c).name if p_asset_c else f"{c_name_c.lower()}_portrait.png"
+                    if not p_fname_c.endswith(".png"):
+                        p_fname_c = f"{p_fname_c}.png"
+                    if not (portraits_dir / p_fname_c).is_file() or (p_asset_c and not (staging_dir / p_asset_c).is_file()):
+                        missing_sprites = True
+                        break
                 if existing_pngs and not missing_sprites and (staging_dir / "assets" / "asset_library.json").is_file():
                     asset_lib.sanitize_misplaced_portraits_in_sprites_dir()
                     asset_lib.save_catalog()
@@ -1449,7 +1492,11 @@ class StudioOrchestrator:
                     elif results and Path(results[0]).is_file():
                         shutil.copy2(results[0], out_path)
                         results.append(out_path)
-                    # Mirror to explicit portrait_asset path if narrative.json references assets/sprites/...
+                    # Mirror to explicit portrait_asset path and sprites_dir for legacy cartridges
+                    if out_path.is_file():
+                        sprite_mirror = sprites_dir / p_filename
+                        if sprite_mirror != out_path:
+                            shutil.copy2(out_path, sprite_mirror)
                     if p_asset:
                         legacy_p_path = staging_dir / p_asset
                         if legacy_p_path != out_path and out_path.is_file():
@@ -2231,8 +2278,32 @@ class StudioOrchestrator:
             raise RuntimeError(f"Passive auto-win violation in '{track.id}': {reason}")
 
         if scene_audit.get("fullscreen_occlusion_detected"):
+            occ_nodes = scene_audit.get("fullscreen_occlusion_nodes") or []
+            occ_detail = f" Offending foreground UI nodes: {occ_nodes}." if occ_nodes else ""
             raise RuntimeError(
-                f"Fullscreen viewport occlusion detected in '{track.id}'. Do not cover the 1280x720 game viewport with opaque panels or overlays."
+                f"Fullscreen UI viewport occlusion detected in '{track.id}'.{occ_detail} "
+                "Do not cover the 1280x720 game viewport with opaque foreground UI ColorRects or panels (alpha >= 0.80 in CanvasLayer/ui_hud.gd). "
+                "NOTE: World floor/terrain surfaces (z_index <= 0 in scenes.gd) SHOULD fill the full 1280x720 viewport—never shrink or add margins around world terrain!"
+            )
+
+        if scene_audit.get("early_failure_state_detected"):
+            raise RuntimeError(
+                f"Unrecoverable early failure state ('is_failed': true in get_state_snapshot()) triggered within the opening 60-tick smoke check in '{track.id}'. "
+                "Ensure the player spawns in a stable recoverable state at t=0 and does not immediately die or fail during the initial 1-second smoke test."
+            )
+
+        empty_frames = scene_audit.get("empty_sprite_frame_nodes") or []
+        if empty_frames:
+            raise RuntimeError(
+                f"Invisible / mis-sliced Sprite2D frame detected in '{track.id}': {empty_frames}. "
+                "Check `assets/asset_library.json` for each texture's true `hframes` and `vframes`—never set `hframes > 1` or `vframes > 1` on a single-frame (`hframes=1, vframes=1`) sprite or articulated rig composite!"
+            )
+
+        sv_thrashing = scene_audit.get("subviewport_thrashing_nodes") or []
+        if sv_thrashing:
+            raise RuntimeError(
+                f"Severe GPU SubViewport frame-rate thrashing detected in '{track.id}': {sv_thrashing}. "
+                "When using a SubViewport as an accumulation mask with `CLEAR_MODE_NEVER`, NEVER set `render_target_update_mode = SubViewport.UPDATE_ALWAYS`—set `SubViewport.UPDATE_ONCE` and trigger `render_target_update_mode = SubViewport.UPDATE_ONCE` only when a new stroke is painted!"
             )
 
         occluding = scene_audit.get("center_occluding_panels") or []
@@ -2304,11 +2375,11 @@ class StudioOrchestrator:
                     "QA telemetry is rendered externally by the QA Test Renderer."
                 )
 
-        # Check mandatory sprite/texture binding when synthesized sprites exist on disk
+        # Check mandatory sprite/texture binding when synthesized sprites exist on disk and main scene integration is under test
         sprites_dir = staging_dir / "assets" / "sprites"
         sprite_pngs = sorted(sprites_dir.glob("*.png")) if sprites_dir.is_dir() else []
         target_mods = set(getattr(track, "target_modules", []) or [])
-        touches_visual_code = bool(target_mods & {"main.gd", "entities.gd", "scenes.gd"}) or not target_mods
+        touches_visual_code = ("main.gd" in target_mods) or not target_mods
         if (
             sprite_pngs
             and touches_visual_code
@@ -2512,10 +2583,15 @@ class StudioOrchestrator:
                     cause = getattr(res, "__cause__", None) or res
                     raise StudioSwarmExecutionError(f"Specialist '{role}' failed during Tier {tier_idx}: {res}") from cause
 
-        # Ensure any narrative barks/portraits written by Writer after parallel Voice/Visual wave exist on disk
+        # In legacy non-board-managed mode, ensure narrative barks/portraits written by Writer after parallel Voice/Visual wave exist on disk
+        board_managed = bool(
+            self._continuous_active
+            and self.production_board is not None
+            and self.production_board.items()
+        )
         voice_roles = {"Voice", "VoiceActingAudioProducerAgent", "voice_audio_engineer"}
         voice_planned = any(r in voice_roles for r in plan.specialist_agent_roles)
-        if voice_planned:
+        if voice_planned and not board_managed:
             narrative_out = context.raw_outputs.get("Writer") or context.raw_outputs.get("NarrativeCharacterWriterAgent")
             if narrative_out is not None:
                 voice_agent = self.agents.get("VoiceActingAudioProducerAgent")
@@ -2531,7 +2607,7 @@ class StudioOrchestrator:
                         if not out_path.is_file():
                             voice_agent.synthesize_voice_line(bark=bark, output_path=out_path, character=char_map.get(getattr(bark, "speaker_id", "")))
         narrative_out = context.raw_outputs.get("Writer") or context.raw_outputs.get("NarrativeCharacterWriterAgent")
-        if narrative_out is not None and getattr(narrative_out, "characters", None):
+        if narrative_out is not None and getattr(narrative_out, "characters", None) and not board_managed:
             visual_agent = self.agents.get("VisualArtSpriteDesignerAgent")
             portraits_dir = staging_dir / "assets" / "portraits"
             portraits_dir.mkdir(parents=True, exist_ok=True)

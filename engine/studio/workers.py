@@ -25,7 +25,9 @@ from engine.studio.models import (
     AssetRequirement,
     FilmstripPlan,
     GameRequirementsSpec,
+    QAPostCaptureAudit,
     RequirementTrack,
+    ScriptWritingDeliverable,
     SpecialistReport,
     StudioAgentError,
     TaskLeadDecision,
@@ -33,6 +35,7 @@ from engine.studio.models import (
     bounded_thinking_config,
     call_gemini_with_transient_retry,
     compact_bible_json_for_prompt,
+    is_real_genai_client,
 )
 from engine.studio.production_board import WorkerResult, WorkerYielded, is_in_board_scheduler
 
@@ -59,6 +62,7 @@ class WorkerContext:
     code_verify: Optional[Callable[[Path, Any], None]] = None     # (cartridge_dir, track) -> raises on failure
     filmstrip_fn: Optional[Callable[..., Path]] = None            # injectable for tests; defaults to proofs.capture_filmstrip
     code_lock: Any = None                                         # shared threading.Lock serialising whole-project code work
+    board: Any = None                                             # optional ProductionBoard for dynamic task spawning (Tasks -> More Tasks)
     event_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None
 
 
@@ -105,6 +109,7 @@ def plan_asset_requirement(
         raise StudioAgentError("Asset planning requires an active google.genai Client (Rule 5)")
     from google.genai import types
 
+    from engine.studio.context_curator import ContextCuratorAgent, is_real_genai_client
     from engine.studio.rendering import build_rendering_guide, load_rendering_strategy
 
     strategy = load_rendering_strategy(ctx.cartridge_dir)
@@ -125,6 +130,28 @@ def plan_asset_requirement(
     fb = [(r.revision_index + 1, r.feedback) for r in item.revisions if r.feedback]
     if fb:
         feedback_block = "COUNCIL FEEDBACK ON EARLIER REVISIONS (address ALL of it):\n" + "\n".join(f"  rev {n}: {t}" for n, t in fb) + "\n"
+    if getattr(item, "failure", ""):
+        feedback_block += f"PREVIOUS WORKER EXECUTION ERROR TO FIX:\n{item.failure[-600:]}\n"
+
+    curated_block = f"{rendering_block}\n--- GAME BIBLE ---\n{bible_text}\n"
+    multimodal_parts: List[Any] = []
+    if is_real_genai_client(ctx.client):
+        curator = ContextCuratorAgent(
+            cartridge_dir=ctx.cartridge_dir,
+            client=ctx.client,
+            model_name=ctx.model_name,
+            board=ctx.board,
+            event_callback=ctx.event_callback,
+        )
+        target_role = "audio_designer" if item.kind == "audio_asset" else "visual_artist"
+        pack = curator.curate_context(
+            target_agent_role=target_role,
+            task_request=f"{item.title}\nSPEC: {item.spec}\nPROOF: {item.proof_spec}\n{feedback_block}",
+            item_id=item.item_id,
+            item_kind=item.kind,
+        )
+        curated_block = f"{pack.prompt_block}\n{rendering_block}\n"
+        multimodal_parts = list(pack.multimodal_parts)
 
     issues: List[str] = []
     for attempt in range(1, attempts + 1):
@@ -136,15 +163,18 @@ def plan_asset_requirement(
             f"Set `asset_id` to exactly '{item.item_id}'. `fabrication_mode` must be one of {list(allowed_modes)}; `asset_type`, `target_path` "
             f"(under assets/), `dimensions` (the rendering strategy's resolution for this subject), `visual_prompt_or_text` and, for rigs, "
             f"`articulated_parts` must be consistent with it and with the style, camera and palette in the Game Bible.\n"
-            f"CRITICAL PROMPT SEPARATION RULE FOR `visual_prompt_or_text`:\n"
+            f"CRITICAL MODE & PROMPT RULES FOR `visual_prompt_or_text`:\n"
+            f"- Avoid `fabrication_mode == 'tile_surface'` for anything that has a silhouette, alpha transparency, endcaps, or distinct shape (such as channels, slabs, platforms, machines, props, or fluid bodies) — `tile_surface` is ONLY for 100% opaque, borderless, full-bleed square surface material swatches. Use `static_sprite` (with `asset_type='prop'` or `'sprite'`), `sprite_sheet`, or `articulated_parts` for any shaped element, structure, or multi-state object so its alpha silhouette is preserved cleanly.\n"
             f"- When `fabrication_mode == 'sprite_sheet'`, `visual_prompt_or_text` is sent to the image generator to synthesize the SINGLE canonical neutral standing/idle figure, and our biomechanical keyframe engine then generates the multi-row, multi-frame sprite sheet (`*_sheet.png`) from `animation_states`. Therefore, `visual_prompt_or_text` MUST describe ONLY ONE single isolated subject in a neutral readiness pose (appearance, proportions, attire/materials, silhouette, palette) and MUST NEVER ask the image generator to draw multiple poses, multiple rows/columns, frame numbers, or a grid layout inside `visual_prompt_or_text`! Put all multi-state/row/frame breakdowns into `animation_states`.\n"
             f"- When `fabrication_mode == 'static_sprite'`, `visual_prompt_or_text` MUST describe ONLY ONE single isolated object/prop in its canonical intact state — NEVER a 3x3 or multi-state variation grid.\n"
-            f"Provide `deliberation` FIRST.\n\n{rendering_block}\n--- GAME BIBLE ---\n{bible_text}\n"
+            f"- When `fabrication_mode == 'audio_bark'`, `visual_prompt_or_text` is sent directly to the neural TTS engine to synthesize ONE single spoken voice line into `target_path` (strictly bounded to [0.1s, 30.0s], max 45 words / 280 characters of direct spoken dialogue). NEVER concatenate multiple barks, speaker labels ('Kaelen barks:', 'Overseer Vhen:'), or parenthetical stage directions into `visual_prompt_or_text`! Write ONLY the exact spoken words of a single representative bark (1–2 sentences, <= 45 words).\n"
+            f"Provide `deliberation` FIRST.\n\n{curated_block}\n{retry}"
         )
+        contents_arg: Any = ([prompt] + multimodal_parts) if multimodal_parts else prompt
         resp = call_gemini_with_transient_retry(
             lambda: ctx.client.models.generate_content(
                 model=ctx.model_name,
-                contents=prompt,
+                contents=contents_arg,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=AssetRequirement,
@@ -166,6 +196,15 @@ def plan_asset_requirement(
             issues.append("target_path must be a relative path under assets/.")
         if req.fabrication_mode == "articulated_parts" and not req.articulated_parts:
             issues.append("articulated_parts mode requires `articulated_parts`.")
+        if req.fabrication_mode == "audio_bark":
+            words = (req.visual_prompt_or_text or "").strip().split()
+            chars = len((req.visual_prompt_or_text or "").strip())
+            if len(words) > 50 or chars > 320:
+                issues.append(
+                    f"For fabrication_mode='audio_bark', visual_prompt_or_text must be a SINGLE concise spoken voice line "
+                    f"(<= 50 words and <= 320 characters so TTS duration stays well under the 30.0s limit); got {len(words)} words "
+                    f"({chars} chars). Do NOT concatenate multiple barks or speaker labels into one string."
+                )
         if not issues:
             # Ensure target_path cannot collide with another task's asset file in the shared catalog
             safe_item_id = _safe_id(item.item_id)
@@ -331,8 +370,8 @@ def level_map_handler(ctx: WorkerContext) -> Callable[[WorkItem], WorkerResult]:
                 f"`level_generation_strategy` in Godot (`{modules}`):\n"
                 f"{item.spec}\n\n"
                 f"CRITICAL WORLD CONSTRUCTION REQUIREMENTS:\n"
-                f"- Execute the Game Bible's `level_generation_strategy` (`generation_approach`, `world_structure`, `runtime_construction_plan`) and load `res://level_layout.json` across all {len(layout.world_regions)} regions (`{[r.region_id for r in layout.world_regions]}`).\n"
-                f"- Bind synthesized sprites and tile textures from `res://assets/sprites/*.png` and `res://assets/tiles/*.png` matching the 16:9 Concept Art Mockup.\n"
+                f"- Execute the Game Bible's `level_generation_strategy` (`generation_approach`, `world_structure`, `runtime_construction_plan`), `rendering_strategy.json`, and load `res://level_layout.json` across all {len(layout.world_regions)} regions (`{[r.region_id for r in layout.world_regions]}`).\n"
+                f"- Render world geometry, terrain, fluids, and props using the bespoke rendering techniques from `rendering_strategy.json` (procedural `Polygon2D`/`Line2D` meshes, custom `CanvasItem` shaders / `ShaderMaterial`, `GPUParticles2D`, `PointLight2D`, and synthesized sprites/rigs from `res://assets/sprites/*.png`) matching the 16:9 Concept Art Mockup.\n"
                 f"- NEVER replace the designed world with a 3-4 `Rect2` placeholder room.\n\n"
                 f"COUNCIL WILL JUDGE: {item.proof_spec}"
             )
@@ -489,9 +528,10 @@ def _summarize_cartridge_for_qa(cartridge_dir: Path, max_chars: int = 4000) -> s
         classes = re.findall(r"^\s*class\s+([A-Za-z0-9_]+)", src, flags=re.MULTILINE)
         funcs = re.findall(r"^\s*(?:static\s+)?func\s+([A-Za-z0-9_]+)\s*\(([^)]*)\)", src, flags=re.MULTILINE)
         vars_top = re.findall(r"^var\s+([A-Za-z0-9_]+)", src, flags=re.MULTILINE)
+        bound_assets = sorted(set(re.findall(r"(?:res://)?assets/[A-Za-z0-9_./-]+\.(?:png|wav|ogg|mp3)", src)))
         func_sig = ", ".join(f"{fn}({args.strip()})" for fn, args in funcs[:18])
         lines.append(
-            f"- {gd_path.name}: classes={classes[:8]} vars={vars_top[:14]} funcs=[{func_sig}]"
+            f"- {gd_path.name}: classes={classes[:8]} vars={vars_top[:14]} bound_assets={bound_assets} funcs=[{func_sig}]"
         )
     cat_path = c_dir / "assets" / "asset_library.json"
     if cat_path.is_file():
@@ -499,7 +539,16 @@ def _summarize_cartridge_for_qa(cartridge_dir: Path, max_chars: int = 4000) -> s
             cat = json.loads(cat_path.read_text(encoding="utf-8"))
             entries = cat.get("entries") if isinstance(cat, dict) else {}
             if isinstance(entries, dict) and entries:
-                lines.append(f"- asset_library.json ({len(entries)} assets): {list(entries.keys())[:16]}")
+                entry_Descs = [
+                    (
+                        f"{k} (type={v.get('asset_type', '')}, mode={v.get('fabrication_mode', '')}, "
+                        f"tex_size={v.get('texture_pixel_size', [])}, hframes={v.get('hframes', 1)}, vframes={v.get('vframes', 1)} "
+                        f"-> {v.get('res_path', '')})"
+                    )
+                    for k, v in list(entries.items())[:24]
+                    if isinstance(v, dict)
+                ]
+                lines.append(f"- asset_library.json ({len(entries)} assets on disk): {entry_Descs}")
         except Exception:
             pass
     summary = "\n".join(lines)
@@ -538,31 +587,52 @@ def plan_filmstrip(ctx: WorkerContext, item: WorkItem, attempts: int = 3) -> Fil
     if not _is_live(ctx.client):
         raise StudioAgentError("Filmstrip planning requires an active google.genai Client (Rule 5)")
     from google.genai import types
+    from engine.studio.context_curator import ContextCuratorAgent, is_real_genai_client
 
     actions = available_input_actions(ctx.cartridge_dir)
     qa_context = _summarize_cartridge_for_qa(ctx.cartridge_dir)
     context_block = f"\nCARTRIDGE SYMBOLS & ASSETS AVAILABLE FOR QA STAGING:\n{qa_context}\n" if qa_context else ""
+    multimodal_parts: List[Any] = []
+    if is_real_genai_client(ctx.client):
+        curator = ContextCuratorAgent(
+            cartridge_dir=ctx.cartridge_dir,
+            client=ctx.client,
+            model_name=ctx.model_name,
+            board=ctx.board,
+            event_callback=ctx.event_callback,
+        )
+        lead_pack_path = _item_dir(ctx, item) / "context_pack_task_lead.json"
+        curation_role = "task_lead" if lead_pack_path.is_file() else "qa_test_engineer"
+        pack = curator.curate_context(
+            target_agent_role=curation_role,
+            task_request=f"{item.title}\nSPEC: {item.spec}\nPROOF: {item.proof_spec}",
+            item_id=item.item_id,
+            item_kind=item.kind,
+        )
+        context_block = f"{context_block}\n{pack.prompt_block}"
+        multimodal_parts = list(pack.multimodal_parts)
     issues: List[str] = []
     for attempt in range(1, attempts + 1):
-        retry = "YOUR PREVIOUS PLAN FAILED VALIDATION; FIX:\n- " + "\n- ".join(issues) + "\n\n" if issues else ""
+        retry = "\n\nYOUR PREVIOUS PLAN FAILED VALIDATION; FIX:\n- " + "\n- ".join(issues) if issues else ""
         prompt = (
-            f"{retry}You are the QA Director planning a short scripted playthrough that PROVES a built item to the design council.\n"
+            f"You are the QA Director planning a short scripted playthrough that PROVES a built item to the design council.\n"
             f"ITEM [{item.item_id}] ({item.kind}): {item.title}\nSPEC: {item.spec}\nTHE COUNCIL WANTS TO SEE: {item.proof_spec}\n"
             f"Available input actions: {actions}.{context_block}\n"
             f"Choose `capture_ticks` (1-{MAX_PROOF_FRAMES} frames, ticks 1-{MAX_PROOF_TICKS}, 60 ticks ~ 1 second), `input_segments` "
             f"(actions or KEY_* held over tick ranges, plus optional `mouse_click_pos`), and optional `setup_calls` (if staging the proof "
             f"requires spawning a hazard, positioning actors into interaction range, or invoking a scene/entity setup method at a specific tick) "
             f"so the captured frames show the state before, the action/interaction, and the result. Also populate `state_assertions` for key "
-            f"observable state transitions. Use no input only if the proof is static. Provide `deliberation` FIRST."
+            f"observable state transitions. Use no input only if the proof is static. Provide `deliberation` FIRST.{retry}"
         )
+        contents_arg: Any = ([prompt] + multimodal_parts) if multimodal_parts else prompt
         resp = call_gemini_with_transient_retry(
             lambda: ctx.client.models.generate_content(
                 model=ctx.model_name,
-                contents=prompt,
+                contents=contents_arg,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=FilmstripPlan,
-                    thinking_config=bounded_thinking_config(1536),
+                    thinking_config=bounded_thinking_config(512),
                 ),
             ),
             label=f"plan_filmstrip[{item.item_id}]",
@@ -577,21 +647,33 @@ def plan_filmstrip(ctx: WorkerContext, item: WorkItem, attempts: int = 3) -> Fil
 
 
 def _snapshot_modules(cartridge_dir: Path, modules: List[str]) -> Dict[str, Optional[str]]:
+    c_dir = Path(cartridge_dir)
+    all_names = list(
+        dict.fromkeys(
+            list(modules)
+            + ["main.gd", "mechanics.gd", "scenes.gd", "entities.gd", "ui_hud.gd", "project.godot", "main.tscn"]
+            + [p.name for p in sorted(c_dir.glob("*.gd"))]
+        )
+    )
     snap: Dict[str, Optional[str]] = {}
-    for m in modules:
-        p = Path(cartridge_dir) / m
+    for m in all_names:
+        p = c_dir / m
         snap[m] = p.read_text(encoding="utf-8") if p.is_file() else None
     return snap
 
 
 def _restore_modules(cartridge_dir: Path, snap: Dict[str, Optional[str]]) -> None:
+    c_dir = Path(cartridge_dir)
     for m, text in snap.items():
-        p = Path(cartridge_dir) / m
+        p = c_dir / m
         if text is None:
             if p.is_file():
                 p.unlink()
         else:
             p.write_text(text, encoding="utf-8")
+    for extra_gd in sorted(c_dir.glob("*.gd")):
+        if extra_gd.name not in snap and not extra_gd.name.startswith("test_"):
+            extra_gd.unlink()
 
 
 def code_item_handler(ctx: WorkerContext) -> Callable[[WorkItem], WorkerResult]:
@@ -700,7 +782,7 @@ def code_item_handler(ctx: WorkerContext) -> Callable[[WorkItem], WorkerResult]:
 # Iterative Task Lead Agent & Autonomous Domain Specialists
 # ---------------------------------------------------------------------------
 
-ALL_SPECIALIST_AGENTS = ("visual_artist", "audio_designer", "swe_engineer", "qa_test_engineer")
+ALL_SPECIALIST_AGENTS = ("visual_artist", "audio_designer", "script_writer", "swe_engineer", "qa_test_engineer")
 
 
 def available_specialists(ctx: WorkerContext, item: Optional[WorkItem] = None) -> List[str]:
@@ -710,7 +792,7 @@ def available_specialists(ctx: WorkerContext, item: Optional[WorkItem] = None) -
     asset fabrication specialists so they produce isolated asset files and inspection/waveform plates
     without rewriting shared `.gd` gameplay scenes or hijacking `main.tscn` into a static showcase.
     Gameplay, level, UI, and integration tasks have full access to all specialists (`visual_artist`,
-    `audio_designer`, `swe_engineer`, `qa_test_engineer`).
+    `audio_designer`, `script_writer`, `swe_engineer`, `qa_test_engineer`).
     """
     has_visual = ctx.library_factory is not None or ctx.visual_agent is not None or _is_live(ctx.client)
     has_audio = ctx.voice_agent is not None
@@ -725,6 +807,8 @@ def available_specialists(ctx: WorkerContext, item: Optional[WorkItem] = None) -
         specs.append("visual_artist")
     if has_audio:
         specs.append("audio_designer")
+    if _is_live(ctx.client):
+        specs.append("script_writer")
     if ctx.swe_agent is not None and (
         hasattr(ctx.swe_agent, "implement_requirement_track") or hasattr(ctx.swe_agent, "formulate_level_layout")
     ):
@@ -819,6 +903,167 @@ def run_audio_designer_specialist(
     )
 
 
+def run_script_writer_specialist(
+    ctx: WorkerContext,
+    item: WorkItem,
+    brief: str,
+    target_paths: Optional[List[str]] = None,
+    turn_index: int = 0,
+) -> SpecialistReport:
+    """Autonomous Scriptwriter & Narrative Dramatist specialist: crafts scene scripts (`cutscenes`),
+    branching `dialogue_trees`, contextual `dialogue_barks`, and character voices based on the Task Lead's brief,
+    persists them into `game_bible.json` / `narrative_bible.json` / `narrative.json`, and renders a visual
+    script table proof sheet (`script_sheet_*.png`)."""
+    if not _is_live(ctx.client):
+        raise StudioAgentError(f"Scriptwriter specialist requires an active google.genai Client for '{item.item_id}' (Rule 5)")
+    from google.genai import types
+    from engine.studio.context_curator import ContextCuratorAgent, is_real_genai_client
+
+    bible_path = ctx.cartridge_dir / "game_bible.json"
+    bible_text = (
+        compact_bible_json_for_prompt(bible_path.read_text(encoding="utf-8"))
+        if bible_path.is_file()
+        else "{}"
+    )
+    curated_context_block = f"GAME BIBLE CONTEXT:\n{bible_text}\n"
+    if is_real_genai_client(ctx.client):
+        curator = ContextCuratorAgent(
+            cartridge_dir=ctx.cartridge_dir,
+            client=ctx.client,
+            model_name=ctx.model_name,
+            board=ctx.board,
+            event_callback=ctx.event_callback,
+        )
+        pack = curator.curate_context(
+            target_agent_role="script_writer",
+            task_request=f"{item.title}\nSPEC: {item.spec}\nBRIEF: {brief}",
+            item_id=item.item_id,
+            item_kind=item.kind,
+        )
+        curated_context_block = f"{pack.prompt_block}\nGAME BIBLE CONTEXT:\n{bible_text}\n"
+    prompt = (
+        f"You are the Lead Scriptwriter & Narrative Dramatist executing a brief for TASK [{item.item_id}] ({item.kind}): {item.title}\n"
+        f"TASK SPEC: {item.spec}\n"
+        f"TASK LEAD BRIEF FOR SCRIPTWRITER:\n{brief}\n\n"
+        f"{curated_context_block}"
+        f"Craft the requested scene scripts (`added_or_updated_cutscenes`), branching dialogue (`added_or_updated_dialogue_trees`), "
+        f"contextual gameplay barks (`added_or_updated_barks`), or character sheets (`added_or_updated_characters`) suited to THIS game. "
+        f"Provide `deliberation` FIRST."
+    )
+    resp = call_gemini_with_transient_retry(
+        lambda: ctx.client.models.generate_content(
+            model=ctx.model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=ScriptWritingDeliverable,
+                thinking_config=bounded_thinking_config(1536),
+            ),
+        ),
+        label=f"run_script_writer_specialist[{item.item_id}:t{turn_index}]",
+    )
+    if not resp.text:
+        raise StudioAgentError(f"Scriptwriter specialist returned an empty response for '{item.item_id}'")
+    deliverable = ScriptWritingDeliverable.model_validate_json(resp.text)
+
+    touched: List[str] = []
+    with _CATALOG_LOCK:
+        bible_path = ctx.cartridge_dir / "game_bible.json"
+        nb_data: Dict[str, Any] = {
+            "deliberation": deliverable.deliberation,
+            "world_title": "Game World",
+            "setting_summary": "",
+            "characters": [],
+            "cutscenes": [],
+            "dialogue_trees": [],
+            "dialogue_barks": [],
+        }
+        bible_data: Optional[Dict[str, Any]] = None
+        if bible_path.is_file():
+            try:
+                bible_data = json.loads(bible_path.read_text(encoding="utf-8"))
+                if isinstance(bible_data, dict) and isinstance(bible_data.get("narrative_bible"), dict):
+                    nb_data.update(bible_data["narrative_bible"])
+            except Exception:
+                bible_data = None
+
+        chars_by_id = {c.get("character_id"): c for c in nb_data.get("characters", []) if isinstance(c, dict)}
+        for c in deliverable.added_or_updated_characters:
+            chars_by_id[c.character_id] = c.model_dump()
+        nb_data["characters"] = list(chars_by_id.values())
+
+        cs_by_id = {c.get("cutscene_id"): c for c in nb_data.get("cutscenes", []) if isinstance(c, dict)}
+        for cs in deliverable.added_or_updated_cutscenes:
+            cs_by_id[cs.cutscene_id] = cs.model_dump()
+        nb_data["cutscenes"] = list(cs_by_id.values())
+
+        dt_by_id = {t.get("root_node_id"): t for t in nb_data.get("dialogue_trees", []) if isinstance(t, dict)}
+        for dt in deliverable.added_or_updated_dialogue_trees:
+            dt_by_id[dt.root_node_id] = dt.model_dump()
+        nb_data["dialogue_trees"] = list(dt_by_id.values())
+
+        barks_by_id = {b.get("bark_id"): b for b in nb_data.get("dialogue_barks", []) if isinstance(b, dict)}
+        for bk in deliverable.added_or_updated_barks:
+            barks_by_id[bk.bark_id] = bk.model_dump()
+        nb_data["dialogue_barks"] = list(barks_by_id.values())
+
+        for fname in ("narrative_bible.json", "narrative.json"):
+            (ctx.cartridge_dir / fname).write_text(json.dumps(nb_data, indent=2), encoding="utf-8")
+            touched.append(fname)
+        if isinstance(bible_data, dict):
+            bible_data["narrative_bible"] = nb_data
+            bible_path.write_text(json.dumps(bible_data, indent=2), encoding="utf-8")
+            touched.append("game_bible.json")
+
+    safe_id = _safe_id(item.item_id)
+    sheet_path = _item_dir(ctx, item) / f"script_sheet_{safe_id}_t{turn_index}.png"
+    img = Image.new("RGB", (960, 540), (15, 23, 42))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([12, 12, 948, 528], outline=(56, 189, 248), width=2)
+    lines = [
+        f"SCRIPTWRITER TABLE READ SHEET — TASK [{item.item_id}] (Turn {turn_index})",
+        f"Brief: {brief[:110]}",
+        f"Notes: {(deliverable.narrative_notes or deliverable.deliberation)[:120]}",
+        f"Authored: {len(deliverable.added_or_updated_cutscenes)} cutscenes | "
+        f"{len(deliverable.added_or_updated_dialogue_trees)} dialogue trees | "
+        f"{len(deliverable.added_or_updated_barks)} barks | "
+        f"{len(deliverable.added_or_updated_characters)} characters",
+        "-" * 96,
+    ]
+    for cs in deliverable.added_or_updated_cutscenes[:3]:
+        lines.append(f"[Cutscene '{cs.title}' ({cs.cutscene_id}) trigger={cs.trigger}]")
+        for beat in cs.beats[:4]:
+            lines.append(f"  Beat {beat.beat_number} ({beat.speaker_id or 'stage'}): {beat.dialogue_line or beat.action_description}"[:115])
+    for dt in deliverable.added_or_updated_dialogue_trees[:2]:
+        lines.append(f"[Dialogue Tree root={dt.root_node_id} ({len(dt.nodes)} nodes)]")
+        for nid, node in list(dt.nodes.items())[:3]:
+            lines.append(f"  ({nid}) {node.speaker_id}: \"{node.text}\""[:115])
+    for bk in deliverable.added_or_updated_barks[:6]:
+        lines.append(f"[Bark {bk.bark_id}] ({bk.speaker_id} on {bk.trigger_type}): \"{bk.text}\""[:115])
+    y = 26
+    for ln in lines[:24]:
+        draw.text((28, y), ln, fill=(226, 232, 240))
+        y += 20
+    img.save(sheet_path)
+
+    summary = (
+        f"Scriptwriter authored {len(deliverable.added_or_updated_cutscenes)} cutscene(s), "
+        f"{len(deliverable.added_or_updated_dialogue_trees)} dialogue tree(s), "
+        f"{len(deliverable.added_or_updated_barks)} bark(s), and "
+        f"{len(deliverable.added_or_updated_characters)} character(s). "
+        f"{deliverable.narrative_notes or deliverable.deliberation[:200]}"
+    )
+    return SpecialistReport(
+        deliberation=deliverable.deliberation,
+        turn_index=turn_index,
+        specialist_agent="script_writer",
+        brief=brief,
+        summary=summary,
+        touched_files=touched,
+        proof_images=[str(sheet_path)],
+    )
+
+
 def run_swe_engineer_specialist(
     ctx: WorkerContext,
     item: WorkItem,
@@ -842,6 +1087,8 @@ def run_swe_engineer_specialist(
     explicit_code_modules = [
         m for m in (target_paths or item.target_modules) if m.endswith(CODE_MODULE_SUFFIXES)
     ]
+    if item.kind == "level_map" and not explicit_code_modules and is_real_genai_client(ctx.client):
+        explicit_code_modules = ["scenes.gd"]
     wants_level_layout = (
         hasattr(agent, "formulate_level_layout")
         and (
@@ -911,12 +1158,52 @@ def run_swe_engineer_specialist(
             requirements=[track],
             asset_manifest=[],
         )
+        import inspect
+        swe_extra_kwargs: Dict[str, Any] = {}
+        try:
+            sig = inspect.signature(agent.implement_requirement_track)
+            accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            prior_rev_proofs: List[str] = []
+            if item.revisions:
+                for p in (item.revisions[-1].proof_paths or []):
+                    if p and p not in prior_rev_proofs:
+                        prior_rev_proofs.append(p)
+            if accepts_var_kw or "extra_image_paths" in sig.parameters:
+                swe_extra_kwargs["extra_image_paths"] = prior_rev_proofs
+            if accepts_var_kw or "board" in sig.parameters:
+                swe_extra_kwargs["board"] = ctx.board
+        except Exception:
+            pass
         with lock_cm:
             snap = _snapshot_modules(ctx.cartridge_dir, modules + ["project.godot", "main.tscn"])
             try:
-                agent.implement_requirement_track(track=track, staging_dir=ctx.cartridge_dir, requirements_spec=req_spec)
+                agent.implement_requirement_track(
+                    track=track,
+                    staging_dir=ctx.cartridge_dir,
+                    requirements_spec=req_spec,
+                    **swe_extra_kwargs,
+                )
                 if ctx.code_verify is not None:
-                    ctx.code_verify(ctx.cartridge_dir, track)
+                    try:
+                        ctx.code_verify(ctx.cartridge_dir, track)
+                    except Exception as verify_exc:
+                        from engine.studio.context_curator import is_real_genai_client
+                        if is_real_genai_client(ctx.client):
+                            logger.warning(
+                                "SWE code_verify failed on first pass for '%s' (%s); retrying with prior_error feedback.",
+                                item.item_id,
+                                verify_exc,
+                            )
+                            agent.implement_requirement_track(
+                                track=track,
+                                staging_dir=ctx.cartridge_dir,
+                                requirements_spec=req_spec,
+                                prior_error=str(verify_exc),
+                                **swe_extra_kwargs,
+                            )
+                            ctx.code_verify(ctx.cartridge_dir, track)
+                        else:
+                            raise
             except Exception:
                 _restore_modules(ctx.cartridge_dir, snap)
                 raise
@@ -1001,9 +1288,10 @@ def run_qa_test_engineer_specialist(
         extra_qa += f" Setup calls: {[c['method_name'] for c in setup_calls]}."
     if getattr(plan, "state_assertions", None):
         extra_qa += f" Assertions: {[(a.at_tick, a.snapshot_key, a.expected_value_or_change) for a in plan.state_assertions]}."
+
     summary = (
-        f"Filmstrip ticks {plan.capture_ticks}. Plan: {plan.deliberation[:300]} "
-        f"Expected frames: {plan.frame_expectations}{extra_qa}"
+        f"Filmstrip ticks {plan.capture_ticks}. Plan: {plan.deliberation[:260]} "
+        f"Pre-capture expected frames: {plan.frame_expectations}{extra_qa}"
     )
     return SpecialistReport(
         deliberation=plan.deliberation,
@@ -1020,6 +1308,9 @@ def validate_task_lead_decision(
     decision: TaskLeadDecision,
     specialists: List[str],
     collected_proofs: List[str],
+    board: Any = None,
+    parent_item_id: str = "",
+    item_kind: str = "",
 ) -> List[str]:
     """Structural validation of a `TaskLeadDecision` turn."""
     issues: List[str] = []
@@ -1032,12 +1323,37 @@ def validate_task_lead_decision(
             )
         if not decision.brief.strip():
             issues.append("brief must be non-empty when action == 'delegate'.")
+    elif decision.action == "spawn_tasks":
+        if not decision.spawned_tasks:
+            issues.append("spawned_tasks must contain at least one WorkItemProposal when action == 'spawn_tasks'.")
+        elif board is not None and hasattr(board, "validate_proposals"):
+            existing_ids = {i.item_id for i in board.items()} if hasattr(board, "items") else set()
+            sanitized = []
+            for p in decision.spawned_tasks:
+                if decision.wait_for_spawned_tasks and p.item_id in existing_ids and p.item_id != parent_item_id:
+                    continue
+                if decision.wait_for_spawned_tasks and parent_item_id and parent_item_id in p.depends_on:
+                    p_copy = p.model_copy(deep=True)
+                    p_copy.depends_on = [d for d in p.depends_on if d != parent_item_id]
+                    sanitized.append(p_copy)
+                else:
+                    sanitized.append(p)
+            board_issues = board.validate_proposals(sanitized) if sanitized else []
+            issues.extend(board_issues)
     elif decision.action == "submit_to_council":
         if not collected_proofs:
             issues.append(
                 "Cannot submit_to_council before any proof images have been produced; delegate to a specialist "
                 f"({specialists}) to build and capture proof first."
             )
+        elif item_kind == "level_map" and "qa_test_engineer" in specialists:
+            has_engine_filmstrip = any("filmstrip" in Path(p).name.lower() for p in collected_proofs)
+            if not has_engine_filmstrip:
+                issues.append(
+                    "Cannot submit_to_council for a 'level_map' task with only a 2D wireframe diagram (level_map_*.png). "
+                    "You MUST delegate to 'qa_test_engineer' to capture a live in-engine Godot viewport filmstrip "
+                    "(level_filmstrip_*.png / filmstrip_*.png) proving the world geometry, surface textures, and Camera2D traversal in Godot."
+                )
         if decision.selected_proof_paths:
             unknown = [
                 p for p in decision.selected_proof_paths if p not in collected_proofs and not Path(p).is_file()
@@ -1056,9 +1372,8 @@ class _LegacyFakeClientDirectPayload(Exception):
 
 def _build_task_lead_multimodal_parts(ctx: WorkerContext, collected_proofs: List[str]) -> List[Any]:
     """Builds multimodal image parts (reference 16:9 Concept Art Mockup + latest collected proof images)
-    so the Task Lead Strategist can visually inspect captured proofs before submitting to the Council."""
-    if not collected_proofs:
-        return []
+    so the Task Lead Strategist can see the target visual aesthetic from Turn 0 onward and visually inspect
+    captured proofs before submitting to the Council."""
     from google.genai import types
 
     parts: List[Any] = []
@@ -1078,10 +1393,18 @@ def _build_task_lead_multimodal_parts(ctx: WorkerContext, collected_proofs: List
         except Exception:
             pass
 
-    for p_str in collected_proofs[-3:]:
-        p = Path(p_str)
-        if not p.is_file():
-            continue
+    valid_proofs = [Path(p_str) for p_str in collected_proofs if Path(p_str).is_file()]
+    filmstrips = [p for p in valid_proofs if "filmstrip" in p.name.lower()]
+    non_filmstrips = [p for p in valid_proofs if "filmstrip" not in p.name.lower()]
+    deduped_proofs: List[Path] = []
+    if non_filmstrips:
+        deduped_proofs.append(non_filmstrips[-1])
+    if filmstrips:
+        deduped_proofs.append(filmstrips[-1])
+    if not deduped_proofs and valid_proofs:
+        deduped_proofs = valid_proofs[-1:]
+
+    for p in deduped_proofs:
         mime = "image/jpeg" if p.suffix.lower() in (".jpg", ".jpeg") else "image/png"
         parts.append(
             f"CAPTURED PROOF IMAGE ({p.name}) — inspect this image carefully before choosing submit_to_council:"
@@ -1114,6 +1437,49 @@ def plan_task_lead_turn(
             except Exception:
                 pass
 
+    slice_context_block = ""
+    bible_path = Path(ctx.cartridge_dir) / "game_bible.json"
+    if bible_path.is_file():
+        try:
+            bible_data = json.loads(bible_path.read_text(encoding="utf-8"))
+            if isinstance(bible_data, dict):
+                roadmap = bible_data.get("slice_roadmap")
+                active_idx = int(bible_data.get("active_slice_index") or 0)
+                if isinstance(roadmap, list) and roadmap:
+                    active_slice = None
+                    for s in roadmap:
+                        if isinstance(s, dict) and s.get("status") == "active":
+                            active_slice = s
+                            break
+                    if active_slice is None and 0 <= active_idx < len(roadmap):
+                        active_slice = roadmap[active_idx]
+                    if isinstance(active_slice, dict):
+                        slice_context_block = (
+                            f"\nACTIVE GAME SLICE [{active_slice.get('slice_id', '')}] (Iteration #{active_slice.get('slice_index', 0)} — {active_slice.get('title', '')}):\n"
+                            f"  Objective: {active_slice.get('slice_objective', '')}\n"
+                            f"  Player Acclimation & Mechanics Focus: {active_slice.get('player_acclimation_and_mechanics_focus', '')}\n"
+                            f"  Expansion from Prior Slice: {active_slice.get('expansion_from_prior_slice', '')}\n"
+                            f"  Scope Boundaries (ONLY build assets & mechanics needed for this slice): {active_slice.get('scope_boundaries', '')}\n"
+                        )
+        except Exception:
+            pass
+
+    board_snapshot_block = ""
+    if ctx.board is not None and hasattr(ctx.board, "items"):
+        try:
+            b_lines = [
+                f"  - id={b_it.item_id} ({b_it.kind}, state={b_it.state}, slice={b_it.slice_id or 'default'}): {b_it.title}"
+                for b_it in ctx.board.items()
+            ]
+            if b_lines:
+                board_snapshot_block = (
+                    "\nCURRENT PRODUCTION BOARD ITEMS (check before spawning so you never duplicate existing tasks):\n"
+                    + "\n".join(b_lines)
+                    + "\n"
+                )
+        except Exception:
+            pass
+
     prior_revision_block = ""
     if item.revisions:
         rev_lines = [
@@ -1133,6 +1499,8 @@ def plan_task_lead_turn(
             + "\n"
             + prior_trace_text
         )
+    if getattr(item, "failure", ""):
+        prior_revision_block += f"\nPREVIOUS WORKER EXECUTION ERROR TO FIX:\n{item.failure[-800:]}\n"
 
     turns_block = ""
     if turn_history:
@@ -1154,6 +1522,10 @@ def plan_task_lead_turn(
         "audio_designer": (
             "  - 'audio_designer': synthesizes voice barks, SFX, or ambient loops and renders a waveform proof image (`waveform_*.png`).\n"
         ),
+        "script_writer": (
+            "  - 'script_writer': Lead Scriptwriter & Narrative Dramatist — crafts scene scripts (`cutscenes`), branching `dialogue_trees`, "
+            "contextual `dialogue_barks`, and character sheets into `narrative_bible.json` / `narrative.json` and produces a script table proof sheet (`script_sheet_*.png`).\n"
+        ),
         "swe_engineer": (
             "  - 'swe_engineer': architects or modifies GDScript modules (.gd), world/level layouts, scenes, entities, or UI and verifies headless engine compilation/boot.\n"
         ),
@@ -1161,32 +1533,90 @@ def plan_task_lead_turn(
             "  - 'qa_test_engineer': designs and executes a scripted Godot headless test scenario (setup_calls, input_segments, mouse_click_pos, state_assertions, capture_ticks) and captures a multi-frame gameplay filmstrip proof image.\n"
         ),
     }
+    from engine.studio.context_curator import ContextCuratorAgent, is_real_genai_client
+
     available_spec_lines = "".join(spec_descriptions[s] for s in specialists if s in spec_descriptions)
+    curated_lead_block = ""
     multimodal_parts: List[Any] = []
-    if collected_proofs and getattr(type(ctx.client), "__module__", "") != "google.genai.fake":
-        multimodal_parts = _build_task_lead_multimodal_parts(ctx, collected_proofs)
+    prior_rev_proofs: List[str] = []
+    if item.revisions:
+        for p in (item.revisions[-1].proof_paths or []):
+            if p and p not in prior_rev_proofs:
+                prior_rev_proofs.append(p)
+    lead_image_paths = list(dict.fromkeys(prior_rev_proofs + list(collected_proofs)))
+    if is_real_genai_client(ctx.client):
+        curator = ContextCuratorAgent(
+            cartridge_dir=ctx.cartridge_dir,
+            client=ctx.client,
+            model_name=ctx.model_name,
+            board=ctx.board,
+            event_callback=ctx.event_callback,
+        )
+        pack = curator.curate_context(
+            target_agent_role="task_lead",
+            task_request=(
+                f"{item.title}\nSPEC: {item.spec}\nPROOF: {item.proof_spec}\n"
+                f"{prior_revision_block}"
+            ),
+            item_id=item.item_id,
+            item_kind=item.kind,
+            extra_image_paths=lead_image_paths,
+        )
+        curated_lead_block = pack.prompt_block
+        multimodal_parts = list(pack.multimodal_parts) or _build_task_lead_multimodal_parts(ctx, lead_image_paths)
+        if collected_proofs and pack.multimodal_parts:
+            existing_labels = {p for p in multimodal_parts if isinstance(p, str)}
+            extra_proof_parts = _build_task_lead_multimodal_parts(ctx, collected_proofs)
+            for idx_p in range(0, len(extra_proof_parts), 2):
+                lbl = extra_proof_parts[idx_p]
+                if (
+                    isinstance(lbl, str)
+                    and lbl.startswith("CAPTURED PROOF IMAGE")
+                    and lbl not in existing_labels
+                    and idx_p + 1 < len(extra_proof_parts)
+                ):
+                    multimodal_parts.append(lbl)
+                    multimodal_parts.append(extra_proof_parts[idx_p + 1])
+                    existing_labels.add(lbl)
 
     issues: List[str] = []
     for attempt in range(1, attempts + 1):
-        retry = "YOUR PREVIOUS TaskLeadDecision FAILED VALIDATION; FIX:\n- " + "\n- ".join(issues) + "\n\n" if issues else ""
+        retry = "\nYOUR PREVIOUS TaskLeadDecision FAILED VALIDATION; FIX:\n- " + "\n- ".join(issues) + "\n" if issues else ""
         prompt = (
-            f"{retry}You are the Task Lead Strategist for TASK [{item.item_id}] ({item.kind}): {item.title}\n"
+            f"You are the Task Lead Strategist for TASK [{item.item_id}] ({item.kind}): {item.title}\n"
             f"SPEC: {item.spec}\n"
             f"PROOF THE COUNCIL WILL JUDGE: {item.proof_spec}\n"
             f"TARGET MODULES HINT: {item.target_modules}\n"
             f"AVAILABLE AUTONOMOUS SPECIALISTS: {specialists}\n"
             f"{available_spec_lines}"
-            f"COLLECTED PROOF IMAGES SO FAR: {collected_proofs}\n"
-            f"CARTRIDGE SYMBOLS & FILES:\n{qa_context or '(empty)'}{cat_block}"
-            f"{prior_revision_block}{turns_block}\n"
             f"INSTRUCTIONS:\n"
-            f"1. Formulate your bespoke `current_strategy` for accomplishing and proving this task (and pivoting if the Council requested changes).\n"
-            f"2. If `COLLECTED PROOF IMAGES SO FAR` is non-empty, visually inspect the attached proof image(s) before choosing `submit_to_council`:\n"
+            f"1. Formulate your bespoke `current_strategy` for accomplishing and proving this task within the active slice (and pivoting if the Council requested changes).\n"
+            f"2. JUST-IN-TIME ASSET & SUB-TASK DISCOVERY (`action = 'spawn_tasks'` or `'delegate'` to `'visual_artist'`): Assets and animations are NOT built heavily upfront. As you plan or implement this task, reason out what specific assets, surface textures, animations, sounds, or sub-tasks are needed for THIS task in THIS slice.\n"
+            f"   - HYBRID PROCEDURAL + GENERATED VISUAL CRAFT (THE BEST OF BOTH WORLDS):\n"
+            f"     * NEVER rely on flat untextured `Polygon2D` slabs, blank monochrome backgrounds, or bare 8-point `Line2D` programmer-art zigzags! Instead, combine procedural generation (Simplex noise, cellular automata, Voronoi, spline contours, custom `ShaderMaterial`, `GPUParticles2D`) with fabricated visual assets from `'visual_artist'`:\n"
+            f"       - Fabricate seamless `tile_surface` textures in `assets/sprites/*.png` and bind them onto procedural `Polygon2D` terrain/strata via `StudioRigHelper.create_tiled_polygon(points, tex)` (`texture_repeat = CanvasItem.TEXTURE_REPEAT_ENABLED`).\n"
+            f"       - Fabricate repeatable strip textures or shaders for `Line2D` conduits/cracks/vines (`texture_mode = Line2D.LINE_TEXTURE_TILE`) and scatter fabricated `static_sprite` environmental decals/landmarks along procedural contours.\n"
+            f"     * Characters, creatures, avatars, and interactive world structures MUST be rendered with actual fabricated visual assets (`sprite_sheet`, `articulated_parts`, or `static_sprite` loaded from `res://assets/sprites/*.png`), NEVER left as primitive `draw_circle` / `draw_rect` placeholder stickmen or untextured boxes!\n"
+            f"     * When Council feedback critiques crude procedural polygons/lines (`Polygon2D` / `Line2D` / `_draw()`) or missing textures, delegate to `'visual_artist'` FIRST to fabricate the needed `tile_surface` or sprite PNGs in `assets/sprites/*.png` and THEN delegate to `'swe_engineer'` to bind those textures onto the procedural geometry.\n"
+            f"   - For `level_map` tasks: A 2D wireframe diagram (`level_map_*.png`) alone is NEVER sufficient! You MUST ensure `scenes.gd` realizes the multi-region `level_layout.json` in Godot with hybrid procedural + textured terrain, environmental props, and an active `Camera2D` tracking the player across `world_bounds` (with HUD isolated on a `CanvasLayer`), and then delegate to `'qa_test_engineer'` to capture a live in-engine Godot viewport filmstrip (`level_filmstrip_*.png` / `filmstrip_*.png`) before `submit_to_council`.\n"
+            f"   - If this task implements or tests a character, creature, or interactive entity (`mechanic_code`, `integration`, `level_map`, etc.):\n"
+            f"     * First check `ON-DISK ASSET CATALOG` and `CURRENT PRODUCTION BOARD ITEMS`. If a matching sprite, rig, or `tile_surface` texture already exists on disk, instruct `'swe_engineer'` in your `brief` to load and bind that exact PNG/rig (`Image.load_from_file` / `StudioRigHelper`)—preserving its exact `hframes`/`vframes` from `asset_library.json` (remember `articulated_parts` composites have `hframes=1, vframes=1`!).\n"
+            f"     * If a needed character rig, structure sprite, or `tile_surface` texture does not exist on disk yet, either delegate to `'visual_artist'` first to fabricate it inside this task, OR choose `action = 'spawn_tasks'` with `wait_for_spawned_tasks = True` so the visual asset is fabricated before `'swe_engineer'` binds it.\n"
+            f"3. If `COLLECTED PROOF IMAGES SO FAR` is non-empty, visually inspect the attached proof image(s) (and any `QA Post-Capture Visual Audit` findings in the turn history) before choosing `submit_to_council`:\n"
             f"   - In `filmstrip_*.png` contact sheets, the top (`[QA] tick N in:[...]`) and bottom (`[QA] pos=(...) ...`) bands outside each 16:9 frame border are external QA test-harness annotations—use them to verify coordinates/state, and never mistake them for in-game debug text.\n"
-            f"   - Verify that the active gameplay entities (`CharacterBody2D` / `Sprite2D` actors and floor/world tiles) are visibly rendered inside the 16:9 viewport and are NOT hidden behind an opaque full-screen background/border frame drawn at a higher `z_index` or foreground `CanvasLayer`.\n"
-            f"   - If the proof image shows an occluded character, missing floor tiles, or a visual/functional defect, delegate back to `swe_engineer` (or `visual_artist`) to fix it right now before submitting to the Council.\n"
-            f"3. Choose `action = 'delegate'` to send an open-ended natural-language `brief` to one of {specialists}, OR choose `action = 'submit_to_council'` ONLY after all required assets/code are built AND at least one proof image in `COLLECTED PROOF IMAGES SO FAR` visually proves the requirement.\n"
-            f"Provide `deliberation` FIRST and `action` LAST."
+            f"   - NEVER SUBMIT PLACEHOLDER STICKMEN, CLIPPED SPRITES, OR SHRUNK VIEWPORT BACKGROUNDS: If the proof image or `QA Post-Capture Visual Audit` reports `qa_passed=False`, unaddressed Council defects, clipped/invisible sprites (`hframes > 1` on a single-frame texture), or a shrunk background that leaves dark void around the level, do NOT choose `submit_to_council`! Fix the root cause with `'visual_artist'` / `'swe_engineer'` and re-run `'qa_test_engineer'`.\n"
+            f"   - Verify that active gameplay entities (`CharacterBody2D` / `Sprite2D` actors and floor/world geometry) are visibly rendered inside the 16:9 viewport and are NOT hidden behind an opaque full-screen background/border frame drawn at a higher `z_index` or foreground `CanvasLayer`.\n"
+            f"4. Choose `action = 'delegate'` to send an open-ended natural-language `brief` to one of {specialists}, `action = 'spawn_tasks'` to create newly discovered tasks on the board, OR `action = 'submit_to_council'` ONLY after all required assets/code are built AND at least one proof image in `COLLECTED PROOF IMAGES SO FAR` visually proves the requirement.\n"
+            f"   - CRITICAL SCHEMA FIELD ORDER WARNING: In `TaskLeadDecision`, `specialist_agent` and `brief` appear BEFORE `action` in the JSON schema! Decide your turn action inside `deliberation` and `current_strategy` first: whenever you are delegating to a specialist (`action = 'delegate'`), you MUST populate `specialist_agent` (one of {specialists}) and a non-empty `brief` BEFORE emitting `action = 'delegate'`! Never leave `specialist_agent` or `brief` empty when delegating.\n"
+            f"Provide `deliberation` FIRST and `action` LAST.\n"
+            f"{slice_context_block}"
+            f"{curated_lead_block}"
+            f"{prior_revision_block}"
+            f"{board_snapshot_block}"
+            f"CARTRIDGE SYMBOLS & FILES:\n{qa_context or '(empty)'}{cat_block}"
+            f"COLLECTED PROOF IMAGES SO FAR: {collected_proofs}\n"
+            f"{turns_block}"
+            f"{retry}"
         )
         contents_arg: Any = ([prompt] + multimodal_parts) if multimodal_parts else prompt
         resp = call_gemini_with_transient_retry(
@@ -1212,7 +1642,14 @@ def plan_task_lead_turn(
                 if "fabrication_mode" in raw_dict or "capture_ticks" in raw_dict:
                     raise _LegacyFakeClientDirectPayload(resp.text)
         decision = TaskLeadDecision.model_validate_json(resp.text)
-        issues = validate_task_lead_decision(decision, specialists, collected_proofs)
+        issues = validate_task_lead_decision(
+            decision,
+            specialists,
+            collected_proofs,
+            board=ctx.board,
+            parent_item_id=item.item_id,
+            item_kind=item.kind,
+        )
         if not issues:
             return decision
         logger.info("TaskLeadDecision attempt %d/%d for %s invalid: %s", attempt, attempts, item.item_id, issues)
@@ -1231,6 +1668,8 @@ def _dispatch_to_specialist(
         return run_visual_artist_specialist(ctx, item, decision.brief, decision.target_paths, turn_index=turn_index)
     if spec_name == "audio_designer":
         return run_audio_designer_specialist(ctx, item, decision.brief, decision.target_paths, turn_index=turn_index)
+    if spec_name == "script_writer":
+        return run_script_writer_specialist(ctx, item, decision.brief, decision.target_paths, turn_index=turn_index)
     if spec_name == "swe_engineer":
         return run_swe_engineer_specialist(
             ctx, item, decision.brief, decision.target_paths, turn_index=turn_index, _lock_already_held=_lock_already_held
@@ -1276,6 +1715,55 @@ def run_task_lead(
     ):
         return level_map_handler(ctx)(item)
 
+    from engine.studio.context_curator import is_real_genai_client
+    if item.kind in ("visual_asset", "animation", "audio_asset") and is_real_genai_client(ctx.client):
+        spec_role = "audio_designer" if item.kind == "audio_asset" else "visual_artist"
+        res = _fallback_for_legacy_fake_client(ctx, item)
+        direct_report = SpecialistReport(
+            deliberation=f"Direct single-specialist execution of standalone {item.kind} task '{item.item_id}'.",
+            turn_index=0,
+            specialist_agent=spec_role,
+            brief=f"{item.title}: {item.spec}",
+            summary=res.notes,
+            touched_files=[],
+            proof_images=list(res.proof_images),
+            verification_passed=True,
+        )
+        trace_path = _item_dir(ctx, item) / f"lead_trace_rev{len(item.revisions)}.json"
+        trace_path.write_text(
+            json.dumps(
+                {
+                    "item_id": item.item_id,
+                    "revision": len(item.revisions),
+                    "status": "submitted",
+                    "current_strategy": f"Direct {spec_role} fabrication for standalone {item.kind}",
+                    "submission_summary": res.notes,
+                    "collected_proofs": list(res.proof_images),
+                    "turns": [direct_report.model_dump()],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        if ctx.event_callback is not None:
+            try:
+                ctx.event_callback(
+                    "backlog_item_specialist_completed",
+                    {
+                        "deliberation": res.notes,
+                        "item_id": item.item_id,
+                        "revision": len(item.revisions),
+                        "turn_index": 0,
+                        "specialist_agent": spec_role,
+                        "summary": res.notes,
+                        "proof_images": list(res.proof_images),
+                        "verification_passed": True,
+                    },
+                )
+            except Exception:
+                pass
+        return res
+
     turn_history: List[SpecialistReport] = []
     collected_proofs: List[str] = []
     last_strategy = ""
@@ -1289,7 +1777,8 @@ def run_task_lead(
             existing_trace = json.loads(trace_path.read_text(encoding="utf-8"))
             if (
                 isinstance(existing_trace, dict)
-                and existing_trace.get("status", "in_progress") in ("in_progress", "yielded")
+                and existing_trace.get("status", "in_progress")
+                in ("in_progress", "yielded", "waiting_for_spawned_tasks")
                 and not existing_trace.get("submission_summary")
             ):
                 for raw_turn in existing_trace.get("turns", []):
@@ -1320,14 +1809,32 @@ def run_task_lead(
 
     code_lock = ctx.code_lock if ctx.code_lock is not None else threading.Lock()
     code_lock_held = False
+    spawn_turn_bonus = sum(1 for t in turn_history if t.specialist_agent == "board_task_spawner")
+    effective_max_turns = max_turns + spawn_turn_bonus
     try:
-        for turn_idx in range(len(turn_history), max_turns):
+        turn_idx = len(turn_history)
+        while turn_idx < effective_max_turns:
             resumed_from_pending = False
             if pending_decision is not None:
                 decision = pending_decision
                 pending_decision = None
                 resumed_from_pending = True
             else:
+                if ctx.event_callback is not None:
+                    try:
+                        ctx.event_callback(
+                            "backlog_item_lead_planning",
+                            {
+                                "deliberation": f"Task Lead Strategist is planning Turn #{turn_idx + 1} for '{item.item_id}' ({item.kind}).",
+                                "item_id": item.item_id,
+                                "kind": item.kind,
+                                "title": item.title,
+                                "revision": len(item.revisions),
+                                "turn_index": turn_idx,
+                            },
+                        )
+                    except Exception:
+                        pass
                 try:
                     decision = plan_task_lead_turn(ctx, item, turn_history, collected_proofs)
                 except _LegacyFakeClientDirectPayload:
@@ -1347,6 +1854,7 @@ def run_task_lead(
                             "action": decision.action,
                             "specialist_agent": decision.specialist_agent,
                             "brief": decision.brief,
+                            "spawned_task_ids": [p.item_id for p in decision.spawned_tasks],
                         },
                     )
                 except Exception:
@@ -1358,6 +1866,40 @@ def run_task_lead(
                 selected_proofs = chosen if chosen else list(collected_proofs)
                 _persist_trace(status="submitted", pending=None)
                 break
+
+            if decision.action == "spawn_tasks":
+                if ctx.board is None or not hasattr(ctx.board, "spawn_tasks_from_item"):
+                    raise StudioAgentError(
+                        f"Task '{item.item_id}' chose action='spawn_tasks', but WorkerContext has no active ProductionBoard attached."
+                    )
+                spawned_items = ctx.board.spawn_tasks_from_item(
+                    parent_item_id=item.item_id,
+                    proposals=decision.spawned_tasks,
+                    wait_for_spawned=decision.wait_for_spawned_tasks,
+                )
+                spawned_ids = [s.item_id for s in spawned_items]
+                spawn_report = SpecialistReport(
+                    turn_index=turn_idx,
+                    specialist_agent="board_task_spawner",
+                    brief=decision.brief or f"Spawned {len(spawned_ids)} tasks on ProductionBoard: {spawned_ids}",
+                    summary=(
+                        f"Dynamically spawned {len(spawned_ids)} task(s) on ProductionBoard ({spawned_ids}); "
+                        f"wait_for_spawned_tasks={decision.wait_for_spawned_tasks}."
+                    ),
+                    touched_files=[],
+                    proof_images=[],
+                    verification_passed=True,
+                )
+                turn_history.append(spawn_report)
+                effective_max_turns += 1
+                if decision.wait_for_spawned_tasks:
+                    _persist_trace(status="waiting_for_spawned_tasks", pending=None)
+                    raise WorkerYielded(
+                        f"spawned_prerequisite_tasks:{','.join(spawned_ids)}"
+                    )
+                _persist_trace(status="in_progress", pending=None)
+                turn_idx += 1
+                continue
 
             if decision.specialist_agent in ("swe_engineer", "qa_test_engineer") and not code_lock_held:
                 if is_in_board_scheduler():
@@ -1387,13 +1929,48 @@ def run_task_lead(
                 except Exception:
                     pass
 
-            report = _dispatch_to_specialist(
-                ctx,
-                item,
-                decision,
-                turn_index=turn_idx,
-                _lock_already_held=code_lock_held,
-            )
+            try:
+                report = _dispatch_to_specialist(
+                    ctx,
+                    item,
+                    decision,
+                    turn_index=turn_idx,
+                    _lock_already_held=code_lock_held,
+                )
+            except WorkerYielded:
+                raise
+            except Exception as spec_exc:
+                if (
+                    turn_idx + 1 < effective_max_turns
+                    and decision.specialist_agent in ("qa_test_engineer", "swe_engineer")
+                ):
+                    logger.warning(
+                        "Specialist '%s' failed on Turn #%d of '%s' (%s); reporting failure to Task Lead for self-correction.",
+                        decision.specialist_agent,
+                        turn_idx + 1,
+                        item.item_id,
+                        spec_exc,
+                    )
+                    report = SpecialistReport(
+                        deliberation=(
+                            f"Specialist '{decision.specialist_agent}' encountered an error on Turn #{turn_idx + 1}; "
+                            f"returning failure report to Task Lead so it can self-correct within the turn budget."
+                        ),
+                        turn_index=turn_idx,
+                        specialist_agent=decision.specialist_agent,
+                        brief=decision.brief,
+                        summary=(
+                            f"ERROR from {decision.specialist_agent}: {spec_exc}\n"
+                            f"ACTION REQUIRED FOR TASK LEAD: Diagnose this failure and delegate a fix to 'swe_engineer' "
+                            f"(if GDScript/scene wiring or performance is broken) or 'qa_test_engineer' (if the QA test plan/setup_calls need adjustment)."
+                        ),
+                        touched_files=[],
+                        proof_images=[],
+                        verification_passed=False,
+                    )
+                else:
+                    _persist_trace(status="failed", pending=None)
+                    raise
             turn_history.append(report)
             for p in report.proof_images:
                 if p not in collected_proofs and Path(p).is_file():
@@ -1416,8 +1993,10 @@ def run_task_lead(
                     )
                 except Exception:
                     pass
+            turn_idx += 1
         else:
             if not collected_proofs:
+                _persist_trace(status="failed", pending=None)
                 raise StudioAgentError(
                     f"Task Lead for '{item.item_id}' exhausted {max_turns} turns without producing any proof images."
                 )
@@ -1456,6 +2035,7 @@ def task_lead_handler(ctx: WorkerContext, max_turns: int = 6) -> Callable[[WorkI
         ctx.code_lock = threading.Lock()
     fn = lambda item: run_task_lead(ctx, item, max_turns=max_turns)
     setattr(fn, "_code_lock", ctx.code_lock)
+    setattr(fn, "_worker_ctx", ctx)
     return fn
 
 

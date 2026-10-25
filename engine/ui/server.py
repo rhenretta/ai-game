@@ -44,6 +44,8 @@ from engine.ui.models import (
     CheckpointsResponse,
     CodeDiffResponse,
     DeathClusterPoint,
+    GameLaunchRequest,
+    GameLaunchResponse,
     GenesisTriggerRequest,
     GenesisTriggerResponse,
     GreenlightRequest,
@@ -829,6 +831,37 @@ class SwarmEventBus:
             "agent_name": role,
             "timestamp_utc": data.get("end_time_utc") or data.get("start_time_utc") or datetime.now(timezone.utc).isoformat(),
             "payload": data,
+        }
+        self.publish_threadsafe(event)
+
+    def publish_game_bible_update(
+        self,
+        bible: Union[Dict[str, Any], Any],
+        agent_name: str = "CreativeDirectorWorldbuilderAgent",
+        deliberation: Optional[str] = None,
+    ) -> None:
+        """Publishes a GAME_BIBLE_UPDATED event and updates the in-memory & SQLite Living Game Bible."""
+        if hasattr(bible, "model_dump"):
+            bible_dict = bible.model_dump()
+        elif isinstance(bible, dict):
+            bible_dict = dict(bible)
+        else:
+            bible_dict = {}
+
+        if not bible_dict:
+            return
+
+        delib = (
+            deliberation
+            or str(bible_dict.get("deliberation") or "").strip()
+            or f"Living Game Bible updated for '{bible_dict.get('game_title') or bible_dict.get('cartridge_id') or 'active build'}'."
+        )
+        event = {
+            "deliberation": delib,
+            "event_type": SwarmEventType.GAME_BIBLE_UPDATED.value,
+            "agent_name": agent_name,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "payload": bible_dict,
         }
         self.publish_threadsafe(event)
 
@@ -1858,6 +1891,8 @@ def create_app(
             except Exception:
                 db_count = 0
 
+        from engine.studio.models import TOKEN_USAGE_TRACKER
+
         resp = StudioStatusResponse(
             deliberation="Studio observability health assessment: all agent nodes verified and SQLite WAL reader active.",
             status="ONLINE",
@@ -1869,6 +1904,7 @@ def create_app(
             supervisor_state="IDLE",
             current_episode=0,
             uptime_seconds=round(time.time() - start_time, 2),
+            token_usage=TOKEN_USAGE_TRACKER.get_summary(),
         )
         return JSONResponse(resp.model_dump())
 
@@ -1930,6 +1966,8 @@ def create_app(
                 except Exception:
                     current_ep = 0
 
+        from engine.studio.models import TOKEN_USAGE_TRACKER
+
         resp = StudioStatusResponse(
             deliberation="Detailed studio status: all 9 agent personas verified, WAL telemetry store online, PEV cycle ready.",
             status="ONLINE",
@@ -1942,6 +1980,7 @@ def create_app(
             current_episode=current_ep,
             pev_cycle=pev_info,
             uptime_seconds=round(time.time() - start_time, 2),
+            token_usage=TOKEN_USAGE_TRACKER.get_summary(),
         )
         return JSONResponse(resp.model_dump())
 
@@ -4853,6 +4892,192 @@ def create_app(
             "paused": paused_val,
         })
 
+    _launched_game_proc: List[Optional[Any]] = [None]
+
+    async def game_launch_handler(request):
+        """POST /api/game/launch: Launches the currently selected or active game cartridge in a native Godot 4.3 window."""
+        import subprocess
+        raw_body: Dict[str, Any] = {}
+        try:
+            body_bytes = await request.body()
+            if body_bytes:
+                parsed = json.loads(body_bytes.decode("utf-8"))
+                if isinstance(parsed, dict):
+                    raw_body = parsed
+        except Exception:
+            return JSONResponse(
+                {"deliberation": "Rejected malformed JSON request body for game launch.", "error": "Invalid JSON body"},
+                status_code=400,
+            )
+
+        raw_body.setdefault("deliberation", "Launching game cartridge from Mission Control UI.")
+        if not raw_body.get("cartridge_id") and request.query_params.get("cartridge"):
+            raw_body["cartridge_id"] = request.query_params.get("cartridge")
+
+        try:
+            req = GameLaunchRequest.model_validate(raw_body)
+        except Exception as val_err:
+            return JSONResponse(
+                {"deliberation": "Validation failed for GameLaunchRequest.", "error": str(val_err)},
+                status_code=422,
+            )
+
+        requested_id = (req.cartridge_id or "").strip()
+        resolved_dir: Optional[Path] = None
+
+        if requested_id and requested_id != "active":
+            sanitized, err_resp = _sanitize_cartridge_override(requested_id)
+            if err_resp is not None:
+                # Also check checkpoints/<requested_id> if not directly under target_cartridges
+                chk_candidate = target_cartridges / "checkpoints" / requested_id
+                try:
+                    if (
+                        ".." not in requested_id
+                        and "/" not in requested_id
+                        and "\\" not in requested_id
+                        and chk_candidate.is_dir()
+                    ):
+                        sanitized = chk_candidate.resolve()
+                        err_resp = None
+                except Exception:
+                    pass
+                if err_resp is not None:
+                    return err_resp
+            resolved_dir = sanitized
+        else:
+            if (target_active / "project.godot").is_file() or (target_active / "mechanics.py").is_file():
+                resolved_dir = target_active
+            else:
+                latest_cand = _resolve_active_or_latest_cartridge()
+                if (latest_cand / "project.godot").is_file() or (latest_cand / "mechanics.py").is_file():
+                    resolved_dir = latest_cand
+                elif target_cartridges.is_dir():
+                    playable_dirs = [
+                        d for d in list(target_cartridges.glob("candidate_*")) + list((target_cartridges / "checkpoints").glob("*"))
+                        if d.is_dir() and ((d / "project.godot").is_file() or (d / "mechanics.py").is_file())
+                    ]
+                    if playable_dirs:
+                        playable_dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                        resolved_dir = playable_dirs[0]
+
+        if resolved_dir is None or not resolved_dir.is_dir():
+            return JSONResponse(
+                {
+                    "deliberation": f"Could not find a playable cartridge for '{requested_id or 'active'}'.",
+                    "error": f"Cartridge '{requested_id or 'active'}' not found.",
+                },
+                status_code=404,
+            )
+
+        has_godot = (resolved_dir / "project.godot").is_file()
+        has_pygame = (resolved_dir / "mechanics.py").is_file()
+        if not has_godot and not has_pygame:
+            # Check if a verified checkpoint for this candidate already has project.godot
+            chk_root = target_cartridges / "checkpoints"
+            if chk_root.is_dir():
+                matching_chks = sorted(
+                    [
+                        d for d in chk_root.glob(f"{resolved_dir.name}_*")
+                        if d.is_dir() and ((d / "project.godot").is_file() or (d / "mechanics.py").is_file())
+                    ],
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                if matching_chks:
+                    resolved_dir = matching_chks[0]
+                    has_godot = (resolved_dir / "project.godot").is_file()
+                    has_pygame = (resolved_dir / "mechanics.py").is_file()
+
+        if not has_godot and not has_pygame:
+            return JSONResponse(
+                {
+                    "deliberation": f"Cartridge '{resolved_dir.name}' does not have runnable game code (project.godot) yet.",
+                    "error": f"Cartridge '{resolved_dir.name}' has no project.godot yet — wait for the first level_map or mechanic_code task to complete.",
+                },
+                status_code=409,
+            )
+
+        game_title = resolved_dir.name
+        for meta_name, key_name in (("game_bible.json", "game_title"), ("manifest.json", "title")):
+            mf = resolved_dir / meta_name
+            if mf.is_file():
+                try:
+                    mdata = json.loads(mf.read_text(encoding="utf-8"))
+                    if isinstance(mdata, dict) and str(mdata.get(key_name, "")).strip():
+                        game_title = str(mdata[key_name]).strip()
+                        break
+                except Exception:
+                    pass
+
+        # Cleanly terminate any previously launched UI game window so duplicate windows do not pile up
+        prev_proc = _launched_game_proc[0]
+        if prev_proc is not None:
+            try:
+                if prev_proc.poll() is None:
+                    prev_proc.terminate()
+            except Exception:
+                pass
+            _launched_game_proc[0] = None
+
+        pid: Optional[int] = None
+        try:
+            if has_godot:
+                try:
+                    from engine.studio.models import enforce_hidpi_project_godot
+                    enforce_hidpi_project_godot(resolved_dir / "project.godot")
+                except Exception:
+                    pass
+                from engine.godot_runtime import ensure_godot_binary
+                godot_bin = ensure_godot_binary()
+                cmd = [str(godot_bin), "--path", str(resolved_dir)]
+            else:
+                cmd = [sys.executable, str(config.PROJECT_ROOT / "run_game.py"), "--cartridge", str(resolved_dir)]
+
+            if "PYTEST_CURRENT_TEST" not in os.environ:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(resolved_dir),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                _launched_game_proc[0] = proc
+                pid = proc.pid
+            else:
+                pid = 0
+        except Exception as launch_exc:
+            return JSONResponse(
+                {
+                    "deliberation": f"Failed to launch cartridge '{resolved_dir.name}': {launch_exc}",
+                    "error": str(launch_exc),
+                },
+                status_code=500,
+            )
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        delib_msg = f"Launched '{game_title}' ({resolved_dir.name}) in native game window (PID {pid})."
+        target_bus.publish_threadsafe({
+            "deliberation": delib_msg,
+            "event_type": "game_launched",
+            "agent_name": "MissionControlGateway",
+            "timestamp_utc": now_iso,
+            "payload": {
+                "cartridge_id": resolved_dir.name,
+                "cartridge_path": str(resolved_dir),
+                "game_title": game_title,
+                "pid": pid,
+            },
+        })
+        resp_obj = GameLaunchResponse(
+            deliberation=delib_msg,
+            status="launched",
+            cartridge_id=resolved_dir.name,
+            cartridge_path=str(resolved_dir),
+            game_title=game_title,
+            pid=pid,
+        )
+        return JSONResponse(resp_obj.model_dump())
+
     routes = [
         Route("/", endpoint=index_handler, methods=["GET"]),
         Route("/health", endpoint=health_handler, methods=["GET"]),
@@ -4862,6 +5087,7 @@ def create_app(
         Route("/api/game-bible", endpoint=game_bible_handler, methods=["GET"]),
         Route("/api/studio/greenlight", endpoint=studio_greenlight_handler, methods=["POST"]),
         Route("/api/studio/settings", endpoint=studio_settings_handler, methods=["GET", "POST"]),
+        Route("/api/game/launch", endpoint=game_launch_handler, methods=["POST"]),
         Route("/api/events/history", endpoint=events_history_handler, methods=["GET"]),
         Route("/api/events", endpoint=events_history_handler, methods=["GET"]),
         Route("/api/agents/history", endpoint=agents_history_handler, methods=["GET"]),
@@ -4905,7 +5131,49 @@ def create_app(
         )
     ]
 
-    return Starlette(routes=routes, middleware=middleware)
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def _lifespan(_app: Starlette):
+        daemon_inst = None
+        if os.environ.get("STUDIO_RELOAD_WORKER_DAEMON") == "1" and "PYTEST_CURRENT_TEST" not in os.environ:
+            try:
+                from engine.studio.daemon import StudioDaemon, StudioDaemonConfig
+                interval = float(os.environ.get("STUDIO_DAEMON_INTERVAL", "5.0"))
+                steam_prof = os.environ.get("STUDIO_STEAM_PROFILE", "default")
+                c_dir = os.environ.get("STUDIO_CARTRIDGES_DIR")
+                d_path = os.environ.get("STUDIO_DB_PATH")
+                cfg = StudioDaemonConfig(
+                    poll_interval=interval,
+                    enable_daemon=True,
+                    steam_profile=steam_prof,
+                    cartridges_root=Path(c_dir) if c_dir else target_cartridges,
+                    db_path=Path(d_path) if d_path else (target_db or config.DB_PATH),
+                )
+                daemon_inst = StudioDaemon(config_obj=cfg, event_bus=target_bus)
+                t = threading.Thread(
+                    target=daemon_inst.run,
+                    name="StudioDaemonReloadWorkerThread",
+                    daemon=True,
+                )
+                t.start()
+            except Exception as exc:
+                logger.warning("Failed to start reload worker StudioDaemon: %s", exc)
+        try:
+            yield
+        finally:
+            if daemon_inst is not None:
+                try:
+                    daemon_inst.stop()
+                    daemon_inst.release_lock()
+                except Exception:
+                    pass
+
+    return Starlette(
+        routes=routes,
+        middleware=middleware,
+        lifespan=_lifespan,
+    )
 
 
 app = create_app()

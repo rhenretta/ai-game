@@ -146,7 +146,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("=" * 64)
 
     daemon_thread: Optional[threading.Thread] = None
-    if _active_daemon and not args.no_daemon:
+    if args.reload and not args.no_daemon:
+        os.environ["STUDIO_RELOAD_WORKER_DAEMON"] = "1"
+        os.environ["STUDIO_DAEMON_INTERVAL"] = str(args.interval)
+        os.environ["STUDIO_STEAM_PROFILE"] = str(args.steam_profile)
+        if args.cartridges_dir:
+            os.environ["STUDIO_CARTRIDGES_DIR"] = str(args.cartridges_dir)
+        if args.db_path:
+            os.environ["STUDIO_DB_PATH"] = str(args.db_path)
+    elif _active_daemon and not args.no_daemon:
         daemon_thread = threading.Thread(
             target=_active_daemon.run,
             name="StudioDaemonThread",
@@ -154,13 +162,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         daemon_thread.start()
 
+    uvicorn_kwargs = {
+        "host": args.host,
+        "port": args.port,
+        "reload": args.reload,
+        "log_level": args.log_level,
+    }
+    if args.reload:
+        uvicorn_kwargs["reload_dirs"] = [str(config.PROJECT_ROOT / "engine")]
+
     try:
         uvicorn.run(
             "engine.ui.server:app",
-            host=args.host,
-            port=args.port,
-            reload=args.reload,
-            log_level=args.log_level,
+            **uvicorn_kwargs,
         )
         return 0
     except SystemExit:

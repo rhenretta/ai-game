@@ -1496,17 +1496,19 @@ static func create_tiled_surface(
                     for p in entry.articulated_parts
                 )
                 lines.append(
-                    f"- [{aid}] (mode=articulated_parts) composite='{entry.res_path}', parts=[{parts_str}], "
-                    f"display_size={entry.target_display_size} | {entry.purpose}"
+                    f"- [{aid}] (mode=articulated_parts, SINGLE-FRAME COMPOSITE: hframes={entry.hframes}, vframes={entry.vframes} — NEVER set hframes>1 or vframes>1 on this composite!) "
+                    f"composite='{entry.res_path}', parts=[{parts_str}], "
+                    f"display_size={entry.target_display_size}, tex_size={entry.texture_pixel_size} | {entry.purpose}"
                 )
             elif entry.fabrication_mode == "portrait":
                 lines.append(
-                    f"- [{aid}] (mode=portrait, UI ONLY) res_path='{entry.res_path}', display_size={entry.target_display_size}, tex_size={entry.texture_pixel_size} | {entry.purpose}"
+                    f"- [{aid}] (mode=portrait, UI ONLY) res_path='{entry.res_path}', display_size={entry.target_display_size}, tex_size={entry.texture_pixel_size}, hframes=1, vframes=1 | {entry.purpose}"
                 )
             else:
                 lines.append(
                     f"- [{aid}] (mode={entry.fabrication_mode}) res_path='{entry.res_path}', "
-                    f"display_size={entry.target_display_size}, tex_size={entry.texture_pixel_size} | {entry.purpose}"
+                    f"display_size={entry.target_display_size}, tex_size={entry.texture_pixel_size}, "
+                    f"hframes={entry.hframes}, vframes={entry.vframes} | {entry.purpose}"
                 )
         return "\n".join(lines)
 
