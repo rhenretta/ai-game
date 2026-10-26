@@ -2282,6 +2282,9 @@
             <button type="button" class="bible-subtab-btn" data-bible-tab="pillars">
               ⚙️ Pillars &amp; World Spec
             </button>
+            <button type="button" class="bible-subtab-btn" data-bible-tab="dna">
+              🧬 Steam Player DNA (<span id="bible-count-dna">0</span>)
+            </button>
             <button type="button" class="bible-subtab-btn" data-bible-tab="signoff">
               🛡️ Sign-Off Council (<span id="bible-count-signoff">0/6</span>)
             </button>
@@ -2459,6 +2462,13 @@
             <div class="blueprint-empty">No Multi-Agent Specialist Sign-Off Council report recorded yet. Each specialist who authored the Living Game Bible inspects the rendered candidate build, audio mix rates, and scene tree audit before promotion.</div>
           </div>
         </div>
+
+        <!-- Subtab 6: Steam Player DNA & Full Creation Provenance -->
+        <div id="bible-subview-dna" class="bible-subview">
+          <div id="bible-dna-container" style="display: flex; flex-direction: column; gap: 14px;">
+            <div class="blueprint-empty">Loading scanned Steam Player DNA, logarithmic engagement weights, multi-dimensional affinity vectors, and Writers' Room concept genesis provenance...</div>
+          </div>
+        </div>
       </div>
     </div>
   </section>
@@ -2580,8 +2590,13 @@
       <!-- Panel 1: Steam Player DNA & Game Blueprint Panel -->
       <div class="panel">
         <div class="panel-title">
-          <span>Steam Player DNA & Game Blueprint</span>
-          <span id="game-blueprint-status" style="font-size: 11px; color: var(--light-gray);">Library Profile</span>
+          <span>Steam Player DNA &amp; Game Blueprint</span>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span id="game-blueprint-status" style="font-size: 11px; color: var(--light-gray);">Library Profile</span>
+            <button type="button" class="btn-secondary" style="font-size: 9.5px; padding: 2px 7px; border-color: var(--cyan); color: var(--cyan);" onclick="switchMainWorkspace('bible'); switchBibleSubtab('dna');">
+              🧬 Full DNA &amp; Provenance
+            </button>
+          </div>
         </div>
         <div class="dna-grid">
           <div class="dna-metric-box">
@@ -4438,11 +4453,372 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     // =========================================================================
     // Steam Player DNA & Telemetry Dashboard Loaders
     // =========================================================================
+    let latestSteamDnaData = null;
+
+    function renderVectorBarList(weightsObj, accentColor = 'var(--cyan)', highlightKeys = []) {
+      const entries = Object.entries(weightsObj || {}).sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0));
+      if (entries.length === 0) {
+        return '<div style="font-size: 10.5px; color: var(--slate);">No weights recorded.</div>';
+      }
+      const hiSet = new Set((highlightKeys || []).map(k => String(k).toLowerCase()));
+      return `
+        <div style="display: flex; flex-direction: column; gap: 6px;">
+          ${entries.map(([label, rawVal]) => {
+            const val = Number(rawVal || 0);
+            const pct = Math.max(0, Math.min(100, val * 100));
+            const isHi = hiSet.has(String(label).toLowerCase());
+            return `
+              <div style="display: flex; flex-direction: column; gap: 2px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; font-size: 11px;">
+                  <span style="color: ${isHi ? 'var(--yellow)' : 'var(--white)'}; font-weight: ${isHi ? '700' : '500'};">
+                    ${isHi ? '★ ' : ''}${escapeHtml(label)}
+                  </span>
+                  <span style="font-family: monospace; font-size: 10.5px; color: ${val > 0 ? accentColor : 'var(--slate)'};">
+                    ${pct.toFixed(1)}% (${val.toFixed(4)})
+                  </span>
+                </div>
+                <div style="height: 6px; background: rgba(29, 43, 83, 0.55); border-radius: 3px; overflow: hidden;">
+                  <div style="width: ${Math.max(val > 0 ? 2 : 0, pct)}%; height: 100%; background: ${isHi ? 'var(--yellow)' : accentColor}; border-radius: 3px;"></div>
+                </div>
+              </div>
+            `;
+          }).join('')}
+        </div>
+      `;
+    }
+
+    function renderSteamDnaSubview(dnaData, bibleData) {
+      const container = document.getElementById('bible-dna-container');
+      const countEl = document.getElementById('bible-count-dna');
+      const d = dnaData || latestSteamDnaData;
+      const b = bibleData || cachedGameBible || {};
+      if (countEl && d) {
+        countEl.textContent = String(d.total_games_analyzed || (d.top_games ? d.top_games.length : 0));
+      }
+      if (!container) return;
+      if (!d) {
+        return;
+      }
+
+      const totalHours = Number(d.total_playtime_hours || 0);
+      const totalGames = Number(d.total_games_analyzed || 0);
+      const pacingScore = Number(d.pacing_score || 0);
+      const pacingPct = Math.max(0, Math.min(100, ((pacingScore + 1) / 2) * 100));
+      const challengeVal = Number(d.challenge_tolerance ?? 0.5);
+      const challengePct = Math.max(0, Math.min(100, challengeVal * 100));
+      const topGames = Array.isArray(d.top_games) ? d.top_games : [];
+      const prov = d.ingestion_provenance || {};
+      const formulas = prov.formulas || {};
+      const dnaPromptSummary = String(b.target_player_dna_summary || '').trim();
+      const conceptFragments = Array.isArray(b.concept_fragments) ? b.concept_fragments : [];
+      const conceptCandidates = Array.isArray(b.concept_candidates) ? b.concept_candidates : [];
+
+      // Parse spotlight & anchor game names from target_player_dna_summary so we can badge them in the table
+      const spotlightLineMatch = dnaPromptSummary.match(/Session Spotlight Cross-Pollination Subset[^:]*:\s*([^\n]+)/i);
+      const spotlightRaw = spotlightLineMatch ? spotlightLineMatch[1] : '';
+      const anchorLineMatch = dnaPromptSummary.match(/Most-Played Core Anchor Games[^:]*:\s*([^\n]+)/i);
+      const anchorRaw = anchorLineMatch ? anchorLineMatch[1] : '';
+
+      const playDist = d.playtime_distribution || {};
+      const tierMeta = [
+        ['mastered_over_100h', '🏆 Mastered (> 100h)', 'var(--green)'],
+        ['dedicated_50_to_100h', '🔥 Dedicated (50h – 100h)', 'var(--cyan)'],
+        ['engaged_10_to_50h', '⚙️ Engaged (10h – 50h)', 'var(--amber)'],
+        ['casual_2_to_10h', '🎮 Casual (2h – 10h)', 'var(--purple)'],
+        ['dabbled_under_2h', '👀 Dabbled (< 2h)', 'var(--slate)'],
+      ];
+
+      const html = `
+        <!-- 1. Epistemic Synthesis Deliberation & Provenance Pipeline -->
+        <div class="blueprint-box" style="margin-top: 0; border-left: 3px solid var(--cyan); background: linear-gradient(135deg, rgba(41, 173, 255, 0.08), rgba(4, 9, 24, 0.95));">
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px;">
+            <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+              <strong style="color: var(--cyan); font-size: 13px;">🧬 Steam Player DNA Profile &amp; Epistemic Synthesis</strong>
+              <span class="genre-chip" style="font-size: 10px;">SteamID: ${escapeHtml(d.player_id || 'local_player')}</span>
+              <span class="genre-chip" style="font-size: 10px; border-color: var(--amber); color: var(--amber);">Profile Tag: ${escapeHtml(d.profile_tag || 'default')}</span>
+            </div>
+            ${d.created_at_utc ? `<span style="font-size: 10px; color: var(--slate); font-family: monospace;">Synthesized: ${escapeHtml(d.created_at_utc)}</span>` : ''}
+          </div>
+          <div style="font-size: 11.5px; color: var(--white); line-height: 1.5; background: rgba(2, 5, 14, 0.7); border: 1px solid var(--navy); border-radius: 5px; padding: 8px 10px; margin-bottom: 10px;">
+            <strong style="color: var(--amber);">🧠 SteamDNAProfiler Deliberation:</strong> ${escapeHtml(d.deliberation || '')}
+          </div>
+
+          <!-- 4-Stage Creation Pipeline Cards -->
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px;">
+            <div style="background: #040918; border: 1px solid var(--navy); border-radius: 5px; padding: 8px 10px; font-size: 10.5px;">
+              <div style="color: var(--cyan); font-weight: bold; margin-bottom: 3px;">1. Local Steam VDF Scanner</div>
+              <div style="color: var(--light-gray); line-height: 1.4;">
+                Parses <code>loginusers.vdf</code>, <code>libraryfolders.vdf</code>, <code>localconfig.vdf</code> &amp; <code>appmanifest_*.acf</code> across volumes (${totalGames} games, ${totalHours.toFixed(1)}h). Filters non-game utilities.
+              </div>
+            </div>
+            <div style="background: #040918; border: 1px solid var(--navy); border-radius: 5px; padding: 8px 10px; font-size: 10.5px;">
+              <div style="color: var(--yellow); font-weight: bold; margin-bottom: 3px;">2. Store API Metadata Cache</div>
+              <div style="color: var(--light-gray); line-height: 1.4;">
+                Enriches top-played &amp; installed AppIDs via <code>SteamStoreApiClient</code> (<code>${escapeHtml(prov.store_cache_path || 'data/steam_app_cache.json')}</code>, ${Number(prov.store_cached_apps_count || 0)} cached apps) with genres &amp; tags.
+              </div>
+            </div>
+            <div style="background: #040918; border: 1px solid var(--navy); border-radius: 5px; padding: 8px 10px; font-size: 10.5px;">
+              <div style="color: var(--green); font-weight: bold; margin-bottom: 3px;">3. Logarithmic Vector Profiling</div>
+              <div style="color: var(--light-gray); line-height: 1.4;">
+                Computes <code>w_g = ln(1 + h_g)</code> engagement weights, L1-normalized genre/category vectors, <code>[-1, +1]</code> pacing index, and Style Bible palette mood.
+              </div>
+            </div>
+            <div style="background: #040918; border: 1px solid var(--navy); border-radius: 5px; padding: 8px 10px; font-size: 10.5px;">
+              <div style="color: var(--pink); font-weight: bold; margin-bottom: 3px;">4. Writers' Room DNA Injection</div>
+              <div style="color: var(--light-gray); line-height: 1.4;">
+                Extracts Top-8 Core Anchor Games + 4 Spotlight Cross-Pollination titles to drive ${conceptFragments.length} specialist fragments &amp; ${conceptCandidates.length} concept candidates.
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 2. Core Behavioral Metrics & Continuum Gauges -->
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px;">
+          <div class="blueprint-box" style="margin-top: 0;">
+            <div style="font-size: 10px; color: var(--slate); text-transform: uppercase;">Library Scale &amp; Mastery Depth</div>
+            <div style="display: flex; align-items: baseline; gap: 10px; margin-top: 4px;">
+              <span style="font-size: 22px; font-weight: 800; color: var(--cyan); font-family: monospace;">${totalHours.toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 })}h</span>
+              <span style="font-size: 12px; color: var(--white);">across <strong>${totalGames}</strong> games</span>
+            </div>
+            <div style="font-size: 10.5px; color: var(--green); margin-top: 4px;">
+              ${((Number(playDist.mastered_over_100h || 0)) * 100).toFixed(1)}% of total playtime invested in Mastered (&gt;100h) titles
+            </div>
+          </div>
+
+          <div class="blueprint-box" style="margin-top: 0;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <span style="font-size: 10px; color: var(--slate); text-transform: uppercase;">Cognitive Pacing Index</span>
+              <span style="font-family: monospace; font-size: 11px; color: var(--yellow); font-weight: bold;">${pacingScore >= 0 ? '+' : ''}${pacingScore.toFixed(3)} (${escapeHtml(d.pacing_preference || 'balanced')})</span>
+            </div>
+            <div style="position: relative; height: 10px; background: linear-gradient(90deg, #29ADFF 0%, #83769C 50%, #FF004D 100%); border-radius: 5px; margin: 8px 0 4px 0;">
+              <div style="position: absolute; left: calc(${pacingPct}% - 5px); top: -2px; width: 10px; height: 14px; background: var(--white); border: 2px solid #000; border-radius: 3px;" title="Pacing Score: ${pacingScore}"></div>
+            </div>
+            <div style="display: flex; justify-content: space-between; font-size: 9.5px; color: var(--light-gray);">
+              <span>-1.0 Tactical / Methodical</span>
+              <span>0.0 Balanced</span>
+              <span>+1.0 High-Kinetic</span>
+            </div>
+          </div>
+
+          <div class="blueprint-box" style="margin-top: 0;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <span style="font-size: 10px; color: var(--slate); text-transform: uppercase;">Challenge Tolerance Score</span>
+              <span style="font-family: monospace; font-size: 11px; color: var(--amber); font-weight: bold;">${challengeVal.toFixed(2)} / 1.00</span>
+            </div>
+            <div style="height: 10px; background: rgba(29, 43, 83, 0.6); border-radius: 5px; overflow: hidden; margin: 8px 0 4px 0;">
+              <div style="width: ${challengePct}%; height: 100%; background: linear-gradient(90deg, var(--green), var(--amber), var(--neon-red));"></div>
+            </div>
+            <div style="font-size: 9.5px; color: var(--light-gray);">
+              <code>${escapeHtml(formulas.challenge_tolerance || '0.35*hardcore_genre + 0.35*difficulty_tags + 0.20*achievements + 0.10*depth')}</code>
+            </div>
+          </div>
+
+          <div class="blueprint-box" style="margin-top: 0;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <span style="font-size: 10px; color: var(--slate); text-transform: uppercase;">Style Bible Palette Mood</span>
+              <span class="genre-chip" style="border-color: var(--pink); color: var(--pink); font-size: 10px;">${escapeHtml(d.preferred_palette_mood || 'vibrant_fantasy')}</span>
+            </div>
+            <div style="margin-top: 6px;">
+              ${renderVectorBarList(d.palette_weights || {}, 'var(--pink)', [d.preferred_palette_mood])}
+            </div>
+          </div>
+        </div>
+
+        <!-- 3. 5-Tier Playtime & Mastery Distribution -->
+        <div class="blueprint-box" style="margin-top: 0;">
+          <h4 style="color: var(--green); font-size: 11.5px; text-transform: uppercase; margin: 0 0 8px 0;">📊 5-Tier Playtime &amp; Mastery Depth Distribution</h4>
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px;">
+            ${tierMeta.map(([key, label, col]) => {
+              const val = Number(playDist[key] || 0);
+              const pct = Math.max(0, Math.min(100, val * 100));
+              const approxHrs = totalHours * val;
+              return `
+                <div style="background: #040918; border: 1px solid var(--navy); border-radius: 5px; padding: 8px 10px;">
+                  <div style="display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 4px;">
+                    <strong style="color: var(--white);">${label}</strong>
+                    <span style="font-family: monospace; color: ${col}; font-weight: bold;">${pct.toFixed(1)}%</span>
+                  </div>
+                  <div style="height: 6px; background: rgba(29, 43, 83, 0.55); border-radius: 3px; overflow: hidden; margin-bottom: 4px;">
+                    <div style="width: ${Math.max(val > 0 ? 2 : 0, pct)}%; height: 100%; background: ${col};"></div>
+                  </div>
+                  <div style="font-size: 10px; color: var(--slate); font-family: monospace;">~${approxHrs.toFixed(1)}h logged</div>
+                </div>
+              `;
+            }).join('')}
+          </div>
+        </div>
+
+        <!-- 4. Multi-Dimensional Affinity Vectors -->
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 12px;">
+          <div class="blueprint-box" style="margin-top: 0;">
+            <h4 style="color: var(--cyan); font-size: 11.5px; text-transform: uppercase; margin: 0 0 8px 0;">🎮 Canonical Studio Genre Weights (L1 Normalized)</h4>
+            ${renderVectorBarList(d.genre_weights || {}, 'var(--cyan)', d.top_genres || [])}
+          </div>
+          <div class="blueprint-box" style="margin-top: 0;">
+            <h4 style="color: var(--amber); font-size: 11.5px; text-transform: uppercase; margin: 0 0 8px 0;">🏷️ Steam Category Affinities (L1 Normalized)</h4>
+            ${renderVectorBarList(d.category_weights || {}, 'var(--amber)', d.top_categories || [])}
+          </div>
+          <div class="blueprint-box" style="margin-top: 0;">
+            <h4 style="color: var(--green); font-size: 11.5px; text-transform: uppercase; margin: 0 0 8px 0;">⚙️ Mechanical Biases &amp; Thematic Lexicon</h4>
+            <div style="margin-bottom: 10px;">
+              <div style="font-size: 10px; color: var(--slate); text-transform: uppercase; margin-bottom: 4px;">Mechanical Action Biases</div>
+              ${renderVectorBarList(d.mechanical_biases || {}, 'var(--green)', [])}
+            </div>
+            <div>
+              <div style="font-size: 10px; color: var(--slate); text-transform: uppercase; margin-bottom: 4px;">Thematic Biases (Top: ${escapeHtml((d.thematic_biases || []).join(', '))})</div>
+              ${renderVectorBarList(d.thematic_weights || {}, 'var(--purple)', d.thematic_biases || [])}
+            </div>
+          </div>
+        </div>
+
+        <!-- 5. Scanned Top Games & Logarithmic Engagement Weight Table -->
+        <div class="blueprint-box" style="margin-top: 0;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 8px;">
+            <h4 style="color: var(--yellow); font-size: 11.5px; text-transform: uppercase; margin: 0;">
+              🕹️ Top Analyzed Steam Library Titles &amp; Logarithmic Engagement Weights (${topGames.length} Enriched Anchor Titles)
+            </h4>
+            <code style="font-size: 10px; color: var(--cyan); background: #040918; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--navy);">
+              ${escapeHtml(formulas.engagement_weight || 'w_g = ln(1 + playtime_hours)')}
+            </code>
+          </div>
+          <div style="overflow-x: auto;">
+            <table class="probes-table" style="width: 100%; border-collapse: collapse; font-size: 11px;">
+              <thead>
+                <tr style="text-align: left; border-bottom: 1px solid var(--navy); color: var(--light-gray);">
+                  <th style="padding: 6px 8px;">#</th>
+                  <th style="padding: 6px 8px;">Game Title &amp; Role in Genesis</th>
+                  <th style="padding: 6px 8px;">AppID</th>
+                  <th style="padding: 6px 8px;">Logged Playtime</th>
+                  <th style="padding: 6px 8px;">Engagement Weight <code>w_g = ln(1+h)</code></th>
+                  <th style="padding: 6px 8px;">Steam Store Genres &amp; Categories</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${topGames.map((g, idx) => {
+                  const gName = String(g.name || `App ${g.appid}`);
+                  const hrs = Number(g.playtime_hours || 0);
+                  const wg = Number(g.engagement_weight ?? Math.log1p(Math.max(0, hrs)));
+                  const wSharePct = Number(g.weight_share || 0) * 100;
+                  const pSharePct = Number(g.playtime_share || (totalHours > 0 ? hrs / totalHours : 0)) * 100;
+                  const isAnchor = idx < 8 || (anchorRaw && anchorRaw.toLowerCase().includes(gName.toLowerCase()));
+                  const isSpotlight = spotlightRaw && spotlightRaw.toLowerCase().includes(gName.toLowerCase());
+                  const genres = Array.isArray(g.genres) ? g.genres : [];
+                  const cats = Array.isArray(g.categories) ? g.categories : [];
+                  return `
+                    <tr style="border-bottom: 1px solid rgba(29, 43, 83, 0.45);">
+                      <td style="padding: 6px 8px; font-family: monospace; color: var(--slate);">${idx + 1}</td>
+                      <td style="padding: 6px 8px;">
+                        <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
+                          <strong style="color: var(--white);">${escapeHtml(gName)}</strong>
+                          ${isAnchor ? '<span class="genre-chip" style="font-size: 9px; border-color: var(--cyan); color: var(--cyan);">⚓ Core Anchor</span>' : ''}
+                          ${isSpotlight ? '<span class="genre-chip" style="font-size: 9px; border-color: var(--yellow); color: var(--yellow);">✨ Session Spotlight</span>' : ''}
+                        </div>
+                        ${g.short_description ? `<div style="font-size: 9.5px; color: var(--slate); margin-top: 2px; max-width: 440px;">${escapeHtml(g.short_description)}</div>` : ''}
+                      </td>
+                      <td style="padding: 6px 8px; font-family: monospace; color: var(--light-gray);">${escapeHtml(g.appid || '—')}</td>
+                      <td style="padding: 6px 8px; font-family: monospace;">
+                        <strong style="color: var(--amber);">${hrs.toFixed(1)}h</strong>
+                        <span style="font-size: 9.5px; color: var(--slate);">(${pSharePct.toFixed(1)}% of library)</span>
+                      </td>
+                      <td style="padding: 6px 8px; min-width: 150px;">
+                        <div style="display: flex; align-items: center; gap: 6px; font-family: monospace; font-size: 10.5px;">
+                          <span style="color: var(--green); font-weight: bold;">${wg.toFixed(3)}</span>
+                          <span style="color: var(--slate);">(${wSharePct.toFixed(1)}% weight)</span>
+                        </div>
+                        <div style="height: 5px; background: rgba(29, 43, 83, 0.55); border-radius: 3px; overflow: hidden; margin-top: 2px;">
+                          <div style="width: ${Math.min(100, wSharePct * 5)}%; height: 100%; background: var(--green);"></div>
+                        </div>
+                      </td>
+                      <td style="padding: 6px 8px;">
+                        <div style="display: flex; flex-wrap: wrap; gap: 3px;">
+                          ${genres.map(gn => `<span class="genre-chip" style="font-size: 9px;">${escapeHtml(gn)}</span>`).join('')}
+                          ${cats.slice(0, 3).map(ct => `<span style="font-size: 9px; padding: 1px 5px; border-radius: 3px; background: rgba(255, 163, 0, 0.1); border: 1px solid rgba(255, 163, 0, 0.3); color: var(--amber);">${escapeHtml(ct)}</span>`).join('')}
+                        </div>
+                      </td>
+                    </tr>
+                  `;
+                }).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- 6. Active Game Bible Translation: Target Player DNA Prompt, Concept Candidates & Fragments -->
+        <div class="blueprint-box" style="margin-top: 0; border-left: 3px solid var(--yellow);">
+          <h4 style="color: var(--yellow); font-size: 11.5px; text-transform: uppercase; margin: 0 0 8px 0;">
+            🧠 How the Writers' Room Translated This Steam DNA into "${escapeHtml(b.game_title || 'Active Game Concept')}"
+          </h4>
+          ${dnaPromptSummary ? `
+            <div style="margin-bottom: 12px;">
+              <div style="font-size: 10.5px; color: var(--cyan); font-weight: bold; margin-bottom: 4px;">
+                Exact Target Player DNA Directive Injected into All 9 Writers' Room Specialists (<code>game_bible.target_player_dna_summary</code>):
+              </div>
+              <pre style="background: #040918; border: 1px solid var(--navy); border-radius: 5px; padding: 10px 12px; font-size: 10.5px; line-height: 1.5; color: var(--white); white-space: pre-wrap; margin: 0;">${escapeHtml(dnaPromptSummary)}</pre>
+            </div>
+          ` : ''}
+
+          ${conceptCandidates.length > 0 ? `
+            <div style="margin-bottom: 12px;">
+              <div style="font-size: 10.5px; color: var(--green); font-weight: bold; margin-bottom: 6px;">
+                Phase 0.5 — Synthesized Concept Candidates Collided from DNA Fragments (${conceptCandidates.length} Candidates):
+              </div>
+              <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px;">
+                ${conceptCandidates.map((cc, idx) => {
+                  const isChosen = b.game_title && String(cc.working_title || '').toLowerCase() === String(b.game_title || '').toLowerCase();
+                  return `
+                    <div style="background: #040918; border: 1px solid ${isChosen ? 'var(--green)' : 'var(--navy)'}; border-radius: 6px; padding: 10px 12px; font-size: 11px; display: flex; flex-direction: column; gap: 5px;">
+                      <div style="display: flex; justify-content: space-between; align-items: center; gap: 6px;">
+                        <strong style="color: ${isChosen ? 'var(--green)' : 'var(--white)'}; font-size: 12px;">#${idx + 1}: ${escapeHtml(cc.working_title || cc.candidate_id)}</strong>
+                        ${isChosen ? '<span class="genre-chip" style="border-color: var(--green); color: var(--green); font-size: 9px;">✓ SELECTED CONCEPT</span>' : `<span style="font-size: 9.5px; color: var(--slate); font-family: monospace;">${escapeHtml(cc.candidate_id || '')}</span>`}
+                      </div>
+                      <div style="font-size: 10.5px; color: var(--light-gray); line-height: 1.4;">${escapeHtml(cc.premise || '')}</div>
+                      ${cc.core_tension ? `<div style="font-size: 10px; color: var(--peach);"><strong>Core Tension:</strong> ${escapeHtml(cc.core_tension)}</div>` : ''}
+                      ${cc.deliberation ? `<div style="font-size: 10px; color: var(--amber);"><strong>Synthesis Deliberation:</strong> ${escapeHtml(cc.deliberation)}</div>` : ''}
+                      ${Array.isArray(cc.source_fragment_ids) && cc.source_fragment_ids.length > 0 ? `<div style="font-size: 9.5px; color: var(--cyan); font-family: monospace;">Collided Fragments: ${escapeHtml(cc.source_fragment_ids.join(' + '))}</div>` : ''}
+                    </div>
+                  `;
+                }).join('')}
+              </div>
+            </div>
+          ` : ''}
+
+          ${conceptFragments.length > 0 ? `
+            <details style="margin-top: 6px;">
+              <summary style="cursor: pointer; color: var(--cyan); font-size: 11px; font-weight: bold;">
+                🧩 Inspect All ${conceptFragments.length} Phase 0 Specialist Concept Fragments Generated from Steam DNA
+              </summary>
+              <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 8px; margin-top: 8px;">
+                ${conceptFragments.map(cf => `
+                  <div style="background: #040918; border: 1px solid var(--navy); border-radius: 5px; padding: 8px 10px; font-size: 10.5px; display: flex; flex-direction: column; gap: 4px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                      <strong style="color: var(--cyan);">${escapeHtml(cf.fragment_id || cf.contributor_role)}</strong>
+                      <span class="genre-chip" style="font-size: 9px;">${escapeHtml(cf.fragment_kind || 'fragment')}</span>
+                    </div>
+                    <div style="color: var(--white); line-height: 1.4;">${escapeHtml(cf.fragment || '')}</div>
+                    ${cf.deliberation ? `<div style="color: var(--amber); font-size: 9.5px;"><strong>Deliberation:</strong> ${escapeHtml(cf.deliberation)}</div>` : ''}
+                  </div>
+                `).join('')}
+              </div>
+            </details>
+          ` : ''}
+        </div>
+
+        <!-- 7. Raw SteamPlayerDNA JSON Payload Inspector -->
+        <details style="background: #040918; border: 1px solid var(--navy); border-radius: 6px; padding: 8px 12px;">
+          <summary style="cursor: pointer; color: var(--slate); font-size: 10.5px;">Inspect Raw <code>/api/steam/dna</code> JSON Payload</summary>
+          <pre class="json-dump" style="max-height: 320px; margin-top: 8px;">${escapeHtml(JSON.stringify(d, null, 2))}</pre>
+        </details>
+      `;
+
+      setHtmlIfChanged(container, html);
+    }
+
     async function loadSteamDNA() {
       try {
         const res = await fetch('/api/steam/dna');
         if (!res.ok) return;
         const data = await res.json();
+        latestSteamDnaData = data;
         const pt = document.getElementById('dna-playtime');
         const gc = document.getElementById('dna-games-count');
         const pp = document.getElementById('dna-pacing');
@@ -4476,6 +4852,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             tg.appendChild(span);
           });
         }
+        renderSteamDnaSubview(data, cachedGameBible);
       } catch (e) {
         // Backend not ready
       }
@@ -5841,7 +6218,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       document.querySelectorAll('.bible-subtab-btn').forEach(btn => {
         btn.classList.toggle('active', btn.getAttribute('data-bible-tab') === subtabName);
       });
-      ['board', 'renders', 'transcript', 'evolution', 'mockups', 'characters', 'pillars', 'signoff'].forEach(name => {
+      ['board', 'renders', 'transcript', 'evolution', 'mockups', 'characters', 'pillars', 'dna', 'signoff'].forEach(name => {
         const view = document.getElementById(`bible-subview-${name}`);
         if (view) view.classList.toggle('active', name === subtabName);
       });
@@ -5851,6 +6228,13 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       }
       if (subtabName === 'renders' && _latestArtifactsData) {
         renderBuiltRendersShowcase(_latestArtifactsData, _selectedCartridgeId || _activeCandidateId || '');
+      }
+      if (subtabName === 'dna') {
+        if (latestSteamDnaData) {
+          renderSteamDnaSubview(latestSteamDnaData, cachedGameBible);
+        } else {
+          loadSteamDNA();
+        }
       }
     }
 
@@ -8349,6 +8733,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       }
 
       renderGameBlueprintPanel(latestHeatmapData, cachedGameBible);
+      renderSteamDnaSubview(latestSteamDnaData, cachedGameBible);
       updateBibleProductionBanner();
       updateStudioPulseRibbon();
     }

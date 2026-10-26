@@ -3530,13 +3530,74 @@ def create_app(
                 except Exception as scan_err:
                     logger.debug("Local Steam scanner fallback unavailable: %s", scan_err)
 
+        app_cache_apps: Dict[str, Any] = {}
+        app_cache_meta: Dict[str, Any] = {}
+        app_cache_path = config.DATA_DIR / "steam_app_cache.json"
+        if app_cache_path.is_file():
+            try:
+                raw_cache = json.loads(app_cache_path.read_text(encoding="utf-8"))
+                if isinstance(raw_cache, dict):
+                    app_cache_apps = raw_cache.get("apps", {}) if isinstance(raw_cache.get("apps"), dict) else {}
+                    app_cache_meta = raw_cache.get("_meta", {}) if isinstance(raw_cache.get("_meta"), dict) else {}
+            except Exception:
+                pass
+
+        provenance_formulas = {
+            "engagement_weight": "w_g = ln(1 + playtime_hours) * (1 + 0.5 * min(1.0, recent_2wk_hours / 20))",
+            "genre_and_category_normalization": "L1-normalized engagement-weighted indicator sum across 10 canonical Studio genres and 8 Steam categories",
+            "pacing_index": "Continuous [-1.0, +1.0] index: (W_kinetic - W_methodical) / (W_kinetic + W_methodical); < -0.20 = tactical_methodical, > +0.20 = high_kinetic",
+            "challenge_tolerance": "0.35 * hardcore_genre_affinity + 0.35 * difficulty_tag_ratio + 0.20 * achievement_completion + 0.10 * mastery_depth",
+            "palette_mood": "Weighted linear combination of genre & thematic vectors mapped onto 4 Style Bible 16-color moods (neon_cyberpunk, grim_dark, vibrant_fantasy, retro_arcade)",
+        }
+
         if dna:
-            top_games_list = []
+            raw_top_games = []
             if hasattr(dna, "top_games") and dna.top_games:
-                top_games_list = dna.top_games
+                raw_top_games = list(dna.top_games)
             elif hasattr(dna, "playtime_distribution") and dna.playtime_distribution:
                 for appid_str, hours in sorted(dna.playtime_distribution.items(), key=lambda x: x[1], reverse=True)[:10]:
-                    top_games_list.append({"name": f"App {appid_str}", "playtime_hours": hours})
+                    raw_top_games.append({"name": f"App {appid_str}", "playtime_hours": hours})
+
+            total_hrs = float(getattr(dna, "total_playtime_hours", 0.0) or 0.0)
+            weights_list = []
+            for g in raw_top_games:
+                hrs = float(g.get("playtime_hours", 0.0) or 0.0) if isinstance(g, dict) else 0.0
+                weights_list.append(math.log1p(max(0.0, hrs)))
+            sum_top_weights = sum(weights_list) or 1.0
+
+            top_games_list = []
+            for idx_g, g in enumerate(raw_top_games):
+                if not isinstance(g, dict):
+                    continue
+                g_copy = dict(g)
+                appid_val = g_copy.get("appid")
+                hrs = float(g_copy.get("playtime_hours", 0.0) or 0.0)
+                w_g = weights_list[idx_g] if idx_g < len(weights_list) else math.log1p(max(0.0, hrs))
+                g_copy["engagement_weight"] = round(w_g, 4)
+                g_copy["weight_share"] = round(w_g / sum_top_weights, 4)
+                g_copy["playtime_share"] = round(hrs / total_hrs, 4) if total_hrs > 0 else 0.0
+                if appid_val is not None and str(appid_val) in app_cache_apps:
+                    cached_entry = app_cache_apps[str(appid_val)]
+                    if isinstance(cached_entry, dict):
+                        if not g_copy.get("categories") and cached_entry.get("categories"):
+                            g_copy["categories"] = cached_entry.get("categories", [])[:6]
+                        if cached_entry.get("short_description"):
+                            g_copy["short_description"] = cached_entry.get("short_description")
+                top_games_list.append(g_copy)
+
+            provenance = {
+                "scanner_sources": [
+                    "~/Library/Application Support/Steam/config/loginusers.vdf",
+                    "~/Library/Application Support/Steam/steamapps/libraryfolders.vdf",
+                    "~/Library/Application Support/Steam/userdata/<id>/config/localconfig.vdf",
+                    "~/Library/Application Support/Steam/steamapps/appmanifest_*.acf",
+                ],
+                "store_cache_path": "data/steam_app_cache.json",
+                "store_cached_apps_count": len(app_cache_apps),
+                "store_cache_updated_at_utc": app_cache_meta.get("updated_at_utc", ""),
+                "persistence_table": "telemetry.db :: steam_player_dna (SQLite WAL)",
+                "formulas": provenance_formulas,
+            }
 
             delib = dna.deliberation or f"Analyzed Steam DNA profile for '{dna.player_id}'."
             resp = SteamDNAResponse(
@@ -3545,12 +3606,22 @@ def create_app(
                 profile_tag=dna.profile_tag,
                 total_playtime_hours=dna.total_playtime_hours,
                 total_games_analyzed=dna.total_games_analyzed,
-                top_genres=dna.top_genres,
-                genre_weights=dna.genre_weights,
+                top_genres=getattr(dna, "top_genres", []) or [],
+                genre_weights=getattr(dna, "genre_weights", {}) or {},
+                top_categories=getattr(dna, "top_categories", []) or [],
+                category_weights=getattr(dna, "category_weights", {}) or {},
+                playtime_distribution=getattr(dna, "playtime_distribution", {}) or {},
                 top_games=top_games_list,
                 pacing_preference=dna.pacing_preference,
                 pacing_score=dna.pacing_score,
                 challenge_tolerance=dna.challenge_tolerance,
+                thematic_biases=getattr(dna, "thematic_biases", []) or [],
+                thematic_weights=getattr(dna, "thematic_weights", {}) or {},
+                mechanical_biases=getattr(dna, "mechanical_biases", {}) or {},
+                preferred_palette_mood=getattr(dna, "preferred_palette_mood", "vibrant_fantasy") or "vibrant_fantasy",
+                palette_weights=getattr(dna, "palette_weights", {}) or {},
+                created_at_utc=getattr(dna, "created_at_utc", "") or "",
+                ingestion_provenance=provenance,
             )
         else:
             delib = "No persisted or scanned Steam library profile found. Default baseline profile active."
@@ -3562,10 +3633,26 @@ def create_app(
                 total_games_analyzed=0,
                 top_genres=["Action", "Roguelike", "Strategy"],
                 genre_weights={"Action": 0.4, "Roguelike": 0.35, "Strategy": 0.25},
+                top_categories=["Single-player", "Full controller support"],
+                category_weights={"Single-player": 0.7, "Full controller support": 0.3},
+                playtime_distribution={
+                    "mastered_over_100h": 0.0,
+                    "dedicated_50_to_100h": 0.0,
+                    "engaged_10_to_50h": 0.0,
+                    "casual_2_to_10h": 0.0,
+                    "dabbled_under_2h": 0.0,
+                },
                 top_games=[],
                 pacing_preference="balanced",
                 pacing_score=0.0,
                 challenge_tolerance=0.5,
+                thematic_biases=["sci-fi", "dark fantasy"],
+                thematic_weights={"sci-fi": 0.5, "dark fantasy": 0.5},
+                mechanical_biases={"dodge_roll": 0.5, "ranged_aim": 0.5, "close_combat": 0.5, "speedrun": 0.3},
+                preferred_palette_mood="neon_cyberpunk",
+                palette_weights={"neon_cyberpunk": 0.4, "grim_dark": 0.2, "vibrant_fantasy": 0.2, "retro_arcade": 0.2},
+                created_at_utc="",
+                ingestion_provenance={"formulas": provenance_formulas},
             )
         return JSONResponse(resp.model_dump())
 
