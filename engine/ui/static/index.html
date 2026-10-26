@@ -3700,8 +3700,36 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       _lastBuildError = null;
       const banner = document.getElementById('studio-build-error-banner');
       if (banner) banner.style.display = 'none';
+      if (typeof renderProductionBoard === 'function' && latestProductionBoard) {
+        renderProductionBoard(latestProductionBoard);
+      }
     }
     window.dismissBuildErrorBanner = dismissBuildErrorBanner;
+
+    function dismissCardError(itemId, ev) {
+      if (ev && typeof ev.stopPropagation === 'function') ev.stopPropagation();
+      if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+      const boardItems = (latestProductionBoard && Array.isArray(latestProductionBoard.items)) ? latestProductionBoard.items : [];
+      for (const it of boardItems) {
+        const id = it ? (it.id || it.item_id || '') : '';
+        if (id === itemId && it.failure) {
+          _dismissedErrorKeys.add(`item:${id}|${String(it.failure || '').slice(0, 160)}`);
+        }
+      }
+      if (_lastBuildError && _lastBuildError.item_id === itemId) {
+        _dismissedErrorKeys.add(_getErrorDismissKey(_lastBuildError));
+        _lastBuildError = null;
+        const banner = document.getElementById('studio-build-error-banner');
+        if (banner) banner.style.display = 'none';
+      }
+      try {
+        sessionStorage.setItem('studio_dismissed_errors', JSON.stringify(Array.from(_dismissedErrorKeys).slice(-100)));
+      } catch (e) {}
+      if (typeof renderProductionBoard === 'function' && latestProductionBoard) {
+        renderProductionBoard(latestProductionBoard);
+      }
+    }
+    window.dismissCardError = dismissCardError;
 
     let _selectedCartridgeId = '';
     let _userPinnedCartridge = false;
@@ -6353,10 +6381,11 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
               </div>
             </div>
             ${formatStructuredSpecHtml(it.description || '', it.proof_spec || '')}
-            ${it.failure ? `
-              <details ${st === 'failed' ? 'open' : ''} style="background: rgba(255, 0, 77, 0.12); border: 1px solid var(--neon-red); border-left: 3px solid var(--neon-red); border-radius: 5px; padding: 6px 10px; font-size: 10.5px; color: var(--pink); min-width: 0; overflow-wrap: anywhere;">
-                <summary style="cursor: pointer; font-weight: 800; color: var(--neon-red);">
-                  ⚠️ Execution Error on [${escapeHtml(it.id)}]: <span style="font-weight: 400; color: var(--pink);">${escapeHtml(String(it.failure).slice(0, 140))}${String(it.failure).length > 140 ? '…' : ''}</span>
+            ${(it.failure && (st === 'failed' || st === 'needs_decision') && !_isErrorDismissed({ item_id: it.id, message: it.failure })) ? `
+              <details data-details-key="err-${escapeHtml(it.id)}-${escapeHtml(st)}" ${st === 'failed' ? 'open' : ''} style="background: rgba(255, 0, 77, 0.12); border: 1px solid var(--neon-red); border-left: 3px solid var(--neon-red); border-radius: 5px; padding: 6px 10px; font-size: 10.5px; color: var(--pink); min-width: 0; overflow-wrap: anywhere;">
+                <summary style="cursor: pointer; font-weight: 800; color: var(--neon-red); display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+                  <span>⚠️ Execution Error on [${escapeHtml(it.id)}]: <span style="font-weight: 400; color: var(--pink);">${escapeHtml(String(it.failure).slice(0, 140))}${String(it.failure).length > 140 ? '…' : ''}</span></span>
+                  <button type="button" onclick="dismissCardError('${escapeHtml(it.id)}', event)" style="background: transparent; color: var(--slate); border: 1px solid var(--slate); border-radius: 4px; padding: 1px 7px; font-size: 9.5px; cursor: pointer; flex-shrink: 0;">Dismiss</button>
                 </summary>
                 <pre tabindex="0" style="margin: 6px 0 0 0; padding: 8px; background: #030712; border: 1px solid rgba(255, 0, 77, 0.4); border-radius: 4px; color: var(--pink); font-family: monospace; font-size: 10px; white-space: pre-wrap; overflow-x: auto; max-height: 220px;"><code>${escapeHtml(it.failure)}</code></pre>
               </details>

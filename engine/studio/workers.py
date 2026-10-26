@@ -1866,7 +1866,14 @@ def plan_task_lead_turn(
             + prior_trace_text
         )
     if getattr(item, "failure", ""):
-        prior_revision_block += f"\nPREVIOUS WORKER EXECUTION ERROR TO FIX:\n{item.failure[-800:]}\n"
+        if turn_history and any(not str(t.summary).startswith("FAILED") for t in turn_history):
+            prior_revision_block += (
+                "\nPRIOR ATTEMPT ERROR (occurred BEFORE Turn 0 of this attempt; if a specialist in CURRENT REVISION TURN HISTORY "
+                "already updated the code to address this, proceed to the next verification/proof specialist such as qa_test_engineer):\n"
+                f"{item.failure[-800:]}\n"
+            )
+        else:
+            prior_revision_block += f"\nPREVIOUS WORKER EXECUTION ERROR TO FIX:\n{item.failure[-800:]}\n"
 
     turns_block = ""
     if turn_history:
