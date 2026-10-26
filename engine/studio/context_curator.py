@@ -102,6 +102,50 @@ class CuratedContextPack:
     retrieved_chunks: List[ContextChunk] = field(default_factory=list)
 
 
+class SelfInquiryQAPair(BaseModel):
+    """A resolved Question -> Self-Answer pair produced by an agent's self-inquiry turn (Rule 4: deliberation first)."""
+
+    deliberation: str = Field(
+        default="Recorded self-inquiry question and agent-synthesized answer for tight context retention.",
+        description="Rationale for recording this resolved self-inquiry Q&A pair.",
+    )
+    question: str = Field(..., description="The question the agent asked itself when it needed additional context.")
+    answer: str = Field(
+        ...,
+        description="The concise, factual answer synthesized by the asking agent itself on the next turn after inspecting the chunks brought in by ContextCuratorAgent.",
+    )
+    researched_chunk_ids: List[str] = Field(
+        default_factory=list,
+        description="The chunk IDs brought in by ContextCuratorAgent to let the agent answer this question.",
+    )
+
+
+class QuestionContextResearchDecision(BaseModel):
+    """Structured output of ContextCuratorAgent when researching an agent's `self_question` (Rule 4: deliberation strictly first).
+    Crucially, ContextCuratorAgent NEVER answers the question itself; it only selects the chunks needed for the asking agent to answer its own question.
+    """
+
+    deliberation: str = Field(
+        ...,
+        description="Step-by-step deliberation identifying which candidate chunks (code modules, reference-graph neighbors, design specs, council utterances, or asset definitions) contain the raw evidence needed so the asking agent can answer its own question on the next turn.",
+    )
+    selected_chunk_ids: List[str] = Field(
+        default_factory=list,
+        description="Exact `chunk_id` values from the candidate chunks to bring into the asking agent's next turn so the agent can answer its own question.",
+    )
+
+
+@dataclass
+class QuestionContextPack:
+    """Raw context chunks retrieved by `ContextCuratorAgent.research_question_context` for an agent's `self_question`."""
+
+    question: str
+    prompt_block: str
+    selected_chunk_ids: List[str] = field(default_factory=list)
+    retrieved_chunks: List[ContextChunk] = field(default_factory=list)
+    decision: Optional[QuestionContextResearchDecision] = None
+
+
 def is_real_genai_client(client: Any) -> bool:
     """Returns True when `client` is a live `google.genai` Client (excluding unit-test `google.genai.fake` clients)."""
     if client is None:
@@ -286,8 +330,9 @@ class CartridgeSemanticIndex:
                         )
                     )
 
-            # 1e. Level Generation Strategy, Core Loop, Engagement, Onboarding, Goal Hierarchy, Audio, UI
+            # 1e. Target Player DNA, Level Generation Strategy, Core Loop, Engagement, Onboarding, Goal Hierarchy, Audio, UI
             for section_key, section_title in (
+                ("target_player_dna_summary", "Target Player Steam DNA Profile & Optimization Mandate"),
                 ("level_generation_strategy", "Level Generation Strategy & World Construction Plan"),
                 ("core_loop", "Core Gameplay Loop & System Interactions"),
                 ("engagement_plan", "Player Engagement & Pacing Plan"),
@@ -644,35 +689,132 @@ class CartridgeSemanticIndex:
                 )
             )
 
-        # 6. On-Disk GDScript Modules & Bound Assets
-        for gd_path in sorted(self.cartridge_dir.glob("*.gd")):
-            if gd_path.name.startswith("test_"):
-                continue
-            try:
-                src = gd_path.read_text(encoding="utf-8")
-            except Exception:
-                continue
-            classes = re.findall(r"^\s*class\s+([A-Za-z0-9_]+)", src, flags=re.MULTILINE)
-            funcs = re.findall(r"^\s*(?:static\s+)?func\s+([A-Za-z0-9_]+)\s*\(([^)]*)\)", src, flags=re.MULTILINE)
-            vars_top = re.findall(r"^var\s+([A-Za-z0-9_]+)", src, flags=re.MULTILINE)
-            bound_assets = sorted(set(re.findall(r"(?:res://)?assets/[A-Za-z0-9_./-]+\.(?:png|wav|ogg|mp3)", src)))
-            func_sig = ", ".join(f"{fn}({args.strip()})" for fn, args in funcs[:24])
+        # 6. On-Disk GDScript / Shader / Scene Modules & Bidirectional Reference Graph
+        code_graph = self.build_code_reference_graph()
+        for rel_mod, meta in sorted(code_graph.items()):
             _add(
                 ContextChunk(
-                    chunk_id=f"code:module:{gd_path.name}",
+                    chunk_id=f"code:module:{rel_mod}",
                     category="code_module",
-                    title=f"GDScript Module `{gd_path.name}` (bound_assets={bound_assets})",
-                    content=(
-                        f"Module: {gd_path.name} ({len(src)} chars)\n"
-                        f"Inner Classes: {classes}\n"
-                        f"Top-Level Vars: {vars_top[:20]}\n"
-                        f"Bound Asset Paths Referenced in Code: {bound_assets}\n"
-                        f"Function Signatures: [{func_sig}]"
+                    title=(
+                        f"Code Module `{rel_mod}` "
+                        f"(imports={meta['imports']}, imported_by={meta['imported_by']}, bound_assets={meta['bound_assets']})"
                     ),
+                    content=meta["summary_content"],
                 )
             )
 
         return chunks
+
+    def build_code_reference_graph(self) -> Dict[str, Dict[str, Any]]:
+        """Scans all `.gd`, `.gdshader`, and `.tscn` files in the cartridge (including `scripts/`, `shaders/`, `tests/`)
+        and constructs a bidirectional reference graph (`imports` and `imported_by`) across `preload(...)`, `load(...)`,
+        `[ext_resource ... path="res://..."]`, and global `class_name` identifiers, along with compact symbol & property contracts."""
+        ignored_top_dirs = {".godot", "artifacts", "assets", "res:", "__pycache__"}
+        module_files: Dict[str, Path] = {}
+        for ext in ("*.gd", "*.gdshader", "*.tscn"):
+            for p in sorted(self.cartridge_dir.rglob(ext)):
+                if not p.is_file():
+                    continue
+                try:
+                    rel = p.relative_to(self.cartridge_dir)
+                except ValueError:
+                    continue
+                if rel.parts and rel.parts[0] in ignored_top_dirs:
+                    continue
+                rel_str = str(rel).replace("\\", "/")
+                if rel_str == "src/studio_rig_and_collider.gd":
+                    continue
+                module_files[rel_str] = p
+
+        raw_sources: Dict[str, str] = {}
+        class_name_to_mod: Dict[str, str] = {}
+        for rel_str, p in module_files.items():
+            try:
+                src = p.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            raw_sources[rel_str] = src
+            if rel_str.endswith(".gd"):
+                m_cn = re.search(r"^\s*class_name\s+([A-Za-z0-9_]+)", src, flags=re.MULTILINE)
+                if m_cn:
+                    class_name_to_mod[m_cn.group(1).strip()] = rel_str
+
+        imports_map: Dict[str, List[str]] = {k: [] for k in raw_sources}
+        imported_by_map: Dict[str, List[str]] = {k: [] for k in raw_sources}
+
+        ref_re = re.compile(
+            r'(?:preload|load)\(\s*["\'](?:res://)?([A-Za-z0-9_./-]+\.(?:gd|gdshader|tscn))["\']\s*\)'
+            r'|path\s*=\s*["\'](?:res://)?([A-Za-z0-9_./-]+\.(?:gd|gdshader|tscn))["\']'
+        )
+
+        for rel_str, src in raw_sources.items():
+            refs: List[str] = []
+            for m in ref_re.finditer(src):
+                target = (m.group(1) or m.group(2) or "").strip().lstrip("/")
+                if target in raw_sources and target != rel_str and target not in refs:
+                    refs.append(target)
+            if rel_str.endswith(".gd"):
+                for cn, cn_mod in class_name_to_mod.items():
+                    if cn_mod != rel_str and cn_mod not in refs:
+                        if re.search(rf"\b{re.escape(cn)}\b", src):
+                            refs.append(cn_mod)
+            imports_map[rel_str] = refs
+            for r in refs:
+                if rel_str not in imported_by_map[r]:
+                    imported_by_map[r].append(rel_str)
+
+        graph: Dict[str, Dict[str, Any]] = {}
+        for rel_str, src in raw_sources.items():
+            classes = re.findall(r"^\s*class\s+([A-Za-z0-9_]+)", src, flags=re.MULTILINE)
+            signals = re.findall(r"^\s*signal\s+([A-Za-z0-9_]+(?:\([^)]*\))?)", src, flags=re.MULTILINE)
+            funcs = re.findall(r"^\s*(?:static\s+)?func\s+([A-Za-z0-9_]+)\s*\(([^)]*)\)", src, flags=re.MULTILINE)
+            var_lines: List[str] = []
+            for m_var in re.finditer(
+                r"^(?:@onready\s+|@export\s+)?var\s+([A-Za-z0-9_]+(?:\s*:\s*[A-Za-z0-9_]+)?(?:\s*=\s*[^\n#]+)?)",
+                src,
+                flags=re.MULTILINE,
+            ):
+                v_decl = m_var.group(1).strip()
+                if len(v_decl) > 80:
+                    v_decl = v_decl[:77] + "..."
+                var_lines.append(v_decl)
+            uniforms = re.findall(
+                r"^\s*uniform\s+([A-Za-z0-9_]+\s+[A-Za-z0-9_]+(?:\s*:\s*[^=;\n]+)?(?:\s*=\s*[^;\n]+)?)",
+                src,
+                flags=re.MULTILINE,
+            )
+            bound_assets = sorted(
+                set(re.findall(r"(?:res://)?assets/[A-Za-z0-9_./-]+\.(?:png|wav|ogg|mp3)", src))
+            )
+            func_sig = ", ".join(f"{fn}({args.strip()})" for fn, args in funcs[:28])
+            summary_lines = [
+                f"Module: {rel_str} ({len(src)} chars)",
+                f"Imports / References: {imports_map[rel_str]}",
+                f"Imported By: {imported_by_map[rel_str]}",
+            ]
+            if signals:
+                summary_lines.append(f"Signals: {signals[:16]}")
+            if classes:
+                summary_lines.append(f"Inner Classes: {classes[:12]}")
+            if var_lines:
+                summary_lines.append(f"Top-Level Vars & Defaults: {var_lines[:28]}")
+            if uniforms:
+                summary_lines.append(f"Shader Uniforms: {uniforms[:20]}")
+            if bound_assets:
+                summary_lines.append(f"Bound Asset Paths Referenced in Code: {bound_assets}")
+            if func_sig:
+                summary_lines.append(f"Function Signatures: [{func_sig}]")
+            if rel_str.endswith((".tscn", ".gdshader")) and len(src) <= 1800:
+                summary_lines.append(f"Source Preview:\n{src}")
+            graph[rel_str] = {
+                "rel_path": rel_str,
+                "imports": imports_map[rel_str],
+                "imported_by": imported_by_map[rel_str],
+                "bound_assets": bound_assets,
+                "summary_content": "\n".join(summary_lines),
+            }
+        return graph
 
     def _load_embedding_cache(self) -> Dict[str, List[float]]:
         if not self.index_path.is_file():
@@ -959,7 +1101,15 @@ class ContextCuratorAgent:
                             if not p.is_file():
                                 continue
                             mime = "image/jpeg" if p.suffix.lower() in (".jpg", ".jpeg") else "image/png"
-                            multimodal_parts.append(f"CURATED REFERENCE / PROOF IMAGE ({p.name}):")
+                            n_low = p.name.lower()
+                            qa_overlay_note = ""
+                            if n_low.startswith("plate_"):
+                                qa_overlay_note = " [QA ALPHA INSPECTION PLATE: dark/light checkerboard grids and cyan bounding box are external QA overlays, NOT inside the sprite PNG]"
+                            elif n_low.startswith("anim_sheet_") or n_low.startswith("anim_rig_"):
+                                qa_overlay_note = " [QA ANIMATION CONTACT SHEET: dark checkerboard grid, cyan cell borders, and horizontal yellow/gold baseline ruler lines at the bottom of frames are external QA alignment guides, NOT inside the sprite sheet PNG]"
+                            elif "filmstrip" in n_low:
+                                qa_overlay_note = " [QA CONTACT SHEET: top/bottom '[QA] tick ...' / '[QA] pos=...' strips are external QA margins, NOT inside the 16:9 viewport]"
+                            multimodal_parts.append(f"CURATED REFERENCE / PROOF IMAGE ({p.name}){qa_overlay_note}:")
                             multimodal_parts.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime))
                         if trace_dir is not None and safe_role != cache_role:
                             role_file = trace_dir / f"context_pack_{safe_role}.json"
@@ -1016,6 +1166,69 @@ class ContextCuratorAgent:
                                 effective_extra_images.insert(0, ch.associated_image_path)
                         break
 
+            # Traverse 1-2 hops of the code reference graph (imports & imported_by) from target modules
+            # so any file referenced by or referencing the task's files is presented to the Curator LLM.
+            code_graph = self.semantic_index.build_code_reference_graph()
+            all_by_cid: Dict[str, ContextChunk] = {c.chunk_id: c for c in all_chunks}
+            seed_mods: List[str] = []
+
+            def _add_seed_mod(raw_m: str) -> None:
+                s = str(raw_m or "").strip().replace("\\", "/")
+                if s.startswith("res://"):
+                    s = s[len("res://"):]
+                elif s.startswith("res:/"):
+                    s = s[len("res:/"):]
+                s = s.lstrip("/")
+                if s in code_graph and s not in seed_mods:
+                    seed_mods.append(s)
+
+            if item_id and self.board is not None and hasattr(self.board, "get"):
+                try:
+                    b_item = self.board.get(item_id)
+                    for tm in (getattr(b_item, "target_modules", None) or []):
+                        _add_seed_mod(tm)
+                except Exception:
+                    pass
+            for m_path in re.findall(r"(?:res://)?([A-Za-z0-9_./-]+\.(?:gd|gdshader|tscn))", task_request or ""):
+                _add_seed_mod(m_path)
+            if item_kind in ("level_map", "ui", "integration", "mechanic_code"):
+                _add_seed_mod("main.gd")
+
+            graph_relations: Dict[str, str] = {}
+            hop1_mods: List[str] = []
+            for sm in seed_mods:
+                graph_relations.setdefault(sm, "target/seed module")
+                meta = code_graph.get(sm) or {}
+                for imp in meta.get("imports", []):
+                    if imp in code_graph and imp not in graph_relations:
+                        graph_relations[imp] = f"imported by `{sm}`"
+                        hop1_mods.append(imp)
+                for imp_by in meta.get("imported_by", []):
+                    if imp_by in code_graph and imp_by not in graph_relations:
+                        graph_relations[imp_by] = f"imports `{sm}`"
+                        hop1_mods.append(imp_by)
+            for h1 in hop1_mods:
+                meta = code_graph.get(h1) or {}
+                for imp in meta.get("imports", []):
+                    if imp in code_graph and imp not in graph_relations:
+                        graph_relations[imp] = f"2-hop import via `{h1}`"
+
+            for rel_mod, rel_reason in graph_relations.items():
+                cid = f"code:module:{rel_mod}"
+                if cid in all_by_cid and cid not in chunks_by_id:
+                    ch_copy = all_by_cid[cid].model_copy(
+                        update={
+                            "title": f"{all_by_cid[cid].title} [GRAPH-LINKED: {rel_reason}]",
+                        }
+                    )
+                    ranked_pairs.append((ch_copy, 0.92))
+                    candidate_chunks.append(ch_copy)
+                    chunks_by_id[cid] = ch_copy
+                elif cid in chunks_by_id:
+                    existing_ch = chunks_by_id[cid]
+                    if "[GRAPH-LINKED:" not in existing_ch.title:
+                        existing_ch.title = f"{existing_ch.title} [GRAPH-LINKED: {rel_reason}]"
+
             # Collect available multimodal images from candidate chunks + any explicit `extra_image_paths`
             available_images: Dict[str, str] = {}
             for c in candidate_chunks:
@@ -1057,6 +1270,7 @@ class ContextCuratorAgent:
                 f"   - Include relevant Council utterances (`council:utterance:...`) where the Council discussed this feature, entity, level, or aesthetic.\n"
                 f"   - Include the relevant `design:rendering:treatment:...` and `design:visual_style_and_layers` / `asset:concept_mockup:...` chunks whenever `{target_agent_role}` is planning, building, or reviewing visual assets, entities, levels (`level_map`), mechanics, or UI.\n"
                 f"   - Include relevant `asset:catalog:...` and `board:item:...` chunks so `{target_agent_role}` knows which sprites/rigs/props already exist on disk vs. which are queued on the ProductionBoard.\n"
+                f"   - Inspect `code:module:...` chunks (especially `[GRAPH-LINKED: ...]` modules imported by or importing the task's target files) and include any referenced modules whose classes, variables, UI overlays, or signals interact with this task.\n"
                 f"2. In `selected_image_paths`, select the 16:9 Concept Art Mockup image path whenever `{target_agent_role}` is planning, implementing, fabricating, or reviewing visual, level, entity, or UI work, plus any relevant fabricated sprite plates or captured proof images.\n"
                 f"3. In `role_tailored_synthesis`, write a concise, high-signal synthesis specifically for `{target_agent_role}` connecting the Council's discussion, the target visual/rendering aesthetic, and the exact asset/code contracts for `{item_id}`.\n"
                 f"Provide `deliberation` FIRST."
@@ -1113,7 +1327,15 @@ class ContextCuratorAgent:
                     continue
                 mime = "image/jpeg" if p.suffix.lower() in (".jpg", ".jpeg") else "image/png"
                 desc = available_images.get(img_str) or f"Attached image ({p.name})"
-                multimodal_parts.append(f"CURATED REFERENCE / PROOF IMAGE ({p.name} — {desc}):")
+                n_low = p.name.lower()
+                qa_overlay_note = ""
+                if n_low.startswith("plate_"):
+                    qa_overlay_note = " [QA ALPHA INSPECTION PLATE: dark/light checkerboard grids and cyan bounding box are external QA overlays, NOT inside the sprite PNG]"
+                elif n_low.startswith("anim_sheet_") or n_low.startswith("anim_rig_"):
+                    qa_overlay_note = " [QA ANIMATION CONTACT SHEET: dark checkerboard grid, cyan cell borders, and horizontal yellow/gold baseline ruler lines at the bottom of frames are external QA alignment guides, NOT inside the sprite sheet PNG]"
+                elif "filmstrip" in n_low:
+                    qa_overlay_note = " [QA CONTACT SHEET: top/bottom '[QA] tick ...' / '[QA] pos=...' strips are external QA margins, NOT inside the 16:9 viewport]"
+                multimodal_parts.append(f"CURATED REFERENCE / PROOF IMAGE ({p.name} — {desc}){qa_overlay_note}:")
                 multimodal_parts.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime))
 
             chunk_sections = "\n\n".join(
@@ -1175,3 +1397,285 @@ class ContextCuratorAgent:
                 decision=decision,
                 retrieved_chunks=chosen_chunks,
             )
+
+    def _expand_chunk_for_question(self, chunk: ContextChunk) -> ContextChunk:
+        """When a `code:module:<rel_path>` chunk is selected to help an agent answer a `self_question`,
+        expands the chunk content with the full on-disk source code of that module so the asking agent
+        can inspect exact method bodies, signal definitions, and shader uniforms."""
+        if not chunk.chunk_id.startswith("code:module:"):
+            return chunk
+        rel_path = chunk.chunk_id[len("code:module:") :].strip().lstrip("/")
+        if not rel_path:
+            return chunk
+        f_path = self.cartridge_dir / rel_path
+        if not f_path.is_file():
+            return chunk
+        try:
+            raw_src = f_path.read_text(encoding="utf-8")
+        except Exception:
+            return chunk
+        expanded_content = (
+            f"{chunk.content}\n\n"
+            f"--- FULL SOURCE OF `{rel_path}` ---\n"
+            f"{raw_src[:6500]}"
+        )
+        return chunk.model_copy(update={"content": expanded_content})
+
+    def research_question_context(
+        self,
+        target_agent_role: str,
+        question: str,
+        item_id: str = "",
+        target_modules: Optional[Sequence[str]] = None,
+        already_included_chunk_ids: Optional[Sequence[str]] = None,
+        max_selected_chunks: int = 5,
+    ) -> QuestionContextPack:
+        """Researches an agent's `self_question` against the cartridge semantic index and code reference graph.
+
+        IMPORTANT: `ContextCuratorAgent` does NOT answer the question itself. It selects and returns the
+        necessary raw context chunks (including full module source for selected `code:module:*` chunks) so the
+        asking agent can answer its own question on the next turn.
+        """
+        clean_q = (question or "").strip()
+        if not clean_q:
+            return QuestionContextPack(question="", prompt_block="")
+
+        from google.genai import types
+
+        all_chunks = self.semantic_index.extract_corpus_chunks(
+            board=self.board,
+            game_bible=self.game_bible,
+        )
+        if not all_chunks:
+            return QuestionContextPack(
+                question=clean_q,
+                prompt_block=(
+                    f"\n=== CONTEXT RESEARCHED FOR YOUR SELF-QUESTION ===\n"
+                    f"YOUR PENDING QUESTION: {clean_q}\n"
+                    f"(No indexed chunks exist in the cartridge yet.)\n"
+                    f"=== END RESEARCHED QUESTION CONTEXT ===\n"
+                ),
+            )
+
+        excluded = set(already_included_chunk_ids or [])
+        ranked_pairs = self.semantic_index.semantic_search(
+            queries=[
+                clean_q,
+                f"GDScript modules, signals, methods, shaders, and design specs for ({target_agent_role}): {clean_q}",
+            ],
+            chunks=all_chunks,
+            top_k=min(14, len(all_chunks)),
+        )
+        candidate_chunks: List[ContextChunk] = []
+        filtered_pairs: List[Tuple[ContextChunk, float]] = []
+        chunks_by_id: Dict[str, ContextChunk] = {}
+        all_by_id = {c.chunk_id: c for c in all_chunks}
+
+        for ch, sim in ranked_pairs:
+            if ch.chunk_id in excluded:
+                continue
+            candidate_chunks.append(ch)
+            filtered_pairs.append((ch, sim))
+            chunks_by_id[ch.chunk_id] = ch
+
+        # Traverse the code reference graph from any module paths mentioned in `question` or `target_modules`
+        code_graph = self.semantic_index.build_code_reference_graph()
+        seed_mods: List[str] = []
+        for tm in target_modules or []:
+            norm_m = str(tm or "").strip().replace("\\", "/")
+            if norm_m.startswith("res://"):
+                norm_m = norm_m[len("res://") :]
+            elif norm_m.startswith("res:/"):
+                norm_m = norm_m[len("res:/") :]
+            norm_m = norm_m.lstrip("/")
+            if norm_m and norm_m not in seed_mods:
+                seed_mods.append(norm_m)
+
+        q_lower = clean_q.lower()
+        for known_mod in code_graph:
+            if known_mod.lower() in q_lower or Path(known_mod).name.lower() in q_lower:
+                if known_mod not in seed_mods:
+                    seed_mods.append(known_mod)
+                cid = f"code:module:{known_mod}"
+                if cid in all_by_id and cid not in chunks_by_id:
+                    ch_direct = all_by_id[cid].model_copy(
+                        update={"title": f"{all_by_id[cid].title} [MENTIONED IN QUESTION]"}
+                    )
+                    candidate_chunks.insert(0, ch_direct)
+                    filtered_pairs.insert(0, (ch_direct, 0.98))
+                    chunks_by_id[cid] = ch_direct
+
+        for sm in seed_mods:
+            entry = code_graph.get(sm) or {}
+            for neighbor in list(entry.get("imports", [])) + list(entry.get("imported_by", [])):
+                cid = f"code:module:{neighbor}"
+                if cid in all_by_id and cid not in chunks_by_id and cid not in excluded:
+                    ch_graph = all_by_id[cid].model_copy(
+                        update={"title": f"{all_by_id[cid].title} [GRAPH-LINKED TO {sm}]"}
+                    )
+                    candidate_chunks.append(ch_graph)
+                    filtered_pairs.append((ch_graph, 0.92))
+                    chunks_by_id[cid] = ch_graph
+
+        # If all top chunks were already in `excluded`, allow the top ranked chunks so the agent still gets evidence
+        if not candidate_chunks:
+            for ch, sim in ranked_pairs[: min(6, len(ranked_pairs))]:
+                candidate_chunks.append(ch)
+                filtered_pairs.append((ch, sim))
+                chunks_by_id[ch.chunk_id] = ch
+
+        decision: Optional[QuestionContextResearchDecision] = None
+        chosen_chunks: List[ContextChunk] = []
+
+        if is_real_genai_client(self.client):
+            candidate_lines: List[str] = []
+            for c, sim in filtered_pairs[:16]:
+                candidate_lines.append(
+                    f"--- CHUNK id='{c.chunk_id}' category='{c.category}' similarity={sim:.3f} ---\n"
+                    f"Title: {c.title}\n"
+                    f"{c.content[:1600]}\n"
+                )
+            prompt = (
+                f"You are the Studio Context Generator & Curator Agent researching a self-inquiry question asked by `{target_agent_role}`.\n"
+                f"CRITICAL RULE: Do NOT answer the question yourself! Your ONLY job is to select the candidate `chunk_id`s "
+                f"(up to {max_selected_chunks}) that contain the raw code, signals, variables, council decisions, or design specs "
+                f"so `{target_agent_role}` can read them and answer its own question on the next turn.\n\n"
+                f"ASKING AGENT ROLE: {target_agent_role}\n"
+                f"WORK ITEM: {item_id or '(general)'}\n"
+                f"AGENT'S SELF-QUESTION:\n{clean_q}\n\n"
+                f"CANDIDATE CHUNKS:\n"
+                + "\n".join(candidate_lines)
+                + "\nSelect the most relevant `selected_chunk_ids` and provide `deliberation` FIRST."
+            )
+            resp = call_gemini_with_transient_retry(
+                lambda: self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=QuestionContextResearchDecision,
+                        thinking_config=bounded_thinking_config(256),
+                    ),
+                ),
+                label=f"research_question[{self._normalized_cache_role(target_agent_role)}:{item_id}]",
+            )
+            if resp.text:
+                decision = QuestionContextResearchDecision.model_validate_json(resp.text)
+                seen_ids: set[str] = set()
+                for cid in decision.selected_chunk_ids:
+                    if cid in chunks_by_id and cid not in seen_ids:
+                        chosen_chunks.append(self._expand_chunk_for_question(chunks_by_id[cid]))
+                        seen_ids.add(cid)
+                        if len(chosen_chunks) >= max_selected_chunks:
+                            break
+
+        if not chosen_chunks and candidate_chunks:
+            chosen_chunks = [
+                self._expand_chunk_for_question(c) for c in candidate_chunks[: min(3, max_selected_chunks)]
+            ]
+
+        chunk_sections = "\n\n".join(
+            f"[{c.chunk_id}] ({c.category}) {c.title}:\n{c.content}" for c in chosen_chunks
+        )
+        prompt_block = (
+            f"\n=== CONTEXT RESEARCHED FOR YOUR SELF-QUESTION (for {target_agent_role} on '{item_id or 'task'}') ===\n"
+            f"YOUR PENDING QUESTION FROM PREVIOUS TURN:\n{clean_q}\n\n"
+            f"RETRIEVED CONTEXT CHUNKS ({len(chosen_chunks)} chunk(s) brought in by ContextCuratorAgent):\n"
+            f"{chunk_sections}\n\n"
+            f"MANDATORY NEXT-TURN INSTRUCTION:\n"
+            f"1. Read the retrieved chunks above and write a concise, factual answer to your question in `self_question_answer` "
+            f"(citing the exact function names, signal signatures, property names, or spec values you need).\n"
+            f"2. Your `self_question_answer` will be saved in your persistent context going forward so you do not need to re-ask this question.\n"
+            f"3. After filling `self_question_answer`, proceed to complete your task output in this same response (leave `self_question` empty unless a brand-new follow-up question is strictly required).\n"
+            f"=== END RESEARCHED QUESTION CONTEXT ===\n"
+        )
+
+        if self.event_callback is not None:
+            try:
+                self.event_callback(
+                    "context_curator_question_researched",
+                    {
+                        "deliberation": (
+                            decision.deliberation
+                            if decision is not None
+                            else f"Researched context for {target_agent_role} self-question: {clean_q[:120]}"
+                        ),
+                        "item_id": item_id,
+                        "target_agent_role": target_agent_role,
+                        "question": clean_q,
+                        "selected_chunk_ids": [c.chunk_id for c in chosen_chunks],
+                    },
+                )
+            except Exception:
+                pass
+
+        return QuestionContextPack(
+            question=clean_q,
+            prompt_block=prompt_block,
+            selected_chunk_ids=[c.chunk_id for c in chosen_chunks],
+            retrieved_chunks=chosen_chunks,
+            decision=decision,
+        )
+
+    def _self_inquiry_memory_path(self, item_id: str, target_agent_role: str) -> Optional[Path]:
+        safe_item = re.sub(r"[^a-z0-9_]+", "_", (item_id or "").lower()).strip("_")
+        if not safe_item:
+            return None
+        cache_role = self._normalized_cache_role(target_agent_role)
+        trace_dir = self.cartridge_dir / "artifacts" / "work_items" / safe_item
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        return trace_dir / f"self_inquiry_qa_{cache_role}.json"
+
+    def load_self_inquiry_memory(self, item_id: str, target_agent_role: str) -> List[SelfInquiryQAPair]:
+        """Loads previously answered `(question, answer)` pairs for `(item_id, target_agent_role)`."""
+        p = self._self_inquiry_memory_path(item_id, target_agent_role)
+        if p is None or not p.is_file():
+            return []
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                return [SelfInquiryQAPair.model_validate(item) for item in raw if isinstance(item, dict)]
+        except Exception:
+            pass
+        return []
+
+    def save_self_inquiry_memory(
+        self,
+        item_id: str,
+        target_agent_role: str,
+        pairs: Sequence[SelfInquiryQAPair],
+    ) -> None:
+        """Persists resolved `(question, answer)` pairs for `(item_id, target_agent_role)` so they remain in context across turns."""
+        p = self._self_inquiry_memory_path(item_id, target_agent_role)
+        if p is None:
+            return
+        try:
+            p.write_text(
+                json.dumps([pair.model_dump() for pair in pairs], indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def format_self_inquiry_prompt_section(
+        resolved_pairs: Sequence[SelfInquiryQAPair],
+        pending_pack: Optional[QuestionContextPack] = None,
+    ) -> str:
+        """Formats the agent's accumulated `Question -> Self-Answer` memory plus any active `pending_pack`
+        brought in by `ContextCuratorAgent` for the current turn."""
+        sections: List[str] = []
+        if resolved_pairs:
+            qa_lines = [
+                "=== SELF-INQUIRY MEMORY (QUESTIONS YOU ALREADY ASKED & ANSWERED) ===",
+                "Use these verified facts that you extracted on earlier turns (do not re-ask these questions):",
+            ]
+            for idx, pair in enumerate(resolved_pairs, start=1):
+                cids = f" (from {pair.researched_chunk_ids})" if pair.researched_chunk_ids else ""
+                qa_lines.append(f"  Q{idx}{cids}: {pair.question}\n  A{idx}: {pair.answer}")
+            qa_lines.append("=== END SELF-INQUIRY MEMORY ===")
+            sections.append("\n".join(qa_lines))
+        if pending_pack is not None and pending_pack.prompt_block:
+            sections.append(pending_pack.prompt_block)
+        return ("\n\n".join(sections) + "\n\n") if sections else ""
+

@@ -14,7 +14,11 @@ import threading
 import time
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
-from engine.godot_runtime import ensure_godot_binary, run_godot_command
+from engine.godot_runtime import (
+    ensure_godot_background_render_binary,
+    ensure_godot_binary,
+    run_godot_command,
+)
 from engine.sim.headless import (
     InMemoryTelemetryRecorder,
     SimulationInput,
@@ -200,10 +204,14 @@ def verify_godot_cartridge_syntax(
     diagnostics: List[GDScriptDiagnostic] = []
 
     # 1. Run check-only on every .gd script in the cartridge so dynamically loaded scripts are also compiled
-    gd_files = sorted(c_dir.glob("*.gd"))
+    gd_files = [
+        p for p in sorted(c_dir.rglob("*.gd"))
+        if p.is_file() and not any(part in (".godot", "res:", "artifacts") for part in p.relative_to(c_dir).parts)
+    ]
     for gd_file in gd_files:
+        rel_gd = str(gd_file.relative_to(c_dir)).replace("\\", "/")
         res_script = run_godot_command(
-            ["--path", str(c_dir), "--check-only", "--script", f"res://{gd_file.name}"],
+            ["--path", str(c_dir), "--check-only", "--script", f"res://{rel_gd}"],
             cwd=c_dir,
             timeout=timeout,
             headless=True,
@@ -257,6 +265,7 @@ class GodotHeadlessSimulator:
         capture_ticks: Optional[List[int]] = None,
         input_script: Optional[List[Dict[str, Any]]] = None,
         setup_script: Optional[List[Dict[str, Any]]] = None,
+        target_scene: str = "",
         **kwargs: Any,
     ):
         self.cartridge_path = Path(cartridge_path).resolve()
@@ -266,6 +275,7 @@ class GodotHeadlessSimulator:
         self.capture_ticks = sorted(set(int(t) for t in (capture_ticks or [])))
         self.input_script = input_script
         self.setup_script = setup_script
+        self.target_scene = str(target_scene or "").strip()
         self.viewport_captured = False
         self.step_count = 0
         self.elapsed_time = 0.0
@@ -339,7 +349,11 @@ class GodotHeadlessSimulator:
             setup_path.parent.mkdir(parents=True, exist_ok=True)
             setup_path.write_text(json.dumps(self.setup_script), encoding="utf-8")
             extra_args += ["--setup-script", str(setup_path)]
-        godot_bin = ensure_godot_binary()
+        if self.target_scene:
+            extra_args += ["--scene", str(self.target_scene)]
+        sys_name = platform.system()
+        has_display = (sys_name == "Darwin") or bool(os.environ.get("DISPLAY")) or bool(os.environ.get("WAYLAND_DISPLAY"))
+        xvfb_bin = shutil.which("xvfb-run") if (sys_name == "Linux" and not has_display) else None
 
         if use_viewport:
             cap_dir = self.cartridge_path / "assets" / "playtest_captures"
@@ -350,33 +364,19 @@ class GodotHeadlessSimulator:
                         stale_p.unlink()
                     except Exception:
                         pass
+            if "--capture-viewport" not in extra_args:
+                extra_args.append("--capture-viewport")
 
-        sys_name = platform.system()
-        has_display = (sys_name == "Darwin") or bool(os.environ.get("DISPLAY")) or bool(os.environ.get("WAYLAND_DISPLAY"))
-        xvfb_bin = shutil.which("xvfb-run") if (sys_name == "Linux" and not has_display) else None
-
-        if use_viewport and (has_display or xvfb_bin):
-            cmd: List[str] = []
-            if xvfb_bin:
-                cmd.extend([xvfb_bin, "-a"])
-            cmd.extend([
-                str(godot_bin),
-                "--audio-driver", "Dummy",
-                "--fixed-fps", "60",
-                "--position", "-4000,-4000",
-                "--path", str(self.cartridge_path),
-                "-s", str(HARNESS_SCRIPT_PATH),
-                "--max-ticks", str(limit),
-            ] + extra_args)
-        else:
-            cmd = [
-                str(godot_bin),
-                "--headless",
-                "--fixed-fps", "60",
-                "--path", str(self.cartridge_path),
-                "-s", str(HARNESS_SCRIPT_PATH),
-                "--max-ticks", str(limit),
-            ] + extra_args
+        godot_bin = ensure_godot_binary()
+        cmd: List[str] = [
+            str(godot_bin),
+            "--headless",
+            "--audio-driver", "Dummy",
+            "--fixed-fps", "60",
+            "--path", str(self.cartridge_path),
+            "-s", str(HARNESS_SCRIPT_PATH),
+            "--max-ticks", str(limit),
+        ] + extra_args
 
         logger.info("Executing Godot playtest harness: %s", " ".join(cmd))
         proc = subprocess.Popen(

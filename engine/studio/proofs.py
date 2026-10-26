@@ -133,6 +133,96 @@ def _format_snapshot_footer(snap: Optional[Dict[str, Any]], max_chars: int = 58)
     return line[:max_chars]
 
 
+def _resolve_snapshot_key(snap: Dict[str, Any], key_path: str) -> Tuple[bool, Any]:
+    """Resolves a dotted or top-level key against a tick snapshot dictionary."""
+    if not isinstance(snap, dict) or not key_path:
+        return False, None
+    clean = key_path.strip()
+    if clean in snap:
+        return True, snap[clean]
+    cur: Any = snap
+    for part in clean.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return False, None
+    return True, cur
+
+
+def _evaluate_qa_state_assertions(
+    tick_snaps: Union[Dict[int, Dict[str, Any]], List[Dict[str, Any]]],
+    state_assertions: Optional[List[Any]],
+) -> None:
+    """Evaluates explicit numeric/boolean/equality `QAStateAssertion` entries against `tick_snapshots`
+    when the target key is present in the captured snapshot."""
+    if not state_assertions or not tick_snaps:
+        return
+    if isinstance(tick_snaps, list):
+        tick_snaps = {
+            int(s.get("tick", idx + 1)): s
+            for idx, s in enumerate(tick_snaps)
+            if isinstance(s, dict)
+        }
+    import re as _re
+
+    cmp_re = _re.compile(r"^\s*(==|!=|>=|<=|>|<)\s*(-?\d+(?:\.\d+)?|true|false|[A-Za-z0-9_]+)\s*$", _re.IGNORECASE)
+    exact_re = _re.compile(r"^\s*(-?\d+(?:\.\d+)?|true|false)\s*$", _re.IGNORECASE)
+    failures: List[str] = []
+    for raw_a in state_assertions:
+        at_t = int(getattr(raw_a, "at_tick", 0) if not isinstance(raw_a, dict) else raw_a.get("at_tick", 0))
+        key = str(getattr(raw_a, "snapshot_key", "") if not isinstance(raw_a, dict) else raw_a.get("snapshot_key", "")).strip()
+        exp = str(
+            getattr(raw_a, "expected_value_or_change", "")
+            if not isinstance(raw_a, dict)
+            else raw_a.get("expected_value_or_change", "")
+        ).strip()
+        if at_t not in tick_snaps or not key or not exp:
+            continue
+        found, actual_val = _resolve_snapshot_key(tick_snaps[at_t], key)
+        if not found:
+            continue
+        m_cmp = cmp_re.match(exp)
+        m_exact = exact_re.match(exp) if not m_cmp else None
+        op = m_cmp.group(1) if m_cmp else ("==" if m_exact else "")
+        rhs_raw = m_cmp.group(2) if m_cmp else (m_exact.group(1) if m_exact else "")
+        if not op:
+            continue
+        try:
+            if rhs_raw.lower() in ("true", "false") or isinstance(actual_val, bool):
+                lhs_b = bool(actual_val) if isinstance(actual_val, bool) else str(actual_val).strip().lower() in ("true", "1")
+                rhs_b = rhs_raw.lower() == "true"
+                ok = (lhs_b == rhs_b) if op == "==" else (lhs_b != rhs_b)
+            elif isinstance(actual_val, (int, float)):
+                lhs_f = float(actual_val)
+                rhs_f = float(rhs_raw)
+                if op == "==":
+                    ok = abs(lhs_f - rhs_f) <= 0.05
+                elif op == "!=":
+                    ok = abs(lhs_f - rhs_f) > 0.05
+                elif op == ">=":
+                    ok = lhs_f >= rhs_f - 1e-4
+                elif op == "<=":
+                    ok = lhs_f <= rhs_f + 1e-4
+                elif op == ">":
+                    ok = lhs_f > rhs_f
+                elif op == "<":
+                    ok = lhs_f < rhs_f
+                else:
+                    ok = True
+            else:
+                lhs_s = str(actual_val).strip().lower()
+                rhs_s = rhs_raw.strip().lower()
+                ok = (lhs_s == rhs_s) if op == "==" else (lhs_s != rhs_s)
+        except Exception:
+            continue
+        if not ok:
+            failures.append(f"tick {at_t}: expected `{key}` {exp}, got {actual_val!r}")
+    if failures:
+        raise StudioAgentError(
+            "QA filmstrip state assertions failed against live engine snapshots: " + "; ".join(failures)
+        )
+
+
 def capture_filmstrip(
     cartridge_dir: Path,
     ticks: List[int],
@@ -142,6 +232,8 @@ def capture_filmstrip(
     cols: int = 2,
     setup_script: Optional[List[Dict[str, Any]]] = None,
     verify_counterfactual: bool = False,
+    state_assertions: Optional[List[Any]] = None,
+    target_scene: str = "",
 ) -> Path:
     """Runs the real game, captures the viewport at `ticks` (driven by `input_script` and `setup_script` if given),
     and composes a labelled QA proof strip with external input & state telemetry."""
@@ -156,8 +248,19 @@ def capture_filmstrip(
     sim = GodotHeadlessSimulator(
         cartridge_dir, capture_viewport=True, capture_ticks=ticks, input_script=input_script,
         setup_script=setup_script, max_ticks=max(ticks), telemetry_mode="in_memory",
+        target_scene=target_scene,
     )
     sim.run_until_complete()
+    script_errs = [
+        f"{d.file_path.name}:{d.line_number} - {d.error_message}"
+        for d in (getattr(sim, "runtime_diagnostics", None) or [])
+        if getattr(d, "file_path", None) is not None and str(d.file_path).endswith(".gd")
+    ] + list(getattr(sim, "script_errors", None) or [])
+    if script_errs:
+        raise StudioAgentError(
+            f"QA filmstrip capture encountered runtime GDScript error(s) in {target_scene or 'res://main.tscn'}: "
+            + " | ".join(str(e) for e in script_errs[:5])
+        )
     avg_ms = float(getattr(sim, "avg_frame_time_ms", 0.0) or 0.0)
     max_ms = float(getattr(sim, "max_frame_time_ms", 0.0) or 0.0)
     audit_dict = getattr(sim, "scene_audit", None) or {}
@@ -173,16 +276,26 @@ def capture_filmstrip(
             "Eliminate unconditional per-frame `queue_redraw()` on nodes whose `_draw()` iterates over 2D grids or unbounded stroke arrays, and use `SubViewport.UPDATE_ONCE` for accumulation masks."
         )
     tick_snaps = dict(getattr(sim, "tick_snapshots", {}) or {})
+    _evaluate_qa_state_assertions(tick_snaps, state_assertions)
 
     if verify_counterfactual and (input_script or setup_script) and len(set(ticks)) >= 2:
         ctrl_sim = GodotHeadlessSimulator(
             cartridge_dir, capture_viewport=False, capture_ticks=ticks, input_script=[],
             setup_script=[], max_ticks=max(ticks), telemetry_mode="null",
+            target_scene=target_scene,
         )
         ctrl_sim.run_until_complete()
         ctrl_snaps = dict(getattr(ctrl_sim, "tick_snapshots", {}) or {})
         sorted_t = sorted(set(ticks))
         t_first, t_last = sorted_t[0], sorted_t[-1]
+        if t_last in ctrl_snaps and isinstance(ctrl_snaps[t_last], dict):
+            c_last_raw = ctrl_snaps[t_last]
+            for win_key in ("victory", "victory_state", "is_completed", "level_completed", "game_won", "stage_cleared"):
+                if bool(c_last_raw.get(win_key, False)):
+                    raise StudioAgentError(
+                        f"Counterfactual QA check failed: zero-input control run (input_script=[]) achieved `{win_key}=True` "
+                        f"by tick {t_last} with zero player input! Ensure objectives require active player agency and never auto-complete at start."
+                    )
         if t_first in ctrl_snaps and t_last in ctrl_snaps and t_last in tick_snaps:
             passive_clock_keys = {
                 "tick",

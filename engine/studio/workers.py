@@ -43,6 +43,99 @@ logger = logging.getLogger("BoardWorkers")
 
 # Serialises merges into the shared asset catalog (each worker fabricates with its own library instance).
 _CATALOG_LOCK = threading.Lock()
+_ACTIVE_TURN_CTX = threading.local()
+
+
+def record_turn_substep(
+    step_type: str,
+    message: str,
+    *,
+    details: Optional[Dict[str, Any]] = None,
+    specialist_agent: Optional[str] = None,
+) -> None:
+    """Appends a live sub-step ('editing_file', 'running_tests', 'generating_asset', 'rendering_scene',
+    'curating_context', 'self_inquiry', etc.) to the active turn on the current worker thread, persists
+    `lead_trace_rev{N}.json`, and broadcasts `backlog_item_substep` to the live UI."""
+    from datetime import datetime, timezone
+
+    state = getattr(_ACTIVE_TURN_CTX, "state", None)
+    if not isinstance(state, dict):
+        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    spec_role = specialist_agent or state.get("specialist_agent") or "task_lead"
+    entry: Dict[str, Any] = {
+        "timestamp_utc": now_iso,
+        "step_type": step_type,
+        "specialist_agent": spec_role,
+        "message": message,
+    }
+    if details:
+        entry["details"] = details
+    step_log = state.setdefault("step_log", [])
+    step_log.append(entry)
+    persist_fn = state.get("_persist_fn")
+    if callable(persist_fn):
+        try:
+            persist_fn()
+        except Exception:
+            pass
+    ev_cb = state.get("_event_callback")
+    if callable(ev_cb):
+        try:
+            ev_cb(
+                "backlog_item_substep",
+                {
+                    "deliberation": message,
+                    "item_id": state.get("item_id", ""),
+                    "revision": state.get("revision", 0),
+                    "turn_index": state.get("turn_index", 0),
+                    "specialist_agent": spec_role,
+                    "step_type": step_type,
+                    "message": message,
+                    "details": details or {},
+                    "step_count": len(step_log),
+                    "timestamp_utc": now_iso,
+                },
+            )
+        except Exception:
+            pass
+
+
+def record_turn_epistemic_context(
+    *,
+    role: str = "specialist",
+    curated_context: Optional[str] = None,
+    prompt_text: Optional[str] = None,
+    self_inquiries: Optional[List[Dict[str, Any]]] = None,
+    deliberation: Optional[str] = None,
+) -> None:
+    """Records the curated context, full prompt, and self-inquiry Q&As for the active turn (either Task Lead or Specialist)
+    and persists them to `lead_trace_rev{N}.json` for live UI inspection."""
+    state = getattr(_ACTIVE_TURN_CTX, "state", None)
+    if not isinstance(state, dict):
+        return
+    if role == "task_lead":
+        if curated_context is not None:
+            state["lead_curated_context"] = curated_context[:35000]
+        if prompt_text is not None:
+            state["lead_prompt_text"] = prompt_text[:45000]
+        if self_inquiries is not None:
+            state["lead_self_inquiries"] = list(self_inquiries)
+        if deliberation is not None:
+            state["lead_deliberation"] = deliberation
+    else:
+        if curated_context is not None:
+            state["curated_context"] = curated_context[:35000]
+        if prompt_text is not None:
+            state["prompt_text"] = prompt_text[:45000]
+        if self_inquiries is not None:
+            state["self_inquiries"] = list(self_inquiries)
+    persist_fn = state.get("_persist_fn")
+    if callable(persist_fn):
+        try:
+            persist_fn()
+        except Exception:
+            pass
 
 VISUAL_MODES = ("static_sprite", "sprite_sheet", "articulated_parts", "tile_surface", "parallax_layer", "portrait", "diegetic_ui")
 ANIMATION_MODES = ("sprite_sheet", "articulated_parts")
@@ -165,12 +258,18 @@ def plan_asset_requirement(
             f"`articulated_parts` must be consistent with it and with the style, camera and palette in the Game Bible.\n"
             f"CRITICAL MODE & PROMPT RULES FOR `visual_prompt_or_text`:\n"
             f"- Avoid `fabrication_mode == 'tile_surface'` for anything that has a silhouette, alpha transparency, endcaps, or distinct shape (such as channels, slabs, platforms, machines, props, or fluid bodies) — `tile_surface` is ONLY for 100% opaque, borderless, full-bleed square surface material swatches. Use `static_sprite` (with `asset_type='prop'` or `'sprite'`), `sprite_sheet`, or `articulated_parts` for any shaped element, structure, or multi-state object so its alpha silhouette is preserved cleanly.\n"
-            f"- When `fabrication_mode == 'sprite_sheet'`, `visual_prompt_or_text` is sent to the image generator to synthesize the SINGLE canonical neutral standing/idle figure, and our biomechanical keyframe engine then generates the multi-row, multi-frame sprite sheet (`*_sheet.png`) from `animation_states`. Therefore, `visual_prompt_or_text` MUST describe ONLY ONE single isolated subject in a neutral readiness pose (appearance, proportions, attire/materials, silhouette, palette) and MUST NEVER ask the image generator to draw multiple poses, multiple rows/columns, frame numbers, or a grid layout inside `visual_prompt_or_text`! Put all multi-state/row/frame breakdowns into `animation_states`.\n"
-            f"- When `fabrication_mode == 'static_sprite'`, `visual_prompt_or_text` MUST describe ONLY ONE single isolated object/prop in its canonical intact state — NEVER a 3x3 or multi-state variation grid.\n"
+            f"- When `fabrication_mode == 'sprite_sheet'` AND the asset is an animated character/actor whose poses are deformed from a single base figure, `visual_prompt_or_text` is sent to the image generator to synthesize the SINGLE canonical neutral standing/idle figure, and our biomechanical keyframe engine then generates the multi-row, multi-frame sprite sheet (`*_sheet.png`) from `animation_states` (leave `grid_cols=1, grid_rows=1, cell_prompts=[]`).\n"
+            f"- MULTI-CELL GRID / STATE SHEET / ATLAS COMPOSITION (`grid_cols`, `grid_rows`, `cell_prompts`): Whenever the Task Lead brief or task spec requests a multi-cell grid, sheet, or atlas of distinct visual states, icons, stages, or variants (e.g., a 2x2 or NxM sheet where each cell depicts a distinct state, graphic, or component rather than biomechanical deformation of one walking figure), set `grid_cols` and `grid_rows` to the exact grid dimensions (e.g. `grid_cols=2, grid_rows=2`) and populate `cell_prompts` with exactly `grid_cols * grid_rows` focused visual descriptions in row-major order (top-left to bottom-right), where EACH string in `cell_prompts` describes the single isolated graphic/state that belongs inside that specific cell!\n"
+            f"- When `grid_cols == 1` and `grid_rows == 1` (single isolated asset), `visual_prompt_or_text` MUST describe ONLY ONE single isolated object/prop in its canonical intact state — NEVER a multi-state variation grid.\n"
             f"- When `fabrication_mode == 'audio_bark'`, `visual_prompt_or_text` is sent directly to the neural TTS engine to synthesize ONE single spoken voice line into `target_path` (strictly bounded to [0.1s, 30.0s], max 45 words / 280 characters of direct spoken dialogue). NEVER concatenate multiple barks, speaker labels ('Kaelen barks:', 'Overseer Vhen:'), or parenthetical stage directions into `visual_prompt_or_text`! Write ONLY the exact spoken words of a single representative bark (1–2 sentences, <= 45 words).\n"
             f"Provide `deliberation` FIRST.\n\n{curated_block}\n{retry}"
         )
         contents_arg: Any = ([prompt] + multimodal_parts) if multimodal_parts else prompt
+        record_turn_epistemic_context(
+            role="specialist",
+            curated_context=curated_block,
+            prompt_text=prompt,
+        )
         resp = call_gemini_with_transient_retry(
             lambda: ctx.client.models.generate_content(
                 model=ctx.model_name,
@@ -196,6 +295,13 @@ def plan_asset_requirement(
             issues.append("target_path must be a relative path under assets/.")
         if req.fabrication_mode == "articulated_parts" and not req.articulated_parts:
             issues.append("articulated_parts mode requires `articulated_parts`.")
+        if req.cell_prompts:
+            expected_cells = max(1, int(req.grid_cols or 1)) * max(1, int(req.grid_rows or 1))
+            if expected_cells <= 1 or len(req.cell_prompts) != expected_cells:
+                issues.append(
+                    f"When `cell_prompts` is populated ({len(req.cell_prompts)} items), `grid_cols * grid_rows` "
+                    f"({req.grid_cols}x{req.grid_rows}={expected_cells}) must be > 1 and equal `len(cell_prompts)`."
+                )
         if req.fabrication_mode == "audio_bark":
             words = (req.visual_prompt_or_text or "").strip().split()
             chars = len((req.visual_prompt_or_text or "").strip())
@@ -255,20 +361,40 @@ def _merge_catalog_entry(ctx: WorkerContext, worker_lib: Any, asset_id: str) -> 
         shared.save_catalog()
 
 
-def _fabricate_visual(ctx: WorkerContext, item: WorkItem, allowed_modes: tuple) -> WorkerResult:
+def _fabricate_visual(
+    ctx: WorkerContext,
+    item: WorkItem,
+    allowed_modes: tuple,
+    force_regenerate: Optional[bool] = None,
+) -> WorkerResult:
     req = plan_asset_requirement(ctx, item, allowed_modes)
+    record_turn_substep(
+        "generating_asset",
+        f"Generating visual asset {req.target_path} (mode={req.fabrication_mode}, size={req.dimensions})",
+        details={"asset_id": req.asset_id, "target_path": req.target_path, "mode": req.fabrication_mode},
+    )
     lib = ctx.new_library()
-    out = lib.fabricate_single_asset(req, force_regenerate=bool(item.revisions))
+    eff_force = bool(item.revisions) if force_regenerate is None else bool(force_regenerate)
+    out = lib.fabricate_single_asset(req, force_regenerate=eff_force)
     if out is None or not Path(out).is_file():
         raise StudioAgentError(f"Fabrication of '{item.item_id}' produced no file (mode={req.fabrication_mode}).")
     _merge_catalog_entry(ctx, lib, req.asset_id)
     renders = ctx.cartridge_dir / "artifacts" / "renders"
     proofs = _collect_proofs(renders, req.asset_id, Path(out))
+    record_turn_substep(
+        "captured_proof",
+        f"Rendered visual inspection plate for {req.target_path}",
+        details={"proof_images": proofs},
+    )
     if not proofs:
         raise StudioAgentError(f"Fabrication of '{item.item_id}' produced no proof images.")
     entry = lib.catalog.entries.get(req.asset_id)
     sheet_meta_note = ""
-    if entry is not None and getattr(entry, "fabrication_mode", "") == "sprite_sheet":
+    if entry is not None and (
+        getattr(entry, "fabrication_mode", "") == "sprite_sheet"
+        or int(getattr(entry, "hframes", 1) or 1) > 1
+        or int(getattr(entry, "vframes", 1) or 1) > 1
+    ):
         sheet_meta_note = (
             f" (sheet_res_path='{getattr(entry, 'res_path', '')}', "
             f"hframes={getattr(entry, 'hframes', 1)}, vframes={getattr(entry, 'vframes', 1)}, "
@@ -331,7 +457,7 @@ def audio_asset_handler(ctx: WorkerContext) -> Callable[[WorkItem], WorkerResult
         safe_id = _safe_id(item.item_id)
         proof = render_waveform_image(Path(out), _item_dir(ctx, item) / f"waveform_{safe_id}_rev{len(item.revisions)}.png")
         notes = f"Audio '{req.asset_id}' ({req.fabrication_mode}) -> {req.target_path}. Text/prompt: {(req.visual_prompt_or_text or req.description)[:300]}"
-        return WorkerResult(proof_images=[str(proof)], notes=notes)
+        return WorkerResult(proof_images=[str(proof), str(out)], notes=notes)
 
     return handler
 
@@ -467,7 +593,7 @@ def level_map_handler(ctx: WorkerContext) -> Callable[[WorkItem], WorkerResult]:
 STANDARD_INPUT_ACTIONS = ["ui_up", "ui_down", "ui_left", "ui_right", "ui_accept", "ui_select", "ui_cancel"]
 MAX_PROOF_TICKS = 900
 MAX_PROOF_FRAMES = 12
-CODE_MODULE_SUFFIXES = (".gd", ".tscn", ".godot")
+CODE_MODULE_SUFFIXES = (".gd", ".tscn", ".godot", ".gdshader")
 
 
 _GD_ACTION_RE = re.compile(r'Input\.(?:is_action_pressed|is_action_just_pressed|is_action_just_released|get_action_strength)\(\s*["\']([A-Za-z0-9_]+)["\']\s*\)')
@@ -526,7 +652,11 @@ def _summarize_cartridge_for_qa(cartridge_dir: Path, max_chars: int = 4000) -> s
         except Exception:
             continue
         classes = re.findall(r"^\s*class\s+([A-Za-z0-9_]+)", src, flags=re.MULTILINE)
-        funcs = re.findall(r"^\s*(?:static\s+)?func\s+([A-Za-z0-9_]+)\s*\(([^)]*)\)", src, flags=re.MULTILINE)
+        funcs = [
+            (fn, args)
+            for fn, args in re.findall(r"^\s*(?:static\s+)?func\s+([A-Za-z0-9_]+)\s*\(([^)]*)\)", src, flags=re.MULTILINE)
+            if not fn.startswith("simulate_")
+        ]
         vars_top = re.findall(r"^var\s+([A-Za-z0-9_]+)", src, flags=re.MULTILINE)
         bound_assets = sorted(set(re.findall(r"(?:res://)?assets/[A-Za-z0-9_./-]+\.(?:png|wav|ogg|mp3)", src)))
         func_sig = ", ".join(f"{fn}({args.strip()})" for fn, args in funcs[:18])
@@ -555,7 +685,18 @@ def _summarize_cartridge_for_qa(cartridge_dir: Path, max_chars: int = 4000) -> s
     return summary[:max_chars]
 
 
-def validate_filmstrip_plan(plan: FilmstripPlan, actions: List[str]) -> List[str]:
+_FORBIDDEN_SETUP_CALL_PREFIXES = ("simulate_", "force_", "complete_", "auto_solve", "instant_win")
+_FORBIDDEN_SETUP_CALL_NAMES = frozenset({
+    "set_onboarding_step",
+    "advance_onboarding_step",
+    "advance_step",
+    "skip_onboarding",
+    "trigger_win",
+    "win_game",
+})
+
+
+def validate_filmstrip_plan(plan: FilmstripPlan, actions: List[str], item_kind: str = "") -> List[str]:
     issues: List[str] = []
     ticks = plan.capture_ticks
     if not ticks or len(ticks) > MAX_PROOF_FRAMES:
@@ -571,15 +712,42 @@ def validate_filmstrip_plan(plan: FilmstripPlan, actions: List[str]) -> List[str
     for call in getattr(plan, "setup_calls", []) or []:
         if call.at_tick < 1 or call.at_tick > MAX_PROOF_TICKS:
             issues.append(f"setup_call at_tick={call.at_tick} must be within [1, {MAX_PROOF_TICKS}].")
-        if not call.method_name.strip():
+        m_clean = call.method_name.strip()
+        m_lower = m_clean.lower()
+        if not m_clean:
             issues.append("setup_call method_name must not be empty.")
+        elif m_lower.startswith(_FORBIDDEN_SETUP_CALL_PREFIXES) or m_lower in _FORBIDDEN_SETUP_CALL_NAMES:
+            issues.append(
+                f"setup_call '{call.method_name}' is a 'simulate_*' / state-forcing shortcut that bypasses real player input/physics or forces onboarding/completion state. "
+                f"Drive gameplay mechanics and onboarding step transitions causally via `input_segments` (`actions`, `mouse_click_pos`, or `when_snapshot_key` reactive triggers)."
+            )
         try:
             parsed_args = json.loads(call.args_json or "[]")
             if not isinstance(parsed_args, list):
                 issues.append(f"setup_call args_json for '{call.method_name}' must encode a JSON list.")
         except Exception:
             issues.append(f"setup_call args_json for '{call.method_name}' is not valid JSON.")
+    if item_kind in ("mechanic_code", "integration") and actions and not plan.input_segments:
+        issues.append(
+            f"FilmstripPlan for '{item_kind}' must include at least one `input_segments` entry (keyboard `actions` or `mouse_click_pos`) "
+            f"demonstrating causal player interaction from the unsolved t=0 baseline."
+        )
     return issues
+
+
+def _serialize_input_segments(plan: FilmstripPlan) -> List[Dict[str, Any]]:
+    script: List[Dict[str, Any]] = []
+    for s in plan.input_segments:
+        seg_d: Dict[str, Any] = {"from": s.from_tick, "to": s.to_tick, "actions": list(s.actions)}
+        if getattr(s, "mouse_click_pos", None) is not None:
+            seg_d["mouse_click_pos"] = list(s.mouse_click_pos)
+        if getattr(s, "when_snapshot_key", ""):
+            seg_d["when_snapshot_key"] = s.when_snapshot_key
+            seg_d["when_operator"] = getattr(s, "when_operator", "") or "=="
+            seg_d["when_value"] = getattr(s, "when_value", None)
+            seg_d["hold_ticks"] = int(getattr(s, "hold_ticks", 10) or 10)
+        script.append(seg_d)
+    return script
 
 
 def plan_filmstrip(ctx: WorkerContext, item: WorkItem, attempts: int = 3) -> FilmstripPlan:
@@ -619,12 +787,24 @@ def plan_filmstrip(ctx: WorkerContext, item: WorkItem, attempts: int = 3) -> Fil
             f"ITEM [{item.item_id}] ({item.kind}): {item.title}\nSPEC: {item.spec}\nTHE COUNCIL WANTS TO SEE: {item.proof_spec}\n"
             f"Available input actions: {actions}.{context_block}\n"
             f"Choose `capture_ticks` (1-{MAX_PROOF_FRAMES} frames, ticks 1-{MAX_PROOF_TICKS}, 60 ticks ~ 1 second), `input_segments` "
-            f"(actions or KEY_* held over tick ranges, plus optional `mouse_click_pos`), and optional `setup_calls` (if staging the proof "
-            f"requires spawning a hazard, positioning actors into interaction range, or invoking a scene/entity setup method at a specific tick) "
-            f"so the captured frames show the state before, the action/interaction, and the result. Also populate `state_assertions` for key "
-            f"observable state transitions. Use no input only if the proof is static. Provide `deliberation` FIRST.{retry}"
+            f"(actions or KEY_* held over tick ranges, plus optional `mouse_click_pos`), and optional `setup_calls` (ONLY for scenario staging "
+            f"such as spawning a hazard or positioning actors—NEVER call `simulate_*`, `force_*`, `complete_*`, or `set_onboarding_step` shortcuts that bypass real player input or physics) "
+            f"so the captured frames show:\n"
+            f"  - Frame 1 (`capture_ticks[0]`, before player inputs take effect): the UNSOLVED t=0 baseline state (`test_unsolved_baseline_t0`), and\n"
+            f"  - Subsequent frames (`capture_ticks[1..]`): the authentic causal progression driven by `input_segments` (`actions` and/or `mouse_click_pos`).\n"
+            f"REACTIVE TIMING TIP: When a secondary player input depends on dynamic physics or movement reaching a threshold (rather than a fixed tick guess), "
+            f"populate `when_snapshot_key`, `when_operator` ('<=', '>=', '==', '!='), `when_value`, and `hold_ticks` on that `InputSegment` so the harness "
+            f"fires the input at the exact tick the live simulation state satisfies the condition.\n"
+            f"Also populate `state_assertions` for key observable state transitions (which are verified against live engine snapshots). "
+            f"If the item spec or QA verification brief explicitly targets an isolated subsystem test scene `.tscn` file (e.g. `res://tests/test_*.tscn`) rather than the integrated main scene, set `target_scene` to that `res://tests/...tscn` path; otherwise leave `target_scene` empty (`\"\"`) to boot `res://main.tscn`. "
+            f"Use no input only if the item kind is a purely static layout preview. Provide `deliberation` FIRST.{retry}"
         )
         contents_arg: Any = ([prompt] + multimodal_parts) if multimodal_parts else prompt
+        record_turn_epistemic_context(
+            role="qa_test_engineer",
+            curated_context=context_block,
+            prompt_text=prompt,
+        )
         resp = call_gemini_with_transient_retry(
             lambda: ctx.client.models.generate_content(
                 model=ctx.model_name,
@@ -640,7 +820,11 @@ def plan_filmstrip(ctx: WorkerContext, item: WorkItem, attempts: int = 3) -> Fil
         if not resp.text:
             raise StudioAgentError(f"Filmstrip planning for '{item.item_id}' returned an empty response")
         plan = FilmstripPlan.model_validate_json(resp.text)
-        issues = validate_filmstrip_plan(plan, actions)
+        issues = validate_filmstrip_plan(
+            plan,
+            actions,
+            item_kind=item.kind if is_real_genai_client(ctx.client) else "",
+        )
         if not issues:
             return plan
     raise StudioAgentError(f"Filmstrip plan for '{item.item_id}' still invalid after {attempts} attempts: {issues}")
@@ -648,11 +832,31 @@ def plan_filmstrip(ctx: WorkerContext, item: WorkItem, attempts: int = 3) -> Fil
 
 def _snapshot_modules(cartridge_dir: Path, modules: List[str]) -> Dict[str, Optional[str]]:
     c_dir = Path(cartridge_dir)
+    normalized_mods: List[str] = []
+    for m in modules:
+        s = str(m or "").strip().replace("\\", "/")
+        if s.startswith("res://"):
+            s = s[len("res://"):]
+        elif s.startswith("res:/"):
+            s = s[len("res:/"):]
+        s = s.lstrip("/")
+        if s:
+            normalized_mods.append(s)
+    existing_rel_paths: List[str] = []
+    for ext in ("*.gd", "*.tscn", "*.gdshader"):
+        for p in sorted(c_dir.rglob(ext)):
+            try:
+                rel = p.relative_to(c_dir).as_posix()
+            except ValueError:
+                continue
+            if rel.startswith((".godot/", "artifacts/")):
+                continue
+            existing_rel_paths.append(rel)
     all_names = list(
         dict.fromkeys(
-            list(modules)
+            normalized_mods
             + ["main.gd", "mechanics.gd", "scenes.gd", "entities.gd", "ui_hud.gd", "project.godot", "main.tscn"]
-            + [p.name for p in sorted(c_dir.glob("*.gd"))]
+            + existing_rel_paths
         )
     )
     snap: Dict[str, Optional[str]] = {}
@@ -670,10 +874,45 @@ def _restore_modules(cartridge_dir: Path, snap: Dict[str, Optional[str]]) -> Non
             if p.is_file():
                 p.unlink()
         else:
+            p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(text, encoding="utf-8")
-    for extra_gd in sorted(c_dir.glob("*.gd")):
-        if extra_gd.name not in snap and not extra_gd.name.startswith("test_"):
-            extra_gd.unlink()
+    for ext in ("*.gd", "*.tscn", "*.gdshader"):
+        for extra_p in sorted(c_dir.rglob(ext)):
+            try:
+                rel = extra_p.relative_to(c_dir).as_posix()
+            except ValueError:
+                continue
+            if rel.startswith((".godot/", "artifacts/")):
+                continue
+            if rel not in snap:
+                extra_p.unlink()
+
+
+def _compute_turn_code_diffs(cartridge_dir: Path, pre_snap: Dict[str, Optional[str]]) -> Dict[str, str]:
+    """Computes unified diffs for any `.gd`, `.tscn`, `.gdshader`, or `project.godot` file created or modified since `pre_snap`."""
+    import difflib
+
+    c_dir = Path(cartridge_dir)
+    post_snap = _snapshot_modules(c_dir, list(pre_snap.keys()))
+    all_keys = sorted(set(pre_snap.keys()) | set(post_snap.keys()))
+    diffs: Dict[str, str] = {}
+    for rel_path in all_keys:
+        before_txt = pre_snap.get(rel_path) or ""
+        after_txt = post_snap.get(rel_path) or ""
+        if before_txt == after_txt:
+            continue
+        diff_lines = list(
+            difflib.unified_diff(
+                before_txt.splitlines(keepends=True),
+                after_txt.splitlines(keepends=True),
+                fromfile=f"a/{rel_path}",
+                tofile=f"b/{rel_path}",
+                n=3,
+            )
+        )
+        if diff_lines:
+            diffs[rel_path] = "".join(diff_lines)[:12000]
+    return diffs
 
 
 def code_item_handler(ctx: WorkerContext) -> Callable[[WorkItem], WorkerResult]:
@@ -725,12 +964,7 @@ def code_item_handler(ctx: WorkerContext) -> Callable[[WorkItem], WorkerResult]:
                 if ctx.code_verify is not None:
                     ctx.code_verify(ctx.cartridge_dir, track)
                 plan = plan_filmstrip(ctx, item)
-                script: List[Dict[str, Any]] = []
-                for s in plan.input_segments:
-                    seg_d: Dict[str, Any] = {"from": s.from_tick, "to": s.to_tick, "actions": list(s.actions)}
-                    if getattr(s, "mouse_click_pos", None) is not None:
-                        seg_d["mouse_click_pos"] = list(s.mouse_click_pos)
-                    script.append(seg_d)
+                script = _serialize_input_segments(plan)
                 setup_calls = [
                     {
                         "at_tick": c.at_tick,
@@ -750,6 +984,7 @@ def code_item_handler(ctx: WorkerContext) -> Callable[[WorkItem], WorkerResult]:
                         input_script=script,
                         setup_script=setup_calls or None,
                         verify_counterfactual=True,
+                        state_assertions=list(getattr(plan, "state_assertions", None) or []),
                     )
                 else:
                     strip = ctx.filmstrip_fn(
@@ -758,8 +993,9 @@ def code_item_handler(ctx: WorkerContext) -> Callable[[WorkItem], WorkerResult]:
                         out_path=out_strip_path,
                         input_script=script,
                     )
-            except Exception:
-                _restore_modules(ctx.cartridge_dir, snap)
+            except Exception as swe_run_exc:
+                if "Godot headless smoke check failed in res://tests/" not in str(swe_run_exc):
+                    _restore_modules(ctx.cartridge_dir, snap)
                 raise
         finally:
             lock.release()
@@ -796,7 +1032,7 @@ def available_specialists(ctx: WorkerContext, item: Optional[WorkItem] = None) -
     """
     has_visual = ctx.library_factory is not None or ctx.visual_agent is not None or _is_live(ctx.client)
     has_audio = ctx.voice_agent is not None
-    if item is not None:
+    if item is not None and not item.revisions:
         if item.kind in ("visual_asset", "animation"):
             return ["visual_artist"] if has_visual else []
         if item.kind == "audio_asset":
@@ -846,7 +1082,12 @@ def run_visual_artist_specialist(
             "spec": f"{item.spec}\n\nTASK LEAD BRIEF FOR VISUAL ARTIST:\n{brief}{path_hint}",
         }
     )
-    res = _fabricate_visual(ctx, sub_item, VISUAL_MODES)
+    res = _fabricate_visual(
+        ctx,
+        sub_item,
+        VISUAL_MODES,
+        force_regenerate=bool(item.revisions) or (turn_index > 0),
+    )
     req_file = _item_dir(ctx, sub_item) / "requirement.json"
     touched: List[str] = list(target_paths or [])
     if req_file.is_file():
@@ -1076,6 +1317,7 @@ def run_swe_engineer_specialist(
     scenes, entities, or UI based on the Task Lead's brief and verifies headless engine compilation/boot
     without forcing a bundled filmstrip capture."""
     import contextlib
+    from engine.studio.context_curator import is_real_genai_client
 
     agent = ctx.swe_agent
     if agent is None:
@@ -1089,11 +1331,16 @@ def run_swe_engineer_specialist(
     ]
     if item.kind == "level_map" and not explicit_code_modules and is_real_genai_client(ctx.client):
         explicit_code_modules = ["scenes.gd"]
+    has_existing_layout = (ctx.cartridge_dir / "level_layout.json").is_file()
+    explicitly_targets_layout = any("level_layout" in str(p) for p in (target_paths or []))
     wants_level_layout = (
         hasattr(agent, "formulate_level_layout")
         and (
-            item.kind == "level_map"
-            or any("level_layout" in str(p) for p in (target_paths or []))
+            explicitly_targets_layout
+            or (
+                item.kind == "level_map"
+                and (not has_existing_layout or not target_paths)
+            )
             or (not explicit_code_modules and not hasattr(agent, "implement_requirement_track"))
         )
     )
@@ -1116,6 +1363,11 @@ def run_swe_engineer_specialist(
             f"Layout: {len(layout.world_regions)} regions, {len(layout.entities)} entities, "
             f"{len(layout.triggers)} triggers; world {layout.world_bounds} (~{layout.intended_world_scale_in_viewports:.1f} screens)."
         )
+    elif item.kind == "level_map" and has_existing_layout:
+        safe_id = _safe_id(item.item_id)
+        existing_map_proof = _item_dir(ctx, item) / f"level_map_{safe_id}_rev{len(item.revisions)}.png"
+        if existing_map_proof.is_file():
+            proof_images.append(str(existing_map_proof))
 
     should_run_code = hasattr(agent, "implement_requirement_track") and (
         bool(explicit_code_modules) or not wants_level_layout
@@ -1174,40 +1426,56 @@ def run_swe_engineer_specialist(
                 swe_extra_kwargs["board"] = ctx.board
         except Exception:
             pass
+        turn_code_diffs: Dict[str, str] = {}
         with lock_cm:
-            snap = _snapshot_modules(ctx.cartridge_dir, modules + ["project.godot", "main.tscn"])
-            try:
-                agent.implement_requirement_track(
-                    track=track,
-                    staging_dir=ctx.cartridge_dir,
-                    requirements_spec=req_spec,
-                    **swe_extra_kwargs,
+            if (
+                is_real_genai_client(ctx.client)
+                and hasattr(agent, "formulate_level_layout")
+                and (ctx.cartridge_dir / "game_bible.json").is_file()
+                and not (ctx.cartridge_dir / "level_layout.json").is_file()
+            ):
+                try:
+                    agent.formulate_level_layout(ctx.cartridge_dir, force_refresh=False)
+                except Exception as layout_exc:
+                    logger.warning("Pre-code formulate_level_layout skipped: %s", layout_exc)
+            pre_turn_snap = _snapshot_modules(ctx.cartridge_dir, modules)
+            agent.implement_requirement_track(
+                track=track,
+                staging_dir=ctx.cartridge_dir,
+                requirements_spec=req_spec,
+                **swe_extra_kwargs,
+            )
+            if ctx.code_verify is not None:
+                record_turn_substep(
+                    "running_tests",
+                    f"Running headless engine verification & unit checks on {modules}",
+                    details={"modules": list(modules)},
                 )
-                if ctx.code_verify is not None:
-                    try:
+                try:
+                    ctx.code_verify(ctx.cartridge_dir, track)
+                except Exception as verify_exc:
+                    if is_real_genai_client(ctx.client):
+                        logger.warning(
+                            "SWE code_verify failed on first pass for '%s' (%s); retrying with prior_error feedback.",
+                            item.item_id,
+                            verify_exc,
+                        )
+                        record_turn_substep(
+                            "running_tests",
+                            f"Verification failed ({str(verify_exc)[:120]}); self-healing and re-verifying {modules}",
+                        )
+                        agent.implement_requirement_track(
+                            track=track,
+                            staging_dir=ctx.cartridge_dir,
+                            requirements_spec=req_spec,
+                            prior_error=str(verify_exc),
+                            **swe_extra_kwargs,
+                        )
                         ctx.code_verify(ctx.cartridge_dir, track)
-                    except Exception as verify_exc:
-                        from engine.studio.context_curator import is_real_genai_client
-                        if is_real_genai_client(ctx.client):
-                            logger.warning(
-                                "SWE code_verify failed on first pass for '%s' (%s); retrying with prior_error feedback.",
-                                item.item_id,
-                                verify_exc,
-                            )
-                            agent.implement_requirement_track(
-                                track=track,
-                                staging_dir=ctx.cartridge_dir,
-                                requirements_spec=req_spec,
-                                prior_error=str(verify_exc),
-                                **swe_extra_kwargs,
-                            )
-                            ctx.code_verify(ctx.cartridge_dir, track)
-                        else:
-                            raise
-            except Exception:
-                _restore_modules(ctx.cartridge_dir, snap)
-                raise
-        for m in modules:
+                    else:
+                        raise
+            turn_code_diffs = _compute_turn_code_diffs(ctx.cartridge_dir, pre_turn_snap)
+        for m in list(modules) + list(turn_code_diffs.keys()):
             if m not in touched:
                 touched.append(m)
         summaries.append(
@@ -1215,6 +1483,7 @@ def run_swe_engineer_specialist(
             f"Available actions: {available_input_actions(ctx.cartridge_dir)}."
         )
 
+    from datetime import datetime, timezone
     return SpecialistReport(
         deliberation=f"SWE Engineer executed brief for '{item.item_id}'.",
         turn_index=turn_index,
@@ -1223,6 +1492,9 @@ def run_swe_engineer_specialist(
         summary=" ".join(summaries),
         touched_files=touched,
         proof_images=proof_images,
+        verification_passed=True,
+        code_diffs=turn_code_diffs if "turn_code_diffs" in locals() else {},
+        timestamp_utc=datetime.now(timezone.utc).isoformat(),
     )
 
 
@@ -1247,13 +1519,12 @@ def run_qa_test_engineer_specialist(
         }
     )
     with lock_cm:
+        record_turn_substep(
+            "planning_qa",
+            f"Planning headless QA filmstrip scenario & state assertions for '{item.item_id}'",
+        )
         plan = plan_filmstrip(ctx, qa_item)
-        script: List[Dict[str, Any]] = []
-        for s in plan.input_segments:
-            seg_d: Dict[str, Any] = {"from": s.from_tick, "to": s.to_tick, "actions": list(s.actions)}
-            if getattr(s, "mouse_click_pos", None) is not None:
-                seg_d["mouse_click_pos"] = list(s.mouse_click_pos)
-            script.append(seg_d)
+        script = _serialize_input_segments(plan)
         setup_calls = [
             {
                 "at_tick": c.at_tick,
@@ -1266,6 +1537,29 @@ def run_qa_test_engineer_specialist(
         strip_prefix = "level_filmstrip" if item.kind == "level_map" else "filmstrip"
         safe_id = _safe_id(item.item_id)
         out_strip_path = _item_dir(ctx, item) / f"{strip_prefix}_{safe_id}_rev{len(item.revisions)}.png"
+        resolved_scene = ""
+        raw_scene = (getattr(plan, "target_scene", "") or "").strip()
+        if not raw_scene:
+            # Check if brief or target_paths explicitly specify a standalone test .tscn that exists on disk
+            for cand_src in [brief or ""] + list(target_paths or []):
+                m_tscn = re.search(r"(?:res://)?(tests/[A-Za-z0-9_./-]+\.tscn)", str(cand_src))
+                if m_tscn:
+                    raw_scene = f"res://{m_tscn.group(1)}"
+                    break
+        if raw_scene:
+            rel_scene = raw_scene
+            if rel_scene.startswith("res://"):
+                rel_scene = rel_scene[len("res://"):]
+            elif rel_scene.startswith("res:/"):
+                rel_scene = rel_scene[len("res:/"):]
+            rel_scene = rel_scene.lstrip("/")
+            if (ctx.cartridge_dir / rel_scene).is_file():
+                resolved_scene = f"res://{rel_scene}"
+        record_turn_substep(
+            "rendering_scene",
+            f"Rendering scene {resolved_scene or 'res://main.tscn'} across ticks {list(plan.capture_ticks)}",
+            details={"scene": resolved_scene or "res://main.tscn", "ticks": list(plan.capture_ticks)},
+        )
         if ctx.filmstrip_fn is None:
             from engine.studio.proofs import capture_filmstrip
             strip = capture_filmstrip(
@@ -1275,6 +1569,8 @@ def run_qa_test_engineer_specialist(
                 input_script=script,
                 setup_script=setup_calls or None,
                 verify_counterfactual=(item.kind != "level_map"),
+                state_assertions=list(getattr(plan, "state_assertions", None) or []),
+                target_scene=resolved_scene,
             )
         else:
             strip = ctx.filmstrip_fn(
@@ -1283,6 +1579,11 @@ def run_qa_test_engineer_specialist(
                 out_path=out_strip_path,
                 input_script=script,
             )
+        record_turn_substep(
+            "captured_proof",
+            f"Captured QA filmstrip {Path(strip).name}",
+            details={"proof_image": str(strip)},
+        )
     extra_qa = ""
     if setup_calls:
         extra_qa += f" Setup calls: {[c['method_name'] for c in setup_calls]}."
@@ -1396,8 +1697,15 @@ def _build_task_lead_multimodal_parts(ctx: WorkerContext, collected_proofs: List
     valid_proofs = [Path(p_str) for p_str in collected_proofs if Path(p_str).is_file()]
     filmstrips = [p for p in valid_proofs if "filmstrip" in p.name.lower()]
     non_filmstrips = [p for p in valid_proofs if "filmstrip" not in p.name.lower()]
+    inspection_plates = [
+        p
+        for p in non_filmstrips
+        if p.name.lower().startswith(("plate_", "anim_sheet_", "anim_rig_", "waveform_", "script_sheet_", "level_map_"))
+    ]
     deduped_proofs: List[Path] = []
-    if non_filmstrips:
+    if inspection_plates:
+        deduped_proofs.append(inspection_plates[-1])
+    elif non_filmstrips:
         deduped_proofs.append(non_filmstrips[-1])
     if filmstrips:
         deduped_proofs.append(filmstrips[-1])
@@ -1406,8 +1714,27 @@ def _build_task_lead_multimodal_parts(ctx: WorkerContext, collected_proofs: List
 
     for p in deduped_proofs:
         mime = "image/jpeg" if p.suffix.lower() in (".jpg", ".jpeg") else "image/png"
+        n_low = p.name.lower()
+        qa_note = ""
+        if n_low.startswith("plate_"):
+            qa_note = (
+                " [QA ALPHA INSPECTION PLATE: The side-by-side dark/light square checkerboard grids and cyan bounding-box rectangle "
+                "are external QA test-harness backgrounds drawn behind/around the transparent PNG—they are NOT inside the sprite PNG file "
+                "and must NEVER be flagged as cross-hatch/grid/box artifacts!]"
+            )
+        elif n_low.startswith("anim_sheet_") or n_low.startswith("anim_rig_"):
+            qa_note = (
+                " [QA ANIMATION CONTACT SHEET: The dark square checkerboard grid, cyan cell borders, and horizontal yellow/gold baseline ruler lines "
+                "at the bottom of each frame are external QA test-harness alignment guides—they are NOT inside the sprite sheet PNG file and must NEVER "
+                "be flagged as yellow line or checkerboard artifacts!]"
+            )
+        elif "filmstrip" in n_low:
+            qa_note = (
+                " [QA CONTACT SHEET: The top ('[QA] tick N in:[...]') and bottom ('[QA] pos=...') strips outside each 16:9 frame are external QA "
+                "telemetry margins, NOT inside the game viewport.]"
+            )
         parts.append(
-            f"CAPTURED PROOF IMAGE ({p.name}) — inspect this image carefully before choosing submit_to_council:"
+            f"CAPTURED PROOF IMAGE ({p.name}){qa_note} — inspect this image carefully before choosing submit_to_council:"
         )
         parts.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime))
     return parts
@@ -1443,6 +1770,32 @@ def plan_task_lead_turn(
         try:
             bible_data = json.loads(bible_path.read_text(encoding="utf-8"))
             if isinstance(bible_data, dict):
+                dna_summary = str(bible_data.get("target_player_dna_summary") or "").strip()
+                core_loop_data = bible_data.get("core_loop") if isinstance(bible_data.get("core_loop"), dict) else {}
+                agency_depth = str(core_loop_data.get("player_agency_and_optimization_depth") or "").strip()
+                m2m_loop = str(core_loop_data.get("moment_to_moment_loop") or "").strip()
+                min2min_loop = str(core_loop_data.get("minute_to_minute_loop") or "").strip()
+                sess_loop = str(core_loop_data.get("session_loop") or "").strip()
+                goal_data = bible_data.get("goal_hierarchy") if isinstance(bible_data.get("goal_hierarchy"), dict) else {}
+                goals_list = goal_data.get("goals") if isinstance(goal_data.get("goals"), list) else []
+                goals_summary = "; ".join(
+                    f"[{g.get('horizon', '')}] {g.get('description', '')}"
+                    for g in goals_list
+                    if isinstance(g, dict) and g.get("description")
+                )
+                dna_and_agency_lines = ""
+                if dna_summary:
+                    dna_and_agency_lines += f"\nTARGET PLAYER STEAM DNA (YOU ARE BUILDING THIS GAME SPECIFICALLY FOR THIS PLAYER):\n{dna_summary}\n"
+                if m2m_loop or min2min_loop or sess_loop or agency_depth:
+                    dna_and_agency_lines += (
+                        f"\nWHOLE-GAME CORE LOOP & AGENCY DEPTH (DO NOT SHRINK INTO A 1-STEP TUTORIAL):\n"
+                        f"  - Moment-to-Moment Loop: {m2m_loop}\n"
+                        f"  - Minute-to-Minute Loop: {min2min_loop}\n"
+                        f"  - Session Loop: {sess_loop}\n"
+                        f"  - Player Agency & Optimization Depth: {agency_depth}\n"
+                    )
+                if goals_summary:
+                    dna_and_agency_lines += f"  - Escalating Goal Hierarchy: {goals_summary}\n"
                 roadmap = bible_data.get("slice_roadmap")
                 active_idx = int(bible_data.get("active_slice_index") or 0)
                 if isinstance(roadmap, list) and roadmap:
@@ -1455,12 +1808,15 @@ def plan_task_lead_turn(
                         active_slice = roadmap[active_idx]
                     if isinstance(active_slice, dict):
                         slice_context_block = (
+                            f"{dna_and_agency_lines}"
                             f"\nACTIVE GAME SLICE [{active_slice.get('slice_id', '')}] (Iteration #{active_slice.get('slice_index', 0)} — {active_slice.get('title', '')}):\n"
                             f"  Objective: {active_slice.get('slice_objective', '')}\n"
-                            f"  Player Acclimation & Mechanics Focus: {active_slice.get('player_acclimation_and_mechanics_focus', '')}\n"
+                            f"  Player Acclimation & Full-Loop Focus: {active_slice.get('player_acclimation_and_mechanics_focus', '')}\n"
                             f"  Expansion from Prior Slice: {active_slice.get('expansion_from_prior_slice', '')}\n"
-                            f"  Scope Boundaries (ONLY build assets & mechanics needed for this slice): {active_slice.get('scope_boundaries', '')}\n"
+                            f"  Required Systems & Scope: {active_slice.get('scope_boundaries', '')}\n"
                         )
+                elif dna_and_agency_lines:
+                    slice_context_block = dna_and_agency_lines
         except Exception:
             pass
 
@@ -1533,7 +1889,7 @@ def plan_task_lead_turn(
             "  - 'qa_test_engineer': designs and executes a scripted Godot headless test scenario (setup_calls, input_segments, mouse_click_pos, state_assertions, capture_ticks) and captures a multi-frame gameplay filmstrip proof image.\n"
         ),
     }
-    from engine.studio.context_curator import ContextCuratorAgent, is_real_genai_client
+    from engine.studio.context_curator import ContextCuratorAgent, SelfInquiryQAPair, is_real_genai_client
 
     available_spec_lines = "".join(spec_descriptions[s] for s in specialists if s in spec_descriptions)
     curated_lead_block = ""
@@ -1544,6 +1900,8 @@ def plan_task_lead_turn(
             if p and p not in prior_rev_proofs:
                 prior_rev_proofs.append(p)
     lead_image_paths = list(dict.fromkeys(prior_rev_proofs + list(collected_proofs)))
+    active_curator: Optional[ContextCuratorAgent] = None
+    already_included_cids: List[str] = []
     if is_real_genai_client(ctx.client):
         curator = ContextCuratorAgent(
             cartridge_dir=ctx.cartridge_dir,
@@ -1552,6 +1910,7 @@ def plan_task_lead_turn(
             board=ctx.board,
             event_callback=ctx.event_callback,
         )
+        active_curator = curator
         pack = curator.curate_context(
             target_agent_role="task_lead",
             task_request=(
@@ -1562,6 +1921,7 @@ def plan_task_lead_turn(
             item_kind=item.kind,
             extra_image_paths=lead_image_paths,
         )
+        already_included_cids = [ch.chunk_id for ch in (pack.retrieved_chunks or [])]
         curated_lead_block = pack.prompt_block
         multimodal_parts = list(pack.multimodal_parts) or _build_task_lead_multimodal_parts(ctx, lead_image_paths)
         if collected_proofs and pack.multimodal_parts:
@@ -1580,8 +1940,24 @@ def plan_task_lead_turn(
                     existing_labels.add(lbl)
 
     issues: List[str] = []
-    for attempt in range(1, attempts + 1):
+    resolved_inquiries: List[SelfInquiryQAPair] = (
+        active_curator.load_self_inquiry_memory(item.item_id, "task_lead")
+        if active_curator is not None
+        else []
+    )
+    pending_question_pack = None
+    asked_questions: set[str] = {p.question.strip().lower() for p in resolved_inquiries if p.question}
+    inquiry_budget_used = 0
+    max_inquiry_turns = 2 if active_curator is not None else 0
+
+    attempt = 1
+    while attempt <= attempts:
         retry = "\nYOUR PREVIOUS TaskLeadDecision FAILED VALIDATION; FIX:\n- " + "\n- ".join(issues) + "\n" if issues else ""
+        inquiry_block = (
+            active_curator.format_self_inquiry_prompt_section(resolved_inquiries, pending_question_pack)
+            if active_curator is not None
+            else ""
+        )
         prompt = (
             f"You are the Task Lead Strategist for TASK [{item.item_id}] ({item.kind}): {item.title}\n"
             f"SPEC: {item.spec}\n"
@@ -1590,7 +1966,11 @@ def plan_task_lead_turn(
             f"AVAILABLE AUTONOMOUS SPECIALISTS: {specialists}\n"
             f"{available_spec_lines}"
             f"INSTRUCTIONS:\n"
-            f"1. Formulate your bespoke `current_strategy` for accomplishing and proving this task within the active slice (and pivoting if the Council requested changes).\n"
+            f"1. Formulate your bespoke `current_strategy` and `proof_strategy` for creating everything necessary for this task and generating the final proof (and pivoting if the Council requested changes):\n"
+            f"   - Creation Strategy (`current_strategy`): Plan every artifact, asset, multi-cell sheet/grid, rig, script, or GDScript module required by `SPEC`, and decide which specialist(s) in {specialists} to delegate to in sequence.\n"
+            f"   - Proof Generation Strategy (`proof_strategy`): Plan how the final visual proof artifact(s) (`selected_proof_paths`) will be generated and verified to directly satisfy `PROOF THE COUNCIL WILL JUDGE` (`{item.proof_spec}`).\n"
+            f"   - When delegating to `'visual_artist'` for a task that requires a multi-cell grid, sheet, or atlas of distinct visual states, icons, stages, or components (e.g. a 2x2 or NxM state sheet where each cell depicts a distinct graphic/state), explicitly specify the `grid_cols x grid_rows` layout and each cell's visual contents in row-major order in your `brief` so `'visual_artist'` populates `grid_cols`, `grid_rows`, and `cell_prompts`.\n"
+            f"   - SELF-INQUIRY TOOL (`self_question` -> ContextCuratorAgent research -> `self_question_answer`): If you need to inspect a specific module's code, signals, or design spec that is not in your current context before writing your specialist `brief`, you may output a specific question in `self_question` (leaving `brief` empty). `ContextCuratorAgent` will fetch the relevant chunks on the next turn so YOU can answer your own question in `self_question_answer` and then delegate accurately.\n"
             f"2. JUST-IN-TIME ASSET & SUB-TASK DISCOVERY (`action = 'spawn_tasks'` or `'delegate'` to `'visual_artist'`): Assets and animations are NOT built heavily upfront. As you plan or implement this task, reason out what specific assets, surface textures, animations, sounds, or sub-tasks are needed for THIS task in THIS slice.\n"
             f"   - HYBRID PROCEDURAL + GENERATED VISUAL CRAFT (THE BEST OF BOTH WORLDS):\n"
             f"     * NEVER rely on flat untextured `Polygon2D` slabs, blank monochrome backgrounds, or bare 8-point `Line2D` programmer-art zigzags! Instead, combine procedural generation (Simplex noise, cellular automata, Voronoi, spline contours, custom `ShaderMaterial`, `GPUParticles2D`) with fabricated visual assets from `'visual_artist'`:\n"
@@ -1602,15 +1982,25 @@ def plan_task_lead_turn(
             f"   - If this task implements or tests a character, creature, or interactive entity (`mechanic_code`, `integration`, `level_map`, etc.):\n"
             f"     * First check `ON-DISK ASSET CATALOG` and `CURRENT PRODUCTION BOARD ITEMS`. If a matching sprite, rig, or `tile_surface` texture already exists on disk, instruct `'swe_engineer'` in your `brief` to load and bind that exact PNG/rig (`Image.load_from_file` / `StudioRigHelper`)—preserving its exact `hframes`/`vframes` from `asset_library.json` (remember `articulated_parts` composites have `hframes=1, vframes=1`!).\n"
             f"     * If a needed character rig, structure sprite, or `tile_surface` texture does not exist on disk yet, either delegate to `'visual_artist'` first to fabricate it inside this task, OR choose `action = 'spawn_tasks'` with `wait_for_spawned_tasks = True` so the visual asset is fabricated before `'swe_engineer'` binds it.\n"
-            f"3. If `COLLECTED PROOF IMAGES SO FAR` is non-empty, visually inspect the attached proof image(s) (and any `QA Post-Capture Visual Audit` findings in the turn history) before choosing `submit_to_council`:\n"
+            f"3. EMPATHETIC NEW-PLAYER PERSPECTIVE, TARGET PLAYER DNA, WHOLE-GAME LOOP & UNSOLVED t=0 BASELINE (for `mechanic_code`, `ui`, `integration`, `level_map`):\n"
+            f"   - DELIVER THE LARGER POINT OF THE GAME (NEVER SHRINK INTO A 1-STEP TUTORIAL): Check `TARGET PLAYER STEAM DNA` and `WHOLE-GAME CORE LOOP & AGENCY DEPTH` below. You are building this game specifically for THIS player. Do NOT build 'the smallest slice possible' that reduces the game to a 4-step linear tutorial or a single pre-placed connection! Onboarding is ONLY the opening 60 seconds; the game itself must deliver the full `moment_to_moment_loop`, `minute_to_minute_loop`, and `session_loop` with genuine player construction, experimentation, optimization, or tactical depth (`core_loop.player_agency_and_optimization_depth`) and escalating goals (`goal_hierarchy`).\n"
+            f"   - Think empathetically from the perspective of a brand-new player booting this game for the first time with zero external instructions. Strategize how THIS game communicates: (a) what the player is doing and why (their role, purpose, and stakes), (b) how they interact with the world and how actions causally connect (`input -> entity response -> world consequence`), and (c) what visual/audio feedback occurs when an action succeeds OR when an action is attempted before its prerequisite is met.\n"
+            f"   - UNSOLVED t=0 BASELINE (`test_unsolved_baseline_t0`) — NEVER CORRUPT `_ready()` FOR SUBSYSTEM QA PROOFS: `_ready()` at `t=0` is what the live human player boots into! `_ready()` MUST initialize the world in its unbuilt/unsolved starting state as defined by the Game Bible. NEVER pre-connect, pre-build, or pre-solve the player's work inside `_ready()` just so a downstream mechanic is visible at tick 0 in a QA screenshot—instead, instruct `'qa_test_engineer'` to use `input_segments` (mouse clicks/drags and keys) to construct and trigger the mechanic from the clean `t=0` state!\n"
+            f"   - REAL INTERACTIVE VERBS & CAMERA NAVIGATION: Every core player verb in `core_loop.player_verbs` and the active slice's `scope_boundaries` (including mouse click/drag placement or connection, interactive component tuning/socketing, hazard clearing, and `Camera2D` panning/scrolling when `world_bounds` exceeds the 1280x720 viewport) MUST be wired to real `_unhandled_input` / `_input` / UI handlers and exercised via `input_segments` (`mouse_click_pos` or actions) in QA filmstrips.\n"
+            f"   - Every input key/action bound in the codebase (`Available actions`) MUST have a discoverable in-world or HUD affordance—never bind hidden/secret keys that the player cannot know exist, and NEVER bind fake tutorial-skip keys (such as `KEY_TAB` or `set_onboarding_step`) that advance onboarding text without the player performing the actual in-world mechanic.\n"
+            f"   - Never rig an input handler to bypass physics, force a win state, or teleport world state when a timing window is missed; instead, instruct `'qa_test_engineer'` to use reactive state triggers (`when_snapshot_key`, `when_operator`, `when_value`) to test timing-sensitive mechanics honestly.\n"
+            f"   - Prevent duplicate rendering across modules: ensure a single authoritative module owns each world structure or visual effect so `main.gd`, `scenes.gd`, `entities.gd`, and `ui_hud.gd` do not draw overlapping copies of the same geometry or indicator.\n"
+            f"4. If `COLLECTED PROOF IMAGES SO FAR` is non-empty, visually inspect the attached proof image(s) (and any `QA Post-Capture Visual Audit` findings in the turn history) before choosing `submit_to_council`:\n"
             f"   - In `filmstrip_*.png` contact sheets, the top (`[QA] tick N in:[...]`) and bottom (`[QA] pos=(...) ...`) bands outside each 16:9 frame border are external QA test-harness annotations—use them to verify coordinates/state, and never mistake them for in-game debug text.\n"
-            f"   - NEVER SUBMIT PLACEHOLDER STICKMEN, CLIPPED SPRITES, OR SHRUNK VIEWPORT BACKGROUNDS: If the proof image or `QA Post-Capture Visual Audit` reports `qa_passed=False`, unaddressed Council defects, clipped/invisible sprites (`hframes > 1` on a single-frame texture), or a shrunk background that leaves dark void around the level, do NOT choose `submit_to_council`! Fix the root cause with `'visual_artist'` / `'swe_engineer'` and re-run `'qa_test_engineer'`.\n"
+            f"   - In `plate_*.png` and `anim_sheet_*.png` / `anim_rig_*.png`, the dark/light square checkerboard grids, cyan bounding-box borders, and horizontal yellow/gold baseline ruler lines at the bottom of frames are external QA test-harness overlays drawn behind/around the transparent PNG—NEVER mistake those external QA overlays for cross-hatch grids or yellow line artifacts inside the sprite PNG!\n"
+            f"   - NEVER SUBMIT PLACEHOLDER STICKMEN, CLIPPED SPRITES, DUPLICATE OVERLAPPING GEOMETRY, OR SHRUNK VIEWPORT BACKGROUNDS: If the proof image or `QA Post-Capture Visual Audit` reports `qa_passed=False`, unaddressed Council defects, clipped/invisible sprites (`hframes > 1` on a single-frame texture), or a shrunk background that leaves dark void around the level, do NOT choose `submit_to_council`! Fix the root cause with `'visual_artist'` / `'swe_engineer'` and re-run `'qa_test_engineer'`.\n"
             f"   - Verify that active gameplay entities (`CharacterBody2D` / `Sprite2D` actors and floor/world geometry) are visibly rendered inside the 16:9 viewport and are NOT hidden behind an opaque full-screen background/border frame drawn at a higher `z_index` or foreground `CanvasLayer`.\n"
-            f"4. Choose `action = 'delegate'` to send an open-ended natural-language `brief` to one of {specialists}, `action = 'spawn_tasks'` to create newly discovered tasks on the board, OR `action = 'submit_to_council'` ONLY after all required assets/code are built AND at least one proof image in `COLLECTED PROOF IMAGES SO FAR` visually proves the requirement.\n"
+            f"5. Choose `action = 'delegate'` to send an open-ended natural-language `brief` to one of {specialists}, `action = 'spawn_tasks'` to create newly discovered tasks on the board, OR `action = 'submit_to_council'` ONLY after all required assets/code are built AND at least one proof image in `COLLECTED PROOF IMAGES SO FAR` visually proves the requirement.\n"
             f"   - CRITICAL SCHEMA FIELD ORDER WARNING: In `TaskLeadDecision`, `specialist_agent` and `brief` appear BEFORE `action` in the JSON schema! Decide your turn action inside `deliberation` and `current_strategy` first: whenever you are delegating to a specialist (`action = 'delegate'`), you MUST populate `specialist_agent` (one of {specialists}) and a non-empty `brief` BEFORE emitting `action = 'delegate'`! Never leave `specialist_agent` or `brief` empty when delegating.\n"
             f"Provide `deliberation` FIRST and `action` LAST.\n"
             f"{slice_context_block}"
             f"{curated_lead_block}"
+            f"{inquiry_block}"
             f"{prior_revision_block}"
             f"{board_snapshot_block}"
             f"CARTRIDGE SYMBOLS & FILES:\n{qa_context or '(empty)'}{cat_block}"
@@ -1619,6 +2009,18 @@ def plan_task_lead_turn(
             f"{retry}"
         )
         contents_arg: Any = ([prompt] + multimodal_parts) if multimodal_parts else prompt
+        record_turn_epistemic_context(
+            role="task_lead",
+            curated_context=f"{slice_context_block}\n{curated_lead_block}\n{prior_revision_block}".strip(),
+            prompt_text=prompt,
+            self_inquiries=[p.model_dump() for p in resolved_inquiries],
+        )
+        record_turn_substep(
+            "planning_turn",
+            f"Task Lead Strategist planning Turn #{len(turn_history) + 1} for '{item.item_id}'"
+            + (f" (self-inquiry pass #{inquiry_budget_used})" if inquiry_budget_used > 0 else ""),
+            specialist_agent="task_lead",
+        )
         resp = call_gemini_with_transient_retry(
             lambda: ctx.client.models.generate_content(
                 model=ctx.model_name,
@@ -1642,6 +2044,67 @@ def plan_task_lead_turn(
                 if "fabrication_mode" in raw_dict or "capture_ticks" in raw_dict:
                     raise _LegacyFakeClientDirectPayload(resp.text)
         decision = TaskLeadDecision.model_validate_json(resp.text)
+        record_turn_epistemic_context(
+            role="task_lead",
+            deliberation=decision.deliberation,
+        )
+
+        # 1. If the Task Lead answered a pending self_question on this turn, record Q->A in persistent memory
+        if pending_question_pack is not None and active_curator is not None:
+            ans_text = (decision.self_question_answer or "").strip() or (decision.deliberation or "").strip()
+            if ans_text:
+                resolved_inquiries.append(
+                    SelfInquiryQAPair(
+                        deliberation=f"Task Lead answered its own self-question on '{item.item_id}'.",
+                        question=pending_question_pack.question,
+                        answer=ans_text,
+                        researched_chunk_ids=list(pending_question_pack.selected_chunk_ids),
+                    )
+                )
+                active_curator.save_self_inquiry_memory(item.item_id, "task_lead", resolved_inquiries)
+                record_turn_substep(
+                    "self_inquiry_answered",
+                    f"Task Lead answered internal question: {ans_text[:140]}",
+                    details={"question": pending_question_pack.question, "answer": ans_text},
+                    specialist_agent="task_lead",
+                )
+                record_turn_epistemic_context(
+                    role="task_lead",
+                    self_inquiries=[p.model_dump() for p in resolved_inquiries],
+                )
+            pending_question_pack = None
+
+        # 2. If the Task Lead asked a self_question instead of delegating/submitting, research it and loop without consuming a validation attempt
+        new_q = (decision.self_question or "").strip()
+        if (
+            new_q
+            and not decision.brief.strip()
+            and active_curator is not None
+            and inquiry_budget_used < max_inquiry_turns
+            and new_q.lower() not in asked_questions
+        ):
+            asked_questions.add(new_q.lower())
+            inquiry_budget_used += 1
+            logger.info("Task Lead self-inquiry on '%s' (turn %d): %s", item.item_id, inquiry_budget_used, new_q)
+            record_turn_substep(
+                "self_inquiry",
+                f"Task Lead asking internal question: {new_q}",
+                details={"question": new_q},
+                specialist_agent="task_lead",
+            )
+            pending_question_pack = active_curator.research_question_context(
+                target_agent_role="task_lead",
+                question=new_q,
+                item_id=item.item_id,
+                target_modules=item.target_modules,
+                already_included_chunk_ids=already_included_cids,
+            )
+            for cid in pending_question_pack.selected_chunk_ids:
+                if cid not in already_included_cids:
+                    already_included_cids.append(cid)
+            issues = []
+            continue
+
         issues = validate_task_lead_decision(
             decision,
             specialists,
@@ -1653,6 +2116,7 @@ def plan_task_lead_turn(
         if not issues:
             return decision
         logger.info("TaskLeadDecision attempt %d/%d for %s invalid: %s", attempt, attempts, item.item_id, issues)
+        attempt += 1
     raise StudioAgentError(f"TaskLeadDecision for '{item.item_id}' still invalid after {attempts} attempts: {issues}")
 
 
@@ -1715,58 +2179,10 @@ def run_task_lead(
     ):
         return level_map_handler(ctx)(item)
 
-    from engine.studio.context_curator import is_real_genai_client
-    if item.kind in ("visual_asset", "animation", "audio_asset") and is_real_genai_client(ctx.client):
-        spec_role = "audio_designer" if item.kind == "audio_asset" else "visual_artist"
-        res = _fallback_for_legacy_fake_client(ctx, item)
-        direct_report = SpecialistReport(
-            deliberation=f"Direct single-specialist execution of standalone {item.kind} task '{item.item_id}'.",
-            turn_index=0,
-            specialist_agent=spec_role,
-            brief=f"{item.title}: {item.spec}",
-            summary=res.notes,
-            touched_files=[],
-            proof_images=list(res.proof_images),
-            verification_passed=True,
-        )
-        trace_path = _item_dir(ctx, item) / f"lead_trace_rev{len(item.revisions)}.json"
-        trace_path.write_text(
-            json.dumps(
-                {
-                    "item_id": item.item_id,
-                    "revision": len(item.revisions),
-                    "status": "submitted",
-                    "current_strategy": f"Direct {spec_role} fabrication for standalone {item.kind}",
-                    "submission_summary": res.notes,
-                    "collected_proofs": list(res.proof_images),
-                    "turns": [direct_report.model_dump()],
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        if ctx.event_callback is not None:
-            try:
-                ctx.event_callback(
-                    "backlog_item_specialist_completed",
-                    {
-                        "deliberation": res.notes,
-                        "item_id": item.item_id,
-                        "revision": len(item.revisions),
-                        "turn_index": 0,
-                        "specialist_agent": spec_role,
-                        "summary": res.notes,
-                        "proof_images": list(res.proof_images),
-                        "verification_passed": True,
-                    },
-                )
-            except Exception:
-                pass
-        return res
-
     turn_history: List[SpecialistReport] = []
     collected_proofs: List[str] = []
     last_strategy = ""
+    last_proof_strategy = ""
     submission_summary = ""
     selected_proofs: List[str] = []
     pending_decision: Optional[TaskLeadDecision] = None
@@ -1787,33 +2203,79 @@ def run_task_lead(
                     if isinstance(p, str) and Path(p).is_file() and p not in collected_proofs:
                         collected_proofs.append(p)
                 last_strategy = str(existing_trace.get("current_strategy") or "")
+                last_proof_strategy = str(existing_trace.get("proof_strategy") or "")
                 raw_pending = existing_trace.get("pending_decision")
                 if isinstance(raw_pending, dict):
                     pending_decision = TaskLeadDecision.model_validate(raw_pending)
         except Exception:
             logger.debug("Could not hydrate existing lead trace at %s", trace_path, exc_info=True)
 
-    def _persist_trace(status: str = "in_progress", pending: Optional[TaskLeadDecision] = None) -> None:
+    def _persist_trace(
+        status: str = "in_progress",
+        pending: Optional[TaskLeadDecision] = None,
+        include_active_turn: bool = True,
+    ) -> None:
         trace_data: Dict[str, Any] = {
             "item_id": item.item_id,
             "revision": len(item.revisions),
             "status": status,
             "current_strategy": last_strategy,
+            "proof_strategy": last_proof_strategy,
             "submission_summary": submission_summary,
             "collected_proofs": list(collected_proofs),
             "turns": [t.model_dump() for t in turn_history],
         }
         if pending is not None:
             trace_data["pending_decision"] = pending.model_dump()
+        live_turn_state = getattr(_ACTIVE_TURN_CTX, "state", None)
+        if include_active_turn and status == "in_progress" and isinstance(live_turn_state, dict):
+            trace_data["active_turn"] = {
+                k: v for k, v in live_turn_state.items() if not str(k).startswith("_")
+            }
         trace_path.write_text(json.dumps(trace_data, indent=2), encoding="utf-8")
 
     code_lock = ctx.code_lock if ctx.code_lock is not None else threading.Lock()
     code_lock_held = False
+    task_baseline_snap: Optional[Dict[str, Optional[str]]] = None
     spawn_turn_bonus = sum(1 for t in turn_history if t.specialist_agent == "board_task_spawner")
     effective_max_turns = max_turns + spawn_turn_bonus
     try:
+        from datetime import datetime, timezone
         turn_idx = len(turn_history)
         while turn_idx < effective_max_turns:
+            if is_in_board_scheduler() and ctx.cartridge_dir is not None:
+                pause_file = ctx.cartridge_dir.parent / ".studio_paused.json"
+                if pause_file.is_file():
+                    try:
+                        p_data = json.loads(pause_file.read_text(encoding="utf-8"))
+                        if isinstance(p_data, dict) and p_data.get("paused") is True:
+                            _ACTIVE_TURN_CTX.state = None
+                            _persist_trace(status="yielded", pending=pending_decision, include_active_turn=False)
+                            raise WorkerYielded(f"Build paused by operator before Turn #{turn_idx + 1} on '{item.item_id}'")
+                    except WorkerYielded:
+                        raise
+                    except Exception:
+                        pass
+            _ACTIVE_TURN_CTX.state = {
+                "item_id": item.item_id,
+                "revision": len(item.revisions),
+                "turn_index": turn_idx,
+                "phase": "lead_planning",
+                "specialist_agent": "task_lead",
+                "brief": "",
+                "started_at_utc": datetime.now(timezone.utc).isoformat(),
+                "lead_deliberation": "",
+                "lead_curated_context": "",
+                "lead_prompt_text": "",
+                "lead_self_inquiries": [],
+                "curated_context": "",
+                "prompt_text": "",
+                "self_inquiries": [],
+                "step_log": [],
+                "_persist_fn": lambda: _persist_trace(status="in_progress", pending=None, include_active_turn=True),
+                "_event_callback": ctx.event_callback,
+            }
+            _persist_trace(status="in_progress", pending=pending_decision, include_active_turn=True)
             resumed_from_pending = False
             if pending_decision is not None:
                 decision = pending_decision
@@ -1838,9 +2300,18 @@ def run_task_lead(
                 try:
                     decision = plan_task_lead_turn(ctx, item, turn_history, collected_proofs)
                 except _LegacyFakeClientDirectPayload:
+                    _ACTIVE_TURN_CTX.state = None
                     return _fallback_for_legacy_fake_client(ctx, item)
 
             last_strategy = decision.current_strategy
+            if getattr(decision, "proof_strategy", ""):
+                last_proof_strategy = decision.proof_strategy
+            if isinstance(getattr(_ACTIVE_TURN_CTX, "state", None), dict):
+                _ACTIVE_TURN_CTX.state["phase"] = "specialist_executing" if decision.action == "delegate" else decision.action
+                _ACTIVE_TURN_CTX.state["specialist_agent"] = decision.specialist_agent or decision.action
+                _ACTIVE_TURN_CTX.state["brief"] = decision.brief or ""
+                _ACTIVE_TURN_CTX.state["lead_deliberation"] = decision.deliberation or ""
+                _persist_trace(status="in_progress", pending=decision if decision.action == "delegate" else None, include_active_turn=True)
             if not resumed_from_pending and ctx.event_callback is not None:
                 try:
                     ctx.event_callback(
@@ -1864,7 +2335,8 @@ def run_task_lead(
                 submission_summary = decision.submission_summary or decision.current_strategy
                 chosen = [p for p in decision.selected_proof_paths if Path(p).is_file()]
                 selected_proofs = chosen if chosen else list(collected_proofs)
-                _persist_trace(status="submitted", pending=None)
+                _ACTIVE_TURN_CTX.state = None
+                _persist_trace(status="submitted", pending=None, include_active_turn=False)
                 break
 
             if decision.action == "spawn_tasks":
@@ -1878,6 +2350,7 @@ def run_task_lead(
                     wait_for_spawned=decision.wait_for_spawned_tasks,
                 )
                 spawned_ids = [s.item_id for s in spawned_items]
+                live_st = getattr(_ACTIVE_TURN_CTX, "state", None) or {}
                 spawn_report = SpecialistReport(
                     turn_index=turn_idx,
                     specialist_agent="board_task_spawner",
@@ -1889,29 +2362,41 @@ def run_task_lead(
                     touched_files=[],
                     proof_images=[],
                     verification_passed=True,
+                    step_log=list(live_st.get("step_log") or []),
+                    lead_deliberation=str(live_st.get("lead_deliberation") or decision.deliberation or ""),
+                    lead_prompt_text=str(live_st.get("lead_prompt_text") or ""),
+                    lead_curated_context=str(live_st.get("lead_curated_context") or ""),
+                    lead_self_inquiries=list(live_st.get("lead_self_inquiries") or []),
                 )
                 turn_history.append(spawn_report)
                 effective_max_turns += 1
+                _ACTIVE_TURN_CTX.state = None
                 if decision.wait_for_spawned_tasks:
-                    _persist_trace(status="waiting_for_spawned_tasks", pending=None)
+                    _persist_trace(status="waiting_for_spawned_tasks", pending=None, include_active_turn=False)
                     raise WorkerYielded(
                         f"spawned_prerequisite_tasks:{','.join(spawned_ids)}"
                     )
-                _persist_trace(status="in_progress", pending=None)
+                _persist_trace(status="in_progress", pending=None, include_active_turn=False)
                 turn_idx += 1
                 continue
 
             if decision.specialist_agent in ("swe_engineer", "qa_test_engineer") and not code_lock_held:
                 if is_in_board_scheduler():
                     if not code_lock.acquire(blocking=False):
-                        _persist_trace(status="yielded", pending=decision)
+                        _ACTIVE_TURN_CTX.state = None
+                        _persist_trace(status="yielded", pending=decision, include_active_turn=False)
                         raise WorkerYielded(
                             f"Waiting for code_lock to run {decision.specialist_agent} on turn {turn_idx + 1} of '{item.item_id}'"
                         )
                 else:
                     code_lock.acquire()
                 code_lock_held = True
-                _persist_trace(status="in_progress", pending=None)
+                if task_baseline_snap is None:
+                    task_baseline_snap = _snapshot_modules(
+                        ctx.cartridge_dir,
+                        list(item.target_modules or []) + ["project.godot", "main.tscn"],
+                    )
+                _persist_trace(status="in_progress", pending=None, include_active_turn=True)
 
             if ctx.event_callback is not None:
                 try:
@@ -1929,6 +2414,12 @@ def run_task_lead(
                 except Exception:
                     pass
 
+            pre_dispatch_snap: Optional[Dict[str, Optional[str]]] = None
+            if decision.specialist_agent == "swe_engineer":
+                pre_dispatch_snap = _snapshot_modules(
+                    ctx.cartridge_dir,
+                    list(item.target_modules or []) + list(decision.target_paths or []),
+                )
             try:
                 report = _dispatch_to_specialist(
                     ctx,
@@ -1938,18 +2429,29 @@ def run_task_lead(
                     _lock_already_held=code_lock_held,
                 )
             except WorkerYielded:
+                _ACTIVE_TURN_CTX.state = None
                 raise
             except Exception as spec_exc:
                 if (
                     turn_idx + 1 < effective_max_turns
                     and decision.specialist_agent in ("qa_test_engineer", "swe_engineer")
                 ):
+                    partial_diffs = (
+                        _compute_turn_code_diffs(ctx.cartridge_dir, pre_dispatch_snap)
+                        if pre_dispatch_snap is not None
+                        else {}
+                    )
                     logger.warning(
                         "Specialist '%s' failed on Turn #%d of '%s' (%s); reporting failure to Task Lead for self-correction.",
                         decision.specialist_agent,
                         turn_idx + 1,
                         item.item_id,
                         spec_exc,
+                    )
+                    record_turn_substep(
+                        "error",
+                        f"Error in {decision.specialist_agent}: {str(spec_exc)[:240]}",
+                        specialist_agent=decision.specialist_agent,
                     )
                     report = SpecialistReport(
                         deliberation=(
@@ -1964,18 +2466,34 @@ def run_task_lead(
                             f"ACTION REQUIRED FOR TASK LEAD: Diagnose this failure and delegate a fix to 'swe_engineer' "
                             f"(if GDScript/scene wiring or performance is broken) or 'qa_test_engineer' (if the QA test plan/setup_calls need adjustment)."
                         ),
-                        touched_files=[],
+                        touched_files=list(partial_diffs.keys()),
                         proof_images=[],
                         verification_passed=False,
+                        code_diffs=partial_diffs,
+                        timestamp_utc=datetime.now(timezone.utc).isoformat(),
                     )
                 else:
-                    _persist_trace(status="failed", pending=None)
+                    _ACTIVE_TURN_CTX.state = None
+                    _persist_trace(status="failed", pending=None, include_active_turn=False)
                     raise
+            live_st = getattr(_ACTIVE_TURN_CTX, "state", None) or {}
+            if isinstance(live_st, dict):
+                report.step_log = list(live_st.get("step_log") or report.step_log or [])
+                report.curated_context = str(live_st.get("curated_context") or report.curated_context or "")
+                report.prompt_text = str(live_st.get("prompt_text") or report.prompt_text or "")
+                report.self_inquiries = list(live_st.get("self_inquiries") or report.self_inquiries or [])
+                report.lead_deliberation = str(live_st.get("lead_deliberation") or decision.deliberation or "")
+                report.lead_prompt_text = str(live_st.get("lead_prompt_text") or "")
+                report.lead_curated_context = str(live_st.get("lead_curated_context") or "")
+                report.lead_self_inquiries = list(live_st.get("lead_self_inquiries") or [])
+                if not report.timestamp_utc:
+                    report.timestamp_utc = datetime.now(timezone.utc).isoformat()
+            _ACTIVE_TURN_CTX.state = None
             turn_history.append(report)
             for p in report.proof_images:
                 if p not in collected_proofs and Path(p).is_file():
                     collected_proofs.append(p)
-            _persist_trace(status="in_progress", pending=None)
+            _persist_trace(status="in_progress", pending=None, include_active_turn=False)
             if ctx.event_callback is not None:
                 try:
                     ctx.event_callback(
@@ -2003,6 +2521,12 @@ def run_task_lead(
             selected_proofs = list(collected_proofs)
             submission_summary = submission_summary or last_strategy
             _persist_trace(status="submitted", pending=None)
+    except WorkerYielded:
+        raise
+    except Exception:
+        if task_baseline_snap is not None:
+            _restore_modules(ctx.cartridge_dir, task_baseline_snap)
+        raise
     finally:
         if code_lock_held:
             code_lock.release()

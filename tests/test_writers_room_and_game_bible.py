@@ -926,12 +926,21 @@ def test_genesis_raises_when_nothing_is_distinct(tmp_path: Path):
 
 def test_specialist_prompt_marks_concept_as_provisional_and_dna_not_a_template(tmp_path: Path):
     room, client = _make_room(tmp_path)
+    assert room.creative_temperature == pytest.approx(0.7)
     prompts = []
+    temps = []
     orig = room._call_structured_llm
-    room._call_structured_llm = lambda prompt, schema_cls, temperature=None, parts=None: (prompts.append(prompt), orig(prompt, schema_cls, temperature, parts))[1]
+    room._call_structured_llm = lambda prompt, schema_cls, temperature=None, parts=None: (
+        prompts.append(prompt),
+        temps.append((schema_cls.__name__, room.creative_temperature if temperature is None else float(temperature))),
+        orig(prompt, schema_cls, temperature, parts),
+    )[2]
     room.run_writers_room(dna=_sample_dna(), candidate_dir=tmp_path / "cartridges" / "candidate_new")
     assert any("THE CONCEPT IS STILL EVOLVING" in p for p in prompts)
-    assert any("NOT templates to imitate" in p for p in prompts if "Taste signals" in p) or True
+    assert any("CLARITY & CONCRETE GAME DESIGN" in p for p in prompts)
+    assert all(t <= 0.75 for _, t in temps)
+    assert any(name == "WritersRoomListenCheck" and t == pytest.approx(0.4) for name, t in temps)
+    assert any(name == "DirectorConvergenceCheck" and t == pytest.approx(0.4) for name, t in temps)
     summary = room._format_dna_summary(_sample_dna())
     assert "Session Creative Exploration Lens" not in summary
 

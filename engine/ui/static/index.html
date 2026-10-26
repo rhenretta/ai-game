@@ -1920,6 +1920,9 @@
       display: flex;
       flex-direction: column;
       gap: 8px;
+      min-width: 0;
+      overflow-wrap: anywhere;
+      word-break: break-word;
       transition: border-color 0.2s ease;
     }
     .board-item-card.state-in_progress,
@@ -2130,9 +2133,14 @@
         <span id="header-task-count" style="background: var(--navy); padding: 1px 6px; border-radius: 10px; font-size: 10px;">0</span>
       </button>
       <span id="studio-status-badge" class="badge-status">ONLINE</span>
-      <button id="btn-resume-genesis" class="btn-primary" style="background: rgba(255, 163, 0, 0.18); border: 1px solid var(--amber); color: var(--yellow); display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; font-size: 11px;" title="Pause or resume development on the selected game at any time">
-        <span>▶️ Resume Build</span>
-      </button>
+      <div id="build-control-group" style="display: inline-flex; align-items: center; background: #050b1a; border: 1px solid #28406e; border-radius: 6px; padding: 2px 3px; gap: 4px;">
+        <span id="build-process-status-pill" style="display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px; border-radius: 4px; font-size: 11px; font-weight: 800; font-family: var(--font-mono); background: rgba(255, 0, 77, 0.2); color: var(--pink); border: 1px solid var(--neon-red);" title="Active server process &amp; worker thread telemetry">
+          <span>🛑 STOPPED</span>
+        </span>
+        <button id="btn-resume-genesis" class="btn-primary" style="background: #142242; border: 1px solid #3d5a8a; color: var(--white); display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; font-size: 11px; border-radius: 4px;" title="Pause or resume development on the selected game at any time">
+          <span>▶ Resume</span>
+        </button>
+      </div>
       <button id="btn-trigger-genesis" class="btn-primary btn-genesis-cta" style="padding: 5px 11px; font-size: 11px;" title="Start a brand-new game from scratch in the Creative Writers' Room">
         <span>🚀 New Game</span>
       </button>
@@ -2184,6 +2192,7 @@
       </button>
     </div>
     <div id="pulse-active-agents-strip" class="live-running-agents-strip" aria-label="Currently Running Agents and Workers"></div>
+    <div id="studio-build-error-banner" role="alert" style="display: none; width: 100%; margin-top: 8px; padding: 10px 14px; background: rgba(255, 0, 77, 0.14); border: 1.5px solid var(--neon-red); border-radius: 6px; color: var(--white);"></div>
   </section>
 
   <!-- Native HTML <dialog closedby="any"> Modal for Commissioning a New Game from Scratch -->
@@ -2453,19 +2462,6 @@
       </div>
     </div>
   </section>
-
-  <!-- Native HTML <dialog closedby="any"> Lightbox for 16:9 Concept & UI Mockups -->
-  <dialog id="bible-mockup-lightbox" closedby="any" aria-label="Concept Art Mockup Lightbox">
-    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; gap: 16px;">
-      <div>
-        <strong id="lightbox-mockup-title" style="color: var(--cyan); font-size: 14px;">Mockup Preview</strong>
-        <span id="lightbox-mockup-scene" class="genre-chip" style="margin-left: 8px;">gameplay_scene</span>
-      </div>
-      <button id="btn-close-mockup-lightbox" type="button" class="drawer-close-btn" title="Close (Esc)">✕</button>
-    </div>
-    <img id="lightbox-mockup-img" src="" alt="16:9 Concept Mockup" style="max-width: 84vw; max-height: 70vh; border-radius: 4px; border: 1px solid var(--navy); display: block;" />
-    <div id="lightbox-mockup-notes" style="margin-top: 10px; font-size: 12px; color: var(--light-gray); max-width: 84vw;"></div>
-  </dialog>
 
   <div id="workspace-telemetry" class="grid-container" style="display: none;">
     <!-- Left Column: Agent Swarm DAG and Telemetry Heatmap -->
@@ -2849,6 +2845,56 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     </div>
   </aside>
 
+  <!-- Native Modal Dialog for Chronological Task History & Artifact Drill-Down -->
+  <dialog id="task-chronology-modal" closedby="any" style="width: min(1180px, 95vw); max-height: 90vh; background: #050b1a; color: var(--white); border: 1px solid var(--cyan); border-radius: 10px; padding: 0; box-shadow: 0 24px 64px rgba(0, 0, 0, 0.85);">
+    <div style="display: flex; flex-direction: column; max-height: 90vh;">
+      <header style="display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 14px 18px; background: linear-gradient(90deg, #081229, #0c1b3a); border-bottom: 1px solid var(--navy);">
+        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+          <span style="font-size: 16px;" aria-hidden="true">🕒</span>
+          <h2 id="chronology-modal-title" style="margin: 0; font-size: 15px; color: var(--white); font-weight: 800;">Task Chronological History</h2>
+          <span id="chronology-modal-badge" style="font-family: monospace; font-size: 11px; padding: 2px 8px; border-radius: 4px; background: rgba(41, 173, 255, 0.16); color: var(--cyan); border: 1px solid var(--cyan);"></span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <button type="button" id="chronology-refresh-btn" style="background: rgba(41, 173, 255, 0.14); border: 1px solid var(--cyan); color: var(--cyan); border-radius: 5px; padding: 5px 10px; font-size: 11px; font-weight: 700; cursor: pointer;">↻ Refresh</button>
+          <form method="dialog" style="margin: 0;">
+            <button value="close" style="background: rgba(255, 0, 77, 0.16); border: 1px solid var(--neon-red); color: var(--white); border-radius: 5px; padding: 5px 11px; font-size: 11px; font-weight: 800; cursor: pointer;">✕ Close</button>
+          </form>
+        </div>
+      </header>
+      <div id="chronology-modal-body" style="padding: 16px 18px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px;">
+        <div class="blueprint-empty">Loading chronological task execution history...</div>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Native HTML <dialog closedby="any"> Full-Resolution Artifact & Audio Waveform Lightbox -->
+  <dialog id="bible-mockup-lightbox" closedby="any" aria-label="Full-Size Artifact & Audio Waveform Lightbox" style="width: min(1420px, 95vw); max-width: 96vw; max-height: 94vh; padding: 14px 18px;">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; gap: 12px; flex-wrap: wrap; border-bottom: 1px solid var(--navy); padding-bottom: 8px;">
+      <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+        <strong id="lightbox-mockup-title" style="color: var(--cyan); font-size: 14px;">Artifact Preview</strong>
+        <span id="lightbox-mockup-scene" class="genre-chip">artifact</span>
+        <span id="lightbox-img-dimensions" style="font-family: monospace; font-size: 10.5px; color: var(--amber); background: rgba(255, 163, 0, 0.14); padding: 2px 7px; border-radius: 4px; display: none;"></span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <button id="btn-toggle-lightbox-zoom" type="button" onclick="toggleLightboxZoomMode()" style="background: rgba(41, 173, 255, 0.16); border: 1px solid var(--cyan); color: var(--cyan); border-radius: 4px; padding: 4px 10px; font-size: 11px; font-weight: 700; cursor: pointer;" title="Toggle between 1:1 actual pixel resolution and fit-to-window">
+          🔍 1:1 Actual Size
+        </button>
+        <a id="link-open-raw-lightbox" href="#" target="_blank" rel="noopener" style="background: rgba(0, 228, 54, 0.14); border: 1px solid var(--green); color: var(--green); border-radius: 4px; padding: 4px 10px; font-size: 11px; font-weight: 700; text-decoration: none;" title="Open raw full-resolution image in a new browser tab">
+          ↗ Open Raw
+        </a>
+        <button id="btn-close-mockup-lightbox" type="button" class="drawer-close-btn" title="Close (Esc)">✕</button>
+      </div>
+    </div>
+    <div id="lightbox-audio-container" style="display: none; align-items: center; gap: 12px; background: linear-gradient(90deg, rgba(255, 119, 168, 0.16), rgba(41, 173, 255, 0.14)); border: 1px solid var(--pink); border-radius: 6px; padding: 8px 12px; margin-bottom: 10px;">
+      <span style="font-size: 11.5px; font-weight: 800; color: var(--peach); font-family: monospace; white-space: nowrap;">🔊 Play Synthesized Audio:</span>
+      <audio id="lightbox-audio-player" controls preload="auto" style="height: 32px; flex: 1;"></audio>
+    </div>
+    <div id="lightbox-img-scroll-wrap" style="max-width: 92vw; max-height: 76vh; overflow: auto; background: #02050e; border: 1px solid var(--navy); border-radius: 6px; padding: 8px; display: flex; justify-content: center; align-items: flex-start;">
+      <img id="lightbox-mockup-img" src="" alt="Full-Size Artifact Preview" onclick="toggleLightboxZoomMode()" title="Click to toggle 1:1 Actual Size vs Fit to Window" style="max-width: 88vw; max-height: 72vh; border-radius: 4px; display: block; cursor: zoom-in;" />
+    </div>
+    <div id="lightbox-mockup-notes" style="margin-top: 10px; font-size: 11.5px; color: var(--light-gray); max-width: 92vw; line-height: 1.45; white-space: pre-wrap; max-height: 110px; overflow-y: auto;"></div>
+  </dialog>
+
   <script>
     // =========================================================================
     // Pure ES6 WebSocket Client & Mission Control UI Controller (Zero Build)
@@ -2891,40 +2937,139 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         .replace(/'/g, '&#039;');
     }
 
+    function escapeJsAttr(str) {
+      if (!str) return '';
+      return String(str)
+        .replace(/\\/g, '\\\\')
+        .replace(/'/g, "\\'")
+        .replace(/\r/g, '\\r')
+        .replace(/\n/g, '\\n')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function resolveAudioUrlForWaveform(imgPathOrUrl, contextNotes = '', candId = '') {
+      const s = String(imgPathOrUrl || '');
+      const notes = String(contextNotes || '');
+      const effCand = candId || (typeof _selectedCartridgeId !== 'undefined' && _selectedCartridgeId) || (typeof _activeCandidateId !== 'undefined' && _activeCandidateId) || '';
+      const cartQ = effCand ? `?cartridge=${encodeURIComponent(effCand)}` : '';
+
+      // 1. Check if contextNotes explicitly records -> path/to/file.wav
+      const arrowMatch = notes.match(/->\s*([^\s()'"]+\.(?:wav|mp3|ogg))/i);
+      if (arrowMatch && arrowMatch[1]) {
+        const wavFname = arrowMatch[1].split('/').pop();
+        if (wavFname) {
+          return `/api/assets/audio/${encodeURIComponent(wavFname)}${cartQ}`;
+        }
+      }
+
+      // 2. Check if image filename or URL is waveform_<stem>[_revN].png
+      let rawName = s.split('?')[0].split('/').pop() || '';
+      try {
+        if (s.includes('path=')) {
+          const u = new URL(s, window.location.origin);
+          const pParam = u.searchParams.get('path') || '';
+          if (pParam) rawName = pParam.split('/').pop() || rawName;
+        }
+      } catch (e) {}
+      const wfMatch = rawName.match(/^waveform_(.+?)(?:_rev\d+)?\.(?:png|jpg|jpeg|webp)$/i);
+      if (wfMatch && wfMatch[1]) {
+        const stem = wfMatch[1];
+        return `/api/assets/audio/${encodeURIComponent(stem + '.wav')}${cartQ}`;
+      }
+      return '';
+    }
+
     const _lastRenderedHtmlByEl = new WeakMap();
+    function _getDetailsStateKey(detailsEl, idx) {
+      if (!detailsEl) return String(idx);
+      const explicitKey = detailsEl.getAttribute && detailsEl.getAttribute('data-details-key');
+      if (explicitKey) return explicitKey;
+      const sumEl = detailsEl.querySelector ? detailsEl.querySelector('summary') : null;
+      const rawSum = sumEl ? String(sumEl.textContent || '') : '';
+      const stableSum = rawSum
+        .replace(/\s+/g, ' ')
+        .replace(/\(\d+\s*steps?[^)]*\)/gi, '()')
+        .trim()
+        .slice(0, 96);
+      return stableSum ? `${stableSum}::${idx}` : String(idx);
+    }
+
+    function updateLiveElapsedCountersInDom(rootNode = document) {
+      if (!rootNode || !rootNode.querySelectorAll) return;
+      const nowMs = Date.now();
+      const counters = rootNode.querySelectorAll('.live-elapsed-counter[data-started-ms]');
+      counters.forEach(span => {
+        const startedMs = Number(span.getAttribute('data-started-ms') || 0);
+        if (startedMs > 0) {
+          const sec = Math.max(1, Math.round((nowMs - startedMs) / 1000));
+          const nextTxt = `${sec}s`;
+          if (span.textContent !== nextTxt) {
+            span.textContent = nextTxt;
+          }
+        }
+      });
+    }
+
     function setHtmlIfChanged(el, newHtml) {
       if (!el) return false;
       const normalized = String(newHtml ?? '');
       if (_lastRenderedHtmlByEl.get(el) === normalized) {
+        updateLiveElapsedCountersInDom(el);
         return false;
       }
-      // Capture scroll positions of the element, its scrollable ancestor, and inner <pre> blocks
+      // Capture window/document scroll, element scroll, scrollable ancestor scroll, and all scrollable descendants
+      const winScrollX = typeof window !== 'undefined' ? (window.scrollX || 0) : 0;
+      const winScrollY = typeof window !== 'undefined' ? (window.scrollY || 0) : 0;
+      const docScrollEl = (typeof document !== 'undefined' && document.scrollingElement) ? document.scrollingElement : null;
+      const prevDocScrollTop = docScrollEl ? docScrollEl.scrollTop : winScrollY;
       const prevElScrollTop = el.scrollTop;
       const prevElScrollLeft = el.scrollLeft;
-      const scrollParent = el.closest ? el.closest('.bible-subview, #handoff-viewer') : null;
+      const scrollParent = el.closest ? el.closest('.bible-subview, #handoff-viewer, .chronology-modal-body, .modal-content') : null;
       const prevParentScrollTop = scrollParent ? scrollParent.scrollTop : 0;
-      const innerPres = el.querySelectorAll ? Array.from(el.querySelectorAll('pre, .json-dump')) : [];
-      const prevPreScrolls = innerPres.map(p => ({ top: p.scrollTop, left: p.scrollLeft }));
-      const openDetailsIdx = el.querySelectorAll
-        ? Array.from(el.querySelectorAll('details')).map(d => d.open)
-        : [];
+      const scrollSelector = 'pre, .json-dump, [style*="overflow"]';
+      const innerScrollables = el.querySelectorAll ? Array.from(el.querySelectorAll(scrollSelector)) : [];
+      const prevInnerScrolls = innerScrollables.map(node => ({
+        top: node.scrollTop,
+        left: node.scrollLeft,
+      }));
+      const prevDetailsStateMap = new Map();
+      const prevDetailsBySummary = new Map();
+      if (el.querySelectorAll) {
+        Array.from(el.querySelectorAll('details')).forEach((d, idx) => {
+          const key = _getDetailsStateKey(d, idx);
+          prevDetailsStateMap.set(key, Boolean(d.open));
+          const baseKey = key.split('::')[0];
+          if (baseKey && !prevDetailsBySummary.has(baseKey)) {
+            prevDetailsBySummary.set(baseKey, Boolean(d.open));
+          }
+        });
+      }
 
       el.innerHTML = normalized;
       _lastRenderedHtmlByEl.set(el, normalized);
 
-      // Restore <details> open states and scroll positions
-      if (el.querySelectorAll && openDetailsIdx.length > 0) {
-        const nextDetails = Array.from(el.querySelectorAll('details'));
-        nextDetails.forEach((d, idx) => {
-          if (openDetailsIdx[idx]) d.open = true;
+      // Restore <details> open/closed states
+      if (el.querySelectorAll && prevDetailsStateMap.size > 0) {
+        Array.from(el.querySelectorAll('details')).forEach((d, idx) => {
+          const key = _getDetailsStateKey(d, idx);
+          const baseKey = key.split('::')[0];
+          if (prevDetailsStateMap.has(key)) {
+            d.open = prevDetailsStateMap.get(key);
+          } else if (baseKey && prevDetailsBySummary.has(baseKey)) {
+            d.open = prevDetailsBySummary.get(baseKey);
+          }
         });
       }
-      if (el.querySelectorAll && prevPreScrolls.length > 0) {
-        const nextPres = Array.from(el.querySelectorAll('pre, .json-dump'));
-        nextPres.forEach((p, idx) => {
-          if (prevPreScrolls[idx]) {
-            p.scrollTop = prevPreScrolls[idx].top;
-            p.scrollLeft = prevPreScrolls[idx].left;
+      // Restore inner scrollable containers (step logs, <pre>, json-dumps)
+      if (el.querySelectorAll && prevInnerScrolls.length > 0) {
+        const nextScrollables = Array.from(el.querySelectorAll(scrollSelector));
+        nextScrollables.forEach((node, idx) => {
+          if (prevInnerScrolls[idx]) {
+            node.scrollTop = prevInnerScrolls[idx].top;
+            node.scrollLeft = prevInnerScrolls[idx].left;
           }
         });
       }
@@ -2933,6 +3078,12 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       if (scrollParent) {
         scrollParent.scrollTop = prevParentScrollTop;
       }
+      if (docScrollEl && Math.abs(docScrollEl.scrollTop - prevDocScrollTop) > 1) {
+        docScrollEl.scrollTop = prevDocScrollTop;
+      } else if (typeof window !== 'undefined' && typeof window.scrollTo === 'function' && (Math.abs((window.scrollY || 0) - winScrollY) > 1 || Math.abs((window.scrollX || 0) - winScrollX) > 1)) {
+        window.scrollTo(winScrollX, winScrollY);
+      }
+      updateLiveElapsedCountersInDom(el);
       return true;
     }
 
@@ -3112,11 +3263,13 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     let _resumeOptimisticUntil = 0;
     let latestProductionBoard = null;
     let _activeCandidateId = null;
-    let _lastActivityTimestampMs = Date.now();
+    let _lastActivityTimestampMs = 0;
     let _lastActivityHeadline = '';
     let _lastRetryNotice = '';
     let currentBoardFilter = 'all';
     const _liveRunningAgents = {};
+    const _observedEventKeys = new Set();
+    let _serverProcessStatus = null;
     let _writersRoomLiveStatus = {
       statusText: '',
       activeAgents: [],
@@ -3145,8 +3298,16 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       AudioAtmosphereDesigner: 'Audio & Atmosphere'
     };
 
-    function observeEventForBuildActivity(ev) {
+    function observeEventForBuildActivity(ev, isHistoricalReplay = false) {
       if (!ev) return;
+      const evKey = ev.event_id || `${ev.timestamp_utc || ''}_${ev.event_type || ''}_${ev.agent_name || ''}`;
+      if (isHistoricalReplay && evKey && _observedEventKeys.has(evKey)) {
+        return;
+      }
+      if (evKey) {
+        _observedEventKeys.add(evKey);
+      }
+
       const evType = (ev.event_type || '').toUpperCase();
       const evTypeLower = (ev.event_type || '').toLowerCase();
       const agent = ev.agent_name || (ev.payload && ev.payload.agent_name) || '';
@@ -3176,15 +3337,23 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         }
       }
 
+      let evTsMs = 0;
       if (ev.timestamp_utc) {
         const parsedTs = Date.parse(ev.timestamp_utc);
-        if (!Number.isNaN(parsedTs) && parsedTs > _lastActivityTimestampMs) {
-          _lastActivityTimestampMs = parsedTs;
+        if (!Number.isNaN(parsedTs)) {
+          evTsMs = parsedTs;
+          if (parsedTs > _lastActivityTimestampMs) {
+            _lastActivityTimestampMs = parsedTs;
+          }
         }
+      } else if (!isHistoricalReplay) {
+        evTsMs = Date.now();
+        _lastActivityTimestampMs = evTsMs;
       }
+      const effectiveStartMs = isHistoricalReplay ? (evTsMs || 0) : (evTsMs || Date.now());
 
       const delibText = String(ev.deliberation || p.deliberation || '');
-      if (delibText.includes('504') || delibText.includes('DEADLINE_EXCEEDED') || delibText.toLowerCase().includes('retrying')) {
+      if (!isHistoricalReplay && (delibText.includes('504') || delibText.includes('DEADLINE_EXCEEDED') || delibText.toLowerCase().includes('retrying'))) {
         _lastRetryNotice = '⏳ Upstream LLM timeout detected — automatically retrying in background...';
       }
 
@@ -3198,7 +3367,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           statusText: statusTxt,
           activeAgents: activeList,
           phase: phaseStr,
-          startedAtMs: Date.now(),
+          startedAtMs: effectiveStartMs,
         };
         if (statusTxt) {
           _lastActivityHeadline = `🎙️ ${statusTxt}`;
@@ -3215,7 +3384,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             specialistBadge: personaBadge,
             agentLabel: shortRoleNames.slice(0, 2).join(', ') + (shortRoleNames.length > 2 ? ` +${shortRoleNames.length - 2}` : ''),
             action: statusTxt || "Writers' Room deliberating...",
-            startedAtMs: Date.now(),
+            startedAtMs: effectiveStartMs,
           };
         } else {
           delete _liveRunningAgents['writers_room'];
@@ -3237,7 +3406,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             turnIndex: 1,
             agentLabel: `${ownerRole} [${itemId}]`,
             action: `${resumedTag} ${p.kind || 'work item'} (initializing Task Lead)...`,
-            startedAtMs: Date.now(),
+            startedAtMs: effectiveStartMs,
           };
         }
       } else if (evTypeLower === 'backlog_item_lead_planning') {
@@ -3249,6 +3418,14 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         const statusTxt = p.status_text || `Task Lead (${ownerRole}) deliberating Turn #${turnNo} strategy for [${itemId}]...`;
         _lastActivityHeadline = `🧠 ${statusTxt}`;
         if (itemId) {
+          const prevEntry = _liveRunningAgents['item_' + itemId] || {};
+          const stepLog = prevEntry.turnIndex === turnNo && Array.isArray(prevEntry.stepLog) ? prevEntry.stepLog : [];
+          stepLog.push({
+            step_type: 'planning_turn',
+            specialist_agent: 'task_lead',
+            message: `Task Lead planning Turn #${turnNo} strategy`,
+            timestamp_utc: ev.timestamp_utc || '',
+          });
           _liveRunningAgents['item_' + itemId] = {
             key: 'item_' + itemId,
             itemId: itemId,
@@ -3257,8 +3434,10 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             turnIndex: turnNo,
             agentLabel: `${ownerRole} [${itemId}]`,
             action: `Turn #${turnNo}: Deliberating strategy & selecting specialist...`,
-            startedAtMs: Date.now(),
+            stepLog: stepLog.slice(-40),
+            startedAtMs: effectiveStartMs,
           };
+          if (typeof scheduleChronologyLiveRefresh === 'function') scheduleChronologyLiveRefresh(itemId);
         }
       } else if (evTypeLower === 'backlog_item_yielded') {
         _lastBuildStoppedByErrorOrPromote = false;
@@ -3275,16 +3454,27 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         const strat = String(p.current_strategy || p.brief || '').slice(0, 95);
         _lastActivityHeadline = `🎯 Task Lead [${itemId}] Turn #${turnNo}${specAg}: ${strat}`;
         if (itemId) {
+          const prevEntry = _liveRunningAgents['item_' + itemId] || {};
+          const stepLog = prevEntry.turnIndex === turnNo && Array.isArray(prevEntry.stepLog) ? prevEntry.stepLog : [];
+          stepLog.push({
+            step_type: 'lead_decision',
+            specialist_agent: p.specialist_agent || 'task_lead',
+            message: `Task Lead delegated Turn #${turnNo} to ${p.specialist_agent || p.action}: ${strat}`,
+            timestamp_utc: ev.timestamp_utc || '',
+          });
           _liveRunningAgents['item_' + itemId] = {
             key: 'item_' + itemId,
             itemId: itemId,
             ownerRole: ownerRole,
             specialist: p.specialist_agent || 'TaskLead',
             turnIndex: turnNo,
+            brief: p.brief || '',
             agentLabel: `${ownerRole}${specAg} [${itemId}]`,
             action: `Turn #${turnNo}: ${strat || 'Dispatching specialist...'}`,
-            startedAtMs: Date.now(),
+            stepLog: stepLog.slice(-40),
+            startedAtMs: effectiveStartMs,
           };
+          if (typeof scheduleChronologyLiveRefresh === 'function') scheduleChronologyLiveRefresh(itemId);
         }
       } else if (evTypeLower === 'backlog_item_specialist_started') {
         _lastBuildStoppedByErrorOrPromote = false;
@@ -3296,16 +3486,61 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         const briefTxt = String(p.brief || '').slice(0, 90);
         _lastActivityHeadline = `🔧 ${specName} executing Turn #${turnNo} for "${itemId}"...`;
         if (itemId) {
+          const prevEntry = _liveRunningAgents['item_' + itemId] || {};
+          const stepLog = prevEntry.turnIndex === turnNo && Array.isArray(prevEntry.stepLog) ? prevEntry.stepLog : [];
+          stepLog.push({
+            step_type: 'specialist_started',
+            specialist_agent: specName,
+            message: `${specName} started Turn #${turnNo}: ${briefTxt}`,
+            timestamp_utc: ev.timestamp_utc || '',
+          });
           _liveRunningAgents['item_' + itemId] = {
             key: 'item_' + itemId,
             itemId: itemId,
             ownerRole: ownerRole,
             specialist: specName,
             turnIndex: turnNo,
+            brief: p.brief || prevEntry.brief || '',
             agentLabel: `${ownerRole} → ${specName} [${itemId}]`,
             action: `Turn #${turnNo} (${specName}): ${briefTxt || 'Synthesizing & verifying...'}`,
-            startedAtMs: Date.now(),
+            stepLog: stepLog.slice(-40),
+            startedAtMs: effectiveStartMs,
           };
+          if (typeof scheduleChronologyLiveRefresh === 'function') scheduleChronologyLiveRefresh(itemId);
+        }
+      } else if (evTypeLower === 'backlog_item_substep') {
+        _lastBuildStoppedByErrorOrPromote = false;
+        _lastRetryNotice = '';
+        const itemId = p.item_id || '';
+        const specName = p.specialist_agent || 'Specialist';
+        const turnNo = (p.turn_index || 0) + 1;
+        const msg = String(p.message || 'Executing step...');
+        _lastActivityHeadline = `⚡ [${itemId}] Turn #${turnNo} (${specName}): ${msg}`;
+        if (itemId) {
+          const prevEntry = _liveRunningAgents['item_' + itemId] || {};
+          const stepLog = prevEntry.turnIndex === turnNo && Array.isArray(prevEntry.stepLog) ? prevEntry.stepLog : [];
+          stepLog.push({
+            step_type: p.step_type || 'substep',
+            specialist_agent: specName,
+            message: msg,
+            details: p.details || {},
+            timestamp_utc: p.timestamp_utc || ev.timestamp_utc || '',
+          });
+          _liveRunningAgents['item_' + itemId] = {
+            ...prevEntry,
+            key: 'item_' + itemId,
+            itemId: itemId,
+            specialist: specName,
+            turnIndex: turnNo,
+            agentLabel: prevEntry.agentLabel || `TaskLead → ${specName} [${itemId}]`,
+            action: `Turn #${turnNo} (${specName}): ${msg}`,
+            stepLog: stepLog.slice(-40),
+            startedAtMs: effectiveStartMs,
+          };
+          if (typeof renderProductionBoard === 'function' && latestProductionBoard) {
+            renderProductionBoard(latestProductionBoard);
+          }
+          if (typeof scheduleChronologyLiveRefresh === 'function') scheduleChronologyLiveRefresh(itemId);
         }
       } else if (evTypeLower === 'backlog_item_specialist_completed') {
         _lastBuildStoppedByErrorOrPromote = false;
@@ -3317,7 +3552,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         _lastActivityHeadline = `✓ ${specName} finished Turn #${turnNo} for "${itemId}": ${String(p.summary || '').slice(0, 90)}`;
         if (itemId && _liveRunningAgents['item_' + itemId]) {
           _liveRunningAgents['item_' + itemId].action = `Turn #${turnNo}: ${specName} finished — Task Lead evaluating proof...`;
-          _liveRunningAgents['item_' + itemId].startedAtMs = Date.now();
+          _liveRunningAgents['item_' + itemId].startedAtMs = effectiveStartMs;
         }
       } else if (evTypeLower === 'backlog_item_proof_ready') {
         _lastBuildStoppedByErrorOrPromote = false;
@@ -3334,6 +3569,15 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         _lastActivityHeadline = `🔄 Council requested revision on "${p.item_id || ''}": ${String(p.feedback || '').slice(0, 90)}`;
       } else if (evTypeLower === 'backlog_item_escalated' || evTypeLower === 'backlog_item_failed') {
         if (p.item_id) delete _liveRunningAgents['item_' + p.item_id];
+        if (evTypeLower === 'backlog_item_failed') {
+          _lastBuildError = {
+            event_type: ev.event_type || 'backlog_item_failed',
+            agent_name: agent || 'TaskWorker',
+            item_id: p.item_id || '',
+            message: String(p.error || p.failure || delibText || 'Task execution failed.'),
+            timestamp_utc: ev.timestamp_utc || new Date().toISOString(),
+          };
+        }
       } else if (evTypeLower === 'context_curator_packed') {
         _lastBuildStoppedByErrorOrPromote = false;
         const targetRole = p.target_agent_role || 'Specialist';
@@ -3387,6 +3631,16 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         _lastBuildStoppedByErrorOrPromote = true;
         _resumeOptimisticUntil = 0;
       } else if (evType === 'ERROR') {
+        const errTxt = String((p && (p.error || p.message || p.failure)) || delibText || 'Build encountered an error.');
+        if (!/StudioPausedError|paused by operator/i.test(errTxt)) {
+          _lastBuildError = {
+            event_type: 'ERROR',
+            agent_name: agent || 'Studio',
+            item_id: (p && p.item_id) || '',
+            message: errTxt,
+            timestamp_utc: ev.timestamp_utc || new Date().toISOString(),
+          };
+        }
         if (['StudioDaemon', 'BuildSupervisor', 'StudioOrchestrator', 'LeadGameplaySWEAgent', 'MissionControlGateway'].includes(agent)) {
           _lastBuildStoppedByErrorOrPromote = true;
           _resumeOptimisticUntil = 0;
@@ -3398,14 +3652,48 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     }
 
     let _isBuildPaused = false;
+    let _lastBuildError = null;
     let _selectedCartridgeId = '';
     let _userPinnedCartridge = false;
     const _gameCatalogCache = new Map();
 
+    function syncServerProcessStatus(ps) {
+      if (!ps || typeof ps !== 'object') return;
+      _serverProcessStatus = ps;
+      if (typeof ps.is_paused === 'boolean' && Date.now() >= _resumeOptimisticUntil) {
+        _isBuildPaused = ps.is_paused;
+      }
+      if (ps.last_error && typeof ps.last_error === 'object') {
+        _lastBuildError = ps.last_error;
+      } else if (ps.build_actively_running) {
+        // Clear stale build-stopping banner once build is actively running again
+      }
+      if (ps.last_event_timestamp_utc) {
+        const parsedTs = Date.parse(ps.last_event_timestamp_utc);
+        if (!Number.isNaN(parsedTs) && parsedTs > _lastActivityTimestampMs) {
+          _lastActivityTimestampMs = parsedTs;
+        }
+      }
+      if (!ps.is_process_alive && Date.now() >= _resumeOptimisticUntil) {
+        for (const k of Object.keys(_liveRunningAgents)) {
+          delete _liveRunningAgents[k];
+        }
+      }
+    }
+
     function isBuildActivelyRunning() {
       if (_isBuildPaused) return false;
       if (Date.now() < _resumeOptimisticUntil) return true;
+      if (_serverProcessStatus && typeof _serverProcessStatus.build_actively_running === 'boolean') {
+        return Boolean(!_isBuildPaused && _serverProcessStatus.build_actively_running);
+      }
       const bible = (typeof cachedGameBible === 'object' && cachedGameBible) ? cachedGameBible : {};
+      if (typeof bible.build_paused === 'boolean' && bible.build_paused) {
+        return false;
+      }
+      if (typeof bible.build_actively_running === 'boolean') {
+        return Boolean(bible.build_actively_running);
+      }
       const bibleSt = (bible.status || '').toLowerCase();
       const orchSt = (bible.orchestrator_state || '').toUpperCase();
       if (bibleSt === 'awaiting_greenlight' || orchSt === 'AWAITING_GREENLIGHT') {
@@ -3414,10 +3702,10 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       if (_lastBuildStoppedByErrorOrPromote) {
         return false;
       }
-      if (bible.build_actively_running === true || ['BRAINSTORMING', 'ANALYZING', 'SYNTHESIZING', 'VERIFYING'].includes(orchSt)) {
+      if (['BRAINSTORMING', 'ANALYZING', 'SYNTHESIZING', 'VERIFYING'].includes(orchSt)) {
         return true;
       }
-      const hasRecentEvent = _lastActivityTimestampMs > 0 && (Date.now() - _lastActivityTimestampMs < 300000);
+      const hasRecentEvent = _lastActivityTimestampMs > 0 && (Date.now() - _lastActivityTimestampMs < 90000);
       if ((bibleSt === 'brainstorming' || orchSt === 'BRAINSTORMING') && hasRecentEvent) {
         return true;
       }
@@ -3428,44 +3716,14 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         if (hasRecentEvent && hasActiveBoardItems) {
           return true;
         }
-        const allApproved = latestProductionBoard.items.every(it =>
-          String(it.status || it.state || '').toLowerCase() === 'approved'
-        );
-        if (allApproved && !hasRecentEvent) {
-          return false;
-        }
-        if (!hasActiveBoardItems && !hasRecentEvent) {
-          return false;
-        }
-      }
-      const reqResp = (typeof observabilityState === 'object' && observabilityState && observabilityState.cachedRequirementsSpec) || {};
-      const specData = (reqResp.has_active_spec || reqResp.has_spec) && reqResp.requirements_spec
-        ? reqResp.requirements_spec
-        : (reqResp.requirements ? reqResp : null);
-      const tracks = (specData && Array.isArray(specData.requirements)) ? specData.requirements : [];
-      if (hasRecentEvent && tracks.some(t => (t.status || '').toLowerCase() === 'in_progress')) {
-        return true;
-      }
-      if (!hasRecentEvent) {
         return false;
-      }
-      const activeStates = ['ANALYZING', 'SYNTHESIZING', 'VERIFYING', 'BRAINSTORMING'];
-      for (const [ag, st] of Object.entries(activeAgentStates)) {
-        if (ag !== 'StudioOrchestrator' && activeStates.includes((st || '').toUpperCase())) {
-          return true;
-        }
-      }
-      if (
-        activeStates.includes((activeAgentStates['StudioOrchestrator'] || '').toUpperCase()) &&
-        (tracks.length === 0 || tracks.some(t => !['completed', 'satisfied'].includes((t.status || '').toLowerCase())))
-      ) {
-        return true;
       }
       return false;
     }
 
     function updateHeaderBuildStatus() {
       const btn = document.getElementById('btn-resume-genesis');
+      const statusPill = document.getElementById('build-process-status-pill');
       if (!btn) return;
 
       const reqResp = (typeof observabilityState === 'object' && observabilityState && observabilityState.cachedRequirementsSpec) || {};
@@ -3475,7 +3733,6 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const tracks = (specData && Array.isArray(specData.requirements)) ? specData.requirements : [];
       const totalTracks = tracks.length;
       const completedCount = tracks.filter(t => ['completed', 'satisfied'].includes((t.status || '').toLowerCase())).length;
-      const inProgTrack = tracks.find(t => (t.status || '').toLowerCase() === 'in_progress');
       const running = isBuildActivelyRunning();
       const pbCounts = (latestProductionBoard && (latestProductionBoard.counts_by_state || latestProductionBoard.counts))
         ? (latestProductionBoard.counts_by_state || latestProductionBoard.counts)
@@ -3484,90 +3741,85 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const pbApproved = pbCounts ? (pbCounts.approved || 0) : 0;
       const pbInProg = pbCounts ? (pbCounts.in_progress || 0) : 0;
 
+      const ps = _serverProcessStatus || {};
+      const procAlive = Boolean(ps.is_process_alive);
+      const activeThreads = Array.isArray(ps.active_threads) ? ps.active_threads : [];
+      const procTooltip = _serverProcessStatus
+        ? `Server Process Inspection: state=${ps.process_state || 'unknown'} | alive=${procAlive} | paused=${Boolean(_isBuildPaused)} | lock_held=${Boolean(ps.genesis_lock_held)} | threads=${activeThreads.length > 0 ? activeThreads.join(', ') : 'none'}${ps.daemon_pid ? ` | daemon_pid=${ps.daemon_pid}` : ''}`
+        : 'Build process status';
+
+      const progressSuffix = pbTotal > 0
+        ? ` (${pbApproved}/${pbTotal} Done)`
+        : (totalTracks > 0 ? ` (${completedCount}/${totalTracks})` : '');
+
+      // Neutral action button style: NEVER colored green or red so color ONLY represents the current status pill!
+      btn.style.background = '#142242';
+      btn.style.borderColor = '#3d5a8a';
+      btn.style.color = 'var(--white)';
+
       if (_isBuildPaused) {
+        if (statusPill) {
+          statusPill.title = procTooltip;
+          statusPill.style.background = 'rgba(255, 163, 0, 0.22)';
+          statusPill.style.borderColor = 'var(--amber)';
+          statusPill.style.color = 'var(--yellow)';
+          if (procAlive) {
+            setHtmlIfChanged(statusPill, `<span>⏳ PAUSING...${escapeHtml(progressSuffix)}</span>`);
+          } else {
+            setHtmlIfChanged(statusPill, `<span>⏸️ PAUSED${escapeHtml(progressSuffix)}</span>`);
+          }
+        }
         btn.dataset.buildMode = 'paused';
-        btn.style.background = 'rgba(0, 228, 54, 0.2)';
-        btn.style.borderColor = 'var(--green)';
-        btn.style.color = 'var(--green)';
         btn.title = 'Build is currently paused. Click to resume at will.';
-        const resumeCounts = pbTotal > 0 ? ` (${pbApproved}/${pbTotal} Verified)` : '';
-        setHtmlIfChanged(btn, `<span>▶️ Resume Build — Paused${escapeHtml(resumeCounts)}</span>`);
+        setHtmlIfChanged(btn, `<span>▶ Resume</span>`);
         return;
       }
 
       if (running) {
-        let label = '';
-        if (pbTotal > 0) {
-          label = `⏸️ Pause Build (${pbApproved}/${pbTotal} Done • ${pbInProg} Active)`;
-        } else if (inProgTrack) {
-          const rawTitle = inProgTrack.title || '';
-          const shortTitle = rawTitle.length > 26 ? rawTitle.slice(0, 24) + '…' : rawTitle;
-          label = `⏸️ Pause (${inProgTrack.id} ${completedCount}/${totalTracks}: ${shortTitle})`;
-        } else {
-          const activeStates = ['ANALYZING', 'SYNTHESIZING', 'VERIFYING', 'BRAINSTORMING'];
-          let activeAgentEntry = Object.entries(activeAgentStates).find(
-            ([ag, st]) => ag !== 'StudioOrchestrator' && activeStates.includes((st || '').toUpperCase())
+        if (statusPill) {
+          statusPill.title = procTooltip;
+          statusPill.style.background = 'rgba(0, 228, 54, 0.22)';
+          statusPill.style.borderColor = 'var(--green)';
+          statusPill.style.color = 'var(--green)';
+          const activeLabel = pbTotal > 0
+            ? `🟢 RUNNING (${pbApproved}/${pbTotal} • ${Math.max(1, pbInProg || ps.scheduler_running_workers || 1)} Active)`
+            : `🟢 RUNNING${progressSuffix}`;
+          setHtmlIfChanged(
+            statusPill,
+            `<span class="activity-beacon" style="background: var(--green); box-shadow: 0 0 8px var(--green);"></span><span>${escapeHtml(activeLabel)}</span>`
           );
-          if (!activeAgentEntry && activeStates.includes((activeAgentStates['StudioOrchestrator'] || '').toUpperCase())) {
-            activeAgentEntry = ['StudioOrchestrator', activeAgentStates['StudioOrchestrator']];
-          }
-          const bibleSt = ((typeof cachedGameBible === 'object' && cachedGameBible && cachedGameBible.status) || '').toLowerCase();
-          if (bibleSt === 'brainstorming') {
-            label = "⏸️ Pause Writers' Room";
-          } else if (activeAgentEntry) {
-            const [agName, agState] = activeAgentEntry;
-            const shortAg = AGENT_SHORT_LABELS[agName] || agName;
-            const stFormatted = agState.charAt(0).toUpperCase() + agState.slice(1).toLowerCase();
-            label = totalTracks > 0
-              ? `⏸️ Pause (${shortAg}: ${stFormatted} ${completedCount}/${totalTracks})`
-              : `⏸️ Pause (${shortAg}: ${stFormatted})`;
-          } else {
-            label = totalTracks > 0
-              ? `⏸️ Pause Build (${completedCount}/${totalTracks} Tracks)`
-              : '⏸️ Pause Build';
-          }
         }
         btn.dataset.buildMode = 'running';
-        btn.style.background = 'rgba(255, 0, 77, 0.16)';
-        btn.style.borderColor = 'var(--neon-red)';
-        btn.style.color = 'var(--pink)';
-        btn.title = 'Build is actively running. Click to pause at any time.';
-        setHtmlIfChanged(
-          btn,
-          `<span class="activity-beacon" style="background: var(--cyan); box-shadow: 0 0 8px var(--cyan);"></span><span>${escapeHtml(label)}</span>`
-        );
+        btn.title = 'Build is actively running on the server. Click to pause after the current turn.';
+        setHtmlIfChanged(btn, `<span>⏸ Pause</span>`);
         return;
       }
 
-      if (pbTotal > 0 && pbApproved === pbTotal) {
+      if ((pbTotal > 0 && pbApproved === pbTotal) || (totalTracks > 0 && completedCount === totalTracks)) {
+        if (statusPill) {
+          statusPill.title = procTooltip;
+          statusPill.style.background = 'rgba(41, 173, 255, 0.2)';
+          statusPill.style.borderColor = 'var(--cyan)';
+          statusPill.style.color = 'var(--cyan)';
+          setHtmlIfChanged(statusPill, `<span>✅ COMPLETE${escapeHtml(progressSuffix)}</span>`);
+        }
         btn.dataset.buildMode = 'completed';
-        btn.style.background = 'rgba(0, 228, 54, 0.16)';
-        btn.style.borderColor = 'var(--green)';
-        btn.style.color = 'var(--green)';
-        btn.title = 'All Production Board items are verified. Click to re-run verification or finalize.';
-        setHtmlIfChanged(btn, `<span>▶️ Verified (${pbApproved}/${pbTotal}) — Re-Run / Finalize</span>`);
+        btn.title = 'All items are verified. Click to re-run verification or finalize.';
+        setHtmlIfChanged(btn, `<span>🔄 Re-Verify</span>`);
         return;
       }
 
-      if (totalTracks > 0 && completedCount === totalTracks) {
-        btn.dataset.buildMode = 'completed';
-        btn.style.background = 'rgba(0, 228, 54, 0.16)';
-        btn.style.borderColor = 'var(--green)';
-        btn.style.color = 'var(--green)';
-        btn.title = 'All requirement tracks are implemented. Click to re-run quality gates or resume.';
-        setHtmlIfChanged(btn, `<span>▶️ Tracks Complete (${completedCount}/${totalTracks}) — Run Quality Gates</span>`);
-        return;
+      if (statusPill) {
+        statusPill.title = procTooltip;
+        statusPill.style.background = 'rgba(255, 0, 77, 0.2)';
+        statusPill.style.borderColor = 'var(--neon-red)';
+        statusPill.style.color = 'var(--pink)';
+        const stoppedText = pbTotal > 0 ? `🛑 STOPPED (${pbApproved}/${pbTotal} Done)` : '🛑 STOPPED';
+        setHtmlIfChanged(statusPill, `<span>${escapeHtml(stoppedText)}</span>`);
       }
-
       btn.dataset.buildMode = 'resumable';
-      btn.style.background = 'rgba(255, 163, 0, 0.18)';
-      btn.style.borderColor = 'var(--amber)';
-      btn.style.color = 'var(--yellow)';
-      const resumeLabel = pbTotal > 0
-        ? `▶️ Resume Build (${pbApproved}/${pbTotal} Done)`
-        : '▶️ Resume Build';
-      btn.title = 'Resume development on the selected game from its persisted Game Bible and Production Board';
-      setHtmlIfChanged(btn, `<span>${escapeHtml(resumeLabel)}</span>`);
+      btn.title = 'Build process is not currently running. Click to resume development from the persisted Game Bible and Production Board.';
+      setHtmlIfChanged(btn, `<span>▶ Resume</span>`);
     }
 
     async function loadEventHistory() {
@@ -3576,6 +3828,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         if (!res.ok) return;
         const data = await res.json();
         historyHydrated = true;
+        if (data.process_status) {
+          syncServerProcessStatus(data.process_status);
+        }
         if (data.agent_lifecycle_states) {
           Object.entries(data.agent_lifecycle_states).forEach(([agent, st]) => {
             updateAgentLifecycleState(agent, st);
@@ -3583,7 +3838,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         }
         if (Array.isArray(data.events) && data.events.length > 0) {
           data.events.forEach(ev => {
-            observeEventForBuildActivity(ev);
+            observeEventForBuildActivity(ev, true);
             if (ev.deliberation && ev.event_type !== 'TOOL_INVOCATION') {
               addDeliberation(ev);
             }
@@ -3950,6 +4205,24 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       }
     }
 
+    async function loadStudioSettingsStatus() {
+      try {
+        const res = await fetch('/api/studio/settings');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (typeof data.paused === 'boolean' && Date.now() >= _resumeOptimisticUntil) {
+          _isBuildPaused = data.paused;
+        }
+        if (data.process_status) {
+          syncServerProcessStatus(data.process_status);
+        }
+        updateHeaderBuildStatus();
+        if (typeof updateStudioPulseRibbon === 'function') updateStudioPulseRibbon();
+      } catch (e) {
+        // Ignore if settings endpoint unavailable
+      }
+    }
+
     async function pauseActiveGameBuild() {
       _isBuildPaused = true;
       _resumeOptimisticUntil = 0;
@@ -3965,7 +4238,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         event_type: 'build_paused'
       });
       try {
-        await fetch('/api/studio/settings', {
+        const res = await fetch('/api/studio/settings', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -3974,6 +4247,14 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             paused: true,
           }),
         });
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.process_status) {
+            syncServerProcessStatus(data.process_status);
+          }
+          updateHeaderBuildStatus();
+          if (typeof updateStudioPulseRibbon === 'function') updateStudioPulseRibbon();
+        }
       } catch (err) {
         console.warn('Failed to send pause signal:', err);
       }
@@ -4000,7 +4281,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         event_type: 'genesis_triggered'
       });
       try {
-        await fetch('/api/studio/settings', {
+        const setRes = await fetch('/api/studio/settings', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -4009,6 +4290,12 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             paused: false,
           }),
         });
+        if (setRes.ok) {
+          const setData = await setRes.json();
+          if (setData && setData.process_status) {
+            syncServerProcessStatus(setData.process_status);
+          }
+        }
         const res = await fetch('/api/genesis/trigger', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -4414,7 +4701,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           const spritesHtml = (data.sprites || [])
             .map(s => {
               const sUrl = resolveVisualAssetUrl(s.filename, effCart);
-              return `<span class="sprite-chip" style="cursor:pointer;" title="Click to preview ${escapeHtml(s.filename)}" onclick="openMockupLightbox('${escapeHtml(sUrl)}', '${escapeHtml(s.filename)}', 'sprite_asset', '')">${escapeHtml(s.filename)}</span>`;
+              const isWf = /^waveform_/i.test(String(s.filename || ''));
+              const pairedAudio = isWf ? resolveAudioUrlForWaveform(s.filename, '', effCart) : '';
+              return `<span class="sprite-chip" style="cursor:pointer;" title="Click to preview ${escapeHtml(s.filename)}" onclick="openMockupLightbox('${escapeJsAttr(sUrl)}', '${escapeJsAttr(s.filename)}', 'sprite_asset', '', '${escapeJsAttr(pairedAudio)}')">${isWf ? '🔊 ' : ''}${escapeHtml(s.filename)}</span>`;
             })
             .join('');
           setHtmlIfChanged(spritesGallery, spritesHtml);
@@ -4445,6 +4734,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       }
     });
 
+    let _lastPaletteSig = '';
     async function loadPalette() {
       try {
         const effCart = _selectedCartridgeId || _activeCandidateId || '';
@@ -4452,6 +4742,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         const res = await fetch(`/api/assets/palette${cartParam}`);
         if (!res.ok) return;
         const data = await res.json();
+        const sig = `${effCart}::${JSON.stringify(data.colors || [])}`;
+        if (sig === _lastPaletteSig && paletteGrid.children.length > 0) return;
+        _lastPaletteSig = sig;
         paletteGrid.innerHTML = '';
         data.colors.forEach(c => {
           const chip = document.createElement('div');
@@ -4820,10 +5113,13 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         const data = await res.json();
         body.setAttribute('data-loaded', 'true');
         if (data.is_image) {
+          const isWf = /^waveform_/i.test(String(filename || ''));
+          const pairedAudio = isWf ? resolveAudioUrlForWaveform(filename || data.url, '') : '';
           body.innerHTML = `
             <div style="text-align: center; padding: 6px; background: #070b14; border-radius: 4px; border: 1px solid rgba(255,255,255,0.08);">
-              <img src="${escapeHtml(data.url)}" alt="${escapeHtml(filename)}" style="max-height: 180px; image-rendering: pixelated; border-radius: 4px; border: 1px solid var(--slate);" />
-              <div style="margin-top: 4px; font-size: 10px; color: var(--light-gray);">${escapeHtml(filename)} (${formatBytes(data.size_bytes || 0)})</div>
+              <img src="${escapeHtml(data.url)}" alt="${escapeHtml(filename)}" title="Click to view full-size artifact" style="max-height: 180px; image-rendering: pixelated; border-radius: 4px; border: 1px solid var(--slate); cursor: pointer;" onclick="openMockupLightbox('${escapeJsAttr(data.url)}', '${escapeJsAttr(filename)}', 'artifact_preview', '', '${escapeJsAttr(pairedAudio)}')" />
+              <div style="margin-top: 4px; font-size: 10px; color: var(--light-gray);">${isWf ? '🔊 ' : '📸 '}${escapeHtml(filename)} (${formatBytes(data.size_bytes || 0)}) — Click to view full size</div>
+              ${pairedAudio ? `<audio controls preload="metadata" style="width: 100%; height: 26px; margin-top: 4px;" src="${escapeHtml(pairedAudio)}"></audio>` : ''}
             </div>
           `;
         } else if (data.is_audio) {
@@ -5573,6 +5869,18 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const feedbackVal = rawIt.verdict?.feedback || rawIt.feedback || (latestRev && latestRev.feedback) || '';
       const reviewerRoleVal = rawIt.verdict?.reviewer_role || (Array.isArray(rawIt.reviewer_roles) && rawIt.reviewer_roles[0]) || 'Council';
 
+      // Auto-pair waveform_*.png or audio_asset items with their synthesized .wav audio so cards & lightboxes can play it directly
+      const hasAudioProof = normProofPaths.some(p => /\.(wav|mp3|ogg)(\?|$)/i.test(String(p)));
+      if (!hasAudioProof) {
+        const wfImg = normProofPaths.find(p => /waveform_.+\.(png|jpg|jpeg|webp)$/i.test(String(p)));
+        if (wfImg || String(rawIt.kind || '') === 'audio_asset') {
+          const derivedAudioUrl = resolveAudioUrlForWaveform(wfImg || `waveform_${idVal}.png`, workerNotesVal, effCand);
+          if (derivedAudioUrl && !normProofPaths.includes(derivedAudioUrl)) {
+            normProofPaths.push(derivedAudioUrl);
+          }
+        }
+      }
+
       return {
         ...rawIt,
         id: idVal,
@@ -5916,8 +6224,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         const proofPaths = Array.isArray(it.proof?.artifact_paths)
           ? it.proof.artifact_paths
           : (Array.isArray(it.proof_paths) ? it.proof_paths : []);
-        const imageProofs = proofPaths.filter(p => /\.(png|jpg|jpeg|webp)$/i.test(String(p)));
-        const audioProofs = proofPaths.filter(p => /\.(wav|mp3|ogg)$/i.test(String(p)));
+        const imageProofs = proofPaths.filter(p => /\.(png|jpg|jpeg|webp)(\?|$)/i.test(String(p)));
+        const audioProofs = proofPaths.filter(p => /\.(wav|mp3|ogg)(\?|$)/i.test(String(p)));
         const deps = Array.isArray(it.dependencies) && it.dependencies.length > 0
           ? `Depends on: ${it.dependencies.join(', ')}`
           : '';
@@ -5934,11 +6242,24 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           <div class="board-proof-strip">
             ${imageProofs.map(p => {
               const url = formatProofUrl(p);
-              const fname = String(p).split('/').pop();
+              const fname = String(p).split('?')[0].split('/').pop();
+              const isWaveform = /^waveform_/i.test(fname);
+              const pairedAudioUrl = isWaveform
+                ? (audioProofs.length > 0 ? formatProofUrl(audioProofs[0]) : resolveAudioUrlForWaveform(p, workerNotes))
+                : '';
+              const captionIcon = isWaveform ? '🔊' : '📸';
+              const captionLabel = isWaveform ? `${fname} (Click to Hear & Enlarge)` : fname;
               return `
-                <div class="board-proof-thumb" onclick="openMockupLightbox('${escapeHtml(url)}', '${escapeHtml(it.id + ': ' + it.title)}', '${escapeHtml(fname)}', '${escapeHtml(workerNotes || feedback || '')}')" title="Click to inspect proof artifact: ${escapeHtml(fname)}">
+                <div class="board-proof-thumb"
+                     data-lightbox-url="${escapeHtml(url)}"
+                     data-lightbox-title="${escapeHtml(it.id + ': ' + it.title)}"
+                     data-lightbox-scene="${escapeHtml(fname)}"
+                     data-lightbox-notes="${escapeHtml(workerNotes || feedback || '')}"
+                     data-lightbox-audio="${escapeHtml(pairedAudioUrl)}"
+                     onclick="openMockupLightbox('${escapeJsAttr(url)}', '${escapeJsAttr(it.id + ': ' + it.title)}', '${escapeJsAttr(fname)}', '${escapeJsAttr(workerNotes || feedback || '')}', '${escapeJsAttr(pairedAudioUrl)}')"
+                     title="${isWaveform ? 'Click to hear synthesized audio and view full-size waveform' : 'Click to inspect full-size proof artifact'}: ${escapeHtml(fname)}">
                   <img src="${escapeHtml(url)}" alt="${escapeHtml(fname)}" loading="lazy" onerror="this.parentElement.style.display='none'" />
-                  <div class="proof-caption">📸 ${escapeHtml(fname)}</div>
+                  <div class="proof-caption">${captionIcon} ${escapeHtml(captionLabel)}</div>
                 </div>
               `;
             }).join('')}
@@ -5949,7 +6270,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           <div style="display: flex; flex-direction: column; gap: 4px; margin-top: 4px;">
             ${audioProofs.map(p => {
               const url = formatProofUrl(p);
-              const fname = String(p).split('/').pop();
+              const fname = String(p).split('?')[0].split('/').pop();
               return `
                 <div style="display: flex; align-items: center; gap: 8px; background: #040917; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--navy);">
                   <span style="font-size: 10px; color: var(--peach); font-family: monospace;">🔊 ${escapeHtml(fname)}</span>
@@ -5969,41 +6290,73 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
                 <span class="task-badge-role" style="font-size: 9.5px;">👤 ${escapeHtml(it.owner_role || 'Worker')}</span>
                 <span style="font-size: 10px; color: var(--slate);">🔍 Reviewers: ${escapeHtml(reviewers)}</span>
               </div>
-              <div style="display: flex; align-items: center; gap: 6px;">
+              <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
+                <button type="button" onclick="openTaskChronologyModal('${escapeHtml(it.id)}')" style="background: rgba(41, 173, 255, 0.14); border: 1px solid var(--cyan); color: var(--cyan); border-radius: 4px; padding: 2px 8px; font-size: 10px; font-weight: 800; cursor: pointer;">
+                  🕒 Timeline &amp; Artifacts
+                </button>
                 ${it.attempt_count ? `<span style="font-size: 10px; color: var(--amber); font-family: monospace;">Attempt #${escapeHtml(it.attempt_count)}</span>` : ''}
                 <span style="padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 800; color: ${cfg.col}; background: ${cfg.bg}; border: 1px solid ${cfg.col};">
                   ${cfg.icon} ${escapeHtml(cfg.label)}
                 </span>
               </div>
             </div>
-            ${it.description ? `<div style="font-size: 11px; color: var(--light-gray); line-height: 1.4;">${escapeHtml(it.description)}</div>` : ''}
-            ${(st === 'in_progress' && _liveRunningAgents['item_' + it.id]) ? (() => {
-              const liveAg = _liveRunningAgents['item_' + it.id];
-              const elapsedSec = Math.max(1, Math.round((Date.now() - (liveAg.startedAtMs || Date.now())) / 1000));
+            ${formatStructuredSpecHtml(it.description || '', it.proof_spec || '')}
+            ${it.failure ? `
+              <details ${st === 'failed' ? 'open' : ''} style="background: rgba(255, 0, 77, 0.12); border: 1px solid var(--neon-red); border-left: 3px solid var(--neon-red); border-radius: 5px; padding: 6px 10px; font-size: 10.5px; color: var(--pink); min-width: 0; overflow-wrap: anywhere;">
+                <summary style="cursor: pointer; font-weight: 800; color: var(--neon-red);">
+                  ⚠️ Execution Error on [${escapeHtml(it.id)}]: <span style="font-weight: 400; color: var(--pink);">${escapeHtml(String(it.failure).slice(0, 140))}${String(it.failure).length > 140 ? '…' : ''}</span>
+                </summary>
+                <pre tabindex="0" style="margin: 6px 0 0 0; padding: 8px; background: #030712; border: 1px solid rgba(255, 0, 77, 0.4); border-radius: 4px; color: var(--pink); font-family: monospace; font-size: 10px; white-space: pre-wrap; overflow-x: auto; max-height: 220px;"><code>${escapeHtml(it.failure)}</code></pre>
+              </details>
+            ` : ''}
+            ${(st === 'in_progress') ? (() => {
+              const liveAg = _liveRunningAgents['item_' + it.id] || {};
+              const startedMs = Number(liveAg.startedAtMs || 0);
+              const turnNo = liveAg.turnIndex || 1;
+              const specLabel = liveAg.specialist || it.owner_role || 'TaskLead';
+              const stepLog = Array.isArray(liveAg.stepLog) ? liveAg.stepLog : [];
+              const latestMsg = liveAg.action || (stepLog.length > 0 ? stepLog[stepLog.length - 1].message : `Executing Turn #${turnNo} on [${it.id}]...`);
+              const stepLogRows = stepLog.map((s, idx) => `
+                <div style="display: flex; align-items: flex-start; gap: 6px; font-size: 10px; padding: 3px 6px; background: rgba(4, 9, 23, 0.78); border-radius: 3px; border-left: 2px solid ${s.step_type === 'error' ? 'var(--neon-red)' : 'var(--cyan)'}; min-width: 0; overflow-wrap: anywhere;">
+                  <span style="font-family: monospace; color: var(--amber); white-space: nowrap;">#${idx + 1}</span>
+                  <span style="font-family: monospace; color: var(--cyan); font-weight: 700; white-space: nowrap;">[${escapeHtml(s.step_type || 'step')}]</span>
+                  <span style="color: var(--white); flex: 1; min-width: 0; overflow-wrap: anywhere;">${escapeHtml(s.message || '')}</span>
+                </div>
+              `).join('');
               return `
-                <div style="font-size: 11px; color: var(--white); background: linear-gradient(90deg, rgba(41, 173, 255, 0.18), rgba(0, 228, 54, 0.12)); border: 1px solid var(--cyan); padding: 6px 10px; border-radius: 5px; display: flex; justify-content: space-between; align-items: center; gap: 8px;">
-                  <div>
-                    <span class="activity-beacon" style="background: var(--cyan); box-shadow: 0 0 6px var(--cyan); margin-right: 6px;"></span>
-                    <strong style="color: var(--cyan);">${escapeHtml(liveAg.agentLabel || it.owner_role)}:</strong>
-                    <span>${escapeHtml(liveAg.action || 'Executing turn...')}</span>
+                <div style="font-size: 11px; color: var(--white); background: linear-gradient(90deg, rgba(41, 173, 255, 0.18), rgba(0, 228, 54, 0.12)); border: 1px solid var(--cyan); padding: 8px 10px; border-radius: 6px; display: flex; flex-direction: column; gap: 6px; min-width: 0; overflow-wrap: anywhere;">
+                  <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+                    <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; flex: 1;">
+                      <span class="activity-beacon" style="background: var(--cyan); box-shadow: 0 0 6px var(--cyan);"></span>
+                      <span style="font-family: monospace; font-size: 10px; font-weight: 800; background: rgba(41, 173, 255, 0.24); color: var(--cyan); padding: 1px 6px; border-radius: 4px; border: 1px solid var(--cyan);">
+                        ⚡ Executing Turn #${turnNo} • ${escapeHtml(specLabel)}
+                      </span>
+                      <span style="color: var(--white); min-width: 0; overflow-wrap: anywhere;">${escapeHtml(latestMsg)}</span>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 6px;">
+                      <span class="live-elapsed-counter" data-started-ms="${startedMs}" style="font-family: monospace; color: var(--amber); font-size: 10px;">1s</span>
+                      <button type="button" onclick="openTaskChronologyModal('${escapeHtml(it.id)}')" style="background: #07132c; border: 1px solid var(--cyan); color: var(--cyan); border-radius: 4px; padding: 2px 7px; font-size: 10px; font-weight: 800; cursor: pointer;">
+                        🔍 Drill Down Live Turn
+                      </button>
+                    </div>
                   </div>
-                  <span style="font-family: monospace; color: var(--amber); font-size: 10px;">${elapsedSec}s</span>
+                  ${stepLog.length > 0 ? `
+                    <details open style="margin-top: 2px; background: rgba(3, 7, 18, 0.65); border: 1px solid var(--navy); border-radius: 4px; padding: 4px 8px;">
+                      <summary style="cursor: pointer; font-size: 10px; font-weight: 700; color: var(--green);">
+                        📋 Live Turn Activity Log (${stepLog.length} step${stepLog.length === 1 ? '' : 's'} — editing files, running tests, rendering scenes)
+                      </summary>
+                      <div style="margin-top: 5px; display: flex; flex-direction: column; gap: 3px; max-height: 160px; overflow-y: auto;">
+                        ${stepLogRows}
+                      </div>
+                    </details>
+                  ` : ''}
                 </div>
               `;
             })() : ''}
-            ${workerNotes ? `
-              <div style="font-size: 10.5px; color: var(--cyan); background: rgba(41, 173, 255, 0.07); border-left: 2px solid var(--cyan); padding: 4px 8px; border-radius: 3px;">
-                <strong>🔧 Worker Proof Summary:</strong> ${escapeHtml(workerNotes)}
-              </div>
-            ` : ''}
-            ${feedback ? `
-              <div style="font-size: 10.5px; color: ${st === 'approved' ? 'var(--green)' : 'var(--pink)'}; background: rgba(255, 119, 168, 0.08); border-left: 2px solid ${st === 'approved' ? 'var(--green)' : 'var(--pink)'}; padding: 5px 8px; border-radius: 3px;">
-                <strong>⚖️ Council Review Verdict (${escapeHtml(it.verdict?.reviewer_role || 'Council')}):</strong> ${escapeHtml(feedback)}
-                ${reqChanges.length > 0 ? `<ul style="margin: 3px 0 0 16px; padding: 0; color: var(--yellow);">${reqChanges.map(c => `<li>${escapeHtml(c)}</li>`).join('')}</ul>` : ''}
-              </div>
-            ` : ''}
             ${thumbsHtml}
             ${audioHtml}
+            ${workerNotes ? formatStructuredWorkerSummaryHtml(workerNotes, it.id) : ''}
+            ${feedback ? formatStructuredCouncilFeedbackHtml(feedback, reqChanges, st, it.verdict?.reviewer_role || 'Council') : ''}
             <div style="display: flex; justify-content: space-between; align-items: center; font-size: 10px; color: var(--slate); flex-wrap: wrap; gap: 6px;">
               <span>📁 Target Files: <code>${escapeHtml((it.target_files || []).join(', ') || 'cartridge')}</code></span>
               ${metricsKeys.length > 0 ? `<span>📊 Metrics: ${escapeHtml(metricsKeys.map(k => `${k}=${JSON.stringify(metricsObj[k])}`).join(' | ').slice(0, 120))}</span>` : ''}
@@ -6014,6 +6367,788 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       }).join('');
 
       setHtmlIfChanged(grid, cardsHtml);
+    }
+
+    function splitNumberedPoints(rawText) {
+      const txt = String(rawText || '').trim();
+      if (!txt) return [];
+      const parts = txt.split(/(?:\s+|^)(?=\d+[\)\.]\s+)/).map(s => s.trim()).filter(Boolean);
+      return parts.length > 1 ? parts : [txt];
+    }
+
+    function formatStructuredSpecHtml(desc, proofSpec) {
+      const cleanDesc = String(desc || '').trim();
+      if (!cleanDesc) return '';
+      const points = splitNumberedPoints(cleanDesc);
+      const leadSentence = points[0].length > 220 ? points[0].slice(0, 220) + '…' : points[0];
+      if (cleanDesc.length <= 240 && points.length <= 1 && !proofSpec) {
+        return `<div style="font-size: 11px; color: var(--light-gray); line-height: 1.45;">${escapeHtml(cleanDesc)}</div>`;
+      }
+      const listHtml = points.length > 1
+        ? `<ul style="margin: 6px 0 0 16px; padding: 0; display: flex; flex-direction: column; gap: 4px; color: var(--light-gray); font-size: 11px; line-height: 1.45;">${points.map(p => `<li>${escapeHtml(p)}</li>`).join('')}</ul>`
+        : `<div style="margin-top: 6px; font-size: 11px; color: var(--light-gray); line-height: 1.45;">${escapeHtml(cleanDesc)}</div>`;
+      const proofBlock = proofSpec
+        ? `<div style="margin-top: 6px; padding: 5px 8px; background: rgba(0, 228, 54, 0.08); border-left: 2px solid var(--green); border-radius: 3px; font-size: 10.5px; color: var(--white);"><strong>🎯 Proof Gate:</strong> ${escapeHtml(proofSpec)}</div>`
+        : '';
+      return `
+        <details style="background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(41, 173, 255, 0.18); border-radius: 5px; padding: 5px 9px;">
+          <summary style="cursor: pointer; font-size: 11px; color: var(--light-gray); font-weight: 600;">
+            <strong style="color: var(--white);">📋 Spec:</strong> ${escapeHtml(leadSentence)}
+            <span style="color: var(--cyan); font-size: 10px; margin-left: 6px;">(${points.length > 1 ? points.length + ' requirements' : 'expand'})</span>
+          </summary>
+          ${listHtml}
+          ${proofBlock}
+        </details>
+      `;
+    }
+
+    function parseWorkerSummaryParts(workerNotes) {
+      const raw = String(workerNotes || '').trim();
+      if (!raw) return { strategy: '', summary: '', turns: [] };
+      const segments = raw.split(' | ').map(s => s.trim()).filter(Boolean);
+      let strategy = '';
+      let summary = '';
+      const turns = [];
+      for (const seg of segments) {
+        if (seg.startsWith('Strategy:')) {
+          strategy = seg.replace(/^Strategy:\s*/, '').trim();
+        } else if (seg.startsWith('Summary:')) {
+          summary = seg.replace(/^Summary:\s*/, '').trim();
+        } else {
+          const cleaned = seg.replace(/^Specialist Turns:\s*/, '').trim();
+          const m = cleaned.match(/^\[Turn\s+(\d+)\s+([^\]]+)\]\s*(.*)$/i);
+          if (m) {
+            turns.push({
+              turnIndex: Number(m[1]),
+              agent: m[2].trim(),
+              text: m[3].trim(),
+            });
+          } else if (cleaned) {
+            if (!strategy) strategy = cleaned;
+            else summary = summary ? `${summary} • ${cleaned}` : cleaned;
+          }
+        }
+      }
+      return { strategy, summary, turns };
+    }
+
+    function getSpecialistBadgeStyle(agentName) {
+      const a = String(agentName || '').toLowerCase();
+      if (a.includes('swe')) return { icon: '🔨', label: 'swe_engineer', col: 'var(--cyan)', bg: 'rgba(41, 173, 255, 0.16)' };
+      if (a.includes('qa')) return { icon: '🧪', label: 'qa_test_engineer', col: 'var(--amber)', bg: 'rgba(255, 163, 0, 0.16)' };
+      if (a.includes('visual')) return { icon: '🎨', label: 'visual_artist', col: 'var(--pink)', bg: 'rgba(255, 119, 168, 0.16)' };
+      if (a.includes('audio')) return { icon: '🔊', label: 'audio_designer', col: 'var(--peach)', bg: 'rgba(255, 204, 170, 0.16)' };
+      if (a.includes('script')) return { icon: '✍️', label: 'script_writer', col: 'var(--yellow)', bg: 'rgba(255, 236, 39, 0.16)' };
+      return { icon: '🤖', label: agentName || 'specialist', col: 'var(--light-gray)', bg: 'rgba(255,255,255,0.08)' };
+    }
+
+    function formatStructuredWorkerSummaryHtml(workerNotes, itemId) {
+      const parsed = parseWorkerSummaryParts(workerNotes);
+      const headline = parsed.strategy || parsed.summary || (parsed.turns.length > 0 ? parsed.turns[parsed.turns.length - 1].text : workerNotes);
+      const shortHeadline = headline.length > 185 ? headline.slice(0, 185) + '…' : headline;
+      if (parsed.turns.length === 0 && String(workerNotes).length < 220) {
+        return `
+          <div style="font-size: 10.5px; color: var(--cyan); background: rgba(41, 173, 255, 0.07); border-left: 2px solid var(--cyan); padding: 5px 8px; border-radius: 3px;">
+            <strong>🔧 Worker Proof Summary:</strong> ${escapeHtml(workerNotes)}
+          </div>
+        `;
+      }
+      const turnsListHtml = parsed.turns.map(t => {
+        const b = getSpecialistBadgeStyle(t.agent);
+        const isErr = /^ERROR from /i.test(t.text);
+        const cleanText = t.text.replace(/\s*Available actions:\s*\[[^\]]*\][\.]?/gi, '').trim();
+        const isLongTurn = cleanText.length > 220;
+        const turnBodyHtml = isLongTurn
+          ? `
+            <details style="min-width: 0; overflow-wrap: anywhere; word-break: break-word;">
+              <summary style="cursor: pointer; color: ${isErr ? 'var(--pink)' : 'var(--light-gray)'}; line-height: 1.4; min-width: 0; overflow-wrap: anywhere; word-break: break-word;">
+                ${escapeHtml(cleanText.slice(0, 220))}… <span style="color: var(--cyan); font-weight: 700; font-size: 9.5px; white-space: nowrap;">[Expand full turn]</span>
+              </summary>
+              <div style="margin-top: 5px; padding-top: 5px; border-top: 1px dashed var(--navy); color: var(--white); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;">${escapeHtml(cleanText)}</div>
+            </details>
+          `
+          : `<div style="color: ${isErr ? 'var(--pink)' : 'var(--light-gray)'}; line-height: 1.4; min-width: 0; overflow-wrap: anywhere; word-break: break-word;">${escapeHtml(cleanText)}</div>`;
+        return `
+          <div style="display: flex; align-items: flex-start; gap: 8px; padding: 5px 7px; background: rgba(4, 9, 23, 0.75); border: 1px solid ${isErr ? 'rgba(255, 0, 77, 0.45)' : 'var(--navy)'}; border-radius: 4px; min-width: 0; max-width: 100%; overflow: hidden;">
+            <span style="font-family: monospace; font-size: 10px; font-weight: 800; color: ${b.col}; background: ${b.bg}; padding: 1px 6px; border-radius: 3px; white-space: nowrap; flex-shrink: 0;">
+              Turn #${t.turnIndex + 1} ${b.icon} ${escapeHtml(b.label)}
+            </span>
+            <div style="font-size: 10.5px; line-height: 1.4; flex: 1; min-width: 0; overflow-wrap: anywhere; word-break: break-word;">
+              ${turnBodyHtml}
+            </div>
+          </div>
+        `;
+      }).join('');
+
+      return `
+        <details style="font-size: 10.5px; color: var(--cyan); background: rgba(41, 173, 255, 0.07); border-left: 2px solid var(--cyan); padding: 5px 9px; border-radius: 4px; min-width: 0; max-width: 100%; overflow-wrap: anywhere; word-break: break-word;">
+          <summary style="cursor: pointer; font-weight: 700; color: var(--cyan); min-width: 0; overflow-wrap: anywhere; word-break: break-word;">
+            🔧 Worker Summary (${parsed.turns.length} specialist turn${parsed.turns.length === 1 ? '' : 's'}):
+            <span style="font-weight: 400; color: var(--white); overflow-wrap: anywhere; word-break: break-word;">${escapeHtml(shortHeadline)}</span>
+          </summary>
+          <div style="margin-top: 7px; display: flex; flex-direction: column; gap: 5px; min-width: 0; max-width: 100%;">
+            ${parsed.strategy ? `<div style="color: var(--white); font-size: 10.5px; min-width: 0; overflow-wrap: anywhere; word-break: break-word;"><strong>Strategy:</strong> ${escapeHtml(parsed.strategy)}</div>` : ''}
+            ${turnsListHtml}
+          </div>
+        </details>
+      `;
+    }
+
+    function parseCouncilFeedbackByRole(feedbackStr) {
+      const raw = String(feedbackStr || '').trim();
+      if (!raw) return [];
+      const segments = raw.split(' | ').map(s => s.trim()).filter(Boolean);
+      return segments.map(seg => {
+        const m = seg.match(/^\[([^\]]+)\]:\s*([\s\S]*)$/);
+        const role = m ? m[1].trim() : 'Council';
+        const body = m ? m[2].trim() : seg;
+        const points = splitNumberedPoints(body);
+        return { role, body, points };
+      });
+    }
+
+    function formatStructuredCouncilFeedbackHtml(feedback, reqChanges, st, reviewerRole) {
+      const roleBlocks = parseCouncilFeedbackByRole(feedback);
+      const col = st === 'approved' ? 'var(--green)' : 'var(--pink)';
+      const bg = st === 'approved' ? 'rgba(0, 228, 54, 0.08)' : 'rgba(255, 119, 168, 0.08)';
+      const firstPoint = roleBlocks.length > 0 && roleBlocks[0].points.length > 0
+        ? `[${roleBlocks[0].role}] ${roleBlocks[0].points[0]}`
+        : feedback;
+      const preview = firstPoint.length > 170 ? firstPoint.slice(0, 170) + '…' : firstPoint;
+
+      const rolesHtml = roleBlocks.map(rb => `
+        <div style="background: rgba(4, 9, 23, 0.72); border: 1px solid rgba(255, 119, 168, 0.25); border-radius: 4px; padding: 6px 8px;">
+          <div style="font-weight: 800; font-size: 10.5px; color: var(--amber); margin-bottom: 3px;">👤 ${escapeHtml(rb.role)}</div>
+          <ul style="margin: 0 0 0 16px; padding: 0; display: flex; flex-direction: column; gap: 3px; color: var(--white); font-size: 10.5px; line-height: 1.4;">
+            ${rb.points.map(pt => `<li>${escapeHtml(pt)}</li>`).join('')}
+          </ul>
+        </div>
+      `).join('');
+
+      return `
+        <details ${st === 'changes_requested' ? 'open' : ''} style="font-size: 10.5px; color: ${col}; background: ${bg}; border-left: 2px solid ${col}; padding: 5px 9px; border-radius: 4px;">
+          <summary style="cursor: pointer; font-weight: 700; color: ${col};">
+            ⚖️ Council Review Verdict (${roleBlocks.length} reviewer${roleBlocks.length === 1 ? '' : 's'}):
+            <span style="font-weight: 400; color: var(--light-gray);">${escapeHtml(preview)}</span>
+          </summary>
+          <div style="margin-top: 7px; display: flex; flex-direction: column; gap: 6px;">
+            ${rolesHtml}
+            ${reqChanges.length > 0 ? `<ul style="margin: 3px 0 0 16px; padding: 0; color: var(--yellow);">${reqChanges.map(c => `<li>${escapeHtml(c)}</li>`).join('')}</ul>` : ''}
+          </div>
+        </details>
+      `;
+    }
+
+    let _activeChronologyItemId = '';
+    let _activeChronologyAttemptFilter = 'all';
+    let _cachedChronologyPayload = null;
+    let _chronologyLiveRefreshTimer = null;
+
+    function getStepIconAndColor(stepType) {
+      const st = String(stepType || '').toLowerCase();
+      if (st.includes('edit')) return { icon: '✏️', label: 'EDITING FILE', col: 'var(--cyan)' };
+      if (st.includes('test') || st.includes('verify')) return { icon: '🧪', label: 'RUNNING TESTS', col: 'var(--green)' };
+      if (st.includes('asset')) return { icon: '🎨', label: 'GENERATING ASSET', col: 'var(--pink)' };
+      if (st.includes('render') || st.includes('scene') || st.includes('proof')) return { icon: '🎬', label: 'RENDERING SCENE', col: 'var(--amber)' };
+      if (st.includes('inquiry') || st.includes('question')) return { icon: '❓', label: 'SELF-INQUIRY Q&A', col: 'var(--yellow)' };
+      if (st.includes('synth')) return { icon: '🧠', label: 'SYNTHESIZING CODE', col: 'var(--cyan)' };
+      if (st.includes('error')) return { icon: '❌', label: 'ERROR', col: 'var(--neon-red)' };
+      return { icon: '⚡', label: (stepType || 'STEP').toUpperCase(), col: 'var(--light-gray)' };
+    }
+
+    function formatTurnStepLogHtml(stepLog, isOpenByDefault = false) {
+      const steps = Array.isArray(stepLog) ? stepLog : [];
+      if (steps.length === 0) return '';
+      const rows = steps.map((s, idx) => {
+        const meta = getStepIconAndColor(s.step_type);
+        const tsShort = s.timestamp_utc ? String(s.timestamp_utc).split('T').pop().replace('Z', '').slice(0, 8) : '';
+        return `
+          <div style="display: flex; align-items: flex-start; gap: 8px; padding: 4px 8px; background: #030816; border-left: 2px solid ${meta.col}; border-radius: 3px; font-size: 10.5px; min-width: 0; overflow-wrap: anywhere;">
+            <span style="font-family: monospace; color: var(--slate); font-size: 9.5px; white-space: nowrap;">#${idx + 1}${tsShort ? ' ' + escapeHtml(tsShort) : ''}</span>
+            <span style="font-family: monospace; font-size: 9.5px; font-weight: 800; color: ${meta.col}; white-space: nowrap;">${meta.icon} ${escapeHtml(meta.label)}</span>
+            <span style="color: var(--white); flex: 1; min-width: 0; overflow-wrap: anywhere;">${escapeHtml(s.message || '')}</span>
+          </div>
+        `;
+      }).join('');
+      return `
+        <details ${isOpenByDefault ? 'open' : ''} style="margin-top: 7px; background: #040917; border: 1px solid var(--navy); border-radius: 4px; padding: 5px 8px;">
+          <summary style="cursor: pointer; font-size: 10.5px; font-weight: 700; color: var(--green);">
+            📋 Step-by-Step Activity Log (${steps.length} step${steps.length === 1 ? '' : 's'}: editing files, running tests, generating assets, rendering scene)
+          </summary>
+          <div style="margin-top: 6px; display: flex; flex-direction: column; gap: 4px; max-height: 240px; overflow-y: auto;">
+            ${rows}
+          </div>
+        </details>
+      `;
+    }
+
+    function formatTurnEpistemicDetailsHtml(t, globalContextPacks = [], globalInquiries = []) {
+      const inquiries = [
+        ...(Array.isArray(t.lead_self_inquiries) ? t.lead_self_inquiries.map(q => ({ ...q, _role: 'task_lead' })) : []),
+        ...(Array.isArray(t.self_inquiries) ? t.self_inquiries.map(q => ({ ...q, _role: t.specialist_agent || 'specialist' })) : []),
+      ];
+      // Fallback to global self-inquiries if turn-level wasn't persisted on an older revision
+      const effInquiries = inquiries.length > 0 ? inquiries : globalInquiries;
+      const curatedCtx = t.curated_context || t.lead_curated_context || '';
+      const promptTxt = t.prompt_text || t.lead_prompt_text || '';
+      const leadPromptTxt = (t.prompt_text && t.lead_prompt_text) ? t.lead_prompt_text : '';
+      const matchingPack = globalContextPacks.find(cp =>
+        String(cp.target_agent_role || '').toLowerCase() === String(t.specialist_agent || '').toLowerCase()
+      ) || globalContextPacks[0] || null;
+
+      const inquiriesHtml = effInquiries.length > 0 ? `
+        <details style="margin-top: 6px; background: rgba(0, 228, 54, 0.05); border: 1px solid rgba(0, 228, 54, 0.3); border-radius: 4px; padding: 5px 8px;">
+          <summary style="cursor: pointer; font-size: 10.5px; font-weight: 700; color: var(--yellow);">
+            ❓ Internal Questions Asked &amp; Answered (${effInquiries.length} Self-Inquiry Q&amp;A${effInquiries.length === 1 ? '' : 's'})
+          </summary>
+          <div style="margin-top: 6px; display: flex; flex-direction: column; gap: 6px;">
+            ${effInquiries.map(qa => `
+              <div style="background: #030712; border-left: 3px solid var(--yellow); padding: 6px 9px; border-radius: 4px; font-size: 10.5px;">
+                <div style="color: var(--amber); font-weight: 700;">❓ Question (${escapeHtml(qa._role || qa.agent_role || t.specialist_agent || 'agent')}): ${escapeHtml(qa.question || '')}</div>
+                <div style="color: var(--white); margin-top: 4px; white-space: pre-wrap;"><strong>💡 Answer:</strong> ${escapeHtml(qa.answer || '')}</div>
+                ${Array.isArray(qa.researched_chunk_ids) && qa.researched_chunk_ids.length > 0 ? `<div style="color: var(--slate); font-size: 9.5px; margin-top: 3px;">Researched chunks: <code>${escapeHtml(qa.researched_chunk_ids.join(', '))}</code></div>` : ''}
+              </div>
+            `).join('')}
+          </div>
+        </details>
+      ` : '';
+
+      const contextHtml = (curatedCtx || matchingPack) ? `
+        <details style="margin-top: 6px; background: #040917; border: 1px solid var(--navy); border-radius: 4px; padding: 5px 8px;">
+          <summary style="cursor: pointer; font-size: 10.5px; font-weight: 700; color: var(--cyan);">
+            🧠 Curated Context Generated for this Turn ${matchingPack ? `(${(matchingPack.selected_chunk_ids || []).length} chunks selected for ${escapeHtml(matchingPack.target_agent_role)})` : ''}
+          </summary>
+          <div style="margin-top: 6px; display: flex; flex-direction: column; gap: 6px;">
+            ${matchingPack && matchingPack.role_tailored_synthesis ? `
+              <div style="font-size: 10.5px; color: var(--white); background: rgba(41, 173, 255, 0.08); border-left: 2px solid var(--cyan); padding: 6px 8px; border-radius: 3px;">
+                <strong>Context Curator Role-Tailored Synthesis:</strong> ${escapeHtml(matchingPack.role_tailored_synthesis)}
+                <div style="color: var(--slate); font-size: 9.5px; margin-top: 4px;">Selected Chunks: <code>${escapeHtml((matchingPack.selected_chunk_ids || []).join(', '))}</code></div>
+              </div>
+            ` : ''}
+            ${curatedCtx ? `
+              <pre tabindex="0" style="margin: 0; padding: 8px 10px; background: #030712; border: 1px solid var(--navy); border-radius: 4px; font-family: monospace; font-size: 10px; color: var(--light-gray); white-space: pre-wrap; overflow-x: auto; max-height: 260px;"><code>${escapeHtml(curatedCtx)}</code></pre>
+            ` : ''}
+          </div>
+        </details>
+      ` : '';
+
+      const promptHtml = (promptTxt || leadPromptTxt || t.deliberation || t.lead_deliberation) ? `
+        <details style="margin-top: 6px; background: #040917; border: 1px solid var(--navy); border-radius: 4px; padding: 5px 8px;">
+          <summary style="cursor: pointer; font-size: 10.5px; font-weight: 700; color: var(--peach);">
+            📝 Turn Prompt &amp; Epistemic Deliberation ${promptTxt ? `(${promptTxt.length.toLocaleString()} chars)` : ''}
+          </summary>
+          <div style="margin-top: 6px; display: flex; flex-direction: column; gap: 6px;">
+            ${t.lead_deliberation ? `
+              <div style="font-size: 10.5px; color: var(--light-gray); background: rgba(255, 163, 0, 0.07); border-left: 2px solid var(--amber); padding: 6px 8px; border-radius: 3px; white-space: pre-wrap;">
+                <strong style="color: var(--amber);">🧭 Task Lead Deliberation:</strong> ${escapeHtml(t.lead_deliberation)}
+              </div>
+            ` : ''}
+            ${t.deliberation && t.deliberation !== t.lead_deliberation ? `
+              <div style="font-size: 10.5px; color: var(--light-gray); background: rgba(41, 173, 255, 0.07); border-left: 2px solid var(--cyan); padding: 6px 8px; border-radius: 3px; white-space: pre-wrap;">
+                <strong style="color: var(--cyan);">🤖 Specialist Deliberation:</strong> ${escapeHtml(t.deliberation)}
+              </div>
+            ` : ''}
+            ${promptTxt ? `
+              <div>
+                <div style="font-size: 10px; font-weight: 700; color: var(--peach); margin-bottom: 3px;">Full Prompt Sent to Model:</div>
+                <pre tabindex="0" style="margin: 0; padding: 8px 10px; background: #030712; border: 1px solid var(--navy); border-radius: 4px; font-family: monospace; font-size: 10px; color: var(--light-gray); white-space: pre-wrap; overflow-x: auto; max-height: 280px;"><code>${escapeHtml(promptTxt)}</code></pre>
+              </div>
+            ` : ''}
+            ${leadPromptTxt ? `
+              <details style="margin-top: 4px;">
+                <summary style="cursor: pointer; font-size: 10px; color: var(--amber);">View Task Lead Planning Prompt (${leadPromptTxt.length.toLocaleString()} chars)</summary>
+                <pre tabindex="0" style="margin: 4px 0 0 0; padding: 8px 10px; background: #030712; border: 1px solid var(--navy); border-radius: 4px; font-family: monospace; font-size: 10px; color: var(--light-gray); white-space: pre-wrap; overflow-x: auto; max-height: 240px;"><code>${escapeHtml(leadPromptTxt)}</code></pre>
+              </details>
+            ` : ''}
+          </div>
+        </details>
+      ` : '';
+
+      return `${inquiriesHtml}${contextHtml}${promptHtml}`;
+    }
+
+    function scheduleChronologyLiveRefresh(itemId) {
+      const modal = document.getElementById('task-chronology-modal');
+      if (!modal || !modal.open || _activeChronologyItemId !== itemId) return;
+      if (_chronologyLiveRefreshTimer) return;
+      _chronologyLiveRefreshTimer = setTimeout(async () => {
+        _chronologyLiveRefreshTimer = null;
+        if (!modal.open || _activeChronologyItemId !== itemId) return;
+        const effCand = _selectedCartridgeId || _activeCandidateId || '';
+        const q = effCand && effCand !== 'active' ? `?cartridge=${encodeURIComponent(effCand)}` : '';
+        try {
+          const res = await fetch(`/api/studio/board-item/${encodeURIComponent(itemId)}/chronology${q}`);
+          if (res.ok) {
+            const data = await res.json();
+            _cachedChronologyPayload = data;
+            renderTaskChronologyModal(data);
+          }
+        } catch (e) {
+          // ignore
+        }
+      }, 900);
+    }
+
+    function formatUnifiedDiffHtml(diffText) {
+      if (!diffText) return '';
+      const lines = String(diffText).split('\n');
+      return `<pre tabindex="0" style="margin: 6px 0 0 0; padding: 8px 10px; background: #030712; border: 1px solid var(--navy); border-radius: 5px; font-family: monospace; font-size: 10.5px; line-height: 1.4; overflow-x: auto; max-height: 320px;"><code>${lines.map(line => {
+        if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@')) {
+          return `<span style="color: var(--cyan); font-weight: 700;">${escapeHtml(line)}</span>`;
+        }
+        if (line.startsWith('+')) {
+          return `<span style="color: var(--green); background: rgba(0, 228, 54, 0.1); display: inline-block; width: 100%;">${escapeHtml(line)}</span>`;
+        }
+        if (line.startsWith('-')) {
+          return `<span style="color: var(--pink); background: rgba(255, 0, 77, 0.12); display: inline-block; width: 100%;">${escapeHtml(line)}</span>`;
+        }
+        return `<span style="color: var(--light-gray);">${escapeHtml(line)}</span>`;
+      }).join('\n')}</code></pre>`;
+    }
+
+    window.setChronologyAttemptFilter = function(val) {
+      _activeChronologyAttemptFilter = val;
+      if (_cachedChronologyPayload) {
+        renderTaskChronologyModal(_cachedChronologyPayload);
+      }
+    };
+
+    async function fetchChronologyFallbackFromArtifacts(itemId, candId) {
+      const boardItems = (latestProductionBoard && Array.isArray(latestProductionBoard.items)) ? latestProductionBoard.items : [];
+      const it = boardItems.find(x => (x.id || x.item_id) === itemId) || { id: itemId, item_id: itemId, title: itemId };
+      const effCand = candId || _selectedCartridgeId || _activeCandidateId || 'active';
+      const basePrefix = effCand === 'active' ? `artifacts/work_items/${itemId}` : `../${effCand}/artifacts/work_items/${itemId}`;
+      const revs = Array.isArray(it.revisions) ? it.revisions : [];
+      const attempts = [];
+
+      const maxCheck = Math.max(revs.length + 1, Number(it.attempt_count || 1));
+      for (let r = 0; r < maxCheck; r++) {
+        let ltData = null;
+        try {
+          const ltRes = await fetch(`/api/artifacts/content?path=${encodeURIComponent(`${basePrefix}/lead_trace_rev${r}.json`)}`);
+          if (ltRes.ok) {
+            const ltJson = await ltRes.json();
+            if (ltJson && typeof ltJson.content === 'string') {
+              ltData = JSON.parse(ltJson.content);
+            }
+          }
+        } catch (e) {
+          // ignore
+        }
+        const rv = revs[r] || null;
+        if (!ltData && !rv) continue;
+        const turns = (ltData && Array.isArray(ltData.turns)) ? ltData.turns.map((t, idx) => ({
+          turn_index: t.turn_index ?? idx,
+          specialist_agent: t.specialist_agent || 'worker',
+          deliberation: t.deliberation || '',
+          brief: t.brief || '',
+          summary: t.summary || '',
+          verification_passed: t.verification_passed ?? !String(t.summary || '').startsWith('ERROR from '),
+          touched_files: Array.isArray(t.touched_files) ? t.touched_files : [],
+          code_diffs: t.code_diffs || {},
+          proof_urls: (Array.isArray(t.proof_images) ? t.proof_images : []).map(p => ({
+            path: p,
+            filename: String(p).split('/').pop(),
+            url: formatProofUrl(p),
+            is_audio: /\.(wav|mp3|ogg)$/i.test(String(p)),
+          })),
+        })) : [];
+
+        const rvProofs = (rv && Array.isArray(rv.proof_paths)) ? rv.proof_paths : ((ltData && Array.isArray(ltData.collected_proofs)) ? ltData.collected_proofs : []);
+        attempts.push({
+          revision_index: r,
+          attempt_number: r + 1,
+          status: (ltData && ltData.status) || (rv ? 'reviewed' : 'in_progress'),
+          current_strategy: (ltData && ltData.current_strategy) || '',
+          submission_summary: (ltData && ltData.submission_summary) || '',
+          turns,
+          council_review: rv ? {
+            revision_index: r,
+            verdict: rv.verdict || (rv.approved ? 'approve' : 'request_changes'),
+            approved: rv.verdict === 'approve' || Boolean(rv.approved),
+            feedback: rv.feedback || '',
+            reviewer_breakdown: parseCouncilFeedbackByRole(rv.feedback || '').map(rb => ({
+              reviewer_role: rb.role,
+              raw_text: rb.body,
+              points: rb.points,
+            })),
+            worker_notes: rv.worker_notes || '',
+            proof_artifacts: rvProofs.map(p => ({
+              path: p,
+              filename: String(p).split('/').pop(),
+              url: formatProofUrl(p),
+              is_audio: /\.(wav|mp3|ogg)$/i.test(String(p)),
+            })),
+          } : null,
+        });
+      }
+
+      return {
+        cartridge_id: effCand,
+        item_id: itemId,
+        title: it.title || itemId,
+        kind: it.kind || 'mechanic_code',
+        state: it.status || it.state || 'ready',
+        raised_by_role: it.owner_role || it.raised_by_role || 'GameplayDesigner',
+        spec: it.description || it.spec || '',
+        proof_spec: it.proof_spec || '',
+        target_modules: it.target_files || it.target_modules || [],
+        depends_on: it.dependencies || it.depends_on || [],
+        failure: it.failure || '',
+        context_packs: [],
+        self_inquiries: [],
+        attempts,
+        file_contents: {},
+      };
+    }
+
+    window.openTaskChronologyModal = async function(itemId) {
+      if (!itemId) return;
+      _activeChronologyItemId = itemId;
+      _activeChronologyAttemptFilter = 'all';
+      const modal = document.getElementById('task-chronology-modal');
+      const titleEl = document.getElementById('chronology-modal-title');
+      const badgeEl = document.getElementById('chronology-modal-badge');
+      const bodyEl = document.getElementById('chronology-modal-body');
+      const refreshBtn = document.getElementById('chronology-refresh-btn');
+      if (refreshBtn) {
+        refreshBtn.onclick = () => window.openTaskChronologyModal(itemId);
+      }
+      if (titleEl) titleEl.textContent = `Chronological History: ${itemId}`;
+      if (badgeEl) badgeEl.textContent = 'LOADING...';
+      if (bodyEl) {
+        bodyEl.innerHTML = `<div class="blueprint-empty">Loading chronological agent turns, diffs, and proof artifacts for <code>${escapeHtml(itemId)}</code>...</div>`;
+      }
+      if (modal && typeof modal.showModal === 'function' && !modal.open) {
+        modal.showModal();
+      }
+
+      const effCand = _selectedCartridgeId || _activeCandidateId || '';
+      const q = effCand && effCand !== 'active' ? `?cartridge=${encodeURIComponent(effCand)}` : '';
+      let data = null;
+      try {
+        const res = await fetch(`/api/studio/board-item/${encodeURIComponent(itemId)}/chronology${q}`);
+        if (res.ok) {
+          data = await res.json();
+        }
+      } catch (e) {
+        // fallback below
+      }
+      if (!data || !Array.isArray(data.attempts)) {
+        data = await fetchChronologyFallbackFromArtifacts(itemId, effCand);
+      }
+      _cachedChronologyPayload = data;
+      renderTaskChronologyModal(data);
+    };
+
+    function renderTaskChronologyModal(data) {
+      const titleEl = document.getElementById('chronology-modal-title');
+      const badgeEl = document.getElementById('chronology-modal-badge');
+      const bodyEl = document.getElementById('chronology-modal-body');
+      if (!bodyEl || !data) return;
+
+      if (titleEl) {
+        titleEl.textContent = `${data.title || data.item_id} (${data.item_id})`;
+      }
+      if (badgeEl) {
+        badgeEl.textContent = `${String(data.state || 'ready').toUpperCase()} • ${(data.attempts || []).length} Attempt(s)`;
+      }
+
+      const attempts = Array.isArray(data.attempts) ? data.attempts : [];
+      const fileContents = data.file_contents || {};
+      const contextPacks = Array.isArray(data.context_packs) ? data.context_packs : [];
+      const selfInquiries = Array.isArray(data.self_inquiries) ? data.self_inquiries : [];
+
+      const filterPillsHtml = `
+        <div style="display: flex; gap: 6px; flex-wrap: wrap; align-items: center;">
+          <button type="button" onclick="setChronologyAttemptFilter('all')" style="background: ${_activeChronologyAttemptFilter === 'all' ? 'rgba(41, 173, 255, 0.25)' : '#071024'}; border: 1px solid ${_activeChronologyAttemptFilter === 'all' ? 'var(--cyan)' : 'var(--navy)'}; color: var(--white); border-radius: 999px; padding: 4px 11px; font-size: 11px; font-weight: 700; cursor: pointer;">
+            All Attempts (${attempts.length})
+          </button>
+          ${attempts.map(att => {
+            const k = String(att.revision_index);
+            const isSel = String(_activeChronologyAttemptFilter) === k;
+            const cr = att.council_review;
+            const icon = cr ? (cr.approved ? '✅' : '🛠️') : '🔨';
+            return `
+              <button type="button" onclick="setChronologyAttemptFilter('${k}')" style="background: ${isSel ? 'rgba(41, 173, 255, 0.25)' : '#071024'}; border: 1px solid ${isSel ? 'var(--cyan)' : 'var(--navy)'}; color: var(--white); border-radius: 999px; padding: 4px 11px; font-size: 11px; font-weight: 700; cursor: pointer;">
+                ${icon} Attempt #${att.attempt_number} (${(att.turns || []).length} turns)
+              </button>
+            `;
+          }).join('')}
+        </div>
+      `;
+
+      const contextAndSelfInquiryHtml = (contextPacks.length > 0 || selfInquiries.length > 0) ? `
+        <details style="background: #071126; border: 1px solid var(--navy); border-radius: 6px; padding: 8px 12px;">
+          <summary style="cursor: pointer; font-size: 11.5px; font-weight: 800; color: var(--cyan);">
+            🧠 Curated Studio Context (${contextPacks.length} packs) &amp; Agent Self-Inquiry Memory (${selfInquiries.length} Q&amp;As)
+          </summary>
+          <div style="margin-top: 10px; display: flex; flex-direction: column; gap: 8px;">
+            ${selfInquiries.map(qa => `
+              <div style="background: rgba(0, 228, 54, 0.07); border-left: 3px solid var(--green); padding: 7px 10px; border-radius: 4px; font-size: 11px;">
+                <div style="color: var(--amber); font-weight: 700;">❓ Self-Question (${escapeHtml(qa.agent_role || 'agent')}): ${escapeHtml(qa.question || '')}</div>
+                <div style="color: var(--white); margin-top: 4px;"><strong>💡 Self-Answer:</strong> ${escapeHtml(qa.answer || '')}</div>
+                ${Array.isArray(qa.researched_chunk_ids) && qa.researched_chunk_ids.length > 0 ? `<div style="color: var(--slate); font-size: 10px; margin-top: 3px;">Researched chunks: <code>${escapeHtml(qa.researched_chunk_ids.join(', '))}</code></div>` : ''}
+              </div>
+            `).join('')}
+            ${contextPacks.map(cp => `
+              <div style="background: #040917; border: 1px solid var(--navy); padding: 8px 10px; border-radius: 4px; font-size: 11px;">
+                <div style="display: flex; justify-content: space-between; color: var(--cyan); font-weight: 700;">
+                  <span>📦 Role: ${escapeHtml(cp.target_agent_role)}</span>
+                  <span style="color: var(--slate); font-family: monospace;">${(cp.selected_chunk_ids || []).length} / ${cp.total_indexed_chunks || 0} chunks selected</span>
+                </div>
+                ${cp.role_tailored_synthesis ? `<div style="color: var(--light-gray); margin-top: 4px; line-height: 1.4;">${escapeHtml(cp.role_tailored_synthesis)}</div>` : ''}
+                <div style="color: var(--slate); font-size: 10px; margin-top: 4px;">Chunks: <code>${escapeHtml((cp.selected_chunk_ids || []).join(', '))}</code></div>
+              </div>
+            `).join('')}
+          </div>
+        </details>
+      ` : '';
+
+      const visibleAttempts = _activeChronologyAttemptFilter === 'all'
+        ? attempts
+        : attempts.filter(a => String(a.revision_index) === String(_activeChronologyAttemptFilter));
+
+      const attemptsTimelineHtml = visibleAttempts.length === 0
+        ? `<div class="blueprint-empty">No specialist turns recorded yet for this task.</div>`
+        : visibleAttempts.map(att => {
+            const turns = Array.isArray(att.turns) ? att.turns : [];
+            const cr = att.council_review;
+            const turnsHtml = turns.map(t => {
+              const b = getSpecialistBadgeStyle(t.specialist_agent);
+              const passed = t.verification_passed !== false;
+              const touched = Array.isArray(t.touched_files) ? t.touched_files : [];
+              const codeDiffs = t.code_diffs || {};
+              const diffKeys = Object.keys(codeDiffs);
+              const proofs = Array.isArray(t.proof_urls) ? t.proof_urls : [];
+
+              const proofsStripHtml = proofs.length > 0 ? `
+                <div style="margin-top: 8px;">
+                  <div style="font-size: 10px; font-weight: 700; color: var(--amber); margin-bottom: 4px;">🖼️ Artifacts Emitted at Turn #${t.turn_index + 1}:</div>
+                  <div class="board-proof-strip">
+                    ${proofs.map(pr => {
+                      if (pr.is_audio) {
+                        return `
+                          <div style="display: flex; align-items: center; gap: 8px; background: #040917; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--navy);">
+                            <span style="font-size: 10px; color: var(--peach); font-family: monospace;">🔊 ${escapeHtml(pr.filename)}</span>
+                            <audio controls preload="metadata" style="height: 24px;" src="${escapeHtml(pr.url)}"></audio>
+                          </div>
+                        `;
+                      }
+                      const isWf = /^waveform_/i.test(String(pr.filename || ''));
+                      const turnAudioPr = proofs.find(x => x.is_audio);
+                      const pairedAudio = isWf
+                        ? ((turnAudioPr && turnAudioPr.url) || resolveAudioUrlForWaveform(pr.path || pr.filename, t.summary || '', data.cartridge_id))
+                        : '';
+                      return `
+                        <div class="board-proof-thumb"
+                             data-lightbox-url="${escapeHtml(pr.url)}"
+                             data-lightbox-title="${escapeHtml(data.item_id + ' Turn #' + (t.turn_index + 1))}"
+                             data-lightbox-scene="${escapeHtml(pr.filename)}"
+                             data-lightbox-notes="${escapeHtml(t.summary || '')}"
+                             data-lightbox-audio="${escapeHtml(pairedAudio)}"
+                             onclick="openMockupLightbox('${escapeJsAttr(pr.url)}', '${escapeJsAttr(data.item_id + ' Turn #' + (t.turn_index + 1))}', '${escapeJsAttr(pr.filename)}', '${escapeJsAttr(t.summary || '')}', '${escapeJsAttr(pairedAudio)}')">
+                          <img src="${escapeHtml(pr.url)}" alt="${escapeHtml(pr.filename)}" loading="lazy" />
+                          <div class="proof-caption">${isWf ? '🔊 ' + escapeHtml(pr.filename) + ' (Click to Hear)' : '📸 ' + escapeHtml(pr.filename)}</div>
+                        </div>
+                        ${isWf && !turnAudioPr && pairedAudio ? `
+                          <div style="display: flex; align-items: center; gap: 8px; background: #040917; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--navy);">
+                            <span style="font-size: 10px; color: var(--peach); font-family: monospace;">🔊 ${escapeHtml(pairedAudio.split('?')[0].split('/').pop())}</span>
+                            <audio controls preload="metadata" style="height: 24px;" src="${escapeHtml(pairedAudio)}"></audio>
+                          </div>
+                        ` : ''}
+                      `;
+                    }).join('')}
+                  </div>
+                </div>
+              ` : '';
+
+              const filesAndDiffsHtml = (touched.length > 0 || diffKeys.length > 0) ? `
+                <div style="margin-top: 8px; display: flex; flex-direction: column; gap: 5px;">
+                  <div style="font-size: 10px; color: var(--slate);">
+                    📁 Touched Modules: ${touched.map(f => `<code style="color: var(--cyan); margin-right: 6px;">${escapeHtml(f)}</code>`).join('')}
+                  </div>
+                  ${diffKeys.map(f => `
+                    <details style="background: #040917; border: 1px solid var(--navy); border-radius: 4px; padding: 4px 8px;">
+                      <summary style="cursor: pointer; font-size: 10.5px; color: var(--green); font-family: monospace; font-weight: 700;">
+                        ± Unified Code Diff: ${escapeHtml(f)}
+                      </summary>
+                      ${formatUnifiedDiffHtml(codeDiffs[f])}
+                    </details>
+                  `).join('')}
+                  ${touched.filter(f => !codeDiffs[f] && fileContents[f] && !fileContents[f].is_binary).map(f => `
+                    <details style="background: #040917; border: 1px solid var(--navy); border-radius: 4px; padding: 4px 8px;">
+                      <summary style="cursor: pointer; font-size: 10.5px; color: var(--cyan); font-family: monospace;">
+                        📄 View Module Source: ${escapeHtml(f)} (${fileContents[f].line_count || 0} lines)
+                      </summary>
+                      <pre tabindex="0" style="margin: 6px 0 0 0; padding: 8px 10px; background: #030712; border: 1px solid var(--navy); border-radius: 4px; font-family: monospace; font-size: 10.5px; color: var(--light-gray); overflow-x: auto; max-height: 300px;"><code>${escapeHtml(fileContents[f].content || '')}</code></pre>
+                    </details>
+                  `).join('')}
+                </div>
+              ` : '';
+
+              return `
+                <div style="position: relative; padding: 10px 12px; background: #060e22; border: 1px solid ${passed ? 'rgba(41, 173, 255, 0.28)' : 'rgba(255, 0, 77, 0.5)'}; border-left: 3px solid ${passed ? b.col : 'var(--neon-red)'}; border-radius: 6px;">
+                  <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                      <span style="font-family: monospace; font-size: 11px; font-weight: 800; color: ${b.col}; background: ${b.bg}; padding: 2px 8px; border-radius: 4px;">
+                        Turn #${t.turn_index + 1} • ${b.icon} ${escapeHtml(b.label)}
+                      </span>
+                      <span style="font-size: 10px; font-weight: 800; color: ${passed ? 'var(--green)' : 'var(--neon-red)'};">
+                        ${passed ? '✅ VERIFIED' : '❌ FAILED / SELF-CORRECTING'}
+                      </span>
+                    </div>
+                    ${t.timestamp_utc ? `<span style="font-family: monospace; font-size: 10px; color: var(--slate);">${escapeHtml(t.timestamp_utc)}</span>` : ''}
+                  </div>
+                  ${t.brief ? `
+                    <details style="margin-top: 7px; background: rgba(255, 255, 255, 0.03); border: 1px solid var(--navy); border-radius: 4px; padding: 4px 8px;">
+                      <summary style="cursor: pointer; font-size: 10.5px; color: var(--amber); font-weight: 700;">
+                        📨 Task Lead Delegation Brief (${escapeHtml(t.brief.slice(0, 110))}${t.brief.length > 110 ? '…' : ''})
+                      </summary>
+                      <div style="margin-top: 6px; font-size: 11px; color: var(--white); white-space: pre-wrap; line-height: 1.45;">${escapeHtml(t.brief)}</div>
+                    </details>
+                  ` : ''}
+                  ${t.summary ? `
+                    <div style="margin-top: 7px; font-size: 11px; color: ${passed ? 'var(--light-gray)' : 'var(--pink)'}; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere;">${escapeHtml(t.summary)}</div>
+                  ` : ''}
+                  ${formatTurnStepLogHtml(t.step_log, false)}
+                  ${formatTurnEpistemicDetailsHtml(t, contextPacks, selfInquiries)}
+                  ${filesAndDiffsHtml}
+                  ${proofsStripHtml}
+                </div>
+              `;
+            }).join('');
+
+            const liveAgForTask = _liveRunningAgents['item_' + data.item_id];
+            const activeTurnObj = att.active_turn || ((att.status === 'in_progress' && liveAgForTask) ? {
+              turn_index: (liveAgForTask.turnIndex || (turns.length + 1)) - 1,
+              specialist_agent: liveAgForTask.specialist || 'task_lead',
+              brief: liveAgForTask.brief || '',
+              step_log: liveAgForTask.stepLog || [],
+            } : null);
+            const activeTurnHtml = activeTurnObj ? (() => {
+              const ab = getSpecialistBadgeStyle(activeTurnObj.specialist_agent);
+              const mergedStepLog = (Array.isArray(activeTurnObj.step_log) && activeTurnObj.step_log.length > 0)
+                ? activeTurnObj.step_log
+                : (liveAgForTask && Array.isArray(liveAgForTask.stepLog) ? liveAgForTask.stepLog : []);
+              return `
+                <div style="position: relative; padding: 11px 13px; background: linear-gradient(90deg, rgba(41, 173, 255, 0.14), rgba(0, 228, 54, 0.08)); border: 1.5px solid var(--cyan); border-left: 4px solid var(--cyan); border-radius: 6px;">
+                  <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+                    <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                      <span class="activity-beacon" style="background: var(--cyan); box-shadow: 0 0 8px var(--cyan);"></span>
+                      <span style="font-family: monospace; font-size: 11.5px; font-weight: 800; color: var(--cyan); background: rgba(41, 173, 255, 0.2); padding: 2px 8px; border-radius: 4px;">
+                        ⚡ Currently Executing Turn #${(activeTurnObj.turn_index ?? turns.length) + 1} • ${ab.icon} ${escapeHtml(ab.label)}
+                      </span>
+                      <span style="font-size: 10.5px; color: var(--green); font-weight: 700;">
+                        LIVE IN PROGRESS
+                      </span>
+                    </div>
+                    ${activeTurnObj.started_at_utc ? `<span style="font-family: monospace; font-size: 10px; color: var(--amber);">Started: ${escapeHtml(activeTurnObj.started_at_utc)}</span>` : ''}
+                  </div>
+                  ${activeTurnObj.brief ? `
+                    <div style="margin-top: 7px; font-size: 11px; color: var(--white); background: rgba(4, 9, 23, 0.72); border: 1px solid var(--navy); padding: 6px 9px; border-radius: 4px; white-space: pre-wrap;">
+                      <strong style="color: var(--amber);">📨 Active Delegation Brief:</strong> ${escapeHtml(activeTurnObj.brief)}
+                    </div>
+                  ` : ''}
+                  ${formatTurnStepLogHtml(mergedStepLog, true) || `<div style="margin-top: 6px; font-size: 11px; color: var(--cyan);">⏳ Initializing turn context and model call...</div>`}
+                  ${formatTurnEpistemicDetailsHtml(activeTurnObj, contextPacks, selfInquiries)}
+                </div>
+              `;
+            })() : '';
+
+            const councilHtml = cr ? `
+              <div style="margin-top: 6px; padding: 10px 12px; background: ${cr.approved ? 'rgba(0, 228, 54, 0.08)' : 'rgba(255, 119, 168, 0.08)'}; border: 1px solid ${cr.approved ? 'var(--green)' : 'var(--pink)'}; border-left: 3px solid ${cr.approved ? 'var(--green)' : 'var(--pink)'}; border-radius: 6px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                  <strong style="font-size: 11.5px; color: ${cr.approved ? 'var(--green)' : 'var(--pink)'};">
+                    ⚖️ Specialist Council Gate Verdict (Attempt #${att.attempt_number}): ${cr.approved ? '✅ APPROVED' : '🛠️ CHANGES REQUESTED'}
+                  </strong>
+                </div>
+                <div style="display: flex; flex-direction: column; gap: 6px;">
+                  ${(cr.reviewer_breakdown || []).map(rb => `
+                    <div style="background: rgba(4, 9, 23, 0.78); border: 1px solid var(--navy); border-radius: 4px; padding: 6px 9px;">
+                      <div style="font-weight: 800; font-size: 10.5px; color: var(--amber); margin-bottom: 3px;">👤 ${escapeHtml(rb.reviewer_role)}</div>
+                      <ul style="margin: 0 0 0 16px; padding: 0; font-size: 11px; color: var(--white); line-height: 1.45; display: flex; flex-direction: column; gap: 3px;">
+                        ${(rb.points || []).map(pt => `<li>${escapeHtml(pt)}</li>`).join('')}
+                      </ul>
+                    </div>
+                  `).join('')}
+                </div>
+                ${Array.isArray(cr.proof_artifacts) && cr.proof_artifacts.length > 0 ? `
+                  <div style="margin-top: 8px;">
+                    <div style="font-size: 10px; font-weight: 700; color: var(--cyan); margin-bottom: 4px;">📸 Submitted Proof Artifacts Evaluated by Council:</div>
+                    <div class="board-proof-strip">
+                      ${cr.proof_artifacts.filter(pr => !pr.is_audio).map(pr => {
+                        const isWf = /^waveform_/i.test(String(pr.filename || ''));
+                        const crAudio = cr.proof_artifacts.find(x => x.is_audio);
+                        const pairedAudio = isWf
+                          ? ((crAudio && crAudio.url) || resolveAudioUrlForWaveform(pr.path || pr.filename, cr.worker_notes || cr.feedback || '', data.cartridge_id))
+                          : '';
+                        return `
+                          <div class="board-proof-thumb"
+                               data-lightbox-url="${escapeHtml(pr.url)}"
+                               data-lightbox-title="${escapeHtml(data.item_id + ' Attempt #' + att.attempt_number)}"
+                               data-lightbox-scene="${escapeHtml(pr.filename)}"
+                               data-lightbox-notes="${escapeHtml(cr.feedback || '')}"
+                               data-lightbox-audio="${escapeHtml(pairedAudio)}"
+                               onclick="openMockupLightbox('${escapeJsAttr(pr.url)}', '${escapeJsAttr(data.item_id + ' Attempt #' + att.attempt_number)}', '${escapeJsAttr(pr.filename)}', '${escapeJsAttr(cr.feedback || '')}', '${escapeJsAttr(pairedAudio)}')">
+                            <img src="${escapeHtml(pr.url)}" alt="${escapeHtml(pr.filename)}" loading="lazy" />
+                            <div class="proof-caption">${isWf ? '🔊 ' + escapeHtml(pr.filename) + ' (Click to Hear)' : '📸 ' + escapeHtml(pr.filename)}</div>
+                          </div>
+                        `;
+                      }).join('')}
+                    </div>
+                  </div>
+                ` : ''}
+              </div>
+            ` : '';
+
+            return `
+              <section style="background: #081229; border: 1px solid var(--navy); border-radius: 8px; padding: 12px 14px; display: flex; flex-direction: column; gap: 9px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; border-bottom: 1px solid var(--navy); padding-bottom: 8px;">
+                  <div>
+                    <strong style="font-size: 13px; color: var(--cyan);">Attempt #${att.attempt_number} (Revision ${att.revision_index})</strong>
+                    ${att.current_strategy ? `<div style="font-size: 11px; color: var(--light-gray); margin-top: 2px;">🧭 <strong>Task Lead Strategy:</strong> ${escapeHtml(att.current_strategy)}</div>` : ''}
+                  </div>
+                  <span style="font-family: monospace; font-size: 10.5px; color: var(--amber); background: rgba(255, 163, 0, 0.14); padding: 2px 8px; border-radius: 4px;">
+                    Status: ${escapeHtml(String(att.status || 'in_progress').toUpperCase())} • ${turns.length} Completed Turn(s)${activeTurnObj ? ` + Turn #${(activeTurnObj.turn_index ?? turns.length) + 1} Active` : ''}
+                  </span>
+                </div>
+                ${turnsHtml}
+                ${activeTurnHtml || (!turnsHtml ? `<div style="font-size: 11px; color: var(--slate);">Task Lead is currently executing Turn #1...</div>` : '')}
+                ${councilHtml}
+              </section>
+            `;
+          }).join('');
+
+      const failureBannerHtml = data.failure ? `
+        <details style="background: rgba(255, 0, 77, 0.1); border: 1px solid var(--neon-red); border-radius: 6px; padding: 8px 12px;">
+          <summary style="cursor: pointer; font-size: 11px; font-weight: 800; color: var(--neon-red);">
+            ⚠️ Latest Runtime / Verification Exception Diagnostic Trace
+          </summary>
+          <pre tabindex="0" style="margin: 8px 0 0 0; padding: 8px; background: #030712; color: var(--pink); font-size: 10.5px; overflow-x: auto; border-radius: 4px;"><code>${escapeHtml(data.failure)}</code></pre>
+        </details>
+      ` : '';
+
+      setHtmlIfChanged(bodyEl, `
+        ${formatStructuredSpecHtml(data.spec || '', data.proof_spec || '')}
+        ${failureBannerHtml}
+        ${contextAndSelfInquiryHtml}
+        ${filterPillsHtml}
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          ${attemptsTimelineHtml}
+        </div>
+      `);
+    }
+
+    function formatElapsedAge(secAgo) {
+      const s = Math.max(0, Math.round(Number(secAgo) || 0));
+      if (s < 60) return `${s}s ago`;
+      const mins = Math.floor(s / 60);
+      const remSec = s % 60;
+      if (mins < 60) return `${mins}m ${String(remSec).padStart(2, '0')}s ago`;
+      const hrs = Math.floor(mins / 60);
+      const remMins = mins % 60;
+      return `${hrs}h ${String(remMins).padStart(2, '0')}m ago`;
     }
 
     function updateStudioPulseRibbon() {
@@ -6056,7 +7191,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       if (countApproved) countApproved.textContent = `${approvedCount}/${totalCount}`;
 
       const running = typeof isBuildActivelyRunning === 'function' ? isBuildActivelyRunning() : false;
-      const hasActiveWork = running || inProgItems.length > 0 || reviewItems.length > 0;
+      const hasActiveWork = running;
 
       ribbon.classList.toggle('is-working', hasActiveWork);
       if (orb) {
@@ -6094,7 +7229,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
 
       // Empathetic Headline & Subtext explaining EXACTLY what is happening right now
       const gameTitle = bible.game_title || (board && board.game_title) || 'Autonomous Cartridge';
-      if (inProgItems.length > 0 || reviewItems.length > 0 || changesItems.length > 0) {
+      if (running && (inProgItems.length > 0 || reviewItems.length > 0 || changesItems.length > 0)) {
         if (phaseChip) {
           phaseChip.textContent = inProgItems.length > 0
             ? `⚡ PARALLEL BUILD & PROOF SYNTHESIS`
@@ -6131,9 +7266,18 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         if (headlineEl) headlineEl.textContent = _lastActivityHeadline || `Specialists are brainstorming "${gameTitle}"...`;
         if (subtextEl) subtextEl.textContent = `${transcript.length} utterances recorded in the Living Game Bible.`;
       } else if (totalCount > 0 && approvedCount < totalCount) {
-        if (phaseChip) phaseChip.textContent = '⏸️ PRODUCTION BOARD READY';
-        if (headlineEl) headlineEl.textContent = `"${gameTitle}" — ${approvedCount}/${totalCount} items verified (${totalCount - approvedCount} remaining)`;
-        if (subtextEl) subtextEl.textContent = `Click "▶️ Resume Game" in the top bar or inspect the Production Board below.`;
+        if (phaseChip) {
+          phaseChip.textContent = _isBuildPaused ? '⏸️ BUILD PAUSED' : '⏹️ BUILD STOPPED';
+        }
+        if (headlineEl) {
+          const pausedItemHint = inProgItems.length > 0
+            ? ` (Paused on [${inProgItems.map(i => i.id).join(', ')}])`
+            : '';
+          headlineEl.textContent = `"${gameTitle}" — ${approvedCount}/${totalCount} items verified (${totalCount - approvedCount} remaining)${pausedItemHint}`;
+        }
+        if (subtextEl) {
+          subtextEl.textContent = `Build process is currently ${_isBuildPaused ? 'paused' : 'stopped'}. Click "▶️ Resume Build" in the top bar to continue where workers left off.`;
+        }
       } else if (totalCount > 0 && approvedCount === totalCount) {
         if (phaseChip) phaseChip.textContent = '✅ ALL ITEMS APPROVED';
         if (headlineEl) headlineEl.textContent = `🎉 All ${totalCount} Production Board items for "${gameTitle}" verified with proof!`;
@@ -6154,13 +7298,15 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       if (heartbeatEl) {
         if (_lastActivityTimestampMs > 0) {
           const secAgo = Math.max(0, Math.round((Date.now() - _lastActivityTimestampMs) / 1000));
-          heartbeatEl.textContent = secAgo <= 2 ? 'Live: just now' : `Last event: ${secAgo}s ago`;
+          heartbeatEl.textContent = (running && secAgo <= 2) ? 'Live: just now' : `Last event: ${formatElapsedAge(secAgo)}`;
         } else if (board && board.updated_at) {
           const dt = Date.parse(board.updated_at);
           if (!Number.isNaN(dt)) {
             const secAgo = Math.max(0, Math.round((Date.now() - dt) / 1000));
-            heartbeatEl.textContent = `Board updated: ${secAgo}s ago`;
+            heartbeatEl.textContent = `Board updated: ${formatElapsedAge(secAgo)}`;
           }
+        } else {
+          heartbeatEl.textContent = 'No events yet';
         }
       }
 
@@ -6194,7 +7340,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         if (activeChips.length > 0 && hasActiveWork) {
           stripEl.classList.add('has-agents');
           const lanesHtml = activeChips.map(c => {
-            const sec = Math.max(1, Math.round((nowMs - (c.startedAtMs || nowMs)) / 1000));
+            const startedMs = Number(c.startedAtMs || 0);
             const isWr = Boolean(c.isWritersRoom || c.key === 'writers_room');
             const trackTitle = isWr
               ? "🏛️ Writers' Room Council"
@@ -6217,7 +7363,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
                   </span>
                   <span style="display: inline-flex; align-items: center; gap: 5px;">
                     <span style="background: rgba(41, 173, 255, 0.18); border: 1px solid rgba(41, 173, 255, 0.45); color: var(--cyan); font-size: 9.5px; font-weight: 700; padding: 1px 6px; border-radius: 4px;">${escapeHtml(personaTag)}</span>
-                    <span style="font-family: monospace; color: var(--amber); font-size: 9.5px;">${sec}s</span>
+                    <span class="live-elapsed-counter" data-started-ms="${startedMs}" style="font-family: monospace; color: var(--amber); font-size: 9.5px;">1s</span>
                   </span>
                 </div>
                 <div class="live-agent-lane-bottom">${escapeHtml(cleanAction)}</div>
@@ -6228,6 +7374,58 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         } else {
           stripEl.classList.remove('has-agents');
           setHtmlIfChanged(stripEl, '');
+        }
+      }
+      updateLiveElapsedCountersInDom(document);
+
+      // Update prominent Build Error Banner when an error stops the build or a board item fails
+      const errBanner = document.getElementById('studio-build-error-banner');
+      if (errBanner) {
+        const failedBoardItem = items.find(it => it.status === 'failed' || (it.failure && !hasActiveWork));
+        const activeError = _lastBuildError || (failedBoardItem && failedBoardItem.failure ? {
+          event_type: failedBoardItem.status === 'failed' ? 'backlog_item_failed' : 'ERROR',
+          agent_name: failedBoardItem.owner_role || 'TaskWorker',
+          item_id: failedBoardItem.id || '',
+          message: String(failedBoardItem.failure),
+          timestamp_utc: '',
+        } : null);
+        if (activeError && activeError.message && (!hasActiveWork || activeError.event_type === 'backlog_item_failed')) {
+          const stoppedBuild = !hasActiveWork && !_isBuildPaused;
+          const badgeTitle = stoppedBuild ? '🚨 BUILD STOPPED BY ERROR' : '⚠️ TASK EXECUTION ERROR';
+          const shortErr = String(activeError.message).split('\n')[0].slice(0, 220);
+          const itemBtn = activeError.item_id ? `
+            <button type="button" onclick="openTaskChronologyModal('${escapeHtml(activeError.item_id)}')" style="background: rgba(41, 173, 255, 0.2); border: 1px solid var(--cyan); color: var(--cyan); border-radius: 4px; padding: 3px 9px; font-size: 10.5px; font-weight: 800; cursor: pointer;">
+              🕒 Inspect Task [${escapeHtml(activeError.item_id)}]
+            </button>
+          ` : '';
+          const dismissBtn = `
+            <button type="button" onclick="_lastBuildError=null; document.getElementById('studio-build-error-banner').style.display='none';" style="background: transparent; border: 1px solid var(--slate); color: var(--light-gray); border-radius: 4px; padding: 3px 8px; font-size: 10px; cursor: pointer;">
+              Dismiss
+            </button>
+          `;
+          errBanner.style.display = 'block';
+          setHtmlIfChanged(errBanner, `
+            <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; flex-wrap: wrap;">
+              <div style="flex: 1; min-width: 240px;">
+                <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                  <span style="background: var(--neon-red); color: var(--white); font-size: 10px; font-weight: 900; padding: 2px 7px; border-radius: 4px;">${badgeTitle}</span>
+                  <strong style="color: var(--pink); font-size: 11.5px;">${escapeHtml(activeError.agent_name || 'Studio')}${activeError.item_id ? ` on [${escapeHtml(activeError.item_id)}]` : ''}</strong>
+                  ${activeError.timestamp_utc ? `<span style="font-family: monospace; font-size: 10px; color: var(--slate);">${escapeHtml(activeError.timestamp_utc)}</span>` : ''}
+                </div>
+                <div style="margin-top: 5px; font-size: 11px; color: var(--white); overflow-wrap: anywhere;">${escapeHtml(shortErr)}</div>
+                <details style="margin-top: 5px;">
+                  <summary style="cursor: pointer; font-size: 10px; color: var(--amber); font-weight: 700;">View Full Error &amp; Diagnostic Stack Trace</summary>
+                  <pre tabindex="0" style="margin: 5px 0 0 0; padding: 8px; background: #030712; border: 1px solid rgba(255, 0, 77, 0.45); border-radius: 4px; color: var(--pink); font-family: monospace; font-size: 10px; white-space: pre-wrap; overflow-x: auto; max-height: 220px;"><code>${escapeHtml(activeError.message)}</code></pre>
+                </details>
+              </div>
+              <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
+                ${itemBtn}
+                ${dismissBtn}
+              </div>
+            </div>
+          `);
+        } else {
+          errBanner.style.display = 'none';
         }
       }
 
@@ -6253,23 +7451,158 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       }
     }
 
-    window.openMockupLightbox = function(url, title, sceneType, notes) {
+    let _lightboxActualSizeMode = false;
+
+    function applyLightboxZoomStyle(img, actualSize) {
+      if (!img) return;
+      _lightboxActualSizeMode = Boolean(actualSize);
+      const btn = document.getElementById('btn-toggle-lightbox-zoom');
+      if (btn) {
+        btn.textContent = _lightboxActualSizeMode ? '🗗 Fit to Window' : '🔍 1:1 Actual Size';
+      }
+      const nw = img.naturalWidth || 0;
+      const nh = img.naturalHeight || 0;
+      const isPixelArt = nw > 0 && nw <= 320 && nh <= 320;
+      img.style.imageRendering = isPixelArt ? 'pixelated' : 'auto';
+      if (_lightboxActualSizeMode) {
+        img.style.maxWidth = 'none';
+        img.style.maxHeight = 'none';
+        if (isPixelArt && nw > 0) {
+          const scale = Math.max(2, Math.min(8, Math.floor(512 / nw)));
+          img.style.width = `${nw * scale}px`;
+          img.style.height = `${nh * scale}px`;
+        } else {
+          img.style.width = nw > 0 ? `${nw}px` : 'auto';
+          img.style.height = 'auto';
+        }
+        img.style.cursor = 'zoom-out';
+      } else {
+        // If tall vertical filmstrip (nh > nw * 1.6), fit width to 88vw and allow vertical scrolling so frames aren't tiny!
+        if (nw > 0 && nh > nw * 1.6) {
+          img.style.maxWidth = '88vw';
+          img.style.maxHeight = 'none';
+          img.style.width = `${Math.min(nw, Math.round(window.innerWidth * 0.86))}px`;
+          img.style.height = 'auto';
+        } else {
+          img.style.maxWidth = '88vw';
+          img.style.maxHeight = '72vh';
+          img.style.width = isPixelArt && nw > 0 ? `${Math.min(512, nw * 4)}px` : 'auto';
+          img.style.height = 'auto';
+        }
+        img.style.cursor = 'zoom-in';
+      }
+    }
+
+    window.toggleLightboxZoomMode = function() {
+      const img = document.getElementById('lightbox-mockup-img');
+      if (!img) return;
+      applyLightboxZoomStyle(img, !_lightboxActualSizeMode);
+    };
+
+    window.openMockupLightbox = function(url, title, sceneType, notes, audioUrl = '') {
       const dlg = document.getElementById('bible-mockup-lightbox');
       const img = document.getElementById('lightbox-mockup-img');
       const ttl = document.getElementById('lightbox-mockup-title');
       const scn = document.getElementById('lightbox-mockup-scene');
       const nts = document.getElementById('lightbox-mockup-notes');
-      if (!dlg || !img) return;
+      const dimEl = document.getElementById('lightbox-img-dimensions');
+      const rawLink = document.getElementById('link-open-raw-lightbox');
+      const audioWrap = document.getElementById('lightbox-audio-container');
+      const audioEl = document.getElementById('lightbox-audio-player');
+      if (!dlg || !img || !url) return;
+
+      if (dimEl) {
+        dimEl.style.display = 'none';
+        dimEl.textContent = '';
+      }
+      if (rawLink) {
+        rawLink.href = url;
+      }
+
+      img.onload = () => {
+        const nw = img.naturalWidth || 0;
+        const nh = img.naturalHeight || 0;
+        if (dimEl && nw > 0 && nh > 0) {
+          dimEl.textContent = `${nw} × ${nh} px`;
+          dimEl.style.display = 'inline-block';
+        }
+        // Default tall filmstrips or large contact sheets to readable width immediately
+        applyLightboxZoomStyle(img, false);
+      };
       img.src = url;
-      if (ttl) ttl.textContent = title || '16:9 Concept Mockup';
-      if (scn) scn.textContent = sceneType || 'gameplay_scene';
+      applyLightboxZoomStyle(img, false);
+
+      if (ttl) ttl.textContent = title || 'Artifact Preview';
+      if (scn) scn.textContent = sceneType || 'artifact';
       if (nts) nts.textContent = notes || '';
+
+      // Resolve audio URL if this is a waveform image or has an explicit audioUrl
+      const resolvedAudio = audioUrl || resolveAudioUrlForWaveform(url, notes || '') || resolveAudioUrlForWaveform(sceneType || '', notes || '');
+      if (audioWrap && audioEl) {
+        if (resolvedAudio) {
+          audioWrap.style.display = 'flex';
+          if (audioEl.getAttribute('src') !== resolvedAudio) {
+            audioEl.src = resolvedAudio;
+          }
+          audioEl.currentTime = 0;
+          audioEl.play().catch(() => {});
+        } else {
+          audioEl.pause();
+          audioEl.removeAttribute('src');
+          audioWrap.style.display = 'none';
+        }
+      }
+
+      // Ensure lightbox always renders on top of any other open <dialog> (e.g., task-chronology-modal)
+      if (dlg.open && typeof dlg.close === 'function') {
+        dlg.close();
+      }
       if (typeof dlg.showModal === 'function') {
         dlg.showModal();
       } else {
         dlg.setAttribute('open', 'open');
       }
     };
+
+    // Pause lightbox audio when lightbox dialog closes
+    document.getElementById('bible-mockup-lightbox')?.addEventListener('close', () => {
+      const audioEl = document.getElementById('lightbox-audio-player');
+      if (audioEl) audioEl.pause();
+    });
+
+    // Global delegated click listener so ANY image artifact across the entire Studio UI opens full-size (and plays audio if waveform)
+    // IMPORTANT: Never call target.querySelector('img') on container elements (such as <dialog> backdrops, <body>, or task cards),
+    // which previously caused clicking off a task box to open the first image in the container!
+    document.addEventListener('click', (ev) => {
+      const target = ev.target;
+      if (!target || typeof target.closest !== 'function') return;
+      // Ignore clicks on <dialog> backdrops, buttons, summaries, inputs, or inside the lightbox itself
+      if (target.tagName === 'DIALOG' || target.closest('#bible-mockup-lightbox')) return;
+      if (target.closest('button, a, summary, input, select, textarea, audio')) return;
+
+      const thumbEl = target.closest('[data-lightbox-url]');
+      if (thumbEl) {
+        const lUrl = thumbEl.getAttribute('data-lightbox-url');
+        if (lUrl) {
+          window.openMockupLightbox(
+            lUrl,
+            thumbEl.getAttribute('data-lightbox-title') || '',
+            thumbEl.getAttribute('data-lightbox-scene') || '',
+            thumbEl.getAttribute('data-lightbox-notes') || '',
+            thumbEl.getAttribute('data-lightbox-audio') || ''
+          );
+          return;
+        }
+      }
+
+      if (target.tagName === 'IMG' && target.src) {
+        const src = target.getAttribute('src') || target.src;
+        if (!src) return;
+        const alt = target.getAttribute('alt') || src.split('?')[0].split('/').pop() || 'Artifact Preview';
+        const audioUrl = resolveAudioUrlForWaveform(src, alt);
+        window.openMockupLightbox(src, alt, src.split('?')[0].split('/').pop() || 'image_artifact', '', audioUrl);
+      }
+    });
 
     let _selectedWritersRoomRoleFilter = null;
 
@@ -6373,7 +7706,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           artifactBadge += `
             <div style="margin-top: 6px; background: #040814; border: 1px solid var(--navy); border-radius: 4px; padding: 6px;">
               <div style="font-size: 10px; color: var(--yellow); font-weight: bold; margin-bottom: 4px;">🖼️ Synthesized 16:9 Concept Mockup: ${escapeHtml(mTitle)}</div>
-              <img src="${escapeHtml(mUrl)}" alt="${escapeHtml(mTitle)}" style="width: 100%; max-height: 160px; object-fit: cover; border-radius: 3px; cursor: pointer;" onclick="openMockupLightbox('${escapeHtml(mUrl)}', '${escapeHtml(mTitle)}', 'concept_mockup', '')" />
+              <img src="${escapeHtml(mUrl)}" alt="${escapeHtml(mTitle)}" style="width: 100%; max-height: 160px; object-fit: cover; border-radius: 3px; cursor: pointer;" onclick="openMockupLightbox('${escapeJsAttr(mUrl)}', '${escapeJsAttr(mTitle)}', 'concept_mockup', '')" />
             </div>
           `;
         } else if (aType === 'evolution') {
@@ -6412,6 +7745,11 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     function renderGameBible(bible) {
       if (!bible) return;
       cachedGameBible = bible;
+      if (bible.process_status) {
+        syncServerProcessStatus(bible.process_status);
+      } else if (typeof bible.build_paused === 'boolean' && Date.now() >= _resumeOptimisticUntil) {
+        _isBuildPaused = bible.build_paused;
+      }
       if (!_userPinnedCartridge && bible.cartridge_id && String(bible.cartridge_id).startsWith('candidate_')) {
         const newCid = String(bible.cartridge_id);
         const changed = newCid !== _selectedCartridgeId || newCid !== _activeCandidateId;
@@ -6631,7 +7969,12 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
               const rawNotes = m.ui_callout_notes || m.diegetic_ui_notes || m.scene_description || m.composition_prompt || '';
               const mNotes = formatHumanText(rawNotes);
               return `
-                <div class="mockup-card" onclick="openMockupLightbox('${escapeHtml(mUrl)}', '${escapeHtml(m.title || '')}', '${escapeHtml(m.scene_type || 'gameplay_scene')}', '${escapeHtml(mNotes)}')">
+                <div class="mockup-card"
+                     data-lightbox-url="${escapeHtml(mUrl)}"
+                     data-lightbox-title="${escapeHtml(m.title || '')}"
+                     data-lightbox-scene="${escapeHtml(m.scene_type || 'gameplay_scene')}"
+                     data-lightbox-notes="${escapeHtml(mNotes)}"
+                     onclick="openMockupLightbox('${escapeJsAttr(mUrl)}', '${escapeJsAttr(m.title || '')}', '${escapeJsAttr(m.scene_type || 'gameplay_scene')}', '${escapeJsAttr(mNotes)}')">
                   <img src="${escapeHtml(mUrl)}" alt="${escapeHtml(m.title || '16:9 Mockup')}" loading="lazy" />
                   <div style="padding: 10px;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
@@ -6701,7 +8044,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
               return `
                 <div class="character-sheet-card">
                   <div style="display: flex; gap: 10px; align-items: center;">
-                    <img src="${escapeHtml(pUrl)}" alt="${escapeHtml(c.name)}" style="width: 56px; height: 56px; border-radius: 6px; border: 1px solid var(--cyan); image-rendering: pixelated; background: #02050e; object-fit: cover;" onerror="this.style.display='none'" />
+                    <img src="${escapeHtml(pUrl)}" alt="${escapeHtml(c.name)}" title="Click to view full-size character portrait" style="width: 56px; height: 56px; border-radius: 6px; border: 1px solid var(--cyan); image-rendering: pixelated; background: #02050e; object-fit: cover; cursor: pointer;" onclick="openMockupLightbox('${escapeJsAttr(pUrl)}', '${escapeJsAttr(c.name || 'Character Portrait')}', '${escapeJsAttr(pFile)}', '${escapeJsAttr(c.backstory || '')}', '${escapeJsAttr(audioFile ? '/api/assets/audio/' + encodeURIComponent(audioFile) + cartQueryForBible : '')}')" onerror="this.style.display='none'" />
                     <div>
                       <div style="font-weight: bold; font-size: 13px; color: var(--white);">${escapeHtml(c.name)}</div>
                       <span class="task-badge-role" style="font-size: 9px;">${escapeHtml((c.role || 'npc').toUpperCase())}</span>
@@ -7078,11 +8421,16 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const seenProofFiles = new Set(seenSpriteNames);
       for (const it of boardItems) {
         const pList = Array.isArray(it.proof?.artifact_paths) ? it.proof.artifact_paths : (it.proof_paths || []);
-        for (const p of pList) {
-          if (/\.(png|jpg|jpeg|webp)$/i.test(String(p))) {
-            const fn = String(p).split('/').pop();
+              for (const p of pList) {
+          if (/\.(png|jpg|jpeg|webp)(\?|$)/i.test(String(p))) {
+            const fn = String(p).split('?')[0].split('/').pop();
             if (!fn || seenProofFiles.has(fn)) continue;
             seenProofFiles.add(fn);
+            const isWf = /^waveform_/i.test(fn);
+            const itemAudioPath = pList.find(x => /\.(wav|mp3|ogg)(\?|$)/i.test(String(x)));
+            const pairedAudioUrl = isWf
+              ? (itemAudioPath ? formatProofUrl(itemAudioPath) : resolveAudioUrlForWaveform(p, it.worker_notes || '', effCart))
+              : '';
             boardProofImages.push({
               path: p,
               url: formatProofUrl(p),
@@ -7091,6 +8439,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
               itemTitle: it.title,
               ownerRole: it.owner_role,
               status: it.status,
+              isWaveform: isWf,
+              audioUrl: pairedAudioUrl,
             });
           }
         }
@@ -7136,13 +8486,26 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         const primaryUrl = resolveVisualAssetUrl(fn, effCart);
         const fallbackUrl = `/api/artifacts/content?path=${encodeURIComponent(`${prefix}assets/sprites/${fn}`)}&raw=true`;
         const kb = ((sp.size_bytes || 0) / 1024).toFixed(1);
+        const isWf = /^waveform_/i.test(fn);
+        const pairedAudioUrl = isWf ? resolveAudioUrlForWaveform(fn, '', effCart) : '';
         return `
-          <div class="built-render-card ${isPixelSprite ? 'sprite-card' : ''}" onclick="openMockupLightbox('${escapeHtml(primaryUrl)}', '${escapeHtml(fn)}', '${escapeHtml(categoryLabel)}', '${escapeHtml(gameTitle + ' — ' + kb + ' KB')}')">
+          <div class="built-render-card ${isPixelSprite ? 'sprite-card' : ''}"
+               data-lightbox-url="${escapeHtml(primaryUrl)}"
+               data-lightbox-title="${escapeHtml(fn)}"
+               data-lightbox-scene="${escapeHtml(categoryLabel)}"
+               data-lightbox-notes="${escapeHtml(gameTitle + ' — ' + kb + ' KB')}"
+               data-lightbox-audio="${escapeHtml(pairedAudioUrl)}"
+               onclick="openMockupLightbox('${escapeJsAttr(primaryUrl)}', '${escapeJsAttr(fn)}', '${escapeJsAttr(categoryLabel)}', '${escapeJsAttr(gameTitle + ' — ' + kb + ' KB')}', '${escapeJsAttr(pairedAudioUrl)}')">
             <img src="${escapeHtml(primaryUrl)}" alt="${escapeHtml(fn)}" loading="lazy" onerror="if(!this.dataset.retried){this.dataset.retried='1';this.src='${escapeHtml(fallbackUrl)}';}else{this.parentElement.style.display='none';}" />
             <div style="padding: 6px 8px; display: flex; justify-content: space-between; align-items: center; gap: 4px; font-size: 10px;">
-              <strong style="color: var(--white); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(fn)}">${escapeHtml(fn)}</strong>
+              <strong style="color: var(--white); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(fn)}">${isWf ? '🔊 ' : ''}${escapeHtml(fn)}</strong>
               <span style="color: var(--slate); font-family: monospace; flex-shrink: 0;">${kb}KB</span>
             </div>
+            ${pairedAudioUrl ? `
+              <div style="padding: 0 8px 6px 8px;" onclick="event.stopPropagation()">
+                <audio controls preload="metadata" style="width: 100%; height: 24px;" src="${escapeHtml(pairedAudioUrl)}"></audio>
+              </div>
+            ` : ''}
           </div>
         `;
       };
@@ -7181,12 +8544,23 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           <div class="built-renders-grid">
             ${inspectionPlatesAndSheets.map(sp => renderCardHtml(sp, 'inspection_plate')).join('')}
             ${boardProofImages.map(bp => `
-              <div class="built-render-card" onclick="openMockupLightbox('${escapeHtml(bp.url)}', '${escapeHtml(bp.itemId + ': ' + bp.itemTitle)}', 'work_item_proof', 'Verified proof artifact for ${escapeHtml(bp.itemId)} (${escapeHtml(bp.ownerRole)})')">
+              <div class="built-render-card"
+                   data-lightbox-url="${escapeHtml(bp.url)}"
+                   data-lightbox-title="${escapeHtml(bp.itemId + ': ' + bp.itemTitle)}"
+                   data-lightbox-scene="work_item_proof"
+                   data-lightbox-notes="${escapeHtml('Verified proof artifact for ' + bp.itemId + ' (' + bp.ownerRole + ')')}"
+                   data-lightbox-audio="${escapeHtml(bp.audioUrl || '')}"
+                   onclick="openMockupLightbox('${escapeJsAttr(bp.url)}', '${escapeJsAttr(bp.itemId + ': ' + bp.itemTitle)}', 'work_item_proof', '${escapeJsAttr('Verified proof artifact for ' + bp.itemId + ' (' + bp.ownerRole + ')')}', '${escapeJsAttr(bp.audioUrl || '')}')">
                 <img src="${escapeHtml(bp.url)}" alt="${escapeHtml(bp.filename)}" loading="lazy" onerror="this.parentElement.style.display='none'" />
                 <div style="padding: 6px 8px; font-size: 10px;">
                   <div style="color: var(--cyan); font-weight: bold;">[${escapeHtml(bp.itemId)}] ${escapeHtml(bp.itemTitle)}</div>
-                  <div style="color: var(--light-gray); font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">📸 ${escapeHtml(bp.filename)}</div>
+                  <div style="color: var(--light-gray); font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${bp.isWaveform ? '🔊 Click to Hear & Enlarge: ' : '📸 '}${escapeHtml(bp.filename)}</div>
                 </div>
+                ${bp.audioUrl ? `
+                  <div style="padding: 0 8px 6px 8px;" onclick="event.stopPropagation()">
+                    <audio controls preload="metadata" style="width: 100%; height: 24px;" src="${escapeHtml(bp.audioUrl)}"></audio>
+                  </div>
+                ` : ''}
               </div>
             `).join('')}
           </div>
@@ -7254,9 +8628,28 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         </section>
       `;
 
-      setHtmlIfChanged(container, html);
-      if (codeModules.includes('main.gd')) {
-        inspectSourceCodeModule('main.gd', effCart);
+      const prevTitleEl = document.getElementById('built-source-code-title');
+      const prevViewerEl = document.getElementById('built-source-code-viewer');
+      const prevTitleText = prevTitleEl ? prevTitleEl.textContent : '';
+      const prevViewerText = prevViewerEl ? prevViewerEl.textContent : '';
+      const prevViewerScrollTop = prevViewerEl ? prevViewerEl.scrollTop : 0;
+      const prevViewerScrollLeft = prevViewerEl ? prevViewerEl.scrollLeft : 0;
+
+      const changed = setHtmlIfChanged(container, html);
+      if (changed) {
+        if (window._lastInspectedSourceCartridge === effCart && prevViewerText && !prevViewerText.startsWith('Select a GDScript module')) {
+          const nextTitleEl = document.getElementById('built-source-code-title');
+          const nextViewerEl = document.getElementById('built-source-code-viewer');
+          if (nextTitleEl && prevTitleText) nextTitleEl.textContent = prevTitleText;
+          if (nextViewerEl) {
+            nextViewerEl.textContent = prevViewerText;
+            nextViewerEl.scrollTop = prevViewerScrollTop;
+            nextViewerEl.scrollLeft = prevViewerScrollLeft;
+          }
+        } else if (codeModules.includes('main.gd')) {
+          window._lastInspectedSourceCartridge = effCart;
+          inspectSourceCodeModule('main.gd', effCart);
+        }
       }
     }
 
@@ -7398,13 +8791,14 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         const currentChoice = _userPinnedCartridge
           ? (_selectedCartridgeId || liveCand || (gameEntries[0] && gameEntries[0].cartridge_id) || 'active')
           : (liveCand || _selectedCartridgeId || (gameEntries[0] && gameEntries[0].cartridge_id) || 'active');
-        switcher.innerHTML = gameEntries.map(g => {
+        const optionsHtml = gameEntries.map(g => {
           const badge = g.total_items > 0
             ? `[${g.approved_items}/${g.total_items} Verified]`
             : (g.is_active ? '[Promoted Active]' : (g.cartridge_id === liveCand ? '[Live Build]' : '[Prototype]'));
           const shortId = g.cartridge_id === 'active' ? 'active' : g.cartridge_id.replace('candidate_genesis_', '#');
           return `<option value="${escapeHtml(g.cartridge_id)}">${escapeHtml(g.game_title)} ${escapeHtml(badge)} (${escapeHtml(shortId)})</option>`;
         }).join('');
+        setHtmlIfChanged(switcher, optionsHtml);
 
           if (gameEntries.some(g => g.cartridge_id === currentChoice)) {
             switcher.value = currentChoice;
@@ -7697,9 +9091,11 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     // Initialize UI components (await game catalog first so _selectedCartridgeId is set before asset/bible fetches)
     initTaskObservability();
     initWritersRoomWorkspace();
+    loadStudioSettingsStatus();
     loadSteamDNA();
     loadHeatmap();
     loadAvailableGames().finally(() => {
+      loadStudioSettingsStatus();
       loadGameBible();
       fetchLiveProductionBoardFallback();
       loadArtifacts();

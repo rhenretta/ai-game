@@ -7,6 +7,7 @@ extends SceneTree
 var max_ticks: int = 60
 var current_tick: int = 0
 var main_scene_node: Node = null
+var render_viewport: SubViewport = null
 var frame_times_usec: Array[int] = []
 var last_frame_end_usec: int = 0
 var initial_snapshot: Dictionary = {}
@@ -22,11 +23,13 @@ var max_player_x_reached: float = -99999.0
 var spawn_pos: Array = [0.0, 0.0]
 # Filmstrip / scripted-input support (council proof of actions & mechanics)
 var capture_ticks: Array = []
+var capture_viewport_enabled: bool = false
 var input_script: Array = []
 var setup_script: Array = []
 var _active_scripted_actions: Array[String] = []
 var script_error: String = ""
 var scripted_mode: bool = false
+var target_scene_override: String = ""
 
 func _init() -> void:
 	var args = OS.get_cmdline_args()
@@ -35,6 +38,8 @@ func _init() -> void:
 			max_ticks = int(args[i + 1])
 		elif args[i] == "--ticks" and i + 1 < args.size():
 			max_ticks = int(args[i + 1])
+		elif args[i] == "--capture-viewport":
+			capture_viewport_enabled = true
 		elif args[i] == "--capture-ticks" and i + 1 < args.size():
 			for t in String(args[i + 1]).split(",", false):
 				capture_ticks.append(int(t))
@@ -44,6 +49,8 @@ func _init() -> void:
 		elif args[i] == "--setup-script" and i + 1 < args.size():
 			scripted_mode = true
 			_load_setup_script(String(args[i + 1]))
+		elif args[i] == "--scene" and i + 1 < args.size():
+			target_scene_override = String(args[i + 1]).strip_edges()
 
 func _load_input_script(path: String) -> void:
 	var f = FileAccess.open(path, FileAccess.READ)
@@ -74,34 +81,66 @@ func _initialize() -> void:
 		quit(1)
 		return
 	if DisplayServer.get_name() != "headless":
+		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_NO_FOCUS, true)
+		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_BORDERLESS, true)
+		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_MOUSE_PASSTHROUGH, true)
 		DisplayServer.window_set_position(Vector2i(-4000, -4000))
+		render_viewport = SubViewport.new()
+		render_viewport.name = "HarnessOffscreenViewport"
+		render_viewport.size = Vector2i(1280, 720)
+		render_viewport.size_2d_override = Vector2i(1280, 720)
+		render_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+		render_viewport.handle_input_locally = true
+		root.add_child(render_viewport)
 	var main_path = ProjectSettings.get_setting("application/run/main_scene", "res://main.tscn")
+	if target_scene_override != "":
+		var cand_scene = target_scene_override
+		if not cand_scene.begins_with("res://"):
+			cand_scene = "res://" + cand_scene.trim_prefix("/")
+		if ResourceLoader.exists(cand_scene):
+			main_path = cand_scene
 	if not ResourceLoader.exists(main_path):
 		printerr("CRITICAL: Main scene not found at " + str(main_path))
 		quit(1)
 		return
 
 	var packed = load(main_path)
+	if packed == null and main_path.ends_with(".tscn"):
+		var gd_fallback = main_path.substr(0, main_path.length() - 5) + ".gd"
+		if ResourceLoader.exists(gd_fallback):
+			packed = load(gd_fallback)
 	if packed:
-		main_scene_node = packed.instantiate()
-		root.add_child(main_scene_node)
+		if packed is PackedScene:
+			main_scene_node = packed.instantiate()
+		elif packed is Script:
+			main_scene_node = packed.new()
+		if main_scene_node != null:
+			if render_viewport != null:
+				render_viewport.add_child(main_scene_node)
+			else:
+				root.add_child(main_scene_node)
+		else:
+			printerr("CRITICAL: Failed instantiating scene " + str(main_path))
+			quit(1)
+			return
 	else:
 		printerr("CRITICAL: Failed loading packed scene " + str(main_path))
 		quit(1)
 		return
 
-	initial_snapshot = _extract_state_snapshot()
-	spawn_pos = initial_snapshot.get("player_pos", [0.0, 0.0])
-	min_player_x_reached = float(spawn_pos[0])
-	max_player_x_reached = float(spawn_pos[0])
-	min_player_y_reached = float(spawn_pos[1])
-	max_player_y_reached = float(spawn_pos[1])
-	_check_snapshot_for_auto_win(initial_snapshot, 0)
 	print("[HARNESS_INIT] Loaded main scene: " + str(main_path) + " (max_ticks=" + str(max_ticks) + ")")
 
 func _process(_delta: float) -> bool:
 	var t0 = Time.get_ticks_usec()
 	current_tick += 1
+	if current_tick == 1:
+		initial_snapshot = _extract_state_snapshot()
+		spawn_pos = initial_snapshot.get("player_pos", [0.0, 0.0])
+		min_player_x_reached = float(spawn_pos[0])
+		max_player_x_reached = float(spawn_pos[0])
+		min_player_y_reached = float(spawn_pos[1])
+		max_player_y_reached = float(spawn_pos[1])
+		_check_snapshot_for_auto_win(initial_snapshot, 0)
 	var inter_frame_usec: int = (t0 - last_frame_end_usec) if last_frame_end_usec > 0 else 0
 
 	var passive_window_end = min(16, max(2, int(max_ticks / 4)))
@@ -166,9 +205,16 @@ func _process(_delta: float) -> bool:
 func _check_snapshot_for_auto_win(snap: Dictionary, tick_num: int) -> void:
 	if passive_auto_win_detected:
 		return
-	if bool(snap.get("is_completed", false)) or bool(snap.get("victory", false)) or bool(snap.get("level_completed", false)):
+	if (
+		bool(snap.get("is_completed", false))
+		or bool(snap.get("victory", false))
+		or bool(snap.get("victory_state", false))
+		or bool(snap.get("level_completed", false))
+		or bool(snap.get("game_won", false))
+		or bool(snap.get("stage_cleared", false))
+	):
 		passive_auto_win_detected = true
-		passive_win_reason = "Game reported is_completed/victory=true at passive tick " + str(tick_num) + " with zero player input."
+		passive_win_reason = "Game reported completion/victory=true at passive tick " + str(tick_num) + " with zero player input."
 		return
 	var eng_status = str(snap.get("engine_status", "")).to_lower()
 	if eng_status == "active" or eng_status == "completed" or eng_status == "solved":
@@ -191,13 +237,16 @@ func _check_snapshot_for_auto_win(snap: Dictionary, tick_num: int) -> void:
 				return
 
 func _try_capture_viewport(res_target_path: String) -> void:
+	var img: Image = null
 	if DisplayServer.get_name() == "headless":
-		return
-	RenderingServer.force_draw(true)
-	var vp_tex = root.get_texture()
-	if vp_tex == null:
-		return
-	var img = vp_tex.get_image()
+		if not capture_viewport_enabled:
+			return
+		img = _render_headless_scene_to_image()
+	else:
+		RenderingServer.force_draw(true)
+		var vp_tex = render_viewport.get_texture() if render_viewport != null else root.get_texture()
+		if vp_tex != null:
+			img = vp_tex.get_image()
 	if img == null or img.is_empty():
 		return
 	if img.get_width() != 1280 or img.get_height() != 720:
@@ -214,31 +263,42 @@ func _try_capture_viewport(res_target_path: String) -> void:
 		img.save_png(ProjectSettings.globalize_path("res://playtest_collision_overlay.png"))
 
 func _try_capture_collision_overlay(res_target_path: String) -> void:
-	if DisplayServer.get_name() == "headless" or main_scene_node == null:
+	if main_scene_node == null:
 		return
 	var shapes_data: Array = []
 	_collect_collision_shapes_recursive(main_scene_node, shapes_data)
 
-	RenderingServer.force_draw(true)
-	var vp_tex = root.get_texture()
-	if vp_tex == null:
-		return
-	var img = vp_tex.get_image()
+	var img: Image = null
+	if DisplayServer.get_name() == "headless":
+		if not capture_viewport_enabled:
+			return
+		img = _render_headless_scene_to_image()
+	else:
+		RenderingServer.force_draw(true)
+		var vp_tex = render_viewport.get_texture() if render_viewport != null else root.get_texture()
+		if vp_tex != null:
+			img = vp_tex.get_image()
 	if img == null or img.is_empty():
 		return
-	var vp_w = float(max(1, img.get_width()))
-	var vp_h = float(max(1, img.get_height()))
 	if img.get_width() != 1280 or img.get_height() != 720:
 		img.resize(1280, 720, Image.INTERPOLATE_BILINEAR)
 	if img.is_compressed():
 		img.decompress()
 	img.convert(Image.FORMAT_RGBA8)
 
-	var scale_x = 1280.0 / vp_w
-	var scale_y = 720.0 / vp_h
+	var logical_w: float = 1280.0
+	var logical_h: float = 720.0
 	var canvas_xform: Transform2D = Transform2D.IDENTITY
 	if main_scene_node.get_viewport() != null:
-		canvas_xform = main_scene_node.get_viewport().get_canvas_transform()
+		var vp = main_scene_node.get_viewport()
+		canvas_xform = vp.get_canvas_transform()
+		var vis_rect = vp.get_visible_rect()
+		if vis_rect.size.x > 0.0 and vis_rect.size.y > 0.0:
+			logical_w = float(vis_rect.size.x)
+			logical_h = float(vis_rect.size.y)
+
+	var scale_x = 1280.0 / logical_w
+	var scale_y = 720.0 / logical_h
 
 	_rasterize_shapes_on_image(img, shapes_data, canvas_xform, scale_x, scale_y)
 
@@ -248,6 +308,453 @@ func _try_capture_collision_overlay(res_target_path: String) -> void:
 	img.save_png(abs_path)
 	if res_target_path.ends_with("playtest_collision_overlay.png"):
 		img.save_png(ProjectSettings.globalize_path("res://playtest_collision_overlay.png"))
+
+func _get_effective_modulate(node: Node) -> Color:
+	var col = Color(1.0, 1.0, 1.0, 1.0)
+	var cur: Node = node
+	while cur != null and cur != root:
+		if cur is CanvasItem:
+			var ci = cur as CanvasItem
+			if cur == node:
+				col = col * ci.self_modulate
+			col = col * ci.modulate
+		cur = cur.get_parent()
+	return col
+
+func _blend_rect_alpha(img: Image, rect: Rect2i, col: Color) -> void:
+	var clipped = rect.intersection(Rect2i(0, 0, 1280, 720))
+	if clipped.size.x <= 0 or clipped.size.y <= 0 or col.a <= 0.005:
+		return
+	if col.a >= 0.99:
+		img.fill_rect(clipped, Color(clampf(col.r, 0.0, 1.0), clampf(col.g, 0.0, 1.0), clampf(col.b, 0.0, 1.0), 1.0))
+		return
+	var step = 2 if (clipped.size.x * clipped.size.y > 16000) else 1
+	for y in range(clipped.position.y, clipped.end.y, step):
+		for x in range(clipped.position.x, clipped.end.x, step):
+			var dst = img.get_pixel(x, y)
+			var a = clampf(col.a, 0.0, 1.0)
+			var out_col = Color(
+				clampf(dst.r * (1.0 - a) + col.r * a, 0.0, 1.0),
+				clampf(dst.g * (1.0 - a) + col.g * a, 0.0, 1.0),
+				clampf(dst.b * (1.0 - a) + col.b * a, 0.0, 1.0),
+				1.0
+			)
+			if step == 2:
+				img.fill_rect(Rect2i(x, y, min(2, clipped.end.x - x), min(2, clipped.end.y - y)), out_col)
+			else:
+				img.set_pixel(x, y, out_col)
+
+func _collect_headless_render_items(
+	node: Node,
+	in_ui: bool,
+	parent_z: int,
+	world_items: Array,
+	ui_items: Array,
+	lights: Array,
+	modulates: Array
+) -> void:
+	if node == null:
+		return
+	if node is CanvasItem and not (node as CanvasItem).visible:
+		return
+	var cur_in_ui = in_ui
+	if node is CanvasLayer:
+		var cl = node as CanvasLayer
+		if not cl.visible:
+			return
+		cur_in_ui = (cl.layer >= 0)
+	var eff_z = parent_z
+	if node is CanvasItem:
+		var ci = node as CanvasItem
+		eff_z = (parent_z + ci.z_index) if ci.z_as_relative else ci.z_index
+		if not cur_in_ui and (node is Control) and not ((node is ColorRect) and eff_z <= 0):
+			cur_in_ui = true
+	if node is CanvasModulate and not cur_in_ui:
+		modulates.append((node as CanvasModulate).color)
+	elif node is PointLight2D and not cur_in_ui:
+		lights.append(node)
+	elif node is CanvasItem:
+		var entry = {"node": node, "z": eff_z, "order": world_items.size() + ui_items.size()}
+		if cur_in_ui:
+			ui_items.append(entry)
+		else:
+			world_items.append(entry)
+	for child in node.get_children():
+		_collect_headless_render_items(child, cur_in_ui, eff_z, world_items, ui_items, lights, modulates)
+
+func _draw_simple_glyph_text(img: Image, text: String, pos: Vector2, col: Color, max_chars: int = 64) -> void:
+	var clean = text.strip_edges()
+	if clean == "":
+		return
+	var cx = int(round(pos.x))
+	var cy = int(round(pos.y))
+	var count = min(clean.length(), max_chars)
+	for i in range(count):
+		var ch = clean.unicode_at(i)
+		if ch == 32:
+			cx += 6
+			continue
+		if cx + 5 >= 1280 or cy + 7 >= 720 or cx < 0 or cy < 0:
+			cx += 6
+			continue
+		for gy in range(7):
+			for gx in range(5):
+				var on = false
+				if gy == 0 or gy == 6:
+					on = (gx > 0 and gx < 4)
+				elif gy == 3:
+					on = (gx > 0 and ((ch + gy) % 2 == 0))
+				else:
+					on = (gx == 0 or gx == 4 or ((ch + gx * 3 + gy) % 5 == 0))
+				if on:
+					_blend_pixel(img, cx + gx, cy + gy, col)
+		cx += 6
+
+func _render_headless_canvas_item(img: Image, node: CanvasItem, canvas_xform: Transform2D, canvas_mod: Color, is_ui: bool) -> void:
+	var eff_mod = _get_effective_modulate(node)
+	if not is_ui:
+		eff_mod = eff_mod * canvas_mod
+
+	if node is ColorRect:
+		var cr = node as ColorRect
+		var xform = (Transform2D.IDENTITY if is_ui else canvas_xform) * cr.get_global_transform()
+		var tl = xform * Vector2.ZERO
+		var br = xform * cr.size
+		var rx = int(clampf(min(tl.x, br.x), 0.0, 1279.0))
+		var ry = int(clampf(min(tl.y, br.y), 0.0, 719.0))
+		var rw = int(clampf(absf(br.x - tl.x), 0.0, float(1280 - rx)))
+		var rh = int(clampf(absf(br.y - tl.y), 0.0, float(720 - ry)))
+		if rw <= 0 or rh <= 0:
+			return
+		if cr.material is ShaderMaterial and (cr.material as ShaderMaterial).shader != null and (cr.material as ShaderMaterial).shader.code != "":
+			var step_s = 2
+			for sy in range(ry, ry + rh, step_s):
+				var uvy = float(sy - ry) / float(max(1, rh))
+				for sx in range(rx, rx + rw, step_s):
+					var uvx = float(sx - rx) / float(max(1, rw))
+					var sh_col = Color(
+						clampf(uvx * 0.85 + 0.1 * cr.color.r, 0.0, 1.0),
+						clampf(uvy * 0.85 + 0.1 * cr.color.g, 0.0, 1.0),
+						clampf(0.85 * cr.color.b, 0.0, 1.0),
+						cr.color.a * eff_mod.a
+					)
+					img.fill_rect(Rect2i(sx, sy, min(step_s, rx + rw - sx), min(step_s, ry + rh - sy)), sh_col)
+		else:
+			_blend_rect_alpha(img, Rect2i(rx, ry, rw, rh), cr.color * eff_mod)
+		return
+
+	if node is Polygon2D:
+		var poly = node as Polygon2D
+		if poly.polygon.size() < 3:
+			return
+		var xform = (Transform2D.IDENTITY if is_ui else canvas_xform) * poly.get_global_transform()
+		var s_pts = PackedVector2Array()
+		var min_x = 1280.0
+		var max_x = 0.0
+		var min_y = 720.0
+		var max_y = 0.0
+		for p in poly.polygon:
+			var sp = xform * (p + poly.offset)
+			s_pts.append(sp)
+			min_x = min(min_x, sp.x)
+			max_x = max(max_x, sp.x)
+			min_y = min(min_y, sp.y)
+			max_y = max(max_y, sp.y)
+		var ix0 = int(clampf(min_x, 0.0, 1279.0))
+		var ix1 = int(clampf(max_x, 0.0, 1279.0))
+		var iy0 = int(clampf(min_y, 0.0, 719.0))
+		var iy1 = int(clampf(max_y, 0.0, 719.0))
+		var pcol = poly.color * eff_mod
+		var tex_img: Image = null
+		if poly.texture != null:
+			tex_img = poly.texture.get_image()
+			if tex_img != null and not tex_img.is_empty():
+				if tex_img.is_compressed():
+					tex_img.decompress()
+				tex_img.convert(Image.FORMAT_RGBA8)
+			else:
+				tex_img = null
+		for py in range(iy0, iy1 + 1, 2):
+			for px in range(ix0, ix1 + 1, 2):
+				if Geometry2D.is_point_in_polygon(Vector2(float(px), float(py)), s_pts):
+					var fill_c = pcol
+					if tex_img != null:
+						var tx = clampi(int(px - ix0) % max(1, tex_img.get_width()), 0, max(0, tex_img.get_width() - 1))
+						var ty = clampi(int(py - iy0) % max(1, tex_img.get_height()), 0, max(0, tex_img.get_height() - 1))
+						fill_c = tex_img.get_pixel(tx, ty) * pcol
+					img.fill_rect(Rect2i(px, py, min(2, 1280 - px), min(2, 720 - py)), Color(clampf(fill_c.r, 0.0, 1.0), clampf(fill_c.g, 0.0, 1.0), clampf(fill_c.b, 0.0, 1.0), 1.0))
+		var edge_c = Color(clampf(pcol.r * 1.25 + 0.08, 0.0, 1.0), clampf(pcol.g * 1.25 + 0.08, 0.0, 1.0), clampf(pcol.b * 1.25 + 0.08, 0.0, 1.0), 0.95)
+		for i in range(s_pts.size()):
+			_draw_thick_line_on_image(img, s_pts[i], s_pts[(i + 1) % s_pts.size()], edge_c, 1)
+		return
+
+	if node is Line2D:
+		var ln = node as Line2D
+		if ln.points.size() < 2:
+			return
+		var xform = (Transform2D.IDENTITY if is_ui else canvas_xform) * ln.get_global_transform()
+		var thick = clampi(int(round(ln.width * 0.45)), 1, 6)
+		var lcol = ln.default_color * eff_mod
+		for i in range(ln.points.size() - 1):
+			var p0 = xform * ln.points[i]
+			var p1 = xform * ln.points[i + 1]
+			var seg_col = lcol
+			if ln.gradient != null:
+				seg_col = ln.gradient.sample(float(i) / float(max(1, ln.points.size() - 1))) * eff_mod
+			_draw_thick_line_on_image(img, p0, p1, Color(clampf(seg_col.r, 0.0, 1.0), clampf(seg_col.g, 0.0, 1.0), clampf(seg_col.b, 0.0, 1.0), clampf(seg_col.a, 0.1, 1.0)), thick)
+		return
+
+	if (node is Sprite2D) or (node is AnimatedSprite2D):
+		var tex: Texture2D = null
+		var hframes: int = 1
+		var vframes: int = 1
+		var frame_idx: int = 0
+		var centered: bool = true
+		var offset_v: Vector2 = Vector2.ZERO
+		var flip_h: bool = false
+		var flip_v: bool = false
+		var region_enabled: bool = false
+		var region_rect: Rect2 = Rect2()
+		if node is Sprite2D:
+			var sp = node as Sprite2D
+			tex = sp.texture
+			hframes = max(1, sp.hframes)
+			vframes = max(1, sp.vframes)
+			frame_idx = sp.frame
+			centered = sp.centered
+			offset_v = sp.offset
+			flip_h = sp.flip_h
+			flip_v = sp.flip_v
+			region_enabled = sp.region_enabled
+			region_rect = sp.region_rect
+		elif node is AnimatedSprite2D:
+			var asp = node as AnimatedSprite2D
+			centered = asp.centered
+			offset_v = asp.offset
+			flip_h = asp.flip_h
+			flip_v = asp.flip_v
+			if asp.sprite_frames != null and asp.sprite_frames.has_animation(asp.animation):
+				var fcount = asp.sprite_frames.get_frame_count(asp.animation)
+				if fcount > 0:
+					tex = asp.sprite_frames.get_frame_texture(asp.animation, clampi(asp.frame, 0, fcount - 1))
+		if tex != null:
+			var simg = tex.get_image()
+			if simg != null and not simg.is_empty():
+				simg = simg.duplicate()
+				if simg.is_compressed():
+					simg.decompress()
+				simg.convert(Image.FORMAT_RGBA8)
+				if region_enabled and region_rect.size.x > 0 and region_rect.size.y > 0:
+					simg = simg.get_region(Rect2i(int(region_rect.position.x), int(region_rect.position.y), int(region_rect.size.x), int(region_rect.size.y)))
+				elif hframes > 1 or vframes > 1:
+					var cw = max(1, int(simg.get_width() / hframes))
+					var ch = max(1, int(simg.get_height() / vframes))
+					var c_idx = clampi(frame_idx % hframes, 0, hframes - 1)
+					var r_idx = clampi(int(frame_idx / hframes), 0, vframes - 1)
+					simg = simg.get_region(Rect2i(c_idx * cw, r_idx * ch, cw, ch))
+				if flip_h:
+					simg.flip_x()
+				if flip_v:
+					simg.flip_y()
+				var gscale = (node as Node2D).global_scale
+				var dst_w = clampi(int(round(float(simg.get_width()) * absf(gscale.x))), 4, 1280)
+				var dst_h = clampi(int(round(float(simg.get_height()) * absf(gscale.y))), 4, 720)
+				if simg.get_width() != dst_w or simg.get_height() != dst_h:
+					simg.resize(dst_w, dst_h, Image.INTERPOLATE_BILINEAR)
+				var gpos = ((Transform2D.IDENTITY if is_ui else canvas_xform) * (node as Node2D).global_position) + offset_v * gscale
+				var top_left = gpos - (Vector2(float(dst_w) * 0.5, float(dst_h) * 0.5) if centered else Vector2.ZERO)
+				var dx0 = int(round(top_left.x))
+				var dy0 = int(round(top_left.y))
+				if absf(eff_mod.r - 1.0) > 0.03 or absf(eff_mod.g - 1.0) > 0.03 or absf(eff_mod.b - 1.0) > 0.03 or absf(eff_mod.a - 1.0) > 0.03:
+					for sy in range(0, dst_h, 2):
+						for sx in range(0, dst_w, 2):
+							var c_px = simg.get_pixel(sx, sy)
+							if c_px.a > 0.02:
+								var m_px = Color(
+									clampf(c_px.r * eff_mod.r, 0.0, 1.0),
+									clampf(c_px.g * eff_mod.g, 0.0, 1.0),
+									clampf(c_px.b * eff_mod.b, 0.0, 1.0),
+									clampf(c_px.a * eff_mod.a, 0.0, 1.0)
+								)
+								_blend_pixel(img, dx0 + sx, dy0 + sy, m_px)
+								_blend_pixel(img, dx0 + sx + 1, dy0 + sy, m_px)
+								_blend_pixel(img, dx0 + sx, dy0 + sy + 1, m_px)
+								_blend_pixel(img, dx0 + sx + 1, dy0 + sy + 1, m_px)
+				else:
+					img.blend_rect(simg, Rect2i(0, 0, dst_w, dst_h), Vector2i(dx0, dy0))
+		return
+
+	if (node is GPUParticles2D) or (node is CPUParticles2D):
+		var emitting: bool = true
+		var amount: int = 24
+		var lifetime: float = 1.5
+		var dir_v := Vector2(0.0, -1.0)
+		var spread_deg: float = 35.0
+		var vel_max: float = 95.0
+		if node is GPUParticles2D:
+			var gp = node as GPUParticles2D
+			emitting = gp.emitting
+			amount = clampi(gp.amount, 8, 40)
+			lifetime = max(0.2, gp.lifetime)
+			if gp.process_material is ParticleProcessMaterial:
+				var pm = gp.process_material as ParticleProcessMaterial
+				dir_v = Vector2(pm.direction.x, pm.direction.y)
+				if dir_v.length_squared() < 0.001:
+					dir_v = Vector2(0.0, -1.0)
+				else:
+					dir_v = dir_v.normalized()
+				spread_deg = pm.spread
+				vel_max = max(30.0, pm.initial_velocity_max)
+		elif node is CPUParticles2D:
+			var cp = node as CPUParticles2D
+			emitting = cp.emitting
+			amount = clampi(cp.amount, 8, 40)
+			lifetime = max(0.2, cp.lifetime)
+			dir_v = cp.direction.normalized() if cp.direction.length_squared() > 0.001 else Vector2(0.0, -1.0)
+			spread_deg = cp.spread
+			vel_max = max(30.0, cp.initial_velocity_max)
+		if emitting:
+			var origin = (Transform2D.IDENTITY if is_ui else canvas_xform) * (node as Node2D).global_position
+			var raw_mod = node.modulate * node.self_modulate
+			var p_col = Color(
+				clampf(raw_mod.r * max(0.35, canvas_mod.r), 0.0, 1.0),
+				clampf(raw_mod.g * max(0.35, canvas_mod.g), 0.0, 1.0),
+				clampf(raw_mod.b * max(0.35, canvas_mod.b), 0.0, 1.0),
+				clampf(raw_mod.a, 0.5, 1.0)
+			)
+			var base_ang = dir_v.angle()
+			var max_reach = clampf(vel_max * lifetime * 0.9, 40.0, 220.0)
+			for i in range(amount):
+				var phase = fmod((float(i) / float(amount)) + float(current_tick) * 0.035, 1.0)
+				var ang_off = deg_to_rad(spread_deg) * (sin(float(i) * 2.39996) * 0.85)
+				var dist = phase * max_reach
+				var pt = origin + Vector2.from_angle(base_ang + ang_off) * dist
+				img.fill_rect(Rect2i(clampi(int(pt.x) - 3, 0, 1274), clampi(int(pt.y) - 3, 0, 714), 6, 6), p_col)
+		return
+
+	if node is TextureRect:
+		var tr = node as TextureRect
+		if tr.texture != null:
+			var timg = tr.texture.get_image()
+			if timg != null and not timg.is_empty():
+				timg = timg.duplicate()
+				if timg.is_compressed():
+					timg.decompress()
+				timg.convert(Image.FORMAT_RGBA8)
+				var sz = tr.size
+				if sz.x <= 1.0 or sz.y <= 1.0:
+					sz = Vector2(float(timg.get_width()), float(timg.get_height()))
+				var dw = clampi(int(round(sz.x)), 4, 1280)
+				var dh = clampi(int(round(sz.y)), 4, 720)
+				if timg.get_width() != dw or timg.get_height() != dh:
+					timg.resize(dw, dh, Image.INTERPOLATE_BILINEAR)
+				var gp = tr.global_position
+				img.blend_rect(timg, Rect2i(0, 0, dw, dh), Vector2i(int(round(gp.x)), int(round(gp.y))))
+		return
+
+	if (node is Panel) or (node is PanelContainer):
+		var ctrl = node as Control
+		var r = Rect2i(int(round(ctrl.global_position.x)), int(round(ctrl.global_position.y)), max(16, int(round(ctrl.size.x))), max(16, int(round(ctrl.size.y))))
+		_blend_rect_alpha(img, r, Color(0.08, 0.11, 0.16, 0.82) * eff_mod)
+		var tl = Vector2(float(r.position.x), float(r.position.y))
+		var br = Vector2(float(r.end.x), float(r.end.y))
+		var bcol = Color(0.28, 0.48, 0.68, 0.9)
+		_draw_thick_line_on_image(img, tl, Vector2(br.x, tl.y), bcol, 1)
+		_draw_thick_line_on_image(img, Vector2(br.x, tl.y), br, bcol, 1)
+		_draw_thick_line_on_image(img, br, Vector2(tl.x, br.y), bcol, 1)
+		_draw_thick_line_on_image(img, Vector2(tl.x, br.y), tl, bcol, 1)
+		return
+
+	if node is ProgressBar:
+		var pb = node as ProgressBar
+		var r = Rect2i(int(round(pb.global_position.x)), int(round(pb.global_position.y)), max(24, int(round(pb.size.x))), max(8, int(round(pb.size.y))))
+		_blend_rect_alpha(img, r, Color(0.12, 0.15, 0.22, 0.9))
+		var ratio = clampf(float((pb.value - pb.min_value) / max(0.001, pb.max_value - pb.min_value)), 0.0, 1.0)
+		var fill_w = int(round(float(r.size.x) * ratio))
+		if fill_w > 0:
+			_blend_rect_alpha(img, Rect2i(r.position.x, r.position.y, fill_w, r.size.y), Color(0.2, 0.85, 0.55, 0.95))
+		return
+
+	if node is Label:
+		var lbl = node as Label
+		var lcol = lbl.get_theme_color("font_color", "Label") * eff_mod
+		lcol.a = 1.0
+		_draw_simple_glyph_text(img, lbl.text, lbl.global_position + Vector2(2.0, 4.0), lcol, 72)
+		return
+
+	if node is Button:
+		var btn = node as Button
+		var r = Rect2i(int(round(btn.global_position.x)), int(round(btn.global_position.y)), max(32, int(round(btn.size.x))), max(18, int(round(btn.size.y))))
+		_blend_rect_alpha(img, r, Color(0.16, 0.24, 0.36, 0.92))
+		_draw_simple_glyph_text(img, btn.text, btn.global_position + Vector2(6.0, 5.0), Color(0.92, 0.96, 1.0, 1.0), 40)
+		return
+
+func _render_headless_scene_to_image() -> Image:
+	var img = Image.create(1280, 720, false, Image.FORMAT_RGBA8)
+	var bg_col: Color = ProjectSettings.get_setting("rendering/environment/defaults/default_clear_color", Color(0.07, 0.09, 0.13, 1.0))
+	bg_col.a = 1.0
+	img.fill(bg_col)
+	if main_scene_node == null:
+		return img
+
+	var world_items: Array = []
+	var ui_items: Array = []
+	var lights: Array = []
+	var modulates: Array = []
+	_collect_headless_render_items(main_scene_node, false, 0, world_items, ui_items, lights, modulates)
+
+	var canvas_mod := Color(1.0, 1.0, 1.0, 1.0)
+	if modulates.size() > 0:
+		canvas_mod = modulates[modulates.size() - 1]
+		img.fill(Color(bg_col.r * canvas_mod.r, bg_col.g * canvas_mod.g, bg_col.b * canvas_mod.b, 1.0))
+
+	world_items.sort_custom(func(a, b):
+		if a["z"] != b["z"]:
+			return int(a["z"]) < int(b["z"])
+		return int(a["order"]) < int(b["order"])
+	)
+
+	var canvas_xform := Transform2D.IDENTITY
+	for item in world_items:
+		_render_headless_canvas_item(img, item["node"], canvas_xform, canvas_mod, false)
+
+	# If procedural physics bodies have CollisionShape2D/CollisionPolygon2D but no Sprite2D/Polygon2D children, render their shapes
+	var fallback_shapes: Array = []
+	_collect_collision_shapes_recursive(main_scene_node, fallback_shapes)
+	if world_items.size() <= 3 and fallback_shapes.size() > 0:
+		_rasterize_shapes_on_image(img, fallback_shapes, canvas_xform, 1.0, 1.0)
+
+	# Apply PointLight2D radial additive lighting
+	for lnode in lights:
+		var pl = lnode as PointLight2D
+		var lpos = canvas_xform * pl.global_position
+		var rad = 220.0
+		if pl.texture != null:
+			rad = clampf(float(pl.texture.get_width()) * absf(pl.global_scale.x) * 0.5, 48.0, 480.0)
+		var lcol = pl.color
+		var energy = clampf(pl.energy, 0.1, 4.0)
+		var lx0 = clampi(int(lpos.x - rad), 0, 1279)
+		var lx1 = clampi(int(lpos.x + rad), 0, 1279)
+		var ly0 = clampi(int(lpos.y - rad), 0, 719)
+		var ly1 = clampi(int(lpos.y + rad), 0, 719)
+		for ly in range(ly0, ly1 + 1, 2):
+			for lx in range(lx0, lx1 + 1, 2):
+				var d = lpos.distance_to(Vector2(float(lx), float(ly)))
+				if d < rad:
+					var falloff = pow(1.0 - d / rad, 1.35) * energy * 0.55
+					var cur_c = img.get_pixel(lx, ly)
+					var lit_c = Color(
+						clampf(cur_c.r + lcol.r * falloff, 0.0, 1.0),
+						clampf(cur_c.g + lcol.g * falloff, 0.0, 1.0),
+						clampf(cur_c.b + lcol.b * falloff, 0.0, 1.0),
+						1.0
+					)
+					img.fill_rect(Rect2i(lx, ly, min(2, 1280 - lx), min(2, 720 - ly)), lit_c)
+
+	for uitem in ui_items:
+		_render_headless_canvas_item(img, uitem["node"], Transform2D.IDENTITY, Color(1.0, 1.0, 1.0, 1.0), true)
+
+	return img
 
 func _blend_pixel(img: Image, x: int, y: int, col: Color) -> void:
 	if x < 0 or x >= 1280 or y < 0 or y >= 720:
@@ -466,6 +973,11 @@ func _action_to_keycode(action: String) -> int:
 		"Z": return KEY_Z
 	return 0
 
+func _push_input_event(ev: InputEvent) -> void:
+	if render_viewport != null:
+		render_viewport.push_input(ev)
+	root.push_input(ev)
+
 func _emit_action_and_key_event(action: String, is_pressed: bool) -> void:
 	if not InputMap.has_action(action):
 		InputMap.add_action(action)
@@ -473,7 +985,7 @@ func _emit_action_and_key_event(action: String, is_pressed: bool) -> void:
 	act_ev.action = action
 	act_ev.pressed = is_pressed
 	act_ev.strength = 1.0 if is_pressed else 0.0
-	root.push_input(act_ev)
+	_push_input_event(act_ev)
 	var kc = _action_to_keycode(action)
 	if kc != 0:
 		var key_ev = InputEventKey.new()
@@ -481,7 +993,7 @@ func _emit_action_and_key_event(action: String, is_pressed: bool) -> void:
 		key_ev.physical_keycode = kc
 		key_ev.pressed = is_pressed
 		key_ev.echo = false
-		root.push_input(key_ev)
+		_push_input_event(key_ev)
 
 func _resolve_qa_target(base_node: Node, target_spec: String) -> Object:
 	if base_node == null:
@@ -508,6 +1020,23 @@ func _resolve_qa_target(base_node: Node, target_spec: String) -> Object:
 				return null
 	return cur
 
+func _coerce_setup_arg(val: Variant) -> Variant:
+	if typeof(val) == TYPE_DICTIONARY:
+		var d: Dictionary = val
+		if d.size() == 2 and d.has("x") and d.has("y"):
+			return Vector2(float(d["x"]), float(d["y"]))
+	elif typeof(val) == TYPE_STRING:
+		var s = String(val).strip_edges()
+		if s.begins_with("Vector2(") and s.ends_with(")"):
+			var inner = s.substr(8, s.length() - 9).split(",", false)
+			if inner.size() == 2 and inner[0].strip_edges().is_valid_float() and inner[1].strip_edges().is_valid_float():
+				return Vector2(float(inner[0].strip_edges()), float(inner[1].strip_edges()))
+		elif s == "Vector2.ONE":
+			return Vector2.ONE
+		elif s == "Vector2.ZERO":
+			return Vector2.ZERO
+	return val
+
 func _execute_setup_calls_for_tick(tick: int) -> void:
 	for entry in setup_script:
 		if typeof(entry) != TYPE_DICTIONARY:
@@ -527,6 +1056,8 @@ func _execute_setup_calls_for_tick(tick: int) -> void:
 			var parsed_args = JSON.parse_string(String(entry.get("args_json", "[]")))
 			if typeof(parsed_args) == TYPE_ARRAY:
 				args_arr = parsed_args
+		for i in range(args_arr.size()):
+			args_arr[i] = _coerce_setup_arg(args_arr[i])
 		var target_obj = _resolve_qa_target(main_scene_node, target_spec)
 		var status = "skipped_missing_target"
 		if target_obj != null:
@@ -549,14 +1080,63 @@ func _execute_setup_calls_for_tick(tick: int) -> void:
 			"status": status
 		}))
 
+func _evaluate_snapshot_condition(snap: Dictionary, key_path: String, op: String, target_str: String) -> bool:
+	var clean_key = key_path.strip_edges()
+	if clean_key == "":
+		return true
+	var cur: Variant = snap
+	for part in clean_key.split("."):
+		if typeof(cur) == TYPE_DICTIONARY and (cur as Dictionary).has(part):
+			cur = (cur as Dictionary)[part]
+		elif main_scene_node != null and part in main_scene_node:
+			cur = main_scene_node.get(part)
+		else:
+			return false
+	var t_clean = target_str.strip_edges()
+	var clean_op = op.strip_edges()
+	if clean_op == "":
+		clean_op = "=="
+	if typeof(cur) == TYPE_INT or typeof(cur) == TYPE_FLOAT or t_clean.is_valid_float():
+		var lhs = float(cur)
+		var rhs = float(t_clean) if t_clean.is_valid_float() else 0.0
+		match clean_op:
+			"==": return absf(lhs - rhs) <= 0.001
+			"!=": return absf(lhs - rhs) > 0.001
+			">=": return lhs >= rhs
+			"<=": return lhs <= rhs
+			">": return lhs > rhs
+			"<": return lhs < rhs
+	var s_lhs = str(cur).strip_edges().to_lower()
+	var s_rhs = t_clean.to_lower()
+	if clean_op == "!=":
+		return s_lhs != s_rhs
+	return s_lhs == s_rhs
+
 func _apply_scripted_inputs(tick: int) -> void:
 	_execute_setup_calls_for_tick(tick)
 	_release_all_inputs()
+	var live_snap: Dictionary = {}
 	for entry in input_script:
 		if typeof(entry) != TYPE_DICTIONARY:
 			continue
-		var first = int(entry.get("from", 0))
-		var last = int(entry.get("to", first))
+		var when_key = String(entry.get("when_snapshot_key", "")).strip_edges()
+		if when_key != "" and not entry.has("_triggered_at"):
+			var min_t = int(entry.get("from", 1))
+			var max_t = int(entry.get("to", max_ticks))
+			if tick >= min_t and tick <= max_t:
+				if live_snap.is_empty():
+					live_snap = _extract_state_snapshot()
+				var when_op = String(entry.get("when_operator", "=="))
+				var when_val = String(entry.get("when_value", ""))
+				if _evaluate_snapshot_condition(live_snap, when_key, when_op, when_val):
+					entry["_triggered_at"] = tick
+					var hold = max(1, int(entry.get("hold_ticks", 5)))
+					entry["_eff_from"] = tick
+					entry["_eff_to"] = min(max_t, tick + hold - 1)
+		var first = int(entry.get("_eff_from", entry.get("from", 0)))
+		var last = int(entry.get("_eff_to", entry.get("to", first)))
+		if when_key != "" and not entry.has("_triggered_at"):
+			continue
 		if tick == last + 1:
 			for rel_action in entry.get("actions", []):
 				_emit_action_and_key_event(String(rel_action), false)
@@ -566,7 +1146,7 @@ func _apply_scripted_inputs(tick: int) -> void:
 				rel_ev.button_index = MOUSE_BUTTON_LEFT
 				rel_ev.pressed = false
 				rel_ev.position = Vector2(float(rel_click[0]), float(rel_click[1]))
-				root.push_input(rel_ev)
+				_push_input_event(rel_ev)
 			continue
 		if tick < first or tick > last:
 			continue
@@ -582,12 +1162,12 @@ func _apply_scripted_inputs(tick: int) -> void:
 			var cpos = Vector2(float(click_pos[0]), float(click_pos[1]))
 			var motion_ev = InputEventMouseMotion.new()
 			motion_ev.position = cpos
-			root.push_input(motion_ev)
+			_push_input_event(motion_ev)
 			var click_ev = InputEventMouseButton.new()
 			click_ev.button_index = MOUSE_BUTTON_LEFT
 			click_ev.pressed = true
 			click_ev.position = cpos
-			root.push_input(click_ev)
+			_push_input_event(click_ev)
 
 func _apply_synthetic_inputs(tick: int, passive_end: int) -> void:
 	_release_all_inputs()
@@ -627,23 +1207,23 @@ func _apply_synthetic_inputs(tick: int, passive_end: int) -> void:
 		key_ev.keycode = KEY_1
 		key_ev.physical_keycode = KEY_1
 		key_ev.pressed = true
-		root.push_input(key_ev)
+		_push_input_event(key_ev)
 	elif active_tick in [6, 18, 28]:
 		var motion_ev = InputEventMouseMotion.new()
 		motion_ev.position = Vector2(640.0 + float(active_tick * 2), 360.0 + float(active_tick))
-		root.push_input(motion_ev)
+		_push_input_event(motion_ev)
 	elif active_tick in [8, 22, 30]:
 		var click_ev = InputEventMouseButton.new()
 		click_ev.button_index = MOUSE_BUTTON_LEFT
 		click_ev.pressed = true
 		click_ev.position = Vector2(640.0 + float(active_tick * 2), 360.0 + float(active_tick))
-		root.push_input(click_ev)
+		_push_input_event(click_ev)
 	elif active_tick in [9, 23, 31]:
 		var rel_ev = InputEventMouseButton.new()
 		rel_ev.button_index = MOUSE_BUTTON_LEFT
 		rel_ev.pressed = false
 		rel_ev.position = Vector2(640.0 + float(active_tick * 2), 360.0 + float(active_tick))
-		root.push_input(rel_ev)
+		_push_input_event(rel_ev)
 
 func _press(action: String) -> void:
 	if not InputMap.has_action(action):
@@ -670,7 +1250,7 @@ func _extract_state_snapshot() -> Dictionary:
 		if "health" in actor:
 			snap["player_health"] = float(actor.health)
 
-	if main_scene_node and main_scene_node.has_method("get_state_snapshot"):
+	if main_scene_node and main_scene_node.is_node_ready() and main_scene_node.has_method("get_state_snapshot"):
 		var custom_snap = main_scene_node.call("get_state_snapshot")
 		if typeof(custom_snap) == TYPE_DICTIONARY:
 			var actor_pos = snap["player_pos"]

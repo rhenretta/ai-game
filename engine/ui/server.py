@@ -1782,15 +1782,31 @@ def resolve_asset_safe(
                     continue
             except OSError:
                 continue
-            # Check subdirectories
+            # Check subdirectories (including nested subdirectories such as assets/audio/ambient/, assets/audio/sfx/)
             for sub in asset_subdirs:
                 try:
-                    cand = root / "assets" / sub / filename if sub else root / "assets" / filename
+                    sub_dir = root / "assets" / sub if sub else root / "assets"
+                    cand = sub_dir / filename
                     if cand.is_file():
                         cand.resolve().relative_to(root.resolve())
                         return cand
+                    if sub_dir.is_dir():
+                        for nested_cand in sub_dir.rglob(filename):
+                            if nested_cand.is_file():
+                                nested_cand.resolve().relative_to(root.resolve())
+                                return nested_cand
                 except (ValueError, RuntimeError, OSError):
                     pass
+            # Check artifacts/work_items/ for waveform_*, filmstrip_*, plate_*, anim_sheet_*
+            try:
+                art_dir = root / "artifacts"
+                if art_dir.is_dir():
+                    for art_cand in art_dir.rglob(filename):
+                        if art_cand.is_file():
+                            art_cand.resolve().relative_to(root.resolve())
+                            return art_cand
+            except (ValueError, RuntimeError, OSError):
+                pass
             # Check root direct
             try:
                 cand_direct = root / filename
@@ -3855,6 +3871,7 @@ def create_app(
             "deliberation": f"Retrieved {len(combined_events)} historical studio swarm events.",
             "events": combined_events,
             "agent_lifecycle_states": lifecycle_states,
+            "process_status": _inspect_live_build_process(),
         })
 
     async def agents_history_handler(request):
@@ -4330,18 +4347,25 @@ def create_app(
 
         if raw_path:
             p = Path(raw_path)
+            cand_paths: List[Path] = []
             if not p.is_absolute():
-                p = (target_dir / p).resolve()
+                cand_paths.append((target_dir / p).resolve())
+                if config.PROJECT_ROOT:
+                    cand_paths.append((config.PROJECT_ROOT / p).resolve())
+                if c_root:
+                    cand_paths.append((c_root / p).resolve())
             else:
-                p = p.resolve()
+                cand_paths.append(p.resolve())
             try:
-                is_safe = any(
-                    _is_subpath(p, boundary)
-                    for boundary in (config.PROJECT_ROOT, c_root, target_dir)
-                    if boundary
-                )
-                if is_safe and p.is_file():
-                    target_file = p
+                for cp in cand_paths:
+                    is_safe = any(
+                        _is_subpath(cp, boundary)
+                        for boundary in (config.PROJECT_ROOT, c_root, target_dir)
+                        if boundary
+                    )
+                    if is_safe and cp.is_file():
+                        target_file = cp
+                        break
             except Exception:
                 return JSONResponse({"error": "Path traversal prohibited"}, status_code=403)
 
@@ -4518,7 +4542,11 @@ def create_app(
                     nb = {}
                 title = ws.get("game_title") or nb.get("world_title") or cart_dir.name
                 genre = ws.get("core_genre") or "Interactive Experience"
-                now_iso = datetime.now(timezone.utc).isoformat()
+                try:
+                    src_mtime = (ws_file if ws_file.is_file() else (nb_file if nb_file.is_file() else cart_dir)).stat().st_mtime
+                    now_iso = datetime.fromtimestamp(src_mtime, tz=timezone.utc).isoformat()
+                except Exception:
+                    now_iso = "2026-01-01T00:00:00+00:00"
                 transcript = []
                 if ws.get("deliberation"):
                     transcript.append({
@@ -4611,23 +4639,10 @@ def create_app(
                 except Exception:
                     continue
 
-        orch = getattr(target_bus, "_active_orchestrator", None) or getattr(swarm_bus, "_active_orchestrator", None)
-        orch_state = getattr(getattr(orch, "state", None), "value", "IDLE") if orch else "IDLE"
-        pause_greenlight = bool(
-            getattr(target_bus, "_pause_for_greenlight", False)
-            or (orch and getattr(getattr(orch, "config", None), "pause_for_greenlight", False))
-        )
-        try:
-            from engine.studio.daemon import _genesis_build_lock
-            lock_held = _genesis_build_lock.locked()
-        except Exception:
-            lock_held = False
-        is_paused_sentinel = bool(target_cartridges and (target_cartridges / ".studio_paused.json").is_file())
-        build_actively_running = bool(
-            not is_paused_sentinel
-            and orch_state != "AWAITING_GREENLIGHT"
-            and (lock_held or orch_state in ("BRAINSTORMING", "ANALYZING", "SYNTHESIZING", "VERIFYING"))
-        )
+        proc_info = _inspect_live_build_process()
+        orch_state = proc_info["orchestrator_state"]
+        pause_greenlight = proc_info["pause_for_greenlight"]
+        build_actively_running = proc_info["build_actively_running"]
 
         if bible_data:
             resp_payload = dict(bible_data)
@@ -4653,6 +4668,8 @@ def create_app(
             resp_payload["has_bible"] = True
             resp_payload["pause_for_greenlight"] = pause_greenlight
             resp_payload["build_actively_running"] = build_actively_running
+            resp_payload["build_paused"] = proc_info["is_paused"]
+            resp_payload["process_status"] = proc_info
             if str(resp_payload.get("status", "")).lower() == "brainstorming" and orch_state == "AWAITING_GREENLIGHT":
                 resp_payload["orchestrator_state"] = "BRAINSTORMING"
             else:
@@ -4715,6 +4732,361 @@ def create_app(
             "pause_for_greenlight": pause_greenlight,
             "orchestrator_state": orch_state,
         })
+
+    async def board_item_chronology_handler(request):
+        """GET /api/studio/board-item/{item_id}/chronology: Returns the full chronological execution history of a ProductionBoard item across all attempts, agent calls, context packs, self-inquiry Q&As, code diffs, and proof artifacts."""
+        import re
+        from urllib.parse import quote
+
+        item_id = str(request.path_params.get("item_id") or "").strip()
+        if not item_id or len(item_id) > 200 or "\0" in item_id or ".." in item_id or "/" in item_id or "\\" in item_id:
+            return JSONResponse({"error": "Invalid item_id"}, status_code=400)
+
+        cart_override = request.query_params.get("cartridge")
+        sanitized_cart, err_resp = _sanitize_cartridge_override(cart_override)
+        if err_resp is not None:
+            return err_resp
+
+        search_dirs: List[Path] = []
+        if sanitized_cart is not None:
+            search_dirs.append(sanitized_cart)
+        else:
+            live_bible = _get_active_writers_room_bible()
+            if live_bible:
+                matched_c = _resolve_matching_candidate_for_bible(live_bible)
+                if matched_c:
+                    search_dirs.append(matched_c)
+            if target_cartridges and target_cartridges.exists():
+                try:
+                    search_dirs.extend(
+                        sorted(
+                            [d for d in target_cartridges.glob("candidate_*") if d.is_dir()],
+                            key=lambda p: p.stat().st_mtime,
+                            reverse=True,
+                        )
+                    )
+                except OSError:
+                    pass
+            if target_active and target_active.is_dir():
+                search_dirs.append(target_active)
+
+        found_cart: Optional[Path] = None
+        board_item: Optional[Dict[str, Any]] = None
+        for sdir in search_dirs:
+            bf = sdir / "backlog.json"
+            if not bf.is_file():
+                continue
+            try:
+                bdata = json.loads(bf.read_text(encoding="utf-8"))
+                for it in bdata.get("items", []):
+                    if isinstance(it, dict) and str(it.get("item_id") or it.get("id") or "") == item_id:
+                        found_cart = sdir
+                        board_item = dict(it)
+                        break
+                if found_cart is not None:
+                    break
+            except Exception:
+                continue
+
+        if found_cart is None or board_item is None:
+            return JSONResponse(
+                {
+                    "deliberation": f"Board item '{item_id}' not found in any cartridge backlog.",
+                    "error": f"Board item '{item_id}' not found",
+                },
+                status_code=404,
+            )
+
+        def _artifact_url(raw_p: str) -> str:
+            s = str(raw_p or "").strip()
+            if not s:
+                return ""
+            if s.startswith("/api/"):
+                return s
+            p_obj = Path(s)
+            if p_obj.is_absolute():
+                try:
+                    rel_to_proj = p_obj.resolve().relative_to(config.PROJECT_ROOT.resolve()).as_posix()
+                    return f"/api/artifacts/content?path={quote(rel_to_proj)}&raw=true"
+                except Exception:
+                    return f"/api/artifacts/content?path={quote(s)}&raw=true"
+            if not s.startswith(("cartridges/", "../")):
+                cand_p = found_cart / s
+                if cand_p.is_file():
+                    try:
+                        rel_to_proj = cand_p.resolve().relative_to(config.PROJECT_ROOT.resolve()).as_posix()
+                        return f"/api/artifacts/content?path={quote(rel_to_proj)}&raw=true"
+                    except Exception:
+                        pass
+            return f"/api/artifacts/content?path={quote(s)}&raw=true"
+
+        def _parse_council_feedback(fb_str: str) -> List[Dict[str, Any]]:
+            text = str(fb_str or "").strip()
+            if not text:
+                return []
+            segments = [seg.strip() for seg in text.split(" | ") if seg.strip()]
+            parsed_roles: List[Dict[str, Any]] = []
+            for seg in segments:
+                m = re.match(r"^\[([^\]]+)\]:\s*(.*)$", seg, flags=re.DOTALL)
+                if m:
+                    role_name = m.group(1).strip()
+                    body = m.group(2).strip()
+                else:
+                    role_name = "CouncilReviewer"
+                    body = seg
+                points = [
+                    pt.strip()
+                    for pt in re.split(r"(?:^|\s+)(?=\d+\.\s)", body)
+                    if pt.strip()
+                ]
+                parsed_roles.append(
+                    {
+                        "reviewer_role": role_name,
+                        "raw_text": body,
+                        "points": points if points else [body],
+                    }
+                )
+            return parsed_roles
+
+        safe_item_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", item_id).strip("_") or "item"
+        work_item_dir = found_cart / "artifacts" / "work_items" / safe_item_id
+        if not work_item_dir.is_dir():
+            alt_dir = found_cart / "artifacts" / "work_items" / item_id
+            if alt_dir.is_dir():
+                work_item_dir = alt_dir
+
+        context_packs: List[Dict[str, Any]] = []
+        self_inquiries: List[Dict[str, Any]] = []
+        lead_traces_by_rev: Dict[int, Dict[str, Any]] = {}
+        all_touched_files: List[str] = [
+            str(m).replace("res://", "").lstrip("/")
+            for m in (board_item.get("target_modules") or [])
+            if m
+        ]
+
+        if work_item_dir.is_dir():
+            for cp_file in sorted(work_item_dir.glob("context_pack_*.json")):
+                try:
+                    cp_data = json.loads(cp_file.read_text(encoding="utf-8"))
+                    if isinstance(cp_data, dict):
+                        dec = cp_data.get("decision") if isinstance(cp_data.get("decision"), dict) else {}
+                        img_paths = cp_data.get("selected_image_paths") or []
+                        context_packs.append(
+                            {
+                                "filename": cp_file.name,
+                                "target_agent_role": cp_data.get("target_agent_role") or cp_data.get("normalized_role") or cp_file.stem,
+                                "revision": cp_data.get("revision", 0),
+                                "total_indexed_chunks": cp_data.get("total_indexed_chunks", 0),
+                                "selected_chunk_ids": cp_data.get("selected_chunk_ids") or [],
+                                "selected_image_paths": img_paths,
+                                "selected_image_urls": [_artifact_url(p) for p in img_paths],
+                                "role_tailored_synthesis": dec.get("role_tailored_synthesis") or "",
+                                "deliberation": dec.get("deliberation") or "",
+                                "search_queries_used": dec.get("search_queries_used") or [],
+                            }
+                        )
+                except Exception:
+                    continue
+
+            for si_file in sorted(work_item_dir.glob("self_inquiry_qa_*.json")):
+                try:
+                    si_data = json.loads(si_file.read_text(encoding="utf-8"))
+                    if isinstance(si_data, list):
+                        for entry in si_data:
+                            if isinstance(entry, dict):
+                                self_inquiries.append(entry)
+                except Exception:
+                    continue
+
+            for lt_file in sorted(work_item_dir.glob("lead_trace_rev*.json")):
+                m_rev = re.search(r"lead_trace_rev(\d+)\.json$", lt_file.name)
+                if not m_rev:
+                    continue
+                rev_idx = int(m_rev.group(1))
+                try:
+                    lt_data = json.loads(lt_file.read_text(encoding="utf-8"))
+                    if isinstance(lt_data, dict):
+                        lead_traces_by_rev[rev_idx] = lt_data
+                except Exception:
+                    continue
+
+        revisions_list = board_item.get("revisions") if isinstance(board_item.get("revisions"), list) else []
+        revs_by_idx: Dict[int, Dict[str, Any]] = {}
+        for idx, rv in enumerate(revisions_list):
+            if isinstance(rv, dict):
+                r_i = int(rv.get("revision_index", idx))
+                revs_by_idx[r_i] = rv
+
+        all_rev_indices = sorted(set(lead_traces_by_rev.keys()) | set(revs_by_idx.keys()))
+        attempts: List[Dict[str, Any]] = []
+        for rev_idx in all_rev_indices:
+            lt = lead_traces_by_rev.get(rev_idx) or {}
+            rv = revs_by_idx.get(rev_idx) or {}
+            raw_turns = lt.get("turns") if isinstance(lt.get("turns"), list) else []
+            enriched_turns: List[Dict[str, Any]] = []
+            for t_i, t in enumerate(raw_turns):
+                if not isinstance(t, dict):
+                    continue
+                t_files = [
+                    str(tf).replace("res://", "").lstrip("/")
+                    for tf in (t.get("touched_files") or [])
+                    if tf
+                ]
+                for tf in t_files:
+                    if tf not in all_touched_files:
+                        all_touched_files.append(tf)
+                p_imgs = [str(p) for p in (t.get("proof_images") or []) if p]
+                raw_step_log = t.get("step_log") if isinstance(t.get("step_log"), list) else []
+                if not raw_step_log:
+                    fallback_steps: List[Dict[str, Any]] = []
+                    for tf in t_files:
+                        fallback_steps.append(
+                            {
+                                "step_type": "editing_file",
+                                "specialist_agent": t.get("specialist_agent") or "worker",
+                                "message": f"Edited file {tf}",
+                                "timestamp_utc": t.get("timestamp_utc") or "",
+                            }
+                        )
+                    for p in p_imgs:
+                        fallback_steps.append(
+                            {
+                                "step_type": "captured_proof",
+                                "specialist_agent": t.get("specialist_agent") or "worker",
+                                "message": f"Rendered proof artifact {Path(p).name}",
+                                "timestamp_utc": t.get("timestamp_utc") or "",
+                            }
+                        )
+                    if t.get("specialist_agent") in ("swe_engineer", "qa_test_engineer"):
+                        fallback_steps.append(
+                            {
+                                "step_type": "running_tests" if t.get("verification_passed", True) else "error",
+                                "specialist_agent": t.get("specialist_agent") or "worker",
+                                "message": (
+                                    "Engine & headless verification passed"
+                                    if t.get("verification_passed", True)
+                                    else f"Verification failed: {str(t.get('summary') or '')[:180]}"
+                                ),
+                                "timestamp_utc": t.get("timestamp_utc") or "",
+                            }
+                        )
+                    raw_step_log = fallback_steps
+                enriched_turns.append(
+                    {
+                        "turn_index": t.get("turn_index", t_i),
+                        "specialist_agent": t.get("specialist_agent") or "worker",
+                        "deliberation": t.get("deliberation") or "",
+                        "brief": t.get("brief") or "",
+                        "summary": t.get("summary") or "",
+                        "verification_passed": t.get("verification_passed", not str(t.get("summary") or "").startswith("ERROR from ")),
+                        "touched_files": t_files,
+                        "code_diffs": t.get("code_diffs") if isinstance(t.get("code_diffs"), dict) else {},
+                        "step_log": raw_step_log,
+                        "curated_context": t.get("curated_context") or "",
+                        "prompt_text": t.get("prompt_text") or "",
+                        "self_inquiries": t.get("self_inquiries") if isinstance(t.get("self_inquiries"), list) else [],
+                        "lead_deliberation": t.get("lead_deliberation") or "",
+                        "lead_prompt_text": t.get("lead_prompt_text") or "",
+                        "lead_curated_context": t.get("lead_curated_context") or "",
+                        "lead_self_inquiries": t.get("lead_self_inquiries") if isinstance(t.get("lead_self_inquiries"), list) else [],
+                        "proof_images": p_imgs,
+                        "proof_urls": [
+                            {
+                                "path": p,
+                                "filename": Path(p).name,
+                                "url": _artifact_url(p),
+                                "is_audio": Path(p).suffix.lower() in (".wav", ".mp3", ".ogg"),
+                            }
+                            for p in p_imgs
+                        ],
+                        "timestamp_utc": t.get("timestamp_utc") or "",
+                    }
+                )
+
+            rv_proofs = [str(p) for p in (rv.get("proof_paths") or lt.get("collected_proofs") or []) if p]
+            council_review = None
+            if rv:
+                fb_raw = str(rv.get("feedback") or "")
+                verdict_val = str(rv.get("verdict") or ("approve" if rv.get("approved") else "request_changes"))
+                council_review = {
+                    "revision_index": rev_idx,
+                    "verdict": verdict_val,
+                    "approved": verdict_val == "approve" or bool(rv.get("approved")),
+                    "feedback": fb_raw,
+                    "reviewer_breakdown": _parse_council_feedback(fb_raw),
+                    "worker_notes": str(rv.get("worker_notes") or ""),
+                    "proof_artifacts": [
+                        {
+                            "path": p,
+                            "filename": Path(p).name,
+                            "url": _artifact_url(p),
+                            "is_audio": Path(p).suffix.lower() in (".wav", ".mp3", ".ogg"),
+                        }
+                        for p in rv_proofs
+                    ],
+                }
+
+            attempts.append(
+                {
+                    "revision_index": rev_idx,
+                    "attempt_number": rev_idx + 1,
+                    "status": lt.get("status") or ("reviewed" if rv else "in_progress"),
+                    "current_strategy": lt.get("current_strategy") or "",
+                    "submission_summary": lt.get("submission_summary") or "",
+                    "turns": enriched_turns,
+                    "council_review": council_review,
+                    "pending_decision": lt.get("pending_decision"),
+                    "active_turn": lt.get("active_turn") if isinstance(lt.get("active_turn"), dict) else None,
+                }
+            )
+
+        file_contents: Dict[str, Dict[str, Any]] = {}
+        for rel_f in all_touched_files:
+            clean_rel = str(rel_f).replace("res://", "").lstrip("/")
+            if not clean_rel or ".." in clean_rel:
+                continue
+            cand_f = found_cart / clean_rel
+            if cand_f.is_file():
+                try:
+                    if cand_f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".wav", ".mp3", ".ogg"):
+                        file_contents[clean_rel] = {
+                            "path": clean_rel,
+                            "is_binary": True,
+                            "url": _artifact_url(str(cand_f)),
+                            "size_bytes": cand_f.stat().st_size,
+                        }
+                    else:
+                        txt = cand_f.read_text(encoding="utf-8", errors="replace")
+                        file_contents[clean_rel] = {
+                            "path": clean_rel,
+                            "is_binary": False,
+                            "content": txt[:40000],
+                            "line_count": len(txt.splitlines()),
+                            "size_bytes": cand_f.stat().st_size,
+                        }
+                except Exception:
+                    continue
+
+        return JSONResponse(
+            {
+                "deliberation": f"Loaded chronological history for '{item_id}' in '{found_cart.name}' across {len(attempts)} attempt(s).",
+                "cartridge_id": found_cart.name,
+                "item_id": item_id,
+                "title": board_item.get("title") or item_id,
+                "kind": board_item.get("kind") or "mechanic_code",
+                "state": board_item.get("state") or board_item.get("status") or "ready",
+                "raised_by_role": board_item.get("raised_by_role") or "CreativeDirector",
+                "spec": board_item.get("spec") or board_item.get("description") or "",
+                "proof_spec": board_item.get("proof_spec") or "",
+                "target_modules": board_item.get("target_modules") or [],
+                "depends_on": board_item.get("depends_on") or [],
+                "failure": board_item.get("failure") or "",
+                "context_packs": context_packs,
+                "self_inquiries": self_inquiries,
+                "attempts": attempts,
+                "file_contents": file_contents,
+            }
+        )
 
     async def studio_greenlight_handler(request):
         """POST /api/studio/greenlight: Approves the Living Game Bible or injects Executive Producer steering feedback."""
@@ -4822,8 +5194,192 @@ def create_app(
             "orchestrator": orch_result,
         })
 
+    def _inspect_live_build_process() -> Dict[str, Any]:
+        """Actively inspects the live Python threads, mutex locks, external daemon PID, and pause sentinel to determine true build execution state."""
+        orch = getattr(target_bus, "_active_orchestrator", None) or getattr(swarm_bus, "_active_orchestrator", None)
+        orch_state = getattr(getattr(orch, "state", None), "value", "IDLE") if orch else "IDLE"
+        pause_greenlight = bool(
+            getattr(target_bus, "_pause_for_greenlight", False)
+            or (orch and getattr(getattr(orch, "config", None), "pause_for_greenlight", False))
+        )
+        try:
+            from engine.studio.daemon import _genesis_build_lock
+            lock_held = _genesis_build_lock.locked()
+        except Exception:
+            lock_held = False
+
+        # 1. Inspect live Python threads in current process
+        active_threads: List[str] = []
+        try:
+            for th in threading.enumerate():
+                if not th.is_alive():
+                    continue
+                tname = str(th.name or "")
+                if (
+                    tname.startswith("GenesisTrigger_")
+                    or tname == "board-scheduler"
+                    or (lock_held and tname.startswith("board-worker"))
+                ):
+                    active_threads.append(tname)
+        except Exception:
+            pass
+
+        # 2. Inspect external studio.lock daemon PID if present
+        daemon_pid: Optional[int] = None
+        daemon_alive = False
+        try:
+            lock_candidates = []
+            if target_cartridges is not None:
+                lock_candidates.append(target_cartridges.parent / "studio.lock")
+                if target_cartridges.resolve() == config.CARTRIDGES_ROOT.resolve():
+                    lock_candidates.append(config.PROJECT_ROOT / "studio.lock")
+            else:
+                lock_candidates.append(config.PROJECT_ROOT / "studio.lock")
+            for lf in lock_candidates:
+                if lf.is_file():
+                    raw_pid = lf.read_text(encoding="utf-8").strip()
+                    if raw_pid.isdigit():
+                        pid_val = int(raw_pid)
+                        try:
+                            os.kill(pid_val, 0)
+                            daemon_pid = pid_val
+                            daemon_alive = True
+                            break
+                        except OSError:
+                            pass
+        except Exception:
+            pass
+
+        # 3. Inspect BoardScheduler running workers & pause flag
+        scheduler = getattr(orch, "_board_scheduler", None) if orch is not None else None
+        scheduler_running_workers = 0
+        scheduler_paused = False
+        if scheduler is not None:
+            try:
+                scheduler_running_workers = int(scheduler.running_count())
+            except Exception:
+                scheduler_running_workers = 0
+            try:
+                scheduler_paused = bool(scheduler.is_paused())
+            except Exception:
+                scheduler_paused = False
+
+        # 4. Inspect pause sentinel file & bus flag
+        is_paused = bool(
+            getattr(target_bus, "_build_paused", False)
+            or getattr(swarm_bus, "_build_paused", False)
+            or (target_cartridges and (target_cartridges / ".studio_paused.json").is_file())
+            or scheduler_paused
+        )
+
+        # 5. Determine if any build execution is genuinely alive right now
+        is_process_alive = bool(
+            lock_held
+            or len(active_threads) > 0
+            or daemon_alive
+            or scheduler_running_workers > 0
+            or orch_state in ("BRAINSTORMING", "ANALYZING", "SYNTHESIZING", "VERIFYING")
+        )
+
+        if orch_state == "AWAITING_GREENLIGHT":
+            process_state = "awaiting_greenlight"
+            build_actively_running = False
+        elif is_paused:
+            process_state = "pausing" if is_process_alive else "paused"
+            build_actively_running = False
+        elif is_process_alive:
+            process_state = "running"
+            build_actively_running = True
+        else:
+            process_state = "stopped"
+            build_actively_running = False
+
+        # 6. Query true latest event timestamp from event bus or SQLite studio_events, and detect any build-stopping error
+        last_event_ts: Optional[str] = None
+        last_error: Optional[Dict[str, Any]] = None
+        try:
+            recent_ev = target_bus.get_recent_events(limit=500)
+            if recent_ev and isinstance(recent_ev[-1], dict):
+                last_event_ts = recent_ev[-1].get("timestamp_utc")
+            for ev in reversed(recent_ev or []):
+                if not isinstance(ev, dict):
+                    continue
+                ev_t = str(ev.get("event_type") or "")
+                if ev_t in ("ERROR", "backlog_item_failed", "backlog_item_blocked"):
+                    pl = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+                    err_msg = str(
+                        pl.get("error")
+                        or pl.get("failure")
+                        or pl.get("reason")
+                        or ev.get("deliberation")
+                        or "Build encountered an error."
+                    )
+                    if "StudioPausedError" not in err_msg and "paused by operator" not in err_msg.lower():
+                        last_error = {
+                            "event_type": ev_t,
+                            "agent_name": str(ev.get("agent_name") or "Studio"),
+                            "item_id": str(pl.get("item_id") or ""),
+                            "message": err_msg,
+                            "timestamp_utc": str(ev.get("timestamp_utc") or ""),
+                        }
+                        break
+        except Exception:
+            pass
+        if not last_event_ts and target_db and target_db.exists():
+            try:
+                tdb = TelemetryDB(target_db)
+                conn = tdb.get_reader_connection()
+                try:
+                    row = conn.execute("SELECT MAX(timestamp_utc) AS max_ts FROM studio_events;").fetchone()
+                    if row and row["max_ts"]:
+                        last_event_ts = str(row["max_ts"])
+                    if last_error is None:
+                        err_row = conn.execute(
+                            "SELECT event_type, agent_name, timestamp_utc, payload_json FROM studio_events "
+                            "WHERE event_type IN ('ERROR', 'backlog_item_failed') ORDER BY id DESC LIMIT 1;"
+                        ).fetchone()
+                        if err_row:
+                            try:
+                                pl_d = json.loads(err_row["payload_json"] or "{}")
+                            except Exception:
+                                pl_d = {}
+                            pl_inner = pl_d.get("payload") if isinstance(pl_d.get("payload"), dict) else pl_d
+                            err_msg = str(
+                                pl_inner.get("error")
+                                or pl_inner.get("failure")
+                                or pl_d.get("deliberation")
+                                or ""
+                            )
+                            if err_msg and "StudioPausedError" not in err_msg and "paused by operator" not in err_msg.lower():
+                                last_error = {
+                                    "event_type": str(err_row["event_type"]),
+                                    "agent_name": str(err_row["agent_name"] or "Studio"),
+                                    "item_id": str(pl_inner.get("item_id") or ""),
+                                    "message": err_msg,
+                                    "timestamp_utc": str(err_row["timestamp_utc"] or ""),
+                                }
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+
+        return {
+            "process_state": process_state,
+            "is_process_alive": is_process_alive,
+            "is_paused": is_paused,
+            "pause_for_greenlight": pause_greenlight,
+            "build_actively_running": build_actively_running,
+            "lock_held": lock_held,
+            "active_threads": active_threads,
+            "daemon_pid": daemon_pid,
+            "scheduler_running_workers": scheduler_running_workers,
+            "orchestrator_state": orch_state,
+            "last_event_timestamp_utc": last_event_ts,
+            "last_error": last_error,
+        }
+
     async def studio_settings_handler(request):
-        """GET/POST /api/studio/settings: Reads or updates studio orchestration settings such as pause_for_greenlight."""
+        """GET/POST /api/studio/settings: Reads or updates studio orchestration settings such as pause_for_greenlight and paused."""
         orch = getattr(target_bus, "_active_orchestrator", None)
         if request.method == "POST":
             try:
@@ -4878,18 +5434,14 @@ def create_app(
                     except Exception:
                         pass
 
-        pause_val = bool(
-            getattr(target_bus, "_pause_for_greenlight", False)
-            or (orch and getattr(getattr(orch, "config", None), "pause_for_greenlight", False))
-        )
-        paused_val = bool(
-            getattr(target_bus, "_build_paused", False)
-            or (target_cartridges / ".studio_paused.json").is_file()
-        )
+        proc_info = _inspect_live_build_process()
+        pause_val = proc_info["pause_for_greenlight"]
+        paused_val = proc_info["is_paused"]
         return JSONResponse({
-            "deliberation": f"Studio orchestration configuration: pause_for_greenlight={pause_val}, paused={paused_val}.",
+            "deliberation": f"Studio orchestration configuration: pause_for_greenlight={pause_val}, paused={paused_val}, process_state={proc_info['process_state']}.",
             "pause_for_greenlight": pause_val,
             "paused": paused_val,
+            "process_status": proc_info,
         })
 
     _launched_game_proc: List[Optional[Any]] = [None]
@@ -5085,6 +5637,7 @@ def create_app(
         Route("/api/studio/status", endpoint=studio_status_handler, methods=["GET"]),
         Route("/api/studio/game-bible", endpoint=game_bible_handler, methods=["GET"]),
         Route("/api/game-bible", endpoint=game_bible_handler, methods=["GET"]),
+        Route("/api/studio/board-item/{item_id}/chronology", endpoint=board_item_chronology_handler, methods=["GET"]),
         Route("/api/studio/greenlight", endpoint=studio_greenlight_handler, methods=["POST"]),
         Route("/api/studio/settings", endpoint=studio_settings_handler, methods=["GET", "POST"]),
         Route("/api/game/launch", endpoint=game_launch_handler, methods=["POST"]),

@@ -815,7 +815,13 @@ static func create_tiled_surface(
             return portrait_dest
 
         # 2. Multi-Pose / Multi-State Sprite Sheet fabrication + Tier 1 & Tier 2 Contact Sheet Verification
-        if fmode == "sprite_sheet" or atype == "sprite_sheet":
+        # (Note: When grid_cols * grid_rows > 1 and cell_prompts are provided for a multi-cell state/icon/variant grid,
+        # route through Step 4's per-cell grid compositor rather than single-actor biomechanical deformation.)
+        has_grid_cell_prompts = (
+            max(1, int(getattr(req, "grid_cols", 1) or 1)) * max(1, int(getattr(req, "grid_rows", 1) or 1)) > 1
+            and bool(getattr(req, "cell_prompts", None))
+        )
+        if (fmode == "sprite_sheet" or atype == "sprite_sheet") and not has_grid_cell_prompts:
             stem = dest_path.stem
             sheet_filename = f"{stem}_sheet.png" if not stem.endswith("_sheet") else f"{stem}.png"
             sheet_rel = f"assets/sprites/{sheet_filename}"
@@ -941,8 +947,10 @@ static func create_tiled_surface(
             )
             return comp_path
 
-        # 4. Static Sprite / Prop / Tile Surface / Parallax Layer / Diegetic UI + Tier 1 Render Plate Verification
+        # 4. Static Sprite / Prop / Tile Surface / Parallax Layer / Diegetic UI / Multi-Cell Grid + Tier 1 Render Plate Verification
         plate_path = renders_dir / f"plate_{req.asset_id}.png"
+        g_cols = max(1, int(getattr(req, "grid_cols", 1) or 1))
+        g_rows = max(1, int(getattr(req, "grid_rows", 1) or 1))
         out_path = dest_path
         for attempt in range(1, max_val_attempts + 1):
             out_path = self.visual_agent.generate_dynamic_sprite(
@@ -953,11 +961,22 @@ static func create_tiled_surface(
                 style_guide=style_guide,
             )
             if hasattr(self.visual_agent, "render_asset_inspection_plate") and out_path.is_file():
-                self.visual_agent.render_asset_inspection_plate(
-                    out_path,
-                    asset_type="tile_surface" if fmode == "tile_surface" else atype,
-                    output_path=plate_path,
-                )
+                try:
+                    self.visual_agent.render_asset_inspection_plate(
+                        out_path,
+                        asset_type="tile_surface" if fmode == "tile_surface" else atype,
+                        output_path=plate_path,
+                        grid_cols=g_cols,
+                        grid_rows=g_rows,
+                    )
+                except TypeError:
+                    self.visual_agent.render_asset_inspection_plate(
+                        out_path,
+                        asset_type="tile_surface" if fmode == "tile_surface" else atype,
+                        output_path=plate_path,
+                    )
+                if (fmode == "sprite_sheet" or atype == "sprite_sheet") and plate_path.is_file():
+                    shutil.copyfile(plate_path, renders_dir / f"anim_sheet_{req.asset_id}.png")
             if hasattr(self.visual_agent, "verify_rendered_asset") and out_path.is_file():
                 verdict = self.visual_agent.verify_rendered_asset(
                     asset_req=req,
@@ -984,6 +1003,8 @@ static func create_tiled_surface(
             file_path=req.target_path,
             target_display_size=tuple(req.dimensions or tex_size),
             texture_pixel_size=tex_size,
+            hframes=g_cols,
+            vframes=g_rows,
             concept_reference_used=str(ref_images[0]) if ref_images else None,
             sha256_hash=self._compute_sha256(out_path),
         )
@@ -1020,6 +1041,8 @@ static func create_tiled_surface(
                 continue
 
             plate_p = renders_dir / f"plate_{aid}.png"
+            e_hframes = max(1, int(getattr(entry, "hframes", 1) or 1))
+            e_vframes = max(1, int(getattr(entry, "vframes", 1) or 1))
             req_stub = AssetRequirement(
                 deliberation=entry.deliberation,
                 asset_id=aid,
@@ -1032,9 +1055,12 @@ static func create_tiled_surface(
                 visual_prompt_or_text=f"{entry.purpose}. {style_guide}",
                 target_path=entry.file_path,
                 dimensions=entry.target_display_size or (64, 64),
+                grid_cols=e_hframes,
+                grid_rows=e_vframes,
             )
             single_f = self.sprites_dir / f"{aid}.png"
             target_for_plate = single_f if (entry.fabrication_mode == "sprite_sheet" and single_f.is_file()) else f_path
+            target_is_multi_cell = (e_hframes * e_vframes) > 1 and target_for_plate == f_path
 
             # If this is a cutout sprite or character on disk, apply neural/OpenCV alpha matting pass
             if auto_remediate and entry.fabrication_mode not in ("tile_surface", "parallax_layer") and target_for_plate.is_file():
@@ -1046,6 +1072,7 @@ static func create_tiled_surface(
                         target_size=raw_rgba.size,
                         strip_border_frame=True,
                         pad_ratio=0.04,
+                        isolate_single_subject=not target_is_multi_cell,
                     )
                     matted.save(target_for_plate, format="PNG")
                 except Exception as exc:

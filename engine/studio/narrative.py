@@ -83,7 +83,7 @@ class NarrativeCharacterWriterAgent:
         self,
         client: Optional[Any] = None,
         model_name: str = "gemini-3.8-flash",
-        creative_temperature: float = 1.2,
+        creative_temperature: float = 0.7,
     ):
         self.client = client
         self.model_name = model_name

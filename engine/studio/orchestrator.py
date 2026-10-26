@@ -231,7 +231,12 @@ class StudioOrchestrator:
                 self.event_bus = swarm_bus
             except Exception:
                 self.event_bus = None
-        self.client = client if client is not None else self._init_gemini_client(self.api_key, timeout_seconds=self.config.timeout_seconds)
+        from engine.studio.models import install_studio_gemini_guardrails, set_active_gemini_dataset_context
+        self.client = install_studio_gemini_guardrails(
+            client if client is not None else self._init_gemini_client(self.api_key, timeout_seconds=self.config.timeout_seconds),
+            dataset_name=getattr(self.config, "dataset_name", "") or None,
+            store_logs=getattr(self.config, "store_logs", True),
+        )
         self.enable_writers_room = enable_writers_room
         self.active_game_bible: Optional[GameBibleSpec] = None
         self.production_board: Optional[Any] = None
@@ -432,8 +437,15 @@ class StudioOrchestrator:
         """Creates the Production Board, its worker handlers and the scheduler for this build (None when disabled)."""
         if not self._continuous_production_enabled():
             return None
+        from engine.studio.models import set_active_gemini_dataset_context
         from engine.studio.production_board import BoardScheduler, ProductionBoard
         from engine.studio.workers import WorkerContext, default_handlers
+
+        set_active_gemini_dataset_context(
+            dataset_name=getattr(self.config, "dataset_name", "") or c_dir.name,
+            candidate_dir=c_dir,
+            store_logs=getattr(self.config, "store_logs", True),
+        )
 
         def _board_event(event_type: str, payload: Dict[str, Any]) -> None:
             self._publish_event(event_type, "ProductionBoard", payload.get("deliberation", event_type), payload)
@@ -531,6 +543,12 @@ class StudioOrchestrator:
         c_dir = Path(staging_dir) if staging_dir else (PROJECT_ROOT / "cartridges" / f"candidate_genesis_{uuid.uuid4().hex[:6]}")
         c_dir.mkdir(parents=True, exist_ok=True)
         self._active_staging_dir = c_dir
+        from engine.studio.models import set_active_gemini_dataset_context
+        set_active_gemini_dataset_context(
+            dataset_name=getattr(self.config, "dataset_name", "") or c_dir.name,
+            candidate_dir=c_dir,
+            store_logs=getattr(self.config, "store_logs", True),
+        )
         self.writers_room.telemetry_db = self._get_telemetry_db()
         seed = creative_prompt or getattr(self, "_creative_prompt", None)
         board = self._build_production_board(c_dir)
@@ -745,7 +763,7 @@ class StudioOrchestrator:
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=StudioSwarmPlan,
-                    temperature=1.2,
+                    temperature=0.6,
                 ),
             )
             if not response.text:
@@ -1780,24 +1798,39 @@ class StudioOrchestrator:
         context: Optional[SwarmExecutionContext] = None,
     ) -> Dict[str, Path]:
         """Executes iterative requirement execution loop across all ordered RequirementTracks."""
+        from engine.studio.models import TOKEN_USAGE_TRACKER, wait_if_studio_paused
+
         results: Dict[str, Path] = {}
         tracks = req_spec.requirements
         completed_track_ids: List[str] = [t.id for t in tracks if t.status == "completed"]
+        board_managed = bool(
+            (self._continuous_active and self.production_board is not None and self.production_board.items())
+            or (staging_dir / "backlog.json").is_file()
+        )
+        has_existing_cartridge = (staging_dir / "project.godot").is_file() or (staging_dir / "mechanics.py").is_file()
+        has_uncompleted_tracks = any(t.status != "completed" for t in tracks) or not has_existing_cartridge
+        synthesized_any_track = False
 
         # 0. Ensure the per-game RenderingStrategySpec exists (normally created before asset fabrication; cached here).
         if (
-            self._is_live_genai_client()
+            not board_managed
+            and has_uncompleted_tracks
+            and self._is_live_genai_client()
             and (staging_dir / "game_bible.json").is_file()
             and hasattr(agent, "_rendering_strategy_block")
         ):
+            wait_if_studio_paused(candidate_dir=staging_dir, label="LeadGameplaySWEAgent._rendering_strategy_block")
             agent._rendering_strategy_block(staging_dir)
 
         # 0a. Formulate the machine-readable LevelLayoutSpec (data the SWE agent consumes, not prose) before building tracks
         if (
-            self._is_live_genai_client()
+            not board_managed
+            and has_uncompleted_tracks
+            and self._is_live_genai_client()
             and (staging_dir / "game_bible.json").is_file()
             and hasattr(agent, "formulate_level_layout")
         ):
+            wait_if_studio_paused(candidate_dir=staging_dir, label="LeadGameplaySWEAgent.formulate_level_layout")
             layout = agent.formulate_level_layout(staging_dir)
             self._publish_event(
                 "AGENT_STREAM",
@@ -1809,10 +1842,13 @@ class StudioOrchestrator:
         # 0b. Formulate master GameProductionStrategySpec before building tracks (when live Gemini + Game Bible present).
         # Failures are fatal and propagate with their full stack trace (Rule 5).
         if (
-            self._is_live_genai_client()
+            not board_managed
+            and has_uncompleted_tracks
+            and self._is_live_genai_client()
             and (staging_dir / "game_bible.json").is_file()
             and hasattr(agent, "formulate_production_strategy")
         ):
+            wait_if_studio_paused(candidate_dir=staging_dir, label="LeadGameplaySWEAgent.formulate_production_strategy")
             strat = agent.formulate_production_strategy(staging_dir)
             self._publish_event(
                 "AGENT_STREAM",
@@ -1822,6 +1858,7 @@ class StudioOrchestrator:
             )
 
         for track_idx, track in enumerate(tracks):
+            wait_if_studio_paused(candidate_dir=staging_dir, label=f"LeadGameplaySWEAgent.track[{track.id}]")
             # 1. Skip Completed Tracks on Resume
             if track.status == "completed" and ((staging_dir / "project.godot").is_file() or (staging_dir / "mechanics.py").is_file()):
                 logger.info("Skipping already completed requirement track %s: '%s'", track.id, track.title)
@@ -1849,6 +1886,8 @@ class StudioOrchestrator:
                     )
                 self._persist_verified_checkpoint(staging_dir, track, completed_track_ids, mirror_to_active=False)
                 continue
+
+            synthesized_any_track = True
 
             track_t_start = _time.perf_counter()
             track_start_iso = datetime.now(timezone.utc).isoformat()
@@ -2097,19 +2136,22 @@ class StudioOrchestrator:
                 context.record_task(track_task)
 
             # 5. Persist Verified Checkpoint in cartridges/checkpoints/ (do not overwrite cartridges/active/ mid-build before QA & Sign-Off Council)
+            TOKEN_USAGE_TRACKER.reset_swe_pev_streak()
             self._persist_verified_checkpoint(staging_dir, track, completed_track_ids, mirror_to_active=False)
 
-        # 6. Execute Per-Scene Critique & Iterative Refinement Loop after tracks complete
+        # 6. Execute Per-Scene Critique & Iterative Refinement Loop ONLY when legacy non-board tracks were newly synthesized
         if (
-            self._is_live_genai_client()
+            not board_managed
+            and synthesized_any_track
+            and self._is_live_genai_client()
             and (staging_dir / "project.godot").is_file()
             and (staging_dir / "game_bible.json").is_file()
             and hasattr(agent, "execute_scene_strategy_and_refine_loop")
         ):
-            # Iterates until the critic accepts the scene AND authored beats pass. Rejections/errors propagate (Rule 5).
+            wait_if_studio_paused(candidate_dir=staging_dir, label="LeadGameplaySWEAgent.execute_scene_strategy_and_refine_loop")
             refined = agent.execute_scene_strategy_and_refine_loop(
                 staging_dir,
-                max_scene_iterations=None,
+                max_scene_iterations=2,
             )
             results.update(refined)
 
@@ -2400,8 +2442,10 @@ class StudioOrchestrator:
         track: RequirementTrack,
         swe_agent: Optional[Any] = None,
     ) -> None:
-        """Verifies AST security, bytecode compilation, and headless smoke stepping for current track."""
+        """Verifies AST security, bytecode compilation, and headless smoke stepping for current track
+        (including both main.tscn and any standalone tests/*.tscn scenes targeted by the track)."""
         if (staging_dir / "project.godot").is_file():
+            import re as _re
             from engine.sim.godot_verifier import (
                 verify_godot_cartridge_syntax,
                 parse_godot_stderr,
@@ -2414,54 +2458,100 @@ class StudioOrchestrator:
             if not valid:
                 raise RuntimeError(f"Godot syntax verification failed: {errs}")
 
-            sim = GodotHeadlessSimulator(cartridge_path=staging_dir, max_frames=10)
-            res = sim.run()
-            if not res.success and swe_agent is not None and hasattr(swe_agent, "repair_godot_module"):
-                for _rt_pass in range(2):
-                    rt_diags = parse_godot_stderr(staging_dir, res.stderr or res.error_message or "")
-                    if not rt_diags and (staging_dir / "main.gd").is_file():
-                        broken_main = (staging_dir / "main.gd").read_text(encoding="utf-8")
-                        peer_ctx = (
-                            swe_agent._extract_gd_peer_signatures(staging_dir, exclude_file="main.gd")
-                            if hasattr(swe_agent, "_extract_gd_peer_signatures")
-                            else ""
-                        )
-                        fixed_main = swe_agent.repair_godot_module(
-                            "main.gd",
-                            broken_main,
-                            res.error_message or res.stderr or "Headless runtime failure",
-                            peer_context=peer_ctx,
-                        )
-                        (staging_dir / "main.gd").write_text(fixed_main, encoding="utf-8")
-                    else:
-                        by_file: Dict[Path, List[str]] = {}
-                        for d in rt_diags:
-                            if d.file_path.is_file():
-                                by_file.setdefault(d.file_path, []).append(
-                                    f"Line {d.line_number}: {d.error_message} (Raw: {d.raw_line})"
-                                )
-                        for fpath, entries in by_file.items():
+            # Discover standalone test scenes (tests/*.tscn) targeted by this track so SWE catches test scene assertions immediately
+            scenes_to_verify: List[Optional[str]] = [None]
+            candidate_test_scenes: List[str] = []
+            for mod in getattr(track, "target_modules", None) or []:
+                norm_mod = str(mod).strip().replace("\\", "/")
+                if norm_mod.startswith("res://"):
+                    norm_mod = norm_mod[len("res://"):]
+                elif norm_mod.startswith("res:/"):
+                    norm_mod = norm_mod[len("res:/"):]
+                norm_mod = norm_mod.lstrip("/")
+                if norm_mod.startswith("tests/") and norm_mod.endswith(".tscn"):
+                    candidate_test_scenes.append(norm_mod)
+                elif norm_mod.startswith("tests/") and norm_mod.endswith(".gd"):
+                    candidate_test_scenes.append(norm_mod[:-3] + ".tscn")
+            desc_text = f"{getattr(track, 'description', '') or ''}\n" + "\n".join(
+                getattr(ac, "description", "") for ac in (getattr(track, "acceptance_criteria", None) or [])
+            )
+            for m_tscn in _re.finditer(r"(?:res://)?(tests/[A-Za-z0-9_./-]+\.tscn)", desc_text):
+                candidate_test_scenes.append(m_tscn.group(1))
+            for rel_tscn in candidate_test_scenes:
+                if (staging_dir / rel_tscn).is_file():
+                    uri = f"res://{rel_tscn}"
+                    if uri not in scenes_to_verify:
+                        scenes_to_verify.append(uri)
+
+            main_scene_audit: Dict[str, Any] = {}
+            for scene_uri in scenes_to_verify:
+                scene_label = scene_uri or "res://main.tscn"
+                sim = GodotHeadlessSimulator(cartridge_path=staging_dir, max_frames=10, target_scene=scene_uri)
+                res = sim.run()
+                rt_diags = list(
+                    getattr(sim, "runtime_diagnostics", None)
+                    or parse_godot_stderr(staging_dir, res.stderr or res.error_message or "")
+                )
+                if (not res.success or rt_diags) and swe_agent is not None and hasattr(swe_agent, "repair_godot_module"):
+                    for _rt_pass in range(2):
+                        if not rt_diags and (staging_dir / "main.gd").is_file() and scene_uri is None:
+                            broken_main = (staging_dir / "main.gd").read_text(encoding="utf-8")
                             peer_ctx = (
-                                swe_agent._extract_gd_peer_signatures(staging_dir, exclude_file=fpath.name)
+                                swe_agent._extract_gd_peer_signatures(staging_dir, exclude_file="main.gd")
                                 if hasattr(swe_agent, "_extract_gd_peer_signatures")
                                 else ""
                             )
-                            fixed_code = swe_agent.repair_godot_module(
-                                fpath.name,
-                                fpath.read_text(encoding="utf-8"),
-                                "\n".join(entries),
+                            fixed_main = swe_agent.repair_godot_module(
+                                "main.gd",
+                                broken_main,
+                                res.error_message or res.stderr or "Headless runtime failure",
                                 peer_context=peer_ctx,
                             )
-                            fpath.write_text(fixed_code, encoding="utf-8")
-                    if hasattr(swe_agent, "_verify_and_heal_godot_syntax_and_probes"):
-                        swe_agent._verify_and_heal_godot_syntax_and_probes(staging_dir)
-                    sim = GodotHeadlessSimulator(cartridge_path=staging_dir, max_frames=10)
-                    res = sim.run()
-                    if res.success:
-                        break
-            if not res.success:
-                raise RuntimeError(f"Godot headless smoke check failed: {res.error_message or res.stderr}")
-            self._check_godot_gameplay_and_asset_gates(staging_dir, track, getattr(sim, "scene_audit", None) or {})
+                            (staging_dir / "main.gd").write_text(fixed_main, encoding="utf-8")
+                        else:
+                            by_file: Dict[Path, List[str]] = {}
+                            for d in rt_diags:
+                                if d.file_path.is_file():
+                                    by_file.setdefault(d.file_path, []).append(
+                                        f"Line {d.line_number}: {d.error_message} (Raw: {d.raw_line})"
+                                    )
+                            for fpath, entries in by_file.items():
+                                try:
+                                    rel_name = fpath.resolve().relative_to(staging_dir.resolve()).as_posix()
+                                except ValueError:
+                                    rel_name = fpath.name
+                                peer_ctx = (
+                                    swe_agent._extract_gd_peer_signatures(staging_dir, exclude_file=fpath.name)
+                                    if hasattr(swe_agent, "_extract_gd_peer_signatures")
+                                    else ""
+                                )
+                                fixed_code = swe_agent.repair_godot_module(
+                                    rel_name,
+                                    fpath.read_text(encoding="utf-8"),
+                                    "\n".join(entries),
+                                    peer_context=peer_ctx,
+                                )
+                                fpath.write_text(fixed_code, encoding="utf-8")
+                        if hasattr(swe_agent, "_verify_and_heal_godot_syntax_and_probes"):
+                            swe_agent._verify_and_heal_godot_syntax_and_probes(staging_dir)
+                        sim = GodotHeadlessSimulator(cartridge_path=staging_dir, max_frames=10, target_scene=scene_uri)
+                        res = sim.run()
+                        rt_diags = list(
+                            getattr(sim, "runtime_diagnostics", None)
+                            or parse_godot_stderr(staging_dir, res.stderr or res.error_message or "")
+                        )
+                        if res.success and not rt_diags:
+                            break
+                if not res.success or rt_diags:
+                    diag_str = "; ".join(
+                        f"{d.file_path.name}:{d.line_number} - {d.error_message}" for d in rt_diags[:6]
+                    )
+                    err_detail = diag_str or res.error_message or res.stderr
+                    raise RuntimeError(f"Godot headless smoke check failed in {scene_label}: {err_detail}")
+                if scene_uri is None:
+                    main_scene_audit = getattr(sim, "scene_audit", None) or {}
+
+            self._check_godot_gameplay_and_asset_gates(staging_dir, track, main_scene_audit)
             return
 
         from engine.loader import validate_cartridge_ast
@@ -2528,6 +2618,12 @@ class StudioOrchestrator:
         staging_dir = Path(staging_dir).resolve()
         staging_dir.mkdir(parents=True, exist_ok=True)
         candidate_id = staging_dir.name
+        from engine.studio.models import set_active_gemini_dataset_context
+        set_active_gemini_dataset_context(
+            dataset_name=getattr(self.config, "dataset_name", "") or candidate_id,
+            candidate_dir=staging_dir,
+            store_logs=getattr(self.config, "store_logs", True),
+        )
         build_id = f"build_{candidate_id}"
         self.active_build_id = build_id
         if self.event_bus and hasattr(self.event_bus, "set_active_build_id"):

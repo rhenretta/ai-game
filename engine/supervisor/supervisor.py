@@ -684,7 +684,11 @@ class BuildSupervisor:
                     key = StudioOrchestrator._resolve_api_key(None, None)
                     if key:
                         from google import genai
-                        client = genai.Client(api_key=key, http_options={"timeout": 120000})
+                        from engine.studio.models import install_studio_gemini_guardrails
+                        client = install_studio_gemini_guardrails(
+                            genai.Client(api_key=key, http_options={"timeout": 120000}),
+                            candidate_dir=candidate_dir,
+                        )
                         self.gemini_client = client
                 except Exception:
                     pass

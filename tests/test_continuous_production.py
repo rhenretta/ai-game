@@ -2109,8 +2109,22 @@ def test_ai_cost_optimizations_without_quality_loss(tmp_path):
     )
     (tmp_path / "project.godot").write_text("[input]\ndive={}\n")
 
-    # 1. Direct single-specialist execution for standalone visual_asset in live mode
+    # 1. Task Lead Strategist runs for visual_asset in live mode and reuses context_pack_task_lead.json across turns
     llm_schemas_called = []
+    lead_live_turns = iter([
+        _lead_json(
+            "delegate",
+            strategy="Delegate crate_prop to visual_artist",
+            specialist_agent="visual_artist",
+            brief="Fabricate crate_prop sprite",
+            target_paths=["assets/sprites/crate_prop.png"],
+        ),
+        _lead_json(
+            "submit_to_council",
+            strategy="Submit verified crate_prop plate",
+            submission_summary="Fabricated and verified crate_prop.",
+        ),
+    ])
 
     class _LiveOptClient:
         __module__ = "google.genai.client"
@@ -2135,6 +2149,8 @@ def test_ai_cost_optimizations_without_quality_loss(tmp_path):
                         selected_image_paths=[],
                     ).model_dump_json()
                 )
+            if sname == "TaskLeadDecision":
+                return SimpleNamespace(text=next(lead_live_turns))
             if sname == "AssetRequirement":
                 return SimpleNamespace(text=bw.req_json("crate_prop"))
             if sname == "FilmstripPlan":
@@ -2158,7 +2174,7 @@ def test_ai_cost_optimizations_without_quality_loss(tmp_path):
     )
     vis_item = bw.item("crate_prop", kind="visual_asset")
     res = run_task_lead(ctx, vis_item)
-    assert "TaskLeadDecision" not in llm_schemas_called
+    assert llm_schemas_called.count("TaskLeadDecision") == 2
     assert "AssetRequirement" in llm_schemas_called
     trace_file = tmp_path / "artifacts" / "work_items" / "crate_prop" / "lead_trace_rev0.json"
     assert trace_file.is_file()
@@ -2257,6 +2273,1042 @@ def test_ai_cost_optimizations_without_quality_loss(tmp_path):
     assert "- APPROVED ITEMS (6):" in snap
     assert "[item_0] (visual_asset)" in snap
     assert "- [item_8] mechanic_code 'Task Number 8' state=ready" in snap
+
+
+def test_harness_shift_left_reactive_qa_and_asset_revision_escalation(tmp_path):
+    """Verifies the shift-left harness improvements:
+    1. Standalone asset tasks (`visual_asset`, `animation`, `audio_asset`) use the fast single-specialist path on Rev 0,
+       but once rejected by the Council (`len(item.revisions) > 0`), `available_specialists` unlocks `swe_engineer` /
+       `qa_test_engineer` and `run_task_lead` runs the full `TaskLeadDecision` strategist loop so the Task Lead can
+       re-strategize, split multi-asset packs, or composite in-engine proofs instead of repeating a failed 1-shot pipe.
+    2. `validate_filmstrip_plan` rejects `setup_calls` starting with `simulate_*` (which bypass real player input/physics)
+       while `_summarize_cartridge_for_qa` hides `simulate_*` shortcuts, and `_serialize_input_segments` preserves reactive
+       state triggers (`when_snapshot_key`, `when_operator`, `when_value`, `hold_ticks`).
+    3. `_evaluate_qa_state_assertions` enforces `QAStateAssertion`s against live `tick_snapshots`.
+    4. `_remove_magenta_background` despills light/white translucent boundary pixels blended with `#FF00FF`.
+    5. `LeadGameplaySWEAgent` indexes, slices, and surgically patches `tests/test_authored_beats.gd` alongside root `.gd` files.
+    6. `OnboardingPlan` exposes open-ended strategic fields (`purpose_and_stakes_framing` and `causal_chain_and_feedback_strategy`).
+    """
+    from types import SimpleNamespace
+    from engine.studio.context_curator import ContextCuratorDecision
+    from engine.studio.models import (
+        CodeSliceRequest,
+        FilmstripPlan,
+        InputSegment,
+        OnboardingPlan,
+        QASetupCall,
+        QAStateAssertion,
+        RevisionRecord,
+        StudioAgentError,
+        SurgicalCodePatch,
+        TaskLeadDecision,
+    )
+    from engine.studio.proofs import _evaluate_qa_state_assertions
+    from engine.studio.swe import LeadGameplaySWEAgent
+    from engine.studio.visual import VisualArtSpriteDesignerAgent
+    from engine.studio.workers import (
+        _serialize_input_segments,
+        _summarize_cartridge_for_qa,
+        available_specialists,
+        run_task_lead,
+        validate_filmstrip_plan,
+    )
+
+    # 1. Asset task on Revision 1 unlocks full specialists and TaskLeadDecision loop
+    (tmp_path / "project.godot").write_text("[input]\nact={}\n", encoding="utf-8")
+    (tmp_path / "main.gd").write_text(
+        "extends Node2D\nvar pressure: float = 0.0\nfunc real_action() -> void:\n\tpass\nfunc simulate_full_solve() -> void:\n\tpass\n",
+        encoding="utf-8",
+    )
+    swe = FakeSwe()
+    vis_rev0 = bw.item("multi_prop_pack", kind="visual_asset")
+    vis_rev1 = vis_rev0.model_copy(
+        update={
+            "revisions": [
+                RevisionRecord(
+                    revision_index=0,
+                    proof_paths=[],
+                    worker_notes="Generated single sprite",
+                    verdict="request_changes",
+                    feedback="Proof only shows 1 prop; composite all props in-engine or split task.",
+                )
+            ]
+        }
+    )
+    ctx_check = WorkerContext(
+        cartridge_dir=tmp_path,
+        client=bw.make_client(lambda _: ""),
+        swe_agent=swe,
+        library_factory=bw.FakeLibrary,
+    )
+    assert available_specialists(ctx_check, vis_rev0) == ["visual_artist"]
+    rev1_specs = available_specialists(ctx_check, vis_rev1)
+    assert "visual_artist" in rev1_specs
+    assert "swe_engineer" in rev1_specs
+    assert "qa_test_engineer" in rev1_specs
+
+    lead_called = {"n": 0}
+    lead_turns = iter([
+        TaskLeadDecision(
+            deliberation="Council rejected single-sprite proof; delegate to visual_artist with updated multi-panel brief.",
+            current_strategy="Fabricate composite prop sheet addressing Council feedback.",
+            specialist_agent="visual_artist",
+            brief="Fabricate full prop sheet.",
+            action="delegate",
+        ).model_dump_json(),
+        TaskLeadDecision(
+            deliberation="Composite proof ready; submit to Council.",
+            current_strategy="Submit updated proof.",
+            submission_summary="Updated prop pack per Council feedback.",
+            action="submit_to_council",
+        ).model_dump_json(),
+    ])
+
+    class _Rev1LiveClient:
+        __module__ = "google.genai.client"
+
+        def __init__(self):
+            self.models = self
+
+        def embed_content(self, *, model, contents, config=None):
+            return SimpleNamespace(embeddings=[SimpleNamespace(values=[0.2] * 256) for _ in contents])
+
+        def generate_content(self, *, model, contents, config=None):
+            schema = getattr(config, "response_schema", None)
+            sname = getattr(schema, "__name__", "")
+            if sname == "ContextCuratorDecision":
+                return SimpleNamespace(
+                    text=ContextCuratorDecision(
+                        deliberation="d",
+                        search_queries_used=["q"],
+                        role_tailored_synthesis="synth",
+                        selected_chunk_ids=[],
+                        selected_image_paths=[],
+                    ).model_dump_json()
+                )
+            if sname == "TaskLeadDecision":
+                lead_called["n"] += 1
+                return SimpleNamespace(text=next(lead_turns))
+            if sname == "AssetRequirement":
+                return SimpleNamespace(text=bw.req_json("multi_prop_pack"))
+            raise AssertionError(f"Unexpected schema {sname}")
+
+    ctx_live = WorkerContext(
+        cartridge_dir=tmp_path,
+        client=_Rev1LiveClient(),
+        swe_agent=swe,
+        library_factory=bw.FakeLibrary,
+    )
+    res_rev1 = run_task_lead(ctx_live, vis_rev1)
+    assert lead_called["n"] == 2
+    assert res_rev1.proof_images
+
+    # 2. QA summary filters simulate_* and validate_filmstrip_plan rejects simulate_* setup_calls
+    qa_summary = _summarize_cartridge_for_qa(tmp_path)
+    assert "real_action()" in qa_summary
+    assert "simulate_full_solve" not in qa_summary
+
+    bad_sim_plan = FilmstripPlan(
+        deliberation="d",
+        capture_ticks=[5, 20],
+        input_segments=[InputSegment(deliberation="d", from_tick=1, to_tick=10, actions=["act"])],
+        setup_calls=[QASetupCall(deliberation="d", at_tick=1, method_name="simulate_full_solve", args_json="[]")],
+        frame_expectations=["f1", "f2"],
+    )
+    issues = validate_filmstrip_plan(bad_sim_plan, ["act"])
+    assert any("simulate_full_solve" in i and "simulate_*" in i for i in issues)
+
+    reactive_plan = FilmstripPlan(
+        deliberation="d",
+        capture_ticks=[5, 40],
+        input_segments=[
+            InputSegment(
+                deliberation="d",
+                from_tick=1,
+                to_tick=60,
+                actions=["act"],
+                when_snapshot_key="socket_dist",
+                when_operator="<=",
+                when_value="18.0",
+                hold_ticks=12,
+            )
+        ],
+        state_assertions=[
+            QAStateAssertion(deliberation="d", at_tick=40, snapshot_key="pressure", expected_value_or_change="> 10")
+        ],
+        frame_expectations=["f1", "f2"],
+    )
+    assert validate_filmstrip_plan(reactive_plan, ["act"]) == []
+    serialized_segs = _serialize_input_segments(reactive_plan)
+    assert serialized_segs[0]["when_snapshot_key"] == "socket_dist"
+    assert serialized_segs[0]["when_operator"] == "<="
+    assert serialized_segs[0]["when_value"] == "18.0"
+    assert serialized_segs[0]["hold_ticks"] == 12
+
+    # 3. _evaluate_qa_state_assertions verifies state_assertions against live tick snapshots
+    snaps_pass = [
+        {"tick": 1, "pressure": 0.0, "locked": True},
+        {"tick": 40, "pressure": 25.0, "locked": False},
+    ]
+    _evaluate_qa_state_assertions(
+        snaps_pass,
+        [
+            QAStateAssertion(deliberation="d", at_tick=40, snapshot_key="pressure", expected_value_or_change=">= 20.0"),
+            QAStateAssertion(deliberation="d", at_tick=40, snapshot_key="locked", expected_value_or_change="false"),
+        ],
+    )
+    snaps_fail = [
+        {"tick": 1, "pressure": 0.0, "locked": True},
+        {"tick": 40, "pressure": 5.0, "locked": True},
+    ]
+    with pytest.raises(StudioAgentError, match="pressure"):
+        _evaluate_qa_state_assertions(
+            snaps_fail,
+            [QAStateAssertion(deliberation="d", at_tick=40, snapshot_key="pressure", expected_value_or_change=">= 20.0")],
+        )
+
+    # 4. Chroma-key despill cleans white/light translucent boundary pixels blended with #FF00FF
+    img = Image.new("RGBA", (64, 64), (255, 0, 255, 255))
+    # Interior opaque sprite block (warm white/steam)
+    for y in range(16, 48):
+        for x in range(16, 48):
+            img.putpixel((x, y), (235, 235, 235, 255))
+    # Translucent white puff pixels blended with #FF00FF at the boundary (R=250, G=130, B=250 -> g >= 110, magenta_excess = 120 > 45)
+    for x in range(16, 48):
+        img.putpixel((x, 15), (250, 130, 250, 255))
+    cleaned = VisualArtSpriteDesignerAgent.extract_clean_alpha_sprite(img, target_size=(64, 64))
+    for y in range(cleaned.height):
+        for x in range(cleaned.width):
+            r_px, g_px, b_px, a_px = cleaned.getpixel((x, y))
+            if a_px > 0:
+                assert min(r_px, b_px) - g_px <= 45, f"Residual pink/magenta fringe at {(x, y)}: {(r_px, g_px, b_px, a_px)}"
+
+    # 5. SWE symbol index, slice extractor, and surgical patcher support tests/test_authored_beats.gd
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir(exist_ok=True)
+    beat_file = tests_dir / "test_authored_beats.gd"
+    beat_file.write_text(
+        "extends RefCounted\nfunc run(root: Node) -> Dictionary:\n\tvar ok: bool = false\n\treturn {'passed': ok}\n",
+        encoding="utf-8",
+    )
+    swe_agent = LeadGameplaySWEAgent(client=None)
+    sym_idx = swe_agent._build_cartridge_symbol_index(tmp_path)
+    assert "tests/test_authored_beats.gd" in sym_idx
+    slice_txt = swe_agent._extract_code_slice(
+        tmp_path,
+        CodeSliceRequest(
+            deliberation="Inspect beat runner",
+            filename="tests/test_authored_beats.gd",
+            symbol_query="func run",
+        ),
+    )
+    assert "tests/test_authored_beats.gd" in slice_txt
+    assert "var ok: bool = false" in slice_txt
+    patched = swe_agent._apply_surgical_patches(
+        tmp_path,
+        [
+            SurgicalCodePatch(
+                deliberation="Fix beat check",
+                filename="tests/test_authored_beats.gd",
+                start_line=3,
+                end_line=3,
+                replacement_code="\tvar ok: bool = true",
+            )
+        ],
+    )
+    assert "tests/test_authored_beats.gd" in patched
+    assert "var ok: bool = true" in beat_file.read_text(encoding="utf-8")
+
+    # 6. OnboardingPlan supports open-ended empathetic strategy fields and WritersRoomTurnProposal.for_role bounds schema complexity
+    from engine.studio.models import WritersRoomTurnProposal
+    from engine.studio.writers_room import SPECIALIST_ROSTER
+
+    onb = OnboardingPlan(
+        deliberation="Strategizing how a cold player understands purpose and causality.",
+        world_introduction="A storm-tossed signal relay station.",
+        player_role_and_stakes="Keep the beacon aligned before the fleet hits the shoals.",
+        purpose_and_stakes_framing="Visual fleet silhouettes on the horizon drift toward the reef when the beam wanders.",
+        causal_chain_and_feedback_strategy="Turning the crank visibly rotates the mirror gear and sweeps the beam; locked gears spark amber with a clank.",
+    )
+    assert "fleet silhouettes" in onb.purpose_and_stakes_framing
+    assert "locked gears spark" in onb.causal_chain_and_feedback_strategy
+
+    for sp in SPECIALIST_ROSTER:
+        scoped_cls = WritersRoomTurnProposal.for_role(sp["role"])
+        assert scoped_cls.__name__ == "WritersRoomTurnProposal"
+        js = scoped_cls.model_json_schema()
+        defs = js.get("$defs", {})
+        total_props = len(js.get("properties", {})) + sum(len(v.get("properties", {})) for v in defs.values())
+        assert len(defs) <= 12, f"Role {sp['role']} has too many $defs ({len(defs)}) for Gemini structured output"
+        assert total_props <= 95, f"Role {sp['role']} has too many properties ({total_props}) for Gemini structured output"
+
+
+def test_gateway_pause_and_runaway_loop_circuit_breakers(tmp_path: Path, monkeypatch):
+    """Verifies the 4 hard safeguards against runaway/unpaused LLM calls:
+    1. Gateway-level pause enforcement blocks both `call_gemini_with_transient_retry` and direct
+       `client.models.generate_content` calls when `.studio_paused.json` is active.
+    2. `TokenUsageTracker.check_circuit_breaker` trips when consecutive SWE/PEV calls exceed the ceiling,
+       automatically writing `.studio_paused.json` and raising `StudioPausedError`.
+    3. `StudioOrchestrator._execute_iterative_swe_loop` never invokes legacy post-board loops
+       (`formulate_level_layout`, `formulate_production_strategy`, `execute_scene_strategy_and_refine_loop`)
+       when tracks were already completed by the Continuous Production Board (`backlog.json`).
+    """
+    import asyncio
+    from types import SimpleNamespace
+    import pytest
+    from engine.studio.models import (
+        GameRequirementsSpec,
+        RequirementTrack,
+        StudioPausedError,
+        TOKEN_USAGE_TRACKER,
+        call_gemini_with_transient_retry,
+        install_studio_gemini_guardrails,
+        is_studio_paused,
+    )
+    from engine.studio.orchestrator import StudioOrchestrator
+
+    cand_dir = tmp_path / "cartridges" / "candidate_genesis_test"
+    cand_dir.mkdir(parents=True, exist_ok=True)
+    pause_file = cand_dir.parent / ".studio_paused.json"
+    pause_file.write_text('{"paused": true}', encoding="utf-8")
+    monkeypatch.setenv("STUDIO_FAIL_FAST_ON_PAUSE", "1")
+
+    assert is_studio_paused(cand_dir) is True
+
+    # 1a. call_gemini_with_transient_retry is blocked before invoking call_fn
+    called = []
+    with pytest.raises(StudioPausedError):
+        call_gemini_with_transient_retry(
+            lambda: called.append(1),
+            label="LeadGameplaySWEAgent.pev_phase1",
+            candidate_dir=cand_dir,
+        )
+    assert called == []
+
+    # 1b. Direct client.models.generate_content on a guarded live client is also blocked
+    class _LiveClientStub:
+        __module__ = "google.genai.client"
+
+        def __init__(self):
+            self.models = self
+
+        def generate_content(self, *args, **kwargs):
+            called.append(2)
+            return SimpleNamespace(text="ok")
+
+    guarded_client = install_studio_gemini_guardrails(_LiveClientStub(), candidate_dir=cand_dir)
+    with pytest.raises(StudioPausedError):
+        guarded_client.models.generate_content(model="gemini-3.8-flash", contents="hi")
+    assert called == []
+
+    # 2. Unpause and verify Runaway Loop Circuit Breaker trips after STUDIO_MAX_CONSECUTIVE_SWE_CALLS
+    pause_file.unlink()
+    assert is_studio_paused(cand_dir) is False
+    monkeypatch.setenv("STUDIO_MAX_CONSECUTIVE_SWE_CALLS", "3")
+    TOKEN_USAGE_TRACKER.reset()
+
+    for _ in range(3):
+        call_gemini_with_transient_retry(
+            lambda: SimpleNamespace(text="ok"),
+            label="LeadGameplaySWEAgent.pev_phase1",
+            candidate_dir=cand_dir,
+        )
+    # 4th consecutive SWE PEV call trips circuit breaker and auto-writes .studio_paused.json
+    with pytest.raises(StudioPausedError):
+        call_gemini_with_transient_retry(
+            lambda: SimpleNamespace(text="ok"),
+            label="LeadGameplaySWEAgent.pev_phase2",
+            candidate_dir=cand_dir,
+        )
+    assert pause_file.is_file()
+    assert is_studio_paused(cand_dir) is True
+    pause_file.unlink()
+    TOKEN_USAGE_TRACKER.reset()
+
+    # 3. Verify StudioOrchestrator._execute_iterative_swe_loop skips legacy post-board loop when backlog.json exists
+    (cand_dir / "project.godot").write_text("[application]\nconfig/name=\"Test\"\n", encoding="utf-8")
+    (cand_dir / "game_bible.json").write_text("{\"game_title\": \"Test\"}\n", encoding="utf-8")
+    (cand_dir / "backlog.json").write_text("{\"items\": []}\n", encoding="utf-8")
+
+    orch = StudioOrchestrator(api_key="test_key", client=SimpleNamespace())
+    orch._is_live_genai_client = lambda: True
+
+    legacy_calls = []
+    swe_stub = SimpleNamespace(
+        _rendering_strategy_block=lambda d: legacy_calls.append("rendering_strategy"),
+        formulate_level_layout=lambda d: legacy_calls.append("level_layout"),
+        formulate_production_strategy=lambda d: legacy_calls.append("production_strategy"),
+        execute_scene_strategy_and_refine_loop=lambda d, **kw: legacy_calls.append("scene_loop"),
+    )
+    req_spec = GameRequirementsSpec(
+        deliberation="Board verified spec.",
+        spec_id="req_test",
+        game_title="Test",
+        genre_paradigm="simulation",
+        high_concept_summary="Test summary",
+        requirements=[
+            RequirementTrack(
+                deliberation="Completed on board.",
+                id="mechanic_1",
+                title="Track 1",
+                description="Desc",
+                responsible_agents=["LeadGameplaySWEAgent"],
+                target_modules=["main.gd"],
+                status="completed",
+                acceptance_criteria=[],
+            )
+        ],
+    )
+    asyncio.run(
+        orch._execute_iterative_swe_loop(
+            agent=swe_stub,
+            world_spec=None,
+            narrative_bible=None,
+            req_spec=req_spec,
+            staging_dir=cand_dir,
+            context=None,
+        )
+    )
+    assert legacy_calls == []
+
+
+def test_qa_plate_labels_pose_frame_and_causal_filmstrip_invariants(tmp_path: Path):
+    """Verifies:
+    1. `CreativeWritersRoom._proof_parts` and `_build_task_lead_multimodal_parts` explicitly label
+       `plate_*.png` and `anim_sheet_*.png` with `[QA ALPHA INSPECTION PLATE: ...]` and
+       `[QA ANIMATION CONTACT SHEET: ...]` so reviewers never confuse external QA checkerboards,
+       cyan borders, or yellow baseline lines with in-asset defects.
+    2. `VisualArtSpriteDesignerAgent.fabricate_pose_frame_from_base` does not inject unwanted
+       rotational twist when `rotation_deg == 0` on custom keyframe tracks and keeps pixels bounded.
+    3. `validate_filmstrip_plan` rejects setup-call shortcuts (`set_onboarding_step`, `force_*`,
+       `complete_*`) and requires at least one `input_segments` entry for `mechanic_code` / `integration`.
+    """
+    from PIL import Image
+    from engine.studio.models import (
+        FilmstripPlan,
+        InputSegment,
+        KeyframeTransformSpec,
+        PartKeyframeTrackSpec,
+        QASetupCall,
+        RevisionRecord,
+        WorkItem,
+    )
+    from engine.studio.visual import VisualArtSpriteDesignerAgent
+    from engine.studio.workers import WorkerContext, _build_task_lead_multimodal_parts, validate_filmstrip_plan
+    from engine.studio.writers_room import CreativeWritersRoom
+
+    # 1. Verify QA plate and animation contact sheet captions
+    plate_file = tmp_path / "plate_test_asset_rev0.png"
+    anim_file = tmp_path / "anim_sheet_test_asset_rev0.png"
+    Image.new("RGBA", (32, 32), (0, 0, 0, 0)).save(plate_file)
+    Image.new("RGBA", (32, 32), (0, 0, 0, 0)).save(anim_file)
+
+    item = WorkItem(
+        deliberation="Test item",
+        item_id="visual_test_item",
+        kind="visual_asset",
+        title="Visual Test",
+        spec="Spec",
+        proof_spec="Proof",
+        revisions=[
+            RevisionRecord(
+                revision_index=0,
+                worker_notes="Done",
+                proof_paths=[str(plate_file), str(anim_file)],
+            )
+        ],
+    )
+    wr = CreativeWritersRoom(client=None)
+    wr_parts = wr._proof_parts(item, candidate_dir=tmp_path)
+    wr_labels = [p for p in wr_parts if isinstance(p, str)]
+    assert any("QA ALPHA INSPECTION PLATE" in lbl for lbl in wr_labels)
+    assert any("QA ANIMATION CONTACT SHEET" in lbl and "yellow/gold baseline" in lbl for lbl in wr_labels)
+
+    ctx = WorkerContext(cartridge_dir=tmp_path, client=None)
+    tl_parts = _build_task_lead_multimodal_parts(ctx, [str(plate_file), str(anim_file)])
+    tl_labels = [p for p in tl_parts if isinstance(p, str)]
+    assert any("QA ALPHA INSPECTION PLATE" in lbl or "QA ANIMATION CONTACT SHEET" in lbl for lbl in tl_labels)
+
+    # 2. Verify fabricate_pose_frame_from_base with custom track & rotation_degrees == 0
+    vis_agent = VisualArtSpriteDesignerAgent(client=None)
+    base_img = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
+    for y in range(24, 104):
+        for x in range(24, 104):
+            base_img.putpixel((x, y), (220, 140, 40, 255))
+    custom_track = PartKeyframeTrackSpec(
+        deliberation="Radial expansion without rotation.",
+        part_id="core",
+        keyframes=[
+            KeyframeTransformSpec(
+                deliberation="f0",
+                time_normalized=0.0,
+                position_offset_px=(0.0, 0.0),
+                rotation_degrees=0.0,
+                scale_xy=(1.0, 1.0),
+            ),
+            KeyframeTransformSpec(
+                deliberation="f1",
+                time_normalized=1.0,
+                position_offset_px=(0.0, 0.0),
+                rotation_degrees=0.0,
+                scale_xy=(1.15, 1.15),
+            ),
+        ],
+    )
+    frame_out = vis_agent.fabricate_pose_frame_from_base(
+        base_sprite=base_img,
+        state_name="pulse",
+        frame_idx=1,
+        frame_count=4,
+        cell_size=(64, 64),
+        motion_profile="custom",
+        keyframe_tracks=[custom_track],
+    )
+    assert frame_out.size == (64, 64)
+
+    # 3. Verify validate_filmstrip_plan blocks onboarding/completion setup_calls and empty mechanic inputs
+    bad_plan = FilmstripPlan(
+        deliberation="Shortcut plan",
+        capture_ticks=[20, 60],
+        setup_calls=[
+            QASetupCall(
+                deliberation="Force onboarding step",
+                at_tick=10,
+                target_node_or_property="main",
+                method_name="set_onboarding_step",
+                args_json="[2]",
+            )
+        ],
+        input_segments=[],
+        frame_expectations=["f1", "f2"],
+    )
+    issues = validate_filmstrip_plan(bad_plan, ["KEY_1", "KEY_SPACE"], item_kind="mechanic_code")
+    assert any("set_onboarding_step" in iss for iss in issues)
+    assert any("must include at least one `input_segments`" in iss for iss in issues)
+
+    good_plan = FilmstripPlan(
+        deliberation="Authentic causal plan",
+        capture_ticks=[15, 60],
+        setup_calls=[],
+        input_segments=[
+            InputSegment(
+                deliberation="Click node A then node B",
+                from_tick=25,
+                to_tick=35,
+                actions=[],
+                mouse_click_pos=[320.0, 400.0],
+            )
+        ],
+        frame_expectations=["Unsolved baseline at t=15", "Connected state at t=60"],
+    )
+    assert validate_filmstrip_plan(good_plan, ["KEY_1", "KEY_SPACE"], item_kind="mechanic_code") == []
+
+
+def test_target_player_dna_persistence_and_agency_depth(tmp_path: Path):
+    """Verifies that SteamPlayerDNA is formatted with playtime hours, genre weights, and mastery distribution,
+    persisted into GameBibleSpec, and indexed by ContextCuratorAgent."""
+    from engine.studio.context_curator import CartridgeSemanticIndex
+    from engine.studio.models import CoreLoopSpec, GameBibleSpec
+    from engine.studio.writers_room import CreativeWritersRoom
+
+    wr = CreativeWritersRoom(client=object())
+    sample_dna = {
+        "total_games": 250,
+        "total_playtime_hours": 5891.27,
+        "pacing_preference": "tactical_methodical",
+        "pacing_score": -0.411,
+        "challenge_tolerance": 0.4167,
+        "playtime_distribution": {"mastered_over_100h": 0.6992, "core_20_to_100h": 0.2319},
+        "genre_weights": {"Systems Engineering": 0.68, "Tactical Strategy": 0.32},
+        "games": [
+            {"name": "Game Alpha", "playtime_hours": 724.4, "genres": ["Simulation"]},
+            {"name": "Game Beta", "playtime_hours": 542.6, "genres": ["Strategy"]},
+            {"name": "Game Gamma", "playtime_hours": 424.2, "genres": ["Simulation"]},
+        ],
+    }
+    dna_text = wr._format_dna_summary(sample_dna)
+    assert "Game Alpha (724.4h" in dna_text
+    assert "5891.3 total hours" in dna_text
+    assert "tactical_methodical" in dna_text
+    assert "TARGET PLAYER OPTIMIZATION MANDATE" in dna_text
+
+    bible = GameBibleSpec(
+        deliberation="Test bible",
+        game_title="Test Sim",
+        elevator_pitch="A systemic builder.",
+        core_fantasy="Build and optimize networks.",
+        target_player_dna_summary=dna_text,
+        core_loop=CoreLoopSpec(
+            deliberation="Loop",
+            moment_to_moment_loop="Place and route components",
+            minute_to_minute_loop="Expand throughput and clear bottlenecks",
+            session_loop="Scale multi-stage networks",
+            player_verbs=["place", "route", "tune"],
+            feedback_channels=["Throughput gauge", "Chime pitch"],
+            player_agency_and_optimization_depth="Open-ended network construction with continuous throughput optimization.",
+        ),
+    )
+    (tmp_path / "game_bible.json").write_text(bible.model_dump_json(indent=2), encoding="utf-8")
+
+    idx = CartridgeSemanticIndex(tmp_path, client=object())
+    chunks = idx.extract_corpus_chunks(ensure_rendering=False)
+    chunk_ids = {c.chunk_id for c in chunks}
+    assert "design:target_player_dna_summary" in chunk_ids
+    assert "design:core_loop" in chunk_ids
+    core_chunk = next(c for c in chunks if c.chunk_id == "design:core_loop")
+    assert "Open-ended network construction" in core_chunk.content
+
+
+def test_gemini_dataset_labels_and_store_injection(tmp_path):
+    from google.genai import types
+    from engine.studio.models import (
+        build_gemini_request_labels,
+        inject_gemini_dataset_config,
+        sanitize_gemini_label_value,
+        set_active_gemini_dataset_context,
+    )
+
+    cand_dir = tmp_path / "candidate_genesis_dda57b"
+    cand_dir.mkdir(parents=True)
+    set_active_gemini_dataset_context(
+        dataset_name="Run #1: Lithic Harmonic!!",
+        candidate_dir=cand_dir,
+        store_logs=True,
+    )
+
+    assert sanitize_gemini_label_value("Run #1: Lithic Harmonic!!") == "run_1_lithic_harmonic"
+    labels = build_gemini_request_labels(
+        label="ContextCurator.curate_context[mechanic_photoelastic_stress_shader]",
+        candidate_dir=cand_dir,
+    )
+    assert labels["dataset"] == "run_1_lithic_harmonic"
+    assert labels["run_id"] == "run_1_lithic_harmonic"
+    assert labels["cartridge"] == "candidate_genesis_dda57b"
+    assert labels["agent"] == "contextcurator"
+    assert labels["operation"].startswith("contextcurator_curate_context")
+    assert all(len(v) <= 63 for v in labels.values())
+
+    # 1. Inject into GenerateContentConfig (text/code reasoning call) -> sets labels AND store=True
+    base_cfg = types.GenerateContentConfig(temperature=0.3, labels={"custom_tag": "my_val"})
+    kw = inject_gemini_dataset_config(
+        {"model": "gemini-3.8-flash", "contents": "Hello", "config": base_cfg},
+        label="LeadGameplaySWEAgent.pev_phase2_code_synthesis",
+        candidate_dir=cand_dir,
+    )
+    injected_cfg = kw["config"]
+    assert injected_cfg.labels["dataset"] == "run_1_lithic_harmonic"
+    assert injected_cfg.labels["agent"] == "leadgameplaysweagent"
+    assert injected_cfg.labels["custom_tag"] == "my_val"
+    assert injected_cfg.http_options is not None
+    assert injected_cfg.http_options.extra_body == {"store": True}
+
+    # 2. Image / TTS media calls receive labels but do NOT set store=True (unsupported by AI Studio logging)
+    img_cfg = types.GenerateContentConfig(response_modalities=["IMAGE"])
+    img_kw = inject_gemini_dataset_config(
+        {"model": "gemini-3.1-flash-lite-image", "contents": "Sprite", "config": img_cfg},
+        label="VisualArtSpriteDesignerAgent.generate_sprite",
+        candidate_dir=cand_dir,
+    )
+    assert img_kw["config"].labels["dataset"] == "run_1_lithic_harmonic"
+    assert img_kw["config"].http_options is None
+
+
+def test_agent_self_inquiry_question_research_and_answer_loop(tmp_path):
+    from engine.studio.context_curator import (
+        ContextCuratorAgent,
+        ContextCuratorDecision,
+        QuestionContextResearchDecision,
+    )
+    from engine.studio.models import (
+        GameRequirementsSpec,
+        ModuleFileSpec,
+        RequirementTrack,
+        TrackCodeSynthesisPayload,
+    )
+    from engine.studio.swe import LeadGameplaySWEAgent
+
+    # Set up a cartridge with a helper script in scripts/pneumatic_bus.gd that main.gd does NOT yet import
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir(parents=True)
+    (scripts_dir / "pneumatic_bus.gd").write_text(
+        "extends Node\nclass_name PneumaticBus\nsignal pressure_stabilized(node_id: String, kpa: float)\nfunc lock_aperture(ratio: float) -> void:\n\tpass\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "main.gd").write_text("extends Node2D\nfunc _ready() -> void:\n\tpass\n", encoding="utf-8")
+
+    # Fake live genai client that simulates:
+    # 1) Initial ContextCuratorDecision (does NOT include scripts/pneumatic_bus.gd)
+    # 2) SWE Turn 0: SWE asks a self_question about PneumaticBus instead of guessing (files=[])
+    # 3) QuestionContextResearchDecision: ContextCuratorAgent selects code:module:scripts/pneumatic_bus.gd (without answering the question itself)
+    # 4) SWE Turn 1: SWE sees the full source of scripts/pneumatic_bus.gd, answers its own question in self_question_answer, and outputs files=[...]
+    prompts_seen = []
+
+    class _FakeModels:
+        def embed_content(self, model, contents, config=None):
+            class _Emb:
+                def __init__(self, text):
+                    t = str(text).lower()
+                    self.values = [
+                        1.0 if "pneumatic_bus" in t or "pneumaticbus" in t or "lock_aperture" in t else 0.1,
+                        1.0 if "main.gd" in t else 0.1,
+                        0.5,
+                    ]
+            return type("Resp", (), {"embeddings": [_Emb(c) for c in contents]})()
+
+        def generate_content(self, model, contents, config=None):
+            prompt_str = str(contents[0] if isinstance(contents, list) else contents)
+            prompts_seen.append(prompt_str)
+            schema = getattr(config, "response_schema", None)
+            if schema is ContextCuratorDecision:
+                payload = ContextCuratorDecision(
+                    deliberation="Select main.gd initially.",
+                    search_queries_used=["main.gd"],
+                    role_tailored_synthesis="Initial context pack.",
+                    selected_chunk_ids=["code:module:main.gd"],
+                    selected_image_paths=[],
+                ).model_dump_json()
+                return type("Resp", (), {"text": payload})()
+            if schema is QuestionContextResearchDecision:
+                payload = QuestionContextResearchDecision(
+                    deliberation="Select code:module:scripts/pneumatic_bus.gd so SWE can inspect PneumaticBus signals and methods.",
+                    selected_chunk_ids=["code:module:scripts/pneumatic_bus.gd"],
+                ).model_dump_json()
+                return type("Resp", (), {"text": payload})()
+            if schema is TrackCodeSynthesisPayload:
+                if "CONTEXT RESEARCHED FOR YOUR SELF-QUESTION" not in prompt_str:
+                    # Turn 0: SWE realizes it needs PneumaticBus's exact signal & method signature
+                    payload = TrackCodeSynthesisPayload(
+                        deliberation="I need to check the exact signal and method signatures in scripts/pneumatic_bus.gd before implementing.",
+                        self_question="What signal and method signatures does scripts/pneumatic_bus.gd define on PneumaticBus?",
+                        files=[],
+                    ).model_dump_json()
+                    return type("Resp", (), {"text": payload})()
+                else:
+                    # Turn 1: Verify the full source of scripts/pneumatic_bus.gd was brought in by ContextCuratorAgent
+                    assert "signal pressure_stabilized(node_id: String, kpa: float)" in prompt_str
+                    assert "func lock_aperture(ratio: float)" in prompt_str
+                    payload = TrackCodeSynthesisPayload(
+                        deliberation="Now that I have inspected scripts/pneumatic_bus.gd, I can answer my question and implement main.gd.",
+                        self_question_answer="PneumaticBus defines `signal pressure_stabilized(node_id: String, kpa: float)` and `func lock_aperture(ratio: float) -> void`.",
+                        self_question="",
+                        files=[
+                            ModuleFileSpec(
+                                deliberation="Wire PneumaticBus.lock_aperture in main.gd",
+                                filename="main.gd",
+                                content="extends Node2D\nfunc _ready() -> void:\n\tvar bus = PneumaticBus.new()\n\tbus.lock_aperture(0.5)\n",
+                            )
+                        ],
+                    ).model_dump_json()
+                    return type("Resp", (), {"text": payload})()
+            raise AssertionError(f"Unexpected schema: {schema}")
+
+    fake_live_client = type("Client", (), {"models": _FakeModels()})()
+    fake_live_client.__class__.__module__ = "google.genai.client"
+
+    swe = LeadGameplaySWEAgent(client=fake_live_client)
+    swe._verify_and_heal_godot_syntax_and_probes = lambda c_dir: {}
+    track = RequirementTrack(
+        deliberation="Test self-inquiry",
+        id="mechanic_pneumatic_tuner",
+        title="Pneumatic Tuner",
+        description="Connect main.gd to PneumaticBus.",
+        target_modules=["main.gd"],
+    )
+    req_spec = GameRequirementsSpec(
+        deliberation="Spec",
+        game_title="Test",
+        genre_paradigm="simulation",
+        engine_type="godot4",
+        requirements=[track],
+    )
+
+    written = swe.implement_requirement_track(track=track, staging_dir=tmp_path, requirements_spec=req_spec)
+    assert "main.gd" in written
+    assert "bus.lock_aperture(0.5)" in (tmp_path / "main.gd").read_text(encoding="utf-8")
+
+    # Verify the Q->A pair was saved to persistent self-inquiry memory and formats cleanly for subsequent turns
+    curator = ContextCuratorAgent(cartridge_dir=tmp_path, client=fake_live_client)
+    saved_qa = curator.load_self_inquiry_memory("mechanic_pneumatic_tuner", "swe_engineer")
+    assert len(saved_qa) == 1
+    assert "What signal and method signatures does scripts/pneumatic_bus.gd define" in saved_qa[0].question
+    assert "pressure_stabilized" in saved_qa[0].answer
+    assert "code:module:scripts/pneumatic_bus.gd" in saved_qa[0].researched_chunk_ids
+
+    mem_section = curator.format_self_inquiry_prompt_section(saved_qa, pending_pack=None)
+    assert "SELF-INQUIRY MEMORY (QUESTIONS YOU ALREADY ASKED & ANSWERED)" in mem_section
+    assert "lock_aperture" in mem_section
+
+
+def test_board_item_chronology_endpoint_and_turn_code_diffs(tmp_path):
+    import json
+    from starlette.testclient import TestClient
+    from engine.studio.workers import _compute_turn_code_diffs, _snapshot_modules
+    from engine.ui.server import create_app
+
+    cand_dir = tmp_path / "candidate_chron_test"
+    cand_dir.mkdir(parents=True)
+    (cand_dir / "main.gd").write_text("extends Node2D\nfunc _ready() -> void:\n\tpass\n", encoding="utf-8")
+    snap = _snapshot_modules(cand_dir, ["main.gd"])
+    (cand_dir / "main.gd").write_text(
+        "extends Node2D\nfunc _ready() -> void:\n\tvar x = 42\n",
+        encoding="utf-8",
+    )
+    diffs = _compute_turn_code_diffs(cand_dir, snap)
+    assert "main.gd" in diffs
+    assert "+	var x = 42" in diffs["main.gd"]
+
+    item_dir = cand_dir / "artifacts" / "work_items" / "mechanic_tuner"
+    item_dir.mkdir(parents=True)
+    proof_png = item_dir / "filmstrip_mechanic_tuner_rev0.png"
+    proof_png.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    (item_dir / "lead_trace_rev0.json").write_text(
+        json.dumps(
+            {
+                "item_id": "mechanic_tuner",
+                "revision": 0,
+                "status": "submitted",
+                "current_strategy": "Implement and verify tuner in main.gd",
+                "submission_summary": "Verified tuner",
+                "collected_proofs": [str(proof_png)],
+                "turns": [
+                    {
+                        "deliberation": "SWE Turn",
+                        "turn_index": 0,
+                        "specialist_agent": "swe_engineer",
+                        "brief": "Add var x = 42 in main.gd",
+                        "summary": "Implemented main.gd",
+                        "touched_files": ["main.gd"],
+                        "proof_images": [],
+                        "verification_passed": True,
+                        "code_diffs": diffs,
+                    },
+                    {
+                        "deliberation": "QA Turn",
+                        "turn_index": 1,
+                        "specialist_agent": "qa_test_engineer",
+                        "brief": "Capture filmstrip",
+                        "summary": "Captured 5 frames",
+                        "touched_files": [],
+                        "proof_images": [str(proof_png)],
+                        "verification_passed": True,
+                        "code_diffs": {},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (cand_dir / "backlog.json").write_text(
+        json.dumps(
+            {
+                "design_revision": 1,
+                "items": [
+                    {
+                        "item_id": "mechanic_tuner",
+                        "title": "Acoustic Tuner",
+                        "kind": "mechanic_code",
+                        "state": "changes_requested",
+                        "spec": "1) Hover conduit. 2) Drag dial.",
+                        "proof_spec": "Verify dial rotation.",
+                        "target_modules": ["main.gd"],
+                        "depends_on": [],
+                        "revisions": [
+                            {
+                                "revision_index": 0,
+                                "verdict": "request_changes",
+                                "approved": False,
+                                "feedback": "[GameplayDesigner]: 1. Add physical conduit. 2. Fix text clarity. | [VisualArtDirector]: 1. Render brass dial.",
+                                "proof_paths": [str(proof_png)],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    app = create_app(cartridges_root=tmp_path, active_cartridge_dir=cand_dir, db_path=tmp_path / "telemetry.db")
+    with TestClient(app) as client:
+        res = client.get("/api/studio/board-item/mechanic_tuner/chronology?cartridge=candidate_chron_test")
+        assert res.status_code == 200
+        payload = res.json()
+        assert payload["item_id"] == "mechanic_tuner"
+        assert len(payload["attempts"]) == 1
+        att0 = payload["attempts"][0]
+        assert len(att0["turns"]) == 2
+        assert "+	var x = 42" in att0["turns"][0]["code_diffs"]["main.gd"]
+        assert len(att0["council_review"]["reviewer_breakdown"]) == 2
+        assert att0["council_review"]["reviewer_breakdown"][0]["reviewer_role"] == "GameplayDesigner"
+        assert "main.gd" in payload["file_contents"]
+
+
+def test_active_build_process_inspection_and_pause_state(tmp_path: Path):
+    """Server actively inspects process/threads/locks and persists paused state across page refreshes."""
+    from starlette.testclient import TestClient
+    from engine.ui.server import create_app
+
+    cand_dir = tmp_path / "candidate_proc_test"
+    cand_dir.mkdir(parents=True, exist_ok=True)
+    (cand_dir / "game_bible.json").write_text(
+        json.dumps({"game_title": "Process Inspection Test", "status": "building"}),
+        encoding="utf-8",
+    )
+
+    app = create_app(cartridges_root=tmp_path, active_cartridge_dir=cand_dir, db_path=tmp_path / "telemetry.db")
+    with TestClient(app) as client:
+        # Initially stopped and not paused
+        s0 = client.get("/api/studio/settings").json()
+        assert s0["paused"] is False
+        assert "process_status" in s0
+        assert s0["process_status"]["is_process_alive"] is False
+        assert s0["process_status"]["build_actively_running"] is False
+        assert s0["process_status"]["process_state"] == "stopped"
+
+        # Pause build via POST /api/studio/settings
+        s1 = client.post(
+            "/api/studio/settings",
+            json={
+                "deliberation": "Operator paused build",
+                "pause_for_greenlight": True,
+                "paused": True,
+            },
+        ).json()
+        assert s1["paused"] is True
+        assert s1["process_status"]["is_paused"] is True
+        assert s1["process_status"]["process_state"] == "paused"
+        assert s1["process_status"]["build_actively_running"] is False
+
+        # Refreshing /api/events/history and /api/studio/game-bible preserves paused process_status
+        hist = client.get("/api/events/history").json()
+        assert hist["process_status"]["is_paused"] is True
+        assert hist["process_status"]["build_actively_running"] is False
+
+        bible = client.get("/api/studio/game-bible?cartridge=candidate_proc_test").json()
+        assert bible["build_paused"] is True
+        assert bible["build_actively_running"] is False
+        assert bible["process_status"]["is_paused"] is True
+
+
+def test_task_lead_generic_multi_cell_asset_and_proof_strategy(tmp_path: Path):
+    """Verifies that:
+    1. Every task (including Revision 0 `visual_asset` tasks) runs through the Task Lead Strategist loop
+       (`plan_task_lead_turn`), formulating `current_strategy` and `proof_strategy`, delegating to `visual_artist`,
+       inspecting the resulting `plate_*.png` inspection plate, and submitting to the Council.
+    2. When the Task Lead's strategy delegates a multi-cell grid/sheet (`grid_cols=2, grid_rows=2, cell_prompts=[...]`),
+       `CartridgeAssetLibrary.fabricate_single_asset` synthesizes all 4 cells into a `2x2` sheet with zero cross-cell
+       bleed, records `hframes=2, vframes=2` in `AssetLibraryEntry`, renders a `plate_*.png` inspection plate with
+       2x2 grid lines, and preserves all 4 cells during `verify_rendered_asset` and `verify_all_catalog_assets_and_animations`.
+    """
+    import numpy as np
+    from engine.studio.asset_library import CartridgeAssetLibrary
+    from engine.studio.workers import WorkerContext, task_lead_handler
+
+    (tmp_path / "game_bible.json").write_text(json.dumps({"game_title": "MultiCellStrategyGame"}), encoding="utf-8")
+
+    lead_turns = iter([
+        json.dumps(
+            {
+                "deliberation": "Task requires a 4-state indicator sheet; delegating to visual_artist with a 2x2 grid strategy.",
+                "current_strategy": "Delegate 2x2 multi-cell sheet fabrication to visual_artist, then inspect plate.",
+                "proof_strategy": "Render a 2x2 multi-cell alpha inspection plate with cell dividers.",
+                "specialist_agent": "visual_artist",
+                "brief": "Fabricate a 2x2 multi-cell indicator sheet (grid_cols=2, grid_rows=2) with 4 distinct states in cell_prompts.",
+                "target_paths": ["assets/sprites/multi_state_indicator.png"],
+                "action": "delegate",
+            }
+        ),
+        json.dumps(
+            {
+                "deliberation": "Inspected plate_multi_state_indicator.png; all 4 cells are populated and cleanly separated.",
+                "current_strategy": "Submit verified 2x2 multi-cell indicator plate to Council.",
+                "proof_strategy": "Submit plate_multi_state_indicator.png showing all 4 grid cells.",
+                "submission_summary": "Fabricated and verified 2x2 multi-state indicator sheet with hframes=2, vframes=2.",
+                "action": "submit_to_council",
+            }
+        ),
+    ])
+
+    lead_prompts = []
+
+    def responder(contents):
+        text = contents if isinstance(contents, str) else "\n".join(c for c in contents if isinstance(c, str))
+        if "Task Lead Strategist" in text:
+            lead_prompts.append(contents)
+            return next(lead_turns)
+        return bw.req_json(
+            "multi_state_indicator",
+            mode="diegetic_ui",
+            asset_type="diegetic_ui",
+            target="assets/sprites/multi_state_indicator.png",
+            dimensions=[256, 256],
+            grid_cols=2,
+            grid_rows=2,
+            cell_prompts=[
+                "State 1: circular neutral indicator ring",
+                "State 2: diamond active lock bracket",
+                "State 3: hexagonal warning indicator",
+                "State 4: octagonal overload emblem",
+            ],
+        )
+
+    ctx = WorkerContext(
+        cartridge_dir=tmp_path,
+        client=bw.make_client(responder),
+        library_factory=lambda c: CartridgeAssetLibrary(cartridge_dir=c.cartridge_dir, client=None),
+    )
+    item = bw.item("multi_state_indicator", kind="visual_asset")
+    res = task_lead_handler(ctx)(item)
+
+    # 1. Task Lead ran 2 turns (Turn 0 delegate -> Turn 1 inspect plate & submit) and persisted proof_strategy
+    assert len(lead_prompts) == 2
+    trace_data = json.loads(
+        (tmp_path / "artifacts" / "work_items" / "multi_state_indicator" / "lead_trace_rev0.json").read_text(encoding="utf-8")
+    )
+    assert trace_data["status"] == "submitted"
+    assert "plate_multi_state_indicator.png" in trace_data["proof_strategy"]
+
+    # 2. Turn 1 Task Lead prompt and multimodal parts include plate_multi_state_indicator.png (not just the raw sprite)
+    from engine.studio.workers import _build_task_lead_multimodal_parts
+    assert "plate_multi_state_indicator.png" in str(lead_prompts[1])
+    mm_parts = _build_task_lead_multimodal_parts(ctx, res.proof_images)
+    mm_strs = [p for p in mm_parts if isinstance(p, str)]
+    assert any("CAPTURED PROOF IMAGE (plate_multi_state_indicator.png)" in s for s in mm_strs)
+
+    # 3. Fabricated 256x256 sheet has non-empty pixels in all 4 quadrants and records hframes=2, vframes=2
+    sheet_path = tmp_path / "assets" / "sprites" / "multi_state_indicator.png"
+    assert sheet_path.is_file()
+    with Image.open(sheet_path) as im:
+        arr = np.asarray(im.convert("RGBA"))
+    assert arr.shape == (256, 256, 4)
+    for r_i in range(2):
+        for c_i in range(2):
+            quad_alpha = arr[r_i * 128:(r_i + 1) * 128, c_i * 128:(c_i + 1) * 128, 3]
+            assert int(np.count_nonzero(quad_alpha > 24)) > 50, f"Quadrant ({r_i}, {c_i}) was unexpectedly empty"
+
+    cat_data = json.loads((tmp_path / "assets" / "asset_library.json").read_text(encoding="utf-8"))
+    entry = cat_data["entries"]["multi_state_indicator"]
+    assert entry["hframes"] == 2
+    assert entry["vframes"] == 2
+    assert "hframes=2, vframes=2" in res.notes
+
+    # 4. Running verify_all_catalog_assets_and_animations preserves all 4 quadrants without single-subject isolation
+    lib = CartridgeAssetLibrary(cartridge_dir=tmp_path, client=None)
+    audit = lib.verify_all_catalog_assets_and_animations(auto_remediate=True)
+    assert audit["all_passed"] is True
+    with Image.open(sheet_path) as im_after:
+        arr_after = np.asarray(im_after.convert("RGBA"))
+    for r_i in range(2):
+        for c_i in range(2):
+            quad_alpha = arr_after[r_i * 128:(r_i + 1) * 128, c_i * 128:(c_i + 1) * 128, 3]
+            assert int(np.count_nonzero(quad_alpha > 24)) > 50, f"Quadrant ({r_i}, {c_i}) erased during catalog verification"
+
+
+
+
+
+
 
 
 

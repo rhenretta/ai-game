@@ -754,17 +754,24 @@ class VisualArtSpriteDesignerAgent:
                 px[cx, cy] = (r, g, b, new_a)
 
         # Step 2b: Clear pure #FF00FF chroma-key pockets and despill chroma fringes
+        # (including light/translucent boundary pixels where white/grey blended with #FF00FF yields g >= 110)
         for iy in range(work_h):
             for ix in range(work_w):
                 r, g, b, a = px[ix, iy]
                 if a == 0:
                     continue
                 magenta_excess = min(r, b) - g
+                rb_diff = abs(r - b)
                 if r > 175 and b > 175 and g < 95 and magenta_excess > 105:
                     px[ix, iy] = (0, 0, 0, 0)
                 elif r > 140 and b > 140 and g < 110 and magenta_excess > 65:
                     clamped_rb = min(r, b, g + 35)
                     new_a = max(0, min(a, int(a * 0.55)))
+                    px[ix, iy] = (clamped_rb, g, clamped_rb, new_a)
+                elif r > 180 and b > 180 and rb_diff < 35 and magenta_excess > 45 and (a < 250 or g > 95):
+                    spill_frac = min(1.0, float(magenta_excess) / 220.0)
+                    clamped_rb = min(r, b, g + 18)
+                    new_a = max(0, min(a, int(a * (1.0 - 0.65 * spill_frac))))
                     px[ix, iy] = (clamped_rb, g, clamped_rb, new_a)
 
         rgba_np = np.array(work_img, dtype=np.uint8)
@@ -1133,6 +1140,7 @@ class VisualArtSpriteDesignerAgent:
         reference_images: Optional[List[Union[Path, str, bytes, Image.Image]]] = None,
         style_guide: str = "",
         is_animated_actor: bool = False,
+        isolate_single_subject: bool = True,
     ) -> Image.Image:
         """Synthesizes a real 2D game sprite, prop, tile, or parallax backdrop via Gemini image generation."""
         from google.genai import types
@@ -1160,7 +1168,7 @@ class VisualArtSpriteDesignerAgent:
                 f"100% full-bleed edge-to-edge organic asymmetric repeatable material surface filling every pixel of the square frame. "
                 f"Strictly NO horizon, NO sky, NO isometric 3D block, NO bilateral mirror symmetry, NO white corners, NO empty margins, NO border frame, NO text."
             )
-        elif is_actor:
+        elif is_actor and isolate_single_subject:
             aspect = "1:1"
             full_prompt = (
                 f"SINGLE solitary full-body high-resolution illustrated in-game subject in ONE clean neutral readiness pose: {prompt}.{style_clause} "
@@ -1168,6 +1176,13 @@ class VisualArtSpriteDesignerAgent:
                 f"CRITICAL: Draw STRICTLY ONLY ONE single subject instance in ONE pose — NEVER multiple figures, NEVER multiple poses or animation frames, "
                 f"NEVER a multi-angle turnaround chart, NEVER a sprite sheet grid, NEVER a gray-and-white transparency checkerboard pattern, "
                 f"NO detached environment terrain slab, NO ground pedestal, NO cast shadow on the floor, NO background scenery, NOT a bust portrait, NO border frame, NO text."
+            )
+        elif not isolate_single_subject:
+            aspect = "1:1"
+            full_prompt = (
+                f"High-resolution illustrated in-game asset sheet on a solid flat uniform bright magenta (#FF00FF) chroma-key background: {prompt}.{style_clause} "
+                f"Keep each cell cleanly centered inside its grid cell with generous magenta (#FF00FF) margin around every element, "
+                f"NEVER draw grid lines, border frames, picture boxes, or text labels, and NEVER draw a gray-and-white checkerboard pattern."
             )
         else:
             aspect = "1:1"
@@ -1240,6 +1255,7 @@ class VisualArtSpriteDesignerAgent:
             target_size=(w, h),
             strip_border_frame=True,
             pad_ratio=0.06,
+            isolate_single_subject=isolate_single_subject,
         )
 
     @staticmethod
@@ -1736,18 +1752,26 @@ class VisualArtSpriteDesignerAgent:
                 c_sy_prod *= max(0.65, min(1.35, csy))
 
             phase_angle = 2.0 * math.pi * (float(frame_idx) / float(max(1, frame_count)))
-            # Ensure multi-frame custom animations always exhibit distinct inter-frame motion across columns
-            harmonic_radial = 1.0 + 0.06 * math.sin(phase_angle)
-            harmonic_twist_rad = math.radians(6.5 * math.sin(phase_angle) + c_rot_sum * 0.35)
+            # Ensure multi-frame custom animations exhibit distinct inter-frame motion across columns
+            # without injecting unwanted rotational tilt when keyframe rotation_deg is 0.
+            harmonic_radial = 1.0 + 0.05 * math.sin(phase_angle)
+            if abs(c_rot_sum) > 1e-3:
+                harmonic_twist_rad = math.radians(c_rot_sum * 0.55 + 3.0 * math.sin(phase_angle))
+            else:
+                harmonic_twist_rad = 0.0
 
-            eff_sx = max(0.62, min(1.38, c_sx_prod * harmonic_radial + (radial_delta_px / max(16.0, bw * 0.5)) * 0.35))
-            eff_sy = max(0.62, min(1.38, c_sy_prod * harmonic_radial + (radial_delta_px / max(16.0, bh * 0.5)) * 0.35))
+            max_safe_sx = max(1.02, (float(cw) - 6.0) / max(8.0, bw))
+            max_safe_sy = max(1.02, (float(ch) - 6.0) / max(8.0, bh))
+            raw_sx = c_sx_prod * harmonic_radial + (radial_delta_px / max(16.0, bw * 0.5)) * 0.35
+            raw_sy = c_sy_prod * harmonic_radial + (radial_delta_px / max(16.0, bh * 0.5)) * 0.35
+            eff_sx = max(0.62, min(min(1.32, max_safe_sx), raw_sx))
+            eff_sy = max(0.62, min(min(1.32, max_safe_sy), raw_sy))
 
             cos_tw = math.cos(harmonic_twist_rad)
             sin_tw = math.sin(harmonic_twist_rad)
             rel_x = xx - cx
             rel_y = yy - cy
-            # Radial scale + rotational twist weighted toward peripheral outriggers/appendages
+            # Radial scale + optional rotational twist weighted toward peripheral outriggers/appendages
             target_rx = (rel_x * cos_tw - rel_y * sin_tw) * eff_sx
             target_ry = (rel_x * sin_tw + rel_y * cos_tw) * eff_sy
             custom_dx = (target_rx - rel_x) * w_periph + c_dx_sum * scale_factor * 0.35 * w_periph
@@ -1906,8 +1930,42 @@ class VisualArtSpriteDesignerAgent:
                     is_animated_actor=True,
                 )
             for col_idx in range(fcount):
+                col_source_img = row_base_img
+                if (
+                    col_idx > 0
+                    and len(states) == 1
+                    and fcount <= 6
+                    and state_pose_desc
+                    and self._is_live_genai_client()
+                    and m_profile in ("custom", "action")
+                ):
+                    col_prompt = (
+                        f"SINGLE CANONICAL SPRITE ONLY for Frame {col_idx} of {fcount} in animation '{st.state_name}' — "
+                        f"maintain the exact same outer silhouette alignment, camera angle, proportions, and color palette as the "
+                        f"attached Frame 0 reference image, while advancing the internal state/pose to Frame {col_idx} of {fcount} "
+                        f"according to this progression: {state_pose_desc}. Subject context: {raw_base_prompt}. "
+                        f"Do NOT draw multiple frames, grids, or labels; render ONLY the single isolated sprite for Frame {col_idx}."
+                    )
+                    col_refs = [row_base_img] + (list(reference_images) if reference_images else [])
+                    try:
+                        col_source_img = self._generate_gemini_sprite_image(
+                            prompt=col_prompt,
+                            asset_type=asset_req.asset_type or "sprite_sheet",
+                            dimensions=base_dims,
+                            reference_images=col_refs,
+                            style_guide=style_guide,
+                            is_animated_actor=True,
+                        )
+                    except Exception as col_exc:
+                        logger.warning(
+                            "Per-column progression synthesis for %s frame %d fell back to base keyframe articulation: %s",
+                            asset_req.asset_id,
+                            col_idx,
+                            col_exc,
+                        )
+                        col_source_img = row_base_img
                 frame_img = self.fabricate_pose_frame_from_base(
-                    base_sprite=row_base_img,
+                    base_sprite=col_source_img,
                     state_name=st.state_name,
                     frame_idx=col_idx,
                     frame_count=fcount,
@@ -2168,22 +2226,62 @@ class VisualArtSpriteDesignerAgent:
         reference_images: Optional[List[Union[Path, str, bytes, Image.Image]]] = None,
         style_guide: str = "",
     ) -> Path:
-        """Renders and saves a single dynamic sprite from an AssetRequirement."""
-        if self._is_live_genai_client():
-            if isinstance(asset_req, dict):
-                dims = asset_req.get("dimensions") or (64, 64)
-                prompt = asset_req.get("visual_prompt_or_text") or asset_req.get("description") or asset_req.get("name", "game sprite")
-                atype = asset_req.get("asset_type", "sprite")
-            else:
-                dims = getattr(asset_req, "dimensions", None) or (64, 64)
-                prompt = getattr(asset_req, "visual_prompt_or_text", "") or getattr(asset_req, "description", "") or getattr(asset_req, "name", "game sprite")
-                atype = getattr(asset_req, "asset_type", "sprite")
+        """Renders and saves a dynamic sprite (or multi-cell grid/atlas sheet when grid_cols * grid_rows > 1) from an AssetRequirement."""
+        if isinstance(asset_req, dict):
+            dims = asset_req.get("dimensions") or (64, 64)
+            prompt = asset_req.get("visual_prompt_or_text") or asset_req.get("description") or asset_req.get("name", "game sprite")
+            atype = asset_req.get("asset_type", "sprite")
+            aid = asset_req.get("asset_id", "sprite")
+            grid_cols = max(1, int(asset_req.get("grid_cols") or 1))
+            grid_rows = max(1, int(asset_req.get("grid_rows") or 1))
+            cell_prompts = list(asset_req.get("cell_prompts") or [])
+        else:
+            dims = getattr(asset_req, "dimensions", None) or (64, 64)
+            prompt = getattr(asset_req, "visual_prompt_or_text", "") or getattr(asset_req, "description", "") or getattr(asset_req, "name", "game sprite")
+            atype = getattr(asset_req, "asset_type", "sprite")
+            aid = getattr(asset_req, "asset_id", "sprite") or "sprite"
+            grid_cols = max(1, int(getattr(asset_req, "grid_cols", 1) or 1))
+            grid_rows = max(1, int(getattr(asset_req, "grid_rows", 1) or 1))
+            cell_prompts = list(getattr(asset_req, "cell_prompts", None) or [])
+
+        is_multi_cell = (grid_cols * grid_rows) > 1
+        if is_multi_cell and cell_prompts:
+            cell_w = max(32, int(dims[0]) // grid_cols)
+            cell_h = max(32, int(dims[1]) // grid_rows)
+            sheet_w = cell_w * grid_cols
+            sheet_h = cell_h * grid_rows
+            img = Image.new("RGBA", (sheet_w, sheet_h), (0, 0, 0, 0))
+            renderer = None if self._is_live_genai_client() else ProceduralSpriteRenderer(mood=mood)
+            for idx in range(grid_cols * grid_rows):
+                row_i = idx // grid_cols
+                col_i = idx % grid_cols
+                c_prompt = str(cell_prompts[idx] if idx < len(cell_prompts) else prompt).strip() or prompt
+                if self._is_live_genai_client():
+                    cell_img = self._generate_gemini_sprite_image(
+                        prompt=c_prompt,
+                        asset_type="sprite",
+                        dimensions=(cell_w, cell_h),
+                        reference_images=reference_images,
+                        style_guide=style_guide,
+                        isolate_single_subject=True,
+                    )
+                else:
+                    cell_img = renderer.render_dynamic_sprite(
+                        dimensions=(cell_w, cell_h),
+                        prompt=c_prompt,
+                        asset_type=atype,
+                        seed=f"{aid}_cell_{idx}_{c_prompt[:24]}",
+                    )
+                cell_rgba = cell_img.convert("RGBA").resize((cell_w, cell_h), Image.Resampling.LANCZOS)
+                img.paste(cell_rgba, (col_i * cell_w, row_i * cell_h), cell_rgba)
+        elif self._is_live_genai_client():
             img = self._generate_gemini_sprite_image(
                 prompt=prompt,
                 asset_type=atype,
                 dimensions=dims,
                 reference_images=reference_images,
                 style_guide=style_guide,
+                isolate_single_subject=not is_multi_cell,
             )
         else:
             renderer = ProceduralSpriteRenderer(mood=mood)
@@ -2192,7 +2290,6 @@ class VisualArtSpriteDesignerAgent:
         if output_path is None:
             name = getattr(asset_req, "name", None) if hasattr(asset_req, "name") else (asset_req.get("name") if isinstance(asset_req, dict) else None)
             if not name:
-                aid = getattr(asset_req, "asset_id", "sprite") if hasattr(asset_req, "asset_id") else (asset_req.get("asset_id", "sprite") if isinstance(asset_req, dict) else "sprite")
                 name = f"{aid}.png"
             output_path = Path(name)
         else:
@@ -2382,11 +2479,13 @@ class VisualArtSpriteDesignerAgent:
         img: Union[Image.Image, Path, str],
         asset_type: str = "sprite",
         output_path: Optional[Union[Path, str]] = None,
+        grid_cols: int = 1,
+        grid_rows: int = 1,
     ) -> Image.Image:
         """Tier 1 Isolated Asset Render Plate:
         - For `tile` / `tile_surface`: renders a 3x3 seamless tiled grid (`3*w x 3*h`) so any edge seam or corner defect is immediately visible.
         - For `sprite`, `prop`, `portrait`, `diegetic_ui`, `backdrop`: renders a side-by-side Dual-Tone Checkerboard Alpha Inspection Plate
-          (dark checkerboard on left with cyan tight alpha bounding box, light checkerboard on right to expose dark/magenta edge halos).
+          (dark checkerboard on left with cyan tight alpha bounding box and optional multi-cell grid dividers, light checkerboard on right to expose dark/magenta edge halos).
         """
         if isinstance(img, (Path, str)):
             with Image.open(img) as opened:
@@ -2397,6 +2496,9 @@ class VisualArtSpriteDesignerAgent:
         w, h = rgba.size
         norm_type = str(asset_type or "sprite").lower().strip()
         is_tile = norm_type in ("tile", "tile_surface")
+        g_cols = max(1, int(grid_cols or 1))
+        g_rows = max(1, int(grid_rows or 1))
+        is_multi_cell = (g_cols * g_rows) > 1
 
         if is_tile:
             # Render 3x3 repeating grid plate to inspect edge-to-edge seamless tiling
@@ -2409,8 +2511,9 @@ class VisualArtSpriteDesignerAgent:
                     plate.paste(tile_cell, (gx * cell_w, gy * cell_h))
         else:
             # Render side-by-side Dark & Light Checkerboard Alpha Cutout Plate
-            disp_w = max(64, min(192, w))
-            disp_h = max(64, min(192, h))
+            max_disp = 288 if is_multi_cell else 192
+            disp_w = max(64, min(max_disp, w))
+            disp_h = max(64, min(max_disp, h))
             scaled = rgba.resize((disp_w, disp_h), Image.Resampling.NEAREST if max(w, h) <= 64 else Image.Resampling.LANCZOS)
             pad = 12
             plate_w = disp_w * 2 + pad * 3
@@ -2426,14 +2529,27 @@ class VisualArtSpriteDesignerAgent:
             plate.paste(scaled, (pad * 2 + disp_w, pad), scaled)
 
             draw = ImageDraw.Draw(plate)
-            bbox = scaled.getbbox()
-            if bbox:
-                bx0, by0, bx1, by1 = bbox
+            if is_multi_cell:
                 draw.rectangle(
-                    [pad + bx0, pad + by0, pad + bx1 - 1, pad + by1 - 1],
+                    [pad, pad, pad + disp_w - 1, pad + disp_h - 1],
                     outline=(0, 229, 255, 220),
                     width=1,
                 )
+                for cx_i in range(1, g_cols):
+                    gx = pad + int(round((disp_w * cx_i) / float(g_cols)))
+                    draw.line([gx, pad, gx, pad + disp_h - 1], fill=(0, 229, 255, 190), width=1)
+                for cy_i in range(1, g_rows):
+                    gy = pad + int(round((disp_h * cy_i) / float(g_rows)))
+                    draw.line([pad, gy, pad + disp_w - 1, gy], fill=(0, 229, 255, 190), width=1)
+            else:
+                bbox = scaled.getbbox()
+                if bbox:
+                    bx0, by0, bx1, by1 = bbox
+                    draw.rectangle(
+                        [pad + bx0, pad + by0, pad + bx1 - 1, pad + by1 - 1],
+                        outline=(0, 229, 255, 220),
+                        width=1,
+                    )
 
         if output_path is not None:
             out_p = Path(output_path)
@@ -2715,9 +2831,32 @@ class VisualArtSpriteDesignerAgent:
                 alpha_ok = False
                 defects.append("Cutout sprite/portrait has all 4 outer corners opaque (>96% fill), indicating an unremoved background box or frame.")
 
+        g_cols = max(1, int(getattr(req, "grid_cols", 1) or 1))
+        g_rows = max(1, int(getattr(req, "grid_rows", 1) or 1))
+        if (g_cols * g_rows) > 1:
+            cw_chk = max(1, w // g_cols)
+            ch_chk = max(1, h // g_rows)
+            empty_cells: List[str] = []
+            for r_i in range(g_rows):
+                for c_i in range(g_cols):
+                    sub_a = rgba_np[r_i * ch_chk:(r_i + 1) * ch_chk, c_i * cw_chk:(c_i + 1) * cw_chk, 3]
+                    if int(np.count_nonzero(sub_a > 24)) < 16:
+                        empty_cells.append(f"(row={r_i}, col={c_i})")
+            if empty_cells:
+                framing_ok = False
+                defects.append(
+                    f"Multi-cell grid sheet ({g_cols}x{g_rows}) has empty/blank cell(s): {', '.join(empty_cells)}."
+                )
+
         plate_p = Path(inspection_plate_path) if inspection_plate_path else asset_p.parent / "renders" / f"plate_{req.asset_id}.png"
         if not plate_p.is_file():
-            self.render_asset_inspection_plate(rgba, asset_type=req.asset_type, output_path=plate_p)
+            self.render_asset_inspection_plate(
+                rgba,
+                asset_type=req.asset_type,
+                output_path=plate_p,
+                grid_cols=g_cols,
+                grid_rows=g_rows,
+            )
 
         det_passed = bool(alpha_ok and holes_ok and framing_ok and tile_ok and not defects)
 
@@ -2728,15 +2867,21 @@ class VisualArtSpriteDesignerAgent:
             ]
             for rp in self._build_reference_parts(reference_images)[:1]:
                 contents.append(rp)
+            grid_note = (
+                f"\nMulti-Cell Grid Layout: {g_cols} columns x {g_rows} rows (cell_prompts={getattr(req, 'cell_prompts', [])}) — "
+                f"verify that every cell in the {g_cols}x{g_rows} grid contains its distinct graphic cleanly within its cyan cell boundaries."
+                if (g_cols * g_rows) > 1
+                else ""
+            )
             v_prompt = (
                 f"You are the Studio Lead Visual QA Critic inspecting a rendered asset inspection plate before sealing it into the Cartridge Asset Library.\n"
                 f"Asset ID: '{req.asset_id}' | Type: '{req.asset_type}' | Mode: '{req.fabrication_mode}'\n"
-                f"Intended Purpose: {req.purpose or req.description}\n"
+                f"Intended Purpose: {req.purpose or req.description}{grid_note}\n"
                 f"Style Guide: {style_guide}\n"
                 f"Deterministic OpenCV Pre-Check: det_passed={det_passed}, mirror_symmetry_score={mirror_sym:.3f}, pre_detected_defects={defects}\n"
                 f"Inspection Rules:\n"
                 f"- If mode is 'tile_surface' (shown as a 3x3 tiled grid): verify seamless edge-to-edge organic material repetition with ZERO bilateral mirror symmetry, ZERO harsh grid seams, ZERO isometric 3D block corners, and ZERO sky horizons.\n"
-                f"- If mode is 'static_sprite', 'sprite_sheet', or 'portrait' (shown over dark and light checkerboards): verify clean alpha cutout silhouette (ZERO solid background boxes or picture frames, ZERO trapped background pockets between limbs, ZERO transparent holes inside the subject's eyes or face), complete subject framing (ZERO detached environment terrain slabs or ground pedestals attached beneath the subject's base), and cohesive art style.\n"
+                f"- If mode is 'static_sprite', 'sprite_sheet', 'diegetic_ui', or 'portrait' (shown over external QA dark and light square checkerboards with a cyan bounding-box border / grid dividers): verify clean alpha cutout silhouette (ZERO solid background boxes or picture frames inside the subject, ZERO trapped background pockets between limbs, ZERO transparent holes inside the subject's eyes or face), complete subject framing (ZERO detached environment terrain slabs or ground pedestals attached beneath the subject's base), and cohesive art style. IMPORTANT: The side-by-side dark/light square checkerboard grids and the cyan bounding-box/grid lines in `plate_*.png` are drawn externally by the QA plate renderer to visualize transparency and cell bounds—they are NOT inside the sprite PNG and must NEVER be flagged as checkerboard/grid/box defects!\n"
                 f"MANDATORY (Rule 4): Provide `deliberation` FIRST, and `accepted` LAST."
             )
             contents.append(v_prompt)
@@ -2829,7 +2974,8 @@ class VisualArtSpriteDesignerAgent:
                     f"Verify that:\n"
                     f"1. Frames show genuine, readable keyframe pose or mechanism articulation across the strip (not identical static copies).\n"
                     f"2. Subject silhouette is continuous and intact (no severed props, torn limbs, or detached terrain slabs across states).\n"
-                    f"3. Grounded poses (idle/move) maintain consistent base contact along the gold baseline guide.\n"
+                    f"3. Grounded poses (idle/move) maintain consistent base contact along the external gold baseline guide.\n"
+                    f"IMPORTANT: The dark square checkerboard grid, cyan cell borders, and horizontal yellow/gold baseline ruler line near the bottom of each cell in `anim_sheet_*.png` are external QA contact-sheet overlays drawn by the test harness—they are NOT part of the sprite sheet PNG and must NEVER be flagged as yellow line or checkerboard defects!\n"
                     f"MANDATORY (Rule 4): Provide `deliberation` FIRST, and `accepted` LAST."
                 ),
             ]

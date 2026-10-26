@@ -97,9 +97,15 @@ class ProductionBoard:
         self._items: Dict[str, WorkItem] = {}
         self._design_revision = 0
         self._yielded_on_code_lock: Set[str] = set()
+        self._yielded_fifo: List[str] = []
         self._active_resumed_code_lock_item: Optional[str] = None
         if self.path is not None and self.path.is_file():
             self._load()
+
+    def _discard_yielded(self, item_id: str) -> None:
+        self._yielded_on_code_lock.discard(item_id)
+        while item_id in self._yielded_fifo:
+            self._yielded_fifo.remove(item_id)
 
     # ------------------------------------------------------------------ persistence
     def _load(self) -> None:
@@ -604,7 +610,13 @@ class ProductionBoard:
             claimed: List[WorkItem] = []
             order_index = {item_id: idx for idx, item_id in enumerate(self._items)}
             runnable = [i for i in self._items.values() if i.state in RUNNABLE_STATES and self._deps_satisfied(i)]
-            runnable.sort(key=lambda i: (-i.priority, order_index[i.item_id]))
+            runnable.sort(
+                key=lambda i: (
+                    -i.priority,
+                    max(0, len(i.revisions) - i.cap_base_index),
+                    order_index[i.item_id],
+                )
+            )
 
             if not prefer_parallel_assets and not self._yielded_on_code_lock and not effective_code_busy:
                 for item in runnable:
@@ -640,10 +652,16 @@ class ProductionBoard:
 
                 chosen: Optional[WorkItem] = None
                 if not effective_code_busy and not resumed_code_claimed_in_call:
-                    for cand in eligible:
-                        if cand.item_id in self._yielded_on_code_lock:
-                            chosen = cand
+                    eligible_by_id = {c.item_id: c for c in eligible}
+                    for y_id in self._yielded_fifo:
+                        if y_id in eligible_by_id:
+                            chosen = eligible_by_id[y_id]
                             break
+                    if chosen is None:
+                        for cand in eligible:
+                            if cand.item_id in self._yielded_on_code_lock:
+                                chosen = cand
+                                break
 
                 if chosen is None:
                     code_active = effective_code_busy or (in_progress_code_count + code_claimed_in_call) >= 1
@@ -657,7 +675,7 @@ class ProductionBoard:
 
                 remaining.remove(chosen)
                 was_yielded = chosen.item_id in self._yielded_on_code_lock
-                self._yielded_on_code_lock.discard(chosen.item_id)
+                self._discard_yielded(chosen.item_id)
                 if was_yielded:
                     self._active_resumed_code_lock_item = chosen.item_id
                     resumed_code_claimed_in_call = True
@@ -692,9 +710,11 @@ class ProductionBoard:
                 else:
                     item.state = "changes_requested" if item.revisions and item.revisions[-1].feedback else "ready"
             if reason == "spawned_prerequisite_tasks" or not deps_ok:
-                self._yielded_on_code_lock.discard(item_id)
+                self._discard_yielded(item_id)
             else:
                 self._yielded_on_code_lock.add(item_id)
+                if item_id not in self._yielded_fifo:
+                    self._yielded_fifo.append(item_id)
             self._refresh()
             self._persist()
             self._emit(
@@ -713,7 +733,7 @@ class ProductionBoard:
             missing = [p for p in result.proof_images if not Path(p).is_file()]
             if missing:
                 raise BoardValidationError(f"Worker for '{item_id}' reported proof images that do not exist: {missing}")
-            self._yielded_on_code_lock.discard(item_id)
+            self._discard_yielded(item_id)
             if self._active_resumed_code_lock_item == item_id:
                 self._active_resumed_code_lock_item = None
             item.revisions.append(
@@ -734,7 +754,7 @@ class ProductionBoard:
         """Records a worker failure with its full error text; the item stays visible until re-queued (Rule 5)."""
         with self._lock:
             item = self._require(item_id)
-            self._yielded_on_code_lock.discard(item_id)
+            self._discard_yielded(item_id)
             if self._active_resumed_code_lock_item == item_id:
                 self._active_resumed_code_lock_item = None
             item.state = "failed"

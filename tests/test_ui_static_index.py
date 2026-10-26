@@ -172,5 +172,35 @@ class TestMissionControlSinglePageApp:
         assert "pauseActiveGameBuild" in content
         assert "normalizeBoardItem" in content
 
+    def test_live_turn_step_log_context_prompt_error_banner_and_lightbox_click_safety(self):
+        """Verifies live turn execution drill-down, step-by-step log, per-turn context/prompt/self-inquiry Q&A,
+        prominent build error banner, expandable non-overflowing turn summaries, and safe lightbox click handling."""
+        content = INDEX_PATH.read_text(encoding="utf-8")
+        assert 'id="studio-build-error-banner"' in content
+        assert "backlog_item_substep" in content
+        assert "formatTurnStepLogHtml" in content
+        assert "formatTurnEpistemicDetailsHtml" in content
+        assert "scheduleChronologyLiveRefresh" in content
+        assert "[Expand full turn]" in content
+        assert "target.querySelector?.('img')" not in content
+
+    def test_polling_scroll_preservation_and_headless_godot_renders(self):
+        """Verifies UI polling preserves scroll positions / <details> state and Godot automated renders run with --headless."""
+        import inspect
+        from engine.sim.godot_verifier import GodotHeadlessSimulator
+
+        content = INDEX_PATH.read_text(encoding="utf-8")
+        assert "updateLiveElapsedCountersInDom" in content
+        assert "live-elapsed-counter" in content
+        assert "setHtmlIfChanged(bodyEl," in content
+        assert '[style*="overflow"]' in content
+
+        sim_src = inspect.getsource(GodotHeadlessSimulator.run_until_complete)
+        assert '"--headless"' in sim_src
+        assert '"--capture-viewport"' in sim_src
+        assert "--position" not in sim_src
+
+
+
 
 

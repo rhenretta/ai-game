@@ -288,7 +288,7 @@ class CreativeWritersRoom:
         event_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         max_turns: int = 12,
         min_turns_before_convergence: int = 4,
-        creative_temperature: float = 1.25,
+        creative_temperature: float = 0.7,
         max_parallel_calls: Optional[int] = None,
         board: Optional[ProductionBoard] = None,
         scheduler: Optional[BoardScheduler] = None,
@@ -577,44 +577,76 @@ class CreativeWritersRoom:
         if not response.text:
             raise StudioAgentError(f"Empty response from Gemini for schema {schema_name}")
         raw_data = json.loads(response.text)
-        if isinstance(raw_data, schema_cls):
+        target_cls = WritersRoomTurnProposal if schema_name == "WritersRoomTurnProposal" else schema_cls
+        if isinstance(raw_data, target_cls):
             return raw_data
-        return schema_cls(**raw_data)
+        return target_cls(**raw_data)
 
-    def _format_dna_summary(self, dna: Optional[SteamPlayerDNA], hypothesis_report: Optional[Any] = None) -> str:
+    def _format_dna_summary(self, dna: Optional[Any], hypothesis_report: Optional[Any] = None) -> str:
         lines: List[str] = []
         if dna is not None:
+            def _dget(key: str, default: Any = None) -> Any:
+                if isinstance(dna, dict):
+                    return dna.get(key, default)
+                return getattr(dna, key, default)
+
+            raw_games = _dget("top_games") or _dget("games") or []
             top_games = [
-                g for g in (getattr(dna, "top_games", []) or [])
+                g for g in raw_games
                 if isinstance(g, dict) and not str(g.get("name", "")).startswith("App ")
             ]
-            # Dynamically sample a varied spotlight subset of the player's top games so each session
-            # explores a fresh creative intersection of their library rather than repeating the same pitch.
+            sorted_by_hours = sorted(
+                top_games,
+                key=lambda g: float(g.get("playtime_hours", 0.0) or 0.0),
+                reverse=True,
+            )
+            core_anchors = sorted_by_hours[:8]
+            core_str = ", ".join(
+                f"{g.get('name', 'Unknown')} ({float(g.get('playtime_hours', 0.0) or 0.0):.1f}h, genres: {g.get('genres', [])})"
+                for g in core_anchors
+            )
+            # Also sample a varied spotlight subset for fresh creative cross-pollination
             if len(top_games) > 4:
                 spotlight_games = random.sample(top_games[:12], k=min(4, len(top_games[:12])))
             else:
                 spotlight_games = list(top_games)
             spotlight_str = ", ".join(
-                f"{g.get('name', 'Unknown')} (genres: {g.get('genres', [])})"
+                f"{g.get('name', 'Unknown')} ({float(g.get('playtime_hours', 0.0) or 0.0):.1f}h, genres: {g.get('genres', [])})"
                 for g in spotlight_games
             )
-            top_genres = list(getattr(dna, "top_genres", []) or [])
-            if len(top_genres) > 1:
-                shuffled_genres = list(top_genres)
-                random.shuffle(shuffled_genres)
-            else:
-                shuffled_genres = top_genres
+            top_genres = list(_dget("top_genres") or [])
+            genre_weights = _dget("genre_weights") or {}
+            playtime_dist = _dget("playtime_distribution") or {}
+            total_hours = float(_dget("total_playtime_hours", 0.0) or 0.0)
+            total_games = int(_dget("total_games_analyzed") or _dget("total_games") or 0)
+            pacing_pref = _dget("pacing_preference", "balanced")
+            pacing_score = float(_dget("pacing_score", 0.0) or 0.0)
+            challenge_tol = float(_dget("challenge_tolerance", 0.5) or 0.5)
             lines.extend([
-                f"- Genre Affinities to Explore: {shuffled_genres}",
-                f"- Pacing Preference: {getattr(dna, 'pacing_preference', 'balanced')}",
+                f"- Target Player Steam Library Scale: {total_hours:.1f} total hours across {total_games} analyzed games",
+                f"- Top Genres by Playtime Weight: {top_genres} (weights: {genre_weights})",
+                f"- Engagement & Mastery Distribution: {playtime_dist}",
+                f"- Pacing & Cognitive Preference: {pacing_pref} (pacing_score={pacing_score:.2f}, challenge_tolerance={challenge_tol:.2f})",
             ])
-            palette_pref = getattr(dna, "preferred_palette_mood", None)
+            palette_pref = _dget("preferred_palette_mood", None)
             if palette_pref:
                 lines.append(f"- Preferred Palette Mood: {palette_pref}")
+            if core_str:
+                lines.append(
+                    f"- Most-Played Core Anchor Games (what this specific player invests hundreds of hours mastering): {core_str}"
+                )
             if spotlight_str:
                 lines.append(
-                    f"- Taste signals from the player's library (what they value — NOT templates to imitate, mash up or pastiche): {spotlight_str}"
+                    f"- Session Spotlight Cross-Pollination Subset (taste signals — NOT templates to copy or pastiche): {spotlight_str}"
                 )
+            lines.append(
+                "- TARGET PLAYER OPTIMIZATION MANDATE: You are designing specifically for THIS human player based on their Steam library playtime "
+                "and behavioral DNA above—not a generic anonymous casual player. Reason from what this player actually loves to DO in games "
+                "(their mastery depth, systemic/construction/optimization appetite vs. kinetic/tactical expression, and session depth) combined with "
+                "the active concept/genre. When the player's DNA or genre centers on building, routing, automation, engineering, or systemic mastery, "
+                "the player MUST be the one who builds, places, connects, experiments, and optimizes their own layout—there is no single pre-scripted "
+                "'correct' solution, and you must NEVER hand them a pre-built diorama or a trivial 1-step lock-and-key switch!"
+            )
         if hypothesis_report is not None:
             hyps = getattr(hypothesis_report, "hypotheses", []) or []
             if hyps:
@@ -634,7 +666,11 @@ class CreativeWritersRoom:
         )
         loop = game_bible.core_loop
         parts.append(
-            "core_loop=" + (f"[verbs={loop.player_verbs}; m2m={loop.moment_to_moment_loop[:160]}; session={loop.session_loop[:160]}]" if loop else "(missing)")
+            "core_loop=" + (
+                f"[verbs={loop.player_verbs}; agency={getattr(loop, 'player_agency_and_optimization_depth', '')[:140]}; "
+                f"m2m={loop.moment_to_moment_loop[:140]}; session={loop.session_loop[:140]}]"
+                if loop else "(missing)"
+            )
         )
         eng = game_bible.engagement_plan
         parts.append("engagement_plan=" + (f"[pillars={eng.entertainment_pillars}]" if eng else "(missing)"))
@@ -669,16 +705,24 @@ class CreativeWritersRoom:
         active_slice = game_bible.get_active_slice() if hasattr(game_bible, "get_active_slice") else None
         active_slice_str = (
             f"[{active_slice.slice_id} (Iteration #{active_slice.slice_index})] '{active_slice.title}' — "
-            f"Objective: {active_slice.slice_objective} | Acclimation & Mechanics Focus: {active_slice.player_acclimation_and_mechanics_focus} | "
-            f"Expansion: {active_slice.expansion_from_prior_slice} | Scope Boundaries: {active_slice.scope_boundaries}"
+            f"Objective: {active_slice.slice_objective} | Acclimation & Full-Loop Focus: {active_slice.player_acclimation_and_mechanics_focus} | "
+            f"Expansion: {active_slice.expansion_from_prior_slice} | Required Systems & Scope: {active_slice.scope_boundaries}"
             if active_slice is not None
-            else "(not yet strategized — Slice 0 MUST deliver a complete, cohesive playable vertical slice realizing the world's camera/scale, core loop, new-player onboarding, and audio)"
+            else "(not yet strategized — Slice 0 MUST deliver the complete playable game loop realizing all 3 timescales of `core_loop`, `player_agency_and_optimization_depth`, multi-horizon `goal_hierarchy`, multi-region world progression, UX onboarding, and audio—never defer the core game loop to future slices!)"
         )
-        exec_directives = [
-            u.spoken_dialogue.strip()
-            for u in game_bible.writers_room_transcript
-            if u.speaker_role in ("ExecutiveProducer", "UserSteering") and u.spoken_dialogue and u.spoken_dialogue.strip()
-        ]
+        exec_directives: List[str] = []
+        active_seed = (getattr(self, "_active_creative_prompt", None) or "").strip()
+        if not active_seed and game_bible.concept_evolution:
+            first_prev = (game_bible.concept_evolution[0].previous_premise or "").strip()
+            if first_prev and first_prev != "Untitled Concept":
+                active_seed = first_prev
+        if active_seed:
+            exec_directives.append(active_seed)
+        for u in game_bible.writers_room_transcript:
+            if u.speaker_role in ("ExecutiveProducer", "UserSteering") and u.spoken_dialogue and u.spoken_dialogue.strip():
+                d_txt = u.spoken_dialogue.strip()
+                if d_txt not in exec_directives:
+                    exec_directives.append(d_txt)
         exec_banner = (
             "🚨 MANDATORY EXECUTIVE PRODUCER CREATIVE STEERING (HIGHEST PRIORITY — OVERRIDES CONFLICTING PREMISES):\n"
             + "\n".join(f'  - "{d}"' for d in exec_directives)
@@ -686,8 +730,15 @@ class CreativeWritersRoom:
             if exec_directives
             else ""
         )
+        dna_block = (
+            f"TARGET PLAYER STEAM DNA PROFILE (the specific human player this game is being optimized for):\n"
+            f"{game_bible.target_player_dna_summary}\n\n"
+            if getattr(game_bible, "target_player_dna_summary", "")
+            else ""
+        )
         return (
             f"{exec_banner}"
+            f"{dna_block}"
             f"CURRENT LIVING GAME BIBLE STATE:\n"
             f"- Working Title: {game_bible.game_title}\n"
             f"- Core Genre: {game_bible.core_genre}\n"
@@ -1099,7 +1150,7 @@ class CreativeWritersRoom:
             f"script/dialogue, visuals, onboarding/UI, progression, audio, or technical architecture.\n"
             f"Return your structured WritersRoomListenCheck with `deliberation` FIRST."
         )
-        return self._call_structured_llm(prompt, WritersRoomListenCheck)
+        return self._call_structured_llm(prompt, WritersRoomListenCheck, temperature=0.4)
 
     def _execute_specialist_turn(
         self,
@@ -1147,13 +1198,17 @@ class CreativeWritersRoom:
         domain_instructions = ""
         if role == "UXExperienceDesigner":
             domain_instructions = (
-                "Domain Craft & Bible Fields (UXExperienceDesigner): Put yourself in the shoes of a brand-new player booting this game for the first time "
-                "with zero external documentation. Strategize how the player immediately understands their role in the world, what objects are interactive "
-                "and how they connect, what their active objective is, and how the world responds to their actions—without cluttering the screen with "
-                "generic debug labels. Shape `updated_first_60_seconds_hook`, `updated_diegetic_ui_philosophy` (identifying the exact HUD/CanvasLayer "
-                "isolation, visual affordances, and feedback cues that fit THIS game), `updated_onboarding_plan` (how the player is introduced to the "
-                "world, role, and stakes, plus ordered `OnboardingStep`s), and `added_or_updated_storyboard_beats`. When a Production Board is attached, "
-                "raise concrete `ui` / onboarding `backlog_additions` so your new-player experience strategy is actually built in code."
+                "Domain Craft & Bible Fields (UXExperienceDesigner): Put yourself empathetically in the shoes of a brand-new player booting this game "
+                "for the first time with zero external documentation. Strategize how THIS specific game brings the player into the world so they "
+                "understand what they are doing and why (`purpose_and_stakes_framing`), how their actions causally connect (`input -> entity response -> "
+                "world consequence` in `causal_chain_and_feedback_strategy`), how every bound input key is made discoverable, and what feedback occurs "
+                "when an action is blocked or attempted before its prerequisite—using whatever onboarding strategy (environmental cues, NPC barks, "
+                "staged introductory interaction, or diegetic instruments) best fits THIS game's genre and tone. "
+                "CRITICAL: Onboarding is ONLY the opening 60 seconds of play layered onto the real game—it is NEVER the entire game! Do NOT propose standalone "
+                "'tutorial manager' or 'onboarding milestone map' tasks that reduce the game into a linear 4-step checklist that ends once the player learns the controls; "
+                "instead, design HUD/toolbar/affordance UI (`ui` tasks) that empowers the player to play the full `core_loop` (moment-to-moment, minute-to-minute, and session loops) "
+                "and track their progress across `goal_hierarchy`. Shape `updated_first_60_seconds_hook`, `updated_diegetic_ui_philosophy`, "
+                "`updated_onboarding_plan`, and `added_or_updated_storyboard_beats`."
             )
         elif role == "VisualArtDirector":
             domain_instructions = (
@@ -1190,25 +1245,34 @@ class CreativeWritersRoom:
             )
         elif role == "GameplayDesigner":
             domain_instructions = (
-                "Domain Craft & Bible Fields (GameplayDesigner): Pressure-test the mechanics for genuine fun and agency, and shape "
-                "`gameplay_pillars_additions`, `updated_core_loop` (player verbs plus moment-to-moment, minute-to-minute, and session loops, feedback, reward cadence, "
-                "failure and recovery), `updated_engagement_plan` (entertainment pillars, variety injectors, pacing curve, mastery), `added_or_updated_slices`, and "
-                "`concept_evolution_milestone`. You can call on your Sub-Agents `LevelAndProgressionDesigner` and `GameplaySystemsEngineer` via `addressed_to`."
+                "Domain Craft & Bible Fields (GameplayDesigner): Pressure-test the mechanics for genuine fun, player agency, and alignment with the "
+                "Target Player's Steam DNA. Ask: 'What is the LARGER POINT of this game? Why is this genre compelling to play beyond the first 60 seconds?' "
+                "NEVER allow the team to build 'the smallest slice possible' that reduces the game to a 1-step tutorial or a pre-solved diorama while deferring "
+                "the actual game loop to unbuilt future slices! Shape `gameplay_pillars_additions`, `updated_core_loop` (player verbs, `player_agency_and_optimization_depth` "
+                "explaining how the player builds/experiments/optimizes/strategizes their own approach with no single pre-scripted solution, plus moment-to-moment, "
+                "minute-to-minute, and session loops, feedback, reward cadence, failure and recovery), `updated_engagement_plan`, `added_or_updated_slices` "
+                "(ensuring Slice 0 includes the full minute-to-minute and session loop and player toolkit, NEVER deferring the core point of the game), and "
+                "`concept_evolution_milestone`. When a Production Board is attached, raise `mechanic_code` tasks that build both the moment-to-moment verbs AND "
+                "the minute-to-minute/session loop progression. You can call on your Sub-Agents `LevelAndProgressionDesigner` and `GameplaySystemsEngineer` via `addressed_to`."
             )
         elif role == "GameplaySystemsEngineer":
             domain_instructions = (
-                "Domain Craft & Bible Fields (GameplaySystemsEngineer): Translate the game's mechanics, camera/spatial paradigm, and visual direction into "
+                "Domain Craft & Bible Fields (GameplaySystemsEngineer): Translate the game's full 3-timescale `core_loop` (moment-to-moment, minute-to-minute, "
+                "and session loops), `player_agency_and_optimization_depth`, `goal_hierarchy`, camera/spatial paradigm, and visual direction into "
                 "concrete Godot 4 engineering strategies in `added_or_updated_engineering_specs` (`MechanicEngineeringSpec` items covering node/collider architecture, "
                 "hybrid procedural + generated texture/sprite/rig rendering, active `Camera2D` tracking across world bounds with HUD isolated on a `CanvasLayer`, "
-                "deterministic state machines that start unsolved at t=0, and falsifiable headless test invariants)."
+                "deterministic state machines that start unbuilt/unsolved at t=0 and give the player a full interactive toolkit/sandbox to build, experiment, optimize, "
+                "and progress through escalating goals, and falsifiable headless test invariants). Never design or accept a state machine that reduces the game to a "
+                "4-step linear tutorial or pre-solves the player's work in `_ready()`."
             )
         elif role == "LevelAndProgressionDesigner":
             domain_instructions = (
                 "Domain Craft & Bible Fields (LevelAndProgressionDesigner): Strategize the game's world and progression in `updated_level_generation_strategy` "
                 "(bespoke `generation_approach`, `world_structure`, `runtime_construction_plan`, `level_archetypes`, `generation_rules`, and difficulty curve), "
-                "`updated_goal_hierarchy` (goals across multiple horizons, progression structure, and end state), and `added_or_updated_slices` "
-                "(where Slice 0 delivers a complete, cohesive playable vertical slice across the world's intended scale, camera movement, and progression loop, "
-                "rather than a cramped single-object test room)."
+                "`updated_goal_hierarchy` (goals across immediate, short-term, mid-term, and long-term horizons, progression structure, and end state), and "
+                "`added_or_updated_slices` (where Slice 0 delivers the COMPLETE playable game loop across all 3 time scales of `core_loop` and multi-horizon `goal_hierarchy`—never "
+                "shrinking the build into a tutorial-only room or deferring the real progression and systemic depth to future slices!). When a Production Board is attached, "
+                "raise `level_map` and progression `mechanic_code` tasks that realize the multi-region world and escalating goals."
             )
         elif role == "AudioAtmosphereDesigner":
             domain_instructions = (
@@ -1231,11 +1295,15 @@ class CreativeWritersRoom:
             f"THE CONCEPT IS STILL EVOLVING: the premise above is provisional. Do not merely decorate it. Pressure-test it from your domain; "
             f"if your contribution exposes a weakness or a better direction, change it (title, pitch, core fantasy, mechanics) via the `updated_*` "
             f"fields and log a `concept_evolution_milestone` explaining what changed and why. Keep what is alive, replace what is generic.\n"
+            f"CLARITY & CONCRETE GAME DESIGN (NO PSEUDO-SCIENTIFIC JARGON SALAD): Speak in clear, direct, plain-spoken game design language. "
+            f"Always describe concretely what the player sees on screen, what they directly control or manipulate, what obstacle or challenge pushes back, "
+            f"and why the moment-to-moment interaction is fun. Avoid obscure academic, physics, or materials-science buzzword mashups that obscure the actual game.\n"
             f"Speak naturally, creatively, and passionately to your fellow designers in `spoken_dialogue` (never recite raw telemetry floats), "
             f"call out specific colleagues or Sub-Agents in `addressed_to`, and contribute your concrete updates to the Living Game Bible. Provide `deliberation` FIRST."
         )
+        turn_schema = WritersRoomTurnProposal.for_role(role) if is_real_genai_client(self.client) else WritersRoomTurnProposal
         if self.board is None:
-            return self._call_structured_llm(prompt, WritersRoomTurnProposal)
+            return self._call_structured_llm(prompt, turn_schema)
         board_block = (
             f"{self.board.snapshot_text()}\n"
             f"BUILD BACKLOG (ACTIVE SLICE — EMERGENT TASK & ASSET DISCOVERY): The implementation side builds in parallel while you design. "
@@ -1244,6 +1312,10 @@ class CreativeWritersRoom:
             f"HYBRID PROCEDURAL + GENERATED ASSETS: Do NOT settle for flat untextured `Polygon2D` slabs or bare programmer-art `Line2D` strokes! "
             f"Raise `visual_asset` tasks (`tile_surface` seamless textures for procedural `Polygon2D`/`Line2D` terrain/conduits, environmental decals/landmarks, "
             f"and `sprite_sheet`/`articulated_parts` rigs for characters and interactive structures) alongside procedural shaders and particles.\n"
+            f"ATOMIC 1-ENTITY-PER-`visual_asset` RULE: Each `visual_asset` item maps 1-to-1 to a SINGLE `.png` file (`assets/sprites/<id>.png`) and a single "
+            f"`AssetRequirement` entry in `asset_library.json`. Every distinct character, creature, machine, or interactive structure rig (`sprite_sheet` or `articulated_parts`) "
+            f"MUST be proposed as its own separate `visual_asset` item (1 entity/machine rig per `visual_asset` task)—NEVER bundle multiple distinct machines, characters, "
+            f"or animated rigs (e.g. '1) Machine A; 2) Machine B; 3) Machine C') into a single umbrella `visual_asset` item!\n"
             f"DEPENDENCY & ASSET BLOCKING RULES (`depends_on` and `blocks_items`):\n"
             f"- Characters, avatars, creatures, and hero props in `mechanic_code` / `integration` tasks MUST bind actual fabricated sprites or articulated rigs—never primitive `draw_circle`/`draw_rect` stickmen.\n"
             f"- When you raise a `mechanic_code` or `integration` task that requires a character rig, surface texture, or discrete sprite, either include that `visual_asset` item in `depends_on` (proposing the `visual_asset` item in the same turn if it is not on the board yet), OR let the Task Lead spawn it on Turn 0 with `wait_for_spawned_tasks=True`.\n"
@@ -1259,7 +1331,7 @@ class CreativeWritersRoom:
                 return []
             return self.board.validate_proposals(p.backlog_additions) + self._unsupported_kind_issues(p.backlog_additions)
 
-        return self._structured_with_validation(prompt + "\n" + board_block, WritersRoomTurnProposal, _validate)
+        return self._structured_with_validation(prompt + "\n" + board_block, turn_schema, _validate)
 
     # ------------------------------------------------------------------
     # Production Board: proof review, revision-cap decisions and backlog draining
@@ -1348,16 +1420,32 @@ class CreativeWritersRoom:
                 raise StudioAgentError(f"Proof image for item '{item.item_id}' is missing on disk: {path}")
             suffix = path.suffix.lower()
             mime = "image/jpeg" if suffix in (".jpg", ".jpeg") else "image/png"
-            is_filmstrip = "filmstrip" in path.name.lower()
-            filmstrip_note = (
-                " [QA CONTACT SHEET: Each cell shows the 16:9 game viewport inside a thin slate border; the top strip ('[QA] tick N in:[...]') "
-                "and bottom strip ('[QA] pos=(...) ...') outside each 16:9 frame are external QA test-harness annotations provided FOR THE COUNCIL "
-                "to verify simulation ticks, inputs, and live engine state—they are NOT inside the game viewport and must NEVER be flagged as in-game debug text]"
-                if is_filmstrip
-                else ""
-            )
+            name_lower = path.name.lower()
+            is_filmstrip = "filmstrip" in name_lower
+            is_plate = name_lower.startswith("plate_")
+            is_anim_sheet = name_lower.startswith("anim_sheet_") or name_lower.startswith("anim_rig_")
+            if is_filmstrip:
+                proof_note = (
+                    " [QA CONTACT SHEET: Each cell shows the 16:9 game viewport inside a thin slate border; the top strip ('[QA] tick N in:[...]') "
+                    "and bottom strip ('[QA] pos=(...) ...') outside each 16:9 frame are external QA test-harness annotations provided FOR THE COUNCIL "
+                    "to verify simulation ticks, inputs, and live engine state—they are NOT inside the game viewport and must NEVER be flagged as in-game debug text]"
+                )
+            elif is_plate:
+                proof_note = (
+                    " [QA ALPHA INSPECTION PLATE: The side-by-side dark/light square checkerboard grids and cyan bounding-box rectangle are external QA "
+                    "test-harness backgrounds drawn behind/around the transparent PNG to verify alpha cutout cleanliness—they are NOT inside the sprite PNG file "
+                    "and must NEVER be flagged as cross-hatch/grid/box artifacts!]"
+                )
+            elif is_anim_sheet:
+                proof_note = (
+                    " [QA ANIMATION CONTACT SHEET: The dark square checkerboard grid, cyan cell borders, and horizontal yellow/gold baseline ruler lines "
+                    "at the bottom of each frame are external QA test-harness alignment guides—they are NOT inside the sprite sheet PNG file and must NEVER "
+                    "be flagged as yellow line or checkerboard artifacts!]"
+                )
+            else:
+                proof_note = ""
             parts.append(
-                f"PROOF IMAGE for item '{item.item_id}' (revision {latest.revision_index + 1}, file {path.name}){filmstrip_note}:"
+                f"PROOF IMAGE for item '{item.item_id}' (revision {latest.revision_index + 1}, file {path.name}){proof_note}:"
             )
             parts.append(types.Part.from_bytes(data=path.read_bytes(), mime_type=mime))
         if not latest.proof_paths:
@@ -1386,14 +1474,18 @@ class CreativeWritersRoom:
     def _role_review_mandate(role: str) -> str:
         if role == "UXExperienceDesigner":
             return (
-                "ROLE MANDATE (UXExperienceDesigner): You have VETO power over UI/UX and new-player legibility. Put yourself in the shoes of a brand-new "
-                "player seeing this screen for the first time: can they tell what their role/goal is, which structures are interactive, and what is "
-                "world vs. HUD? Evaluate the proof against the UI, HUD, and onboarding approach designed in the Game Bible. Immediately `request_changes` "
-                "if HUD widgets are placed in world-space where the player avatar can walk behind or collide with them (HUD must live on a `CanvasLayer`), "
-                "if a proof shows internal QA test-runner strings (e.g. 'HEADLESS MECHANICS', 'ALL PASS') drawn INSIDE the 16:9 game viewport, or if UI "
-                "panels occlude the playable center. "
-                "IMPORTANT: The thin header bar ('[QA] tick N in:[...]') and footer bar ('[QA] pos=...') outside each 16:9 frame in `filmstrip_*.png` "
-                "are external QA Test Harness contact-sheet margins added FOR THE COUNCIL—do NOT flag those external frame caption bars as in-game HUD defects.\n"
+                "ROLE MANDATE (UXExperienceDesigner): You have VETO power over UI/UX and empathetic new-player legibility. Put yourself in the shoes of a "
+                "brand-new player seeing this screen for the first time with zero external instructions: can they tell what they are doing and why "
+                "(purpose/stakes), which objects are interactive, how their actions causally affect the world, and what is world vs. HUD? Evaluate the proof "
+                "against the UI, HUD, and onboarding strategy (`onboarding_plan`) designed in the Game Bible. Immediately `request_changes` if the game "
+                "relies on hidden/unexplained keys with no discoverable affordance, if onboarding steps can only be skipped via a fake key/setup shortcut "
+                "instead of performing the actual in-world action, if a blocked/locked state freezes the player with no clear feedback on "
+                "why or how to unblock it, if HUD widgets are placed in world-space where the player avatar can walk behind or collide with them (HUD must "
+                "live on a `CanvasLayer`), if a proof shows internal QA test-runner strings (e.g. 'HEADLESS MECHANICS', 'ALL PASS') drawn INSIDE the 16:9 "
+                "game viewport, or if UI panels occlude the playable center. "
+                "IMPORTANT: The thin header bar ('[QA] tick N in:[...]') and footer bar ('[QA] pos=...') outside each 16:9 frame in `filmstrip_*.png`, "
+                "as well as the dark/light checkerboard, cyan bounding boxes, and yellow baseline ruler lines in `plate_*.png` and `anim_sheet_*.png`, "
+                "are external QA Test Harness overlays added FOR THE COUNCIL—do NOT flag those external QA overlays as in-game HUD or sprite defects.\n"
             )
         if role == "VisualArtDirector":
             return (
@@ -1403,16 +1495,20 @@ class CreativeWritersRoom:
                 "`TEXTURE_REPEAT_ENABLED`, `Line2D` strip textures with `LINE_TEXTURE_TILE`), custom `ShaderMaterial`s, environmental decals, and `GPUParticles2D`—NEVER "
                 "solid flat-colored untextured `Polygon2D` slabs, blank white/monochrome backgrounds, or bare 8-point `Line2D` programmer-art zigzags! "
                 "Characters, avatars, creatures, and interactive world structures MUST bind actual fabricated sprites or articulated rigs from `res://assets/sprites/*.png` "
-                "and be coherently layered into the environment (not crudely pasted on top of each other). Immediately `request_changes` if a `level_map`, `mechanic_code`, "
-                "or `integration` proof renders untextured flat polygons, bare programmer-art lines, or primitive `draw_circle`/`draw_rect` stickmen/boxes. "
-                "Do NOT flag the external QA contact-sheet header/footer strips ('[QA] tick ...', '[QA] pos=...') outside each 16:9 frame as in-game text.\n"
+                "and be coherently layered into the environment (not crudely pasted on top of each other, and never duplicated across overlapping scripts). Immediately `request_changes` if a `level_map`, `mechanic_code`, "
+                "or `integration` proof renders untextured flat polygons, bare programmer-art lines, duplicate overlapping structures, or primitive `draw_circle`/`draw_rect` stickmen/boxes. "
+                "IMPORTANT: In `plate_*.png` and `anim_sheet_*.png` / `anim_rig_*.png`, the dark/light square checkerboard grids, cyan bounding-box borders, and horizontal yellow/gold "
+                "baseline ruler lines at the bottom of frames are external QA test-harness overlays drawn behind/around the transparent PNG—NEVER flag the QA checkerboard, cyan border, "
+                "or yellow baseline guide line as a sprite artifact! Likewise, do NOT flag the external QA contact-sheet header/footer strips ('[QA] tick ...', '[QA] pos=...') outside each 16:9 frame as in-game text.\n"
             )
-        if role in ("GameplayDesigner", "GameplaySystemsEngineer"):
+        if role in ("GameplayDesigner", "GameplaySystemsEngineer", "LevelAndProgressionDesigner", "CreativeDirector"):
             return (
-                f"ROLE MANDATE ({role}): You have VETO power over gameplay authenticity. Immediately `request_changes` if the proof filmstrip shows "
-                "static/non-interactive frames where an action should occur, or if state transitions are not causally driven by player inputs. "
+                f"ROLE MANDATE ({role}): You have VETO power over gameplay authenticity, whole-game loop depth, unsolved t=0 baselines, and causal player agency tailored to the Target Player's Steam DNA. Immediately `request_changes` if:\n"
+                "  1. A `mechanic_code`, `level_map`, or `integration` proof starts already pre-connected, pre-built, or pre-solved in Frame 1 (t=0..20) before any player input is applied (violating `test_unsolved_baseline_t0`), or reduces the game into a static pre-wired diorama or a single-solution 1-click lock-and-key tutorial instead of delivering the larger point of the game (`core_loop` across moment-to-moment, minute-to-minute, and session loops, `player_agency_and_optimization_depth`, and escalating `goal_hierarchy`).\n"
+                "  2. State transitions across frames are not causally driven by player inputs (`[QA] tick ... in:[...]` or mouse clicks), or if an input action / setup call teleports or forces the world/onboarding step directly to a solved state by bypassing intermediate mechanics or prerequisites.\n"
+                "  3. A multi-screen world (`world_bounds` larger than the 1280x720 viewport) lacks working camera navigation/panning or leaves core player verbs and mid/long-term progression from the Game Bible unimplemented.\n"
                 "Use the external QA contact-sheet header/footer strips ('[QA] tick ... in:[...]', '[QA] pos=(...) ...') above and below each 16:9 frame "
-                "as ground-truth engine telemetry to verify coordinates and state changes—never flag those external QA margin strips as in-game debug text.\n"
+                "as ground-truth engine telemetry to verify coordinates, inputs, and state changes—never flag those external QA margin strips (or the external checkerboard, cyan border, and yellow baseline guide line in `plate_*.png` / `anim_sheet_*.png`) as defects.\n"
             )
         return ""
 
@@ -1542,7 +1638,7 @@ class CreativeWritersRoom:
                         issues.extend(self._unsupported_kind_issues(c.split_items))
             return issues
 
-        return self._structured_with_validation(prompt, ReviewBatch, _validate, parts=parts)
+        return self._structured_with_validation(prompt, ReviewBatch, _validate, temperature=0.3, parts=parts)
 
     def _run_review_round(
         self,
@@ -1900,13 +1996,14 @@ class CreativeWritersRoom:
             f"4. Synthesized 16:9 Visual Mockup board(s),\n"
             f"5. Cohesive World Lore, Audio direction, and Characters/Entities as appropriate to the game concept,\n"
             f"6. A Technical Architecture Blueprint (`technical_architecture_blueprint`) from GameplaySystemsEngineer translating mechanics into Godot 4 nodes, procedural/shader or sprite rendering, colliders, and test invariants.\n"
-            f"7. A COHESIVE WHOLE GAME, not a single scene: a Level Generation Strategy (how levels are produced and what they look like), a Core Loop at three time scales, "
-            f"an Engagement Plan, an Onboarding Plan, and a Goal Hierarchy spanning short-, mid- and long-term goals. They must agree with one another: the onboarding must teach the "
-            f"core loop's verbs, the level archetypes must exercise those verbs and escalate difficulty, and every short-term goal must serve a long-term goal. "
+            f"7. A COHESIVE WHOLE GAME (NEVER A TINY TUTORIAL SLICE): a Level Generation Strategy (how levels are produced and what they look like), a Core Loop at three time scales "
+            f"(moment-to-moment, minute-to-minute, and session loops, plus `player_agency_and_optimization_depth`), an Engagement Plan, an Onboarding Plan (where onboarding is ONLY the opening 60 seconds, never the whole game), "
+            f"and a Goal Hierarchy spanning short-, mid- and long-term goals. Do NOT lock the Bible if `slice_roadmap` or the Production Board items shrink the build into 'the smallest slice possible' "
+            f"(e.g. a 4-step tutorial or a 1-step connection) while deferring the actual minute-to-minute/session loop and systemic depth to unbuilt future slices! "
             f"Current structural gaps: {validate_game_design(game_bible) or 'none'}.\n"
             f"Return your structured DirectorConvergenceCheck with `deliberation` FIRST."
         )
-        return self._call_structured_llm(prompt, DirectorConvergenceCheck, temperature=0.9)
+        return self._call_structured_llm(prompt, DirectorConvergenceCheck, temperature=0.4)
 
     def _synthesize_final_world_spec(self, game_bible: GameBibleSpec, dna: Optional[SteamPlayerDNA], target_episode: int) -> GenesisWorldSpec:
         """Synthesizes the authoritative GenesisWorldSpec grounded in the locked Living Game Bible."""
@@ -2086,8 +2183,8 @@ class CreativeWritersRoom:
             (
                 f"You are the CreativeDirector preparing Episode {target_episode}'s Writers' Room. NO game has been chosen yet.\n"
                 f"Write one creative provocation for each specialist role in {roles}. Provocations must be mutually orthogonal "
-                f"(each opens a different creative axis), phrased as open prompts/constraints/questions — not genre labels, not existing "
-                f"game names, and deliberately outside conventional game-concept space.\n"
+                f"(each opens a different creative axis), phrased as clear, concrete design questions or constraints — not genre labels, not existing "
+                f"game names, and grounded in tangible, playable experiences rather than obscure academic jargon.\n"
                 f"{prior_clause}{seed_clause}"
                 f"PLAYER TASTE CONTEXT (signals of what they value; do not imitate):\n{dna_summary}\n"
                 f"Provide `deliberation` FIRST."
@@ -2113,8 +2210,9 @@ class CreativeWritersRoom:
                     f"YOUR PROVOCATION: {provocation_by_role[role]}\n"
                     f"{prior_clause}{seed_clause}"
                     f"PLAYER TASTE CONTEXT (signals of what they value; do not imitate or mash up titles):\n{dna_summary}\n\n"
-                    f"Contribute 2 independent concept fragments from YOUR domain, each a vivid, surprising seed (an interaction verb or system, "
-                    f"a world tension, an emotional experience, a structural constraint, a sensory signature). Do NOT pitch a complete game, do "
+                    f"Contribute 2 independent concept fragments from YOUR domain, each a clear, concrete, immediately understandable seed "
+                    f"(a tactile interaction verb or system, a tangible world tension, an emotional experience, a structural constraint, or a sensory signature). "
+                    f"Use plain, vivid language—avoid pretentious pseudo-scientific or academic buzzword salad. Do NOT pitch a complete game, do "
                     f"NOT coordinate with other specialists, and avoid anything resembling the prior concepts. Provide `deliberation` FIRST."
                 ),
                 ConceptSeedProposal,
@@ -2161,9 +2259,11 @@ class CreativeWritersRoom:
             collision = self._structured_with_validation(
                 (
                     f"You are the CreativeDirector. The room has contributed these independent fragments:\n{frag_block}\n\n"
-                    f"Collide fragments from DIFFERENT specialists into 4 candidate premises that are distinct from one another and from the "
-                    f"prior concepts. Each candidate must combine at least two fragments and yield something none implied alone. Premises are "
-                    f"provisional starting points the room will evolve, not finished designs.\n"
+                    f"Synthesize fragments from DIFFERENT specialists into 4 candidate game premises that are distinct from one another and from the "
+                    f"prior concepts. Each candidate must combine at least two fragments into a coherent, grounded, immediately playable game concept "
+                    f"where a human player can instantly picture what they do on screen, what they build/control/fight, and why it is fun. "
+                    f"Write titles and premises in clear, accessible language—NEVER string together obscure scientific or academic jargon into a word salad. "
+                    f"Premises are provisional starting points the room will evolve, not finished designs.\n"
                     f"{prior_clause}{seed_clause}{overlap_feedback}"
                     f"Provide `deliberation` FIRST; each candidate needs a unique `candidate_id`."
                 ),
@@ -2218,8 +2318,9 @@ class CreativeWritersRoom:
         selection = self._structured_with_validation(
             (
                 f"You are the CreativeDirector choosing the PROVISIONAL starting premise.\n{cand_block}\n\n"
-                f"Choose the candidate with the greatest potential to evolve into something fresh, coherent and buildable once the room "
-                f"pressure-tests it. Write `opening_dialogue` presenting it to the room as a draft to be challenged and reshaped, "
+                f"Choose the candidate that is clearest, most coherent, and has the strongest potential to become a genuinely fun, playable 2D game once the room "
+                f"pressure-tests it (reject any candidate that sounds like abstract academic jargon or a confusing mashup of buzzwords). "
+                f"Write `opening_dialogue` in plain, direct language presenting what the player actually does and why it is compelling as a draft to be challenged and reshaped, "
                 f"and name which specialists should challenge it first. Provide `deliberation` FIRST and `selected_candidate_id` last."
             ),
             ConceptSelection,
@@ -2266,6 +2367,13 @@ class CreativeWritersRoom:
 
         dna_summary = self._format_dna_summary(dna, hypothesis_report)
         if creative_prompt and creative_prompt.strip():
+            self._active_creative_prompt = creative_prompt.strip()
+        elif existing_bible is not None and existing_bible.concept_evolution:
+            first_prev = (existing_bible.concept_evolution[0].previous_premise or "").strip()
+            self._active_creative_prompt = first_prev if first_prev != "Untitled Concept" else ""
+        else:
+            self._active_creative_prompt = ""
+        if creative_prompt and creative_prompt.strip():
             dna_summary = (
                 f"{dna_summary}\n"
                 f"- EXECUTIVE PRODUCER CREATIVE SEED / DIRECTION: {creative_prompt.strip()}"
@@ -2274,6 +2382,10 @@ class CreativeWritersRoom:
         if existing_bible is not None:
             game_bible = existing_bible
             game_bible.status = "brainstorming"
+            if dna is not None or not getattr(game_bible, "target_player_dna_summary", ""):
+                game_bible.target_player_dna_summary = dna_summary
+            elif getattr(game_bible, "target_player_dna_summary", ""):
+                dna_summary = game_bible.target_player_dna_summary
         else:
             game_bible = GameBibleSpec(
                 deliberation="Initializing Living Game Bible for open-ended multi-agent Writers' Room.",
@@ -2282,6 +2394,7 @@ class CreativeWritersRoom:
                 status="brainstorming",
                 game_title="Untitled Concept",
                 core_genre=(dna.top_genres[0] if (dna and getattr(dna, "top_genres", None)) else "indie_experience"),
+                target_player_dna_summary=dna_summary,
                 elevator_pitch=(creative_prompt.strip() if (creative_prompt and creative_prompt.strip()) else ""),
             )
 
@@ -2479,19 +2592,29 @@ class CreativeWritersRoom:
                 if game_bible.core_loop and game_bible.core_loop.moment_to_moment_loop
                 else "acclimating to the world and learning the core mechanics"
             )
+            min2min = (
+                game_bible.core_loop.minute_to_minute_loop
+                if game_bible.core_loop and game_bible.core_loop.minute_to_minute_loop
+                else ""
+            )
+            sess_loop = (
+                game_bible.core_loop.session_loop
+                if game_bible.core_loop and game_bible.core_loop.session_loop
+                else ""
+            )
             game_bible.slice_roadmap = [
                 GameSliceSpec(
                     deliberation=(
-                        "Strategizing Slice 0 from the locked Onboarding Plan and Core Loop so the first iteration "
-                        "focuses on getting the player acclimated to the world and understanding the mechanics."
+                        "Strategizing Slice 0 as the complete playable game experience realizing all three timescales of the Core Loop "
+                        "(moment-to-moment, minute-to-minute, and session loops), player agency/optimization depth, and multi-horizon Goal Hierarchy."
                     ),
-                    slice_id="slice_0_acclimation",
+                    slice_id="slice_0_full_core_loop",
                     slice_index=0,
-                    title=f"{game_bible.game_title} — Slice 0: World Acclimation & Core Mechanics",
-                    slice_objective=onb_intro,
-                    player_acclimation_and_mechanics_focus=f"Player verbs ({verbs_str}) and moment-to-moment loop: {m2m}",
-                    expansion_from_prior_slice="Foundational first slice establishing world acclimation and core mechanics.",
-                    scope_boundaries=["Generate and wire ONLY the assets, animations, and systems required for Slice 0."],
+                    title=f"{game_bible.game_title} — Full Core Loop & Progression Experience",
+                    slice_objective=f"{onb_intro} | Minute-to-minute: {min2min} | Session: {sess_loop}".strip(" |"),
+                    player_acclimation_and_mechanics_focus=f"Player verbs ({verbs_str}), moment-to-moment ({m2m}), minute-to-minute ({min2min}), and session loop ({sess_loop})",
+                    expansion_from_prior_slice="Complete playable game loop establishing onboarding in the opening 60s and opening immediately into multi-stage systemic gameplay and goal progression.",
+                    scope_boundaries=["Build and wire the complete core loop, player toolkit, multi-region world progression, and short/mid/long-term goals."],
                     status="active",
                 )
             ]

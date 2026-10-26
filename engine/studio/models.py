@@ -199,6 +199,14 @@ class StudioOrchestratorConfig(BaseEpistemicModel):
     )
     board_workers: int = Field(default=2, description="Maximum concurrent Production Board workers.")
     max_item_revisions: int = Field(default=5, description="Default revision cap per backlog item before the council must decide.")
+    dataset_name: str = Field(
+        default="",
+        description="Optional dataset/run name injected into Gemini API request labels (`dataset`, `run_id`) for filtering and creating datasets in Google AI Studio Logs.",
+    )
+    store_logs: bool = Field(
+        default=True,
+        description="When True, sets `store=True` on Gemini API `generate_content` requests so logs are stored in Google AI Studio for dataset curation.",
+    )
 
 
 class AgentPlan(BaseEpistemicModel):
@@ -892,6 +900,22 @@ class AssetRequirement(BaseEpistemicModel):
         default=(64, 64),
         description="Target world-space display dimensions (width, height) in pixels if visual asset."
     )
+    grid_cols: int = Field(
+        default=1,
+        ge=1,
+        le=16,
+        description="Number of horizontal grid columns (hframes) when fabricating a multi-cell sheet/atlas of distinct states, icons, stages, or variants (1 for a single asset).",
+    )
+    grid_rows: int = Field(
+        default=1,
+        ge=1,
+        le=16,
+        description="Number of vertical grid rows (vframes) when fabricating a multi-cell sheet/atlas of distinct states, icons, stages, or variants (1 for a single asset).",
+    )
+    cell_prompts: List[str] = Field(
+        default_factory=list,
+        description="When grid_cols * grid_rows > 1 and the task requires distinct visual states, icons, stages, or variants in each grid cell (rather than a cyclical character deformation), provide the specific visual prompt for each cell in row-major order (top-left to bottom-right, length == grid_cols * grid_rows).",
+    )
     animation_states: List[AnimationStateSpec] = Field(
         default_factory=list,
         description="Optional multi-pose animation states when fabricating an animated sprite sheet."
@@ -1095,7 +1119,12 @@ class RequirementTrack(BaseEpistemicModel):
                 sanitized = []
                 for m in out["target_modules"]:
                     if isinstance(m, str):
-                        s = m.replace(".py", ".gd")
+                        s = m.strip().replace("\\", "/")
+                        if s.startswith("res://"):
+                            s = s[len("res://"):]
+                        elif s.startswith("res:/"):
+                            s = s[len("res:/"):]
+                        s = s.lstrip("/").replace(".py", ".gd")
                         sanitized.append(s)
                     else:
                         sanitized.append(m)
@@ -1152,12 +1181,26 @@ class ModuleFileSpec(BaseEpistemicModel):
     )
     filename: str = Field(
         ...,
-        description="Relative file path within cartridge (e.g. 'main.gd', 'mechanics.gd', 'entities.gd', 'scenes.gd', 'ui_hud.gd', 'project.godot', 'main.tscn')."
+        description="Relative file path within cartridge without 'res://' prefix (e.g. 'main.gd', 'mechanics.gd', 'entities.gd', 'scenes.gd', 'ui_hud.gd', 'project.godot', 'main.tscn')."
     )
     content: str = Field(
         ...,
         description="Complete, syntactically valid source code or configuration for this module."
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_filename(cls, data: Any) -> Any:
+        if isinstance(data, dict) and isinstance(data.get("filename"), str):
+            out = dict(data)
+            fn = out["filename"].strip().replace("\\", "/")
+            if fn.startswith("res://"):
+                fn = fn[len("res://"):]
+            elif fn.startswith("res:/"):
+                fn = fn[len("res:/"):]
+            out["filename"] = fn.lstrip("/")
+            return out
+        return data
 
 
 class TrackCodeSynthesisPayload(BaseEpistemicModel):
@@ -1167,6 +1210,14 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
     deliberation: str = Field(
         ...,
         description="MANDATORY FIRST PROPERTY: Epistemic rationale explaining the architectural decisions, Godot 4 node composition, and track requirement fulfillment."
+    )
+    self_question_answer: str = Field(
+        default="",
+        description="If you asked a `self_question` on the previous turn, write your concise, factual answer here FIRST based on the retrieved context chunks (citing exact method/signal/variable names) before writing `files`.",
+    )
+    self_question: str = Field(
+        default="",
+        description="Optional self-inquiry: If you lack critical context (e.g. an imported script's exact method/signal signature, node structure, shader uniforms, or design spec) needed to write code without guessing, output your specific question here and leave `files` empty (`[]`). ContextCuratorAgent will fetch the needed context chunks so you can answer your own question on the next turn.",
     )
     requested_assets: List[AssetRequirement] = Field(
         default_factory=list,
@@ -1203,6 +1254,15 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
                 voice_agent=voice_agent,
             )
             if self.requested_assets:
+                try:
+                    from engine.studio.workers import record_turn_substep
+                    record_turn_substep(
+                        "generating_asset",
+                        f"Generating on-demand asset(s): {', '.join(getattr(a, 'asset_id', 'asset') for a in self.requested_assets)}",
+                        details={"assets": [getattr(a, "asset_id", "") for a in self.requested_assets]},
+                    )
+                except Exception:
+                    pass
                 fabricated = lib.fabricate_assets(self.requested_assets)
                 results.update(fabricated)
             lib.save_catalog()
@@ -1248,12 +1308,27 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
             )
             results["project.godot"] = project_godot
 
-        # 3. Write synthesized module files
+        # 3. Write synthesized module files (always strip any accidental 'res://' prefix)
         for fspec in self.files:
-            file_path = target_dir / fspec.filename
+            rel_fname = fspec.filename.strip().replace("\\", "/")
+            if rel_fname.startswith("res://"):
+                rel_fname = rel_fname[len("res://"):]
+            elif rel_fname.startswith("res:/"):
+                rel_fname = rel_fname[len("res:/"):]
+            rel_fname = rel_fname.lstrip("/")
+            file_path = target_dir / rel_fname
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(fspec.content, encoding="utf-8")
-            results[fspec.filename] = file_path
+            results[rel_fname] = file_path
+            try:
+                from engine.studio.workers import record_turn_substep
+                record_turn_substep(
+                    "editing_file",
+                    f"Editing file {rel_fname} ({len(fspec.content.splitlines())} lines)",
+                    details={"file": rel_fname, "lines": len(fspec.content.splitlines())},
+                )
+            except Exception:
+                pass
 
         # 3b. Enforce HiDPI Retina window sizing & resizable=true even if LLM overwrote project.godot
         if project_godot.is_file():
@@ -1274,6 +1349,14 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
             and swe_agent._is_live_genai_client()
             and any(f.filename.endswith(".gd") for f in self.files)
         ):
+            try:
+                from engine.studio.workers import record_turn_substep
+                record_turn_substep(
+                    "running_tests",
+                    "Running headless Godot compiler syntax & probe verification",
+                )
+            except Exception:
+                pass
             healed = swe_agent._verify_and_heal_godot_syntax_and_probes(target_dir)
             results.update(healed)
 
@@ -1719,7 +1802,7 @@ class MechanicEngineeringSpec(BaseEpistemicModel):
     )
     required_sprite_and_tile_assets: List[str] = Field(
         default_factory=list,
-        description="Required visual asset specs in format '<asset_id>:<prop|sprite_sheet|articulated_rig|tile>:<visual description>' combining discrete entity rigs/sprites with seamless surface textures, spline strips, and environmental decals that procedural geometry/terrain generators bind at runtime.",
+        description="Required visual asset specs in format '<asset_id>:<prop|sprite_sheet|articulated_rig|tile>:<visual description>' where EACH distinct character, creature, machine, or interactive structure rig is its own separate entry (1 entity/machine rig per PNG asset—never bundle multiple machines or characters into one asset_id).",
     )
     falsifiable_test_invariants: List[str] = Field(
         default_factory=list,
@@ -1759,33 +1842,33 @@ class WritersRoomUtterance(BaseEpistemicModel):
 
 class GameSliceSpec(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
-    A single playable vertical slice of the game strategized by the Council for iterative development.
+    A playable vertical slice of the game strategized by the Council.
     """
     deliberation: str = Field(
         ...,
-        description="MANDATORY FIRST PROPERTY: Strategic rationale for why this slice is scoped this way for this specific game, how it acclimates the player or expands prior slices, and what stays out of scope until later iterations.",
+        description="MANDATORY FIRST PROPERTY: Strategic rationale for how this slice delivers the larger point of the game—realizing the full CoreLoopSpec (moment-to-moment, minute-to-minute, and session loops), player agency/optimization depth, and multi-horizon GoalHierarchy rather than shrinking the game into a trivial tutorial stub.",
     )
-    slice_id: str = Field(..., description="Unique snake_case identifier for this slice (e.g. 'slice_1_world_acclimation').")
+    slice_id: str = Field(..., description="Unique snake_case identifier for this slice (e.g. 'slice_0_full_core_loop').")
     slice_index: int = Field(
         default=0,
-        description="0-based iteration order (0 = complete playable vertical slice realizing the Game Bible's camera, world progression, core loop, UX onboarding, and audio; 1+ = iterative expansions).",
+        description="0-based iteration order (0 = complete playable game experience realizing the Game Bible's camera, world progression, full 3-timescale core loop, player agency/toolkit, multi-horizon goals, UX onboarding, and audio; 1+ = optional post-launch expansions).",
     )
     title: str = Field(..., description="Concise title for this playable slice.")
     slice_objective: str = Field(
         ...,
-        description="What this slice achieves as a self-contained, genuinely playable experience in the game (never a 1-object static test box).",
+        description="What this slice achieves as a complete, genuinely playable game experience fulfilling the larger point of the concept (NEVER a 1-step tutorial, a 1-connection lock-and-key room, or a pre-built diorama).",
     )
     player_acclimation_and_mechanics_focus: str = Field(
         default="",
-        description="How this slice acclimates the player to the world and teaches/exercises the mechanics in play (devised specifically for this game, never from a fixed menu).",
+        description="How the opening 60 seconds acclimate the player and immediately open into the full moment-to-moment, minute-to-minute, and session gameplay loop where the player builds, experiments, strategizes, and pursues escalating goals.",
     )
     expansion_from_prior_slice: str = Field(
         default="",
-        description="For iteration >= 1, how this slice expands the playable world, mechanics, or progression built in the previous slice.",
+        description="How this slice realizations or expands the playable world, systemic toolkit, and goal progression.",
     )
     scope_boundaries: List[str] = Field(
         default_factory=list,
-        description="Explicit boundaries of what is IN scope for this slice vs deferred to future slices so only the assets and code needed for this slice are built now.",
+        description="Concrete playable systems, player toolkit/capabilities, world regions/progression tiers, and escalating goals that MUST be built and playable now so the larger point of the game (`core_loop` across all 3 time scales and `goal_hierarchy`) is genuinely realized in play (NEVER defer the core loop, player construction/strategy depth, or mid/long-term progression to unbuilt future slices!).",
     )
     status: Literal["planned", "active", "completed"] = Field(
         default="planned",
@@ -1822,6 +1905,8 @@ class WritersRoomTurnProposal(BaseEpistemicModel):
     gameplay_pillars_additions: List[str] = Field(default_factory=list)
     added_or_updated_engineering_specs: List[MechanicEngineeringSpec] = Field(default_factory=list)
     visual_style_guide_update: Optional[str] = Field(default=None)
+    updated_color_palette_hex: List[str] = Field(default_factory=list)
+    added_or_updated_scene_layers: List[VisualSceneLayerSpec] = Field(default_factory=list)
     audio_direction_update: Optional[str] = Field(default=None)
     updated_level_generation_strategy: Optional[LevelGenerationStrategy] = Field(default=None)
     updated_core_loop: Optional[CoreLoopSpec] = Field(default=None)
@@ -1830,9 +1915,105 @@ class WritersRoomTurnProposal(BaseEpistemicModel):
     updated_goal_hierarchy: Optional[GoalHierarchy] = Field(default=None)
     added_or_updated_slices: List[GameSliceSpec] = Field(
         default_factory=list,
-        description="Iterative playable slices strategized for this game. Slice 0 must deliver a complete, cohesive playable vertical slice (realizing the Game Bible's camera/scrolling paradigm, multi-node world progression, UX onboarding, and audio); subsequent slices iteratively expand it.",
+        description="Playable game slices strategized for this game. Slice 0 MUST deliver the complete playable game loop (realizing the full 3-timescale CoreLoopSpec, player toolkit/agency, escalating GoalHierarchy, multi-region LevelGenerationStrategy, UX onboarding, and audio)—never defer the core point of the game to unbuilt future slices!",
     )
     backlog_additions: List[WorkItemProposal] = Field(default_factory=list, description="High-level requirements for the active slice (tasks can dynamically spawn their own asset/animation/sub-mechanic tasks as needed).")
+
+    _ROLE_SCHEMA_CACHE: ClassVar[Dict[str, Type["BaseEpistemicModel"]]] = {}
+    _SHARED_TURN_FIELDS: ClassVar[Tuple[str, ...]] = (
+        "deliberation",
+        "spoken_dialogue",
+        "addressed_to",
+        "updated_game_title",
+        "updated_elevator_pitch",
+        "updated_core_fantasy",
+        "concept_evolution_milestone",
+        "added_or_updated_slices",
+        "backlog_additions",
+    )
+    _ROLE_TURN_FIELDS: ClassVar[Dict[str, Tuple[str, ...]]] = {
+        "CreativeDirector": (
+            "updated_first_60_seconds_hook",
+            "updated_diegetic_ui_philosophy",
+            "updated_camera_and_spatial_paradigm",
+            "gameplay_pillars_additions",
+            "visual_style_guide_update",
+            "audio_direction_update",
+            "added_or_updated_storyboard_beats",
+            "mockup_to_generate",
+        ),
+        "StoryWorldArchitect": (
+            "added_or_updated_cutscenes",
+            "added_or_updated_characters",
+            "added_or_updated_storyboard_beats",
+        ),
+        "ScriptwriterAgent": (
+            "added_or_updated_cutscenes",
+            "added_or_updated_dialogue_trees",
+            "added_or_updated_barks",
+            "added_or_updated_characters",
+        ),
+        "CharacterDesigner": (
+            "added_or_updated_characters",
+            "added_or_updated_dialogue_trees",
+            "added_or_updated_barks",
+        ),
+        "GameplayDesigner": (
+            "gameplay_pillars_additions",
+            "updated_core_loop",
+            "updated_engagement_plan",
+            "updated_first_60_seconds_hook",
+        ),
+        "LevelAndProgressionDesigner": (
+            "updated_level_generation_strategy",
+            "updated_goal_hierarchy",
+        ),
+        "GameplaySystemsEngineer": (
+            "added_or_updated_engineering_specs",
+            "updated_camera_and_spatial_paradigm",
+            "gameplay_pillars_additions",
+        ),
+        "VisualArtDirector": (
+            "visual_style_guide_update",
+            "updated_camera_and_spatial_paradigm",
+            "updated_color_palette_hex",
+            "added_or_updated_scene_layers",
+            "mockup_to_generate",
+        ),
+        "UXExperienceDesigner": (
+            "updated_first_60_seconds_hook",
+            "updated_diegetic_ui_philosophy",
+            "updated_onboarding_plan",
+            "added_or_updated_storyboard_beats",
+        ),
+        "AudioAtmosphereDesigner": (
+            "audio_direction_update",
+            "added_or_updated_barks",
+        ),
+    }
+
+    @classmethod
+    def for_role(cls, role: Optional[str] = None) -> Type["BaseEpistemicModel"]:
+        """Returns a role-scoped Pydantic schema class (named `WritersRoomTurnProposal`) containing the shared
+        Writers' Room turn fields plus the domain fields owned by `role`, keeping `$defs` and total properties
+        well within Gemini's structured-output schema state limits."""
+        from pydantic import create_model
+
+        key = (role or "CreativeDirector").strip() or "CreativeDirector"
+        cached = cls._ROLE_SCHEMA_CACHE.get(key)
+        if cached is not None:
+            return cached
+        role_specific = cls._ROLE_TURN_FIELDS.get(key, cls._ROLE_TURN_FIELDS["CreativeDirector"])
+        keep_fields = list(dict.fromkeys(cls._SHARED_TURN_FIELDS + role_specific))
+        field_defs: Dict[str, Any] = {}
+        for fname in keep_fields:
+            if fname in cls.model_fields:
+                finfo = cls.model_fields[fname]
+                field_defs[fname] = (finfo.annotation, finfo)
+        scoped_cls = create_model("WritersRoomTurnProposal", __base__=BaseEpistemicModel, **field_defs)
+        scoped_cls.model_rebuild(_types_namespace=globals())
+        cls._ROLE_SCHEMA_CACHE[key] = scoped_cls
+        return scoped_cls
 
 
 class DirectorConvergenceCheck(BaseEpistemicModel):
@@ -1965,6 +2146,10 @@ class CoreLoopSpec(BaseEpistemicModel):
     """
     deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this loop is compelling and how its scales reinforce one another.")
     player_verbs: List[str] = Field(default_factory=list, description="The actions the player performs.")
+    player_agency_and_optimization_depth: str = Field(
+        default="",
+        description="How the player exercises open-ended agency, creative construction/expression, and iterative optimization tailored to the target player's Steam DNA (e.g. why there is no single scripted 'correct' solution, how the player builds/experiments/optimizes their own approach, and what live efficiency/performance feedback rewards mastery).",
+    )
     moment_to_moment_loop: str = Field(..., description="Seconds-scale loop: act -> world response -> feedback -> next decision.")
     minute_to_minute_loop: str = Field(..., description="Minutes-scale loop: objectives, encounters, resource flow.")
     session_loop: str = Field(..., description="Whole-session loop: how a play session starts, builds and ends, and why the player returns.")
@@ -2000,8 +2185,19 @@ class OnboardingPlan(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     How the player is introduced to the world and the mechanics.
     """
-    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: How the introduction builds understanding, curiosity and confidence.")
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Empathetic evaluation from the perspective of a brand-new player who has zero prior context: what might confuse them at first glance, and how this introduction builds clear purpose ('why am I doing this?'), causal understanding ('how do my actions affect the world?'), and confidence.",
+    )
     world_introduction: str = Field(..., description="How the player first meets the world, their role and the stakes.")
+    purpose_and_stakes_framing: str = Field(
+        default="",
+        description="Strategy for how THIS game makes the player's goal, motivation, and stakes immediately understandable on screen without relying on external knowledge.",
+    )
+    causal_chain_and_feedback_strategy: str = Field(
+        default="",
+        description="Strategy for how the player visually and physically perceives the causal link between their controls, the world's response, and their objective—including how the game responds when a naive player tries an action whose precondition is not yet met.",
+    )
     steps: List[OnboardingStep] = Field(default_factory=list, description="Ordered teaching steps, each introducing one concept.")
     confusion_recovery: str = Field(default="", description="How a stuck or lost player is gently helped.")
 
@@ -2079,6 +2275,10 @@ class GameBibleSpec(BaseEpistemicModel):
     )
     game_title: str = Field(default="Untitled Concept")
     core_genre: str = Field(default="unclassified")
+    target_player_dna_summary: str = Field(
+        default="",
+        description="Persisted Steam Player DNA profile and player-centric design alignment for the specific human player this game is being built for.",
+    )
     elevator_pitch: str = Field(default="")
     core_fantasy: str = Field(
         default="",
@@ -2119,7 +2319,7 @@ class GameBibleSpec(BaseEpistemicModel):
     goal_hierarchy: Optional[GoalHierarchy] = Field(default=None, description="Short-, mid- and long-term goals.")
     slice_roadmap: List[GameSliceSpec] = Field(
         default_factory=list,
-        description="Iterative playable vertical slices strategized specifically for this game. Slice 0 focuses on getting the player acclimated to the world and understanding the mechanics; subsequent slices iteratively expand that slice.",
+        description="Playable vertical slices strategized specifically for this game. Slice 0 must deliver the complete playable game loop (moment-to-moment, minute-to-minute, and session loops, player toolkit/agency, and escalating goals), never a tutorial-only stub.",
     )
     active_slice_index: int = Field(
         default=0,
@@ -2437,15 +2637,31 @@ class QAStateAssertion(BaseEpistemicModel):
 
 class InputSegment(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
-    Actions held down for a range of physics ticks during a scripted proof run.
+    Actions held down for a range of physics ticks (or triggered reactively when a state condition is met) during a scripted proof run.
     """
     deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: What this input segment demonstrates.")
-    from_tick: int = Field(..., description="First tick (1-based) the actions are held.")
-    to_tick: int = Field(..., description="Last tick (inclusive) the actions are held.")
+    from_tick: int = Field(..., description="First tick (1-based) the actions are held (or earliest tick to start watching `when_snapshot_key`).")
+    to_tick: int = Field(..., description="Last tick (inclusive) the actions are held (or latest tick to watch `when_snapshot_key`).")
     actions: List[str] = Field(default_factory=list, description="Input action names or KEY_* names, chosen only from the game's available actions.")
     mouse_click_pos: Optional[Tuple[float, float]] = Field(
         default=None,
         description="Optional (x, y) viewport coordinate to click at from_tick and release at to_tick.",
+    )
+    when_snapshot_key: str = Field(
+        default="",
+        description="Optional state snapshot key (e.g. from get_state_snapshot()) to watch between from_tick and to_tick; when the condition is met, the input triggers reactively instead of requiring a pre-guessed tick.",
+    )
+    when_operator: str = Field(
+        default="",
+        description="Comparison operator when `when_snapshot_key` is set ('==', '!=', '>=', '<=', '>', '<').",
+    )
+    when_value: str = Field(
+        default="",
+        description="Target value string or number to compare `when_snapshot_key` against.",
+    )
+    hold_ticks: int = Field(
+        default=5,
+        description="When `when_snapshot_key` is set, how many ticks to hold `actions` once the condition triggers.",
     )
 
 
@@ -2454,6 +2670,10 @@ class FilmstripPlan(BaseEpistemicModel):
     How to demonstrate a built mechanic/level/UI to the council: scripted inputs, scenario setup hooks, state assertions, plus the ticks to capture.
     """
     deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why these inputs, scenario setup calls, and frames best prove the item meets its spec and the council's proof request.")
+    target_scene: str = Field(
+        default="",
+        description="Optional Godot scene path (e.g. 'res://tests/test_shader.tscn') to boot instead of 'res://main.tscn' ONLY when proving an isolated subsystem test scene.",
+    )
     capture_ticks: List[int] = Field(default_factory=list, description="Ticks at which to capture a frame (1 to 12 frames).")
     input_segments: List[InputSegment] = Field(default_factory=list, description="Scripted inputs; empty means no input is applied.")
     setup_calls: List[QASetupCall] = Field(
@@ -2475,7 +2695,10 @@ class WorkItemProposal(BaseEpistemicModel):
     item_id: str = Field(..., description="Unique snake_case identifier.")
     kind: WorkItemKind = Field(..., description="Kind of work; selects the worker that builds it.")
     title: str = Field(..., description="Concise title.")
-    spec: str = Field(..., description="Exactly what must be built, with the details the implementer needs.")
+    spec: str = Field(
+        ...,
+        description="Exactly what must be built, with the details the implementer needs. For 'visual_asset' items, each item maps 1-to-1 to a single PNG file and a single AssetRequirement entry—propose a separate 'visual_asset' WorkItemProposal for each distinct character, creature, or machine rig rather than bundling multiple rigs into one item.",
+    )
     proof_spec: str = Field(..., description="The evidence (image or images) the council wants to see to judge the result, e.g. which views, states or frames.")
     depends_on: List[str] = Field(default_factory=list, description="item_ids that must be approved before this can start.")
     blocks_items: List[str] = Field(
@@ -2485,6 +2708,23 @@ class WorkItemProposal(BaseEpistemicModel):
     target_modules: List[str] = Field(default_factory=list, description="Code modules or files this will modify (used for exclusive-access locking).")
     slice_id: str = Field(default="", description="Optional slice_id of the GameSliceSpec this task belongs to (defaults to the active slice).")
     max_revisions: Optional[int] = Field(default=None, description="Optional per-item revision cap override.")
+
+    @field_validator("target_modules", mode="before")
+    @classmethod
+    def _normalize_target_modules(cls, v: Any) -> List[str]:
+        if not isinstance(v, list):
+            return []
+        cleaned: List[str] = []
+        for item in v:
+            s = str(item or "").strip().replace("\\", "/")
+            if s.startswith("res://"):
+                s = s[len("res://"):]
+            elif s.startswith("res:/"):
+                s = s[len("res:/"):]
+            s = s.lstrip("/")
+            if s and s not in cleaned:
+                cleaned.append(s)
+        return cleaned
 
 
 class ReviewDecision(BaseEpistemicModel):
@@ -2558,6 +2798,23 @@ class WorkItem(BaseEpistemicModel):
     priority: int = Field(default=0)
     decision_reason: str = Field(default="", description="Why the item is in needs_decision.")
 
+    @field_validator("target_modules", mode="before")
+    @classmethod
+    def _normalize_item_target_modules(cls, v: Any) -> List[str]:
+        if not isinstance(v, list):
+            return []
+        cleaned: List[str] = []
+        for item in v:
+            s = str(item or "").strip().replace("\\", "/")
+            if s.startswith("res://"):
+                s = s[len("res://"):]
+            elif s.startswith("res:/"):
+                s = s[len("res:/"):]
+            s = s.lstrip("/")
+            if s and s not in cleaned:
+                cleaned.append(s)
+        return cleaned
+
 
 class SpecialistReport(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
@@ -2570,6 +2827,17 @@ class SpecialistReport(BaseEpistemicModel):
     summary: str = Field(default="", description="Concrete summary of what the specialist created, modified, or verified.")
     touched_files: List[str] = Field(default_factory=list, description="Paths of assets, data files, or GDScript modules created or modified.")
     proof_images: List[str] = Field(default_factory=list, description="Proof image paths generated during this specialist step.")
+    verification_passed: bool = Field(default=True, description="Whether engine/QA verification passed on this specialist turn.")
+    code_diffs: Dict[str, str] = Field(default_factory=dict, description="Per-file unified diffs of code/scene modules modified during this turn.")
+    step_log: List[Dict[str, Any]] = Field(default_factory=list, description="Chronological log of sub-steps executed during this turn.")
+    curated_context: str = Field(default="", description="Curated context block assembled for this specialist turn.")
+    prompt_text: str = Field(default="", description="Full prompt text sent to the LLM during this turn.")
+    self_inquiries: List[Dict[str, Any]] = Field(default_factory=list, description="Internal self-inquiry questions asked and answered during this turn.")
+    lead_deliberation: str = Field(default="", description="Task Lead Strategist deliberation when planning this turn.")
+    lead_prompt_text: str = Field(default="", description="Task Lead Strategist prompt text when planning this turn.")
+    lead_curated_context: str = Field(default="", description="Task Lead Strategist curated context when planning this turn.")
+    lead_self_inquiries: List[Dict[str, Any]] = Field(default_factory=list, description="Task Lead Strategist self-inquiry Q&As during this turn.")
+    timestamp_utc: str = Field(default="", description="ISO-8601 UTC timestamp when this turn completed.")
 
 
 class ScriptWritingDeliverable(BaseEpistemicModel):
@@ -2633,9 +2901,21 @@ class TaskLeadDecision(BaseEpistemicModel):
         ...,
         description="MANDATORY FIRST PROPERTY: Step-by-step evaluation of the task requirements, current cartridge state, prior Council feedback (if any), and the results returned by specialists on previous turns.",
     )
+    self_question_answer: str = Field(
+        default="",
+        description="If you asked a `self_question` on the previous turn, write your concise, factual answer here FIRST based on the retrieved context chunks.",
+    )
+    self_question: str = Field(
+        default="",
+        description="Optional self-inquiry: If you need more context from the codebase, Game Bible, or backlog before deciding how to delegate or submit, output a specific question here. ContextCuratorAgent will fetch the needed chunks so you can answer your own question on the next turn.",
+    )
     current_strategy: str = Field(
         ...,
-        description="Bespoke, evolving strategy for accomplishing this task and proving it to the Council (state explicitly whether this turn will 'delegate' to a specific specialist_agent, 'spawn_tasks', or 'submit_to_council').",
+        description="Bespoke, evolving strategy for creating everything required by this task and proving it to the Council (state explicitly whether this turn will 'delegate' to a specific specialist_agent, 'spawn_tasks', or 'submit_to_council').",
+    )
+    proof_strategy: str = Field(
+        default="",
+        description="Explicit strategy for how the final proof artifact(s) will be generated and verified to satisfy `proof_spec` (e.g., isolated asset inspection plate, multi-cell grid/atlas sheet plate, waveform diagram, script table read sheet, or headless Godot gameplay/test-scene filmstrip).",
     )
     specialist_agent: str = Field(
         default="",
@@ -3020,8 +3300,96 @@ def is_transient_gemini_error(exc: BaseException) -> bool:
     )
 
 
+class StudioPausedError(StudioAgentError):
+    """Raised when an outbound LLM call is blocked or aborted because the Studio is paused."""
+
+
+def is_studio_paused(candidate_dir: Optional[Path] = None) -> bool:
+    """Returns True when the Studio is paused via `.studio_paused.json` or `swarm_bus._build_paused`.
+    During pytest runs, only checks an explicit `candidate_dir` pause sentinel or `STUDIO_ENFORCE_GLOBAL_PAUSE=1`
+    so unrelated unit tests do not block on a developer's local `cartridges/.studio_paused.json`.
+    """
+    import json as _json
+    import os as _os
+    import sys as _sys
+
+    in_pytest = bool("PYTEST_CURRENT_TEST" in _os.environ or "pytest" in _sys.modules)
+    enforce_global = not in_pytest or _os.environ.get("STUDIO_ENFORCE_GLOBAL_PAUSE") == "1"
+
+    if candidate_dir is not None:
+        c_path = Path(candidate_dir)
+        for p_file in (c_path / ".studio_paused.json", c_path.parent / ".studio_paused.json"):
+            if p_file.is_file():
+                try:
+                    data = _json.loads(p_file.read_text(encoding="utf-8"))
+                    if isinstance(data, dict) and data.get("paused") is True:
+                        return True
+                except Exception:
+                    pass
+
+    if enforce_global:
+        try:
+            import config as _cfg
+            global_pause = _cfg.PROJECT_ROOT / "cartridges" / ".studio_paused.json"
+            if global_pause.is_file():
+                data = _json.loads(global_pause.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and data.get("paused") is True:
+                    return True
+        except Exception:
+            pass
+        try:
+            from engine.ui.server import swarm_bus as _sb
+            if getattr(_sb, "_build_paused", False):
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def wait_if_studio_paused(
+    candidate_dir: Optional[Path] = None,
+    *,
+    label: str = "generate_content",
+    fail_fast: Optional[bool] = None,
+) -> float:
+    """Gateway pause gate enforced before outbound Gemini calls and inside long-running SWE/PEV loops.
+    - If `fail_fast=True` or `STUDIO_FAIL_FAST_ON_PAUSE=1`, immediately raises `StudioPausedError`.
+    - Otherwise blocks in 0.2s slices while `is_studio_paused(candidate_dir)` is True, raising
+      `StudioPausedError` immediately if the active orchestrator requests an abort.
+    """
+    import os as _os
+    import time as _time
+
+    should_fail_fast = (
+        fail_fast
+        if fail_fast is not None
+        else (_os.environ.get("STUDIO_FAIL_FAST_ON_PAUSE") == "1")
+    )
+    t0 = _time.monotonic()
+    while is_studio_paused(candidate_dir):
+        if should_fail_fast:
+            raise StudioPausedError(
+                f"Blocked outbound Gemini API call '{label}' because Studio build is PAUSED (.studio_paused.json)."
+            )
+        try:
+            from engine.ui.server import swarm_bus as _sb
+            orch = getattr(_sb, "_active_orchestrator", None)
+            if orch is not None and getattr(orch, "_abort_requested", False):
+                raise StudioPausedError(
+                    f"Aborted outbound Gemini API call '{label}' while Studio build was paused."
+                )
+        except StudioPausedError:
+            raise
+        except Exception:
+            pass
+        _time.sleep(0.2)
+    return max(0.0, _time.monotonic() - t0)
+
+
 class TokenUsageTracker:
-    """Thread-safe tracker for Gemini API `usage_metadata` including implicit prefix cache hits."""
+    """Thread-safe tracker for Gemini API `usage_metadata` including implicit prefix cache hits
+    and a hard runaway-loop circuit breaker."""
     deliberation: str = "Tracks cumulative prompt, cached-prefix, output, and thinking token metrics across studio LLM calls."
 
     def __init__(self) -> None:
@@ -3039,18 +3407,76 @@ class TokenUsageTracker:
             self.total_thought_tokens: int = 0
             self.total_tokens: int = 0
             self.by_label: Dict[str, Dict[str, int]] = {}
+            self.consecutive_swe_pev_calls: int = 0
+
+    def reset_swe_pev_streak(self) -> None:
+        with self._lock:
+            self.consecutive_swe_pev_calls = 0
+
+    def check_circuit_breaker(self, label: str = "generate_content", candidate_dir: Optional[Path] = None) -> None:
+        """Trips a hard circuit breaker if a single SWE PEV / scene critique loop fires an unbounded
+        streak of consecutive calls without advancing a board task or checkpoint."""
+        import json as _json
+        import os as _os
+        from datetime import datetime as _dt, timezone as _tz
+
+        max_streak = int(_os.environ.get("STUDIO_MAX_CONSECUTIVE_SWE_CALLS", "36"))
+        low = (label or "").lower()
+        is_swe_loop_call = any(
+            tok in low
+            for tok in ("pev_phase", "scene_critique", "analyze_scene", "debug_and_patch")
+        )
+        with self._lock:
+            if is_swe_loop_call:
+                self.consecutive_swe_pev_calls += 1
+                streak = self.consecutive_swe_pev_calls
+            else:
+                self.consecutive_swe_pev_calls = 0
+                streak = 0
+
+        if max_streak > 0 and streak > max_streak:
+            # Trip circuit breaker: auto-pause studio on disk and in memory so no further calls can fire
+            try:
+                import config as _cfg
+                in_pytest = "PYTEST_CURRENT_TEST" in _os.environ
+                target_pause = (
+                    (Path(candidate_dir).parent / ".studio_paused.json")
+                    if candidate_dir is not None
+                    else (None if in_pytest else (_cfg.PROJECT_ROOT / "cartridges" / ".studio_paused.json"))
+                )
+                if target_pause is not None:
+                    target_pause.parent.mkdir(parents=True, exist_ok=True)
+                    target_pause.write_text(
+                        _json.dumps({
+                            "paused": True,
+                            "reason": f"Runaway SWE/PEV loop circuit breaker tripped after {streak} consecutive calls ({label}).",
+                            "timestamp_utc": _dt.now(_tz.utc).isoformat(),
+                        }),
+                        encoding="utf-8",
+                    )
+            except Exception:
+                pass
+            raise StudioPausedError(
+                f"Runaway LLM call circuit breaker tripped: '{label}' exceeded {max_streak} consecutive SWE/PEV calls without task progression."
+            )
 
     def record_response(self, response: Any, label: str = "generate_content") -> Optional[Dict[str, int]]:
+        if getattr(response, "_studio_usage_recorded", False):
+            return None
+        try:
+            setattr(response, "_studio_usage_recorded", True)
+        except Exception:
+            pass
         usage = getattr(response, "usage_metadata", None)
-        if usage is None:
-            return None
-        prompt_tok = int(getattr(usage, "prompt_token_count", 0) or 0)
-        cached_tok = int(getattr(usage, "cached_content_token_count", 0) or 0)
-        output_tok = int(getattr(usage, "candidates_token_count", 0) or 0)
-        thought_tok = int(getattr(usage, "thoughts_token_count", 0) or 0)
-        total_tok = int(getattr(usage, "total_token_count", 0) or (prompt_tok + output_tok + thought_tok))
-        if prompt_tok == 0 and cached_tok == 0 and output_tok == 0 and total_tok == 0:
-            return None
+        prompt_tok = int(getattr(usage, "prompt_token_count", 0) or 0) if usage is not None else 0
+        cached_tok = int(getattr(usage, "cached_content_token_count", 0) or 0) if usage is not None else 0
+        output_tok = int(getattr(usage, "candidates_token_count", 0) or 0) if usage is not None else 0
+        thought_tok = int(getattr(usage, "thoughts_token_count", 0) or 0) if usage is not None else 0
+        total_tok = (
+            int(getattr(usage, "total_token_count", 0) or (prompt_tok + output_tok + thought_tok))
+            if usage is not None
+            else 0
+        )
 
         family = (label or "generate_content").split("[", 1)[0].strip() or "generate_content"
         with self._lock:
@@ -3121,16 +3547,325 @@ class TokenUsageTracker:
 TOKEN_USAGE_TRACKER = TokenUsageTracker()
 
 
+def _emit_gateway_llm_activity(label: str, stats: Optional[Dict[str, int]] = None) -> None:
+    """Broadcasts live LLM call activity to Mission Control UI when running outside pytest so
+    background LLM calls can never execute invisibly while the UI appears idle."""
+    import os as _os
+    import sys as _sys
+    from datetime import datetime as _dt, timezone as _tz
+
+    if "PYTEST_CURRENT_TEST" in _os.environ or "pytest" in _sys.modules:
+        return
+    try:
+        from engine.ui.server import swarm_bus as _sb
+        if _sb is not None and hasattr(_sb, "publish_threadsafe"):
+            tok_info = f" ({stats.get('total_tokens', 0)} tokens)" if stats else ""
+            _sb.publish_threadsafe({
+                "deliberation": f"Live Gemini API call completed: {label}{tok_info}",
+                "event_type": "studio_live_activity",
+                "agent_name": (label or "StudioAgent").split(".", 1)[0],
+                "timestamp_utc": _dt.now(_tz.utc).isoformat(),
+                "payload": {
+                    "phase": "llm_gateway_call",
+                    "label": label,
+                    "token_stats": stats or {},
+                    "total_calls": TOKEN_USAGE_TRACKER.total_calls,
+                },
+            })
+    except Exception:
+        pass
+
+
+import threading as _gateway_threading
+
+_ACTIVE_DATASET_LOCK = _gateway_threading.Lock()
+_ACTIVE_DATASET_CONTEXT: Dict[str, Any] = {
+    "dataset_name": "",
+    "candidate_dir": None,
+    "store_logs": True,
+}
+_THREAD_LOCAL_GEMINI_CALL_CTX = _gateway_threading.local()
+
+
+def sanitize_gemini_label_value(raw: Any, max_len: int = 63) -> str:
+    """Normalizes any string into a valid Google Cloud / Gemini API label value:
+    lowercase ASCII letters, digits, underscores, and dashes, up to 63 characters."""
+    text = str(raw or "").strip().lower()
+    if not text:
+        return ""
+    out_chars: List[str] = []
+    prev_sep = False
+    for ch in text:
+        if ("a" <= ch <= "z") or ("0" <= ch <= "9") or ch == "-":
+            out_chars.append(ch)
+            prev_sep = False
+        else:
+            if not prev_sep and out_chars:
+                out_chars.append("_")
+                prev_sep = True
+    cleaned = "".join(out_chars).strip("_-")
+    return cleaned[:max_len].rstrip("_-")
+
+
+def set_active_gemini_dataset_context(
+    *,
+    dataset_name: Optional[str] = None,
+    candidate_dir: Optional[Union[Path, str]] = None,
+    store_logs: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Sets the active Studio run/dataset context used to tag outbound Gemini API calls
+    with `labels` (`dataset`, `run_id`, `cartridge`, `agent`, `operation`) and `store=True`."""
+    with _ACTIVE_DATASET_LOCK:
+        if dataset_name is not None:
+            _ACTIVE_DATASET_CONTEXT["dataset_name"] = str(dataset_name).strip()
+        if candidate_dir is not None:
+            _ACTIVE_DATASET_CONTEXT["candidate_dir"] = Path(candidate_dir) if candidate_dir else None
+        if store_logs is not None:
+            _ACTIVE_DATASET_CONTEXT["store_logs"] = bool(store_logs)
+        return dict(_ACTIVE_DATASET_CONTEXT)
+
+
+def get_active_gemini_dataset_context() -> Dict[str, Any]:
+    """Returns a snapshot of the active Studio dataset/run logging context."""
+    with _ACTIVE_DATASET_LOCK:
+        return dict(_ACTIVE_DATASET_CONTEXT)
+
+
+def build_gemini_request_labels(
+    *,
+    label: str = "generate_content",
+    candidate_dir: Optional[Union[Path, str]] = None,
+    dataset_name: Optional[str] = None,
+) -> Dict[str, str]:
+    """Constructs sanitized Gemini API request labels (`dataset`, `run_id`, `cartridge`, `agent`, `operation`)
+    so every call in a Studio run can be filtered and saved as a Dataset in Google AI Studio."""
+    import os as _os
+
+    ctx = get_active_gemini_dataset_context()
+    eff_c_dir = (
+        Path(candidate_dir)
+        if candidate_dir
+        else (getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "candidate_dir", None) or ctx.get("candidate_dir"))
+    )
+    cartridge_name = eff_c_dir.name if isinstance(eff_c_dir, Path) else ""
+
+    raw_dataset = (
+        (dataset_name or "").strip()
+        or _os.environ.get("GEMINI_DATASET_NAME", "").strip()
+        or _os.environ.get("STUDIO_DATASET_NAME", "").strip()
+        or str(ctx.get("dataset_name") or "").strip()
+        or cartridge_name
+        or "studio_run"
+    )
+    eff_label = (
+        label
+        if label and label != "genai.models.generate_content"
+        else (getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "label", None) or label or "generate_content")
+    )
+    agent_raw = (eff_label or "studio").split(".", 1)[0].split("[", 1)[0]
+
+    labels_out: Dict[str, str] = {}
+    ds_val = sanitize_gemini_label_value(raw_dataset)
+    if ds_val:
+        labels_out["dataset"] = ds_val
+        labels_out["run_id"] = ds_val
+    cart_val = sanitize_gemini_label_value(cartridge_name)
+    if cart_val:
+        labels_out["cartridge"] = cart_val
+    agent_val = sanitize_gemini_label_value(agent_raw)
+    if agent_val:
+        labels_out["agent"] = agent_val
+    op_val = sanitize_gemini_label_value(eff_label)
+    if op_val:
+        labels_out["operation"] = op_val
+    return labels_out
+
+
+def inject_gemini_dataset_config(
+    kwargs: Dict[str, Any],
+    *,
+    label: str = "generate_content",
+    candidate_dir: Optional[Union[Path, str]] = None,
+    dataset_name: Optional[str] = None,
+    store_logs: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Non-destructively injects `labels` and `http_options.extra_body['store'] = True` into
+    `generate_content` kwargs so requests are tagged and stored in Google AI Studio Logs."""
+    import os as _os
+
+    out_kwargs = dict(kwargs)
+    auto_labels = build_gemini_request_labels(
+        label=label,
+        candidate_dir=candidate_dir,
+        dataset_name=dataset_name,
+    )
+
+    env_store = _os.environ.get("GEMINI_STORE_LOGS", "").strip().lower()
+    if store_logs is not None:
+        should_store = bool(store_logs)
+    elif env_store in ("0", "false", "no", "off"):
+        should_store = False
+    elif env_store in ("1", "true", "yes", "on"):
+        should_store = True
+    else:
+        should_store = bool(get_active_gemini_dataset_context().get("store_logs", True))
+
+    model_str = str(out_kwargs.get("model") or "").lower()
+    cfg = out_kwargs.get("config")
+
+    # Determine if this is an image or audio/TTS synthesis request where AI Studio request storage is unsupported
+    modalities: List[str] = []
+    if isinstance(cfg, dict):
+        modalities = [str(m).upper() for m in (cfg.get("response_modalities") or cfg.get("responseModalities") or [])]
+    elif cfg is not None and hasattr(cfg, "response_modalities") and getattr(cfg, "response_modalities"):
+        modalities = [str(m).upper() for m in getattr(cfg, "response_modalities")]
+    is_media_synthesis = (
+        "image" in model_str
+        or "tts" in model_str
+        or "IMAGE" in modalities
+        or "AUDIO" in modalities
+    )
+    if is_media_synthesis:
+        should_store = False
+
+    try:
+        from google.genai import types as _genai_types
+    except Exception:
+        _genai_types = None
+
+    if cfg is None:
+        if _genai_types is not None:
+            http_opts = _genai_types.HttpOptions(extra_body={"store": True}) if should_store else None
+            out_kwargs["config"] = _genai_types.GenerateContentConfig(
+                labels=auto_labels,
+                http_options=http_opts,
+            )
+        else:
+            new_cfg: Dict[str, Any] = {"labels": auto_labels}
+            if should_store:
+                new_cfg["http_options"] = {"extra_body": {"store": True}}
+            out_kwargs["config"] = new_cfg
+        return out_kwargs
+
+    if isinstance(cfg, dict):
+        cfg_copy = dict(cfg)
+        existing_labels = dict(cfg_copy.get("labels") or {})
+        cfg_copy["labels"] = {**auto_labels, **existing_labels}
+        if should_store:
+            existing_http = cfg_copy.get("http_options")
+            if isinstance(existing_http, dict):
+                http_copy = dict(existing_http)
+                eb = dict(http_copy.get("extra_body") or {})
+                eb.setdefault("store", True)
+                http_copy["extra_body"] = eb
+                cfg_copy["http_options"] = http_copy
+            elif existing_http is None:
+                cfg_copy["http_options"] = {"extra_body": {"store": True}}
+        out_kwargs["config"] = cfg_copy
+        return out_kwargs
+
+    if hasattr(cfg, "model_copy"):
+        existing_labels = dict(getattr(cfg, "labels", None) or {})
+        merged_labels = {**auto_labels, **existing_labels}
+        updates: Dict[str, Any] = {"labels": merged_labels}
+        if should_store and _genai_types is not None:
+            existing_http = getattr(cfg, "http_options", None)
+            if existing_http is None:
+                updates["http_options"] = _genai_types.HttpOptions(extra_body={"store": True})
+            elif isinstance(existing_http, dict):
+                http_copy = dict(existing_http)
+                eb = dict(http_copy.get("extra_body") or {})
+                eb.setdefault("store", True)
+                http_copy["extra_body"] = eb
+                updates["http_options"] = _genai_types.HttpOptions(**http_copy)
+            elif hasattr(existing_http, "model_copy"):
+                eb = dict(getattr(existing_http, "extra_body", None) or {})
+                eb.setdefault("store", True)
+                updates["http_options"] = existing_http.model_copy(update={"extra_body": eb})
+        out_kwargs["config"] = cfg.model_copy(update=updates)
+        return out_kwargs
+
+    return out_kwargs
+
+
+def install_studio_gemini_guardrails(
+    client: Any,
+    candidate_dir: Optional[Path] = None,
+    dataset_name: Optional[str] = None,
+    store_logs: Optional[bool] = None,
+) -> Any:
+    """Installs transport-level pause enforcement, circuit-breaker checks, AI Studio dataset label injection,
+    and token tracking directly onto `client.models.generate_content`, `embed_content`, and `generate_images`
+    so even direct SDK calls cannot bypass studio pause, dataset tagging, or token accounting."""
+    if candidate_dir is not None or dataset_name is not None or store_logs is not None:
+        set_active_gemini_dataset_context(
+            dataset_name=dataset_name,
+            candidate_dir=candidate_dir,
+            store_logs=store_logs,
+        )
+    if client is None or not is_real_genai_client(client):
+        return client
+    models_obj = getattr(client, "models", None)
+    if models_obj is None or getattr(models_obj, "_studio_guardrails_installed", False):
+        return client
+
+    for method_name in ("generate_content", "embed_content", "generate_images"):
+        orig_fn = getattr(models_obj, method_name, None)
+        if not callable(orig_fn):
+            continue
+
+        def _make_guarded(fn: Any, m_name: str) -> Any:
+            def _guarded(*args: Any, **kwargs: Any) -> Any:
+                ctx_label = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "label", None)
+                ctx_c_dir = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "candidate_dir", None) or candidate_dir
+                lbl = ctx_label or f"genai.models.{m_name}"
+                wait_if_studio_paused(candidate_dir=ctx_c_dir, label=lbl)
+                TOKEN_USAGE_TRACKER.check_circuit_breaker(label=lbl, candidate_dir=ctx_c_dir)
+                call_kwargs = (
+                    inject_gemini_dataset_config(
+                        kwargs,
+                        label=lbl,
+                        candidate_dir=ctx_c_dir,
+                        dataset_name=dataset_name,
+                        store_logs=store_logs,
+                    )
+                    if m_name == "generate_content"
+                    else kwargs
+                )
+                res = fn(*args, **call_kwargs)
+                stats = TOKEN_USAGE_TRACKER.record_response(res, label=lbl)
+                if stats is not None:
+                    _emit_gateway_llm_activity(lbl, stats)
+                return res
+            return _guarded
+
+        try:
+            setattr(models_obj, method_name, _make_guarded(orig_fn, method_name))
+        except Exception:
+            pass
+
+    try:
+        setattr(models_obj, "_studio_guardrails_installed", True)
+    except Exception:
+        pass
+    return client
+
+
 def call_gemini_with_transient_retry(
     call_fn: Any,
     *,
     max_transient_retries: int = 2,
     base_delay_s: float = 1.5,
     label: str = "generate_content",
+    candidate_dir: Optional[Path] = None,
 ) -> Any:
-    """Executes `call_fn()` with jittered exponential backoff strictly for transient 504/503/429 errors.
-    Non-transient errors or exhausted retries immediately raise the authentic underlying exception (Rule 5).
-    Also captures `usage_metadata` (`prompt_token_count`, `cached_content_token_count`, etc.) in `TOKEN_USAGE_TRACKER`.
+    """Executes `call_fn()` with:
+    1. Mandatory gateway pause enforcement (`wait_if_studio_paused`) BEFORE every attempt.
+    2. Hard runaway-loop circuit breaker (`TOKEN_USAGE_TRACKER.check_circuit_breaker`).
+    3. Thread-local call context propagation (`label`, `candidate_dir`) so `install_studio_gemini_guardrails`
+       automatically tags the outbound `generate_content` request with AI Studio Dataset `labels` and `store=True`.
+    4. Jittered exponential backoff strictly for transient 504/503/429 errors.
+    5. Automatic `TOKEN_USAGE_TRACKER` accounting and live Mission Control UI telemetry emission.
     """
     import logging as _logging
     import random as _random
@@ -3138,9 +3873,17 @@ def call_gemini_with_transient_retry(
 
     _log = _logging.getLogger("GeminiRetry")
     for attempt in range(max_transient_retries + 1):
+        wait_if_studio_paused(candidate_dir=candidate_dir, label=label)
+        TOKEN_USAGE_TRACKER.check_circuit_breaker(label=label, candidate_dir=candidate_dir)
+        prev_label = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "label", None)
+        prev_c_dir = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "candidate_dir", None)
+        _THREAD_LOCAL_GEMINI_CALL_CTX.label = label
+        if candidate_dir is not None:
+            _THREAD_LOCAL_GEMINI_CALL_CTX.candidate_dir = candidate_dir
         try:
             res = call_fn()
             stats = TOKEN_USAGE_TRACKER.record_response(res, label=label)
+            _emit_gateway_llm_activity(label, stats)
             if stats is not None and stats["cached_tokens"] > 0:
                 _log.debug(
                     "%s token usage: prompt=%d cached=%d (%.1f%%) output=%d thoughts=%d",
@@ -3152,6 +3895,8 @@ def call_gemini_with_transient_retry(
                     stats["thought_tokens"],
                 )
             return res
+        except StudioPausedError:
+            raise
         except Exception as exc:
             if attempt < max_transient_retries and is_transient_gemini_error(exc):
                 delay = base_delay_s * (2 ** attempt) + _random.uniform(0.0, 0.35)
@@ -3166,6 +3911,9 @@ def call_gemini_with_transient_retry(
                 _time.sleep(delay)
                 continue
             raise
+        finally:
+            _THREAD_LOCAL_GEMINI_CALL_CTX.label = prev_label
+            _THREAD_LOCAL_GEMINI_CALL_CTX.candidate_dir = prev_c_dir
 
 
 def __getattr__(name: str) -> Any:

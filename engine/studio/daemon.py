@@ -59,6 +59,7 @@ class StudioDaemonConfig(BaseModel):
     creative_prompt: Optional[str] = Field(default=None, description="Optional Executive Producer creative seed/prompt for Genesis")
     resume_current: bool = Field(default=False, description="Resume the latest in-progress or failed Genesis candidate from its persisted Game Bible and Requirements")
     resume_candidate_id: Optional[str] = Field(default=None, description="Optional explicit candidate directory name to resume")
+    dataset_name: Optional[str] = Field(default=None, description="Optional dataset/run identifier injected into Gemini API request labels for Google AI Studio Logs")
 
 
 _lock_mutex = threading.Lock()
@@ -555,6 +556,11 @@ class StudioDaemon:
                 })
                 staging_dir = self.config.cartridges_root / f"candidate_genesis_{uuid.uuid4().hex[:6]}"
                 staging_dir.mkdir(parents=True, exist_ok=True)
+            from engine.studio.models import set_active_gemini_dataset_context
+            set_active_gemini_dataset_context(
+                dataset_name=self.config.dataset_name or staging_dir.name,
+                candidate_dir=staging_dir,
+            )
             report = None
 
             try:
@@ -742,6 +748,11 @@ class StudioDaemon:
         logger.info("Starting episodic update cycle for episode %d...", episode_number)
         staging_dir = self.config.cartridges_root / f"candidate_ep{episode_number}_{uuid.uuid4().hex[:6]}"
         staging_dir.mkdir(parents=True, exist_ok=True)
+        from engine.studio.models import set_active_gemini_dataset_context
+        set_active_gemini_dataset_context(
+            dataset_name=self.config.dataset_name or staging_dir.name,
+            candidate_dir=staging_dir,
+        )
         report = None
 
         try:
