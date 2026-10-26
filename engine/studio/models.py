@@ -1198,7 +1198,10 @@ class ModuleFileSpec(BaseEpistemicModel):
                 fn = fn[len("res://"):]
             elif fn.startswith("res:/"):
                 fn = fn[len("res:/"):]
-            out["filename"] = fn.lstrip("/")
+            fn = fn.lstrip("/")
+            if "/" in fn and Path(fn).name in {"main.gd", "mechanics.gd", "scenes.gd", "entities.gd", "ui_hud.gd"}:
+                fn = Path(fn).name
+            out["filename"] = fn
             return out
         return data
 
@@ -1309,6 +1312,7 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
             results["project.godot"] = project_godot
 
         # 3. Write synthesized module files (always strip any accidental 'res://' prefix)
+        canonical_root_gd = {"main.gd", "mechanics.gd", "scenes.gd", "entities.gd", "ui_hud.gd"}
         for fspec in self.files:
             rel_fname = fspec.filename.strip().replace("\\", "/")
             if rel_fname.startswith("res://"):
@@ -1316,6 +1320,8 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
             elif rel_fname.startswith("res:/"):
                 rel_fname = rel_fname[len("res:/"):]
             rel_fname = rel_fname.lstrip("/")
+            if "/" in rel_fname and Path(rel_fname).name in canonical_root_gd:
+                rel_fname = Path(rel_fname).name
             file_path = target_dir / rel_fname
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(fspec.content, encoding="utf-8")

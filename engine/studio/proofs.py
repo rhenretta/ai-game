@@ -240,8 +240,11 @@ def capture_filmstrip(
     from engine.sim.godot_verifier import GodotHeadlessSimulator
 
     cartridge_dir = Path(cartridge_dir)
+    out_path = Path(out_path)
     if not ticks:
         raise StudioAgentError("capture_filmstrip requires at least one tick")
+    if out_path.is_file():
+        out_path.unlink()
     cap_dir = cartridge_dir / "assets" / "playtest_captures"
     for stale in cap_dir.glob("filmstrip_*.png"):
         stale.unlink()
@@ -276,6 +279,47 @@ def capture_filmstrip(
             "Eliminate unconditional per-frame `queue_redraw()` on nodes whose `_draw()` iterates over 2D grids or unbounded stroke arrays, and use `SubViewport.UPDATE_ONCE` for accumulation masks."
         )
     tick_snaps = dict(getattr(sim, "tick_snapshots", {}) or {})
+
+    frames: List[Tuple[int, Path]] = []
+    for t in sorted(set(ticks)):
+        p = cap_dir / f"filmstrip_{t:04d}.png"
+        if p.is_file():
+            frames.append((t, p))
+    if not frames:
+        raise StudioAgentError(
+            "Filmstrip capture produced no frames. Viewport capture needs a display (macOS, DISPLAY/WAYLAND_DISPLAY, or xvfb-run); "
+            "refusing to fabricate proof."
+        )
+    missing = sorted(set(ticks) - {t for t, _ in frames})
+    if missing:
+        raise StudioAgentError(f"Filmstrip is missing frames for ticks {missing}")
+    rows = math.ceil(len(frames) / cols)
+    label_h = 18
+    footer_h = 18 if tick_snaps else 0
+    row_h = cell[1] + label_h + footer_h
+    strip = Image.new("RGB", (cols * cell[0], rows * row_h), (24, 28, 36))
+    draw = ImageDraw.Draw(strip)
+    for i, (t, p) in enumerate(frames):
+        with Image.open(p) as im:
+            thumb = im.convert("RGB").resize(cell, Image.Resampling.LANCZOS)
+        x, y = (i % cols) * cell[0], (i // cols) * row_h
+        strip.paste(thumb, (x, y + label_h))
+        # Draw a crisp 1px frame outline around the 16:9 game viewport so reviewers clearly distinguish
+        # the in-game viewport from the external QA contact-sheet margin strips above/below it.
+        draw.rectangle(
+            [x, y + label_h, x + cell[0] - 1, y + label_h + cell[1] - 1],
+            outline=(90, 105, 130),
+            width=1,
+        )
+        header_txt = f"[QA] tick {t}  {_active_inputs_at_tick(t, input_script, setup_script)}"
+        draw.text((x + 6, y + 3), header_txt[:62], fill=(240, 240, 240))
+        if footer_h > 0:
+            snap_txt = _format_snapshot_footer(tick_snaps.get(t))
+            if snap_txt:
+                draw.text((x + 6, y + label_h + cell[1] + 2), f"[QA] {snap_txt}"[:62], fill=(140, 215, 245))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    strip.save(out_path, "PNG")
+
     _evaluate_qa_state_assertions(tick_snaps, state_assertions)
 
     if verify_counterfactual and (input_script or setup_script) and len(set(ticks)) >= 2:
@@ -340,44 +384,4 @@ def capture_filmstrip(
                     f"from tick {t_first} to tick {t_last} ({c_end}) as the scripted run. Remove self-playing sim_tick demo timers from main.gd/scenes.gd."
                 )
 
-    frames: List[Tuple[int, Path]] = []
-    for t in sorted(set(ticks)):
-        p = cap_dir / f"filmstrip_{t:04d}.png"
-        if p.is_file():
-            frames.append((t, p))
-    if not frames:
-        raise StudioAgentError(
-            "Filmstrip capture produced no frames. Viewport capture needs a display (macOS, DISPLAY/WAYLAND_DISPLAY, or xvfb-run); "
-            "refusing to fabricate proof."
-        )
-    missing = sorted(set(ticks) - {t for t, _ in frames})
-    if missing:
-        raise StudioAgentError(f"Filmstrip is missing frames for ticks {missing}")
-    rows = math.ceil(len(frames) / cols)
-    label_h = 18
-    footer_h = 18 if tick_snaps else 0
-    row_h = cell[1] + label_h + footer_h
-    strip = Image.new("RGB", (cols * cell[0], rows * row_h), (24, 28, 36))
-    draw = ImageDraw.Draw(strip)
-    for i, (t, p) in enumerate(frames):
-        with Image.open(p) as im:
-            thumb = im.convert("RGB").resize(cell, Image.Resampling.LANCZOS)
-        x, y = (i % cols) * cell[0], (i // cols) * row_h
-        strip.paste(thumb, (x, y + label_h))
-        # Draw a crisp 1px frame outline around the 16:9 game viewport so reviewers clearly distinguish
-        # the in-game viewport from the external QA contact-sheet margin strips above/below it.
-        draw.rectangle(
-            [x, y + label_h, x + cell[0] - 1, y + label_h + cell[1] - 1],
-            outline=(90, 105, 130),
-            width=1,
-        )
-        header_txt = f"[QA] tick {t}  {_active_inputs_at_tick(t, input_script, setup_script)}"
-        draw.text((x + 6, y + 3), header_txt[:62], fill=(240, 240, 240))
-        if footer_h > 0:
-            snap_txt = _format_snapshot_footer(tick_snaps.get(t))
-            if snap_txt:
-                draw.text((x + 6, y + label_h + cell[1] + 2), f"[QA] {snap_txt}"[:62], fill=(140, 215, 245))
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    strip.save(out_path, "PNG")
     return out_path

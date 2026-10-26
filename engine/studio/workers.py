@@ -1326,9 +1326,19 @@ def run_swe_engineer_specialist(
     raw_lock = ctx.code_lock if ctx.code_lock is not None else threading.Lock()
     lock_cm = contextlib.nullcontext() if _lock_already_held else raw_lock
     fb = [(r.revision_index + 1, r.feedback) for r in item.revisions if r.feedback]
-    explicit_code_modules = [
-        m for m in (target_paths or item.target_modules) if m.endswith(CODE_MODULE_SUFFIXES)
-    ]
+    canonical_root_gd = {"main.gd", "mechanics.gd", "scenes.gd", "entities.gd", "ui_hud.gd"}
+    explicit_code_modules: List[str] = []
+    for raw_mod in (target_paths or item.target_modules):
+        clean_mod = str(raw_mod or "").strip().replace("\\", "/")
+        if clean_mod.startswith("res://"):
+            clean_mod = clean_mod[len("res://"):]
+        elif clean_mod.startswith("res:/"):
+            clean_mod = clean_mod[len("res:/"):]
+        clean_mod = clean_mod.lstrip("/")
+        if "/" in clean_mod and Path(clean_mod).name in canonical_root_gd:
+            clean_mod = Path(clean_mod).name
+        if clean_mod.endswith(CODE_MODULE_SUFFIXES) and clean_mod not in explicit_code_modules:
+            explicit_code_modules.append(clean_mod)
     if item.kind == "level_map" and not explicit_code_modules and is_real_genai_client(ctx.client):
         explicit_code_modules = ["scenes.gd"]
     has_existing_layout = (ctx.cartridge_dir / "level_layout.json").is_file()
@@ -2237,6 +2247,7 @@ def run_task_lead(
     code_lock = ctx.code_lock if ctx.code_lock is not None else threading.Lock()
     code_lock_held = False
     task_baseline_snap: Optional[Dict[str, Optional[str]]] = None
+    last_verified_swe_snap: Optional[Dict[str, Optional[str]]] = None
     spawn_turn_bonus = sum(1 for t in turn_history if t.specialist_agent == "board_task_spawner")
     effective_max_turns = max_turns + spawn_turn_bonus
     try:
@@ -2428,19 +2439,42 @@ def run_task_lead(
                     turn_index=turn_idx,
                     _lock_already_held=code_lock_held,
                 )
+                if decision.specialist_agent == "swe_engineer" and report.verification_passed:
+                    last_verified_swe_snap = _snapshot_modules(
+                        ctx.cartridge_dir,
+                        list(task_baseline_snap.keys())
+                        if task_baseline_snap is not None
+                        else (list(item.target_modules or []) + list(decision.target_paths or []) + ["project.godot", "main.tscn"]),
+                    )
             except WorkerYielded:
                 _ACTIVE_TURN_CTX.state = None
                 raise
             except Exception as spec_exc:
-                if (
+                qa_proofs: List[str] = []
+                if decision.specialist_agent == "qa_test_engineer":
+                    strip_prefix = "level_filmstrip" if item.kind == "level_map" else "filmstrip"
+                    cand_strip = _item_dir(ctx, item) / f"{strip_prefix}_{_safe_id(item.item_id)}_rev{len(item.revisions)}.png"
+                    if cand_strip.is_file():
+                        qa_proofs.append(str(cand_strip))
+                can_recover_turn = (
                     turn_idx + 1 < effective_max_turns
                     and decision.specialist_agent in ("qa_test_engineer", "swe_engineer")
-                ):
+                ) or (
+                    decision.specialist_agent == "qa_test_engineer"
+                    and bool(qa_proofs or collected_proofs)
+                )
+                if can_recover_turn:
                     partial_diffs = (
                         _compute_turn_code_diffs(ctx.cartridge_dir, pre_dispatch_snap)
                         if pre_dispatch_snap is not None
                         else {}
                     )
+                    if (
+                        decision.specialist_agent == "swe_engineer"
+                        and pre_dispatch_snap is not None
+                        and ctx.code_verify is not None
+                    ):
+                        _restore_modules(ctx.cartridge_dir, pre_dispatch_snap)
                     logger.warning(
                         "Specialist '%s' failed on Turn #%d of '%s' (%s); reporting failure to Task Lead for self-correction.",
                         decision.specialist_agent,
@@ -2467,7 +2501,7 @@ def run_task_lead(
                             f"(if GDScript/scene wiring or performance is broken) or 'qa_test_engineer' (if the QA test plan/setup_calls need adjustment)."
                         ),
                         touched_files=list(partial_diffs.keys()),
-                        proof_images=[],
+                        proof_images=qa_proofs,
                         verification_passed=False,
                         code_diffs=partial_diffs,
                         timestamp_utc=datetime.now(timezone.utc).isoformat(),
@@ -2524,8 +2558,9 @@ def run_task_lead(
     except WorkerYielded:
         raise
     except Exception:
-        if task_baseline_snap is not None:
-            _restore_modules(ctx.cartridge_dir, task_baseline_snap)
+        restore_snap = last_verified_swe_snap if last_verified_swe_snap is not None else task_baseline_snap
+        if restore_snap is not None:
+            _restore_modules(ctx.cartridge_dir, restore_snap)
         raise
     finally:
         if code_lock_held:

@@ -710,5 +710,138 @@ def test_persistence_roundtrip_resets_failed_items_on_resume(tmp_path):
     assert "Error 2" in reloaded.failure
 
 
+def test_final_turn_qa_assertion_failure_preserves_verified_swe_code_and_rendered_filmstrip(tmp_path):
+    """When swe_engineer passes verification on Turn 0 and qa_test_engineer renders the filmstrip on the final turn
+    (Turn 1 of max_turns=2) before failing a QA state assertion, run_task_lead must NOT roll back the verified GDScript
+    changes to task_baseline_snap, must preserve the rendered filmstrip proof, and must surface the QA assertion error
+    in the result notes."""
+    from PIL import Image
+    from engine.studio.models import (
+        ModuleFileSpec,
+        SpecialistReport,
+        StudioAgentError,
+        TaskLeadDecision,
+        TrackCodeSynthesisPayload,
+        WorkItem,
+    )
+    from engine.studio.workers import WorkerContext, run_task_lead
+    import engine.studio.workers as workers_mod
+
+    (tmp_path / "mechanics.gd").write_text("# baseline mechanics\n", encoding="utf-8")
+    (tmp_path / "scenes.gd").write_text("# baseline scenes\n", encoding="utf-8")
+    (tmp_path / "main.gd").write_text("extends Node2D\n", encoding="utf-8")
+    (tmp_path / "project.godot").write_text("config_version=5\n", encoding="utf-8")
+    (tmp_path / "main.tscn").write_text("[gd_scene format=3]\n", encoding="utf-8")
+
+    # Also verify TrackCodeSynthesisPayload normalizes canonical root modules prefixed with 'scripts/'
+    payload = TrackCodeSynthesisPayload(
+        deliberation="Normalize canonical root module paths.",
+        files=[
+            ModuleFileSpec(
+                deliberation="Write mechanics at root.",
+                filename="scripts/mechanics.gd",
+                content="# verified mechanics v1\n",
+            )
+        ],
+    )
+    payload.assemble_cartridge_directory(tmp_path, swe_agent=None)
+    assert (tmp_path / "mechanics.gd").read_text(encoding="utf-8") == "# verified mechanics v1\n"
+    assert not (tmp_path / "scripts" / "mechanics.gd").exists()
+    # Reset back to baseline for run_task_lead test
+    (tmp_path / "mechanics.gd").write_text("# baseline mechanics\n", encoding="utf-8")
+
+    class _FakeModels:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_content(self, model, contents, config=None):
+            self.calls += 1
+            if self.calls == 1:
+                dec = TaskLeadDecision(
+                    deliberation="Turn 0: Delegate to swe_engineer.",
+                    current_strategy="Implement mechanic in mechanics.gd.",
+                    proof_strategy="Capture filmstrip in qa_test_engineer.",
+                    specialist_agent="swe_engineer",
+                    brief="Implement mechanic.",
+                    target_paths=["scripts/mechanics.gd"],
+                    action="delegate",
+                )
+            else:
+                dec = TaskLeadDecision(
+                    deliberation="Turn 1: Delegate to qa_test_engineer.",
+                    current_strategy="Verify mechanic with filmstrip.",
+                    proof_strategy="Capture filmstrip across ticks.",
+                    specialist_agent="qa_test_engineer",
+                    brief="Capture filmstrip.",
+                    action="delegate",
+                )
+
+            class _Resp:
+                text = dec.model_dump_json()
+
+            return _Resp()
+
+    class _FakeClient:
+        __module__ = "google.genai.fake"
+
+        def __init__(self):
+            self.models = _FakeModels()
+
+    class _FakeSwe:
+        def implement_requirement_track(self, *args, **kwargs):
+            return {}
+
+    item = WorkItem(
+        deliberation="d",
+        item_id="mech_test_item",
+        kind="mechanic_code",
+        title="Mechanic Test",
+        spec="Implement mechanic",
+        proof_spec="Filmstrip proof",
+        target_modules=["scripts/mechanics.gd"],
+        state="in_progress",
+    )
+    ctx = WorkerContext(
+        cartridge_dir=tmp_path,
+        client=_FakeClient(),
+        swe_agent=_FakeSwe(),
+        code_verify=lambda c_dir, track: None,
+    )
+
+    orig_dispatch = workers_mod._dispatch_to_specialist
+
+    def _fake_dispatch(w_ctx, w_item, decision, turn_index, _lock_already_held=False):
+        if decision.specialist_agent == "swe_engineer":
+            (w_ctx.cartridge_dir / "mechanics.gd").write_text("# verified swe code\n", encoding="utf-8")
+            return SpecialistReport(
+                turn_index=turn_index,
+                specialist_agent="swe_engineer",
+                brief=decision.brief,
+                summary="Implemented mechanics.gd; verification passed.",
+                touched_files=["mechanics.gd"],
+                proof_images=[],
+                verification_passed=True,
+            )
+        # Final turn qa_test_engineer: saves filmstrip PNG first, then raises state assertion StudioAgentError
+        item_dir = w_ctx.cartridge_dir / "artifacts" / "work_items" / w_item.item_id
+        item_dir.mkdir(parents=True, exist_ok=True)
+        strip_p = item_dir / f"filmstrip_{w_item.item_id}_rev0.png"
+        Image.new("RGB", (64, 36), (20, 40, 60)).save(strip_p)
+        raise StudioAgentError("QA filmstrip state assertions failed against live engine snapshots: tick 60: expected flow 0.3, got 1")
+
+    workers_mod._dispatch_to_specialist = _fake_dispatch
+    try:
+        res = run_task_lead(ctx, item, max_turns=2)
+    finally:
+        workers_mod._dispatch_to_specialist = orig_dispatch
+
+    # Verified SWE code must NOT be rolled back to '# baseline mechanics\n'!
+    assert (tmp_path / "mechanics.gd").read_text(encoding="utf-8") == "# verified swe code\n"
+    assert len(res.proof_images) == 1
+    assert Path(res.proof_images[0]).name == "filmstrip_mech_test_item_rev0.png"
+    assert "QA filmstrip state assertions failed" in res.notes
+
+
+
 
 

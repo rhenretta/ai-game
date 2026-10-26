@@ -1988,13 +1988,15 @@ class LeadGameplaySWEAgent:
         elif clean.startswith("res:/"):
             clean = clean[len("res:/"):]
         clean = clean.lstrip("/")
+        fname = Path(clean).name
+        if "/" in clean and fname in {"main.gd", "mechanics.gd", "scenes.gd", "entities.gd", "ui_hud.gd"}:
+            clean = fname
         if clean:
             direct = c_dir / clean
             if direct.is_file():
                 return str(direct.relative_to(c_dir)), direct
             if "/" in clean:
                 return clean, direct
-        fname = Path(clean).name
         root_cand = c_dir / fname
         if root_cand.is_file():
             return fname, root_cand
