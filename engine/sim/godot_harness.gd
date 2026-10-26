@@ -382,31 +382,89 @@ func _collect_headless_render_items(
 	for child in node.get_children():
 		_collect_headless_render_items(child, cur_in_ui, eff_z, world_items, ui_items, lights, modulates)
 
-func _draw_simple_glyph_text(img: Image, text: String, pos: Vector2, col: Color, max_chars: int = 64) -> void:
-	var clean = text.strip_edges()
+const _FONT_5X7 := {
+	"!": [4, 4, 4, 4, 4, 0, 4],
+	"\"": [10, 10, 0, 0, 0, 0, 0],
+	"#": [10, 31, 10, 10, 31, 10, 0],
+	"%": [25, 26, 4, 4, 11, 19, 0],
+	"&": [12, 18, 20, 8, 21, 18, 13],
+	"'": [4, 4, 0, 0, 0, 0, 0],
+	"(": [2, 4, 8, 8, 8, 4, 2],
+	")": [8, 4, 2, 2, 2, 4, 8],
+	"*": [0, 4, 21, 14, 21, 4, 0],
+	"+": [0, 4, 4, 31, 4, 4, 0],
+	",": [0, 0, 0, 0, 4, 4, 8],
+	"-": [0, 0, 0, 31, 0, 0, 0],
+	".": [0, 0, 0, 0, 0, 0, 4],
+	"/": [1, 2, 2, 4, 8, 8, 16],
+	"0": [14, 17, 19, 21, 25, 17, 14],
+	"1": [4, 12, 4, 4, 4, 4, 14],
+	"2": [14, 17, 1, 6, 8, 16, 31],
+	"3": [31, 2, 4, 6, 1, 17, 14],
+	"4": [2, 6, 10, 18, 31, 2, 2],
+	"5": [31, 16, 30, 1, 1, 17, 14],
+	"6": [6, 8, 16, 30, 17, 17, 14],
+	"7": [31, 1, 2, 4, 8, 8, 8],
+	"8": [14, 17, 17, 14, 17, 17, 14],
+	"9": [14, 17, 17, 15, 1, 2, 12],
+	":": [0, 4, 4, 0, 4, 4, 0],
+	";": [0, 4, 4, 0, 4, 4, 8],
+	"<": [2, 4, 8, 16, 8, 4, 2],
+	"=": [0, 0, 31, 0, 31, 0, 0],
+	">": [8, 4, 2, 1, 2, 4, 8],
+	"?": [14, 17, 1, 6, 4, 0, 4],
+	"[": [14, 8, 8, 8, 8, 8, 14],
+	"]": [14, 2, 2, 2, 2, 2, 14],
+	"_": [0, 0, 0, 0, 0, 0, 31],
+	"|": [4, 4, 4, 4, 4, 4, 4],
+	"A": [14, 17, 17, 31, 17, 17, 17],
+	"B": [30, 17, 17, 30, 17, 17, 30],
+	"C": [14, 17, 16, 16, 16, 17, 14],
+	"D": [28, 18, 17, 17, 17, 18, 28],
+	"E": [31, 16, 16, 30, 16, 16, 31],
+	"F": [31, 16, 16, 30, 16, 16, 16],
+	"G": [14, 17, 16, 23, 17, 17, 15],
+	"H": [17, 17, 17, 31, 17, 17, 17],
+	"I": [14, 4, 4, 4, 4, 4, 14],
+	"J": [7, 2, 2, 2, 2, 18, 12],
+	"K": [17, 18, 20, 24, 20, 18, 17],
+	"L": [16, 16, 16, 16, 16, 16, 31],
+	"M": [17, 27, 21, 21, 17, 17, 17],
+	"N": [17, 25, 21, 19, 17, 17, 17],
+	"O": [14, 17, 17, 17, 17, 17, 14],
+	"P": [30, 17, 17, 30, 16, 16, 16],
+	"Q": [14, 17, 17, 17, 21, 18, 13],
+	"R": [30, 17, 17, 30, 20, 18, 17],
+	"S": [15, 16, 16, 14, 1, 1, 30],
+	"T": [31, 4, 4, 4, 4, 4, 4],
+	"U": [17, 17, 17, 17, 17, 17, 14],
+	"V": [17, 17, 17, 17, 17, 10, 4],
+	"W": [17, 17, 17, 21, 21, 27, 17],
+	"X": [17, 17, 10, 4, 10, 17, 17],
+	"Y": [17, 17, 10, 4, 4, 4, 4],
+	"Z": [31, 1, 2, 4, 8, 16, 31]
+}
+
+func _draw_simple_glyph_text(img: Image, text: String, pos: Vector2, col: Color, max_chars: int = 80) -> void:
+	var clean = text.strip_edges().to_upper()
 	if clean == "":
 		return
 	var cx = int(round(pos.x))
 	var cy = int(round(pos.y))
 	var count = min(clean.length(), max_chars)
 	for i in range(count):
-		var ch = clean.unicode_at(i)
-		if ch == 32:
+		var ch_str = clean.substr(i, 1)
+		if ch_str == " ":
 			cx += 6
 			continue
 		if cx + 5 >= 1280 or cy + 7 >= 720 or cx < 0 or cy < 0:
 			cx += 6
 			continue
+		var rows: Array = _FONT_5X7.get(ch_str, [14, 17, 17, 17, 17, 17, 14])
 		for gy in range(7):
+			var row_bits: int = int(rows[gy])
 			for gx in range(5):
-				var on = false
-				if gy == 0 or gy == 6:
-					on = (gx > 0 and gx < 4)
-				elif gy == 3:
-					on = (gx > 0 and ((ch + gy) % 2 == 0))
-				else:
-					on = (gx == 0 or gx == 4 or ((ch + gx * 3 + gy) % 5 == 0))
-				if on:
+				if (row_bits & (1 << (4 - gx))) != 0:
 					_blend_pixel(img, cx + gx, cy + gy, col)
 		cx += 6
 
@@ -689,6 +747,12 @@ func _render_headless_canvas_item(img: Image, node: CanvasItem, canvas_xform: Tr
 		_draw_simple_glyph_text(img, btn.text, btn.global_position + Vector2(6.0, 5.0), Color(0.92, 0.96, 1.0, 1.0), 40)
 		return
 
+	if node.has_method("_draw") and node.get_script() != null:
+		var item_xform = (Transform2D.IDENTITY if is_ui else canvas_xform) * node.get_global_transform()
+		_render_headless_custom_draw(img, node, item_xform, eff_mod)
+		return
+
+
 func _render_headless_scene_to_image() -> Image:
 	var img = Image.create(1280, 720, false, Image.FORMAT_RGBA8)
 	var bg_col: Color = ProjectSettings.get_setting("rendering/environment/defaults/default_clear_color", Color(0.07, 0.09, 0.13, 1.0))
@@ -755,6 +819,401 @@ func _render_headless_scene_to_image() -> Image:
 		_render_headless_canvas_item(img, uitem["node"], Transform2D.IDENTITY, Color(1.0, 1.0, 1.0, 1.0), true)
 
 	return img
+
+var _headless_draw_proxies: Dictionary = {}
+var _cached_gd_class_blocks: Array = []
+var _gd_blocks_scanned: bool = false
+
+func _scan_gd_files_recursive(dir_path: String, out_files: Array) -> void:
+	var d = DirAccess.open(dir_path)
+	if d == null:
+		return
+	d.list_dir_begin()
+	var fname = d.get_next()
+	while fname != "":
+		if not fname.begins_with("."):
+			var full = dir_path.path_join(fname)
+			if d.current_is_dir():
+				if fname != "assets" and fname != "artifacts":
+					_scan_gd_files_recursive(full, out_files)
+			elif fname.ends_with(".gd"):
+				out_files.append(full)
+		fname = d.get_next()
+	d.list_dir_end()
+
+func _ensure_gd_class_blocks_scanned() -> void:
+	if _gd_blocks_scanned:
+		return
+	_gd_blocks_scanned = true
+	var gd_files: Array = []
+	_scan_gd_files_recursive("res://", gd_files)
+	for fpath in gd_files:
+		var fa = FileAccess.open(fpath, FileAccess.READ)
+		if fa == null:
+			continue
+		var content = fa.get_as_text()
+		if content.find("func _draw") == -1:
+			continue
+		var lines = content.split("\n")
+		var top_consts: PackedStringArray = PackedStringArray()
+		for ln in lines:
+			var trimmed = ln.strip_edges()
+			if (not ln.begins_with("\t") and not ln.begins_with(" ")) and trimmed.begins_with("const "):
+				top_consts.append(ln)
+		# Extract inner classes if any
+		var cur_class_name := ""
+		var cur_class_lines: PackedStringArray = PackedStringArray()
+		var top_level_lines: PackedStringArray = PackedStringArray()
+		for ln in lines:
+			var trimmed = ln.strip_edges()
+			if (not ln.begins_with("\t") and not ln.begins_with(" ")) and trimmed.begins_with("class ") and trimmed.ends_with(":"):
+				if cur_class_name != "" and "\n".join(cur_class_lines).find("func _draw") != -1:
+					_register_gd_class_block(fpath, cur_class_name, top_consts, cur_class_lines)
+				cur_class_name = trimmed
+				cur_class_lines = PackedStringArray()
+			elif cur_class_name != "":
+				if ln.begins_with("\t"):
+					cur_class_lines.append(ln.substr(1))
+				elif ln.begins_with("    "):
+					cur_class_lines.append(ln.substr(4))
+				elif trimmed == "" or trimmed.begins_with("#"):
+					cur_class_lines.append("")
+				else:
+					if "\n".join(cur_class_lines).find("func _draw") != -1:
+						_register_gd_class_block(fpath, cur_class_name, top_consts, cur_class_lines)
+					cur_class_name = ""
+					cur_class_lines = PackedStringArray()
+					top_level_lines.append(ln)
+			else:
+				top_level_lines.append(ln)
+		if cur_class_name != "" and "\n".join(cur_class_lines).find("func _draw") != -1:
+			_register_gd_class_block(fpath, cur_class_name, top_consts, cur_class_lines)
+		if "\n".join(top_level_lines).find("func _draw") != -1:
+			_register_gd_class_block(fpath, "__top__", PackedStringArray(), top_level_lines)
+
+func _register_gd_class_block(fpath: String, cname: String, top_consts: PackedStringArray, body_lines: PackedStringArray) -> void:
+	var vars: Array = []
+	for ln in body_lines:
+		var t = ln.strip_edges()
+		if (not ln.begins_with("\t") and not ln.begins_with(" ")) and t.begins_with("var "):
+			var rest = t.substr(4).strip_edges()
+			var vname = rest.split(":")[0].split("=")[0].split(" ")[0].strip_edges()
+			if vname != "":
+				vars.append(vname)
+	_cached_gd_class_blocks.append({
+		"path": fpath,
+		"class_header": cname,
+		"consts": "\n".join(top_consts),
+		"body": "\n".join(body_lines),
+		"vars": vars
+	})
+
+func _rewrite_draw_calls_in_source(raw_src: String, extra_consts: String, is_control: bool) -> String:
+	var lines = raw_src.split("\n")
+	var out_lines: PackedStringArray = PackedStringArray()
+	out_lines.append("extends Control" if is_control else "extends Node2D")
+	if extra_consts.strip_edges() != "":
+		out_lines.append(extra_consts)
+	var re_draw = RegEx.new()
+	re_draw.compile("(?<![A-Za-z0-9_.])(draw_texture_rect_region|draw_texture_rect|draw_texture|draw_dashed_line|draw_line|draw_circle|draw_arc|draw_rect|draw_string|draw_polyline|draw_colored_polygon|draw_polygon)\\s*\\(")
+	var skipping_lifecycle_func := false
+	for ln in lines:
+		var t = ln.strip_edges()
+		if t.begins_with("extends ") or t.begins_with("class_name "):
+			continue
+		if not ln.begins_with("\t") and not ln.begins_with(" ") and t != "" and not t.begins_with("#"):
+			if (
+				t.begins_with("func _ready(")
+				or t.begins_with("func _enter_tree(")
+				or t.begins_with("func _exit_tree(")
+				or t.begins_with("func _process(")
+				or t.begins_with("func _physics_process(")
+				or t.begins_with("func _input(")
+				or t.begins_with("func _unhandled_input(")
+				or t.begins_with("func _gui_input(")
+			):
+				skipping_lifecycle_func = true
+				continue
+			else:
+				skipping_lifecycle_func = false
+		if skipping_lifecycle_func:
+			continue
+		var mod_ln = re_draw.sub(ln, "_h_$1(", true)
+		out_lines.append(mod_ln)
+
+	out_lines.append("""
+var _h_harness = null
+var _h_img: Image = null
+var _h_xform: Transform2D = Transform2D.IDENTITY
+var _h_mod: Color = Color.WHITE
+
+func _h_draw_line(from: Vector2, to: Vector2, color: Color, width: float = -1.0, _antialiased: bool = false) -> void:
+	if _h_harness != null:
+		_h_harness._proxy_draw_line(_h_img, _h_xform, _h_mod, from, to, color, width)
+
+func _h_draw_dashed_line(from: Vector2, to: Vector2, color: Color, width: float = -1.0, dash: float = 2.0, _aligned: bool = true, _antialiased: bool = false) -> void:
+	if _h_harness != null:
+		_h_harness._proxy_draw_dashed_line(_h_img, _h_xform, _h_mod, from, to, color, width, dash)
+
+func _h_draw_circle(pos: Vector2, radius: float, color: Color, filled: bool = true, width: float = -1.0, _antialiased: bool = false) -> void:
+	if _h_harness != null:
+		_h_harness._proxy_draw_circle(_h_img, _h_xform, _h_mod, pos, radius, color, filled, width)
+
+func _h_draw_arc(center: Vector2, radius: float, start_angle: float, end_angle: float, point_count: int, color: Color, width: float = -1.0, _antialiased: bool = false) -> void:
+	if _h_harness != null:
+		_h_harness._proxy_draw_arc(_h_img, _h_xform, _h_mod, center, radius, start_angle, end_angle, point_count, color, width)
+
+func _h_draw_rect(rect: Rect2, color: Color, filled: bool = true, width: float = -1.0, _antialiased: bool = false) -> void:
+	if _h_harness != null:
+		_h_harness._proxy_draw_rect(_h_img, _h_xform, _h_mod, rect, color, filled, width)
+
+func _h_draw_string(_font: Variant, pos: Vector2, text: String, _alignment: int = 0, _width: float = -1.0, _font_size: int = 16, modulate_col: Color = Color.WHITE, _justification_flags: int = 3, _direction: int = 0, _orientation: int = 0) -> void:
+	if _h_harness != null:
+		_h_harness._proxy_draw_string(_h_img, _h_xform, _h_mod, pos, text, modulate_col)
+
+func _h_draw_texture(texture: Texture2D, pos: Vector2, modulate_col: Color = Color.WHITE) -> void:
+	if _h_harness != null:
+		_h_harness._proxy_draw_texture(_h_img, _h_xform, _h_mod, texture, pos, modulate_col)
+
+func _h_draw_texture_rect(texture: Texture2D, rect: Rect2, _tile: bool, modulate_col: Color = Color.WHITE, _transpose: bool = false) -> void:
+	if _h_harness != null:
+		_h_harness._proxy_draw_texture_rect(_h_img, _h_xform, _h_mod, texture, rect, modulate_col)
+
+func _h_draw_texture_rect_region(texture: Texture2D, rect: Rect2, src_rect: Rect2, modulate_col: Color = Color.WHITE, _transpose: bool = false, _clip_uv: bool = true) -> void:
+	if _h_harness != null:
+		_h_harness._proxy_draw_texture_rect_region(_h_img, _h_xform, _h_mod, texture, rect, src_rect, modulate_col)
+
+func _h_draw_polyline(points: PackedVector2Array, color: Color, width: float = -1.0, _antialiased: bool = false) -> void:
+	if _h_harness != null:
+		_h_harness._proxy_draw_polyline(_h_img, _h_xform, _h_mod, points, color, width)
+
+func _h_draw_polygon(points: PackedVector2Array, colors: PackedColorArray, _uvs: PackedVector2Array = PackedVector2Array(), _texture: Texture2D = null) -> void:
+	if _h_harness != null and colors.size() > 0:
+		_h_harness._proxy_draw_polygon(_h_img, _h_xform, _h_mod, points, colors[0])
+
+func _h_draw_colored_polygon(points: PackedVector2Array, color: Color, _uvs: PackedVector2Array = PackedVector2Array(), _texture: Texture2D = null) -> void:
+	if _h_harness != null:
+		_h_harness._proxy_draw_polygon(_h_img, _h_xform, _h_mod, points, color)
+""")
+	return "\n".join(out_lines)
+
+func _get_or_create_draw_proxy(node: CanvasItem) -> Object:
+	var scr = node.get_script()
+	if scr == null or not (scr is GDScript):
+		return null
+	var sid = scr.get_instance_id()
+	if _headless_draw_proxies.has(sid):
+		return _headless_draw_proxies[sid]
+
+	var raw_body := ""
+	var extra_consts := ""
+	var gd_scr := scr as GDScript
+	if gd_scr.source_code != "" and gd_scr.resource_path == "":
+		raw_body = gd_scr.source_code
+	else:
+		_ensure_gd_class_blocks_scanned()
+		if gd_scr.resource_path != "":
+			for blk in _cached_gd_class_blocks:
+				if blk["path"] == gd_scr.resource_path and blk["class_header"] == "__top__":
+					raw_body = blk["body"]
+					extra_consts = blk["consts"]
+					break
+		if raw_body == "":
+			var node_vars: Array = []
+			for prop in node.get_property_list():
+				if (int(prop.get("usage", 0)) & PROPERTY_USAGE_SCRIPT_VARIABLE) != 0:
+					node_vars.append(String(prop.get("name", "")))
+			var best_score := -1
+			for blk in _cached_gd_class_blocks:
+				if blk["class_header"] == "__top__":
+					continue
+				var bvars: Array = blk["vars"]
+				var all_match := true
+				for v in bvars:
+					if not node_vars.has(v):
+						all_match = false
+						break
+				if all_match and bvars.size() == node_vars.size() and bvars.size() > best_score:
+					best_score = bvars.size()
+					raw_body = blk["body"]
+					extra_consts = blk["consts"]
+	if raw_body == "" or raw_body.find("func _draw") == -1:
+		_headless_draw_proxies[sid] = null
+		return null
+
+	var proxy_code = _rewrite_draw_calls_in_source(raw_body, extra_consts, node is Control)
+	var proxy_scr = GDScript.new()
+	proxy_scr.source_code = proxy_code
+	var err = proxy_scr.reload()
+	if err != OK:
+		_headless_draw_proxies[sid] = null
+		return null
+	var proxy_inst = proxy_scr.new()
+	_headless_draw_proxies[sid] = proxy_inst
+	return proxy_inst
+
+func _render_headless_custom_draw(img: Image, node: CanvasItem, xform: Transform2D, eff_mod: Color) -> void:
+	var proxy = _get_or_create_draw_proxy(node)
+	if proxy == null:
+		return
+	proxy.set("_h_harness", self)
+	proxy.set("_h_img", img)
+	proxy.set("_h_xform", xform)
+	proxy.set("_h_mod", eff_mod)
+	for prop in node.get_property_list():
+		if (int(prop.get("usage", 0)) & PROPERTY_USAGE_SCRIPT_VARIABLE) != 0:
+			var pname = String(prop.get("name", ""))
+			if pname != "" and pname in proxy:
+				proxy.set(pname, node.get(pname))
+	if proxy.has_method("_draw"):
+		proxy.call("_draw")
+
+func _proxy_draw_line(img: Image, xform: Transform2D, mod: Color, p0: Vector2, p1: Vector2, col: Color, width: float) -> void:
+	var thick = clampi(int(round(maxf(1.0, width) * 0.5)), 1, 8)
+	_draw_thick_line_on_image(img, xform * p0, xform * p1, col * mod, thick)
+
+func _proxy_draw_dashed_line(img: Image, xform: Transform2D, mod: Color, p0: Vector2, p1: Vector2, col: Color, width: float, dash: float) -> void:
+	var sp0 = xform * p0
+	var sp1 = xform * p1
+	var dist = sp0.distance_to(sp1)
+	if dist <= 0.5:
+		return
+	var dir = (sp1 - sp0) / dist
+	var step_len = maxf(4.0, dash)
+	var cur = 0.0
+	var thick = clampi(int(round(maxf(1.0, width) * 0.5)), 1, 8)
+	while cur < dist:
+		var e = minf(cur + step_len, dist)
+		_draw_thick_line_on_image(img, sp0 + dir * cur, sp0 + dir * e, col * mod, thick)
+		cur += step_len * 2.0
+
+func _proxy_draw_circle(img: Image, xform: Transform2D, mod: Color, pos: Vector2, radius: float, col: Color, filled: bool, width: float) -> void:
+	if not filled:
+		_proxy_draw_arc(img, xform, mod, pos, radius, 0.0, TAU, 20, col, width)
+		return
+	var c = xform * pos
+	var r = int(round(clampf(radius, 1.0, 200.0)))
+	var fcol = col * mod
+	var cx = int(round(c.x))
+	var cy = int(round(c.y))
+	for dy in range(-r, r + 1):
+		for dx in range(-r, r + 1):
+			if dx * dx + dy * dy <= r * r:
+				_blend_pixel(img, cx + dx, cy + dy, fcol)
+
+func _proxy_draw_arc(img: Image, xform: Transform2D, mod: Color, center: Vector2, radius: float, start_angle: float, end_angle: float, point_count: int, col: Color, width: float) -> void:
+	var segs = clampi(point_count, 8, 48)
+	var thick = clampi(int(round(maxf(1.0, width) * 0.5)), 1, 6)
+	var fcol = col * mod
+	for i in range(segs):
+		var a0 = lerpf(start_angle, end_angle, float(i) / float(segs))
+		var a1 = lerpf(start_angle, end_angle, float(i + 1) / float(segs))
+		var p0 = xform * (center + Vector2(cos(a0), sin(a0)) * radius)
+		var p1 = xform * (center + Vector2(cos(a1), sin(a1)) * radius)
+		_draw_thick_line_on_image(img, p0, p1, fcol, thick)
+
+func _proxy_draw_rect(img: Image, xform: Transform2D, mod: Color, rect: Rect2, col: Color, filled: bool, width: float) -> void:
+	var tl = xform * rect.position
+	var br = xform * (rect.position + rect.size)
+	var x0 = int(round(minf(tl.x, br.x)))
+	var y0 = int(round(minf(tl.y, br.y)))
+	var w = int(round(absf(br.x - tl.x)))
+	var h = int(round(absf(br.y - tl.y)))
+	var fcol = col * mod
+	if filled:
+		_blend_rect_alpha(img, Rect2i(x0, y0, w, h), fcol)
+	else:
+		var thick = clampi(int(round(maxf(1.0, width) * 0.5)), 1, 5)
+		var p_tl = Vector2(float(x0), float(y0))
+		var p_tr = Vector2(float(x0 + w), float(y0))
+		var p_br = Vector2(float(x0 + w), float(y0 + h))
+		var p_bl = Vector2(float(x0), float(y0 + h))
+		_draw_thick_line_on_image(img, p_tl, p_tr, fcol, thick)
+		_draw_thick_line_on_image(img, p_tr, p_br, fcol, thick)
+		_draw_thick_line_on_image(img, p_br, p_bl, fcol, thick)
+		_draw_thick_line_on_image(img, p_bl, p_tl, fcol, thick)
+
+func _proxy_draw_string(img: Image, xform: Transform2D, mod: Color, pos: Vector2, text: String, col: Color) -> void:
+	var sp = xform * pos
+	var fcol = col * mod
+	fcol.a = 1.0
+	_draw_simple_glyph_text(img, text, sp - Vector2(0.0, 6.0), fcol, 80)
+
+func _proxy_draw_texture(img: Image, xform: Transform2D, mod: Color, tex: Texture2D, pos: Vector2, col: Color) -> void:
+	if tex == null:
+		return
+	var rect = Rect2(pos, Vector2(float(tex.get_width()), float(tex.get_height())))
+	_proxy_draw_texture_rect(img, xform, mod, tex, rect, col)
+
+func _proxy_draw_texture_rect(img: Image, xform: Transform2D, mod: Color, tex: Texture2D, rect: Rect2, col: Color) -> void:
+	if tex == null:
+		return
+	var src_rect = Rect2(0.0, 0.0, float(tex.get_width()), float(tex.get_height()))
+	_proxy_draw_texture_rect_region(img, xform, mod, tex, rect, src_rect, col)
+
+func _proxy_draw_texture_rect_region(img: Image, xform: Transform2D, mod: Color, tex: Texture2D, rect: Rect2, src_rect: Rect2, col: Color) -> void:
+	if tex == null:
+		return
+	var timg = tex.get_image()
+	if timg == null or timg.is_empty():
+		return
+	timg = timg.duplicate()
+	if timg.is_compressed():
+		timg.decompress()
+	timg.convert(Image.FORMAT_RGBA8)
+	var sx = clampi(int(round(src_rect.position.x)), 0, max(0, timg.get_width() - 1))
+	var sy = clampi(int(round(src_rect.position.y)), 0, max(0, timg.get_height() - 1))
+	var sw = clampi(int(round(src_rect.size.x)), 1, max(1, timg.get_width() - sx))
+	var sh = clampi(int(round(src_rect.size.y)), 1, max(1, timg.get_height() - sy))
+	var sub = timg.get_region(Rect2i(sx, sy, sw, sh))
+	var tl = xform * rect.position
+	var br = xform * (rect.position + rect.size)
+	var dw = clampi(int(round(absf(br.x - tl.x))), 4, 1280)
+	var dh = clampi(int(round(absf(br.y - tl.y))), 4, 720)
+	if sub.get_width() != dw or sub.get_height() != dh:
+		sub.resize(dw, dh, Image.INTERPOLATE_BILINEAR)
+	var dx0 = int(round(minf(tl.x, br.x)))
+	var dy0 = int(round(minf(tl.y, br.y)))
+	var fcol = col * mod
+	for py in range(0, dh):
+		for px in range(0, dw):
+			var c_px = sub.get_pixel(px, py)
+			if c_px.a > 0.02:
+				_blend_pixel(img, dx0 + px, dy0 + py, c_px * fcol)
+
+func _proxy_draw_polyline(img: Image, xform: Transform2D, mod: Color, pts: PackedVector2Array, col: Color, width: float) -> void:
+	if pts.size() < 2:
+		return
+	var thick = clampi(int(round(maxf(1.0, width) * 0.5)), 1, 6)
+	var fcol = col * mod
+	for i in range(pts.size() - 1):
+		_draw_thick_line_on_image(img, xform * pts[i], xform * pts[i + 1], fcol, thick)
+
+func _proxy_draw_polygon(img: Image, xform: Transform2D, mod: Color, pts: PackedVector2Array, col: Color) -> void:
+	if pts.size() < 3:
+		return
+	var s_pts = PackedVector2Array()
+	var min_x = 1280.0
+	var max_x = 0.0
+	var min_y = 720.0
+	var max_y = 0.0
+	for p in pts:
+		var sp = xform * p
+		s_pts.append(sp)
+		min_x = minf(min_x, sp.x)
+		max_x = maxf(max_x, sp.x)
+		min_y = minf(min_y, sp.y)
+		max_y = maxf(max_y, sp.y)
+	var ix0 = int(clampf(min_x, 0.0, 1279.0))
+	var ix1 = int(clampf(max_x, 0.0, 1279.0))
+	var iy0 = int(clampf(min_y, 0.0, 719.0))
+	var iy1 = int(clampf(max_y, 0.0, 719.0))
+	var fcol = col * mod
+	for py in range(iy0, iy1 + 1, 2):
+		for px in range(ix0, ix1 + 1, 2):
+			if Geometry2D.is_point_in_polygon(Vector2(float(px), float(py)), s_pts):
+				_blend_rect_alpha(img, Rect2i(px, py, 2, 2), fcol)
+
 
 func _blend_pixel(img: Image, x: int, y: int, col: Color) -> void:
 	if x < 0 or x >= 1280 or y < 0 or y >= 720:
