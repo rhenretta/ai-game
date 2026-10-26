@@ -3570,13 +3570,16 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       } else if (evTypeLower === 'backlog_item_escalated' || evTypeLower === 'backlog_item_failed') {
         if (p.item_id) delete _liveRunningAgents['item_' + p.item_id];
         if (evTypeLower === 'backlog_item_failed') {
-          _lastBuildError = {
+          const candErr = {
             event_type: ev.event_type || 'backlog_item_failed',
             agent_name: agent || 'TaskWorker',
             item_id: p.item_id || '',
             message: String(p.error || p.failure || delibText || 'Task execution failed.'),
             timestamp_utc: ev.timestamp_utc || new Date().toISOString(),
           };
+          if (!_isErrorDismissed(candErr)) {
+            _lastBuildError = candErr;
+          }
         }
       } else if (evTypeLower === 'context_curator_packed') {
         _lastBuildStoppedByErrorOrPromote = false;
@@ -3633,13 +3636,16 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       } else if (evType === 'ERROR') {
         const errTxt = String((p && (p.error || p.message || p.failure)) || delibText || 'Build encountered an error.');
         if (!/StudioPausedError|paused by operator/i.test(errTxt)) {
-          _lastBuildError = {
+          const candErr = {
             event_type: 'ERROR',
             agent_name: agent || 'Studio',
             item_id: (p && p.item_id) || '',
             message: errTxt,
             timestamp_utc: ev.timestamp_utc || new Date().toISOString(),
           };
+          if (!_isErrorDismissed(candErr)) {
+            _lastBuildError = candErr;
+          }
         }
         if (['StudioDaemon', 'BuildSupervisor', 'StudioOrchestrator', 'LeadGameplaySWEAgent', 'MissionControlGateway'].includes(agent)) {
           _lastBuildStoppedByErrorOrPromote = true;
@@ -3653,6 +3659,50 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
 
     let _isBuildPaused = false;
     let _lastBuildError = null;
+    const _dismissedErrorKeys = new Set();
+    try {
+      const savedDismissed = JSON.parse(sessionStorage.getItem('studio_dismissed_errors') || '[]');
+      if (Array.isArray(savedDismissed)) {
+        savedDismissed.forEach(k => _dismissedErrorKeys.add(String(k)));
+      }
+    } catch (e) {}
+
+    function _getErrorDismissKey(errObj) {
+      if (!errObj) return '';
+      return `${errObj.item_id || ''}|${errObj.timestamp_utc || ''}|${String(errObj.message || '').slice(0, 160)}`;
+    }
+
+    function _isErrorDismissed(errObj) {
+      if (!errObj) return false;
+      const k1 = _getErrorDismissKey(errObj);
+      const k2 = `item:${errObj.item_id || ''}|${String(errObj.message || '').slice(0, 160)}`;
+      return _dismissedErrorKeys.has(k1) || _dismissedErrorKeys.has(k2);
+    }
+
+    function dismissBuildErrorBanner() {
+      if (_lastBuildError) {
+        _dismissedErrorKeys.add(_getErrorDismissKey(_lastBuildError));
+        _dismissedErrorKeys.add(`item:${_lastBuildError.item_id || ''}|${String(_lastBuildError.message || '').slice(0, 160)}`);
+      }
+      if (_serverProcessStatus && _serverProcessStatus.last_error) {
+        _dismissedErrorKeys.add(_getErrorDismissKey(_serverProcessStatus.last_error));
+        _dismissedErrorKeys.add(`item:${_serverProcessStatus.last_error.item_id || ''}|${String(_serverProcessStatus.last_error.message || '').slice(0, 160)}`);
+      }
+      const boardItems = (latestProductionBoard && Array.isArray(latestProductionBoard.items)) ? latestProductionBoard.items : [];
+      for (const it of boardItems) {
+        if (it && (it.status === 'failed' || it.failure)) {
+          _dismissedErrorKeys.add(`item:${it.id || it.item_id || ''}|${String(it.failure || '').slice(0, 160)}`);
+        }
+      }
+      try {
+        sessionStorage.setItem('studio_dismissed_errors', JSON.stringify(Array.from(_dismissedErrorKeys).slice(-100)));
+      } catch (e) {}
+      _lastBuildError = null;
+      const banner = document.getElementById('studio-build-error-banner');
+      if (banner) banner.style.display = 'none';
+    }
+    window.dismissBuildErrorBanner = dismissBuildErrorBanner;
+
     let _selectedCartridgeId = '';
     let _userPinnedCartridge = false;
     const _gameCatalogCache = new Map();
@@ -3664,7 +3714,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         _isBuildPaused = ps.is_paused;
       }
       if (ps.last_error && typeof ps.last_error === 'object') {
-        _lastBuildError = ps.last_error;
+        if (!_isErrorDismissed(ps.last_error)) {
+          _lastBuildError = ps.last_error;
+        }
       } else if (ps.build_actively_running) {
         // Clear stale build-stopping banner once build is actively running again
       }
@@ -7381,8 +7433,17 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       // Update prominent Build Error Banner when an error stops the build or a board item fails
       const errBanner = document.getElementById('studio-build-error-banner');
       if (errBanner) {
-        const failedBoardItem = items.find(it => it.status === 'failed' || (it.failure && !hasActiveWork));
-        const activeError = _lastBuildError || (failedBoardItem && failedBoardItem.failure ? {
+        const failedBoardItem = items.find(it => {
+          if (!(it.status === 'failed' || (it.failure && !['approved', 'awaiting_review', 'in_progress'].includes(it.status) && !hasActiveWork))) {
+            return false;
+          }
+          return !_isErrorDismissed({
+            item_id: it.id || '',
+            message: String(it.failure || ''),
+          });
+        });
+        const candidateErr = (_lastBuildError && !_isErrorDismissed(_lastBuildError)) ? _lastBuildError : null;
+        const activeError = candidateErr || (failedBoardItem && failedBoardItem.failure ? {
           event_type: failedBoardItem.status === 'failed' ? 'backlog_item_failed' : 'ERROR',
           agent_name: failedBoardItem.owner_role || 'TaskWorker',
           item_id: failedBoardItem.id || '',
@@ -7399,7 +7460,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             </button>
           ` : '';
           const dismissBtn = `
-            <button type="button" onclick="_lastBuildError=null; document.getElementById('studio-build-error-banner').style.display='none';" style="background: transparent; border: 1px solid var(--slate); color: var(--light-gray); border-radius: 4px; padding: 3px 8px; font-size: 10px; cursor: pointer;">
+            <button type="button" onclick="dismissBuildErrorBanner()" style="background: transparent; border: 1px solid var(--slate); color: var(--light-gray); border-radius: 4px; padding: 3px 8px; font-size: 10px; cursor: pointer;">
               Dismiss
             </button>
           `;
