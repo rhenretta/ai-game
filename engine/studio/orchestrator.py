@@ -2452,11 +2452,19 @@ class StudioOrchestrator:
                 GodotHeadlessSimulator,
             )
             valid, errs = verify_godot_cartridge_syntax(staging_dir)
-            if not valid and swe_agent is not None and hasattr(swe_agent, "_verify_and_heal_godot_syntax_and_probes"):
+            if (
+                not valid
+                and swe_agent is not None
+                and hasattr(swe_agent, "_verify_and_heal_godot_syntax_and_probes")
+                and not getattr(swe_agent, "_last_syntax_heal_failed", False)
+            ):
                 swe_agent._verify_and_heal_godot_syntax_and_probes(staging_dir)
                 valid, errs = verify_godot_cartridge_syntax(staging_dir)
             if not valid:
-                raise RuntimeError(f"Godot syntax verification failed: {errs}")
+                err_details = "; ".join(
+                    f"{d.file_path.name}:{d.line_number}: {d.error_message}" for d in (errs or [])[:8]
+                )
+                raise RuntimeError(f"Godot syntax verification failed: {err_details or errs}")
 
             # Discover standalone test scenes (tests/*.tscn) targeted by this track so SWE catches test scene assertions immediately
             scenes_to_verify: List[Optional[str]] = [None]

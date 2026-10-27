@@ -67,6 +67,44 @@ MULTILINE_ERROR_PATTERNS = [
     re.compile(r'ERROR:\s*([^\n]+)\n\s*at:\s*[^\n]*?\((res://[^:]+):(\d+)\)'),
 ]
 
+INLINE_GDSCRIPT_ERROR_RE = re.compile(
+    r'SCRIPT ERROR:\s*(?:Parse Error:\s*)?([^\n]+)\n\s*at:\s*GDScript::reload\s*\(gdscript://[^:]+:(\d+)\)'
+)
+
+
+def _resolve_inline_gdscript_location(c_dir: Path, inline_line: int, err_msg: str = "") -> Tuple[Path, int]:
+    """Maps a line number inside an inline `GDScript.new()` triple-quoted `source_code` block
+    back to the host `.gd` file and exact host line number."""
+    block_re = re.compile(r'source_code\s*=\s*"""(.*?)"""', re.DOTALL)
+    quoted_tokens = [tok for tok in re.findall(r'"([^"]+)"', err_msg or "") if tok]
+    exact_matches: List[Tuple[Path, int]] = []
+    candidates: List[Tuple[Path, int]] = []
+    for gd_file in sorted(c_dir.rglob("*.gd")):
+        try:
+            text = gd_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for m in block_re.finditer(text):
+            block_body = m.group(1)
+            block_lines = block_body.splitlines()
+            if 1 <= inline_line <= len(block_lines) + 1:
+                host_start_line = text[:m.start(1)].count("\n") + 1
+                host_target_line = host_start_line + max(0, inline_line - 1)
+                candidates.append((gd_file, host_target_line))
+                target_line_str = block_lines[inline_line - 1] if inline_line - 1 < len(block_lines) else ""
+                if quoted_tokens and any(tok in target_line_str for tok in quoted_tokens):
+                    exact_matches.append((gd_file, host_target_line))
+    if exact_matches:
+        return exact_matches[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    for gd_file, host_line in candidates:
+        if gd_file.name == "main.gd":
+            return gd_file, host_line
+    if candidates:
+        return candidates[0]
+    return c_dir / "main.gd", 1
+
 
 ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
 
@@ -94,6 +132,20 @@ def parse_godot_stderr(cartridge_dir: Union[Path, str], stderr_text: str) -> Lis
                 )
             )
             matched_spans.append(m.span())
+
+    for m_inline in INLINE_GDSCRIPT_ERROR_RE.finditer(stderr_text):
+        err_msg = m_inline.group(1).strip()
+        inline_line = int(m_inline.group(2))
+        resolved_file, host_line = _resolve_inline_gdscript_location(c_dir, inline_line, err_msg=err_msg)
+        diagnostics.append(
+            GDScriptDiagnostic(
+                file_path=resolved_file,
+                line_number=host_line,
+                error_message=f"{err_msg} (inside inline GDScript.new() source_code block at inline line {inline_line}, around {resolved_file.name}:{host_line})",
+                raw_line=m_inline.group(0),
+            )
+        )
+        matched_spans.append(m_inline.span())
 
     # Check single-line errors (including native-type script attachment errors)
     for line in stderr_text.splitlines():
@@ -367,16 +419,30 @@ class GodotHeadlessSimulator:
             if "--capture-viewport" not in extra_args:
                 extra_args.append("--capture-viewport")
 
-        godot_bin = ensure_godot_binary()
-        cmd: List[str] = [
-            str(godot_bin),
-            "--headless",
-            "--audio-driver", "Dummy",
-            "--fixed-fps", "60",
-            "--path", str(self.cartridge_path),
-            "-s", str(HARNESS_SCRIPT_PATH),
-            "--max-ticks", str(limit),
-        ] + extra_args
+        if use_viewport and (has_display or xvfb_bin):
+            render_bin = ensure_godot_background_render_binary()
+            cmd: List[str] = []
+            if xvfb_bin:
+                cmd.extend([xvfb_bin, "-a"])
+            cmd.extend([
+                str(render_bin),
+                "--audio-driver", "Dummy",
+                "--fixed-fps", "60",
+                "--path", str(self.cartridge_path),
+                "-s", str(HARNESS_SCRIPT_PATH),
+                "--max-ticks", str(limit),
+            ] + extra_args)
+        else:
+            godot_bin = ensure_godot_binary()
+            cmd = [
+                str(godot_bin),
+                "--headless",
+                "--audio-driver", "Dummy",
+                "--fixed-fps", "60",
+                "--path", str(self.cartridge_path),
+                "-s", str(HARNESS_SCRIPT_PATH),
+                "--max-ticks", str(limit),
+            ] + extra_args
 
         logger.info("Executing Godot playtest harness: %s", " ".join(cmd))
         proc = subprocess.Popen(

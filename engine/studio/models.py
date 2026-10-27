@@ -3287,7 +3287,7 @@ def bounded_thinking_config(budget: int = 2048) -> Any:
 
 
 def is_transient_gemini_error(exc: BaseException) -> bool:
-    """Returns True if `exc` is a transient upstream deadline, rate-limit, or overload error (504/503/429)."""
+    """Returns True if `exc` is a transient upstream deadline, rate-limit, overload, DNS, or socket error."""
     msg = f"{type(exc).__name__}: {exc}".upper()
     return any(
         token in msg
@@ -3302,12 +3302,25 @@ def is_transient_gemini_error(exc: BaseException) -> bool:
             "READTIMEOUT",
             "CONNECTTIMEOUT",
             "TIMED OUT",
+            "NODENAME NOR SERVNAME",
+            "TEMPORARY FAILURE IN NAME RESOLUTION",
+            "NAME OR SERVICE NOT KNOWN",
+            "GAIERROR",
+            "[ERRNO 8]",
+            "CONNECTERROR",
+            "REMOTEPROTOCOLERROR",
+            "SERVERDISCONNECTED",
+            "CONNECTION RESET",
+            "CONNECTIONRESETERROR",
+            "BROKEN PIPE",
+            "UNEXPECTED_EOF_WHILE_READING",
         )
     )
 
 
 class StudioPausedError(StudioAgentError):
     """Raised when an outbound LLM call is blocked or aborted because the Studio is paused."""
+    deliberation: str = "Studio execution paused; outbound LLM request aborted."
 
 
 def is_studio_paused(candidate_dir: Optional[Path] = None) -> bool:
@@ -3442,6 +3455,10 @@ class TokenUsageTracker:
 
         if max_streak > 0 and streak > max_streak:
             # Trip circuit breaker: auto-pause studio on disk and in memory so no further calls can fire
+            err_msg = (
+                f"Runaway LLM call circuit breaker tripped: '{label}' exceeded {max_streak} consecutive SWE/PEV calls without task progression."
+            )
+            now_iso = _dt.now(_tz.utc).isoformat()
             try:
                 import config as _cfg
                 in_pytest = "PYTEST_CURRENT_TEST" in _os.environ
@@ -3455,16 +3472,29 @@ class TokenUsageTracker:
                     target_pause.write_text(
                         _json.dumps({
                             "paused": True,
-                            "reason": f"Runaway SWE/PEV loop circuit breaker tripped after {streak} consecutive calls ({label}).",
-                            "timestamp_utc": _dt.now(_tz.utc).isoformat(),
+                            "reason": err_msg,
+                            "timestamp_utc": now_iso,
                         }),
                         encoding="utf-8",
                     )
+                if not in_pytest:
+                    from engine.ui.server import swarm_bus as _sb
+                    if _sb is not None and hasattr(_sb, "publish_threadsafe"):
+                        _sb.publish_threadsafe({
+                            "deliberation": err_msg,
+                            "event_type": "ERROR",
+                            "agent_name": (label or "StudioCircuitBreaker").split(".", 1)[0],
+                            "timestamp_utc": now_iso,
+                            "payload": {
+                                "error": err_msg,
+                                "reason": err_msg,
+                                "label": label,
+                                "streak": streak,
+                            },
+                        })
             except Exception:
                 pass
-            raise StudioPausedError(
-                f"Runaway LLM call circuit breaker tripped: '{label}' exceeded {max_streak} consecutive SWE/PEV calls without task progression."
-            )
+            raise StudioPausedError(err_msg)
 
     def record_response(self, response: Any, label: str = "generate_content") -> Optional[Dict[str, int]]:
         if getattr(response, "_studio_usage_recorded", False):
@@ -3822,8 +3852,12 @@ def install_studio_gemini_guardrails(
 
         def _make_guarded(fn: Any, m_name: str) -> Any:
             def _guarded(*args: Any, **kwargs: Any) -> Any:
+                import random as _random
+                import time as _time
+
                 ctx_label = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "label", None)
                 ctx_c_dir = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "candidate_dir", None) or candidate_dir
+                in_retry_wrapper = bool(getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "in_retry_wrapper", False))
                 lbl = ctx_label or f"genai.models.{m_name}"
                 wait_if_studio_paused(candidate_dir=ctx_c_dir, label=lbl)
                 TOKEN_USAGE_TRACKER.check_circuit_breaker(label=lbl, candidate_dir=ctx_c_dir)
@@ -3838,7 +3872,20 @@ def install_studio_gemini_guardrails(
                     if m_name == "generate_content"
                     else kwargs
                 )
-                res = fn(*args, **call_kwargs)
+                max_direct_retries = 0 if in_retry_wrapper else 3
+                for attempt in range(max_direct_retries + 1):
+                    try:
+                        res = fn(*args, **call_kwargs)
+                        break
+                    except StudioPausedError:
+                        raise
+                    except Exception as exc:
+                        if attempt < max_direct_retries and is_transient_gemini_error(exc):
+                            delay = 1.5 * (2 ** attempt) + _random.uniform(0.0, 0.35)
+                            _time.sleep(delay)
+                            wait_if_studio_paused(candidate_dir=ctx_c_dir, label=lbl)
+                            continue
+                        raise
                 stats = TOKEN_USAGE_TRACKER.record_response(res, label=lbl)
                 if stats is not None:
                     _emit_gateway_llm_activity(lbl, stats)
@@ -3860,7 +3907,7 @@ def install_studio_gemini_guardrails(
 def call_gemini_with_transient_retry(
     call_fn: Any,
     *,
-    max_transient_retries: int = 2,
+    max_transient_retries: int = 4,
     base_delay_s: float = 1.5,
     label: str = "generate_content",
     candidate_dir: Optional[Path] = None,
@@ -3870,7 +3917,7 @@ def call_gemini_with_transient_retry(
     2. Hard runaway-loop circuit breaker (`TOKEN_USAGE_TRACKER.check_circuit_breaker`).
     3. Thread-local call context propagation (`label`, `candidate_dir`) so `install_studio_gemini_guardrails`
        automatically tags the outbound `generate_content` request with AI Studio Dataset `labels` and `store=True`.
-    4. Jittered exponential backoff strictly for transient 504/503/429 errors.
+    4. Jittered exponential backoff strictly for transient 504/503/429 and DNS/socket errors.
     5. Automatic `TOKEN_USAGE_TRACKER` accounting and live Mission Control UI telemetry emission.
     """
     import logging as _logging
@@ -3883,7 +3930,9 @@ def call_gemini_with_transient_retry(
         TOKEN_USAGE_TRACKER.check_circuit_breaker(label=label, candidate_dir=candidate_dir)
         prev_label = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "label", None)
         prev_c_dir = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "candidate_dir", None)
+        prev_in_retry = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "in_retry_wrapper", False)
         _THREAD_LOCAL_GEMINI_CALL_CTX.label = label
+        _THREAD_LOCAL_GEMINI_CALL_CTX.in_retry_wrapper = True
         if candidate_dir is not None:
             _THREAD_LOCAL_GEMINI_CALL_CTX.candidate_dir = candidate_dir
         try:
@@ -3920,6 +3969,7 @@ def call_gemini_with_transient_retry(
         finally:
             _THREAD_LOCAL_GEMINI_CALL_CTX.label = prev_label
             _THREAD_LOCAL_GEMINI_CALL_CTX.candidate_dir = prev_c_dir
+            _THREAD_LOCAL_GEMINI_CALL_CTX.in_retry_wrapper = prev_in_retry
 
 
 def __getattr__(name: str) -> Any:

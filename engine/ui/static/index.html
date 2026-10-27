@@ -3650,7 +3650,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         _resumeOptimisticUntil = 0;
       } else if (evType === 'ERROR') {
         const errTxt = String((p && (p.error || p.message || p.failure)) || delibText || 'Build encountered an error.');
-        if (!/StudioPausedError|paused by operator/i.test(errTxt)) {
+        const isManualPause = /paused by operator/i.test(errTxt) || (/StudioPausedError/i.test(errTxt) && !/circuit breaker/i.test(errTxt));
+        if (!isManualPause) {
           const candErr = {
             event_type: 'ERROR',
             agent_name: agent || 'Studio',
@@ -6765,15 +6766,21 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
               </div>
             </div>
             ${formatStructuredSpecHtml(it.description || '', it.proof_spec || '')}
-            ${(it.failure && (st === 'failed' || st === 'needs_decision') && !_isErrorDismissed({ item_id: it.id, message: it.failure })) ? `
+            ${(it.failure && (st === 'failed' || st === 'needs_decision') && !_isErrorDismissed({ item_id: it.id, message: it.failure })) ? (() => {
+              const failLines = String(it.failure).split('\n').map(l => l.trim()).filter(Boolean);
+              const failSummary = (failLines.length > 1 && /^Traceback \(most recent call last\):/i.test(failLines[0]))
+                ? failLines[failLines.length - 1]
+                : (failLines[0] || String(it.failure));
+              return `
               <details data-details-key="err-${escapeHtml(it.id)}-${escapeHtml(st)}" ${st === 'failed' ? 'open' : ''} style="background: rgba(255, 0, 77, 0.12); border: 1px solid var(--neon-red); border-left: 3px solid var(--neon-red); border-radius: 5px; padding: 6px 10px; font-size: 10.5px; color: var(--pink); min-width: 0; overflow-wrap: anywhere;">
                 <summary style="cursor: pointer; font-weight: 800; color: var(--neon-red); display: flex; align-items: center; justify-content: space-between; gap: 8px;">
-                  <span>⚠️ Execution Error on [${escapeHtml(it.id)}]: <span style="font-weight: 400; color: var(--pink);">${escapeHtml(String(it.failure).slice(0, 140))}${String(it.failure).length > 140 ? '…' : ''}</span></span>
+                  <span>⚠️ Execution Error on [${escapeHtml(it.id)}]: <span style="font-weight: 400; color: var(--pink);">${escapeHtml(failSummary.slice(0, 160))}${failSummary.length > 160 ? '…' : ''}</span></span>
                   <button type="button" onclick="dismissCardError('${escapeHtml(it.id)}', event)" style="background: transparent; color: var(--slate); border: 1px solid var(--slate); border-radius: 4px; padding: 1px 7px; font-size: 9.5px; cursor: pointer; flex-shrink: 0;">Dismiss</button>
                 </summary>
                 <pre tabindex="0" style="margin: 6px 0 0 0; padding: 8px; background: #030712; border: 1px solid rgba(255, 0, 77, 0.4); border-radius: 4px; color: var(--pink); font-family: monospace; font-size: 10px; white-space: pre-wrap; overflow-x: auto; max-height: 220px;"><code>${escapeHtml(it.failure)}</code></pre>
               </details>
-            ` : ''}
+            `;
+            })() : ''}
             ${(st === 'in_progress') ? (() => {
               const liveAg = _liveRunningAgents['item_' + it.id] || {};
               const startedMs = Number(liveAg.startedAtMs || 0);
@@ -7846,6 +7853,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       // Update prominent Build Error Banner when an error stops the build or a board item fails
       const errBanner = document.getElementById('studio-build-error-banner');
       if (errBanner) {
+        const allBoardApproved = totalCount > 0 && approvedCount === totalCount;
         const failedBoardItem = items.find(it => {
           if (!(it.status === 'failed' || (it.failure && !['approved', 'awaiting_review', 'in_progress'].includes(it.status) && !hasActiveWork))) {
             return false;
@@ -7855,7 +7863,22 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             message: String(it.failure || ''),
           });
         });
-        const candidateErr = (_lastBuildError && !_isErrorDismissed(_lastBuildError)) ? _lastBuildError : null;
+        let candidateErr = (_lastBuildError && !_isErrorDismissed(_lastBuildError) && !allBoardApproved) ? _lastBuildError : null;
+        if (candidateErr) {
+          if (candidateErr.item_id) {
+            const matchedItem = items.find(it => it.id === candidateErr.item_id);
+            if (matchedItem && ['approved', 'in_progress', 'awaiting_review'].includes(String(matchedItem.status || '').toLowerCase())) {
+              candidateErr = null;
+            }
+          }
+          if (candidateErr && candidateErr.timestamp_utc && board && board.updated_at) {
+            const errMs = Date.parse(candidateErr.timestamp_utc);
+            const boardMs = Date.parse(board.updated_at);
+            if (!Number.isNaN(errMs) && !Number.isNaN(boardMs) && boardMs > errMs + 5000) {
+              candidateErr = null;
+            }
+          }
+        }
         const activeError = candidateErr || (failedBoardItem && failedBoardItem.failure ? {
           event_type: failedBoardItem.status === 'failed' ? 'backlog_item_failed' : 'ERROR',
           agent_name: failedBoardItem.owner_role || 'TaskWorker',
@@ -7866,7 +7889,11 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         if (activeError && activeError.message && (!hasActiveWork || activeError.event_type === 'backlog_item_failed')) {
           const stoppedBuild = !hasActiveWork && !_isBuildPaused;
           const badgeTitle = stoppedBuild ? '🚨 BUILD STOPPED BY ERROR' : '⚠️ TASK EXECUTION ERROR';
-          const shortErr = String(activeError.message).split('\n')[0].slice(0, 220);
+          const errLines = String(activeError.message).split('\n').map(l => l.trim()).filter(Boolean);
+          const rawHeadline = (errLines.length > 1 && /^Traceback \(most recent call last\):/i.test(errLines[0]))
+            ? errLines[errLines.length - 1]
+            : (errLines[0] || String(activeError.message));
+          const shortErr = rawHeadline.slice(0, 240);
           const itemBtn = activeError.item_id ? `
             <button type="button" onclick="openTaskChronologyModal('${escapeHtml(activeError.item_id)}')" style="background: rgba(41, 173, 255, 0.2); border: 1px solid var(--cyan); color: var(--cyan); border-radius: 4px; padding: 3px 9px; font-size: 10.5px; font-weight: 800; cursor: pointer;">
               🕒 Inspect Task [${escapeHtml(activeError.item_id)}]

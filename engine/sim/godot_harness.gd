@@ -84,11 +84,14 @@ func _initialize() -> void:
 		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_NO_FOCUS, true)
 		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_BORDERLESS, true)
 		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_MOUSE_PASSTHROUGH, true)
+		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_TRANSPARENT, true)
 		DisplayServer.window_set_position(Vector2i(-4000, -4000))
+		root.transparent_bg = true
 		render_viewport = SubViewport.new()
 		render_viewport.name = "HarnessOffscreenViewport"
 		render_viewport.size = Vector2i(1280, 720)
 		render_viewport.size_2d_override = Vector2i(1280, 720)
+		render_viewport.transparent_bg = false
 		render_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
 		render_viewport.handle_input_locally = true
 		root.add_child(render_viewport)
@@ -363,6 +366,8 @@ func _collect_headless_render_items(
 		if not cl.visible:
 			return
 		cur_in_ui = (cl.layer >= 0)
+		if node.has_method("_draw") and node.get_script() != null:
+			ui_items.append({"node": node, "z": cl.layer * 100, "order": world_items.size() + ui_items.size()})
 	var eff_z = parent_z
 	if node is CanvasItem:
 		var ci = node as CanvasItem
@@ -468,8 +473,8 @@ func _draw_simple_glyph_text(img: Image, text: String, pos: Vector2, col: Color,
 					_blend_pixel(img, cx + gx, cy + gy, col)
 		cx += 6
 
-func _render_headless_canvas_item(img: Image, node: CanvasItem, canvas_xform: Transform2D, canvas_mod: Color, is_ui: bool) -> void:
-	var eff_mod = _get_effective_modulate(node)
+func _render_headless_canvas_item(img: Image, node: Node, canvas_xform: Transform2D, canvas_mod: Color, is_ui: bool) -> void:
+	var eff_mod = _get_effective_modulate(node as CanvasItem) if (node is CanvasItem) else Color.WHITE
 	if not is_ui:
 		eff_mod = eff_mod * canvas_mod
 
@@ -747,10 +752,17 @@ func _render_headless_canvas_item(img: Image, node: CanvasItem, canvas_xform: Tr
 		_draw_simple_glyph_text(img, btn.text, btn.global_position + Vector2(6.0, 5.0), Color(0.92, 0.96, 1.0, 1.0), 40)
 		return
 
+	var item_xform = Transform2D.IDENTITY if (is_ui or not (node is CanvasItem)) else (canvas_xform * (node as CanvasItem).get_global_transform())
 	if node.has_method("_draw") and node.get_script() != null:
-		var item_xform = (Transform2D.IDENTITY if is_ui else canvas_xform) * node.get_global_transform()
 		_render_headless_custom_draw(img, node, item_xform, eff_mod)
-		return
+	if node is CanvasItem and node.has_signal("draw"):
+		for conn in node.get_signal_connection_list("draw"):
+			var cb: Variant = conn.get("callable")
+			if cb is Callable and cb.is_valid():
+				var target_obj = cb.get_object()
+				var mname = String(cb.get_method())
+				if target_obj != null and mname != "" and not (target_obj == node and mname == "_draw"):
+					_render_headless_custom_draw_method(img, target_obj, mname, node, item_xform, eff_mod)
 
 
 func _render_headless_scene_to_image() -> Image:
@@ -841,6 +853,21 @@ func _scan_gd_files_recursive(dir_path: String, out_files: Array) -> void:
 		fname = d.get_next()
 	d.list_dir_end()
 
+func _has_custom_draw_code(src: String) -> bool:
+	return (
+		src.find("func _draw") != -1
+		or src.find("draw_rect") != -1
+		or src.find("draw_line") != -1
+		or src.find("draw_string") != -1
+		or src.find("draw_circle") != -1
+		or src.find("draw_arc") != -1
+		or src.find("draw_polygon") != -1
+		or src.find("draw_colored_polygon") != -1
+		or src.find("draw_polyline") != -1
+		or src.find("draw_texture") != -1
+		or src.find("._perform_render") != -1
+	)
+
 func _ensure_gd_class_blocks_scanned() -> void:
 	if _gd_blocks_scanned:
 		return
@@ -852,7 +879,7 @@ func _ensure_gd_class_blocks_scanned() -> void:
 		if fa == null:
 			continue
 		var content = fa.get_as_text()
-		if content.find("func _draw") == -1:
+		if not _has_custom_draw_code(content):
 			continue
 		var lines = content.split("\n")
 		var top_consts: PackedStringArray = PackedStringArray()
@@ -860,35 +887,39 @@ func _ensure_gd_class_blocks_scanned() -> void:
 			var trimmed = ln.strip_edges()
 			if (not ln.begins_with("\t") and not ln.begins_with(" ")) and trimmed.begins_with("const "):
 				top_consts.append(ln)
-		# Extract inner classes if any
+		# Extract inner classes if any, while keeping inner class declarations in top_level_lines
 		var cur_class_name := ""
 		var cur_class_lines: PackedStringArray = PackedStringArray()
 		var top_level_lines: PackedStringArray = PackedStringArray()
 		for ln in lines:
 			var trimmed = ln.strip_edges()
 			if (not ln.begins_with("\t") and not ln.begins_with(" ")) and trimmed.begins_with("class ") and trimmed.ends_with(":"):
-				if cur_class_name != "" and "\n".join(cur_class_lines).find("func _draw") != -1:
+				if cur_class_name != "" and _has_custom_draw_code("\n".join(cur_class_lines)):
 					_register_gd_class_block(fpath, cur_class_name, top_consts, cur_class_lines)
 				cur_class_name = trimmed
 				cur_class_lines = PackedStringArray()
+				top_level_lines.append(ln)
 			elif cur_class_name != "":
 				if ln.begins_with("\t"):
 					cur_class_lines.append(ln.substr(1))
+					top_level_lines.append(ln)
 				elif ln.begins_with("    "):
 					cur_class_lines.append(ln.substr(4))
+					top_level_lines.append(ln)
 				elif trimmed == "" or trimmed.begins_with("#"):
 					cur_class_lines.append("")
+					top_level_lines.append(ln)
 				else:
-					if "\n".join(cur_class_lines).find("func _draw") != -1:
+					if _has_custom_draw_code("\n".join(cur_class_lines)):
 						_register_gd_class_block(fpath, cur_class_name, top_consts, cur_class_lines)
 					cur_class_name = ""
 					cur_class_lines = PackedStringArray()
 					top_level_lines.append(ln)
 			else:
 				top_level_lines.append(ln)
-		if cur_class_name != "" and "\n".join(cur_class_lines).find("func _draw") != -1:
+		if cur_class_name != "" and _has_custom_draw_code("\n".join(cur_class_lines)):
 			_register_gd_class_block(fpath, cur_class_name, top_consts, cur_class_lines)
-		if "\n".join(top_level_lines).find("func _draw") != -1:
+		if _has_custom_draw_code("\n".join(top_level_lines)):
 			_register_gd_class_block(fpath, "__top__", PackedStringArray(), top_level_lines)
 
 func _register_gd_class_block(fpath: String, cname: String, top_consts: PackedStringArray, body_lines: PackedStringArray) -> void:
@@ -910,12 +941,21 @@ func _register_gd_class_block(fpath: String, cname: String, top_consts: PackedSt
 
 func _rewrite_draw_calls_in_source(raw_src: String, extra_consts: String, is_control: bool) -> String:
 	var lines = raw_src.split("\n")
+	var inner_class_names: Array = []
+	for ln in lines:
+		var t = ln.strip_edges()
+		if (not ln.begins_with("\t") and not ln.begins_with(" ")) and t.begins_with("class ") and t.ends_with(":"):
+			var cname = t.substr(6).split(" ")[0].split(":")[0].strip_edges()
+			if cname != "":
+				inner_class_names.append(cname)
 	var out_lines: PackedStringArray = PackedStringArray()
 	out_lines.append("extends Control" if is_control else "extends Node2D")
 	if extra_consts.strip_edges() != "":
 		out_lines.append(extra_consts)
 	var re_draw = RegEx.new()
-	re_draw.compile("(?<![A-Za-z0-9_.])(draw_texture_rect_region|draw_texture_rect|draw_texture|draw_dashed_line|draw_line|draw_circle|draw_arc|draw_rect|draw_string|draw_polyline|draw_colored_polygon|draw_polygon)\\s*\\(")
+	re_draw.compile("(?<![A-Za-z0-9_])(?:[A-Za-z_][A-Za-z0-9_]*\\.)?(draw_texture_rect_region|draw_texture_rect|draw_texture|draw_multiline_string_outline|draw_multiline_string|draw_string_outline|draw_string|draw_char_outline|draw_char|draw_dashed_line|draw_multiline_colors|draw_multiline|draw_line|draw_circle|draw_arc|draw_rect|draw_style_box|draw_polyline_colors|draw_polyline|draw_colored_polygon|draw_polygon|draw_primitive|draw_set_transform_matrix|draw_set_transform|draw_animation_slice|draw_end_animation)\\s*\\(")
+	var re_mouse = RegEx.new()
+	re_mouse.compile("(?<![A-Za-z0-9_])(?:[A-Za-z_][A-Za-z0-9_]*\\.)?(get_global_mouse_position|get_local_mouse_position|get_viewport_rect)\\s*\\(\\s*\\)")
 	var skipping_lifecycle_func := false
 	for ln in lines:
 		var t = ln.strip_edges()
@@ -938,14 +978,44 @@ func _rewrite_draw_calls_in_source(raw_src: String, extra_consts: String, is_con
 				skipping_lifecycle_func = false
 		if skipping_lifecycle_func:
 			continue
-		var mod_ln = re_draw.sub(ln, "_h_$1(", true)
+		var mod_ln = ln
+		if (not ln.begins_with("\t") and not ln.begins_with(" ")) and t.begins_with("var "):
+			for icn in inner_class_names:
+				mod_ln = mod_ln.replace(": " + icn, "").replace(":" + icn, "")
+		if not t.begins_with("func "):
+			mod_ln = re_draw.sub(mod_ln, "_h_$1(", true)
+			mod_ln = re_mouse.sub(mod_ln, "_h_$1()", true)
 		out_lines.append(mod_ln)
 
 	out_lines.append("""
 var _h_harness = null
 var _h_img: Image = null
+var _h_base_xform: Transform2D = Transform2D.IDENTITY
 var _h_xform: Transform2D = Transform2D.IDENTITY
 var _h_mod: Color = Color.WHITE
+
+func _h_get_global_mouse_position() -> Vector2:
+	if _h_harness != null and _h_harness.root != null:
+		return _h_harness.root.get_mouse_position()
+	return Vector2(640.0, 360.0)
+
+func _h_get_local_mouse_position() -> Vector2:
+	return _h_get_global_mouse_position()
+
+func _h_get_viewport_rect() -> Rect2:
+	return Rect2(0.0, 0.0, 1280.0, 720.0)
+
+func _h_draw_set_transform(pos: Vector2, rot: float = 0.0, sc: Vector2 = Vector2.ONE) -> void:
+	_h_xform = _h_base_xform * Transform2D(rot, sc, 0.0, pos)
+
+func _h_draw_set_transform_matrix(xform: Transform2D) -> void:
+	_h_xform = _h_base_xform * xform
+
+func _h_draw_animation_slice(_animation_length: float, _slice_begin: float, _slice_end: float, _offset: float = 0.0) -> void:
+	pass
+
+func _h_draw_end_animation() -> void:
+	pass
 
 func _h_draw_line(from: Vector2, to: Vector2, color: Color, width: float = -1.0, _antialiased: bool = false) -> void:
 	if _h_harness != null:
@@ -954,6 +1024,23 @@ func _h_draw_line(from: Vector2, to: Vector2, color: Color, width: float = -1.0,
 func _h_draw_dashed_line(from: Vector2, to: Vector2, color: Color, width: float = -1.0, dash: float = 2.0, _aligned: bool = true, _antialiased: bool = false) -> void:
 	if _h_harness != null:
 		_h_harness._proxy_draw_dashed_line(_h_img, _h_xform, _h_mod, from, to, color, width, dash)
+
+func _h_draw_multiline(points: PackedVector2Array, color: Color, width: float = -1.0, _antialiased: bool = false) -> void:
+	if _h_harness != null:
+		var i := 0
+		while i + 1 < points.size():
+			_h_harness._proxy_draw_line(_h_img, _h_xform, _h_mod, points[i], points[i + 1], color, width)
+			i += 2
+
+func _h_draw_multiline_colors(points: PackedVector2Array, colors: PackedColorArray, width: float = -1.0, _antialiased: bool = false) -> void:
+	if _h_harness != null and colors.size() > 0:
+		var i := 0
+		var ci := 0
+		while i + 1 < points.size():
+			var c = colors[min(ci, colors.size() - 1)]
+			_h_harness._proxy_draw_line(_h_img, _h_xform, _h_mod, points[i], points[i + 1], c, width)
+			i += 2
+			ci += 1
 
 func _h_draw_circle(pos: Vector2, radius: float, color: Color, filled: bool = true, width: float = -1.0, _antialiased: bool = false) -> void:
 	if _h_harness != null:
@@ -967,9 +1054,37 @@ func _h_draw_rect(rect: Rect2, color: Color, filled: bool = true, width: float =
 	if _h_harness != null:
 		_h_harness._proxy_draw_rect(_h_img, _h_xform, _h_mod, rect, color, filled, width)
 
+func _h_draw_style_box(style_box: StyleBox, rect: Rect2) -> void:
+	if _h_harness != null:
+		var col := Color(0.12, 0.16, 0.24, 0.9)
+		if style_box is StyleBoxFlat:
+			col = (style_box as StyleBoxFlat).bg_color
+		_h_harness._proxy_draw_rect(_h_img, _h_xform, _h_mod, rect, col, true, -1.0)
+
 func _h_draw_string(_font: Variant, pos: Vector2, text: String, _alignment: int = 0, _width: float = -1.0, _font_size: int = 16, modulate_col: Color = Color.WHITE, _justification_flags: int = 3, _direction: int = 0, _orientation: int = 0) -> void:
 	if _h_harness != null:
 		_h_harness._proxy_draw_string(_h_img, _h_xform, _h_mod, pos, text, modulate_col)
+
+func _h_draw_string_outline(_font: Variant, pos: Vector2, text: String, _alignment: int = 0, _width: float = -1.0, _font_size: int = 16, _size: int = 1, modulate_col: Color = Color.BLACK, _justification_flags: int = 3, _direction: int = 0, _orientation: int = 0) -> void:
+	if _h_harness != null:
+		_h_harness._proxy_draw_string(_h_img, _h_xform, _h_mod, pos, text, modulate_col)
+
+func _h_draw_multiline_string(_font: Variant, pos: Vector2, text: String, _alignment: int = 0, _width: float = -1.0, _font_size: int = 16, _max_lines: int = -1, modulate_col: Color = Color.WHITE, _brk_flags: int = 3, _justification_flags: int = 3, _direction: int = 0, _orientation: int = 0) -> void:
+	if _h_harness != null:
+		var lns = text.split("\\n")
+		for idx in range(lns.size()):
+			_h_harness._proxy_draw_string(_h_img, _h_xform, _h_mod, pos + Vector2(0.0, float(idx) * 12.0), lns[idx], modulate_col)
+
+func _h_draw_multiline_string_outline(_font: Variant, pos: Vector2, text: String, _alignment: int = 0, _width: float = -1.0, _font_size: int = 16, _max_lines: int = -1, _size: int = 1, modulate_col: Color = Color.BLACK, _brk_flags: int = 3, _justification_flags: int = 3, _direction: int = 0, _orientation: int = 0) -> void:
+	_h_draw_multiline_string(_font, pos, text, _alignment, _width, _font_size, _max_lines, modulate_col)
+
+func _h_draw_char(_font: Variant, pos: Vector2, chr: String, _font_size: int = 16, modulate_col: Color = Color.WHITE) -> void:
+	if _h_harness != null:
+		_h_harness._proxy_draw_string(_h_img, _h_xform, _h_mod, pos, chr, modulate_col)
+
+func _h_draw_char_outline(_font: Variant, pos: Vector2, chr: String, _font_size: int = 16, _size: int = -1, modulate_col: Color = Color.BLACK) -> void:
+	if _h_harness != null:
+		_h_harness._proxy_draw_string(_h_img, _h_xform, _h_mod, pos, chr, modulate_col)
 
 func _h_draw_texture(texture: Texture2D, pos: Vector2, modulate_col: Color = Color.WHITE) -> void:
 	if _h_harness != null:
@@ -987,6 +1102,10 @@ func _h_draw_polyline(points: PackedVector2Array, color: Color, width: float = -
 	if _h_harness != null:
 		_h_harness._proxy_draw_polyline(_h_img, _h_xform, _h_mod, points, color, width)
 
+func _h_draw_polyline_colors(points: PackedVector2Array, colors: PackedColorArray, width: float = -1.0, _antialiased: bool = false) -> void:
+	if _h_harness != null and colors.size() > 0:
+		_h_harness._proxy_draw_polyline(_h_img, _h_xform, _h_mod, points, colors[0], width)
+
 func _h_draw_polygon(points: PackedVector2Array, colors: PackedColorArray, _uvs: PackedVector2Array = PackedVector2Array(), _texture: Texture2D = null) -> void:
 	if _h_harness != null and colors.size() > 0:
 		_h_harness._proxy_draw_polygon(_h_img, _h_xform, _h_mod, points, colors[0])
@@ -994,10 +1113,19 @@ func _h_draw_polygon(points: PackedVector2Array, colors: PackedColorArray, _uvs:
 func _h_draw_colored_polygon(points: PackedVector2Array, color: Color, _uvs: PackedVector2Array = PackedVector2Array(), _texture: Texture2D = null) -> void:
 	if _h_harness != null:
 		_h_harness._proxy_draw_polygon(_h_img, _h_xform, _h_mod, points, color)
+
+func _h_draw_primitive(points: PackedVector2Array, colors: PackedColorArray, _uvs: PackedVector2Array, _texture: Texture2D = null) -> void:
+	if _h_harness != null and colors.size() > 0:
+		if points.size() >= 3:
+			_h_harness._proxy_draw_polygon(_h_img, _h_xform, _h_mod, points, colors[0])
+		elif points.size() == 2:
+			_h_harness._proxy_draw_line(_h_img, _h_xform, _h_mod, points[0], points[1], colors[0], 1.0)
 """)
 	return "\n".join(out_lines)
 
-func _get_or_create_draw_proxy(node: CanvasItem) -> Object:
+func _get_or_create_draw_proxy(node: Object) -> Object:
+	if node == null:
+		return null
 	var scr = node.get_script()
 	if scr == null or not (scr is GDScript):
 		return null
@@ -1012,36 +1140,37 @@ func _get_or_create_draw_proxy(node: CanvasItem) -> Object:
 		raw_body = gd_scr.source_code
 	else:
 		_ensure_gd_class_blocks_scanned()
-		if gd_scr.resource_path != "":
+		var node_vars: Array = []
+		for prop in node.get_property_list():
+			if (int(prop.get("usage", 0)) & PROPERTY_USAGE_SCRIPT_VARIABLE) != 0:
+				node_vars.append(String(prop.get("name", "")))
+		var base_path := gd_scr.resource_path.split("::")[0] if gd_scr.resource_path != "" else ""
+		var best_score := -1
+		for blk in _cached_gd_class_blocks:
+			if base_path != "" and blk["path"] != base_path:
+				continue
+			var bvars: Array = blk["vars"]
+			var all_match := true
+			for v in bvars:
+				if not node_vars.has(v):
+					all_match = false
+					break
+			if all_match and bvars.size() == node_vars.size() and bvars.size() > best_score:
+				best_score = bvars.size()
+				raw_body = blk["body"]
+				extra_consts = blk["consts"]
+		if raw_body == "" and base_path != "":
 			for blk in _cached_gd_class_blocks:
-				if blk["path"] == gd_scr.resource_path and blk["class_header"] == "__top__":
+				if blk["path"] == base_path and blk["class_header"] == "__top__":
 					raw_body = blk["body"]
 					extra_consts = blk["consts"]
 					break
-		if raw_body == "":
-			var node_vars: Array = []
-			for prop in node.get_property_list():
-				if (int(prop.get("usage", 0)) & PROPERTY_USAGE_SCRIPT_VARIABLE) != 0:
-					node_vars.append(String(prop.get("name", "")))
-			var best_score := -1
-			for blk in _cached_gd_class_blocks:
-				if blk["class_header"] == "__top__":
-					continue
-				var bvars: Array = blk["vars"]
-				var all_match := true
-				for v in bvars:
-					if not node_vars.has(v):
-						all_match = false
-						break
-				if all_match and bvars.size() == node_vars.size() and bvars.size() > best_score:
-					best_score = bvars.size()
-					raw_body = blk["body"]
-					extra_consts = blk["consts"]
-	if raw_body == "" or raw_body.find("func _draw") == -1:
+	if raw_body == "" or not _has_custom_draw_code(raw_body):
 		_headless_draw_proxies[sid] = null
 		return null
 
-	var proxy_code = _rewrite_draw_calls_in_source(raw_body, extra_consts, node is Control)
+	var is_ctrl := (node is Control) or (node is CanvasLayer)
+	var proxy_code = _rewrite_draw_calls_in_source(raw_body, extra_consts, is_ctrl)
 	var proxy_scr = GDScript.new()
 	proxy_scr.source_code = proxy_code
 	var err = proxy_scr.reload()
@@ -1052,21 +1181,58 @@ func _get_or_create_draw_proxy(node: CanvasItem) -> Object:
 	_headless_draw_proxies[sid] = proxy_inst
 	return proxy_inst
 
-func _render_headless_custom_draw(img: Image, node: CanvasItem, xform: Transform2D, eff_mod: Color) -> void:
-	var proxy = _get_or_create_draw_proxy(node)
-	if proxy == null:
-		return
+func _sync_draw_proxy_state(src_obj: Object, proxy: Object, img: Image, xform: Transform2D, eff_mod: Color, depth: int = 0, attached_nodes: Array = []) -> void:
 	proxy.set("_h_harness", self)
 	proxy.set("_h_img", img)
+	proxy.set("_h_base_xform", xform)
 	proxy.set("_h_xform", xform)
 	proxy.set("_h_mod", eff_mod)
-	for prop in node.get_property_list():
+	if proxy is Node and root != null and (proxy as Node).get_parent() == null:
+		root.add_child(proxy)
+		attached_nodes.append(proxy)
+	for prop in src_obj.get_property_list():
 		if (int(prop.get("usage", 0)) & PROPERTY_USAGE_SCRIPT_VARIABLE) != 0:
 			var pname = String(prop.get("name", ""))
 			if pname != "" and pname in proxy:
-				proxy.set(pname, node.get(pname))
+				var pval = src_obj.get(pname)
+				if depth == 0 and (pval is Node) and is_instance_valid(pval) and (src_obj is Node) and pval == (src_obj as Node).get_parent():
+					var parent_proxy = _get_or_create_draw_proxy(pval)
+					if parent_proxy != null:
+						_sync_draw_proxy_state(pval, parent_proxy, img, xform, eff_mod, depth + 1, attached_nodes)
+						proxy.set(pname, parent_proxy)
+						continue
+				proxy.set(pname, pval)
+
+func _render_headless_custom_draw(img: Image, node: Object, xform: Transform2D, eff_mod: Color) -> void:
+	var proxy = _get_or_create_draw_proxy(node)
+	if proxy == null:
+		return
+	var attached_nodes: Array = []
+	_sync_draw_proxy_state(node, proxy, img, xform, eff_mod, 0, attached_nodes)
 	if proxy.has_method("_draw"):
 		proxy.call("_draw")
+	for anode in attached_nodes:
+		if is_instance_valid(anode) and (anode as Node).get_parent() == root:
+			root.remove_child(anode)
+
+func _render_headless_custom_draw_method(img: Image, target_obj: Object, method_name: String, canvas_node: CanvasItem, xform: Transform2D, eff_mod: Color) -> void:
+	var proxy = _get_or_create_draw_proxy(target_obj)
+	if proxy == null or not proxy.has_method(method_name):
+		return
+	var attached_nodes: Array = []
+	_sync_draw_proxy_state(target_obj, proxy, img, xform, eff_mod, 1, attached_nodes)
+	var m_args := 0
+	for m in proxy.get_method_list():
+		if String(m.get("name", "")) == method_name:
+			m_args = (m.get("args", []) as Array).size()
+			break
+	if m_args >= 1:
+		proxy.call(method_name, canvas_node)
+	else:
+		proxy.call(method_name)
+	for anode in attached_nodes:
+		if is_instance_valid(anode) and (anode as Node).get_parent() == root:
+			root.remove_child(anode)
 
 func _proxy_draw_line(img: Image, xform: Transform2D, mod: Color, p0: Vector2, p1: Vector2, col: Color, width: float) -> void:
 	var thick = clampi(int(round(maxf(1.0, width) * 0.5)), 1, 8)
@@ -1433,8 +1599,13 @@ func _action_to_keycode(action: String) -> int:
 	return 0
 
 func _push_input_event(ev: InputEvent) -> void:
+	if ev is InputEventMouse:
+		var mev = ev as InputEventMouse
+		mev.global_position = mev.position
+		if render_viewport != null:
+			render_viewport.warp_mouse(mev.position)
 	if render_viewport != null:
-		render_viewport.push_input(ev)
+		render_viewport.push_input(ev, true)
 	root.push_input(ev)
 
 func _emit_action_and_key_event(action: String, is_pressed: bool) -> void:

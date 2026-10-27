@@ -30,6 +30,7 @@ from engine.studio.models import (
     ScriptWritingDeliverable,
     SpecialistReport,
     StudioAgentError,
+    StudioPausedError,
     TaskLeadDecision,
     WorkItem,
     bounded_thinking_config,
@@ -727,10 +728,10 @@ def validate_filmstrip_plan(plan: FilmstripPlan, actions: List[str], item_kind: 
                 issues.append(f"setup_call args_json for '{call.method_name}' must encode a JSON list.")
         except Exception:
             issues.append(f"setup_call args_json for '{call.method_name}' is not valid JSON.")
-    if item_kind in ("mechanic_code", "integration") and actions and not plan.input_segments:
+    if item_kind in ("mechanic_code", "integration") and actions and not plan.input_segments and not getattr(plan, "setup_calls", None):
         issues.append(
             f"FilmstripPlan for '{item_kind}' must include at least one `input_segments` entry (keyboard `actions` or `mouse_click_pos`) "
-            f"demonstrating causal player interaction from the unsolved t=0 baseline."
+            f"or scenario `setup_calls` demonstrating causal progression from the t=0 baseline."
         )
     return issues
 
@@ -1448,6 +1449,7 @@ def run_swe_engineer_specialist(
                     agent.formulate_level_layout(ctx.cartridge_dir, force_refresh=False)
                 except Exception as layout_exc:
                     logger.warning("Pre-code formulate_level_layout skipped: %s", layout_exc)
+            from engine.studio.models import TOKEN_USAGE_TRACKER
             pre_turn_snap = _snapshot_modules(ctx.cartridge_dir, modules)
             agent.implement_requirement_track(
                 track=track,
@@ -1463,6 +1465,9 @@ def run_swe_engineer_specialist(
                 )
                 try:
                     ctx.code_verify(ctx.cartridge_dir, track)
+                    TOKEN_USAGE_TRACKER.reset_swe_pev_streak()
+                except StudioPausedError:
+                    raise
                 except Exception as verify_exc:
                     if is_real_genai_client(ctx.client):
                         logger.warning(
@@ -1482,6 +1487,7 @@ def run_swe_engineer_specialist(
                             **swe_extra_kwargs,
                         )
                         ctx.code_verify(ctx.cartridge_dir, track)
+                        TOKEN_USAGE_TRACKER.reset_swe_pev_streak()
                     else:
                         raise
             turn_code_diffs = _compute_turn_code_diffs(ctx.cartridge_dir, pre_turn_snap)
@@ -1578,7 +1584,7 @@ def run_qa_test_engineer_specialist(
                 out_path=out_strip_path,
                 input_script=script,
                 setup_script=setup_calls or None,
-                verify_counterfactual=(item.kind != "level_map"),
+                verify_counterfactual=(item.kind != "level_map" and bool(script)),
                 state_assertions=list(getattr(plan, "state_assertions", None) or []),
                 target_scene=resolved_scene,
             )
@@ -2453,7 +2459,7 @@ def run_task_lead(
                         if task_baseline_snap is not None
                         else (list(item.target_modules or []) + list(decision.target_paths or []) + ["project.godot", "main.tscn"]),
                     )
-            except WorkerYielded:
+            except (WorkerYielded, StudioPausedError):
                 _ACTIVE_TURN_CTX.state = None
                 raise
             except Exception as spec_exc:

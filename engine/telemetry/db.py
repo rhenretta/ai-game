@@ -426,22 +426,29 @@ class TelemetryDB:
         build_id: Optional[str] = None,
         limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """Returns studio swarm events, optionally filtered by build_id."""
+        """Returns studio swarm events in chronological order, returning the most recent `limit` events when `limit` is set."""
         conn = self.get_reader_connection()
         try:
             cur = conn.cursor()
-            query = "SELECT * FROM studio_events"
             params: List[Any] = []
-            if build_id:
-                query += " WHERE build_id = ?"
-                params.append(build_id)
-            query += " ORDER BY timestamp_utc ASC"
             if limit and limit > 0:
-                query += " LIMIT ?"
+                inner = "SELECT rowid, * FROM studio_events"
+                if build_id:
+                    inner += " WHERE build_id = ?"
+                    params.append(build_id)
+                inner += " ORDER BY rowid DESC LIMIT ?"
                 params.append(limit)
+                query = f"SELECT * FROM ({inner}) ORDER BY rowid ASC"
+            else:
+                query = "SELECT * FROM studio_events"
+                if build_id:
+                    query += " WHERE build_id = ?"
+                    params.append(build_id)
+                query += " ORDER BY rowid ASC"
             cur.execute(query, params)
             rows = [dict(r) for r in cur.fetchall()]
             for r in rows:
+                r.pop("rowid", None)
                 if "payload_json" in r and r["payload_json"]:
                     try:
                         r["payload"] = json.loads(r["payload_json"])

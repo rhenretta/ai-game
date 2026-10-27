@@ -27,6 +27,7 @@ from engine.studio.models import (
     ReviewDecision,
     RevisionRecord,
     StudioAgentError,
+    StudioPausedError,
     WorkItem,
     WorkItemProposal,
 )
@@ -968,6 +969,11 @@ class BoardScheduler:
         except WorkerYielded as wy:
             logger.info("Worker yielded item %s: %s", item.item_id, wy.reason)
             self.board.yield_item(item.item_id, reason=wy.reason)
+        except StudioPausedError as pe:
+            logger.warning("Worker paused on item %s: %s", item.item_id, pe)
+            if "circuit breaker" in str(pe).lower():
+                self.board._emit("ERROR", item, error=str(pe), reason=str(pe))
+            self.board.yield_item(item.item_id, reason="studio_paused")
         except Exception:
             err = traceback.format_exc()
             logger.error("Worker failed for %s:\n%s", item.item_id, err)

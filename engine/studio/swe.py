@@ -1966,17 +1966,20 @@ class LeadGameplaySWEAgent:
             try:
                 lines = gd_path.read_text(encoding="utf-8").splitlines()
                 entry_lines: List[str] = []
+                var_count = 0
                 for idx, raw_line in enumerate(lines, start=1):
                     stripped = raw_line.strip()
-                    if stripped.startswith(("extends ", "class_name ", "class ", "static func ", "func ", "const ", "signal ", "enum ")):
+                    if stripped.startswith(("extends ", "class_name ", "class ", "static func ", "func ", "signal ", "enum ")):
                         entry_lines.append(f"  L{idx:4d}: {raw_line}")
-                    elif raw_line.startswith(("var ", "\tvar ", "    var ")):
-                        entry_lines.append(f"  L{idx:4d}: {raw_line}")
-                    elif "preload(" in stripped or "load(" in stripped or "AssetLib" in stripped or "asset_library" in stripped:
+                    elif stripped.startswith("const ") or raw_line.startswith(("var ", "\tvar ", "    var ")):
+                        if var_count < 40:
+                            entry_lines.append(f"  L{idx:4d}: {raw_line}")
+                            var_count += 1
+                    elif "preload(" in stripped or "load(" in stripped or "AssetLib" in stripped or "asset_library" in stripped or "GDScript.new()" in stripped:
                         entry_lines.append(f"  L{idx:4d}: {raw_line}")
                 rel_name = str(gd_path.relative_to(c_dir))
                 header = f"=== {rel_name} ({len(lines)} lines total) ==="
-                blocks.append(header + "\n" + "\n".join(entry_lines[:85]))
+                blocks.append(header + "\n" + "\n".join(entry_lines[:140]))
             except Exception:
                 continue
         return "\n\n".join(blocks)
@@ -2190,7 +2193,12 @@ class LeadGameplaySWEAgent:
         except Exception:
             pass
 
-        from engine.studio.models import StudioPausedError, call_gemini_with_transient_retry, wait_if_studio_paused
+        from engine.studio.models import (
+            TOKEN_USAGE_TRACKER,
+            StudioPausedError,
+            call_gemini_with_transient_retry,
+            wait_if_studio_paused,
+        )
 
         for pev_cycle in range(max_pev_cycles):
             wait_if_studio_paused(candidate_dir=c_dir, label=f"LeadGameplaySWEAgent.pev_cycle[{pev_cycle + 1}]")
@@ -2234,6 +2242,22 @@ class LeadGameplaySWEAgent:
                 if auto_slices
                 else ""
             )
+
+            try:
+                from engine.studio.workers import record_turn_substep
+
+                first_diag = (
+                    diag_lines_text[0].lstrip("- ").strip()
+                    if diag_lines_text
+                    else str(current_defect).strip().splitlines()[0][:180]
+                )
+                record_turn_substep(
+                    "running_tests",
+                    f"PEV self-heal cycle {pev_cycle + 1}/{max_pev_cycles}: diagnosing {first_diag[:200]}",
+                    specialist_agent="swe_engineer",
+                )
+            except Exception:
+                pass
 
             # -----------------------------------------------------------------
             # PEV PHASE 1: PLAN & RESEARCH (Request targeted code slices)
@@ -2378,6 +2402,7 @@ class LeadGameplaySWEAgent:
                         lingering_assetlib.append(f"{gd_p.name}:{ln_idx}: references removed AssetLib/asset_library.gd (`{ln_txt.strip()}`)")
 
             if is_valid and not lingering_assetlib:
+                TOKEN_USAGE_TRACKER.reset_swe_pev_streak()
                 if applied_in_cycle or results or initial_diagnostics:
                     logger.info("PEV cycle %d verified clean (0 compiler/runtime errors).", pev_cycle + 1)
                     break
@@ -3757,6 +3782,7 @@ class LeadGameplaySWEAgent:
         results: Dict[str, Path] = {}
 
         is_valid, diagnostics = verify_godot_cartridge_syntax(c_dir)
+        self._last_syntax_heal_failed = False
         if not is_valid and diagnostics:
             if self._is_live_genai_client():
                 diag_summary = "\n".join(
@@ -3770,6 +3796,8 @@ class LeadGameplaySWEAgent:
                     max_pev_cycles=4,
                 )
                 results.update(pev_res)
+                post_valid, _ = verify_godot_cartridge_syntax(c_dir)
+                self._last_syntax_heal_failed = not post_valid
             else:
                 for fix_attempt in range(3):
                     is_valid, diagnostics = verify_godot_cartridge_syntax(c_dir)

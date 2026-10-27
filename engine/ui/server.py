@@ -2164,16 +2164,13 @@ def create_app(
                 db = TelemetryDB(target_db)
                 active_bid = target_bus.get_active_build_id()
                 db_cps = db.get_studio_checkpoints(build_id=active_bid)
-                active_cp_id = None
-                if target_active.exists() and (target_active / "checkpoint_metadata.json").is_file():
-                    try:
-                        active_cp_id = json.loads((target_active / "checkpoint_metadata.json").read_text(encoding="utf-8")).get("checkpoint_id")
-                    except Exception:
-                        active_cp_id = None
                 for cp in db_cps:
                     c_path = Path(cp.get("checkpoint_path", ""))
-                    cp_id_str = str(cp.get("checkpoint_id") or "")
-                    is_active = bool(active_cp_id and cp_id_str == active_cp_id)
+                    is_active = target_active.exists() and (
+                        (target_active / "project.godot").is_file()
+                        or (target_active / "main.gd").is_file()
+                        or (target_active / "mechanics.py").is_file()
+                    )
                     files = []
                     if c_path.exists() and c_path.is_dir():
                         files = sorted([f.name for f in c_path.iterdir() if f.is_file() and not f.name.startswith(".")])
@@ -5352,10 +5349,27 @@ def create_app(
                 scheduler_paused = False
 
         # 4. Inspect pause sentinel file & bus flag
+        pause_reason: Optional[str] = None
+        pause_ts: Optional[str] = None
+        pause_file_active = False
+        if target_cartridges and (target_cartridges / ".studio_paused.json").is_file():
+            try:
+                pause_data = json.loads((target_cartridges / ".studio_paused.json").read_text(encoding="utf-8"))
+                if isinstance(pause_data, dict):
+                    pause_file_active = bool(pause_data.get("paused", True))
+                    if pause_data.get("reason"):
+                        pause_reason = str(pause_data.get("reason")).strip()
+                    if pause_data.get("timestamp_utc"):
+                        pause_ts = str(pause_data.get("timestamp_utc")).strip()
+                else:
+                    pause_file_active = True
+            except Exception:
+                pause_file_active = True
+
         is_paused = bool(
             getattr(target_bus, "_build_paused", False)
             or getattr(swarm_bus, "_build_paused", False)
-            or (target_cartridges and (target_cartridges / ".studio_paused.json").is_file())
+            or pause_file_active
             or scheduler_paused
         )
 
@@ -5372,7 +5386,7 @@ def create_app(
             process_state = "awaiting_greenlight"
             build_actively_running = False
         elif is_paused:
-            process_state = "pausing" if is_process_alive else "paused"
+            process_state = "pausing" if scheduler_running_workers > 0 else "paused"
             build_actively_running = False
         elif is_process_alive:
             process_state = "running"
@@ -5384,16 +5398,48 @@ def create_app(
         # 6. Query true latest event timestamp from event bus or SQLite studio_events, and detect any build-stopping error
         last_event_ts: Optional[str] = None
         last_error: Optional[Dict[str, Any]] = None
+        if pause_file_active and pause_reason and "paused by operator" not in pause_reason.lower():
+            last_error = {
+                "event_type": "CIRCUIT_BREAKER_PAUSED",
+                "agent_name": "StudioCircuitBreaker",
+                "item_id": "",
+                "message": pause_reason,
+                "timestamp_utc": pause_ts or "",
+            }
+        progress_event_types = {
+            "STUDIO_DONE",
+            "SLICE_VERIFIED",
+            "backlog_item_approved",
+            "backlog_item_submitted",
+            "backlog_item_claimed",
+            "task_turn_step",
+            "COUNCIL_VERDICT",
+            "WRITERS_ROOM_TURN",
+            "WRITERS_ROOM_UTTERANCE",
+            "GAME_BIBLE_LOCKED",
+            "GREENLIGHT_DECISION",
+            "STUDIO_RESUMED",
+        }
         try:
             recent_ev = target_bus.get_recent_events(limit=500)
             if recent_ev and isinstance(recent_ev[-1], dict):
                 last_event_ts = recent_ev[-1].get("timestamp_utc")
+            seen_newer_progress = False
+            progressed_items: Set[str] = set()
             for ev in reversed(recent_ev or []):
                 if not isinstance(ev, dict):
                     continue
                 ev_t = str(ev.get("event_type") or "")
+                pl = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+                ev_item_id = str(pl.get("item_id") or "")
+                if ev_t in progress_event_types:
+                    seen_newer_progress = True
+                    if ev_item_id:
+                        progressed_items.add(ev_item_id)
+                    continue
                 if ev_t in ("ERROR", "backlog_item_failed", "backlog_item_blocked"):
-                    pl = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+                    if seen_newer_progress and (not ev_item_id or ev_item_id in progressed_items or ev_t != "backlog_item_failed"):
+                        break
                     err_msg = str(
                         pl.get("error")
                         or pl.get("failure")
@@ -5401,11 +5447,15 @@ def create_app(
                         or ev.get("deliberation")
                         or "Build encountered an error."
                     )
-                    if "StudioPausedError" not in err_msg and "paused by operator" not in err_msg.lower():
+                    is_manual_pause = (
+                        "paused by operator" in err_msg.lower()
+                        or ("studiopausederror" in err_msg.lower() and "circuit breaker" not in err_msg.lower())
+                    )
+                    if not is_manual_pause and last_error is None:
                         last_error = {
                             "event_type": ev_t,
                             "agent_name": str(ev.get("agent_name") or "Studio"),
-                            "item_id": str(pl.get("item_id") or ""),
+                            "item_id": ev_item_id,
                             "message": err_msg,
                             "timestamp_utc": str(ev.get("timestamp_utc") or ""),
                         }
@@ -5421,30 +5471,48 @@ def create_app(
                     if row and row["max_ts"]:
                         last_event_ts = str(row["max_ts"])
                     if last_error is None:
-                        err_row = conn.execute(
+                        recent_rows = conn.execute(
                             "SELECT event_type, agent_name, timestamp_utc, payload_json FROM studio_events "
-                            "WHERE event_type IN ('ERROR', 'backlog_item_failed') ORDER BY id DESC LIMIT 1;"
-                        ).fetchone()
-                        if err_row:
+                            "ORDER BY id DESC LIMIT 50;"
+                        ).fetchall()
+                        seen_newer_progress = False
+                        progressed_items_db: Set[str] = set()
+                        for r in recent_rows:
+                            ev_t = str(r["event_type"] or "")
                             try:
-                                pl_d = json.loads(err_row["payload_json"] or "{}")
+                                pl_d = json.loads(r["payload_json"] or "{}")
                             except Exception:
                                 pl_d = {}
                             pl_inner = pl_d.get("payload") if isinstance(pl_d.get("payload"), dict) else pl_d
-                            err_msg = str(
-                                pl_inner.get("error")
-                                or pl_inner.get("failure")
-                                or pl_d.get("deliberation")
-                                or ""
-                            )
-                            if err_msg and "StudioPausedError" not in err_msg and "paused by operator" not in err_msg.lower():
-                                last_error = {
-                                    "event_type": str(err_row["event_type"]),
-                                    "agent_name": str(err_row["agent_name"] or "Studio"),
-                                    "item_id": str(pl_inner.get("item_id") or ""),
-                                    "message": err_msg,
-                                    "timestamp_utc": str(err_row["timestamp_utc"] or ""),
-                                }
+                            ev_item_id = str(pl_inner.get("item_id") or "") if isinstance(pl_inner, dict) else ""
+                            if ev_t in progress_event_types:
+                                seen_newer_progress = True
+                                if ev_item_id:
+                                    progressed_items_db.add(ev_item_id)
+                                continue
+                            if ev_t in ("ERROR", "backlog_item_failed", "backlog_item_blocked"):
+                                if seen_newer_progress and (not ev_item_id or ev_item_id in progressed_items_db or ev_t != "backlog_item_failed"):
+                                    break
+                                err_msg = str(
+                                    (pl_inner.get("error") if isinstance(pl_inner, dict) else None)
+                                    or (pl_inner.get("failure") if isinstance(pl_inner, dict) else None)
+                                    or (pl_inner.get("reason") if isinstance(pl_inner, dict) else None)
+                                    or pl_d.get("deliberation")
+                                    or ""
+                                )
+                                is_manual_pause = (
+                                    "paused by operator" in err_msg.lower()
+                                    or ("studiopausederror" in err_msg.lower() and "circuit breaker" not in err_msg.lower())
+                                )
+                                if err_msg and not is_manual_pause:
+                                    last_error = {
+                                        "event_type": ev_t,
+                                        "agent_name": str(r["agent_name"] or "Studio"),
+                                        "item_id": ev_item_id,
+                                        "message": err_msg,
+                                        "timestamp_utc": str(r["timestamp_utc"] or ""),
+                                    }
+                                    break
                 finally:
                     conn.close()
             except Exception:
@@ -5454,6 +5522,7 @@ def create_app(
             "process_state": process_state,
             "is_process_alive": is_process_alive,
             "is_paused": is_paused,
+            "pause_reason": pause_reason,
             "pause_for_greenlight": pause_greenlight,
             "build_actively_running": build_actively_running,
             "lock_held": lock_held,
