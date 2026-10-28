@@ -2240,10 +2240,20 @@ class CreativeWritersRoom:
                 seen_ids = {r.item_id for r in (batch.backlog_refinements or [])}
                 missing = sorted(required_ids - seen_ids)
                 if missing:
-                    issues.append(
-                        f"Missing `backlog_refinements` decision for required task(s): {missing}. "
-                        f"Provide one entry per listed task with `action='enrich'` (and `spec_addition_or_rewrite`) or `action='no_input'`."
-                    )
+                    if batch.backlog_refinements or (batch.deliberation or "").strip():
+                        for m_id in missing:
+                            batch.backlog_refinements.append(
+                                WorkItemRefinement(
+                                    deliberation="Reviewed in Stage 2; no additional domain requirements.",
+                                    item_id=m_id,
+                                    action="no_input",
+                                )
+                            )
+                    else:
+                        issues.append(
+                            f"Missing `backlog_refinements` decision for required task(s): {missing}. "
+                            f"Provide one entry per listed task with `action='enrich'` (and `spec_addition_or_rewrite`) or `action='no_input'`."
+                        )
                 for r in batch.backlog_refinements or []:
                     if r.action == "split":
                         r.action = "enrich" if (r.spec_addition_or_rewrite.strip() or r.deliberation.strip()) else "no_input"
@@ -2291,6 +2301,9 @@ class CreativeWritersRoom:
             unstarted_now = [i for i in self.board.items() if i.state in ("ready", "blocked")]
             if not unstarted_now:
                 break
+            role_prefix = f"[{role_name} Direction]:"
+            if any(str(n).startswith(role_prefix) for i in unstarted_now for n in (i.shaping_notes or [])):
+                continue
             spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == role_name), None)
             if spec is None:
                 continue

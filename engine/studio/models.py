@@ -3899,7 +3899,8 @@ def bounded_thinking_config(budget: int = 2048) -> Any:
 
 
 def is_transient_gemini_error(exc: BaseException) -> bool:
-    """Returns True if `exc` is a transient upstream deadline, rate-limit, overload, DNS, or socket error."""
+    """Returns True if `exc` is a transient upstream deadline, rate-limit, overload, DNS, socket,
+    or bare generic 'Request contains an invalid argument.' backend glitch."""
     msg = f"{type(exc).__name__}: {exc}".upper()
     return any(
         token in msg
@@ -3909,8 +3910,13 @@ def is_transient_gemini_error(exc: BaseException) -> bool:
             "DEADLINE EXPIRED",
             "503",
             "UNAVAILABLE",
+            "502",
+            "BAD GATEWAY",
+            "500",
+            "INTERNAL",
             "429",
             "RESOURCE_EXHAUSTED",
+            "REQUEST CONTAINS AN INVALID ARGUMENT",
             "READTIMEOUT",
             "CONNECTTIMEOUT",
             "TIMED OUT",
@@ -4342,14 +4348,21 @@ def inject_gemini_dataset_config(
     import os as _os
 
     out_kwargs = dict(kwargs)
-    auto_labels = build_gemini_request_labels(
-        label=label,
-        candidate_dir=candidate_dir,
-        dataset_name=dataset_name,
+    skip_dataset_meta = bool(getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "skip_dataset_store", False))
+    auto_labels = (
+        {}
+        if skip_dataset_meta
+        else build_gemini_request_labels(
+            label=label,
+            candidate_dir=candidate_dir,
+            dataset_name=dataset_name,
+        )
     )
 
     env_store = _os.environ.get("GEMINI_STORE_LOGS", "").strip().lower()
-    if store_logs is not None:
+    if skip_dataset_meta:
+        should_store = False
+    elif store_logs is not None:
         should_store = bool(store_logs)
     elif env_store in ("0", "false", "no", "off"):
         should_store = False
@@ -4497,12 +4510,26 @@ def install_studio_gemini_guardrails(
                 max_direct_retries = 0 if in_retry_wrapper else 3
                 for attempt in range(max_direct_retries + 1):
                     try:
+                        if attempt > 0:
+                            call_kwargs = (
+                                inject_gemini_dataset_config(
+                                    kwargs,
+                                    label=lbl,
+                                    candidate_dir=ctx_c_dir,
+                                    dataset_name=dataset_name,
+                                    store_logs=store_logs,
+                                )
+                                if m_name == "generate_content"
+                                else kwargs
+                            )
                         res = fn(*args, **call_kwargs)
                         break
                     except StudioPausedError:
                         raise
                     except Exception as exc:
                         if attempt < max_direct_retries and is_transient_gemini_error(exc):
+                            if "400" in str(exc) or "INVALID_ARGUMENT" in str(exc).upper():
+                                _THREAD_LOCAL_GEMINI_CALL_CTX.skip_dataset_store = True
                             delay = 1.5 * (2 ** attempt) + _random.uniform(0.0, 0.35)
                             _time.sleep(delay)
                             wait_if_studio_paused(candidate_dir=ctx_c_dir, label=lbl)
@@ -4553,6 +4580,7 @@ def call_gemini_with_transient_retry(
         prev_label = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "label", None)
         prev_c_dir = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "candidate_dir", None)
         prev_in_retry = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "in_retry_wrapper", False)
+        prev_skip_store = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "skip_dataset_store", False)
         _THREAD_LOCAL_GEMINI_CALL_CTX.label = label
         _THREAD_LOCAL_GEMINI_CALL_CTX.in_retry_wrapper = True
         if candidate_dir is not None:
@@ -4576,6 +4604,9 @@ def call_gemini_with_transient_retry(
             raise
         except Exception as exc:
             if attempt < max_transient_retries and is_transient_gemini_error(exc):
+                if "400" in str(exc) or "INVALID_ARGUMENT" in str(exc).upper():
+                    _THREAD_LOCAL_GEMINI_CALL_CTX.skip_dataset_store = True
+                    prev_skip_store = True
                 delay = base_delay_s * (2 ** attempt) + _random.uniform(0.0, 0.35)
                 _log.warning(
                     "%s transient error (attempt %d/%d), backing off %.2fs: %s",
@@ -4592,6 +4623,7 @@ def call_gemini_with_transient_retry(
             _THREAD_LOCAL_GEMINI_CALL_CTX.label = prev_label
             _THREAD_LOCAL_GEMINI_CALL_CTX.candidate_dir = prev_c_dir
             _THREAD_LOCAL_GEMINI_CALL_CTX.in_retry_wrapper = prev_in_retry
+            _THREAD_LOCAL_GEMINI_CALL_CTX.skip_dataset_store = prev_skip_store
 
 
 def __getattr__(name: str) -> Any:
