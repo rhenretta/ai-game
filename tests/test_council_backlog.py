@@ -284,3 +284,49 @@ def test_multi_specialist_panel_vetoes_when_ux_or_art_rejects_and_attaches_conce
     flat = [c for contents in client.models.review_contents for c in (contents if isinstance(contents, list) else [])]
     assert any(isinstance(c, str) and "REFERENCE 16:9 CONCEPT ART MOCKUP" in c for c in flat)
 
+
+def test_writers_room_turn_refinements_enrich_and_split_tasks_and_expose_to_ui(tmp_path):
+    from engine.studio.models import WorkItemRefinement
+
+    adds = {
+        2: [
+            P("hero_rig", kind="visual_asset"),
+            P("monolith_mech", kind="mechanic_code", modules=("mechanics.gd",)),
+        ]
+    }
+    room, client, board, sched, candidate, _ = build(tmp_path, adds, approve_all)
+    room.min_turns_before_convergence = 3
+
+    orig_generate = client.models.generate_content
+
+    def _gen_with_refinement(model, contents, config=None):
+        resp = orig_generate(model, contents, config)
+        schema = getattr(config, "response_schema", None) if config else None
+        if getattr(schema, "__name__", "") == "WritersRoomTurnProposal" and client.models.turn_call_count == 3:
+            proposal = WritersRoomTurnProposal.model_validate_json(resp.text)
+            proposal.backlog_refinements = [
+                WorkItemRefinement(
+                    deliberation="Enrich monolith_mech with UX onboarding direction and link hero_rig prerequisite.",
+                    item_id="monolith_mech",
+                    spec_addition_or_rewrite="Provide clear diegetic hover tooltips and non-overlapping HUD controls.",
+                    add_depends_on=["hero_rig"],
+                    action="enrich",
+                )
+            ]
+            return base._FakeGeminiResponse(proposal)
+        return resp
+
+    client.models.generate_content = _gen_with_refinement
+    try:
+        bible = room.run_writers_room(dna=base._sample_dna(), candidate_dir=candidate)
+    finally:
+        sched.stop()
+
+    assert bible.status == "locked"
+    mech = board.get("monolith_mech")
+    assert mech.state == "approved"
+    assert "hero_rig" in mech.depends_on
+    assert any("Provide clear diegetic hover tooltips" in n for n in mech.shaping_notes)
+    assert any("Shaped/split 1 backlog item" in u for t in bible.writers_room_transcript for u in t.bible_updates_summary)
+
+

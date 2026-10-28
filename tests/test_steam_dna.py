@@ -675,3 +675,167 @@ class TestGracefulDegradation:
         assert sum(dna_mixed.genre_weights.values()) == pytest.approx(1.0, abs=1e-3)
 
 
+class TestSteamDNALLMEpistemicSynthesis:
+    """Verifies that SteamDNAProfiler delegates player conclusions to the LLM over raw library evidence."""
+
+    def test_llm_epistemic_dna_synthesis_preserves_open_ended_conclusions(self):
+        import json
+
+        captured_prompts = []
+
+        class _StubModels:
+            def generate_content(self, *, model, contents, config=None):
+                captured_prompts.append(contents)
+                payload = {
+                    "deliberation": (
+                        "Player invests 70% of playtime in deep 100h+ engineering, automation, and physics-mastery "
+                        "titles. Primary drive is multi-stage logistics optimization combined with high-ceiling "
+                        "vehicular/flight physics and cooperative spatial problem solving."
+                    ),
+                    "top_genres": [
+                        "Automation & Factory Building",
+                        "Sandbox Engineering",
+                        "Vehicular & Flight Simulation",
+                    ],
+                    "genre_breakdown": [
+                        {"deliberation": "Core factory & logistics hours", "label": "Automation & Factory Building", "weight": 0.45},
+                        {"deliberation": "Voxel and contraption construction", "label": "Sandbox Engineering", "weight": 0.30},
+                        {"deliberation": "High-skill physics mastery", "label": "Vehicular & Flight Simulation", "weight": 0.15},
+                        {"deliberation": "Spatial & co-op puzzles", "label": "Spatial Puzzle", "weight": 0.10},
+                    ],
+                    "top_categories": ["Single-player", "Co-op", "Steam Workshop"],
+                    "category_breakdown": [
+                        {"deliberation": "Deep solo systems", "label": "Single-player", "weight": 0.65},
+                        {"deliberation": "Shared puzzle & engineering", "label": "Co-op", "weight": 0.20},
+                        {"deliberation": "Modding & blueprints", "label": "Steam Workshop", "weight": 0.15},
+                    ],
+                    "pacing_preference": "tactical_methodical",
+                    "pacing_score": -0.45,
+                    "challenge_tolerance": 0.88,
+                    "thematic_biases": [
+                        "industrial automation & logistics",
+                        "aerospace & orbital engineering",
+                        "colony thermodynamics",
+                    ],
+                    "thematic_breakdown": [
+                        {"deliberation": "Automated production lines", "label": "industrial automation & logistics", "weight": 0.50},
+                        {"deliberation": "Spacecraft & flight", "label": "aerospace & orbital engineering", "weight": 0.30},
+                        {"deliberation": "Colony survival systems", "label": "colony thermodynamics", "weight": 0.20},
+                    ],
+                    "mechanical_breakdown": [
+                        {"deliberation": "Conveyor and pipeline throughput optimization", "label": "multi_stage_automation_and_logistics", "weight": 0.96},
+                        {"deliberation": "Physics-based contraption and base building", "label": "sandbox_engineering_and_construction", "weight": 0.91},
+                        {"deliberation": "Precision aerial and vehicular control", "label": "precision_vehicular_and_flight_physics", "weight": 0.84},
+                        {"deliberation": "Multi-step spatial puzzle solving", "label": "cooperative_spatial_puzzle_solving", "weight": 0.78},
+                    ],
+                    "preferred_palette_mood": "industrial_sci_fi",
+                    "palette_breakdown": [
+                        {"deliberation": "Readable industrial & sci-fi machinery", "label": "industrial_sci_fi", "weight": 0.65},
+                        {"deliberation": "Clean high-contrast telemetry", "label": "neon_cyberpunk", "weight": 0.35},
+                    ],
+                }
+
+                class _Resp:
+                    text = json.dumps(payload)
+
+                return _Resp()
+
+        class _StubClient:
+            models = _StubModels()
+
+        dataset = SteamLibraryDataset(
+            player_id="76561197985203987",
+            source="local_scan",
+            games=[
+                SteamGameRecord(
+                    appid=427520,
+                    name="Factorio",
+                    playtime_forever_minutes=43470,
+                    genres=["Indie", "Simulation", "Strategy"],
+                    categories=["Single-player", "Co-op"],
+                    short_description="Factorio is a game about building and creating automated factories to produce items of increasing complexity.",
+                ),
+                SteamGameRecord(
+                    appid=244850,
+                    name="Space Engineers",
+                    playtime_forever_minutes=25450,
+                    genres=["Action", "Indie", "Simulation", "Strategy"],
+                    categories=["Single-player", "Multi-player", "Co-op"],
+                    short_description="Space Engineers is a sandbox game about engineering, construction, exploration and survival in space.",
+                ),
+            ],
+        )
+
+        profiler = SteamDNAProfiler(client=_StubClient())
+        dna = profiler.extract_dna(dataset, profile_tag="llm_synthesized")
+
+        assert len(captured_prompts) == 1
+        assert "Factorio is a game about building and creating automated factories" in captured_prompts[0]
+        assert "Space Engineers is a sandbox game about engineering" in captured_prompts[0]
+        assert dna.challenge_tolerance == pytest.approx(0.88)
+        assert "Automation & Factory Building" in dna.top_genres
+        assert dna.mechanical_biases["multi_stage_automation_and_logistics"] == pytest.approx(0.96)
+        assert "industrial automation & logistics" in dna.thematic_biases
+        assert dna.preferred_palette_mood == "industrial_sci_fi"
+        assert sum(dna.genre_weights.values()) == pytest.approx(1.0, abs=1e-3)
+
+    def test_activity_windows_30d_90d_1yr_lifetime(self):
+        """Verifies compute_activity_windows buckets games across last_30_days, last_90_days, last_1_year, and lifetime."""
+        from engine.steam.dna import compute_activity_windows
+
+        ref_ts = 1_800_000_000
+        games = [
+            SteamGameRecord(
+                appid=1001,
+                name="Active 30d Game",
+                playtime_forever_minutes=3000,  # 50h
+                playtime_2weeks_minutes=600,    # 10h
+                rtime_last_played=ref_ts - 5 * 86400,
+                genres=["Simulation", "Strategy"],
+            ),
+            SteamGameRecord(
+                appid=1002,
+                name="Active 90d Game",
+                playtime_forever_minutes=7800,  # 130h
+                rtime_last_played=ref_ts - 60 * 86400,
+                genres=["Simulation"],
+            ),
+            SteamGameRecord(
+                appid=1003,
+                name="Active 1yr Game",
+                playtime_forever_minutes=1200,  # 20h
+                rtime_last_played=ref_ts - 200 * 86400,
+                genres=["Puzzle"],
+            ),
+            SteamGameRecord(
+                appid=1004,
+                name="Lifetime Anchor Game",
+                playtime_forever_minutes=30000,  # 500h
+                rtime_last_played=ref_ts - 900 * 86400,
+                genres=["Strategy"],
+            ),
+        ]
+
+        windows = compute_activity_windows(games, reference_timestamp=ref_ts)
+        assert set(windows.keys()) == {"last_30_days", "last_90_days", "last_1_year", "lifetime"}
+
+        assert windows["last_30_days"]["games_count"] == 1
+        assert windows["last_30_days"]["recent_2weeks_hours"] == pytest.approx(10.0)
+        assert [g["name"] for g in windows["last_30_days"]["games"]] == ["Active 30d Game"]
+
+        assert windows["last_90_days"]["games_count"] == 2
+        assert [g["name"] for g in windows["last_90_days"]["games"]] == ["Active 90d Game", "Active 30d Game"]
+
+        assert windows["last_1_year"]["games_count"] == 3
+        assert {g["name"] for g in windows["last_1_year"]["games"]} == {
+            "Active 30d Game",
+            "Active 90d Game",
+            "Active 1yr Game",
+        }
+
+        assert windows["lifetime"]["games_count"] == 4
+        assert windows["lifetime"]["games"][0]["name"] == "Lifetime Anchor Game"
+
+
+
+

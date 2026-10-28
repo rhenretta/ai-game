@@ -48,7 +48,9 @@ from engine.studio.models import (
     ReviewBatch,
     ReviewDecision,
     StudioAgentError,
+    TaskShapingBatch,
     VisualMockupArtifact,
+    WorkItemRefinement,
     WritersRoomListenCheck,
     WritersRoomTurnProposal,
     WritersRoomUtterance,
@@ -622,12 +624,21 @@ class CreativeWritersRoom:
             pacing_pref = _dget("pacing_preference", "balanced")
             pacing_score = float(_dget("pacing_score", 0.0) or 0.0)
             challenge_tol = float(_dget("challenge_tolerance", 0.5) or 0.5)
+            dna_delib = str(_dget("deliberation") or "").strip()
+            mech_biases = _dget("mechanical_biases") or {}
+            thematic_biases = list(_dget("thematic_biases") or [])
+            if dna_delib:
+                lines.append(f"- Epistemic Player DNA Synthesis: {dna_delib}")
             lines.extend([
                 f"- Target Player Steam Library Scale: {total_hours:.1f} total hours across {total_games} analyzed games",
-                f"- Top Genres by Playtime Weight: {top_genres} (weights: {genre_weights})",
+                f"- Top Genres: {top_genres} (weights: {genre_weights})",
                 f"- Engagement & Mastery Distribution: {playtime_dist}",
-                f"- Pacing & Cognitive Preference: {pacing_pref} (pacing_score={pacing_score:.2f}, challenge_tolerance={challenge_tol:.2f})",
+                f"- Pacing & Complexity Appetite: {pacing_pref} (pacing_score={pacing_score:.2f}, challenge_tolerance={challenge_tol:.2f})",
             ])
+            if mech_biases:
+                lines.append(f"- Core Mechanical Verbs & Affinities: {mech_biases}")
+            if thematic_biases:
+                lines.append(f"- Thematic & Setting Affinities: {thematic_biases}")
             palette_pref = _dget("preferred_palette_mood", None)
             if palette_pref:
                 lines.append(f"- Preferred Palette Mood: {palette_pref}")
@@ -635,6 +646,40 @@ class CreativeWritersRoom:
                 lines.append(
                     f"- Most-Played Core Anchor Games (what this specific player invests hundreds of hours mastering): {core_str}"
                 )
+            activity_windows = _dget("activity_windows") or {}
+            if isinstance(activity_windows, dict) and activity_windows:
+                for w_key, w_title in (
+                    ("last_30_days", "Recent Gameplay (Last 30 Days)"),
+                    ("last_90_days", "Medium-Term Gameplay (Last 90 Days)"),
+                    ("last_1_year", "Past-Year Gameplay (Last 1 Year)"),
+                ):
+                    w_data = activity_windows.get(w_key)
+                    if not isinstance(w_data, dict):
+                        continue
+                    w_games = [
+                        g
+                        for g in (w_data.get("games") or [])
+                        if isinstance(g, dict) and not str(g.get("name", "")).startswith("App ")
+                    ]
+                    w_count = int(w_data.get("games_count", len(w_games)) or 0)
+                    if w_count <= 0 or not w_games:
+                        continue
+                    w_str = ", ".join(
+                        f"{g.get('name', 'Unknown')} ({float(g.get('playtime_hours', 0.0) or 0.0):.1f}h total"
+                        + (
+                            f", {float(g.get('playtime_2weeks_hours', 0.0) or 0.0):.1f}h in 2wk"
+                            if g.get("playtime_2weeks_hours")
+                            else ""
+                        )
+                        + (
+                            f", last played {g.get('last_played_date')}"
+                            if g.get("last_played_date")
+                            else ""
+                        )
+                        + f", genres: {g.get('genres', [])})"
+                        for g in w_games[:6]
+                    )
+                    lines.append(f"- {w_title} ({w_count} active titles): {w_str}")
             if spotlight_str:
                 lines.append(
                     f"- Session Spotlight Cross-Pollination Subset (taste signals — NOT templates to copy or pastiche): {spotlight_str}"
@@ -1043,6 +1088,19 @@ class CreativeWritersRoom:
             )
             updates_summary.append(f"Raised {len(added)} backlog item(s): {[a.item_id for a in added]}")
 
+        # Pre-execution Council shaping / enrichment / decomposition of existing unstarted board items
+        refinements = getattr(proposal, "backlog_refinements", None) or []
+        if refinements:
+            if self.board is None:
+                raise StudioAgentError("A backlog_refinements proposal arrived but no Production Board is attached.")
+            shaped = self.board.apply_refinements(
+                refinements,
+                by_role=speaker_role,
+            )
+            updates_summary.append(
+                f"Shaped/split {len(refinements)} backlog item(s) -> {[s.item_id for s in shaped]}"
+            )
+
         # 16:9 Visual Mockup Board synthesis
         if proposal.mockup_to_generate is not None:
             mockup = proposal.mockup_to_generate
@@ -1306,9 +1364,14 @@ class CreativeWritersRoom:
             return self._call_structured_llm(prompt, turn_schema)
         board_block = (
             f"{self.board.snapshot_text()}\n"
-            f"BUILD BACKLOG (ACTIVE SLICE — EMERGENT TASK & ASSET DISCOVERY): The implementation side builds in parallel while you design. "
-            f"Raise `backlog_additions` needed for the ACTIVE SLICE right now so Slice 0 ships as a complete, cohesive playable vertical slice "
-            f"(world/level traversal with proper camera tracking, core gameplay loop, empathetic new-player onboarding/HUD on a CanvasLayer, visual assets/surfaces, and audio).\n"
+            f"BUILD BACKLOG (ACTIVE SLICE — COUNCIL TASK SHAPING, ENRICHMENT & DECOMPOSITION):\n"
+            f"Before tasks are built by workers, the Council shapes what is needed so the team builds a cohesive, playable game rather than disconnected subsystems.\n"
+            f"1. INSPECT EXISTING TASKS ON THE PRODUCTION BOARD (`backlog_refinements`):\n"
+            f"   - Review every unstarted (`ready` or `blocked`) item currently on the Production Board from your specialist perspective.\n"
+            f"   - ENRICH (`action='enrich'`): If an existing task needs direction from your domain—such as how it connects to the world/levels, what shared data contracts or node structures it must expose, how the player discovers and interacts with it in the HUD/UI without overlapping panels, or which visual rigs/audio cues it should bind—add a `WorkItemRefinement` in `backlog_refinements` with `action='enrich'`, `spec_addition_or_rewrite`, and any prerequisite `add_depends_on`.\n"
+            f"   - SPLIT (`action='split'`): If an existing task is too monolithic (for example, bundling core simulation physics, player placement/building tools, world progression, and HUD into one giant script task, or bundling multiple distinct rigs into one asset task), decompose it via `WorkItemRefinement` with `action='split'` and `split_items=[...]` into focused, dependency-linked tasks! Any downstream tasks on the board that depended on the original task will automatically re-point to the split tasks.\n"
+            f"2. RAISE NEW OR COMPANION TASKS (`backlog_additions`):\n"
+            f"   - Raise `backlog_additions` needed for the ACTIVE SLICE so Slice 0 ships as a complete, cohesive playable vertical slice (world/level traversal with proper camera tracking, core gameplay loop, empathetic new-player onboarding/HUD consolidated on a single authoritative CanvasLayer, visual assets/surfaces, and audio).\n"
             f"HYBRID PROCEDURAL + GENERATED ASSETS: Do NOT settle for flat untextured `Polygon2D` slabs or bare programmer-art `Line2D` strokes! "
             f"Raise `visual_asset` tasks (`tile_surface` seamless textures for procedural `Polygon2D`/`Line2D` terrain/conduits, environmental decals/landmarks, "
             f"and `sprite_sheet`/`articulated_parts` rigs for characters and interactive structures) alongside procedural shaders and particles.\n"
@@ -1319,17 +1382,25 @@ class CreativeWritersRoom:
             f"DEPENDENCY & ASSET BLOCKING RULES (`depends_on` and `blocks_items`):\n"
             f"- Characters, avatars, creatures, and hero props in `mechanic_code` / `integration` tasks MUST bind actual fabricated sprites or articulated rigs—never primitive `draw_circle`/`draw_rect` stickmen.\n"
             f"- When you raise a `mechanic_code` or `integration` task that requires a character rig, surface texture, or discrete sprite, either include that `visual_asset` item in `depends_on` (proposing the `visual_asset` item in the same turn if it is not on the board yet), OR let the Task Lead spawn it on Turn 0 with `wait_for_spawned_tasks=True`.\n"
-            f"- Conversely, when you raise a `visual_asset`, `animation`, or foundational system task that an ALREADY-PROPOSED task on the Production Board needs (for example, proposing the player's `visual_asset` character rig after a player controller `mechanic_code` task was already raised on an earlier turn), list those downstream task IDs in `blocks_items` (e.g. `blocks_items=['mechanic_...']`)! Setting `blocks_items` automatically wires your new task into their `depends_on` list and blocks them until your asset/system is fabricated and approved.\n"
+            f"- Conversely, when you raise a `visual_asset`, `animation`, or foundational system task that an ALREADY-PROPOSED task on the Production Board needs (for example, proposing the player's `visual_asset` character rig after a player controller `mechanic_code` task was already raised on an earlier turn), list those downstream task IDs in `blocks_items` (e.g. `blocks_items=['mechanic_...']`) or wire them via `backlog_refinements` (`add_depends_on`)!\n"
             f"- For each item you raise, provide a unique `item_id`, `slice_id` matching the active slice, a precise `spec`, `depends_on`, `blocks_items`, "
-            f"`target_modules` (leave `target_modules=[]` for standalone `visual_asset`, `animation`, and `audio_asset` items), and a `proof_spec`. "
+            f"`target_modules` (leave `target_modules=[]` for standalone `visual_asset`, `animation`, and `audio_asset` items; for `mechanic_code`, `ui`, `level_map`, and `integration` items, prefer encapsulated per-feature GDScript module paths such as `scenes/mechanics/<feature_id>.gd`, `scenes/entities/<entity_id>.gd`, `scenes/ui/<widget_id>.gd`, or `scenes/world/<region_id>.gd` that register in the `'state_providers'` node group so multiple SWE workers can build features in parallel with disjoint per-file locks rather than bottlenecking on a single monolithic file), and a `proof_spec`. "
             f"Do not duplicate existing items. The finished work will be shown to the Council panel for approval.\n"
             f"Buildable kinds right now: {self._supported_kinds() or 'all'}.\n"
         )
 
         def _validate(p: WritersRoomTurnProposal) -> List[str]:
-            if not p.backlog_additions:
-                return []
-            return self.board.validate_proposals(p.backlog_additions) + self._unsupported_kind_issues(p.backlog_additions)
+            issues: List[str] = []
+            if p.backlog_additions:
+                issues.extend(self.board.validate_proposals(p.backlog_additions))
+                issues.extend(self._unsupported_kind_issues(p.backlog_additions))
+            refinements = getattr(p, "backlog_refinements", None) or []
+            if refinements:
+                issues.extend(self.board.validate_refinements(refinements, new_proposals=p.backlog_additions))
+                for r in refinements:
+                    if r.action == "split" and r.split_items:
+                        issues.extend(self._unsupported_kind_issues(r.split_items))
+            return issues
 
         return self._structured_with_validation(prompt + "\n" + board_block, turn_schema, _validate)
 
@@ -1419,7 +1490,9 @@ class CreativeWritersRoom:
             if not path.is_file():
                 raise StudioAgentError(f"Proof image for item '{item.item_id}' is missing on disk: {path}")
             suffix = path.suffix.lower()
-            mime = "image/jpeg" if suffix in (".jpg", ".jpeg") else "image/png"
+            if suffix not in (".png", ".jpg", ".jpeg", ".webp"):
+                continue
+            mime = "image/jpeg" if suffix in (".jpg", ".jpeg") else ("image/webp" if suffix == ".webp" else "image/png")
             name_lower = path.name.lower()
             is_filmstrip = "filmstrip" in name_lower
             is_plate = name_lower.startswith("plate_")
@@ -1463,9 +1536,15 @@ class CreativeWritersRoom:
             if getattr(item, "failure", "")
             else ""
         )
+        excluded_line = (
+            f"\n    excluded_modules (pruned by Council): {item.excluded_modules}"
+            if getattr(item, "excluded_modules", None)
+            else ""
+        )
         return (
             f"  ITEM [{item.item_id}] kind={item.kind} title={item.title!r} state={item.state}\n"
-            f"    spec: {item.spec}\n    proof_spec: {item.proof_spec}\n    depends_on: {item.depends_on}\n"
+            f"    spec: {item.spec}\n    proof_spec: {item.proof_spec}\n"
+            f"    target_modules: {getattr(item, 'target_modules', [])} | depends_on: {item.depends_on}{excluded_line}\n"
             f"    revision_cap: {item.max_revisions} (spec rewrites so far: {item.spec_resets}/{MAX_SPEC_RESETS})\n"
             f"    decision_reason: {item.decision_reason or '-'}{failure_line}\n    history:\n{history}"
         )
@@ -1576,23 +1655,43 @@ class CreativeWritersRoom:
                     item_kind=(first_item.kind if first_item is not None else "review"),
                 )
                 curated_review_block = f"{pack.prompt_block}\n"
+        board_review_snapshot = ""
+        if self.board is not None and hasattr(self.board, "snapshot_text"):
+            try:
+                board_review_snapshot = (
+                    "FULL PRODUCTION BOARD STATE (inspect all active, changes_requested, blocked, and approved tasks and their `mods` before attributing defects):\n"
+                    f"{self.board.snapshot_text(limit_chars=4500)}\n\n"
+                )
+            except Exception:
+                pass
         shared_review_context = (
+            f"{board_review_snapshot}"
             f"{on_disk_sprites_block}"
             f"{curated_review_block}"
             f"{self._format_bible_snapshot(game_bible)}\n"
         )
         parts.append(shared_review_context)
+        cross_task_triage_guide = (
+            "CROSS-TASK ROOT-CAUSE ATTRIBUTION & SCOPE ISOLATION (PREVENTING MULTI-TASK PING-PONG):\n"
+            "- Before writing `feedback` on an item, check `FULL PRODUCTION BOARD STATE` above to see whether any visual or behavioral defect visible in the proof belongs to THIS item's core responsibility (`target_modules`) OR to a shared/external subsystem (e.g. a shared camera controller, world backdrop/scene generator, or hub script) owned by another task.\n"
+            "- NEVER instruct multiple downstream mechanic/feature tasks to directly patch the same shared camera, scene, or backdrop script in parallel (which causes workers to overwrite each other and burn revision attempts)!\n"
+            "- Instead, when a proof fails partly or wholly because of a defect in a shared/external module outside this item's primary module:\n"
+            "  1. If an unapproved task on the board (`in_progress`, `changes_requested`, `ready`, or `blocked`) ALREADY owns that shared module, add its `item_id` to `blocked_by_item_ids`, list the shared module path(s) in `out_of_scope_modules_to_prune`, and write `feedback` telling this item what remains in its own module once the blocker finishes.\n"
+            "  2. If the task that originally built that shared module is already `approved` (or no open task owns fixing the shared bug), populate `spawned_prerequisite_tasks` with a focused `WorkItemProposal` targeting that shared module (and set `blocks_items` to include all affected open tasks on the board), and list the shared module path(s) in `out_of_scope_modules_to_prune` so this item is cleanly blocked on the dedicated fix without losing a revision attempt.\n\n"
+        )
         prompt = (
             f"You are {who} reviewing work built by the implementation team for the game being designed.\n"
             f"{mandate}"
             f"{filmstrip_guide}"
+            f"{cross_task_triage_guide}"
             f"ITEMS AWAITING YOUR REVIEW (proof images and Living Game Bible context are attached above):\n"
             + ("\n".join(self._format_item_for_review(i) for i in awaiting) or "  (none)")
             + f"\n\nITEMS THAT HIT THEIR REVISION CAP OR STALLED (you must decide):\n"
             + ("\n".join(self._format_item_for_review(i) for i in deciding) or "  (none)")
             + "\n\nFor EVERY awaiting item give one `review_decisions` entry: examine the proof carefully against the spec, the proof_spec and the "
             "game's design, then `approve`, or `request_changes` with concrete, actionable feedback (never repeat feedback that was already given without "
-            "saying what is still wrong). For EVERY capped/stalled item give one `cap_decisions` entry: `accept_as_is` (only if the result genuinely "
+            "saying what is still wrong; use `blocked_by_item_ids`, `spawned_prerequisite_tasks`, and `out_of_scope_modules_to_prune` when a defect belongs to a shared/external module). "
+            "For EVERY capped/stalled item give one `cap_decisions` entry: `accept_as_is` (only if the result genuinely "
             "serves the game; say what is compromised), `rewrite_spec` (populate a non-empty `replacement_spec` BEFORE setting `action='rewrite_spec'`; max "
             f"{MAX_SPEC_RESETS} rewrites), `split` (populate a non-empty `split_items` list of `WorkItemProposal` objects BEFORE setting `action='split'` — NEVER set `action='split'` if `split_items` is empty), or `cancel`. Provide `deliberation` FIRST and each verdict/action last."
         )
@@ -1609,6 +1708,13 @@ class CreativeWritersRoom:
             for d in batch.review_decisions:
                 if d.verdict == "request_changes" and not d.feedback.strip():
                     issues.append(f"request_changes for '{d.item_id}' needs concrete feedback.")
+                if d.spawned_prerequisite_tasks:
+                    issues.extend(self._unsupported_kind_issues(d.spawned_prerequisite_tasks))
+                    for sp in d.spawned_prerequisite_tasks:
+                        if not sp.item_id.strip():
+                            issues.append(f"spawned_prerequisite_tasks for '{d.item_id}' has an empty item_id.")
+                        if sp.item_id == d.item_id:
+                            issues.append(f"spawned_prerequisite_tasks for '{d.item_id}' cannot use the reviewed item's own item_id.")
             seen_c = [c.item_id for c in batch.cap_decisions]
             for iid in deciding_ids - set(seen_c):
                 issues.append(f"Missing cap decision for item '{iid}'.")
@@ -1706,11 +1812,26 @@ class CreativeWritersRoom:
             else:
                 distinct_fb: List[Tuple[str, str]] = []
                 seen_fb: set = set()
+                merged_blockers: List[str] = []
+                merged_spawned: List[WorkItemProposal] = []
+                seen_spawn_keys: set = set()
+                merged_pruned: List[str] = []
                 for r, d in dissenters:
                     fb_clean = d.feedback.strip()
                     if fb_clean and fb_clean not in seen_fb:
                         seen_fb.add(fb_clean)
                         distinct_fb.append((r, fb_clean))
+                    for b_id in getattr(d, "blocked_by_item_ids", None) or []:
+                        if b_id and b_id not in merged_blockers:
+                            merged_blockers.append(b_id)
+                    for sp in getattr(d, "spawned_prerequisite_tasks", None) or []:
+                        sp_key = (sp.item_id, tuple(sorted(sp.target_modules or [])))
+                        if sp_key not in seen_spawn_keys:
+                            seen_spawn_keys.add(sp_key)
+                            merged_spawned.append(sp)
+                    for pm in getattr(d, "out_of_scope_modules_to_prune", None) or []:
+                        if pm and pm not in merged_pruned:
+                            merged_pruned.append(pm)
                 if len(distinct_fb) == 1:
                     merged_fb = distinct_fb[0][1]
                 else:
@@ -1719,6 +1840,9 @@ class CreativeWritersRoom:
                     deliberation=combined_delib,
                     item_id=it.item_id,
                     feedback=merged_fb,
+                    blocked_by_item_ids=merged_blockers,
+                    spawned_prerequisite_tasks=merged_spawned,
+                    out_of_scope_modules_to_prune=merged_pruned,
                     verdict="request_changes",
                 )
             self.board.apply_review(consolidated)
@@ -1733,7 +1857,7 @@ class CreativeWritersRoom:
             if it.state != "failed":
                 continue
             if it.failure_count >= 2:
-                if is_real_genai_client(self.client) and it.spec_resets < MAX_SPEC_RESETS:
+                if is_real_genai_client(self.client) and it.failure_count <= (MAX_SPEC_RESETS + 2):
                     logger.warning(
                         "Escalating item %s to Council needs_decision after %d worker failures:\n%s",
                         it.item_id,
@@ -1801,6 +1925,221 @@ class CreativeWritersRoom:
                 candidate_dir=candidate_dir,
             )
 
+    _SHAPING_COUNCIL_ROLES = (
+        "GameplayDesigner",
+        "LevelAndProgressionDesigner",
+        "GameplaySystemsEngineer",
+        "UXExperienceDesigner",
+        "VisualArtDirector",
+        "AudioAtmosphereDesigner",
+    )
+
+    def _items_needing_domain_direction(self, role_name: str) -> List[Any]:
+        """Returns unstarted board items that were raised by a different specialist (or split/added in Stage 1)
+        and have not yet received `[<role_name> Direction]` input."""
+        if self.board is None:
+            return []
+        role_prefix = f"[{role_name} Direction]:"
+        needed: List[Any] = []
+        for item in self.board.items():
+            if item.state not in ("ready", "blocked"):
+                continue
+            if item.raised_by_role == role_name:
+                continue
+            if any(str(n).startswith(role_prefix) for n in (item.shaping_notes or [])):
+                continue
+            needed.append(item)
+        return needed
+
+    def _run_full_council_direction_pass(
+        self,
+        game_bible: GameBibleSpec,
+        dna_summary: str,
+        bible_snapshot: str,
+    ) -> int:
+        """Stage 2 of Council Task Shaping: Runs all 6 Council domain leads in parallel over the complete
+        Production Board (including any tasks added or split during Stage 1) so every task receives
+        cross-functional Council direction before workers execute."""
+        if self.board is None:
+            return 0
+        role_targets: List[Tuple[str, Dict[str, Any], List[Any]]] = []
+        for role_name in self._SHAPING_COUNCIL_ROLES:
+            spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == role_name), None)
+            if spec is None:
+                continue
+            targets = self._items_needing_domain_direction(role_name)
+            if targets:
+                role_targets.append((role_name, spec, targets))
+        if not role_targets:
+            return 0
+
+        active_roles = [r for r, _, _ in role_targets]
+        self._emit_activity(
+            agent_role="CouncilTaskShaping",
+            status_text=(
+                f"Council specialists ({', '.join(active_roles)}) are contributing cross-domain direction "
+                f"across all Production Board tasks..."
+            ),
+            active_agents=active_roles,
+            phase="task_shaping",
+        )
+        board_snap = self.board.snapshot_text()
+
+        def _shape_for_role(entry: Tuple[str, Dict[str, Any], List[Any]]) -> Tuple[str, TaskShapingBatch]:
+            role_name, spec, targets = entry
+            display_name = spec["display_name"]
+            required_ids = {t.item_id for t in targets}
+            target_lines = "\n".join(
+                f"  - [{t.item_id}] ({t.kind}, raised_by={t.raised_by_role}, deps={t.depends_on}, modules={t.target_modules}) "
+                f"'{t.title}':\n    spec: {t.spec}\n    proof_spec: {t.proof_spec}"
+                for t in targets
+            )
+            prompt = (
+                f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n\n"
+                f"{bible_snapshot}\n\n"
+                f"{board_snap}\n\n"
+                f"You are the {display_name} ({role_name}) in Stage 2 of the Council Task-Shaping Session (Full-Council Cross-Domain Direction).\n"
+                f"Your specialty focus: {spec['focus']}\n\n"
+                f"All tasks and task decompositions are now on the Production Board. Before workers start building, "
+                f"you must review EVERY unstarted task below from your domain's perspective and provide one `backlog_refinements` entry per task:\n"
+                f"TASKS REQUIRING YOUR DOMAIN REVIEW ({len(targets)} tasks):\n"
+                f"{target_lines}\n\n"
+                f"INSTRUCTIONS:\n"
+                f"1. For EVERY task listed in `TASKS REQUIRING YOUR DOMAIN REVIEW` above, include one `WorkItemRefinement` entry in `backlog_refinements` with matching `item_id`:\n"
+                f"   - Set `action='enrich'` and populate `spec_addition_or_rewrite` (plus optional `proof_spec_update`, `add_depends_on`, or `add_target_modules`—using encapsulated per-feature `.gd` paths like `scenes/mechanics/<feature>.gd`, `scenes/entities/<entity>.gd`, or `scenes/ui/<widget>.gd` when assigning or refining code targets so parallel SWE workers can lock disjoint files) whenever your domain has direction, integration contracts, UX affordances, non-overlapping HUD layout rules, world/progression hooks, visual rig/silhouette specs, or reactive audio cues for that task.\n"
+                f"   - Set `action='no_input'` ONLY if, after deliberating, your domain genuinely has zero requirements or touchpoints with that specific task.\n"
+                f"2. Leave `backlog_additions=[]` in Stage 2 (all companion tasks were already raised in Stage 1).\n"
+                f"Return `TaskShapingBatch` with `deliberation` FIRST."
+            )
+
+            def _validate_stage2(batch: TaskShapingBatch) -> List[str]:
+                issues: List[str] = []
+                seen_ids = {r.item_id for r in (batch.backlog_refinements or [])}
+                missing = sorted(required_ids - seen_ids)
+                if missing:
+                    issues.append(
+                        f"Missing `backlog_refinements` decision for required task(s): {missing}. "
+                        f"Provide one entry per listed task with `action='enrich'` (and `spec_addition_or_rewrite`) or `action='no_input'`."
+                    )
+                for r in batch.backlog_refinements or []:
+                    if r.action == "split":
+                        r.action = "enrich" if (r.spec_addition_or_rewrite.strip() or r.deliberation.strip()) else "no_input"
+                issues.extend(self.board.validate_refinements(batch.backlog_refinements or []))
+                return issues
+
+            return role_name, self._structured_with_validation(prompt, TaskShapingBatch, _validate_stage2)
+
+        results = self._map_parallel(_shape_for_role, role_targets)
+        applied_count = 0
+        for role_name, batch in results:
+            if batch.backlog_refinements:
+                shaped = self.board.apply_refinements(
+                    batch.backlog_refinements,
+                    by_role=role_name,
+                )
+                applied_count += len(shaped)
+        return applied_count
+
+    def _run_council_task_shaping_round(
+        self,
+        game_bible: GameBibleSpec,
+        dna_summary: str,
+        candidate_dir: Optional[Path] = None,
+    ) -> int:
+        """Runs a two-stage Council task-shaping and decomposition pass over unstarted Production Board items
+        before workers start claiming tasks:
+        - Stage 1 (Decomposition & Missing Task Discovery): Specialists decompose monolithic tasks (`action='split'`)
+          and raise any missing companion/prerequisite tasks (`backlog_additions`).
+        - Stage 2 (Full-Council Cross-Domain Direction): Once the complete task list is on the board (including all
+          newly added and split tasks), all 6 Council specialists run in parallel to review every relevant task and
+          contribute domain direction (`action='enrich'`)."""
+        if self.board is None or not is_real_genai_client(self.client):
+            return 0
+        unstarted = [i for i in self.board.items() if i.state in ("ready", "blocked")]
+        if not unstarted:
+            return 0
+        bible_snapshot = self._format_bible_snapshot(game_bible)
+        active_slice_obj = game_bible.get_active_slice()
+        default_slice_id = active_slice_obj.slice_id if active_slice_obj is not None else ""
+        total_changes = 0
+
+        # Stage 1: Decomposition ('split') & Missing Companion Task Discovery ('backlog_additions')
+        for role_name in self._SHAPING_COUNCIL_ROLES:
+            unstarted_now = [i for i in self.board.items() if i.state in ("ready", "blocked")]
+            if not unstarted_now:
+                break
+            spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == role_name), None)
+            if spec is None:
+                continue
+            display_name = spec["display_name"]
+            self._emit_activity(
+                agent_role=role_name,
+                status_text=f"{display_name} ({role_name}) is decomposing tasks & checking for missing companion tasks (Stage 1)...",
+                active_agents=[role_name],
+                phase="task_shaping",
+            )
+            prompt = (
+                f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n\n"
+                f"{bible_snapshot}\n\n"
+                f"{self.board.snapshot_text()}\n\n"
+                f"You are the {display_name} ({role_name}) in Stage 1 of the Council Task-Shaping & Decomposition Session.\n"
+                f"Your specialty focus: {spec['focus']}\n\n"
+                f"Before the full Council gives cross-domain direction in Stage 2, review the unstarted (`ready` or `blocked`) tasks on the Production Board:\n"
+                f"1. DECOMPOSE MONOLITHIC TASKS (`action='split'` in `backlog_refinements`): Should any task be split into smaller, focused tasks (for example, separating core simulation mechanics from interactive player placement/building tools, separating world/level progression from HUD telemetry, or splitting a multi-entity visual_asset bundle into 1-entity-per-item visual_asset tasks)? When you split a task, downstream dependents on the board automatically re-point to your split tasks.\n"
+                f"2. RAISE MISSING COMPANION TASKS (`backlog_additions`): Is a prerequisite asset, UI affordance, level region, or sub-mechanic task missing altogether? Propose it in `backlog_additions` (and use `blocks_items` or `add_depends_on` to link it).\n"
+                f"3. CONTRIBUTE INITIAL DOMAIN DIRECTION (`action='enrich'` in `backlog_refinements`): You may also enrich existing tasks with `spec_addition_or_rewrite` and `add_depends_on`.\n"
+                f"Buildable kinds right now: {self._supported_kinds() or 'all'}.\n"
+                f"Return `TaskShapingBatch` with `deliberation` FIRST."
+            )
+
+            def _validate_shaping(batch: TaskShapingBatch) -> List[str]:
+                issues: List[str] = []
+                if batch.backlog_additions:
+                    issues.extend(self.board.validate_proposals(batch.backlog_additions))
+                    issues.extend(self._unsupported_kind_issues(batch.backlog_additions))
+                if batch.backlog_refinements:
+                    issues.extend(
+                        self.board.validate_refinements(
+                            batch.backlog_refinements,
+                            new_proposals=batch.backlog_additions,
+                        )
+                    )
+                    for r in batch.backlog_refinements:
+                        if r.action == "split" and r.split_items:
+                            issues.extend(self._unsupported_kind_issues(r.split_items))
+                return issues
+
+            batch = self._structured_with_validation(prompt, TaskShapingBatch, _validate_shaping)
+            if batch.backlog_additions:
+                for prop in batch.backlog_additions:
+                    if prop.kind == "level_map" and "level_layout.json" not in prop.target_modules:
+                        prop.target_modules.append("level_layout.json")
+                    elif prop.kind in ("visual_asset", "animation", "audio_asset"):
+                        prop.target_modules = [m for m in prop.target_modules if not str(m).endswith(".gd")]
+                added = self.board.add_items(
+                    batch.backlog_additions,
+                    raised_by_role=role_name,
+                    slice_id=default_slice_id,
+                )
+                total_changes += len(added)
+            if batch.backlog_refinements:
+                shaped = self.board.apply_refinements(
+                    batch.backlog_refinements,
+                    by_role=role_name,
+                )
+                total_changes += len(shaped)
+
+        # Stage 2: Parallel Full-Council Cross-Domain Direction over the complete board (including all newly added/split tasks)
+        total_changes += self._run_full_council_direction_pass(
+            game_bible=game_bible,
+            dna_summary=dna_summary,
+            bible_snapshot=bible_snapshot,
+        )
+
+        if candidate_dir is not None and total_changes > 0:
+            self._persist_bible(game_bible, candidate_dir=candidate_dir)
+        return total_changes
+
     def _drain_backlog(
         self,
         game_bible: GameBibleSpec,
@@ -1810,6 +2149,12 @@ class CreativeWritersRoom:
         """Blocks until every backlog item is approved or cancelled, running review rounds as proofs arrive."""
         if self.board is None:
             return
+        already_executing = any(
+            i.state in ("in_progress", "waiting_for_lock", "awaiting_review", "changes_requested", "approved") or i.revisions
+            for i in self.board.items()
+        )
+        if not already_executing:
+            self._run_council_task_shaping_round(game_bible, dna_summary, candidate_dir=candidate_dir)
         if self.scheduler is not None:
             self.scheduler.start()
         deadline = time.monotonic() + self.drain_timeout_s
@@ -1840,7 +2185,7 @@ class CreativeWritersRoom:
                 deadline = max(deadline, time.monotonic() + self.drain_timeout_s)
             active = [
                 i for i in self.board.items()
-                if i.state in ("ready", "in_progress", "changes_requested", "awaiting_review", "needs_decision")
+                if i.state in ("ready", "in_progress", "waiting_for_lock", "changes_requested", "awaiting_review", "needs_decision")
             ]
             if not active and self.scheduler is not None and self.scheduler.running_count() == 0:
                 raise StudioAgentError(
@@ -2379,9 +2724,34 @@ class CreativeWritersRoom:
                 f"- EXECUTIVE PRODUCER CREATIVE SEED / DIRECTION: {creative_prompt.strip()}"
             )
 
+        already_in_production = False
         if existing_bible is not None:
             game_bible = existing_bible
-            game_bible.status = "brainstorming"
+            has_trailing_user_steering = bool(
+                game_bible.writers_room_transcript
+                and game_bible.writers_room_transcript[-1].speaker_role == "UserSteering"
+            )
+            board_has_execution_history = bool(
+                self.board is not None
+                and any(
+                    i.state in ("in_progress", "awaiting_review", "changes_requested", "approved") or i.revisions
+                    for i in self.board.items()
+                )
+            )
+            transcript_already_converged = any(
+                "Locked Living Game Bible for production" in (u.bible_updates_summary or [])
+                for u in game_bible.writers_room_transcript
+            )
+            already_in_production = (
+                not has_trailing_user_steering
+                and (
+                    game_bible.status in ("in_production", "locked")
+                    or board_has_execution_history
+                    or transcript_already_converged
+                )
+                and not validate_game_design(game_bible)
+            )
+            game_bible.status = "in_production" if already_in_production else "brainstorming"
             if dna is not None or not getattr(game_bible, "target_player_dna_summary", ""):
                 game_bible.target_player_dna_summary = dna_summary
             elif getattr(game_bible, "target_player_dna_summary", ""):
@@ -2437,12 +2807,12 @@ class CreativeWritersRoom:
                 if r not in pending_invited_roles:
                     pending_invited_roles.append(r)
 
-        # Open-ended specialist conversation loop
+        # Open-ended specialist conversation loop (skipped when resuming a build already in active production)
         turns_executed = sum(spoken_counts.values())
-        if self.board is not None and self.scheduler is not None:
+        if self.board is not None and self.scheduler is not None and not is_real_genai_client(self.client):
             if turns_executed >= min(3, self.max_turns) or len(self.board.items()) >= 3:
                 self.scheduler.start()
-        while turns_executed < self.max_turns:
+        while not already_in_production and turns_executed < self.max_turns:
             self._wait_if_paused(candidate_dir)
             steered = self._consume_pending_steering(game_bible, candidate_dir=candidate_dir)
             if steered:
@@ -2487,10 +2857,14 @@ class CreativeWritersRoom:
                     pending_invited_roles.append(r)
             turns_executed += 1
             if self.board is not None:
-                # Wait to start the background worker scheduler until the initial Core Council pass (at least 3 turns
-                # or max_turns if smaller) has completed so VisualArtDirector and fellow Leads can propose foundational
-                # visual_asset rigs and wire `blocks_items` dependencies before mechanic_code workers claim tasks.
-                if self.scheduler is not None and turns_executed >= min(3, self.max_turns):
+                # Wait to start the background worker scheduler until all required Council specialists have spoken
+                # and had the chance to shape, enrich, wire dependencies, or split existing tasks on the board.
+                if (
+                    self.scheduler is not None
+                    and turns_executed >= min(3, self.max_turns)
+                    and not self._missing_required_board_specialists(game_bible)
+                    and not is_real_genai_client(self.client)
+                ):
                     self.scheduler.start()
                 self._handle_failed_items()
                 self._run_review_round(game_bible, dna_summary, candidate_dir)
@@ -2619,6 +2993,9 @@ class CreativeWritersRoom:
                 )
             ]
             game_bible.active_slice_index = 0
+        # Transition Living Game Bible to active production before draining the board so resumes skip initial seeding.
+        game_bible.status = "in_production"
+        self._persist_bible(game_bible, candidate_dir=candidate_dir)
         # ...and every requirement the council raised must be built and approved (or deliberately cancelled).
         self._drain_backlog(game_bible, dna_summary, candidate_dir)
 

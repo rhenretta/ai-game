@@ -98,6 +98,12 @@ def validate_wav_file(path: Path) -> Tuple[bool, str, float]:
 
     bytes_per_sec = sample_rate * channels * (bits_per_sample // 8)
     duration = data_size / max(1, bytes_per_sec)
+    if data_size <= 0 or len(data) <= 44 or duration < 0.05:
+        return (
+            False,
+            f"WAV file has zero or insufficient PCM audio data (data_size={data_size}, file_bytes={len(data)}, duration={duration:.3f}s)",
+            duration,
+        )
     return True, "", duration
 
 

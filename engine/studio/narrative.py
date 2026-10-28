@@ -24,6 +24,7 @@ from engine.studio.models import (
     GenesisWorldSpec,
     NarrativeBible,
     StudioAgentError,
+    bounded_thinking_config,
 )
 
 logger = logging.getLogger("NarrativeCharacterWriterAgent")
@@ -117,6 +118,7 @@ class NarrativeCharacterWriterAgent:
                     response_mime_type="application/json",
                     response_schema=NarrativeBible,
                     temperature=self.creative_temperature,
+                    thinking_config=bounded_thinking_config(1024),
                 ),
             )
             if not response.text:

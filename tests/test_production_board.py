@@ -38,7 +38,7 @@ def proof(tmp_path: Path, name: str, content: bytes = b"x") -> str:
 
 # ----------------------------------------------------------------------------- structure
 def test_models_are_rationale_first():
-    from engine.studio.models import RevisionRecord, WorkItem
+    from engine.studio.models import RevisionRecord, WorkItem, WorkItem
     for cls in (WorkItemProposal, ReviewDecision, CapDecision, WorkItem, RevisionRecord):
         assert list(cls.model_fields)[0] == "deliberation", cls.__name__
     assert list(ReviewDecision.model_fields)[-1] == "verdict"
@@ -840,6 +840,370 @@ def test_final_turn_qa_assertion_failure_preserves_verified_swe_code_and_rendere
     assert len(res.proof_images) == 1
     assert Path(res.proof_images[0]).name == "filmstrip_mech_test_item_rev0.png"
     assert "QA filmstrip state assertions failed" in res.notes
+
+
+def test_council_refinement_enrich_and_split_pre_execution(tmp_path):
+    from engine.studio.models import TaskShapingBatch, WorkItemRefinement
+
+    # Rule 4: deliberation strictly first, action strictly last on WorkItemRefinement
+    ref_fields = list(WorkItemRefinement.model_fields.keys())
+    assert ref_fields[0] == "deliberation"
+    assert ref_fields[-1] == "action"
+    batch_fields = list(TaskShapingBatch.model_fields.keys())
+    assert batch_fields[0] == "deliberation"
+
+    events = []
+    board = ProductionBoard(tmp_path / "backlog.json", event_callback=lambda t, p: events.append((t, p)))
+    board.add_items(
+        [
+            P("rig_asset", kind="visual_asset"),
+            P("core_system", kind="mechanic_code", modules=("mechanics.gd",)),
+            P("final_integration", deps=("core_system",), kind="integration", modules=("main.gd",)),
+        ],
+        raised_by_role="GameplayDesigner",
+    )
+
+    # 1. UXExperienceDesigner and AudioAtmosphereDesigner enrich `core_system` before any worker claims it
+    shaped = board.apply_refinements(
+        [
+            WorkItemRefinement(
+                deliberation="Needs discoverable placement toolbar and non-overlapping HUD layout.",
+                item_id="core_system",
+                spec_addition_or_rewrite="Expose interactive placement tools on the unified CanvasLayer HUD without overlapping panels.",
+                proof_spec_update="Show placement toolbar and non-overlapping HUD in filmstrip.",
+                add_depends_on=["rig_asset"],
+                add_target_modules=["ui_hud.gd"],
+                action="enrich",
+            )
+        ],
+        by_role="UXExperienceDesigner",
+    )
+    assert len(shaped) == 1
+    core = board.get("core_system")
+    assert core.state == "blocked"  # now waits on rig_asset
+    assert "rig_asset" in core.depends_on
+    assert "ui_hud.gd" in core.target_modules
+    assert len(core.shaping_notes) == 1
+    assert "[UXExperienceDesigner Direction]: Expose interactive placement tools" in core.shaping_notes[0]
+    assert "[UXExperienceDesigner Direction]: Expose interactive placement tools" in core.spec
+    assert "[UXExperienceDesigner]: Show placement toolbar" in core.proof_spec
+
+    # 2. GameplaySystemsEngineer splits `core_system` into `sim_engine` and `placement_tools` before execution
+    split_out = board.apply_refinements(
+        [
+            WorkItemRefinement(
+                deliberation="Separate pure simulation physics from interactive placement tool UI.",
+                item_id="core_system",
+                split_items=[
+                    P("sim_engine", kind="mechanic_code", modules=("mechanics.gd",)),
+                    P("placement_tools", deps=("sim_engine",), kind="ui", modules=("ui_hud.gd",)),
+                ],
+                action="split",
+            )
+        ],
+        by_role="GameplaySystemsEngineer",
+    )
+    assert {i.item_id for i in split_out} == {"sim_engine", "placement_tools"}
+    assert board.get("core_system").state == "cancelled"
+    # Both split items inherit the parent's `rig_asset` dependency and prior shaping notes
+    assert "rig_asset" in board.get("sim_engine").depends_on
+    assert any("UXExperienceDesigner Direction" in n for n in board.get("sim_engine").shaping_notes)
+    assert any("Split from core_system by GameplaySystemsEngineer" in n for n in board.get("sim_engine").shaping_notes)
+    # Downstream `final_integration` automatically re-pointed from `core_system` to `sim_engine` and `placement_tools`
+    assert set(board.get("final_integration").depends_on) == {"sim_engine", "placement_tools"}
+    event_types = [t for t, _ in events]
+    assert "backlog_item_shaped" in event_types
+    assert "backlog_item_split" in event_types
+
+    # 3. Deliberation-only enrich (when spec_addition_or_rewrite is empty) and enriching an already-split parent
+    board.add_items(
+        [P("mechanic_tug_flight_controller", kind="mechanic_code", modules=("mechanics.gd",))],
+        raised_by_role="GameplayDesigner",
+    )
+    shaped_delib = board.apply_refinements(
+        [
+            WorkItemRefinement(
+                deliberation="Tug flight controller must expose velocity vector and tether tension in get_state_snapshot().",
+                item_id="mechanic_tug_flight_controller",
+                spec_addition_or_rewrite="",
+                action="enrich",
+            ),
+            WorkItemRefinement(
+                deliberation="Audio cues must bind to both split tasks.",
+                item_id="core_system",
+                spec_addition_or_rewrite="Trigger acoustic feedback on state change.",
+                action="enrich",
+            ),
+        ],
+        by_role="Director",
+    )
+    tug = board.get("mechanic_tug_flight_controller")
+    assert any("velocity vector and tether tension" in n for n in tug.shaping_notes)
+    assert "velocity vector and tether tension" in tug.spec
+    assert any("Trigger acoustic feedback" in n for n in board.get("sim_engine").shaping_notes)
+    assert any("Trigger acoustic feedback" in n for n in board.get("placement_tools").shaping_notes)
+    assert len(shaped_delib) == 3
+
+
+def test_audio_proof_wav_never_wrapped_as_image_part(tmp_path):
+    from PIL import Image
+    from engine.studio.context_curator import ContextCuratorAgent
+    from engine.studio.models import RevisionRecord, WorkItem
+    from engine.studio.workers import WorkerContext, _build_task_lead_multimodal_parts
+    from engine.studio.writers_room import CreativeWritersRoom
+
+    waveform_png = tmp_path / "waveform_audio_cockpit_rev0.png"
+    Image.new("RGB", (900, 220), (16, 18, 28)).save(waveform_png, "PNG")
+    wav_file = tmp_path / "cockpit_kinesthetic_sfx.wav"
+    wav_file.write_bytes(b"RIFF\x24\x00\x00\x00WAVEfmt ")
+
+    ctx = WorkerContext(cartridge_dir=tmp_path, client=None)
+    parts = _build_task_lead_multimodal_parts(ctx, [str(waveform_png), str(wav_file)])
+    assert len(parts) == 2
+    assert "waveform_audio_cockpit_rev0.png" in parts[0]
+
+    item = WorkItem(
+        deliberation="d",
+        item_id="audio_cockpit_kinesthetic_sfx",
+        kind="audio_asset",
+        title="Cockpit SFX",
+        spec="Generate SFX",
+        proof_spec="Waveform",
+        state="awaiting_review",
+        revisions=[
+            RevisionRecord(
+                revision_index=0,
+                proof_paths=[str(waveform_png), str(wav_file)],
+            )
+        ],
+    )
+    room = CreativeWritersRoom(client=None)
+    review_parts = room._proof_parts(item, tmp_path)
+    assert len(review_parts) == 2
+    assert "waveform_audio_cockpit_rev0.png" in review_parts[0]
+
+    board = ProductionBoard()
+    board._items[item.item_id] = item
+    curator = ContextCuratorAgent(cartridge_dir=tmp_path, client=None, board=board)
+    chunks = curator.semantic_index.extract_corpus_chunks(board=board)
+    board_chunk = next(c for c in chunks if c.chunk_id == "board:item:audio_cockpit_kinesthetic_sfx")
+    assert board_chunk.associated_image_path == str(waveform_png)
+
+
+def test_two_stage_full_council_task_direction_and_deduplication(tmp_path):
+    from engine.studio.models import GameBibleSpec, TaskShapingBatch, WorkItemRefinement
+    from engine.studio.writers_room import CreativeWritersRoom
+
+    board = ProductionBoard(tmp_path / "backlog.json")
+    board.add_items(
+        [
+            P("mechanic_tug_flight_controller", kind="mechanic_code", modules=("mechanics.gd",)),
+            P("asset_visual_crucible_pod", kind="visual_asset"),
+        ],
+        raised_by_role="GameplaySystemsEngineer",
+    )
+
+    # 1. Same-role deduplication: if GameplayDesigner enriches mechanic_tug_flight_controller twice,
+    # it updates its single `[GameplayDesigner Direction]` note in-place instead of creating duplicates.
+    board.apply_refinements(
+        [
+            WorkItemRefinement(
+                deliberation="Initial gameplay note.",
+                item_id="mechanic_tug_flight_controller",
+                spec_addition_or_rewrite="Include flight assist toggle.",
+                action="enrich",
+            )
+        ],
+        by_role="GameplayDesigner",
+    )
+    board.apply_refinements(
+        [
+            WorkItemRefinement(
+                deliberation="Updated gameplay note with torque compensation.",
+                item_id="mechanic_tug_flight_controller",
+                spec_addition_or_rewrite="Include flight assist toggle and asymmetric torque counter-compensation.",
+                action="enrich",
+            )
+        ],
+        by_role="GameplayDesigner",
+    )
+    tug = board.get("mechanic_tug_flight_controller")
+    gd_notes = [n for n in tug.shaping_notes if n.startswith("[GameplayDesigner Direction]:")]
+    assert len(gd_notes) == 1
+    assert "asymmetric torque counter-compensation" in gd_notes[0]
+
+    # 2. Verify Stage 2 `_items_needing_domain_direction` and `_run_full_council_direction_pass`
+    room = CreativeWritersRoom(client=None, board=board)
+    # VisualArtDirector must review both `mechanic_tug_flight_controller` and `asset_visual_crucible_pod` (raised by GameplaySystemsEngineer)
+    vad_targets = [i.item_id for i in room._items_needing_domain_direction("VisualArtDirector")]
+    assert set(vad_targets) == {"mechanic_tug_flight_controller", "asset_visual_crucible_pod"}
+    # GameplayDesigner already has `[GameplayDesigner Direction]` on `mechanic_tug_flight_controller`, so it is not re-requested
+    gd_targets = [i.item_id for i in room._items_needing_domain_direction("GameplayDesigner")]
+    assert "mechanic_tug_flight_controller" not in gd_targets
+
+    def _fake_structured(prompt, schema, validate_fn, **kwargs):
+        # Extract role and required task IDs from prompt
+        tasks_section = prompt.split("TASKS REQUIRING YOUR DOMAIN REVIEW", 1)[-1]
+        refs = []
+        for iid in ("mechanic_tug_flight_controller", "asset_visual_crucible_pod"):
+            if f"[{iid}]" in tasks_section:
+                if "(AudioAtmosphereDesigner)" in prompt and iid == "asset_visual_crucible_pod":
+                    refs.append(
+                        WorkItemRefinement(
+                            deliberation="Pure visual sprite; no audio requirement.",
+                            item_id=iid,
+                            action="no_input",
+                        )
+                    )
+                else:
+                    refs.append(
+                        WorkItemRefinement(
+                            deliberation=f"Domain direction for {iid}.",
+                            item_id=iid,
+                            spec_addition_or_rewrite=f"Ensure domain contract for {iid}.",
+                            action="enrich",
+                        )
+                    )
+        batch = TaskShapingBatch(
+            deliberation="Reviewed all required tasks.",
+            backlog_additions=[],
+            backlog_refinements=refs,
+        )
+        assert validate_fn(batch) == []
+        return batch
+
+    room._structured_with_validation = _fake_structured
+    bible = GameBibleSpec(deliberation="d", game_title="Sky Foundry", core_genre="Simulation")
+    room._run_full_council_direction_pass(bible, "dna", "snapshot")
+
+    # `mechanic_tug_flight_controller` now has input from GameplayDesigner, LevelAndProgressionDesigner, UXExperienceDesigner, VisualArtDirector, and AudioAtmosphereDesigner
+    tug_after = board.get("mechanic_tug_flight_controller")
+    assert len(tug_after.shaping_notes) == 5
+    # `asset_visual_crucible_pod` now has input from VisualArtDirector and UXExperienceDesigner
+    pod_after = board.get("asset_visual_crucible_pod")
+    assert any(n.startswith("[VisualArtDirector Direction]:") for n in pod_after.shaping_notes)
+    assert any(n.startswith("[UXExperienceDesigner Direction]:") for n in pod_after.shaping_notes)
+
+
+def test_council_review_cross_task_triage_spawns_prerequisite_and_prunes_scope(tmp_path):
+    from PIL import Image
+
+    proof_img = tmp_path / "proof.png"
+    Image.new("RGB", (64, 36), (10, 20, 30)).save(proof_img)
+
+    board = ProductionBoard(tmp_path / "backlog.json", default_max_revisions=3)
+    board.add_items(
+        [
+            P("camera_rig", kind="mechanic_code", modules=("scenes/camera/train_camera.gd",)),
+            P("mech_a", kind="mechanic_code", modules=("scenes/mechanics/mech_a.gd", "scenes/camera/train_camera.gd", "scenes.gd")),
+            P("mech_b", kind="mechanic_code", modules=("scenes/mechanics/mech_b.gd", "scenes/camera/train_camera.gd", "scenes.gd")),
+        ],
+        raised_by_role="GameplaySystemsEngineer",
+    )
+
+    # Approve camera_rig initially
+    board.claim_ready(limit=1)
+    board.submit_result("camera_rig", WorkerResult(proof_images=[str(proof_img)], notes="camera built"))
+    board.apply_review(ReviewDecision(deliberation="ok", item_id="camera_rig", verdict="approve"))
+
+    # Claim and submit mech_a
+    board.claim_ready(limit=1)
+    board.submit_result("mech_a", WorkerResult(proof_images=[str(proof_img)], notes="mech_a attempt 1"))
+
+    # Council reviews mech_a: notices the defect is in shared train_camera.gd and scenes.gd, spawns a dedicated fix task
+    reviewed_a = board.apply_review(
+        ReviewDecision(
+            deliberation="The off-screen framing and backdrop seam belong to shared camera/scene scripts, not mech_a.",
+            item_id="mech_a",
+            feedback="Once the shared camera/backdrop fix is approved, re-capture the mech_a filmstrip.",
+            spawned_prerequisite_tasks=[
+                WorkItemProposal(
+                    deliberation="Fix shared camera bounds and backdrop mirroring.",
+                    item_id="fix_shared_camera_and_backdrop",
+                    kind="mechanic_code",
+                    title="Fix Shared Camera & Backdrop",
+                    spec="Only include coupled bodies in camera bounds; fix backdrop mirroring.",
+                    proof_spec="Filmstrip showing tug centered and seamless backdrop.",
+                    target_modules=["scenes/camera/train_camera.gd", "scenes.gd"],
+                    blocks_items=["mech_a", "mech_b"],
+                )
+            ],
+            out_of_scope_modules_to_prune=["scenes/camera/train_camera.gd", "scenes.gd"],
+            verdict="request_changes",
+        )
+    )
+
+    # 1. mech_a is now blocked on fix_shared_camera_and_backdrop AND its revision cap was NOT penalized!
+    assert reviewed_a.state == "blocked"
+    assert "fix_shared_camera_and_backdrop" in reviewed_a.depends_on
+    assert reviewed_a.cap_base_index == 1
+    assert board._counted_revisions(reviewed_a) == 0
+    assert reviewed_a.target_modules == ["scenes/mechanics/mech_a.gd"]
+    assert set(reviewed_a.excluded_modules) == {"scenes/camera/train_camera.gd", "scenes.gd"}
+    assert any("[Council Scope Boundary]" in n for n in reviewed_a.shaping_notes)
+
+    # 2. Sibling mech_b was also automatically linked to fix_shared_camera_and_backdrop and had shared modules pruned!
+    mech_b = board.get("mech_b")
+    assert mech_b.state == "blocked"
+    assert "fix_shared_camera_and_backdrop" in mech_b.depends_on
+    assert mech_b.target_modules == ["scenes/mechanics/mech_b.gd"]
+    assert set(mech_b.excluded_modules) == {"scenes/camera/train_camera.gd", "scenes.gd"}
+
+    # 3. Expand target modules refuses to re-add excluded modules
+    board.expand_item_target_modules("mech_a", ["scenes.gd", "scenes/camera/train_camera.gd"])
+    assert board.get("mech_a").target_modules == ["scenes/mechanics/mech_a.gd"]
+
+    # 4. Once fix_shared_camera_and_backdrop is built and approved, mech_a transitions back to changes_requested
+    # and mech_b transitions to ready!
+    claimed_fix = board.claim_ready(limit=2)
+    assert [c.item_id for c in claimed_fix] == ["fix_shared_camera_and_backdrop"]
+    board.submit_result("fix_shared_camera_and_backdrop", WorkerResult(proof_images=[str(proof_img)], notes="fixed"))
+    board.apply_review(ReviewDecision(deliberation="fixed", item_id="fix_shared_camera_and_backdrop", verdict="approve"))
+
+    assert board.get("mech_a").state == "changes_requested"
+    assert board.get("mech_b").state == "ready"
+
+
+def test_yield_on_file_lock_sets_waiting_for_lock_status_and_resumes_when_released(tmp_path):
+    board = ProductionBoard(tmp_path / "backlog.json")
+    board.add_items(
+        [
+            P("level_corridor", kind="level_map", modules=("scripts/world/corridor.gd", "scenes.gd")),
+            P("mech_transfer", kind="mechanic_code", modules=("scripts/mechanics/transfer.gd", "scenes.gd")),
+        ],
+        raised_by_role="LevelAndProgressionDesigner",
+    )
+
+    # Claim level_corridor on rev 0, submit, and request changes so it enters rev 1
+    board.claim_ready(limit=1, locked_modules=set())
+    board.submit_result("level_corridor", WorkerResult(proof_images=[], notes="rev0"))
+    board.apply_review(review("level_corridor", "request_changes", "Fix beacon visibility"))
+    assert board.get("level_corridor").state == "changes_requested"
+
+    # Now both level_corridor and mech_transfer are claimed concurrently (distinct primary modules)
+    claimed = board.claim_ready(limit=2, locked_modules=set())
+    assert {c.item_id for c in claimed} == {"level_corridor", "mech_transfer"}
+
+    # level_corridor tries to lock scenes.gd while mech_transfer holds it -> yields with file_lock_busy:scenes.gd
+    yielded = board.yield_item("level_corridor", reason="file_lock_busy:scenes.gd,level_map.gd")
+    assert yielded.state == "waiting_for_lock"
+    assert yielded.waiting_on_locks == ["level_map.gd", "scenes.gd"]
+    assert "waiting_locks=['level_map.gd', 'scenes.gd']" in board.snapshot_text()
+
+    # While scenes.gd is still locked, level_corridor stays in waiting_for_lock and cannot be claimed
+    assert board.claim_ready(limit=1, locked_modules={"scenes.gd"}) == []
+    assert board.get("level_corridor").state == "waiting_for_lock"
+
+    # Once scenes.gd is released, level_corridor is claimed and waiting_on_locks is cleared
+    resumed = board.claim_ready(limit=1, locked_modules=set())
+    assert [c.item_id for c in resumed] == ["level_corridor"]
+    assert resumed[0].state == "in_progress"
+    assert resumed[0].waiting_on_locks == []
+
+
+
+
+
 
 
 

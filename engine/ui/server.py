@@ -212,6 +212,7 @@ class SwarmEventBus:
                 status_map = {
                     "approved": "COMPLETED",
                     "in_progress": "IN_PROGRESS",
+                    "waiting_for_lock": "IN_PROGRESS",
                     "awaiting_review": "IN_PROGRESS",
                     "ready": "PENDING",
                     "changes_requested": "REJECTED",
@@ -1150,6 +1151,7 @@ class SwarmEventBus:
                 status_map = {
                     "approved": "COMPLETED",
                     "in_progress": "IN_PROGRESS",
+                    "waiting_for_lock": "IN_PROGRESS",
                     "awaiting_review": "IN_PROGRESS",
                     "ready": "PENDING",
                     "changes_requested": "REJECTED",
@@ -1389,7 +1391,12 @@ class SwarmEventBus:
             })
 
         # 5. Lead gameplay SWE tasks (R1..R5)
-        code_files = sorted(list(cart_dir.glob("*.py")) + list(cart_dir.glob("*.gd")) + list(cart_dir.glob("*.tscn")))
+        from engine.sim.godot_verifier import iter_cartridge_gd_files
+        code_files = sorted(
+            list(cart_dir.glob("*.py"))
+            + iter_cartridge_gd_files(cart_dir, include_tests=False, exclude_helper_libs=True)
+            + list(cart_dir.rglob("*.tscn"))
+        )
         if (cart_dir / "project.godot").is_file():
             code_files.append(cart_dir / "project.godot")
 
@@ -3499,13 +3506,9 @@ def create_app(
         )
         return JSONResponse(resp.model_dump())
 
-    async def steam_dna_handler(request):
-        """GET /api/steam/dna: Scanned Steam player DNA and gaming preferences."""
-        player_id = request.query_params.get("player_id", "local_player")
-        profile_tag = request.query_params.get("profile_tag")
-
+    def _compute_steam_dna_payload(player_id: str, profile_tag: Optional[str], force_rescan: bool) -> Dict[str, Any]:
         dna = None
-        if target_db:
+        if target_db and not force_rescan:
             try:
                 repo = SteamDNAPersistence(db_path=target_db)
                 dna = repo.get_latest_dna(player_id=player_id, profile_tag=profile_tag)
@@ -3514,7 +3517,7 @@ def create_app(
             except Exception as e:
                 logger.debug("Could not query steam_player_dna table: %s", e)
 
-        if not dna or getattr(dna, "total_games_analyzed", 0) == 0 or not getattr(dna, "top_games", None):
+        if force_rescan or not dna or getattr(dna, "total_games_analyzed", 0) == 0 or not getattr(dna, "top_games", None):
             if target_db:
                 try:
                     from engine.steam.dna import scan_and_extract_local_dna
@@ -3539,12 +3542,10 @@ def create_app(
             except Exception:
                 pass
 
-        provenance_formulas = {
-            "engagement_weight": "w_g = ln(1 + playtime_hours) * (1 + 0.5 * min(1.0, recent_2wk_hours / 20))",
-            "genre_and_category_normalization": "L1-normalized engagement-weighted indicator sum across 10 canonical Studio genres and 8 Steam categories",
-            "pacing_index": "Continuous [-1.0, +1.0] index: (W_kinetic - W_methodical) / (W_kinetic + W_methodical); < -0.20 = tactical_methodical, > +0.20 = high_kinetic",
-            "challenge_tolerance": "0.35 * hardcore_genre_affinity + 0.35 * difficulty_tag_ratio + 0.20 * achievement_completion + 0.10 * mastery_depth",
-            "palette_mood": "Weighted linear combination of genre & thematic vectors mapped onto 4 Style Bible 16-color moods (neon_cyberpunk, grim_dark, vibrant_fantasy, retro_arcade)",
+        provenance_methodology = {
+            "epistemic_synthesis": "Gemini LLM directly inspects raw Steam library playtimes, recent activity, genres, categories, and store descriptions to form open-ended conclusions without formulas.",
+            "challenge_evaluation": "Holistic LLM assessment across both deep systemic/engineering/logistical complexity and mechanical/reflex skill ceiling.",
+            "mechanical_and_thematic_inference": "Open-ended gameplay verbs and thematic world affinities inferred by LLM from actual games played and their store descriptions.",
         }
 
         if dna:
@@ -3556,31 +3557,102 @@ def create_app(
                     raw_top_games.append({"name": f"App {appid_str}", "playtime_hours": hours})
 
             total_hrs = float(getattr(dna, "total_playtime_hours", 0.0) or 0.0)
-            weights_list = []
-            for g in raw_top_games:
-                hrs = float(g.get("playtime_hours", 0.0) or 0.0) if isinstance(g, dict) else 0.0
-                weights_list.append(math.log1p(max(0.0, hrs)))
-            sum_top_weights = sum(weights_list) or 1.0
-
             top_games_list = []
-            for idx_g, g in enumerate(raw_top_games):
+            for g in raw_top_games:
                 if not isinstance(g, dict):
                     continue
                 g_copy = dict(g)
                 appid_val = g_copy.get("appid")
                 hrs = float(g_copy.get("playtime_hours", 0.0) or 0.0)
-                w_g = weights_list[idx_g] if idx_g < len(weights_list) else math.log1p(max(0.0, hrs))
-                g_copy["engagement_weight"] = round(w_g, 4)
-                g_copy["weight_share"] = round(w_g / sum_top_weights, 4)
                 g_copy["playtime_share"] = round(hrs / total_hrs, 4) if total_hrs > 0 else 0.0
                 if appid_val is not None and str(appid_val) in app_cache_apps:
                     cached_entry = app_cache_apps[str(appid_val)]
                     if isinstance(cached_entry, dict):
+                        if (not g_copy.get("name") or str(g_copy.get("name")).startswith("App ")) and cached_entry.get("name"):
+                            g_copy["name"] = cached_entry.get("name")
+                        if not g_copy.get("genres") and cached_entry.get("genres"):
+                            g_copy["genres"] = cached_entry.get("genres", [])
                         if not g_copy.get("categories") and cached_entry.get("categories"):
                             g_copy["categories"] = cached_entry.get("categories", [])[:6]
                         if cached_entry.get("short_description"):
                             g_copy["short_description"] = cached_entry.get("short_description")
                 top_games_list.append(g_copy)
+
+            activity_windows = dict(getattr(dna, "activity_windows", {}) or {})
+            if not activity_windows:
+                try:
+                    from engine.steam.dna import SteamDNAMapper, compute_activity_windows
+                    from engine.steam.models import SteamGameRecord
+                    in_pytest = "PYTEST_CURRENT_TEST" in os.environ
+                    if not in_pytest:
+                        from engine.steam.scanner import SteamScanner
+                        from engine.steam.store_api import SteamRateLimiter, SteamStoreApiClient
+                        scanner = SteamScanner()
+                        if scanner.is_steam_installed():
+                            local_lib = scanner.scan_full_library()
+                            non_game_appids = {250820, 228980}
+                            one_yr_cut = int(time.time()) - 365 * 86400
+                            recent_uncached = [
+                                p.appid
+                                for p in local_lib.playtimes.values()
+                                if p.appid not in non_game_appids
+                                and str(p.appid) not in app_cache_apps
+                                and ((p.last_played_timestamp or 0) >= one_yr_cut or (p.playtime_2weeks_minutes or 0) > 0)
+                            ]
+                            if recent_uncached:
+                                try:
+                                    store_client = SteamStoreApiClient(rate_limiter=SteamRateLimiter(min_interval=0.1))
+                                    for aid in recent_uncached[:40]:
+                                        try:
+                                            det = store_client.get_app_details(aid)
+                                            if det is not None:
+                                                app_cache_apps[str(aid)] = det.to_dict()
+                                        except Exception:
+                                            continue
+                                except Exception:
+                                    pass
+                            ds = SteamDNAMapper.from_local_library(local_lib)
+                            ds.games = [g for g in ds.games if g.appid not in non_game_appids]
+                            for g in ds.games:
+                                ce = app_cache_apps.get(str(g.appid))
+                                if isinstance(ce, dict):
+                                    if (not g.name or g.name.startswith("App ")) and ce.get("name"):
+                                        g.name = str(ce["name"])
+                                    if not g.genres and ce.get("genres"):
+                                        g.genres = list(ce["genres"])
+                                    if not g.categories and ce.get("categories"):
+                                        g.categories = list(ce["categories"])
+                                    if not g.tags and ce.get("developer_tags"):
+                                        g.tags = list(ce["developer_tags"])
+                                    if not getattr(g, "short_description", "") and ce.get("short_description"):
+                                        g.short_description = str(ce["short_description"])
+                            activity_windows = compute_activity_windows(ds.games)
+                            dna.activity_windows = activity_windows
+                            if target_db:
+                                try:
+                                    SteamDNAPersistence(db_path=target_db).save_dna(dna)
+                                except Exception:
+                                    pass
+                    if not activity_windows:
+                        fallback_records = [
+                            SteamGameRecord(
+                                deliberation=f"Fallback game record for {tg.get('name', 'Unknown')}",
+                                appid=int(tg.get("appid", 0) or 0),
+                                name=str(tg.get("name", "Unknown")),
+                                playtime_forever_minutes=int(round(float(tg.get("playtime_hours", 0.0) or 0.0) * 60.0)),
+                                playtime_2weeks_minutes=tg.get("playtime_2weeks_minutes"),
+                                rtime_last_played=tg.get("rtime_last_played"),
+                                genres=list(tg.get("genres") or []),
+                                categories=list(tg.get("categories") or []),
+                                tags=list(tg.get("tags") or []),
+                                short_description=str(tg.get("short_description") or ""),
+                            )
+                            for tg in top_games_list
+                        ]
+                        activity_windows = compute_activity_windows(fallback_records)
+                        dna.activity_windows = activity_windows
+                except Exception as win_err:
+                    logger.debug("Could not backfill activity_windows: %s", win_err)
 
             provenance = {
                 "scanner_sources": [
@@ -3593,8 +3665,15 @@ def create_app(
                 "store_cached_apps_count": len(app_cache_apps),
                 "store_cache_updated_at_utc": app_cache_meta.get("updated_at_utc", ""),
                 "persistence_table": "telemetry.db :: steam_player_dna (SQLite WAL)",
-                "formulas": provenance_formulas,
+                "methodology": provenance_methodology,
             }
+
+            live_directive = ""
+            try:
+                from engine.studio.writers_room import CreativeWritersRoom
+                live_directive = CreativeWritersRoom()._format_dna_summary(dna)
+            except Exception:
+                pass
 
             delib = dna.deliberation or f"Analyzed Steam DNA profile for '{dna.player_id}'."
             resp = SteamDNAResponse(
@@ -3609,6 +3688,7 @@ def create_app(
                 category_weights=getattr(dna, "category_weights", {}) or {},
                 playtime_distribution=getattr(dna, "playtime_distribution", {}) or {},
                 top_games=top_games_list,
+                activity_windows=activity_windows,
                 pacing_preference=dna.pacing_preference,
                 pacing_score=dna.pacing_score,
                 challenge_tolerance=dna.challenge_tolerance,
@@ -3619,6 +3699,7 @@ def create_app(
                 palette_weights=getattr(dna, "palette_weights", {}) or {},
                 created_at_utc=getattr(dna, "created_at_utc", "") or "",
                 ingestion_provenance=provenance,
+                live_writers_room_dna_directive=live_directive,
             )
         else:
             delib = "No persisted or scanned Steam library profile found. Default baseline profile active."
@@ -3649,9 +3730,17 @@ def create_app(
                 preferred_palette_mood="neon_cyberpunk",
                 palette_weights={"neon_cyberpunk": 0.4, "grim_dark": 0.2, "vibrant_fantasy": 0.2, "retro_arcade": 0.2},
                 created_at_utc="",
-                ingestion_provenance={"formulas": provenance_formulas},
+                ingestion_provenance={"methodology": provenance_methodology},
             )
-        return JSONResponse(resp.model_dump())
+        return resp.model_dump()
+
+    async def steam_dna_handler(request):
+        """GET /api/steam/dna: Scanned Steam player DNA and gaming preferences."""
+        player_id = request.query_params.get("player_id", "local_player")
+        profile_tag = request.query_params.get("profile_tag")
+        force_rescan = str(request.query_params.get("rescan", "")).lower() in ("1", "true", "yes")
+        payload = await asyncio.to_thread(_compute_steam_dna_payload, player_id, profile_tag, force_rescan)
+        return JSONResponse(payload)
 
     async def events_history_handler(request):
         """GET /api/events/history: Returns buffered swarm events and hydrates deliberations/tool cards from active cartridge."""
@@ -4104,6 +4193,7 @@ def create_app(
             counts: Dict[str, int] = {
                 "approved": 0,
                 "in_progress": 0,
+                "waiting_for_lock": 0,
                 "awaiting_review": 0,
                 "changes_requested": 0,
                 "ready": 0,
@@ -4112,14 +4202,88 @@ def create_app(
                 "needs_decision": 0,
                 "cancelled": 0,
             }
+            in_progress_mod_owners: Dict[str, List[str]] = {}
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                if str(it.get("state") or "").lower() != "in_progress":
+                    continue
+                owner_id = str(it.get("item_id") or "")
+                mods = [str(m).strip().lstrip("/") for m in (it.get("target_modules") or []) if m]
+                revs_ip = it.get("revisions") if isinstance(it.get("revisions"), list) else []
+                tr_ip = cart_dir / "artifacts" / "work_items" / owner_id / f"lead_trace_rev{len(revs_ip)}.json"
+                if tr_ip.is_file():
+                    try:
+                        tr_data = json.loads(tr_ip.read_text(encoding="utf-8"))
+                        act_turn = tr_data.get("active_turn") if isinstance(tr_data, dict) else None
+                        if isinstance(act_turn, dict) and isinstance(act_turn.get("target_paths"), list):
+                            for tp in act_turn["target_paths"]:
+                                tp_clean = str(tp).strip().lstrip("/")
+                                if tp_clean and tp_clean not in mods:
+                                    mods.append(tp_clean)
+                    except Exception:
+                        pass
+                for m in mods:
+                    in_progress_mod_owners.setdefault(m, [])
+                    if owner_id and owner_id not in in_progress_mod_owners[m]:
+                        in_progress_mod_owners[m].append(owner_id)
+
             enriched_items: List[Dict[str, Any]] = []
             for it in items:
                 if not isinstance(it, dict):
                     continue
                 st = str(it.get("state") or "ready").lower()
-                counts[st] = counts.get(st, 0) + 1
                 it_copy = dict(it)
+                iid_str = str(it_copy.get("item_id") or "")
                 revs = it_copy.get("revisions") if isinstance(it_copy.get("revisions"), list) else []
+                waiting_locks: List[str] = [
+                    str(x).strip() for x in (it_copy.get("waiting_on_locks") or []) if str(x).strip()
+                ]
+                yielded_turn_info: Optional[Dict[str, Any]] = None
+                if st in ("waiting_for_lock", "changes_requested", "ready") and iid_str:
+                    trace_p = cart_dir / "artifacts" / "work_items" / iid_str / f"lead_trace_rev{len(revs)}.json"
+                    if trace_p.is_file():
+                        try:
+                            tr_json = json.loads(trace_p.read_text(encoding="utf-8"))
+                            if (
+                                isinstance(tr_json, dict)
+                                and str(tr_json.get("status") or "").lower() == "yielded"
+                                and isinstance(tr_json.get("pending_decision"), dict)
+                            ):
+                                st = "waiting_for_lock"
+                                p_dec = tr_json["pending_decision"]
+                                p_targets = [
+                                    str(p).strip().lstrip("/")
+                                    for p in (p_dec.get("target_paths") or [])
+                                    if str(p).strip()
+                                ]
+                                if not waiting_locks:
+                                    conflicting = [p for p in p_targets if p in in_progress_mod_owners]
+                                    waiting_locks = conflicting or p_targets or [
+                                        str(m).strip() for m in (it_copy.get("target_modules") or []) if str(m).strip()
+                                    ]
+                                turns_done = len(tr_json.get("turns") or []) if isinstance(tr_json.get("turns"), list) else 0
+                                yielded_turn_info = {
+                                    "completed_turns": turns_done,
+                                    "next_turn_index": turns_done + 1,
+                                    "specialist_agent": str(p_dec.get("specialist_agent") or "swe_engineer"),
+                                    "target_paths": p_targets,
+                                    "brief": str(p_dec.get("brief") or "")[:240],
+                                }
+                        except Exception:
+                            pass
+                lock_holders: List[str] = []
+                if st == "waiting_for_lock":
+                    for lk in waiting_locks:
+                        for holder_id in in_progress_mod_owners.get(lk, []):
+                            if holder_id != iid_str and holder_id not in lock_holders:
+                                lock_holders.append(holder_id)
+                it_copy["state"] = st
+                it_copy["waiting_on_locks"] = waiting_locks
+                it_copy["lock_holders"] = lock_holders
+                if yielded_turn_info is not None:
+                    it_copy["yielded_turn_info"] = yielded_turn_info
+                counts[st] = counts.get(st, 0) + 1
                 enriched_revs = []
                 latest_proof_urls: List[str] = []
                 for rv in revs:
@@ -4227,6 +4391,7 @@ def create_app(
                 state_to_req_status = {
                     "approved": "completed",
                     "in_progress": "in_progress",
+                    "waiting_for_lock": "in_progress",
                     "awaiting_review": "in_progress",
                     "changes_requested": "rejected",
                     "failed": "rejected",
@@ -4258,6 +4423,16 @@ def create_app(
                             "verification_method": "council_review",
                             "passed": latest_rev.get("verdict") == "approve",
                         })
+                    shaping_notes = item.get("shaping_notes") if isinstance(item.get("shaping_notes"), list) else []
+                    for idx_sn, sn in enumerate(shaping_notes):
+                        if str(sn or "").strip():
+                            criteria.append({
+                                "deliberation": "Pre-execution Specialist Council task shaping and direction.",
+                                "id": f"{iid}:council_shaping_{idx_sn + 1}",
+                                "description": str(sn).strip(),
+                                "verification_method": "council_shaping",
+                                "passed": st == "approved",
+                            })
                     board_tracks.append({
                         "deliberation": item.get("deliberation") or item.get("spec") or item.get("title") or iid,
                         "id": iid,
@@ -4266,6 +4441,8 @@ def create_app(
                         "kind": item.get("kind") or "mechanic_code",
                         "board_state": st,
                         "raised_by_role": item.get("raised_by_role") or "CreativeDirector",
+                        "spawned_by_item_id": item.get("spawned_by_item_id") or "",
+                        "shaping_notes": shaping_notes,
                         "target_modules": item.get("target_modules") or [],
                         "depends_on": item.get("depends_on") or [],
                         "revisions": revs,
@@ -4776,6 +4953,7 @@ def create_app(
                     "counts_by_state": {
                         "approved": 0,
                         "in_progress": 0,
+                        "waiting_for_lock": 0,
                         "awaiting_review": 0,
                         "changes_requested": 0,
                         "ready": 0,
@@ -5160,6 +5338,8 @@ def create_app(
                 "kind": board_item.get("kind") or "mechanic_code",
                 "state": board_item.get("state") or board_item.get("status") or "ready",
                 "raised_by_role": board_item.get("raised_by_role") or "CreativeDirector",
+                "spawned_by_item_id": board_item.get("spawned_by_item_id") or "",
+                "shaping_notes": board_item.get("shaping_notes") if isinstance(board_item.get("shaping_notes"), list) else [],
                 "spec": board_item.get("spec") or board_item.get("description") or "",
                 "proof_spec": board_item.get("proof_spec") or "",
                 "target_modules": board_item.get("target_modules") or [],

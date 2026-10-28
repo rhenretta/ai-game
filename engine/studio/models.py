@@ -1027,6 +1027,20 @@ class AssetRequirement(BaseEpistemicModel):
         return data
 
 
+class AudioAssetPlanBatch(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Plans one or more audio assets (a single audio cue or a multi-cue soundbank) required by an audio task or brief.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST: Rationale enumerating every audio file/cue requested by the task specification or brief and its acoustic character, frequency register, and fabrication mode.",
+    )
+    assets: List[AssetRequirement] = Field(
+        default_factory=list,
+        description="One AssetRequirement per requested audio cue (.wav file). When the task or brief requests multiple audio cues or a soundbank, include a separate AssetRequirement for EVERY requested cue with its own target_path (under assets/audio/...) and visual_prompt_or_text.",
+    )
+
+
 class AssetLibraryEntry(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     Indexed record in the Cartridge Asset Library (assets/asset_library.json) describing a fabricated asset,
@@ -1177,7 +1191,7 @@ class ModuleFileSpec(BaseEpistemicModel):
     """
     deliberation: str = Field(
         ...,
-        description="MANDATORY FIRST PROPERTY: Epistemic rationale explaining the file's architectural role, node hierarchy, and API contracts."
+        description="MANDATORY FIRST PROPERTY: Concise 1-sentence rationale (<= 20 words) stating this file's architectural role and contract."
     )
     filename: str = Field(
         ...,
@@ -1199,11 +1213,209 @@ class ModuleFileSpec(BaseEpistemicModel):
             elif fn.startswith("res:/"):
                 fn = fn[len("res:/"):]
             fn = fn.lstrip("/")
-            if "/" in fn and Path(fn).name in {"main.gd", "mechanics.gd", "scenes.gd", "entities.gd", "ui_hud.gd"}:
+            if "/" in fn and Path(fn).name in {
+                "main.gd",
+                "mechanics.gd",
+                "scenes.gd",
+                "entities.gd",
+                "ui_hud.gd",
+                "main.tscn",
+                "project.godot",
+            }:
                 fn = Path(fn).name
             out["filename"] = fn
             return out
         return data
+
+
+class SurgicalCodePatch(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    A targeted line-range replacement within an existing cartridge file.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Concise 1-sentence rationale (<= 20 words) explaining why replacing lines [start_line..end_line] in filename satisfies the requirement."
+    )
+    filename: str = Field(
+        ...,
+        description="Target relative file path in cartridge without 'res://' prefix (e.g. 'scenes/camera/train_camera.gd', 'level_map.gd', 'main.gd')."
+    )
+    start_line: int = Field(
+        ...,
+        ge=1,
+        description="1-indexed first line of the contiguous block in `filename` to replace."
+    )
+    end_line: int = Field(
+        ...,
+        ge=1,
+        description="1-indexed last line (inclusive) of the contiguous block in `filename` to replace."
+    )
+    target_snippet: str = Field(
+        default="",
+        description="Optional exact existing lines at [start_line..end_line] being replaced (without line-number prefixes) to anchor the patch if line numbers shifted."
+    )
+    replacement_code: str = Field(
+        ...,
+        description="Exact replacement GDScript lines (without line number prefixes, using tab '\\t' indentation matching the surrounding block) to substitute for lines [start_line..end_line]."
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_patch_filename(cls, data: Any) -> Any:
+        if isinstance(data, dict) and isinstance(data.get("filename"), str):
+            out = dict(data)
+            fn = out["filename"].strip().replace("\\", "/")
+            if fn.startswith("res://"):
+                fn = fn[len("res://"):]
+            elif fn.startswith("res:/"):
+                fn = fn[len("res:/"):]
+            fn = fn.lstrip("/")
+            if "/" in fn and Path(fn).name in {
+                "main.gd",
+                "mechanics.gd",
+                "scenes.gd",
+                "entities.gd",
+                "ui_hud.gd",
+                "main.tscn",
+                "project.godot",
+            }:
+                fn = Path(fn).name
+            out["filename"] = fn
+            return out
+        return data
+
+
+def _strip_numbered_line_prefix(raw_line: str) -> str:
+    """Strips an accidental ` 123: ` line-number prefix if an LLM echoed numbered slice output."""
+    if len(raw_line) >= 6 and raw_line[:4].strip().isdigit() and raw_line[4:6] == ": ":
+        return raw_line[6:]
+    return raw_line
+
+
+def _locate_snippet_line_range(
+    file_lines: List[str],
+    snippet_text: str,
+    hint_start_line: int,
+) -> Optional[Tuple[int, int]]:
+    """Attempts to locate `snippet_text` in `file_lines` (1-indexed inclusive `(start, end)`),
+    preferring the match closest to `hint_start_line`."""
+    raw_target = [_strip_numbered_line_prefix(ln) for ln in snippet_text.splitlines()]
+    while raw_target and not raw_target[0].strip():
+        raw_target.pop(0)
+    while raw_target and not raw_target[-1].strip():
+        raw_target.pop()
+    if not raw_target:
+        return None
+    n_t = len(raw_target)
+    total = len(file_lines)
+    if n_t > total:
+        return None
+
+    # First try exact line match (after stripping trailing whitespace)
+    stripped_target = [ln.rstrip() for ln in raw_target]
+    stripped_file = [ln.rstrip() for ln in file_lines]
+    candidates: List[Tuple[int, int]] = []
+    for i in range(total - n_t + 1):
+        if stripped_file[i : i + n_t] == stripped_target:
+            candidates.append((i + 1, i + n_t))
+
+    # Fallback: match ignoring leading/trailing whitespace if multi-line or non-trivial single line
+    if not candidates and (n_t >= 2 or len(raw_target[0].strip()) >= 12):
+        norm_target = [ln.strip() for ln in raw_target]
+        norm_file = [ln.strip() for ln in file_lines]
+        for i in range(total - n_t + 1):
+            if norm_file[i : i + n_t] == norm_target:
+                candidates.append((i + 1, i + n_t))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda rng: abs(rng[0] - max(1, hint_start_line)))
+    return candidates[0]
+
+
+def apply_surgical_patches_to_directory(
+    target_dir: Path,
+    patches: Sequence[SurgicalCodePatch],
+    allowed_files: Optional[Set[str]] = None,
+    path_resolver: Optional[Any] = None,
+) -> Dict[str, Path]:
+    """Applies `SurgicalCodePatch` entries to files in `target_dir` in descending line order,
+    using `target_snippet` anchoring when provided."""
+    updated: Dict[str, Path] = {}
+    if not patches:
+        return updated
+
+    canonical_root_only = {"main.gd", "main.tscn", "project.godot"}
+    patches_by_file: Dict[str, List[SurgicalCodePatch]] = {}
+    resolved_paths: Dict[str, Path] = {}
+
+    for p in patches:
+        if callable(path_resolver):
+            rel_name, fpath = path_resolver(target_dir, p.filename)
+        else:
+            rel_name = p.filename.strip().replace("\\", "/")
+            if rel_name.startswith("res://"):
+                rel_name = rel_name[len("res://"):]
+            elif rel_name.startswith("res:/"):
+                rel_name = rel_name[len("res:/"):]
+            rel_name = rel_name.lstrip("/")
+            if "/" in rel_name and Path(rel_name).name in canonical_root_only:
+                rel_name = Path(rel_name).name
+            fpath = target_dir / rel_name
+            if not fpath.is_file():
+                bname = Path(rel_name).name
+                matches = [
+                    cand for cand in target_dir.rglob(bname)
+                    if cand.is_file() and not any(part in (".godot", "artifacts") for part in cand.relative_to(target_dir).parts)
+                ]
+                if len(matches) == 1:
+                    fpath = matches[0]
+                    rel_name = fpath.relative_to(target_dir).as_posix()
+
+        if allowed_files is not None and rel_name not in allowed_files:
+            continue
+        if rel_name.endswith((".gd", ".tscn", ".gdshader", ".godot")) and fpath.is_file():
+            patches_by_file.setdefault(rel_name, []).append(p)
+            resolved_paths[rel_name] = fpath
+
+    for fname, file_patches in patches_by_file.items():
+        fpath = resolved_paths[fname]
+        if not fpath.is_file():
+            continue
+        lines = fpath.read_text(encoding="utf-8").splitlines()
+        total = len(lines)
+
+        resolved_ranges: List[Tuple[int, int, SurgicalCodePatch]] = []
+        for patch in file_patches:
+            s = max(1, min(patch.start_line, max(1, total)))
+            e = max(s, min(patch.end_line, max(1, total)))
+            if getattr(patch, "target_snippet", ""):
+                anchored = _locate_snippet_line_range(lines, patch.target_snippet, s)
+                if anchored is not None:
+                    s, e = anchored
+            resolved_ranges.append((s, e, patch))
+
+        # Sort descending by start_line so earlier line indices do not shift
+        resolved_ranges.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        last_start = total + 1
+        applied_any = False
+
+        for s, e, patch in resolved_ranges:
+            if e >= last_start:
+                continue
+            cleaned_replacement = [
+                _strip_numbered_line_prefix(raw_line)
+                for raw_line in patch.replacement_code.splitlines()
+            ]
+            lines[s - 1 : e] = cleaned_replacement
+            last_start = s
+            applied_any = True
+
+        if applied_any:
+            fpath.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            updated[fname] = fpath
+
+    return updated
 
 
 class TrackCodeSynthesisPayload(BaseEpistemicModel):
@@ -1216,19 +1428,29 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
     )
     self_question_answer: str = Field(
         default="",
-        description="If you asked a `self_question` on the previous turn, write your concise, factual answer here FIRST based on the retrieved context chunks (citing exact method/signal/variable names) before writing `files`.",
+        description="If you asked a `self_question` on the previous turn, write your concise, factual answer here FIRST based on the retrieved context chunks (citing exact method/signal/variable names) before writing `patches` or `files`.",
     )
     self_question: str = Field(
         default="",
-        description="Optional self-inquiry: If you lack critical context (e.g. an imported script's exact method/signal signature, node structure, shader uniforms, or design spec) needed to write code without guessing, output your specific question here and leave `files` empty (`[]`). ContextCuratorAgent will fetch the needed context chunks so you can answer your own question on the next turn.",
+        description="Optional self-inquiry: If you lack critical context (e.g. an imported script's exact method/signal signature, node structure, shader uniforms, or design spec) needed to write code without guessing, output your specific question here and leave `patches` and `files` empty (`[]`). ContextCuratorAgent will fetch the needed context chunks so you can answer your own question on the next turn.",
     )
     requested_assets: List[AssetRequirement] = Field(
         default_factory=list,
         description="On-demand purpose-built assets (sprite sheets, articulated parts, props, tiles, parallax layers, UI, SFX) requested by the SWE agent for the Cartridge Asset Library."
     )
+    patches: List[SurgicalCodePatch] = Field(
+        default_factory=list,
+        description=(
+            "PREFERRED FOR EXISTING FILES ON DISK: Surgical line-range replacements (`filename`, `start_line`, `end_line`, "
+            "`target_snippet`, `replacement_code`) to modify existing `.gd` / `.gdshader` / `.tscn` files without regenerating the entire file."
+        ),
+    )
     files: List[ModuleFileSpec] = Field(
         default_factory=list,
-        description="Collection of cartridge files to create or update."
+        description=(
+            "For brand-new files that do not yet exist on disk (or complete replacements of small <100-line files): "
+            "collection of cartridge files to create."
+        ),
     )
     manifest_data: Dict[str, Any] = Field(
         default_factory=dict,
@@ -1239,10 +1461,15 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
         self,
         target_dir: Path,
         swe_agent: Optional[Any] = None,
+        pre_write_hook: Optional[Any] = None,
+        commit_gate: Optional[Any] = None,
+        allowed_files: Optional[Set[str]] = None,
     ) -> Dict[str, Path]:
-        """Assembles, verifies, and writes modular cartridge files to target_dir.
+        """Assembles, verifies, and writes modular cartridge files and surgical patches to target_dir.
         Returns dictionary mapping filename -> Path.
         """
+        import contextlib
+
         target_dir.mkdir(parents=True, exist_ok=True)
         results: Dict[str, Path] = {}
 
@@ -1275,96 +1502,165 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
                 f"On-demand asset fabrication failed for cartridge '{target_dir}': {exc!r}"
             ) from exc
 
-        # 1. Ensure minimal main.tscn exists
-        main_tscn = target_dir / "main.tscn"
-        if not main_tscn.is_file():
-            main_tscn.write_text(
-                '[gd_scene load_steps=2 format=3]\n\n'
-                '[ext_resource type="Script" path="res://main.gd" id="1_main"]\n\n'
-                '[node name="Main" type="Node2D"]\n'
-                'script = ExtResource("1_main")\n',
-                encoding="utf-8"
-            )
-            results["main.tscn"] = main_tscn
+        canonical_root_only = {"main.gd", "main.tscn", "project.godot"}
 
-        # 2. Ensure project.godot exists
-        project_godot = target_dir / "project.godot"
-        if not project_godot.is_file():
-            project_godot.write_text(
-                'config_version=5\n\n'
-                '[application]\n'
-                'config/name="Game Cartridge"\n'
-                'run/main_scene="res://main.tscn"\n'
-                'config/features=PackedStringArray("4.3", "Forward Plus")\n\n'
-                '[display]\n'
-                'window/size/viewport_width=1280\n'
-                'window/size/viewport_height=720\n'
-                'window/size/window_width_override=2560\n'
-                'window/size/window_height_override=1440\n'
-                'window/size/resizable=true\n'
-                'window/dpi/allow_hidpi=true\n'
-                'window/stretch/mode="canvas_items"\n'
-                'window/stretch/aspect="keep"\n\n'
-                '[rendering]\n'
-                'textures/canvas_textures/default_texture_filter=2\n',
-                encoding="utf-8"
-            )
-            results["project.godot"] = project_godot
-
-        # 3. Write synthesized module files (always strip any accidental 'res://' prefix)
-        canonical_root_gd = {"main.gd", "mechanics.gd", "scenes.gd", "entities.gd", "ui_hud.gd"}
-        for fspec in self.files:
-            rel_fname = fspec.filename.strip().replace("\\", "/")
+        def _norm_rel(raw_path: str) -> str:
+            rel_fname = str(raw_path or "").strip().replace("\\", "/")
             if rel_fname.startswith("res://"):
                 rel_fname = rel_fname[len("res://"):]
             elif rel_fname.startswith("res:/"):
                 rel_fname = rel_fname[len("res:/"):]
             rel_fname = rel_fname.lstrip("/")
-            if "/" in rel_fname and Path(rel_fname).name in canonical_root_gd:
+            if "/" in rel_fname and Path(rel_fname).name in canonical_root_only:
                 rel_fname = Path(rel_fname).name
-            file_path = target_dir / rel_fname
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            file_path.write_text(fspec.content, encoding="utf-8")
-            results[rel_fname] = file_path
-            try:
-                from engine.studio.workers import record_turn_substep
-                record_turn_substep(
-                    "editing_file",
-                    f"Editing file {rel_fname} ({len(fspec.content.splitlines())} lines)",
-                    details={"file": rel_fname, "lines": len(fspec.content.splitlines())},
+            return rel_fname
+
+        normalized_files: List[Tuple[str, str]] = []
+        for fspec in self.files:
+            rel_fname = _norm_rel(fspec.filename)
+            if rel_fname:
+                cleaned_lines = [_strip_numbered_line_prefix(ln) for ln in fspec.content.splitlines()]
+                cleaned_content = "\n".join(cleaned_lines) + ("\n" if fspec.content.endswith("\n") else "")
+                normalized_files.append((rel_fname, cleaned_content))
+
+        normalized_patches: List[SurgicalCodePatch] = []
+        for pspec in self.patches:
+            rel_fname = _norm_rel(pspec.filename)
+            if rel_fname:
+                normalized_patches.append(pspec.model_copy(update={"filename": rel_fname}))
+
+        all_touched_rel: List[str] = list(
+            dict.fromkeys(
+                [rel_fname for rel_fname, _ in normalized_files]
+                + [p.filename for p in normalized_patches]
+            )
+        )
+
+        if callable(pre_write_hook):
+            pre_write_hook(all_touched_rel, self)
+            allowed_after_hook = set(all_touched_rel)
+            normalized_files = [(f, c) for f, c in normalized_files if f in allowed_after_hook]
+            normalized_patches = [p for p in normalized_patches if p.filename in allowed_after_hook]
+
+        gate_cm = commit_gate if commit_gate is not None else contextlib.nullcontext()
+        with gate_cm:
+            # 1. Ensure minimal main.tscn exists
+            main_tscn = target_dir / "main.tscn"
+            if not main_tscn.is_file():
+                main_tscn.write_text(
+                    '[gd_scene load_steps=2 format=3]\n\n'
+                    '[ext_resource type="Script" path="res://main.gd" id="1_main"]\n\n'
+                    '[node name="Main" type="Node2D"]\n'
+                    'script = ExtResource("1_main")\n',
+                    encoding="utf-8"
                 )
-            except Exception:
-                pass
+                results["main.tscn"] = main_tscn
 
-        # 3b. Enforce HiDPI Retina window sizing & resizable=true even if LLM overwrote project.godot
-        if project_godot.is_file():
-            enforce_hidpi_project_godot(project_godot)
-            results["project.godot"] = project_godot
-
-        # 4. Write manifest.json
-        if self.manifest_data:
-            manifest_path = target_dir / "manifest.json"
-            manifest_path.write_text(json.dumps(manifest_data_clean := self.manifest_data, indent=2), encoding="utf-8")
-            results["manifest.json"] = manifest_path
-
-        # 5. Run Godot 4 compiler syntax verification & self-healing repair loop when live SWE agent is active
-        if (
-            swe_agent is not None
-            and hasattr(swe_agent, "_verify_and_heal_godot_syntax_and_probes")
-            and hasattr(swe_agent, "_is_live_genai_client")
-            and swe_agent._is_live_genai_client()
-            and any(f.filename.endswith(".gd") for f in self.files)
-        ):
-            try:
-                from engine.studio.workers import record_turn_substep
-                record_turn_substep(
-                    "running_tests",
-                    "Running headless Godot compiler syntax & probe verification",
+            # 2. Ensure project.godot exists
+            project_godot = target_dir / "project.godot"
+            if not project_godot.is_file():
+                project_godot.write_text(
+                    'config_version=5\n\n'
+                    '[application]\n'
+                    'config/name="Game Cartridge"\n'
+                    'run/main_scene="res://main.tscn"\n'
+                    'config/features=PackedStringArray("4.3", "Forward Plus")\n\n'
+                    '[display]\n'
+                    'window/size/viewport_width=1280\n'
+                    'window/size/viewport_height=720\n'
+                    'window/size/window_width_override=2560\n'
+                    'window/size/window_height_override=1440\n'
+                    'window/size/resizable=true\n'
+                    'window/dpi/allow_hidpi=true\n'
+                    'window/stretch/mode="canvas_items"\n'
+                    'window/stretch/aspect="keep"\n\n'
+                    '[rendering]\n'
+                    'textures/canvas_textures/default_texture_filter=2\n',
+                    encoding="utf-8"
                 )
-            except Exception:
-                pass
-            healed = swe_agent._verify_and_heal_godot_syntax_and_probes(target_dir)
-            results.update(healed)
+                results["project.godot"] = project_godot
+
+            # 3a. Write synthesized new/full module files
+            for rel_fname, content in normalized_files:
+                file_path = target_dir / rel_fname
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text(content, encoding="utf-8")
+                results[rel_fname] = file_path
+                try:
+                    from engine.studio.workers import record_turn_substep
+                    record_turn_substep(
+                        "editing_file",
+                        f"Editing file {rel_fname} ({len(content.splitlines())} lines)",
+                        details={"file": rel_fname, "lines": len(content.splitlines())},
+                    )
+                except Exception:
+                    pass
+
+            # 3b. Apply surgical patches to existing files
+            if normalized_patches:
+                resolver = getattr(swe_agent, "_resolve_cartridge_gd_path", None) if swe_agent is not None else None
+                patched_map = apply_surgical_patches_to_directory(
+                    target_dir=target_dir,
+                    patches=normalized_patches,
+                    allowed_files=allowed_files,
+                    path_resolver=resolver,
+                )
+                for rel_fname, fpath in patched_map.items():
+                    results[rel_fname] = fpath
+                    patch_cnt = sum(1 for p in normalized_patches if p.filename == rel_fname)
+                    try:
+                        from engine.studio.workers import record_turn_substep
+                        total_lines = len(fpath.read_text(encoding="utf-8").splitlines()) if fpath.is_file() else 0
+                        record_turn_substep(
+                            "editing_file",
+                            f"Patching file {rel_fname} ({patch_cnt} surgical hunk(s), {total_lines} lines total)",
+                            details={"file": rel_fname, "patches": patch_cnt, "lines": total_lines},
+                        )
+                    except Exception:
+                        pass
+
+            # 3c. Enforce HiDPI Retina window sizing & resizable=true even if LLM overwrote project.godot
+            if project_godot.is_file():
+                enforce_hidpi_project_godot(project_godot)
+                results["project.godot"] = project_godot
+
+            # 4. Write manifest.json
+            if self.manifest_data:
+                manifest_path = target_dir / "manifest.json"
+                manifest_path.write_text(json.dumps(self.manifest_data, indent=2), encoding="utf-8")
+                results["manifest.json"] = manifest_path
+
+            # 5. Run Godot 4 compiler syntax verification & self-healing repair loop when live SWE agent is active
+            has_gd_changes = any(
+                rel_fname.endswith(".gd")
+                for rel_fname in list(results.keys()) + all_touched_rel
+            )
+            if (
+                swe_agent is not None
+                and hasattr(swe_agent, "_verify_and_heal_godot_syntax_and_probes")
+                and hasattr(swe_agent, "_is_live_genai_client")
+                and swe_agent._is_live_genai_client()
+                and has_gd_changes
+            ):
+                try:
+                    from engine.studio.workers import record_turn_substep
+                    record_turn_substep(
+                        "running_tests",
+                        "Running headless Godot compiler syntax & probe verification",
+                    )
+                except Exception:
+                    pass
+                effective_allowed = set(allowed_files) if allowed_files is not None else None
+                if effective_allowed is not None:
+                    for rel_fname in all_touched_rel:
+                        effective_allowed.add(rel_fname)
+                try:
+                    healed = swe_agent._verify_and_heal_godot_syntax_and_probes(
+                        target_dir, allowed_files=effective_allowed
+                    )
+                except TypeError:
+                    healed = swe_agent._verify_and_heal_godot_syntax_and_probes(target_dir)
+                results.update(healed)
 
         return results
 
@@ -1464,34 +1760,6 @@ class DebugResearchPlan(BaseEpistemicModel):
     slice_requests: List[CodeSliceRequest] = Field(
         ...,
         description="Focused list of code slices or symbols to inspect (do NOT request entire large files; request only the relevant functions/classes)."
-    )
-
-
-class SurgicalCodePatch(BaseEpistemicModel):
-    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
-    A targeted line-range replacement within a cartridge file.
-    """
-    deliberation: str = Field(
-        ...,
-        description="MANDATORY FIRST PROPERTY: Epistemic rationale explaining why replacing lines [start_line..end_line] in filename fixes the root cause while preserving surrounding indentation and logic."
-    )
-    filename: str = Field(
-        ...,
-        description="Target file in cartridge (e.g. 'scenes.gd', 'main.gd')."
-    )
-    start_line: int = Field(
-        ...,
-        ge=1,
-        description="1-indexed first line of the contiguous block in `filename` to replace."
-    )
-    end_line: int = Field(
-        ...,
-        ge=1,
-        description="1-indexed last line (inclusive) of the contiguous block in `filename` to replace."
-    )
-    replacement_code: str = Field(
-        ...,
-        description="Exact replacement GDScript lines (without line number prefixes, using tab '\\t' indentation matching the surrounding block) to substitute for lines [start_line..end_line]."
     )
 
 
@@ -1924,6 +2192,10 @@ class WritersRoomTurnProposal(BaseEpistemicModel):
         description="Playable game slices strategized for this game. Slice 0 MUST deliver the complete playable game loop (realizing the full 3-timescale CoreLoopSpec, player toolkit/agency, escalating GoalHierarchy, multi-region LevelGenerationStrategy, UX onboarding, and audio)—never defer the core point of the game to unbuilt future slices!",
     )
     backlog_additions: List[WorkItemProposal] = Field(default_factory=list, description="High-level requirements for the active slice (tasks can dynamically spawn their own asset/animation/sub-mechanic tasks as needed).")
+    backlog_refinements: List[WorkItemRefinement] = Field(
+        default_factory=list,
+        description="Pre-execution Council input on existing unstarted tasks on the Production Board: enrich a task's spec with domain direction/contracts (`action='enrich'`), wire dependencies (`add_depends_on`), or split an oversized task into smaller cohesive tasks (`action='split'`).",
+    )
 
     _ROLE_SCHEMA_CACHE: ClassVar[Dict[str, Type["BaseEpistemicModel"]]] = {}
     _SHARED_TURN_FIELDS: ClassVar[Tuple[str, ...]] = (
@@ -1936,6 +2208,7 @@ class WritersRoomTurnProposal(BaseEpistemicModel):
         "concept_evolution_milestone",
         "added_or_updated_slices",
         "backlog_additions",
+        "backlog_refinements",
     )
     _ROLE_TURN_FIELDS: ClassVar[Dict[str, Tuple[str, ...]]] = {
         "CreativeDirector": (
@@ -2611,7 +2884,7 @@ WorkItemKind = Literal[
     "visual_asset", "audio_asset", "level_map", "animation", "mechanic_code", "integration", "ui", "narrative", "other",
 ]
 WorkItemState = Literal[
-    "blocked", "ready", "in_progress", "awaiting_review", "changes_requested",
+    "blocked", "ready", "in_progress", "waiting_for_lock", "awaiting_review", "changes_requested",
     "needs_decision", "approved", "failed", "cancelled",
 ]
 
@@ -2621,7 +2894,7 @@ class QASetupCall(BaseEpistemicModel):
     A scenario-setup action executed by the QA test harness at a specific tick (outside production _physics_process)
     to position actors, spawn a hazard, or trigger an interaction precondition for proof capture.
     """
-    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this scenario setup call is needed to test/prove the work item.")
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Concise 1-sentence rationale (<= 15 words) for this setup call.")
     at_tick: int = Field(default=1, description="Tick at which to invoke this setup hook (1 <= at_tick <= 900).")
     target_node_or_property: str = Field(
         default="",
@@ -2635,7 +2908,7 @@ class QAStateAssertion(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     An observable state assertion evaluated at a specific tick during the QA filmstrip run.
     """
-    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this state condition proves the asset/mechanic works.")
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Concise 1-sentence rationale (<= 15 words) for this assertion.")
     at_tick: int = Field(..., description="Tick at which to check the assertion.")
     snapshot_key: str = Field(..., description="Key in get_state_snapshot() or entity property to inspect.")
     expected_value_or_change: str = Field(..., description="Expected value or transition description.")
@@ -2645,7 +2918,7 @@ class InputSegment(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     Actions held down for a range of physics ticks (or triggered reactively when a state condition is met) during a scripted proof run.
     """
-    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: What this input segment demonstrates.")
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Concise 1-sentence rationale (<= 15 words) for this input segment.")
     from_tick: int = Field(..., description="First tick (1-based) the actions are held (or earliest tick to start watching `when_snapshot_key`).")
     to_tick: int = Field(..., description="Last tick (inclusive) the actions are held (or latest tick to watch `when_snapshot_key`).")
     actions: List[str] = Field(default_factory=list, description="Input action names or KEY_* names, chosen only from the game's available actions.")
@@ -2673,12 +2946,22 @@ class InputSegment(BaseEpistemicModel):
 
 class FilmstripPlan(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
-    How to demonstrate a built mechanic/level/UI to the council: scripted inputs, scenario setup hooks, state assertions, plus the ticks to capture.
+    How to demonstrate a built mechanic/level/UI to the council: scripted inputs, scenario setup hooks, state assertions,
+    optional isolated test scene script (`test_scene_gd_content`), plus the ticks to capture.
     """
-    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why these inputs, scenario setup calls, and frames best prove the item meets its spec and the council's proof request.")
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why these inputs, scenario setup calls, isolated test scene (if any), and frames best prove the item meets its spec and the council's proof request.")
     target_scene: str = Field(
         default="",
-        description="Optional Godot scene path (e.g. 'res://tests/test_shader.tscn') to boot instead of 'res://main.tscn' ONLY when proving an isolated subsystem test scene.",
+        description="Optional Godot scene path (e.g. 'res://tests/test_camera.tscn') to boot instead of 'res://main.tscn' when proving a feature in an isolated test scene.",
+    )
+    test_scene_gd_content: str = Field(
+        default="",
+        description=(
+            "Optional complete GDScript 2.0 (`extends Node2D`) source code for an isolated QA test scene at `target_scene` "
+            "(e.g. `res://tests/test_<item_id>.gd` paired with `res://tests/test_<item_id>.tscn`). "
+            "Use this to stage subsystem or multi-entity test scenarios cleanly inside `res://tests/` so `main.gd` (`res://main.tscn`) "
+            "remains 100% pure playable game code without `func test_*()` staging helpers."
+        ),
     )
     capture_ticks: List[int] = Field(default_factory=list, description="Ticks at which to capture a frame (1 to 12 frames).")
     input_segments: List[InputSegment] = Field(default_factory=list, description="Scripted inputs; empty means no input is applied.")
@@ -2733,14 +3016,115 @@ class WorkItemProposal(BaseEpistemicModel):
         return cleaned
 
 
+class WorkItemRefinement(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    A Council specialist's pre-execution direction, cross-domain enrichment, dependency wiring,
+    or task decomposition ('split') applied to an existing unstarted WorkItem on the Production Board.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Why this existing task needs domain direction, cross-module contract alignment, prerequisite dependencies, or decomposition into smaller cohesive tasks.",
+    )
+    item_id: str = Field(..., description="Existing item_id on the Production Board to enrich or split.")
+    spec_addition_or_rewrite: str = Field(
+        default="",
+        description="When action is 'enrich', concrete domain direction, data-contract requirements, UX affordances, or audio/visual integration notes to append to the task's spec.",
+    )
+    proof_spec_update: str = Field(
+        default="",
+        description="Optional refinement or addition to the item's proof_spec so the Council sees evidence of the enriched requirements.",
+    )
+    add_depends_on: List[str] = Field(
+        default_factory=list,
+        description="Prerequisite item_ids (existing on the board or newly proposed in this turn) that this task must wait for before starting.",
+    )
+    add_target_modules: List[str] = Field(
+        default_factory=list,
+        description="Additional GDScript or data modules this task will read/write.",
+    )
+    split_items: List[WorkItemProposal] = Field(
+        default_factory=list,
+        description="When action is 'split', the smaller, focused WorkItemProposals that replace this oversized task (downstream dependents on the board are automatically re-pointed).",
+    )
+    action: Literal["enrich", "split", "no_input"] = Field(
+        default="enrich",
+        description="Shaping action: 'enrich' to add specialist direction/dependencies to the existing task, 'split' to decompose it into smaller tasks, or 'no_input' if your domain has no additional requirements for this task (strictly last per Rule 4).",
+    )
+
+    @field_validator("add_target_modules", mode="before")
+    @classmethod
+    def _normalize_add_target_modules(cls, v: Any) -> List[str]:
+        if not isinstance(v, list):
+            return []
+        cleaned: List[str] = []
+        for item in v:
+            s = str(item or "").strip().replace("\\", "/")
+            if s.startswith("res://"):
+                s = s[len("res://"):]
+            elif s.startswith("res:/"):
+                s = s[len("res:/"):]
+            s = s.lstrip("/")
+            if s and s not in cleaned:
+                cleaned.append(s)
+        return cleaned
+
+
+class TaskShapingBatch(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    A Council specialist's review of the unstarted backlog on the Production Board prior to execution:
+    giving domain direction, wiring dependencies, splitting monolithic tasks, and raising missing companion tasks.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Cross-functional evaluation of the current Production Board tasks from your specialist domain—identifying any monolithic tasks that should be split, tasks missing domain direction/contracts, or missing prerequisite tasks.",
+    )
+    backlog_additions: List[WorkItemProposal] = Field(
+        default_factory=list,
+        description="New companion or prerequisite tasks (e.g. visual_asset rigs, audio_asset cues, UI/HUD affordances, or sub-mechanics) that existing tasks need.",
+    )
+    backlog_refinements: List[WorkItemRefinement] = Field(
+        default_factory=list,
+        description="Refinements ('enrich') or decompositions ('split') to apply to existing unstarted tasks on the Production Board.",
+    )
+
+
 class ReviewDecision(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     The council's review of an item that has returned with proof.
     """
-    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Close examination of the proof images against the spec and the game's design.")
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Close examination of the proof images against the spec and the game's design, including cross-task root-cause attribution.")
     item_id: str = Field(..., description="Item under review.")
-    feedback: str = Field(default="", description="Concrete, actionable changes required (empty when approving).")
+    feedback: str = Field(default="", description="Concrete, actionable changes required for THIS item's own scope (empty when approving).")
+    blocked_by_item_ids: List[str] = Field(
+        default_factory=list,
+        description="Optional IDs of existing unapproved items on the Production Board that own an out-of-scope or shared defect visible in this item's proof. This item will be blocked on those items rather than re-implementing their modules.",
+    )
+    spawned_prerequisite_tasks: List[WorkItemProposal] = Field(
+        default_factory=list,
+        description="Optional new high-priority prerequisite bugfix task(s) to spawn when a defect visible in this item's proof belongs to a shared/already-approved module outside this item's core responsibility.",
+    )
+    out_of_scope_modules_to_prune: List[str] = Field(
+        default_factory=list,
+        description="Optional module paths (e.g. shared camera, world scene, or hub files) that belong to a linked blocker or spawned prerequisite task and must be pruned from this item's target_modules so workers do not collide.",
+    )
     verdict: Literal["approve", "request_changes"] = Field(..., description="Decision (strictly last).")
+
+    @field_validator("out_of_scope_modules_to_prune", mode="before")
+    @classmethod
+    def _normalize_prune_modules(cls, v: Any) -> List[str]:
+        if not isinstance(v, list):
+            return []
+        cleaned: List[str] = []
+        for item in v:
+            s = str(item or "").strip().replace("\\", "/")
+            if s.startswith("res://"):
+                s = s[len("res://"):]
+            elif s.startswith("res:/"):
+                s = s[len("res:/"):]
+            s = s.lstrip("/")
+            if s and s not in cleaned:
+                cleaned.append(s)
+        return cleaned
 
 
 class CapDecision(BaseEpistemicModel):
@@ -2803,8 +3187,20 @@ class WorkItem(BaseEpistemicModel):
     failure_count: int = Field(default=0, description="Number of worker failures so far.")
     priority: int = Field(default=0)
     decision_reason: str = Field(default="", description="Why the item is in needs_decision.")
+    shaping_notes: List[str] = Field(
+        default_factory=list,
+        description="Pre-execution Council specialist direction and shaping notes contributed to this task.",
+    )
+    excluded_modules: List[str] = Field(
+        default_factory=list,
+        description="Module paths explicitly pruned from this item's scope by a [Council Scope Boundary] decision so workers do not overwrite shared/external modules.",
+    )
+    waiting_on_locks: List[str] = Field(
+        default_factory=list,
+        description="File paths or lock names this item is currently waiting on after yielding mid-run.",
+    )
 
-    @field_validator("target_modules", mode="before")
+    @field_validator("target_modules", "excluded_modules", "waiting_on_locks", mode="before")
     @classmethod
     def _normalize_item_target_modules(cls, v: Any) -> List[str]:
         if not isinstance(v, list):
@@ -2905,7 +3301,7 @@ class TaskLeadDecision(BaseEpistemicModel):
     """
     deliberation: str = Field(
         ...,
-        description="MANDATORY FIRST PROPERTY: Step-by-step evaluation of the task requirements, current cartridge state, prior Council feedback (if any), and the results returned by specialists on previous turns.",
+        description="MANDATORY FIRST PROPERTY: Concise (<= 120 words) evaluation of the task requirements, current cartridge state, prior Council feedback (if any), and the results returned by specialists on previous turns.",
     )
     self_question_answer: str = Field(
         default="",
@@ -2917,11 +3313,11 @@ class TaskLeadDecision(BaseEpistemicModel):
     )
     current_strategy: str = Field(
         ...,
-        description="Bespoke, evolving strategy for creating everything required by this task and proving it to the Council (state explicitly whether this turn will 'delegate' to a specific specialist_agent, 'spawn_tasks', or 'submit_to_council').",
+        description="Concise (<= 60 words) strategy for this turn (state explicitly whether this turn will 'delegate' to a specific specialist_agent, 'spawn_tasks', or 'submit_to_council').",
     )
     proof_strategy: str = Field(
         default="",
-        description="Explicit strategy for how the final proof artifact(s) will be generated and verified to satisfy `proof_spec` (e.g., isolated asset inspection plate, multi-cell grid/atlas sheet plate, waveform diagram, script table read sheet, or headless Godot gameplay/test-scene filmstrip).",
+        description="Concise (<= 40 words) strategy for how the final proof artifact(s) will be generated and verified to satisfy `proof_spec`.",
     )
     specialist_agent: str = Field(
         default="",
@@ -2929,7 +3325,7 @@ class TaskLeadDecision(BaseEpistemicModel):
     )
     brief: str = Field(
         default="",
-        description="REQUIRED non-empty natural-language instructions for `specialist_agent` whenever this turn delegates work. Because `brief` appears BEFORE `action` in the JSON schema, you MUST write the complete specialist brief here whenever you will set `action` to 'delegate'!",
+        description="REQUIRED non-empty natural-language instructions (<= 180 words) for `specialist_agent` whenever this turn delegates work. Name the target files, symbols, and behavioral/visual requirements concisely—NEVER write raw GDScript code blocks inside `brief` (since `swe_engineer` reads the staging files directly)! Because `brief` appears BEFORE `action` in the JSON schema, you MUST write the specialist brief here whenever you will set `action` to 'delegate'!",
     )
     target_paths: List[str] = Field(
         default_factory=list,
@@ -2962,7 +3358,7 @@ class LevelEntitySpec(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     A single concrete entity (landmark, mechanism, spawn point, hazard, goal, region) placed in the level.
     """
-    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this entity exists, why it sits at this position/size, and how it supports the authored experience.")
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Concise 1-sentence rationale (<= 18 words) for this entity's placement and role.")
     entity_id: str = Field(..., description="Unique snake_case identifier referenced by triggers and beats.")
     entity_kind: str = Field(..., description="Free-form role such as 'spawn', 'mechanism', 'landmark', 'region', 'goal', 'hazard', 'collectible'.")
     position: Tuple[float, float] = Field(..., description="World-space (x, y) centre in the game's coordinate system.")
@@ -2976,7 +3372,7 @@ class LevelTriggerSpec(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     A causal relation: when `condition` holds on `source_entity_id`, `target_entity_id` transitions to `resulting_state`.
     """
-    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this causal link exists in the authored experience.")
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Concise 1-sentence rationale (<= 18 words) for this causal link.")
     trigger_id: str = Field(..., description="Unique trigger identifier.")
     source_entity_id: str = Field(..., description="Entity whose interaction/state change fires the trigger.")
     condition: str = Field(..., description="Precise, testable condition (e.g. 'player overlaps region while speed >= threshold').")
@@ -2989,7 +3385,7 @@ class LevelRegionSpec(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     A named area of the world. The concept-art composition is ONE region (the opening), not the whole world.
     """
-    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this region exists, how large it must be, and its role in the Game Bible's progression.")
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Concise 1-sentence rationale (<= 20 words) for this region's bounds and progression role.")
     region_id: str = Field(..., description="Unique snake_case identifier.")
     bounds: Tuple[float, float, float, float] = Field(..., description="(x, y, width, height) world rectangle of this region.")
     progression_order: int = Field(default=0, description="0 = opening region; increasing values are reached later in the experience.")
@@ -3013,10 +3409,61 @@ class LevelLayoutSpec(BaseEpistemicModel):
     viewport_size: Tuple[float, float] = Field(default=(1280.0, 720.0), description="(width, height) of one camera viewport screen in world units.")
     intended_world_scale_in_viewports: float = Field(default=0.0, description="Total playable area expressed as a multiple of one viewport's area, justified by the Game Bible's level_generation_strategy and progression (a 16:9 concept mockup is a single camera frame inside the world, NOT the bounding box of the entire world unless a fixed single-screen stage is explicitly specified).")
     world_bounds: Tuple[float, float, float, float] = Field(..., description="(x, y, width, height) bounding rectangle of the ENTIRE playable world; must contain every region.")
-    world_regions: List[LevelRegionSpec] = Field(default_factory=list, description="Ordered regions covering the Game Bible's progression across its level archetypes.")
+    world_regions: List[LevelRegionSpec] = Field(default_factory=list, description="Ordered regions covering the Game Bible's progression across its level archetypes (when revising an existing layout, you may emit only added/modified regions—unchanged regions are preserved automatically by region_id).")
     camera_framing: str = Field(..., description="Camera behaviour (e.g. Camera2D following the player across world_bounds with HUD isolated on a CanvasLayer, or fixed stage camera when single-screen).")
-    entities: List[LevelEntitySpec] = Field(default_factory=list, description="Every entity required across ALL regions, with exact positions and sizes.")
-    triggers: List[LevelTriggerSpec] = Field(default_factory=list, description="Causal relations between entities.")
+    entities: List[LevelEntitySpec] = Field(default_factory=list, description="Entities with exact positions and sizes (when revising an existing layout, you may emit only added/modified entities—unchanged entities are preserved automatically by entity_id).")
+    triggers: List[LevelTriggerSpec] = Field(default_factory=list, description="Causal relations between entities (when revising an existing layout, you may emit only added/modified triggers—unchanged triggers are preserved automatically by trigger_id).")
+    remove_entity_ids: List[str] = Field(default_factory=list, description="Optional entity_ids to remove when revising an existing layout.")
+    remove_trigger_ids: List[str] = Field(default_factory=list, description="Optional trigger_ids to remove when revising an existing layout.")
+
+
+def merge_level_layout(base: "LevelLayoutSpec", patch: "LevelLayoutSpec") -> "LevelLayoutSpec":
+    """Incrementally merges `patch` onto `base` by `region_id`, `entity_id`, and `trigger_id` so revisions
+    do not need to re-emit unchanged regions, entities, or triggers."""
+    bx0, by0, bw0, bh0 = base.world_bounds
+    bx1, by1, bw1, bh1 = patch.world_bounds
+    if bw1 > 0 and bh1 > 0 and bw0 > 0 and bh0 > 0:
+        min_x = min(bx0, bx1)
+        min_y = min(by0, by1)
+        max_x = max(bx0 + bw0, bx1 + bw1)
+        max_y = max(by0 + bh0, by1 + bh1)
+        merged_bounds = (min_x, min_y, max_x - min_x, max_y - min_y)
+    elif bw1 > 0 and bh1 > 0:
+        merged_bounds = patch.world_bounds
+    else:
+        merged_bounds = base.world_bounds
+
+    regions_by_id: Dict[str, LevelRegionSpec] = {r.region_id: r for r in base.world_regions}
+    for r in patch.world_regions:
+        regions_by_id[r.region_id] = r
+    merged_regions = sorted(regions_by_id.values(), key=lambda r: r.progression_order)
+
+    remove_e = set(patch.remove_entity_ids or [])
+    entities_by_id: Dict[str, LevelEntitySpec] = {
+        e.entity_id: e for e in base.entities if e.entity_id not in remove_e
+    }
+    for e in patch.entities:
+        entities_by_id[e.entity_id] = e
+    merged_entities = list(entities_by_id.values())
+
+    remove_t = set(patch.remove_trigger_ids or [])
+    triggers_by_id: Dict[str, LevelTriggerSpec] = {
+        t.trigger_id: t for t in base.triggers if t.trigger_id not in remove_t and t.source_entity_id not in remove_e and t.target_entity_id not in remove_e
+    }
+    for t in patch.triggers:
+        triggers_by_id[t.trigger_id] = t
+    merged_triggers = list(triggers_by_id.values())
+
+    return LevelLayoutSpec(
+        deliberation=patch.deliberation or base.deliberation,
+        viewport_size=patch.viewport_size if (patch.viewport_size[0] > 0 and patch.viewport_size[1] > 0) else base.viewport_size,
+        intended_world_scale_in_viewports=max(base.intended_world_scale_in_viewports, patch.intended_world_scale_in_viewports),
+        world_bounds=merged_bounds,
+        world_regions=merged_regions,
+        camera_framing=patch.camera_framing or base.camera_framing,
+        entities=merged_entities,
+        triggers=merged_triggers,
+    )
 
 
 def validate_level_layout(
@@ -3094,7 +3541,7 @@ class EntityStateExpectation(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     One expected (entity, state) pair. A list of these replaces a free-form dict, which structured-output schemas handle poorly.
     """
-    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this entity must be in this state at this point.")
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Concise 1-sentence rationale (<= 15 words) for this expected state.")
     entity_id: str = Field(..., description="entity_id from the level layout.")
     expected_state: str = Field(..., description="State the entity must be in.")
 
@@ -3103,7 +3550,7 @@ class BeatStepSpec(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     One timed step of an authored beat: scripted input then an expected observable state.
     """
-    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this input produces this expected state.")
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Concise 1-sentence rationale (<= 18 words) for why this input produces this expected state.")
     step_id: str = Field(..., description="Unique step identifier.")
     scripted_input: str = Field(..., description="Exact input to apply (actions held, frames/duration), phrased so a headless test can execute it.")
     duration_frames: int = Field(default=30, description="Physics frames to simulate for this step.")
@@ -3772,9 +4219,11 @@ def inject_gemini_dataset_config(
     if cfg is None:
         if _genai_types is not None:
             http_opts = _genai_types.HttpOptions(extra_body={"store": True}) if should_store else None
+            default_thinking = bounded_thinking_config(1024) if not is_media_synthesis else None
             out_kwargs["config"] = _genai_types.GenerateContentConfig(
                 labels=auto_labels,
                 http_options=http_opts,
+                thinking_config=default_thinking,
             )
         else:
             new_cfg: Dict[str, Any] = {"labels": auto_labels}
@@ -3787,6 +4236,10 @@ def inject_gemini_dataset_config(
         cfg_copy = dict(cfg)
         existing_labels = dict(cfg_copy.get("labels") or {})
         cfg_copy["labels"] = {**auto_labels, **existing_labels}
+        if not is_media_synthesis and cfg_copy.get("thinking_config") is None:
+            default_thinking = bounded_thinking_config(1024)
+            if default_thinking is not None:
+                cfg_copy["thinking_config"] = default_thinking
         if should_store:
             existing_http = cfg_copy.get("http_options")
             if isinstance(existing_http, dict):
@@ -3804,6 +4257,10 @@ def inject_gemini_dataset_config(
         existing_labels = dict(getattr(cfg, "labels", None) or {})
         merged_labels = {**auto_labels, **existing_labels}
         updates: Dict[str, Any] = {"labels": merged_labels}
+        if not is_media_synthesis and getattr(cfg, "thinking_config", None) is None:
+            default_thinking = bounded_thinking_config(1024)
+            if default_thinking is not None:
+                updates["thinking_config"] = default_thinking
         if should_store and _genai_types is not None:
             existing_http = getattr(cfg, "http_options", None)
             if existing_http is None:

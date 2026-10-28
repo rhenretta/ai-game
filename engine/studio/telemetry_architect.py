@@ -21,6 +21,7 @@ from engine.studio.models import (
     StudioAgentError,
     TelemetryArchitecturePlan,
     TelemetryProbeDesignSpec,
+    bounded_thinking_config,
 )
 from engine.telemetry.db import TelemetryDB
 from engine.telemetry.probes import AgentTelemetryProbe
@@ -82,6 +83,7 @@ class TelemetryArchitectAgent:
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=TelemetryArchitecturePlan,
+                    thinking_config=bounded_thinking_config(512),
                 ),
             )
             if not response.text:

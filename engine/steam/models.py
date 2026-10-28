@@ -285,6 +285,7 @@ class SteamGameRecord(BaseModel):
     genres: List[str] = Field(default_factory=list)
     tags: List[str] = Field(default_factory=list)
     categories: List[str] = Field(default_factory=list)
+    short_description: str = ""
     achievements_total: int = 0
     achievements_unlocked: int = 0
     metacritic_score: Optional[int] = None
@@ -305,10 +306,94 @@ class SteamGameRecord(BaseModel):
             "genres": self.genres,
             "tags": self.tags,
             "categories": self.categories,
+            "short_description": self.short_description,
             "achievements_total": self.achievements_total,
             "achievements_unlocked": self.achievements_unlocked,
             "metacritic_score": self.metacritic_score,
         }
+
+
+class DNAWeightedItem(BaseModel):
+    """Rationale-first weighted trait item returned by LLM DNA synthesis."""
+    deliberation: str = Field(
+        default="",
+        description="Brief evidence-based reason why this genre, category, mechanic, theme, or palette mood applies to the player.",
+    )
+    label: str = Field(description="Name of the genre, category, mechanical verb, thematic motif, or palette mood.")
+    weight: float = Field(description="Relative affinity weight or score in [0.0, 1.0].")
+
+
+class SteamDNALLMSynthesis(BaseModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation MUST be declared first!
+
+    Structured LLM epistemic synthesis formed directly from inspecting raw Steam library data
+    (games, logged playtime hours, recent activity, genres, categories, tags, achievements, and store descriptions)
+    without formulaic constraints.
+    """
+    deliberation: str = Field(
+        description=(
+            "Comprehensive rationale-first epistemic analysis of the player's Steam library: "
+            "what kinds of systems, mechanics, worlds, and skill ceilings hold their attention for hundreds of hours, "
+            "how they balance deep systemic/engineering/logistical mastery vs. physical/kinetic execution, "
+            "and what a game designed specifically for this player must deliver."
+        )
+    )
+    top_genres: List[str] = Field(
+        default_factory=list,
+        description="Ordered list of the player's top 3 to 5 core genres inferred from their actual playtime and game descriptions.",
+    )
+    genre_breakdown: List[DNAWeightedItem] = Field(
+        default_factory=list,
+        description="Relative genre affinity distribution inferred from the library.",
+    )
+    top_categories: List[str] = Field(
+        default_factory=list,
+        description="Ordered list of the player's top 3 Steam play-mode / feature categories.",
+    )
+    category_breakdown: List[DNAWeightedItem] = Field(
+        default_factory=list,
+        description="Relative category affinity distribution inferred from the library.",
+    )
+    pacing_preference: str = Field(
+        default="balanced",
+        description="Holistic pacing classification: 'tactical_methodical', 'balanced', or 'kinetic_high_mobility'.",
+    )
+    pacing_score: float = Field(
+        default=0.0,
+        description="Holistic cognitive-kinetic continuum score in [-1.0, +1.0], where -1.0 is deep methodical/systemic planning and +1.0 is pure high-speed reflex action.",
+    )
+    challenge_tolerance: float = Field(
+        default=0.5,
+        description=(
+            "Holistic appetite for complexity, depth, and skill ceiling in [0.0, 1.0]. "
+            "Must account for BOTH deep systemic/engineering/logistical complexity (e.g., multi-stage factory automation, "
+            "thermodynamics, orbital/flight simulation) AND mechanical/reflex mastery—never rate a deep systems or high-skill physics player as low challenge merely because they don't play soulslikes."
+        ),
+    )
+    thematic_biases: List[str] = Field(
+        default_factory=list,
+        description="Top 3 to 5 authentic thematic motifs, settings, and world flavors inferred from the games and their descriptions.",
+    )
+    thematic_breakdown: List[DNAWeightedItem] = Field(
+        default_factory=list,
+        description="Relative affinity weights across the thematic motifs present in the player's library.",
+    )
+    mechanical_breakdown: List[DNAWeightedItem] = Field(
+        default_factory=list,
+        description=(
+            "Affinities in [0.0, 1.0] for the specific gameplay verbs and mechanical systems this player genuinely loves "
+            "(e.g., 'multi_stage_automation_and_logistics', 'sandbox_engineering_and_construction', 'precision_vehicular_and_flight_physics', "
+            "'cooperative_spatial_puzzle_solving', 'resource_network_optimization', 'dodge_roll', 'close_combat', 'ranged_aim', 'speedrun')."
+        ),
+    )
+    preferred_palette_mood: str = Field(
+        default="retro_arcade",
+        description="Primary visual/atmospheric palette direction suited to the player's tastes.",
+    )
+    palette_breakdown: List[DNAWeightedItem] = Field(
+        default_factory=list,
+        description="Relative weights across visual/atmospheric palette moods.",
+    )
 
 
 class SteamLibraryDataset(BaseModel):
@@ -398,6 +483,10 @@ class SteamPlayerDNA(BaseModel):
         default_factory=list,
         description="Ordered list of top played/installed games with name, appid, playtime_hours, and genres"
     )
+    activity_windows: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Gameplay activity breakdown across last_30_days, last_90_days, last_1_year, and lifetime horizons"
+    )
     created_at_utc: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -423,5 +512,6 @@ class SteamPlayerDNA(BaseModel):
             "top_genres": self.top_genres,
             "top_categories": self.top_categories,
             "top_games": self.top_games,
+            "activity_windows": self.activity_windows,
             "created_at_utc": self.created_at_utc,
         }

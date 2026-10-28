@@ -39,6 +39,7 @@ from engine.studio.models import (
     PartKeyframeTrackSpec,
     StudioAgentError,
     VisualMockupArtifact,
+    bounded_thinking_config,
 )
 
 logger = logging.getLogger("VisualArtSpriteDesignerAgent")
@@ -1166,6 +1167,8 @@ class VisualArtSpriteDesignerAgent:
                 f"Flat 90-degree orthographic top-down seamless game material texture swatch (macro close-up of surface material only): {prompt}. "
                 f"Color palette & art style: {style_guide or 'vibrant hand-painted fantasy'}. "
                 f"100% full-bleed edge-to-edge organic asymmetric repeatable material surface filling every pixel of the square frame. "
+                f"CRITICAL: NEVER draw a gray-and-white or gray-and-black transparency checkerboard pattern! "
+                f"If the material is a see-through lattice, truss, girder, or grate with open gaps, fill the open gaps with a solid flat uniform bright magenta (#FF00FF) chroma-key color (NEVER a checkerboard grid). "
                 f"Strictly NO horizon, NO sky, NO isometric 3D block, NO bilateral mirror symmetry, NO white corners, NO empty margins, NO border frame, NO text."
             )
         elif is_actor and isolate_single_subject:
@@ -1237,6 +1240,20 @@ class VisualArtSpriteDesignerAgent:
 
         raw_img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
         if is_tile:
+            # Check if the tile has interior magenta chroma-key openings (e.g., see-through truss/lattice/grate)
+            arr_raw = np.array(raw_img, dtype=np.uint8)
+            h_r, w_r = arr_raw.shape[:2]
+            inner = arr_raw[h_r // 6 : h_r - h_r // 6, w_r // 6 : w_r - w_r // 6]
+            if inner.size > 0:
+                mag_mask = (inner[:, :, 0] > 185) & (inner[:, :, 2] > 185) & (inner[:, :, 1] < 90)
+                if float(np.mean(mag_mask)) >= 0.03:
+                    return self.extract_clean_alpha_sprite(
+                        raw_img,
+                        target_size=(w, h),
+                        strip_border_frame=True,
+                        pad_ratio=0.0,
+                        isolate_single_subject=False,
+                    )
             # Only apply full-bleed toroidal tiling when the target is an approximately square surface swatch;
             # non-square strips (e.g. 96x32 modular segments or thin fluid ribbons) would be smeared by toroidal self-blending.
             if max(w, h) / max(1, min(w, h)) >= 1.75:
@@ -2893,6 +2910,7 @@ class VisualArtSpriteDesignerAgent:
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_schema=AssetVisualValidationVerdict,
+                        thinking_config=bounded_thinking_config(512),
                     ),
                 )
             except Exception as exc:
@@ -2987,6 +3005,7 @@ class VisualArtSpriteDesignerAgent:
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_schema=AnimationValidationVerdict,
+                        thinking_config=bounded_thinking_config(512),
                     ),
                 )
             except Exception as exc:

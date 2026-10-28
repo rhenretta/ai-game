@@ -316,6 +316,7 @@ class SteamDNAResponse(BaseModel):
     category_weights: Dict[str, float] = Field(default_factory=dict, description="Relative Steam category weight distribution")
     playtime_distribution: Dict[str, float] = Field(default_factory=dict, description="5-tier engagement and mastery playtime distribution")
     top_games: List[Dict[str, Any]] = Field(default_factory=list, description="Top games with playtime, appid, genres, tags, and engagement weights")
+    activity_windows: Dict[str, Any] = Field(default_factory=dict, description="Gameplay activity breakdown across last_30_days, last_90_days, last_1_year, and lifetime horizons")
     pacing_preference: str = Field(default="balanced", description="Inferred gameplay pacing preference")
     pacing_score: float = Field(default=0.0, description="Pacing continuum score (-1.0 tactical to +1.0 kinetic)")
     challenge_tolerance: float = Field(default=0.5, description="Inferred challenge tolerance score (0.0 to 1.0)")
@@ -325,7 +326,8 @@ class SteamDNAResponse(BaseModel):
     preferred_palette_mood: str = Field(default="vibrant_fantasy", description="Inferred Style Bible 16-color palette mood")
     palette_weights: Dict[str, float] = Field(default_factory=dict, description="Relative affinity weights across Style Bible palette moods")
     created_at_utc: str = Field(default="", description="ISO 8601 UTC timestamp when DNA profile was synthesized")
-    ingestion_provenance: Dict[str, Any] = Field(default_factory=dict, description="Provenance of local Steam VDF scan, Store API cache enrichment, and mathematical formulas")
+    ingestion_provenance: Dict[str, Any] = Field(default_factory=dict, description="Provenance of local Steam VDF scan, Store API cache enrichment, and LLM epistemic synthesis")
+    live_writers_room_dna_directive: str = Field(default="", description="Live formatted Target Player DNA directive synthesized from the current SteamPlayerDNA profile")
 
 
 TelemetryDashboardResponse.model_rebuild()

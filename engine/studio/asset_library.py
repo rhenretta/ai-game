@@ -35,6 +35,7 @@ from engine.studio.models import (
     GameBibleSpec,
     GameRequirementsSpec,
     StudioAgentError,
+    bounded_thinking_config,
 )
 
 logger = logging.getLogger("CartridgeAssetLibrary")
@@ -624,6 +625,7 @@ static func create_tiled_surface(
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=DecomposedConceptManifestSpec,
+                    thinking_config=bounded_thinking_config(1024),
                 ),
             )
             if resp.text:

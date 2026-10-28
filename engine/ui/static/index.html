@@ -1930,6 +1930,11 @@
       border-color: var(--cyan);
       box-shadow: 0 0 14px rgba(41, 173, 255, 0.14);
     }
+    .board-item-card.state-waiting_for_lock,
+    .board-item-card.status-waiting_for_lock {
+      border-color: var(--amber);
+      box-shadow: 0 0 12px rgba(255, 163, 0, 0.14);
+    }
     .board-item-card.state-awaiting_review,
     .board-item-card.status-awaiting_review {
       border-color: var(--yellow);
@@ -2591,8 +2596,13 @@
       <div class="panel">
         <div class="panel-title">
           <span>Steam Player DNA &amp; Game Blueprint</span>
-          <div style="display: flex; align-items: center; gap: 8px;">
-            <span id="game-blueprint-status" style="font-size: 11px; color: var(--light-gray);">Library Profile</span>
+          <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
+            <div id="dna-horizon-tabs" style="display: inline-flex; gap: 3px; background: #040918; padding: 2px; border: 1px solid var(--navy); border-radius: 4px;">
+              <button type="button" data-dna-horizon="last_30_days" onclick="selectSteamDnaHorizon('last_30_days')" style="font-size: 9px; padding: 1px 6px; border: none; border-radius: 3px; cursor: pointer; background: transparent; color: var(--light-gray);">30d</button>
+              <button type="button" data-dna-horizon="last_90_days" onclick="selectSteamDnaHorizon('last_90_days')" style="font-size: 9px; padding: 1px 6px; border: none; border-radius: 3px; cursor: pointer; background: transparent; color: var(--light-gray);">90d</button>
+              <button type="button" data-dna-horizon="last_1_year" onclick="selectSteamDnaHorizon('last_1_year')" style="font-size: 9px; padding: 1px 6px; border: none; border-radius: 3px; cursor: pointer; background: transparent; color: var(--light-gray);">1yr</button>
+              <button type="button" data-dna-horizon="lifetime" onclick="selectSteamDnaHorizon('lifetime')" style="font-size: 9px; padding: 1px 6px; border: none; border-radius: 3px; cursor: pointer; background: var(--cyan); color: #02050E; font-weight: 700;">Lifetime</button>
+            </div>
             <button type="button" class="btn-secondary" style="font-size: 9.5px; padding: 2px 7px; border-color: var(--cyan); color: var(--cyan);" onclick="switchMainWorkspace('bible'); switchBibleSubtab('dna');">
               🧬 Full DNA &amp; Provenance
             </button>
@@ -2601,11 +2611,11 @@
         <div class="dna-grid">
           <div class="dna-metric-box">
             <span class="dna-metric-val" id="dna-playtime">0.0h</span>
-            <span class="dna-metric-lbl">Total Playtime</span>
+            <span class="dna-metric-lbl" id="dna-playtime-lbl">Total Playtime</span>
           </div>
           <div class="dna-metric-box">
             <span class="dna-metric-val" id="dna-games-count">0</span>
-            <span class="dna-metric-lbl">Games Analyzed</span>
+            <span class="dna-metric-lbl" id="dna-games-lbl">Games Analyzed</span>
           </div>
           <div class="dna-metric-box">
             <span class="dna-metric-val" id="dna-pacing">balanced</span>
@@ -2615,6 +2625,9 @@
             <span class="dna-metric-val" id="dna-challenge">0.50</span>
             <span class="dna-metric-lbl">Challenge Tolerance</span>
           </div>
+        </div>
+        <div id="dna-horizons-summary-strip" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 8px;">
+          <!-- Populated dynamically with 30d / 90d / 1yr / Lifetime summary cards -->
         </div>
         <div class="dna-genres-bar" id="dna-genres-list">
           <!-- Populated dynamically via /api/steam/dna -->
@@ -3405,6 +3418,17 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           delete _liveRunningAgents['writers_room'];
         }
         if (typeof syncCouncilDeckStatus === 'function') syncCouncilDeckStatus();
+      } else if (evTypeLower === 'backlog_item_shaped') {
+        _lastBuildStoppedByErrorOrPromote = false;
+        const itemId = p.item_id || '';
+        const byRole = p.by_role || agent || 'Council';
+        _lastActivityHeadline = `🏛️ ${byRole} contributed domain direction to task "${itemId}"...`;
+      } else if (evTypeLower === 'backlog_item_split') {
+        _lastBuildStoppedByErrorOrPromote = false;
+        const itemId = p.item_id || '';
+        const byRole = p.by_role || agent || 'Council';
+        const splitInto = Array.isArray(p.split_into) ? p.split_into.join(', ') : '';
+        _lastActivityHeadline = `✂️ ${byRole} split task "${itemId}" into [${splitInto}]...`;
       } else if (evTypeLower === 'backlog_item_started') {
         _lastBuildStoppedByErrorOrPromote = false;
         _lastRetryNotice = '';
@@ -4488,6 +4512,120 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       `;
     }
 
+    let _selectedSteamDnaHorizon = 'lifetime';
+    window.selectSteamDnaHorizon = function(windowKey) {
+      _selectedSteamDnaHorizon = windowKey || 'lifetime';
+      renderSteamDnaDashboardCard(latestSteamDnaData);
+      renderSteamDnaSubview(latestSteamDnaData, cachedGameBible);
+    };
+
+    function renderSteamDnaDashboardCard(dnaData) {
+      const data = dnaData || latestSteamDnaData;
+      if (!data) return;
+      const pt = document.getElementById('dna-playtime');
+      const ptLbl = document.getElementById('dna-playtime-lbl');
+      const gc = document.getElementById('dna-games-count');
+      const gcLbl = document.getElementById('dna-games-lbl');
+      const pp = document.getElementById('dna-pacing');
+      const ct = document.getElementById('dna-challenge');
+      const gl = document.getElementById('dna-genres-list');
+      const tg = document.getElementById('dna-top-games');
+      const stripEl = document.getElementById('dna-horizons-summary-strip');
+
+      const activityWindows = (data.activity_windows && typeof data.activity_windows === 'object') ? data.activity_windows : {};
+      const horizonDefs = [
+        { key: 'last_30_days', shortLabel: '30d', label: 'Last 30d', icon: '⚡', color: 'var(--green)' },
+        { key: 'last_90_days', shortLabel: '90d', label: 'Last 90d', icon: '🔥', color: 'var(--cyan)' },
+        { key: 'last_1_year', shortLabel: '1yr', label: 'Last 1yr', icon: '📅', color: 'var(--amber)' },
+        { key: 'lifetime', shortLabel: 'Lifetime', label: 'Lifetime', icon: '🏆', color: 'var(--yellow)' },
+      ];
+      const activeDef = horizonDefs.find(h => h.key === _selectedSteamDnaHorizon) || horizonDefs[3];
+      const activeWin = activityWindows[activeDef.key] || null;
+      const isLifetime = activeDef.key === 'lifetime' || !activeWin;
+
+      // Update top-right pill buttons
+      document.querySelectorAll('#dna-horizon-tabs button[data-dna-horizon]').forEach(btn => {
+        const k = btn.getAttribute('data-dna-horizon');
+        const active = k === activeDef.key;
+        btn.style.background = active ? 'var(--cyan)' : 'transparent';
+        btn.style.color = active ? '#02050E' : 'var(--light-gray)';
+        btn.style.fontWeight = active ? '700' : '400';
+      });
+
+      const shownHours = isLifetime ? Number(data.total_playtime_hours || 0) : Number(activeWin.total_playtime_hours || 0);
+      const shownCount = isLifetime ? Number(data.total_games_analyzed || 0) : Number(activeWin.games_count || 0);
+      if (pt) pt.textContent = `${shownHours.toFixed(1)}h`;
+      if (ptLbl) ptLbl.textContent = isLifetime ? 'Lifetime Playtime' : `${activeDef.label} Playtime`;
+      if (gc) gc.textContent = String(shownCount);
+      if (gcLbl) gcLbl.textContent = isLifetime ? 'Lifetime Games' : `${activeDef.label} Games`;
+      if (pp) {
+        const sign = (data.pacing_score || 0) >= 0 ? '+' : '';
+        pp.textContent = `${data.pacing_preference || 'balanced'} (${sign}${(data.pacing_score || 0).toFixed(2)})`;
+      }
+      if (ct) ct.textContent = (data.challenge_tolerance || 0.5).toFixed(2);
+
+      if (stripEl) {
+        stripEl.innerHTML = horizonDefs.map(h => {
+          const w = activityWindows[h.key] || {};
+          const selected = h.key === activeDef.key;
+          const cnt = typeof w.games_count === 'number' ? w.games_count : (h.key === 'lifetime' ? Number(data.total_games_analyzed || 0) : 0);
+          const hrs = typeof w.total_playtime_hours === 'number' ? w.total_playtime_hours : (h.key === 'lifetime' ? Number(data.total_playtime_hours || 0) : 0);
+          const hrs2w = Number(w.recent_2weeks_hours || 0);
+          return `
+            <button type="button" onclick="selectSteamDnaHorizon('${h.key}')" style="text-align: left; cursor: pointer; background: ${selected ? 'rgba(41, 173, 255, 0.14)' : '#040918'}; border: 1px solid ${selected ? h.color : 'var(--navy)'}; border-left: 3px solid ${h.color}; border-radius: 4px; padding: 5px 7px; color: var(--white);">
+              <div style="display: flex; justify-content: space-between; align-items: center; font-size: 9.5px;">
+                <strong style="color: ${h.color};">${h.icon} ${escapeHtml(h.shortLabel)}</strong>
+                <span style="font-family: monospace; color: var(--white); font-weight: 700;">${cnt}g</span>
+              </div>
+              <div style="font-family: monospace; font-size: 9px; color: var(--slate); margin-top: 2px;">
+                <span style="color: var(--amber);">${hrs.toFixed(0)}h</span>${hrs2w > 0 && h.key === 'last_30_days' ? ` · <span style="color: var(--green);">${hrs2w.toFixed(1)}h/2w</span>` : ''}
+              </div>
+            </button>
+          `;
+        }).join('');
+      }
+
+      if (gl) {
+        gl.innerHTML = '';
+        const genresToShow = (!isLifetime && Array.isArray(activeWin.top_genres) && activeWin.top_genres.length > 0)
+          ? activeWin.top_genres
+          : (data.top_genres || []);
+        const weightsMap = (!isLifetime && activeWin.genre_weights) ? activeWin.genre_weights : (data.genre_weights || {});
+        genresToShow.forEach(g => {
+          const chip = document.createElement('span');
+          chip.className = 'genre-chip';
+          const weight = weightsMap && weightsMap[g] ? ` (${Math.round(weightsMap[g] * 100)}%)` : '';
+          chip.textContent = `${g}${weight}`;
+          gl.appendChild(chip);
+        });
+      }
+
+      if (tg) {
+        const gamesList = (!isLifetime && Array.isArray(activeWin.games))
+          ? activeWin.games
+          : (Array.isArray(data.top_games) ? data.top_games : []);
+        const labelPrefix = isLifetime ? 'Top Played (Lifetime):' : `Active (${activeDef.label}):`;
+        tg.innerHTML = `<span style="color:var(--amber); font-weight:700; margin-right:4px;">${escapeHtml(labelPrefix)}</span>`;
+        if (gamesList.length === 0) {
+          const emptySpan = document.createElement('span');
+          emptySpan.style.color = 'var(--slate)';
+          emptySpan.textContent = `No games launched in ${activeDef.label}`;
+          tg.appendChild(emptySpan);
+        } else {
+          gamesList.slice(0, 8).forEach(game => {
+            const span = document.createElement('span');
+            span.style.cssText = 'background:rgba(41,173,255,0.08); border:1px solid var(--navy); padding:1px 6px; border-radius:3px; color:var(--white);';
+            const hrs = typeof game.playtime_hours === 'number' ? ` (${game.playtime_hours.toFixed(1)}h)` : '';
+            const r2w = typeof game.playtime_2weeks_hours === 'number' && game.playtime_2weeks_hours > 0
+              ? ` [${game.playtime_2weeks_hours.toFixed(1)}h/2w]`
+              : '';
+            span.textContent = `${game.name || game.appid}${hrs}${r2w}`;
+            tg.appendChild(span);
+          });
+        }
+      }
+    }
+
     function renderSteamDnaSubview(dnaData, bibleData) {
       const container = document.getElementById('bible-dna-container');
       const countEl = document.getElementById('bible-count-dna');
@@ -4508,9 +4646,22 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const challengeVal = Number(d.challenge_tolerance ?? 0.5);
       const challengePct = Math.max(0, Math.min(100, challengeVal * 100));
       const topGames = Array.isArray(d.top_games) ? d.top_games : [];
+      const activityWindows = (d.activity_windows && typeof d.activity_windows === 'object') ? d.activity_windows : {};
+      const horizonDefs = [
+        { key: 'last_30_days', label: 'Last 30 Days', icon: '⚡', color: 'var(--green)' },
+        { key: 'last_90_days', label: 'Last 90 Days', icon: '🔥', color: 'var(--cyan)' },
+        { key: 'last_1_year', label: 'Last 1 Year', icon: '📅', color: 'var(--amber)' },
+        { key: 'lifetime', label: 'Lifetime', icon: '🏆', color: 'var(--yellow)' },
+      ];
+      const activeHorizonDef = horizonDefs.find(h => h.key === _selectedSteamDnaHorizon) || horizonDefs[3];
+      const activeWindowObj = activityWindows[activeHorizonDef.key] || null;
+      const displayedGames = (activeWindowObj && Array.isArray(activeWindowObj.games))
+        ? activeWindowObj.games
+        : topGames;
       const prov = d.ingestion_provenance || {};
-      const formulas = prov.formulas || {};
-      const dnaPromptSummary = String(b.target_player_dna_summary || '').trim();
+      const methodology = prov.methodology || {};
+      const dnaPromptSummary = String(d.live_writers_room_dna_directive || b.target_player_dna_summary || '').trim();
+      const buildSnapshotDnaSummary = String(b.target_player_dna_summary || '').trim();
       const conceptFragments = Array.isArray(b.concept_fragments) ? b.concept_fragments : [];
       const conceptCandidates = Array.isArray(b.concept_candidates) ? b.concept_candidates : [];
 
@@ -4534,14 +4685,19 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         <div class="blueprint-box" style="margin-top: 0; border-left: 3px solid var(--cyan); background: linear-gradient(135deg, rgba(41, 173, 255, 0.08), rgba(4, 9, 24, 0.95));">
           <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px;">
             <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-              <strong style="color: var(--cyan); font-size: 13px;">🧬 Steam Player DNA Profile &amp; Epistemic Synthesis</strong>
+              <strong style="color: var(--cyan); font-size: 13px;">🧬 Steam Player DNA Profile &amp; LLM Epistemic Synthesis</strong>
               <span class="genre-chip" style="font-size: 10px;">SteamID: ${escapeHtml(d.player_id || 'local_player')}</span>
               <span class="genre-chip" style="font-size: 10px; border-color: var(--amber); color: var(--amber);">Profile Tag: ${escapeHtml(d.profile_tag || 'default')}</span>
             </div>
-            ${d.created_at_utc ? `<span style="font-size: 10px; color: var(--slate); font-family: monospace;">Synthesized: ${escapeHtml(d.created_at_utc)}</span>` : ''}
+            <div style="display: flex; align-items: center; gap: 8px;">
+              ${d.created_at_utc ? `<span style="font-size: 10px; color: var(--slate); font-family: monospace;">Synthesized: ${escapeHtml(d.created_at_utc)}</span>` : ''}
+              <button type="button" id="btn-rescan-dna" class="btn-secondary" style="font-size: 10px; padding: 3px 9px; border-color: var(--cyan); color: var(--cyan);" onclick="rescanSteamDNA()">
+                🔄 Re-Synthesize via LLM
+              </button>
+            </div>
           </div>
           <div style="font-size: 11.5px; color: var(--white); line-height: 1.5; background: rgba(2, 5, 14, 0.7); border: 1px solid var(--navy); border-radius: 5px; padding: 8px 10px; margin-bottom: 10px;">
-            <strong style="color: var(--amber);">🧠 SteamDNAProfiler Deliberation:</strong> ${escapeHtml(d.deliberation || '')}
+            <strong style="color: var(--amber);">🧠 LLM Epistemic Deliberation:</strong> ${escapeHtml(d.deliberation || '')}
           </div>
 
           <!-- 4-Stage Creation Pipeline Cards -->
@@ -4553,21 +4709,21 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
               </div>
             </div>
             <div style="background: #040918; border: 1px solid var(--navy); border-radius: 5px; padding: 8px 10px; font-size: 10.5px;">
-              <div style="color: var(--yellow); font-weight: bold; margin-bottom: 3px;">2. Store API Metadata Cache</div>
+              <div style="color: var(--yellow); font-weight: bold; margin-bottom: 3px;">2. Store API Metadata &amp; Descriptions</div>
               <div style="color: var(--light-gray); line-height: 1.4;">
-                Enriches top-played &amp; installed AppIDs via <code>SteamStoreApiClient</code> (<code>${escapeHtml(prov.store_cache_path || 'data/steam_app_cache.json')}</code>, ${Number(prov.store_cached_apps_count || 0)} cached apps) with genres &amp; tags.
+                Enriches top-played &amp; installed AppIDs via <code>SteamStoreApiClient</code> (<code>${escapeHtml(prov.store_cache_path || 'data/steam_app_cache.json')}</code>, ${Number(prov.store_cached_apps_count || 0)} cached apps) with store genres, categories &amp; descriptions.
               </div>
             </div>
             <div style="background: #040918; border: 1px solid var(--navy); border-radius: 5px; padding: 8px 10px; font-size: 10.5px;">
-              <div style="color: var(--green); font-weight: bold; margin-bottom: 3px;">3. Logarithmic Vector Profiling</div>
+              <div style="color: var(--green); font-weight: bold; margin-bottom: 3px;">3. Gemini LLM Epistemic Synthesis</div>
               <div style="color: var(--light-gray); line-height: 1.4;">
-                Computes <code>w_g = ln(1 + h_g)</code> engagement weights, L1-normalized genre/category vectors, <code>[-1, +1]</code> pacing index, and Style Bible palette mood.
+                Inspects raw playtimes, mastery depth &amp; store descriptions directly to conclude open-ended genres, mechanical verbs, systemic/kinetic complexity appetite &amp; themes without formulas.
               </div>
             </div>
             <div style="background: #040918; border: 1px solid var(--navy); border-radius: 5px; padding: 8px 10px; font-size: 10.5px;">
               <div style="color: var(--pink); font-weight: bold; margin-bottom: 3px;">4. Writers' Room DNA Injection</div>
               <div style="color: var(--light-gray); line-height: 1.4;">
-                Extracts Top-8 Core Anchor Games + 4 Spotlight Cross-Pollination titles to drive ${conceptFragments.length} specialist fragments &amp; ${conceptCandidates.length} concept candidates.
+                Injects LLM synthesis + Top-8 Core Anchor Games + 4 Spotlight Cross-Pollination titles to drive ${conceptFragments.length} specialist fragments &amp; ${conceptCandidates.length} concept candidates.
               </div>
             </div>
           </div>
@@ -4603,14 +4759,14 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
 
           <div class="blueprint-box" style="margin-top: 0;">
             <div style="display: flex; justify-content: space-between; align-items: center;">
-              <span style="font-size: 10px; color: var(--slate); text-transform: uppercase;">Challenge Tolerance Score</span>
+              <span style="font-size: 10px; color: var(--slate); text-transform: uppercase;">Challenge &amp; Complexity Appetite</span>
               <span style="font-family: monospace; font-size: 11px; color: var(--amber); font-weight: bold;">${challengeVal.toFixed(2)} / 1.00</span>
             </div>
             <div style="height: 10px; background: rgba(29, 43, 83, 0.6); border-radius: 5px; overflow: hidden; margin: 8px 0 4px 0;">
               <div style="width: ${challengePct}%; height: 100%; background: linear-gradient(90deg, var(--green), var(--amber), var(--neon-red));"></div>
             </div>
             <div style="font-size: 9.5px; color: var(--light-gray);">
-              <code>${escapeHtml(formulas.challenge_tolerance || '0.35*hardcore_genre + 0.35*difficulty_tags + 0.20*achievements + 0.10*depth')}</code>
+              ${escapeHtml(methodology.challenge_evaluation || 'LLM holistic assessment across systemic/engineering complexity & mechanical skill ceiling')}
             </div>
           </div>
 
@@ -4652,59 +4808,98 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         <!-- 4. Multi-Dimensional Affinity Vectors -->
         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 12px;">
           <div class="blueprint-box" style="margin-top: 0;">
-            <h4 style="color: var(--cyan); font-size: 11.5px; text-transform: uppercase; margin: 0 0 8px 0;">🎮 Canonical Studio Genre Weights (L1 Normalized)</h4>
+            <h4 style="color: var(--cyan); font-size: 11.5px; text-transform: uppercase; margin: 0 0 8px 0;">🎮 LLM-Inferred Genre Affinities</h4>
             ${renderVectorBarList(d.genre_weights || {}, 'var(--cyan)', d.top_genres || [])}
           </div>
           <div class="blueprint-box" style="margin-top: 0;">
-            <h4 style="color: var(--amber); font-size: 11.5px; text-transform: uppercase; margin: 0 0 8px 0;">🏷️ Steam Category Affinities (L1 Normalized)</h4>
+            <h4 style="color: var(--amber); font-size: 11.5px; text-transform: uppercase; margin: 0 0 8px 0;">🏷️ Play Mode &amp; Category Affinities</h4>
             ${renderVectorBarList(d.category_weights || {}, 'var(--amber)', d.top_categories || [])}
           </div>
           <div class="blueprint-box" style="margin-top: 0;">
-            <h4 style="color: var(--green); font-size: 11.5px; text-transform: uppercase; margin: 0 0 8px 0;">⚙️ Mechanical Biases &amp; Thematic Lexicon</h4>
+            <h4 style="color: var(--green); font-size: 11.5px; text-transform: uppercase; margin: 0 0 8px 0;">⚙️ Core Mechanical Verbs &amp; Thematic Motifs</h4>
             <div style="margin-bottom: 10px;">
-              <div style="font-size: 10px; color: var(--slate); text-transform: uppercase; margin-bottom: 4px;">Mechanical Action Biases</div>
+              <div style="font-size: 10px; color: var(--slate); text-transform: uppercase; margin-bottom: 4px;">Core Mechanical Verbs &amp; Systems</div>
               ${renderVectorBarList(d.mechanical_biases || {}, 'var(--green)', [])}
             </div>
             <div>
-              <div style="font-size: 10px; color: var(--slate); text-transform: uppercase; margin-bottom: 4px;">Thematic Biases (Top: ${escapeHtml((d.thematic_biases || []).join(', '))})</div>
+              <div style="font-size: 10px; color: var(--slate); text-transform: uppercase; margin-bottom: 4px;">Thematic Motifs (Top: ${escapeHtml((d.thematic_biases || []).join(', '))})</div>
               ${renderVectorBarList(d.thematic_weights || {}, 'var(--purple)', d.thematic_biases || [])}
             </div>
           </div>
         </div>
 
-        <!-- 5. Scanned Top Games & Logarithmic Engagement Weight Table -->
+        <!-- 5. Gameplay Activity Horizons (30d / 90d / 1yr / Lifetime) & Library Titles Table -->
         <div class="blueprint-box" style="margin-top: 0;">
-          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 8px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 10px;">
             <h4 style="color: var(--yellow); font-size: 11.5px; text-transform: uppercase; margin: 0;">
-              🕹️ Top Analyzed Steam Library Titles &amp; Logarithmic Engagement Weights (${topGames.length} Enriched Anchor Titles)
+              🕹️ Gameplay Horizons &amp; Analyzed Steam Library Titles (${activeHorizonDef.label}: ${displayedGames.length} Shown)
             </h4>
-            <code style="font-size: 10px; color: var(--cyan); background: #040918; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--navy);">
-              ${escapeHtml(formulas.engagement_weight || 'w_g = ln(1 + playtime_hours)')}
-            </code>
+            <span style="font-size: 10px; color: var(--cyan); background: #040918; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--navy);">
+              Click Any Horizon Card Below to Filter Library Titles (30d · 90d · 1yr · Lifetime)
+            </span>
           </div>
+
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 8px; margin-bottom: 12px;">
+            ${horizonDefs.map(h => {
+              const w = activityWindows[h.key] || {};
+              const isSelected = h.key === activeHorizonDef.key;
+              const gCount = typeof w.games_count === 'number' ? w.games_count : (h.key === 'lifetime' ? totalGames : 0);
+              const wHrs = typeof w.total_playtime_hours === 'number' ? w.total_playtime_hours : (h.key === 'lifetime' ? totalHours : 0);
+              const w2wk = Number(w.recent_2weeks_hours || 0);
+              const wGenres = Array.isArray(w.top_genres) ? w.top_genres.slice(0, 3) : [];
+              return `
+                <button type="button" onclick="selectSteamDnaHorizon('${h.key}')" style="text-align: left; cursor: pointer; background: ${isSelected ? 'rgba(41, 173, 255, 0.14)' : '#040918'}; border: 1px solid ${isSelected ? h.color : 'var(--navy)'}; border-left: 3px solid ${h.color}; border-radius: 5px; padding: 8px 10px; color: var(--white);">
+                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                    <strong style="color: ${h.color}; font-size: 11px;">${h.icon} ${escapeHtml(h.label)}</strong>
+                    <span style="font-family: monospace; font-size: 10.5px; color: var(--white); font-weight: bold;">${gCount} games</span>
+                  </div>
+                  <div style="font-family: monospace; font-size: 10.5px; color: var(--light-gray);">
+                    <strong style="color: var(--amber);">${wHrs.toFixed(1)}h</strong> total invested
+                    ${w2wk > 0 ? ` · <span style="color: var(--green);">${w2wk.toFixed(1)}h in 2wk</span>` : ''}
+                  </div>
+                  ${wGenres.length > 0 ? `
+                    <div style="display: flex; flex-wrap: wrap; gap: 3px; margin-top: 5px;">
+                      ${wGenres.map(gn => `<span class="genre-chip" style="font-size: 8.5px; padding: 1px 4px;">${escapeHtml(gn)}</span>`).join('')}
+                    </div>
+                  ` : `<div style="font-size: 9.5px; color: var(--slate); margin-top: 4px;">No active games in window</div>`}
+                </button>
+              `;
+            }).join('')}
+          </div>
+
           <div style="overflow-x: auto;">
             <table class="probes-table" style="width: 100%; border-collapse: collapse; font-size: 11px;">
               <thead>
                 <tr style="text-align: left; border-bottom: 1px solid var(--navy); color: var(--light-gray);">
                   <th style="padding: 6px 8px;">#</th>
-                  <th style="padding: 6px 8px;">Game Title &amp; Role in Genesis</th>
+                  <th style="padding: 6px 8px;">Game Title &amp; Store Description</th>
                   <th style="padding: 6px 8px;">AppID</th>
+                  <th style="padding: 6px 8px;">Last Played &amp; Recent Activity</th>
                   <th style="padding: 6px 8px;">Logged Playtime</th>
-                  <th style="padding: 6px 8px;">Engagement Weight <code>w_g = ln(1+h)</code></th>
+                  <th style="padding: 6px 8px;">Library Playtime Share</th>
                   <th style="padding: 6px 8px;">Steam Store Genres &amp; Categories</th>
                 </tr>
               </thead>
               <tbody>
-                ${topGames.map((g, idx) => {
+                ${displayedGames.length === 0 ? `
+                  <tr>
+                    <td colspan="7" style="padding: 14px 8px; text-align: center; color: var(--slate);">
+                      No Steam games recorded in the <strong>${escapeHtml(activeHorizonDef.label)}</strong> window.
+                    </td>
+                  </tr>
+                ` : displayedGames.map((g, idx) => {
                   const gName = String(g.name || `App ${g.appid}`);
                   const hrs = Number(g.playtime_hours || 0);
-                  const wg = Number(g.engagement_weight ?? Math.log1p(Math.max(0, hrs)));
-                  const wSharePct = Number(g.weight_share || 0) * 100;
                   const pSharePct = Number(g.playtime_share || (totalHours > 0 ? hrs / totalHours : 0)) * 100;
-                  const isAnchor = idx < 8 || (anchorRaw && anchorRaw.toLowerCase().includes(gName.toLowerCase()));
+                  const isAnchor = (activeHorizonDef.key === 'lifetime' && idx < 8) || (anchorRaw && anchorRaw.toLowerCase().includes(gName.toLowerCase()));
                   const isSpotlight = spotlightRaw && spotlightRaw.toLowerCase().includes(gName.toLowerCase());
                   const genres = Array.isArray(g.genres) ? g.genres : [];
                   const cats = Array.isArray(g.categories) ? g.categories : [];
+                  const lpDate = String(g.last_played_date || '').trim();
+                  const daysSince = typeof g.days_since_played === 'number' ? g.days_since_played : null;
+                  const recent2wkHrs = g.playtime_2weeks_hours != null
+                    ? Number(g.playtime_2weeks_hours)
+                    : (g.playtime_2weeks_minutes ? Number(g.playtime_2weeks_minutes) / 60.0 : 0);
                   return `
                     <tr style="border-bottom: 1px solid rgba(29, 43, 83, 0.45);">
                       <td style="padding: 6px 8px; font-family: monospace; color: var(--slate);">${idx + 1}</td>
@@ -4717,17 +4912,20 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
                         ${g.short_description ? `<div style="font-size: 9.5px; color: var(--slate); margin-top: 2px; max-width: 440px;">${escapeHtml(g.short_description)}</div>` : ''}
                       </td>
                       <td style="padding: 6px 8px; font-family: monospace; color: var(--light-gray);">${escapeHtml(g.appid || '—')}</td>
+                      <td style="padding: 6px 8px; font-family: monospace; font-size: 10.5px;">
+                        ${lpDate ? `<div style="color: var(--white);">${escapeHtml(lpDate)}${daysSince !== null ? ` <span style="color: var(--slate);">(${daysSince}d ago)</span>` : ''}</div>` : '<span style="color: var(--slate);">—</span>'}
+                        ${recent2wkHrs > 0 ? `<div style="color: var(--green); font-size: 9.5px; font-weight: bold; margin-top: 2px;">⚡ ${recent2wkHrs.toFixed(1)}h in last 2 wks</div>` : ''}
+                      </td>
                       <td style="padding: 6px 8px; font-family: monospace;">
                         <strong style="color: var(--amber);">${hrs.toFixed(1)}h</strong>
-                        <span style="font-size: 9.5px; color: var(--slate);">(${pSharePct.toFixed(1)}% of library)</span>
                       </td>
                       <td style="padding: 6px 8px; min-width: 150px;">
                         <div style="display: flex; align-items: center; gap: 6px; font-family: monospace; font-size: 10.5px;">
-                          <span style="color: var(--green); font-weight: bold;">${wg.toFixed(3)}</span>
-                          <span style="color: var(--slate);">(${wSharePct.toFixed(1)}% weight)</span>
+                          <span style="color: var(--green); font-weight: bold;">${pSharePct.toFixed(1)}%</span>
+                          <span style="color: var(--slate);">of total playtime</span>
                         </div>
                         <div style="height: 5px; background: rgba(29, 43, 83, 0.55); border-radius: 3px; overflow: hidden; margin-top: 2px;">
-                          <div style="width: ${Math.min(100, wSharePct * 5)}%; height: 100%; background: var(--green);"></div>
+                          <div style="width: ${Math.min(100, pSharePct * 4)}%; height: 100%; background: var(--green);"></div>
                         </div>
                       </td>
                       <td style="padding: 6px 8px;">
@@ -4752,10 +4950,18 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           ${dnaPromptSummary ? `
             <div style="margin-bottom: 12px;">
               <div style="font-size: 10.5px; color: var(--cyan); font-weight: bold; margin-bottom: 4px;">
-                Exact Target Player DNA Directive Injected into All 9 Writers' Room Specialists (<code>game_bible.target_player_dna_summary</code>):
+                Live 4-Horizon Target Player DNA Directive Injected into All 9 Writers' Room Specialists (30d · 90d · 1yr · Lifetime):
               </div>
               <pre style="background: #040918; border: 1px solid var(--navy); border-radius: 5px; padding: 10px 12px; font-size: 10.5px; line-height: 1.5; color: var(--white); white-space: pre-wrap; margin: 0;">${escapeHtml(dnaPromptSummary)}</pre>
             </div>
+          ` : ''}
+          ${buildSnapshotDnaSummary && buildSnapshotDnaSummary !== dnaPromptSummary ? `
+            <details style="margin-bottom: 12px;">
+              <summary style="cursor: pointer; color: var(--slate); font-size: 10px;">
+                View Historical DNA Snapshot Captured When "${escapeHtml(b.game_title || 'Active Build')}" Was Started (<code>game_bible.target_player_dna_summary</code>)
+              </summary>
+              <pre style="background: #040918; border: 1px solid var(--navy); border-radius: 5px; padding: 8px 10px; font-size: 10px; line-height: 1.4; color: var(--light-gray); white-space: pre-wrap; margin-top: 6px;">${escapeHtml(buildSnapshotDnaSummary)}</pre>
+            </details>
           ` : ''}
 
           ${conceptCandidates.length > 0 ? `
@@ -4814,48 +5020,33 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       setHtmlIfChanged(container, html);
     }
 
-    async function loadSteamDNA() {
+    async function loadSteamDNA(forceRescan = false) {
       try {
-        const res = await fetch('/api/steam/dna');
+        const res = await fetch(forceRescan ? '/api/steam/dna?rescan=1' : '/api/steam/dna');
         if (!res.ok) return;
         const data = await res.json();
         latestSteamDnaData = data;
-        const pt = document.getElementById('dna-playtime');
-        const gc = document.getElementById('dna-games-count');
-        const pp = document.getElementById('dna-pacing');
-        const ct = document.getElementById('dna-challenge');
-        const gl = document.getElementById('dna-genres-list');
-        const tg = document.getElementById('dna-top-games');
-        if (pt) pt.textContent = `${(data.total_playtime_hours || 0).toFixed(1)}h`;
-        if (gc) gc.textContent = String(data.total_games_analyzed || 0);
-        if (pp) {
-          const sign = (data.pacing_score || 0) >= 0 ? '+' : '';
-          pp.textContent = `${data.pacing_preference || 'balanced'} (${sign}${(data.pacing_score || 0).toFixed(2)})`;
-        }
-        if (ct) ct.textContent = (data.challenge_tolerance || 0.5).toFixed(2);
-        if (gl && data.top_genres) {
-          gl.innerHTML = '';
-          data.top_genres.forEach(g => {
-            const chip = document.createElement('span');
-            chip.className = 'genre-chip';
-            const weight = data.genre_weights && data.genre_weights[g] ? ` (${Math.round(data.genre_weights[g] * 100)}%)` : '';
-            chip.textContent = `${g}${weight}`;
-            gl.appendChild(chip);
-          });
-        }
-        if (tg && Array.isArray(data.top_games) && data.top_games.length > 0) {
-          tg.innerHTML = '<span style="color:var(--amber); font-weight:700; margin-right:4px;">Top Played:</span>';
-          data.top_games.slice(0, 8).forEach(game => {
-            const span = document.createElement('span');
-            span.style.cssText = 'background:rgba(41,173,255,0.08); border:1px solid var(--navy); padding:1px 6px; border-radius:3px; color:var(--white);';
-            const hrs = typeof game.playtime_hours === 'number' ? ` (${game.playtime_hours.toFixed(1)}h)` : '';
-            span.textContent = `${game.name || game.appid}${hrs}`;
-            tg.appendChild(span);
-          });
-        }
+        renderSteamDnaDashboardCard(data);
         renderSteamDnaSubview(data, cachedGameBible);
       } catch (e) {
         // Backend not ready
+      }
+    }
+
+    async function rescanSteamDNA() {
+      const btn = document.getElementById('btn-rescan-dna');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = '⏳ Synthesizing via Gemini LLM...';
+      }
+      try {
+        await loadSteamDNA(true);
+      } finally {
+        const refreshedBtn = document.getElementById('btn-rescan-dna');
+        if (refreshedBtn) {
+          refreshedBtn.disabled = false;
+          refreshedBtn.textContent = '🔄 Re-Synthesize via LLM';
+        }
       }
     }
 
@@ -6251,6 +6442,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         approved: 0,
         awaiting_review: 0,
         in_progress: 0,
+        waiting_for_lock: 0,
         changes_requested: 0,
         ready: 0,
         blocked: 0,
@@ -6359,6 +6551,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         target_files: targetFilesVal,
         dependencies: depsVal,
         attempt_count: rawIt.attempt_count || revs.length || 0,
+        shaping_notes: Array.isArray(rawIt.shaping_notes) ? rawIt.shaping_notes : [],
+        spawned_by_item_id: rawIt.spawned_by_item_id || '',
         worker_notes: workerNotesVal,
         feedback: feedbackVal,
         proof_paths: normProofPaths,
@@ -6467,6 +6661,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
               const statusMap = {
                 approved: 'completed',
                 in_progress: 'in_progress',
+                waiting_for_lock: 'in_progress',
                 awaiting_review: 'in_progress',
                 changes_requested: 'in_progress',
                 ready: 'pending',
@@ -6505,6 +6700,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
                 const taskStatusMap = {
                   approved: 'completed',
                   in_progress: 'synthesizing',
+                  waiting_for_lock: 'synthesizing',
                   awaiting_review: 'verifying',
                   changes_requested: 'synthesizing',
                   ready: 'queued',
@@ -6598,9 +6794,11 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const revBadge = document.getElementById('board-revision-badge');
       if (revBadge && board) {
         const activeWorkers = items.filter(it => it.status === 'in_progress').map(it => `${it.id} (${it.owner_role})`);
+        const waitingLocks = items.filter(it => it.status === 'waiting_for_lock').map(it => it.id);
         const reviewItems = items.filter(it => it.status === 'awaiting_review').map(it => it.id);
         const parts = [`Rev #${board.revision || 0}`];
         if (activeWorkers.length > 0) parts.push(`🔨 Working: ${activeWorkers.join(', ')}`);
+        if (waitingLocks.length > 0) parts.push(`⏸️ Waiting Lock: ${waitingLocks.join(', ')}`);
         if (reviewItems.length > 0) parts.push(`🔍 In Review: ${reviewItems.join(', ')}`);
         revBadge.textContent = parts.join(' • ');
       }
@@ -6609,8 +6807,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       if (pillsRow) {
         const filters = [
           { key: 'all', label: `All Items (${counts.total || 0})`, col: 'var(--cyan)' },
-          { key: 'active', label: `⚡ Active Now (${(counts.in_progress || 0) + (counts.awaiting_review || 0) + (counts.changes_requested || 0)})`, col: 'var(--yellow)' },
+          { key: 'active', label: `⚡ Active Now (${(counts.in_progress || 0) + (counts.waiting_for_lock || 0) + (counts.awaiting_review || 0) + (counts.changes_requested || 0)})`, col: 'var(--yellow)' },
           { key: 'in_progress', label: `🔨 In Progress (${counts.in_progress || 0})`, col: 'var(--cyan)' },
+          { key: 'waiting_for_lock', label: `⏸️ Waiting for Lock (${counts.waiting_for_lock || 0})`, col: 'var(--amber)' },
           { key: 'awaiting_review', label: `🔍 Awaiting Review (${counts.awaiting_review || 0})`, col: 'var(--amber)' },
           { key: 'changes_requested', label: `🛠️ Changes Requested (${counts.changes_requested || 0})`, col: 'var(--pink)' },
           { key: 'approved', label: `✅ Approved (${counts.approved || 0})`, col: 'var(--green)' },
@@ -6638,21 +6837,22 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const searchInput = document.getElementById('board-search-input');
       const searchQuery = searchInput ? String(searchInput.value || '').trim().toLowerCase() : '';
 
-      // Sort items so active items (in_progress, awaiting_review, changes_requested) appear first!
+      // Sort items so active items (in_progress, waiting_for_lock, awaiting_review, changes_requested) appear first!
       const statusPriority = {
         in_progress: 1,
-        awaiting_review: 2,
-        changes_requested: 3,
-        needs_decision: 4,
-        failed: 5,
-        ready: 6,
-        blocked: 7,
-        approved: 8,
+        waiting_for_lock: 2,
+        awaiting_review: 3,
+        changes_requested: 4,
+        needs_decision: 5,
+        failed: 6,
+        ready: 7,
+        blocked: 8,
+        approved: 9,
       };
 
       const filtered = items.filter(it => {
         const st = String(it.status || 'ready').toLowerCase();
-        if (currentBoardFilter === 'active' && !['in_progress', 'awaiting_review', 'changes_requested', 'needs_decision'].includes(st)) return false;
+        if (currentBoardFilter === 'active' && !['in_progress', 'waiting_for_lock', 'awaiting_review', 'changes_requested', 'needs_decision'].includes(st)) return false;
         if ((currentBoardFilter === 'ready' || currentBoardFilter === 'queued') && !['ready', 'blocked'].includes(st)) return false;
         if (!['all', 'active', 'ready', 'queued'].includes(currentBoardFilter) && st !== currentBoardFilter) return false;
         if (searchQuery) {
@@ -6661,8 +6861,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         }
         return true;
       }).sort((a, b) => {
-        const pa = statusPriority[String(a.status || 'ready').toLowerCase()] || 9;
-        const pb = statusPriority[String(b.status || 'ready').toLowerCase()] || 9;
+        const pa = statusPriority[String(a.status || 'ready').toLowerCase()] || 10;
+        const pb = statusPriority[String(b.status || 'ready').toLowerCase()] || 10;
         if (pa !== pb) return pa - pb;
         return (a.priority || 10) - (b.priority || 10);
       });
@@ -6674,6 +6874,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
 
       const statusBadgeConfig = {
         in_progress: { icon: '🔨', label: 'IN PROGRESS (GENERATING)', col: 'var(--cyan)', bg: 'rgba(41, 173, 255, 0.18)' },
+        waiting_for_lock: { icon: '⏸️', label: 'WAITING FOR FILE LOCK', col: 'var(--amber)', bg: 'rgba(255, 163, 0, 0.2)' },
         awaiting_review: { icon: '🔍', label: 'AWAITING COUNCIL REVIEW', col: 'var(--amber)', bg: 'rgba(255, 163, 0, 0.2)' },
         changes_requested: { icon: '🛠️', label: 'CHANGES REQUESTED', col: 'var(--pink)', bg: 'rgba(255, 119, 168, 0.18)' },
         approved: { icon: '✅', label: 'APPROVED WITH PROOF', col: 'var(--green)', bg: 'rgba(0, 228, 54, 0.16)' },
@@ -6766,6 +6967,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
               </div>
             </div>
             ${formatStructuredSpecHtml(it.description || '', it.proof_spec || '')}
+            ${formatCouncilShapingNotesHtml(it.shaping_notes, it.spawned_by_item_id)}
             ${(it.failure && (st === 'failed' || st === 'needs_decision') && !_isErrorDismissed({ item_id: it.id, message: it.failure })) ? (() => {
               const failLines = String(it.failure).split('\n').map(l => l.trim()).filter(Boolean);
               const failSummary = (failLines.length > 1 && /^Traceback \(most recent call last\):/i.test(failLines[0]))
@@ -6825,6 +7027,33 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
                 </div>
               `;
             })() : ''}
+            ${(st === 'waiting_for_lock') ? (() => {
+              const lockFiles = Array.isArray(it.waiting_on_locks) && it.waiting_on_locks.length > 0
+                ? it.waiting_on_locks
+                : (Array.isArray(it.target_files) ? it.target_files : []);
+              const holders = Array.isArray(it.lock_holders) ? it.lock_holders : [];
+              const yInfo = it.yielded_turn_info || {};
+              const nextTurnNo = yInfo.next_turn_index || 1;
+              const nextSpec = yInfo.specialist_agent || 'swe_engineer';
+              const doneTurns = Number(yInfo.completed_turns || 0);
+              return `
+                <div style="font-size: 11px; color: var(--white); background: linear-gradient(90deg, rgba(255, 163, 0, 0.18), rgba(41, 173, 255, 0.1)); border: 1px solid var(--amber); padding: 8px 10px; border-radius: 6px; display: flex; flex-direction: column; gap: 5px; min-width: 0; overflow-wrap: anywhere;">
+                  <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+                    <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; flex: 1;">
+                      <span style="font-family: monospace; font-size: 10px; font-weight: 800; background: rgba(255, 163, 0, 0.24); color: var(--amber); padding: 1px 6px; border-radius: 4px; border: 1px solid var(--amber);">
+                        ⏸️ Paused Before Turn #${nextTurnNo} (${escapeHtml(nextSpec)})${doneTurns > 0 ? ` • ${doneTurns} turn${doneTurns === 1 ? '' : 's'} completed` : ''}
+                      </span>
+                      <span style="color: var(--white);">
+                        Waiting for file lock on <code style="color: var(--amber); font-weight: 700;">${escapeHtml(lockFiles.join(', ') || 'shared module')}</code>${holders.length > 0 ? ` (currently held by <code style="color: var(--cyan); font-weight: 700;">${escapeHtml(holders.join(', '))}</code>)` : ''} — will resume automatically once released.
+                      </span>
+                    </div>
+                    <button type="button" onclick="openTaskChronologyModal('${escapeHtml(it.id)}')" style="background: #07132c; border: 1px solid var(--amber); color: var(--amber); border-radius: 4px; padding: 2px 7px; font-size: 10px; font-weight: 800; cursor: pointer;">
+                      🔍 View Turn History
+                    </button>
+                  </div>
+                </div>
+              `;
+            })() : ''}
             ${thumbsHtml}
             ${audioHtml}
             ${workerNotes ? formatStructuredWorkerSummaryHtml(workerNotes, it.id) : ''}
@@ -6870,6 +7099,40 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           </summary>
           ${listHtml}
           ${proofBlock}
+        </details>
+      `;
+    }
+
+    function formatCouncilShapingNotesHtml(shapingNotes, spawnedByItemId = '', isOpenByDefault = false) {
+      const notes = Array.isArray(shapingNotes) ? shapingNotes.map(n => String(n || '').trim()).filter(Boolean) : [];
+      const spBy = String(spawnedByItemId || '').trim();
+      if (notes.length === 0 && !spBy) return '';
+      const parsedNotes = notes.map(raw => {
+        const m = raw.match(/^\[([^\]]+)\]:\s*([\s\S]*)$/);
+        return {
+          role: m ? m[1].trim() : 'Council Input',
+          body: m ? m[2].trim() : raw,
+        };
+      });
+      const preview = parsedNotes.length > 0
+        ? `[${parsedNotes[0].role}] ${parsedNotes[0].body.slice(0, 140)}${parsedNotes[0].body.length > 140 ? '…' : ''}`
+        : `Split / Spawned from [${spBy}]`;
+      const itemsHtml = parsedNotes.map(n => `
+        <div style="background: rgba(4, 9, 23, 0.78); border: 1px solid rgba(255, 163, 0, 0.28); border-left: 3px solid var(--amber); border-radius: 4px; padding: 6px 8px;">
+          <div style="font-weight: 800; font-size: 10.5px; color: var(--amber); margin-bottom: 3px;">🏛️ ${escapeHtml(n.role)}</div>
+          <div style="font-size: 10.5px; color: var(--white); line-height: 1.45; white-space: pre-wrap;">${escapeHtml(n.body)}</div>
+        </div>
+      `).join('');
+      return `
+        <details ${isOpenByDefault ? 'open' : ''} style="font-size: 10.5px; color: var(--amber); background: rgba(255, 163, 0, 0.08); border: 1px solid rgba(255, 163, 0, 0.28); border-left: 3px solid var(--amber); padding: 5px 9px; border-radius: 5px;">
+          <summary style="cursor: pointer; font-weight: 700; color: var(--amber);">
+            🏛️ Council Task Direction &amp; Decomposition (${notes.length} input${notes.length === 1 ? '' : 's'}${spBy ? ` • from [${escapeHtml(spBy)}]` : ''}):
+            <span style="font-weight: 400; color: var(--light-gray);">${escapeHtml(preview)}</span>
+          </summary>
+          <div style="margin-top: 7px; display: flex; flex-direction: column; gap: 6px;">
+            ${spBy ? `<div style="font-size: 10px; color: var(--cyan);">🔗 Originated / Split from parent task: <code>${escapeHtml(spBy)}</code></div>` : ''}
+            ${itemsHtml}
+          </div>
         </details>
       `;
     }
@@ -7262,6 +7525,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         kind: it.kind || 'mechanic_code',
         state: it.status || it.state || 'ready',
         raised_by_role: it.owner_role || it.raised_by_role || 'GameplayDesigner',
+        spawned_by_item_id: it.spawned_by_item_id || '',
+        shaping_notes: Array.isArray(it.shaping_notes) ? it.shaping_notes : [],
         spec: it.description || it.spec || '',
         proof_spec: it.proof_spec || '',
         target_modules: it.target_files || it.target_modules || [],
@@ -7603,6 +7868,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
 
       setHtmlIfChanged(bodyEl, `
         ${formatStructuredSpecHtml(data.spec || '', data.proof_spec || '')}
+        ${formatCouncilShapingNotesHtml(data.shaping_notes, data.spawned_by_item_id, true)}
         ${failureBannerHtml}
         ${contextAndSelfInquiryHtml}
         ${filterPillsHtml}
@@ -7651,6 +7917,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const counts = board && board.counts ? board.counts : computeBoardCounts(items);
 
       const inProgItems = items.filter(it => it.status === 'in_progress');
+      const waitingLockItems = items.filter(it => it.status === 'waiting_for_lock');
       const reviewItems = items.filter(it => it.status === 'awaiting_review');
       const changesItems = items.filter(it => it.status === 'changes_requested');
       const approvedCount = counts.approved || 0;
@@ -7659,7 +7926,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       if (countTotal) countTotal.textContent = String(totalCount);
       if (countWorking) countWorking.textContent = String(inProgItems.length);
       if (countReview) countReview.textContent = String(reviewItems.length);
-      if (countRevising) countRevising.textContent = String(changesItems.length);
+      if (countRevising) countRevising.textContent = String(changesItems.length + waitingLockItems.length);
       if (countApproved) countApproved.textContent = `${approvedCount}/${totalCount}`;
 
       const running = typeof isBuildActivelyRunning === 'function' ? isBuildActivelyRunning() : false;
@@ -7677,14 +7944,15 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           const weightedDone =
             approvedCount * 1.0 +
             reviewItems.length * 0.75 +
-            changesItems.length * 0.55 +
+            (changesItems.length + waitingLockItems.length) * 0.55 +
             inProgItems.length * 0.35;
           const pct = Math.min(100, Math.max(2, Math.round((weightedDone / totalCount) * 100)));
           progEl.setAttribute('max', '100');
           progEl.setAttribute('value', String(pct));
           if (pctLabel) pctLabel.textContent = `${approvedCount}/${totalCount} Verified (${pct}% Weighted)`;
           if (countsLabel) {
-            countsLabel.textContent = `${inProgItems.length} working · ${reviewItems.length} in review · ${changesItems.length} revising · ${(counts.ready || 0) + (counts.blocked || 0)} queued`;
+            const waitPart = waitingLockItems.length > 0 ? ` · ${waitingLockItems.length} waiting lock` : '';
+            countsLabel.textContent = `${inProgItems.length} working${waitPart} · ${reviewItems.length} in review · ${changesItems.length} revising · ${(counts.ready || 0) + (counts.blocked || 0)} queued`;
           }
         } else if (hasActiveWork) {
           // Indeterminate state when brainstorming before board items exist

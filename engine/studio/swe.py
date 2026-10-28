@@ -21,7 +21,7 @@ from pydantic import Field
 
 from engine.api.contracts import BaseCartridge, BaseEnemy, BaseHazard, BasePlayer, BaseLevelSpec
 from engine.loader import ASTSecurityError, validate_cartridge_ast
-from engine.studio.models import validate_level_layout
+from engine.studio.models import merge_level_layout, validate_level_layout
 from engine.studio.models import (
     AtomicInvariantSpec,
     AtomicTestSynthesisPayload,
@@ -538,14 +538,16 @@ class LeadGameplaySWEAgent:
     @staticmethod
     def _summarize_non_target_gd_module(mod_name: str, code: str) -> str:
         """Extracts a compact cross-module API signature & state contract (classes, signals, constants,
-        member variables, function signatures, and get_state_snapshot body) for a non-target GDScript module."""
+        member variables, function signatures, input-to-action bindings, collision/lighting layers, and
+        get_state_snapshot body) for a non-target GDScript module."""
         sig_lines: List[str] = []
         raw_lines = code.splitlines()
+        n_lines = len(raw_lines)
         in_snapshot_fn = False
         snapshot_lines_captured = 0
         in_func = False
         func_indent = 0
-        for line in raw_lines:
+        for idx, line in enumerate(raw_lines):
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
@@ -585,6 +587,22 @@ class LeadGameplaySWEAgent:
                 sig_lines.append(line)
             elif not in_func and stripped.startswith("var ") and indent_tabs <= 1:
                 sig_lines.append(line)
+            elif any(
+                tok in stripped
+                for tok in ("collision_layer", "collision_mask", "CanvasModulate", "light_mode", "LIGHT_MODE_")
+            ):
+                sig_lines.append(line)
+            elif ("Input." in stripped or "KEY_" in stripped or "MOUSE_BUTTON_" in stripped) and stripped.endswith(":"):
+                sig_lines.append(line)
+                for j in range(idx + 1, min(idx + 4, n_lines)):
+                    nxt = raw_lines[j]
+                    nxt_s = nxt.strip()
+                    if not nxt_s or nxt_s.startswith("#"):
+                        continue
+                    nxt_indent = len(nxt) - len(nxt.lstrip("\t "))
+                    if nxt_indent <= indent_tabs:
+                        break
+                    sig_lines.append(nxt)
         return "\n".join(sig_lines) if sig_lines else code[:2000]
 
     def implement_requirement_track(
@@ -598,6 +616,10 @@ class LeadGameplaySWEAgent:
         prior_error: Optional[str] = None,
         extra_image_paths: Optional[List[str]] = None,
         board: Optional[Any] = None,
+        pre_write_hook: Optional[Any] = None,
+        commit_gate: Optional[Any] = None,
+        allowed_files: Optional[Set[str]] = None,
+        stashed_bundle: Optional[TrackCodeSynthesisPayload] = None,
     ) -> Dict[str, Path]:
         """Iteratively implements or expands cartridge code for a single RequirementTrack.
         Inspects existing code in staging_dir and sealed assets in staging_dir/assets/,
@@ -607,6 +629,14 @@ class LeadGameplaySWEAgent:
             raise StudioAgentError("LeadGameplaySWEAgent requires an active google.genai Client (Rule 5: Zero Silent Fallbacks)")
 
         staging_dir.mkdir(parents=True, exist_ok=True)
+        if stashed_bundle is not None:
+            return stashed_bundle.assemble_cartridge_directory(
+                staging_dir,
+                swe_agent=self,
+                pre_write_hook=pre_write_hook,
+                commit_gate=commit_gate,
+                allowed_files=allowed_files,
+            )
 
         # Unconditionally True for all new builds (Milestone 7 Godot 4 Transition)
         is_godot = True
@@ -640,9 +670,15 @@ class LeadGameplaySWEAgent:
             except Exception:
                 pass
 
-        from engine.studio.context_curator import ContextCuratorAgent, SelfInquiryQAPair, is_real_genai_client
+        from engine.studio.context_curator import (
+            CartridgeSemanticIndex,
+            ContextCuratorAgent,
+            SelfInquiryQAPair,
+            is_real_genai_client,
+        )
         active_curator: Optional[ContextCuratorAgent] = None
         already_included_cids: List[str] = []
+        seed_mods = list(getattr(track, "target_modules", None) or []) + list(existing_modules.keys())
         if is_real_genai_client(self.client):
             multimodal_mockup_parts = []
             curator = ContextCuratorAgent(
@@ -664,7 +700,8 @@ class LeadGameplaySWEAgent:
                 extra_image_paths=extra_image_paths,
             )
             already_included_cids = [ch.chunk_id for ch in (pack.retrieved_chunks or [])]
-            # Load any subdirectory code modules selected by ContextCuratorAgent (or directly imported by target_modules)
+            # Load any subdirectory code modules selected by ContextCuratorAgent OR transitively imported (2 hops)
+            # by target_modules or loaded root modules (e.g., main.gd -> scripts/mechanics/*.gd, scenes.gd -> level_map.gd -> wind_shear_volume.gd)
             code_graph = curator.semantic_index.build_code_reference_graph()
             curated_mods: List[str] = []
             for ch in (pack.retrieved_chunks or []):
@@ -672,16 +709,11 @@ class LeadGameplaySWEAgent:
                     c_mod = ch.chunk_id[len("code:module:"):].strip()
                     if c_mod and c_mod not in curated_mods:
                         curated_mods.append(c_mod)
-            for tmod in (getattr(track, "target_modules", None) or []):
-                clean_tm = str(tmod or "").strip().replace("\\", "/")
-                if clean_tm.startswith("res://"):
-                    clean_tm = clean_tm[len("res://"):]
-                elif clean_tm.startswith("res:/"):
-                    clean_tm = clean_tm[len("res:/"):]
-                clean_tm = clean_tm.lstrip("/")
-                for imp in (code_graph.get(clean_tm) or {}).get("imports", []):
-                    if imp and imp not in curated_mods:
-                        curated_mods.append(imp)
+            for trans_mod in curator.semantic_index.get_transitive_related_modules(
+                seed_mods, max_hops=2, code_graph=code_graph
+            ):
+                if trans_mod and trans_mod not in curated_mods:
+                    curated_mods.append(trans_mod)
             for c_mod in curated_mods:
                 if c_mod not in existing_modules:
                     c_path = staging_dir / c_mod
@@ -708,7 +740,7 @@ class LeadGameplaySWEAgent:
                 logger.debug("Could not build CartridgeAssetLibrary prompt summary: %s", lib_exc)
             focused_parts.append(pack.prompt_block)
             layout_file = staging_dir / "level_layout.json"
-            if layout_file.is_file() and any(m in ("scenes.gd", "main.gd") for m in (track.target_modules or [])):
+            if layout_file.is_file() and any(m in ("scenes.gd", "main.gd", "level_map.gd") for m in (track.target_modules or [])):
                 focused_parts.append(
                     "AUTHORITATIVE LEVEL LAYOUT (`level_layout.json`):\n"
                     + self._require_full_text(layout_file.read_text(encoding="utf-8"), "level_layout.json")
@@ -717,6 +749,15 @@ class LeadGameplaySWEAgent:
             if pack.multimodal_parts:
                 multimodal_mockup_parts = list(pack.multimodal_parts)
         else:
+            try:
+                offline_idx = CartridgeSemanticIndex(staging_dir)
+                for trans_mod in offline_idx.get_transitive_related_modules(seed_mods, max_hops=2):
+                    if trans_mod and trans_mod not in existing_modules:
+                        c_path = staging_dir / trans_mod
+                        if c_path.is_file():
+                            existing_modules[trans_mod] = c_path.read_text(encoding="utf-8")
+            except Exception:
+                pass
             bible_and_narrative_context, multimodal_mockup_parts = self._build_bible_and_narrative_context(
                 staging_dir=staging_dir,
                 narrative_bible=narrative_bible,
@@ -748,6 +789,12 @@ class LeadGameplaySWEAgent:
             elif len(code) > 45000:
                 summary = code[:25000] + f"\n\n# ... [{len(code) - 35000} bytes omitted for brevity] ...\n\n" + code[-10000:]
                 existing_code_summary.append(f"--- Existing {mod_name} (summary) ---\n{summary}")
+            elif mod_name.endswith((".gd", ".gdshader", ".tscn")) and len(code.splitlines()) >= 40:
+                raw_lines = code.splitlines()
+                numbered_body = "\n".join(f"{ln:4d}: {line}" for ln, line in enumerate(raw_lines, start=1))
+                existing_code_summary.append(
+                    f"--- Existing {mod_name} (1-indexed [Lines 1..{len(raw_lines)}] — USE `patches` (`SurgicalCodePatch`) FOR TARGETED EDITS!) ---\n{numbered_body}"
+                )
             else:
                 existing_code_summary.append(f"--- Existing {mod_name} ---\n{code}")
         existing_code_block = "\n".join(existing_code_summary) if existing_code_summary else "No existing code modules."
@@ -773,7 +820,12 @@ class LeadGameplaySWEAgent:
                 f"   - Strictly separate character portraits (`res://assets/portraits/*.png`, used ONLY in `ui_hud.gd` dialogue panels with bounded size <= 64x64) from in-world entity sprites (`res://assets/sprites/*.png`).\n"
                 f"   - DECOMPOSE CONCEPT ART INTO COMPOSABLE WORLD ELEMENTS (NEVER USE A STATIC FULL-SCREEN BACKGROUND IMAGE): Build the world out of discrete, layered, interactive elements matching the 16:9 concept art—horizon/midground layers, procedural/shader + textured physical geometry, and interactive `Node2D` / `CharacterBody2D` / `Area2D` entities.\n"
                 f"   - ON-DEMAND ASSET FABRICATION (`requested_assets`): If your gameplay mechanics, animations, or multi-layer world need an additional discrete asset (a `sprite_sheet` with custom `animation_states`, `articulated_parts` with custom pivots, seamless `tile_surface` texture for procedural polygons, isolated `static_sprite` prop, or `sfx`), include it in `requested_assets` in your JSON response and the Cartridge Asset Library will fabricate it on disk and update `res://assets/asset_library.json`.\n"
-                f"   - main.gd: Root scene script extending Node2D. Preloads child modules (`mechanics.gd`, `entities.gd`, `scenes.gd`, `ui_hud.gd`, plus any additional custom `.gd` modules specified in the Game Bible's `technical_architecture_blueprint`). Sets up an active `Camera2D` tracking the player/focus across `world_bounds` (`limit_left`, `limit_top`, `limit_right`, `limit_bottom`), level scene container, and a separate `CanvasLayer` for `ui_hud.gd` so HUD gauges/prompts never exist in world-space where the player can walk behind or collide with them. Implements `get_state_snapshot() -> Dictionary` for headless playtesting.\n"
+                f"   - main.gd: Root scene script extending Node2D. Preloads child modules (`mechanics.gd`, `entities.gd`, `scenes.gd`, `ui_hud.gd`, plus any encapsulated feature modules under `res://scenes/...` or `res://scripts/...` specified in the Game Bible's `technical_architecture_blueprint`). Sets up an active `Camera2D` tracking the player/focus across `world_bounds` (`limit_left`, `limit_top`, `limit_right`, `limit_bottom`), level scene container, and a separate `CanvasLayer` for `ui_hud.gd` so HUD gauges/prompts never exist in world-space where the player can walk behind or collide with them. Implements `get_state_snapshot() -> Dictionary` for headless playtesting, and automatically merges `node.get_state_snapshot()` from any child node in the `\"state_providers\"` group (`for n in get_tree().get_nodes_in_group(\"state_providers\"): if n.has_method(\"get_state_snapshot\"): snap.merge(n.get_state_snapshot(), true)`) so encapsulated feature modules can expose telemetry without every task rewriting `main.gd`.\n"
+                f"   - ENCAPSULATED FEATURE MODULES, SURGICAL PATCHING (`patches`) & LOCK DISCIPLINE:\n"
+                f"     * Keep each feature module (`scenes/mechanics/*.gd`, `scenes/entities/*.gd`, `scenes/ui/*.gd`, `scenes/world/*.gd`, `scripts/**/*.gd`) focused and self-contained (typically 80–250 lines with `add_to_group(\"state_providers\")` and `func get_state_snapshot() -> Dictionary`).\n"
+                f"     * SURGICAL PATCHES (`patches`) FOR EXISTING FILES — NEVER REWRITE LARGE EXISTING FILES FROM SCRATCH: When modifying an existing file on disk (shown in `EXISTING CARTRIDGE CODE IN STAGING` with 1-indexed line numbers `   1: ...`), emit targeted `SurgicalCodePatch` entries in `patches` (`filename`, `start_line`, `end_line`, `target_snippet`, `replacement_code`) replacing ONLY the specific function(s) or contiguous line ranges `[start_line..end_line]` that need to change! Do NOT include ` 123: ` line-number prefixes in `target_snippet` or `replacement_code`, and preserve exact tab (`\\t`) indentation. To append new methods at the end of an existing N-line file, patch `[N..N]` with line `N` followed by your new methods.\n"
+                f"     * NEW FILES (`files`): Use `files` (`ModuleFileSpec`) ONLY when creating a brand-new file that does not yet exist on disk (or when replacing a tiny <80-line file). Never regenerate a 150–700 line existing file in `files`!\n"
+                f"     * Only touch files in `Target Modules: {track.target_modules}` or strictly necessary for this requirement—NEVER overwrite or delete unrelated subsystem hooks in `main.gd` or `scenes.gd` that belong to other tasks!\n"
                 f"   - mechanics.gd: Core rules, physics/simulation loops, placement/action methods, scoring, progression, and recoverable hazard/win/loss logic tailored to the Game Bible's `core_loop` and `system_interactions`.\n"
                 f"   - entities.gd: CharacterBody2D, RigidBody2D, Area2D, or Node2D entity classes with animated sprite sheets, articulated multi-part rigs, or hybrid shader/textured visuals and directional orientation.\n"
                 f"   - scenes.gd: Multi-layered active world Node2D renderer built from hybrid procedural + textured geometry (`StudioRigHelper.create_tiled_polygon`), decomposed world elements, coherently integrated interactive landmarks, and atmospheric effects spanning the full multi-region `level_layout.json`.\n"
@@ -819,7 +871,7 @@ class LeadGameplaySWEAgent:
                 f"   - Every solid surface, obstacle, boundary wall, or interactive zone rendered visually MUST have matching `StaticBody2D`, `CollisionPolygon2D`, `CollisionShape2D`, or `Area2D` geometry aligned 1:1 with its visual representation so entities never clip through solid boundaries or float over empty space.\n"
                 f"9. ABSOLUTE BAN ON PRE-SOLVED t=0 LEVELS, PRE-WIRED DIORAMAS, SHALLOW TUTORIAL STUBS, SELF-PLAYING `sim_tick` / `playtest_timer` DEMO LOOPS & FAKE DISCONNECTED SIMULATIONS:\n"
                 f"   - DELIVER THE LARGER POINT OF THE GAME (NOT A TINY TUTORIAL SLICE): Onboarding is ONLY the opening 60 seconds of play; never reduce the game to a linear 4-step tutorial checklist or a single 1-click lock-and-key connection! Implement the full playable system described in `CORE LOOP` (`moment_to_moment_loop`, `minute_to_minute_loop`, `session_loop`, and `player_agency_and_optimization_depth`) and `GOAL HIERARCHY` (short-, mid-, and long-term goals) so the player has a genuine toolkit/sandbox to build, experiment, optimize, or strategize across multiple stages with no single pre-scripted solution.\n"
-                f"   - UNSOLVED t=0 BASELINE (`test_unsolved_baseline_t0`) — NEVER CORRUPT `_ready()` FOR QA SCREENSHOTS: `_ready()` at `t = 0` is the live starting state for the human player! NEVER pre-solve, pre-connect, pre-place completed player structures, or pre-complete the game objective inside `_ready()` (`is_completed` MUST be `false` and player-built connections/systems MUST start unbuilt/unsolved at `t=0`) just to make a downstream mechanic visible at tick 0 in a QA capture! The player (and QA `input_segments`) must actively construct, place, aim, connect, or trigger every state transition via real input.\n"
+                f"   - UNSOLVED t=0 BASELINE (`test_unsolved_baseline_t0`) & ZERO `func test_*()` POLLUTION IN `main.gd`: `_ready()` at `t = 0` in `main.gd` (`res://main.tscn`) is the live starting state for the human player! NEVER pre-solve, pre-connect, pre-place completed player structures, or pre-complete the game objective inside `_ready()` (`is_completed` MUST be `false` and player-built connections/systems MUST start unbuilt/unsolved at `t=0`) just to make a downstream mechanic visible at tick 0 in a QA capture, and NEVER add `func test_*()` scenario-staging helper functions to `main.gd`! Isolated QA scenario staging belongs strictly in `res://tests/test_<item_id>.gd` + `res://tests/test_<item_id>.tscn` authored by `qa_test_engineer` (or driven via `input_segments`).\n"
                 f"   - REAL INTERACTIVE VERBS & CAMERA NAVIGATION: Wire every player verb in the Game Bible's `core_loop.player_verbs` and active slice `scope_boundaries` (including mouse click/drag placement or connection via `InputEventMouseButton` / `get_global_mouse_position()`, keyboard actions, component socketing/tuning, and `Camera2D` panning/navigation when `world_bounds` exceeds 1280x720) to authentic `_unhandled_input` / `_input` / UI handlers. NEVER bind a fake tutorial-skip key (like `KEY_TAB`) that advances onboarding labels without the player performing the actual in-world mechanic that completes the step.\n"
                 f"   - NEVER write self-playing tick-sequenced or timer-sequenced demo loops in `_process` or `_physics_process` (e.g., `if sim_tick == 62:`, `if playtest_timer < 1.0:`, `handle_automated_playtest_cadence`, `auto_test_phase`, `current_demo_status`, `user_override_lockout`) that automatically trigger player actions, movement, choices, or objective resolutions on a frame counter or timer. All gameplay actions must be driven by real input handlers (`_input`, `_unhandled_input`, `Input.is_action_pressed`, `Input.is_key_pressed`), and test scenario staging is performed externally by the QA Test Renderer (`setup_calls` and `input_segments`).\n"
                 f"   - All systemic state transitions and mechanics MUST compute authentic state updates from the game's actual rules and entity interactions (`system_interactions`)—NEVER fake state completion out of thin air.\n"
@@ -836,9 +888,9 @@ class LeadGameplaySWEAgent:
                 f"Acceptance Criteria:\n{criteria_context}\n\n"
                 f"SELF-INQUIRY TOOL (`self_question` -> ContextCuratorAgent research -> `self_question_answer`):\n"
                 f"- If you need to verify an imported script's exact method/signal signature, node structure, shader uniform, or design spec that is not shown in your current context, do NOT guess!\n"
-                f"- Instead of outputting speculative code, output your specific question in `self_question` and leave `files` empty (`[]`).\n"
+                f"- Instead of outputting speculative code, output your specific question in `self_question` and leave `patches` and `files` empty (`[]`).\n"
                 f"- `ContextCuratorAgent` will bring in the relevant context chunks on the next turn so YOU can answer your own question in `self_question_answer`.\n"
-                f"- On the turn after asking a `self_question`, FIRST write your concise, factual answer in `self_question_answer` (which will be retained in your context going forward) and THEN output `files`.\n\n"
+                f"- On the turn after asking a `self_question`, FIRST write your concise, factual answer in `self_question_answer` (which will be retained in your context going forward) and THEN output `patches` (for existing files) and/or `files` (for brand-new files).\n\n"
                 f"EXISTING CARTRIDGE CODE IN STAGING:\n{existing_code_block}\n\n"
                 f"{prior_error_block}"
             )
@@ -927,7 +979,7 @@ class LeadGameplaySWEAgent:
                         raise CodeVerificationError(f"Empty response returned from Gemini for requirement track {track.id}")
 
                     bundle_dict = json.loads(response.text)
-                    if "files" in bundle_dict or "self_question" in bundle_dict:
+                    if "files" in bundle_dict or "patches" in bundle_dict or "self_question" in bundle_dict:
                         bundle = TrackCodeSynthesisPayload(**bundle_dict)
                     else:
                         bundle = OpenGenreCartridgeBundle(**bundle_dict)
@@ -974,8 +1026,8 @@ class LeadGameplaySWEAgent:
                         pass
                 pending_question_pack = None
 
-            # 2. If the agent emitted implementation files (or is OpenGenreCartridgeBundle), we are done!
-            if not isinstance(bundle, TrackCodeSynthesisPayload) or bundle.files:
+            # 2. If the agent emitted implementation files or surgical patches (or is OpenGenreCartridgeBundle), we are done!
+            if not isinstance(bundle, TrackCodeSynthesisPayload) or bundle.files or bundle.patches:
                 break
 
             # 3. Otherwise, if `files` is empty and the agent asked a `self_question`, have ContextCuratorAgent research it
@@ -1016,7 +1068,13 @@ class LeadGameplaySWEAgent:
                 raise last_exc
             raise StudioAgentError(f"LeadGameplaySWEAgent failed for requirement track {track.id}: {last_exc}") from last_exc
 
-        return bundle.assemble_cartridge_directory(staging_dir, swe_agent=self)
+        return bundle.assemble_cartridge_directory(
+            staging_dir,
+            swe_agent=self,
+            pre_write_hook=pre_write_hook,
+            commit_gate=commit_gate,
+            allowed_files=allowed_files,
+        )
 
     synthesize_requirement_track = implement_requirement_track
 
@@ -1263,9 +1321,13 @@ class LeadGameplaySWEAgent:
                 f"Return ONLY valid, corrected Python code without markdown tags or explanations.\n"
                 f"Ensure every class defines deliberation as its very first attribute."
             )
+            from google.genai import types
             response = self.client.models.generate_content(
                 model=self.model_name,
                 contents=prompt,
+                config=types.GenerateContentConfig(
+                    thinking_config=bounded_thinking_config(512),
+                ),
             )
             if not response.text:
                 raise CodeVerificationError(f"Empty response from Gemini code repair for {module_name}")
@@ -1356,9 +1418,13 @@ class LeadGameplaySWEAgent:
                                 f"Class code:\n```python\n{cls_src}\n```\n"
                                 f"Return ONLY the valid, corrected Python class code without markdown tags or explanations."
                             )
+                            from google.genai import types
                             resp = self.client.models.generate_content(
                                 model=self.model_name,
                                 contents=prompt,
+                                config=types.GenerateContentConfig(
+                                    thinking_config=bounded_thinking_config(512),
+                                ),
                             )
                             if resp.text:
                                 cand_code = resp.text.strip()
@@ -1442,22 +1508,27 @@ class LeadGameplaySWEAgent:
 
     def _extract_gd_peer_signatures(self, c_dir: Path, exclude_file: str = "") -> str:
         """Extracts class, func, static func, and const declarations from peer .gd files in c_dir
-        so repair_godot_module has accurate cross-module function & class signatures.
+        (recursively including `scenes/**` and `scripts/**`) so repair_godot_module has accurate
+        cross-module function & class signatures.
         """
         if not c_dir.is_dir():
             return ""
+        from engine.sim.godot_verifier import iter_cartridge_gd_files
+
         blocks: List[str] = []
-        for gd_path in sorted(c_dir.glob("*.gd")):
-            if gd_path.name == exclude_file:
+        norm_excl = (exclude_file or "").strip().replace("\\", "/").lstrip("/")
+        for gd_path in iter_cartridge_gd_files(c_dir, include_tests=False, exclude_helper_libs=True):
+            rel_name = gd_path.relative_to(c_dir).as_posix()
+            if rel_name == norm_excl or gd_path.name == norm_excl:
                 continue
             try:
                 sig_lines: List[str] = []
                 for idx, raw_line in enumerate(gd_path.read_text(encoding="utf-8").splitlines(), start=1):
                     stripped = raw_line.strip()
-                    if stripped.startswith(("extends ", "class_name ", "class ", "static func ", "func ", "const ", "signal ")):
+                    if stripped.startswith(("extends ", "class_name ", "class ", "static func ", "func ", "const ", "signal ", "var ", "@export ", "@onready ")):
                         sig_lines.append(f"  L{idx}: {raw_line}")
                 if sig_lines:
-                    blocks.append(f"[{gd_path.name} signatures]\n" + "\n".join(sig_lines[:60]))
+                    blocks.append(f"[{rel_name} signatures]\n" + "\n".join(sig_lines[:65]))
             except Exception:
                 continue
         return "\n\n".join(blocks)
@@ -1503,6 +1574,7 @@ class LeadGameplaySWEAgent:
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_schema=CodeRepairSpec,
+                        thinking_config=bounded_thinking_config(1024),
                     ),
                 )
                 repair_spec = CodeRepairSpec.model_validate_json(resp.text)
@@ -1952,16 +2024,23 @@ class LeadGameplaySWEAgent:
 
     def _build_cartridge_symbol_index(self, c_dir: Path) -> str:
         """Builds a compact structural symbol index (classes, functions, signals, constants, enums, member vars,
-        and external script/asset references with exact 1-indexed line numbers) across all .gd files in c_dir.
+        and external script/asset references with exact 1-indexed line numbers) across all .gd files in c_dir
+        (including subdirectories like scenes/ and scripts/).
         Avoids dumping full files or prose comments so the agent receives only high-signal structural context.
         """
         if not c_dir.is_dir():
             return ""
+        from engine.sim.godot_verifier import iter_cartridge_gd_files
+        from engine.studio.context_curator import CartridgeSemanticIndex
+
+        code_graph: Dict[str, Any] = {}
+        try:
+            code_graph = CartridgeSemanticIndex(c_dir).build_code_reference_graph()
+        except Exception:
+            code_graph = {}
+
         blocks: List[str] = []
-        gd_paths = list(sorted(c_dir.glob("*.gd")))
-        tests_dir = c_dir / "tests"
-        if tests_dir.is_dir():
-            gd_paths.extend(sorted(tests_dir.glob("*.gd")))
+        gd_paths = iter_cartridge_gd_files(c_dir, include_tests=True, exclude_helper_libs=True)
         for gd_path in gd_paths:
             try:
                 lines = gd_path.read_text(encoding="utf-8").splitlines()
@@ -1975,10 +2054,25 @@ class LeadGameplaySWEAgent:
                         if var_count < 40:
                             entry_lines.append(f"  L{idx:4d}: {raw_line}")
                             var_count += 1
-                    elif "preload(" in stripped or "load(" in stripped or "AssetLib" in stripped or "asset_library" in stripped or "GDScript.new()" in stripped:
+                    elif (
+                        "preload(" in stripped
+                        or "load(" in stripped
+                        or "AssetLib" in stripped
+                        or "asset_library" in stripped
+                        or "GDScript.new()" in stripped
+                        or "collision_layer" in stripped
+                        or "collision_mask" in stripped
+                        or "CanvasModulate" in stripped
+                    ):
                         entry_lines.append(f"  L{idx:4d}: {raw_line}")
-                rel_name = str(gd_path.relative_to(c_dir))
-                header = f"=== {rel_name} ({len(lines)} lines total) ==="
+                rel_name = gd_path.relative_to(c_dir).as_posix()
+                node_meta = code_graph.get(rel_name, {}) if isinstance(code_graph, dict) else {}
+                imports_list = node_meta.get("imports", [])
+                imported_by_list = node_meta.get("imported_by", [])
+                graph_suffix = ""
+                if imports_list or imported_by_list:
+                    graph_suffix = f" [imports={imports_list} | imported_by={imported_by_list}]"
+                header = f"=== {rel_name} ({len(lines)} lines total){graph_suffix} ==="
                 blocks.append(header + "\n" + "\n".join(entry_lines[:140]))
             except Exception:
                 continue
@@ -1992,12 +2086,12 @@ class LeadGameplaySWEAgent:
             clean = clean[len("res:/"):]
         clean = clean.lstrip("/")
         fname = Path(clean).name
-        if "/" in clean and fname in {"main.gd", "mechanics.gd", "scenes.gd", "entities.gd", "ui_hud.gd"}:
+        if "/" in clean and fname in {"main.gd", "mechanics.gd", "scenes.gd", "entities.gd", "ui_hud.gd", "main.tscn", "project.godot"}:
             clean = fname
         if clean:
             direct = c_dir / clean
             if direct.is_file():
-                return str(direct.relative_to(c_dir)), direct
+                return direct.relative_to(c_dir).as_posix(), direct
             if "/" in clean:
                 return clean, direct
         root_cand = c_dir / fname
@@ -2006,7 +2100,12 @@ class LeadGameplaySWEAgent:
         test_cand = c_dir / "tests" / fname
         if test_cand.is_file():
             return f"tests/{fname}", test_cand
-        return fname, root_cand
+        if fname:
+            from engine.sim.godot_verifier import iter_cartridge_gd_files
+            for gd_p in iter_cartridge_gd_files(c_dir, include_tests=True, exclude_helper_libs=False):
+                if gd_p.name == fname:
+                    return gd_p.relative_to(c_dir).as_posix(), gd_p
+        return (clean or fname), (c_dir / (clean or fname))
 
     def _extract_code_slice(self, c_dir: Path, req: CodeSliceRequest) -> str:
         """Extracts a bounded, line-numbered code slice from `req.filename` for PEV context inspection.
@@ -2117,52 +2216,18 @@ class LeadGameplaySWEAgent:
         self,
         c_dir: Path,
         patches: List[SurgicalCodePatch],
+        allowed_files: Optional[Set[str]] = None,
     ) -> Dict[str, Path]:
-        """Applies surgical line-range replacements to cartridge files in descending line order."""
-        updated: Dict[str, Path] = {}
-        patches_by_file: Dict[str, List[SurgicalCodePatch]] = {}
-        for p in patches:
-            rel_name, fpath = self._resolve_cartridge_gd_path(c_dir, p.filename)
-            if rel_name.endswith((".gd", ".tscn", ".gdshader")) and fpath.is_file():
-                patches_by_file.setdefault(rel_name, []).append(p)
+        """Applies surgical line-range replacements to cartridge files in descending line order,
+        using `target_snippet` anchoring when provided."""
+        from engine.studio.models import apply_surgical_patches_to_directory
 
-        for fname, file_patches in patches_by_file.items():
-            _, fpath = self._resolve_cartridge_gd_path(c_dir, fname)
-            if not fpath.is_file():
-                continue
-            lines = fpath.read_text(encoding="utf-8").splitlines()
-            total = len(lines)
-            # Sort descending by start_line so earlier line indices do not shift
-            sorted_patches = sorted(file_patches, key=lambda x: (x.start_line, x.end_line), reverse=True)
-            last_start = total + 1
-            applied_any = False
-
-            for patch in sorted_patches:
-                s = max(1, min(patch.start_line, total))
-                e = max(s, min(patch.end_line, total))
-                if e >= last_start:
-                    # Skip overlapping patch range in the same pass
-                    continue
-                cleaned_replacement: List[str] = []
-                for raw_line in patch.replacement_code.splitlines():
-                    # Strip accidental ' 123: ' line number prefix only if LLM echoed slice numbering
-                    if (
-                        len(raw_line) >= 6
-                        and raw_line[:4].strip().isdigit()
-                        and raw_line[4:6] == ": "
-                    ):
-                        cleaned_replacement.append(raw_line[6:])
-                    else:
-                        cleaned_replacement.append(raw_line)
-                lines[s - 1 : e] = cleaned_replacement
-                last_start = s
-                applied_any = True
-
-            if applied_any:
-                fpath.write_text("\n".join(lines) + "\n", encoding="utf-8")
-                updated[fname] = fpath
-
-        return updated
+        return apply_surgical_patches_to_directory(
+            target_dir=c_dir,
+            patches=patches,
+            allowed_files=allowed_files,
+            path_resolver=self._resolve_cartridge_gd_path,
+        )
 
     def debug_and_patch_pev_cycle(
         self,
@@ -2172,6 +2237,7 @@ class LeadGameplaySWEAgent:
         multimodal_parts: Optional[List[Any]] = None,
         pre_slice_requests: Optional[List[CodeSliceRequest]] = None,
         max_pev_cycles: int = 4,
+        allowed_files: Optional[Set[str]] = None,
     ) -> Dict[str, Path]:
         """Executes a disciplined Plan (Research) -> Execute (Inspect Slices & Surgical Patch) -> Verify
         loop without dumping full files at the LLM.
@@ -2180,7 +2246,7 @@ class LeadGameplaySWEAgent:
             return {}
 
         from google.genai import types
-        from engine.sim.godot_verifier import verify_godot_cartridge_syntax
+        from engine.sim.godot_verifier import iter_cartridge_gd_files, verify_godot_cartridge_syntax
         from engine.studio.asset_library import CartridgeAssetLibrary
 
         results: Dict[str, Path] = {}
@@ -2217,16 +2283,23 @@ class LeadGameplaySWEAgent:
                 d_file = getattr(d, "file_path", None)
                 d_line = int(getattr(d, "line_number", 1) or 1)
                 d_msg = getattr(d, "error_message", str(d))
-                fname = Path(d_file).name if d_file else "main.gd"
+                if d_file:
+                    try:
+                        raw_rel = Path(d_file).resolve().relative_to(c_dir.resolve()).as_posix()
+                    except Exception:
+                        raw_rel = str(d_file)
+                    fname, resolved_fpath = self._resolve_cartridge_gd_path(c_dir, raw_rel)
+                else:
+                    fname, resolved_fpath = "main.gd", c_dir / "main.gd"
                 diag_lines_text.append(f"- {fname}:{d_line} -> {d_msg}")
-                if (c_dir / fname).is_file():
+                if resolved_fpath.is_file():
                     err_slice = self._extract_code_slice(
                         c_dir,
                         CodeSliceRequest(
                             deliberation=f"Auto-extracted error window around {fname}:{d_line}",
                             filename=fname,
-                            start_line=max(1, d_line - 18),
-                            end_line=d_line + 18,
+                            start_line=max(1, d_line - 26),
+                            end_line=d_line + 26,
                         ),
                     )
                     if err_slice not in auto_slices:
@@ -2261,47 +2334,59 @@ class LeadGameplaySWEAgent:
 
             # -----------------------------------------------------------------
             # PEV PHASE 1: PLAN & RESEARCH (Request targeted code slices)
+            # Fast-path: When concrete compiler/runtime diagnostics already extracted
+            # the exact +/-26 line error windows into `auto_slices` on cycle 0 (and no
+            # multimodal defect images require open-ended research), skip the redundant
+            # Phase 1 LLM call and proceed directly to Phase 2 (which still supports
+            # `additional_slice_requests` on Hop 1 if another caller/callee is needed).
             # -----------------------------------------------------------------
-            research_prompt = (
-                f"You are the Lead Gameplay SWE Agent in PHASE 1 (PLAN & RESEARCH) of a PEV debugging cycle (Iteration {pev_cycle + 1}/{max_pev_cycles}).\n"
-                f"Do NOT guess blindly and do NOT request entire large files. Analyze the defect and the Cartridge Symbol Index below, "
-                f"formulate a root-cause hypothesis, and request ONLY the specific sub-block code slices (40-80 lines each) "
-                f"you need to inspect to craft a compact surgical fix.\n\n"
-                f"--- DEFECT TO RESOLVE ---\n{current_defect}\n\n"
-                f"{diag_section}"
-                f"{auto_slice_section}"
-                f"--- CARTRIDGE SYMBOL & REFERENCE INDEX ---\n{symbol_index}\n\n"
-                f"{asset_summary}\n"
-                f"Return a `DebugResearchPlan` with `deliberation` strictly first."
-            )
-
             plan: Optional[DebugResearchPlan] = None
-            for attempt in range(2):
-                try:
-                    resp_plan = call_gemini_with_transient_retry(
-                        lambda: self.client.models.generate_content(
-                            model=self.model_name,
-                            contents=research_prompt,
-                            config=types.GenerateContentConfig(
-                                response_mime_type="application/json",
-                                response_schema=DebugResearchPlan,
-                                thinking_config=bounded_thinking_config(1536),
+            if auto_slices and not multimodal_parts and pev_cycle == 0:
+                plan = DebugResearchPlan(
+                    deliberation="Auto-extracted compiler/runtime diagnostic windows provide direct line context for surgical patching.",
+                    root_cause_hypothesis=f"Resolve compiler/runtime diagnostics: {'; '.join(diag_lines_text[:4]) or current_defect[:240]}",
+                    slice_requests=[],
+                )
+            else:
+                research_prompt = (
+                    f"You are the Lead Gameplay SWE Agent in PHASE 1 (PLAN & RESEARCH) of a PEV debugging cycle (Iteration {pev_cycle + 1}/{max_pev_cycles}).\n"
+                    f"Do NOT guess blindly and do NOT request entire large files. Analyze the defect and the Cartridge Symbol Index below, "
+                    f"formulate a root-cause hypothesis, and request ONLY the specific sub-block code slices (40-80 lines each) "
+                    f"you need to inspect to craft a compact surgical fix.\n\n"
+                    f"--- DEFECT TO RESOLVE ---\n{current_defect}\n\n"
+                    f"{diag_section}"
+                    f"{auto_slice_section}"
+                    f"--- CARTRIDGE SYMBOL & REFERENCE INDEX ---\n{symbol_index}\n\n"
+                    f"{asset_summary}\n"
+                    f"Return a `DebugResearchPlan` with `deliberation` strictly first."
+                )
+
+                for attempt in range(2):
+                    try:
+                        resp_plan = call_gemini_with_transient_retry(
+                            lambda: self.client.models.generate_content(
+                                model=self.model_name,
+                                contents=research_prompt,
+                                config=types.GenerateContentConfig(
+                                    response_mime_type="application/json",
+                                    response_schema=DebugResearchPlan,
+                                    thinking_config=bounded_thinking_config(768),
+                                ),
                             ),
-                        ),
-                        max_transient_retries=0,
-                        label=f"LeadGameplaySWEAgent.pev_phase1[{c_dir.name}:iter{pev_cycle + 1}]",
-                        candidate_dir=c_dir,
-                    )
-                    if resp_plan.text:
-                        plan = DebugResearchPlan.model_validate_json(resp_plan.text)
-                        self.last_deliberation = plan.deliberation
-                        break
-                except StudioPausedError:
-                    raise
-                except Exception as exc:
-                    logger.warning("PEV Phase 1 (Research Plan) failed (attempt %d): %s", attempt + 1, exc)
-                    if attempt == 0 and is_transient_gemini_error(exc):
-                        time.sleep(1.5)
+                            max_transient_retries=0,
+                            label=f"LeadGameplaySWEAgent.pev_phase1[{c_dir.name}:iter{pev_cycle + 1}]",
+                            candidate_dir=c_dir,
+                        )
+                        if resp_plan.text:
+                            plan = DebugResearchPlan.model_validate_json(resp_plan.text)
+                            self.last_deliberation = plan.deliberation
+                            break
+                    except StudioPausedError:
+                        raise
+                    except Exception as exc:
+                        logger.warning("PEV Phase 1 (Research Plan) failed (attempt %d): %s", attempt + 1, exc)
+                        if attempt == 0 and is_transient_gemini_error(exc):
+                            time.sleep(1.5)
 
             if plan is None:
                 break
@@ -2354,7 +2439,7 @@ class LeadGameplaySWEAgent:
                                 config=types.GenerateContentConfig(
                                     response_mime_type="application/json",
                                     response_schema=SurgicalPatchPayload,
-                                    thinking_config=bounded_thinking_config(2048),
+                                    thinking_config=bounded_thinking_config(1024),
                                 ),
                             ),
                             max_transient_retries=0,
@@ -2385,7 +2470,9 @@ class LeadGameplaySWEAgent:
 
             applied_in_cycle = False
             if patch_payload and patch_payload.patches:
-                patched_files = self._apply_surgical_patches(c_dir, patch_payload.patches)
+                patched_files = self._apply_surgical_patches(
+                    c_dir, patch_payload.patches, allowed_files=allowed_files
+                )
                 if patched_files:
                     applied_in_cycle = True
                     results.update(patched_files)
@@ -2396,10 +2483,13 @@ class LeadGameplaySWEAgent:
             is_valid, new_diagnostics = verify_godot_cartridge_syntax(c_dir)
             # Also check if any file still contains broken `AssetLib.` calls
             lingering_assetlib: List[str] = []
-            for gd_p in sorted(c_dir.glob("*.gd")):
+            for gd_p in iter_cartridge_gd_files(c_dir, include_tests=False, exclude_helper_libs=True):
+                rel_gd = gd_p.relative_to(c_dir).as_posix()
+                if allowed_files is not None and rel_gd not in allowed_files:
+                    continue
                 for ln_idx, ln_txt in enumerate(gd_p.read_text(encoding="utf-8").splitlines(), start=1):
                     if "AssetLib." in ln_txt or "asset_library.gd" in ln_txt:
-                        lingering_assetlib.append(f"{gd_p.name}:{ln_idx}: references removed AssetLib/asset_library.gd (`{ln_txt.strip()}`)")
+                        lingering_assetlib.append(f"{rel_gd}:{ln_idx}: references removed AssetLib/asset_library.gd (`{ln_txt.strip()}`)")
 
             if is_valid and not lingering_assetlib:
                 TOKEN_USAGE_TRACKER.reset_swe_pev_streak()
@@ -2410,7 +2500,11 @@ class LeadGameplaySWEAgent:
             current_diagnostics = list(new_diagnostics)
             verify_feedback = []
             for d in new_diagnostics[:6]:
-                verify_feedback.append(f"{d.file_path.name}:{d.line_number}: {d.error_message}")
+                try:
+                    d_rel = d.file_path.resolve().relative_to(c_dir.resolve()).as_posix()
+                except Exception:
+                    d_rel = d.file_path.name
+                verify_feedback.append(f"{d_rel}:{d.line_number}: {d.error_message}")
             verify_feedback.extend(lingering_assetlib[:6])
             if not verify_feedback and not applied_in_cycle:
                 verify_feedback.append(
@@ -2814,8 +2908,12 @@ class LeadGameplaySWEAgent:
             critique_file = c_dir / "scene_critique_report.json"
             if scene_iter == 1 and critique_file.is_file():
                 try:
+                    from engine.sim.godot_verifier import iter_cartridge_gd_files
                     crit_mtime = critique_file.stat().st_mtime
-                    latest_gd_mtime = max((p.stat().st_mtime for p in c_dir.glob("*.gd")), default=0.0)
+                    latest_gd_mtime = max(
+                        (p.stat().st_mtime for p in iter_cartridge_gd_files(c_dir, include_tests=True)),
+                        default=0.0,
+                    )
                     if crit_mtime >= latest_gd_mtime:
                         critique = SceneCritiqueAndStrategySpec.model_validate_json(
                             critique_file.read_text(encoding="utf-8")
@@ -3035,11 +3133,15 @@ class LeadGameplaySWEAgent:
                 existing_layout = LevelLayoutSpec.model_validate_json(layout_path.read_text(encoding="utf-8"))
             except Exception:
                 existing_layout = None
-        if existing_layout is not None and not force_refresh:
-            prior_issues = validate_level_layout(existing_layout, strategy=strategy)
-            if not prior_issues:
-                return existing_layout
-            logger.info("Cached level_layout.json is invalid and will be regenerated: %s", prior_issues)
+        existing_is_valid = False
+        if existing_layout is not None:
+            existing_issues = validate_level_layout(existing_layout, strategy=strategy)
+            existing_is_valid = len(existing_issues) == 0
+            if not force_refresh:
+                if existing_is_valid:
+                    return existing_layout
+                prior_issues = existing_issues
+                logger.info("Cached level_layout.json is invalid and will be regenerated: %s", prior_issues)
 
         bible_text = compact_bible_json_for_prompt(raw_bible_text, mode="full")
         concept_parts = self._collect_concept_art_parts(c_dir)
@@ -3047,8 +3149,10 @@ class LeadGameplaySWEAgent:
         if guidance.strip():
             current = layout_path.read_text(encoding="utf-8") if layout_path.is_file() else ""
             guidance_block = (
-                f"COUNCIL / WORK-ITEM DIRECTION FOR THIS REVISION (integrate this additively into the full world layout; "
-                f"NEVER shrink `world_bounds` or drop existing `world_regions` from the world when revising a specific region or test chamber):\n{guidance.strip()}\n"
+                f"COUNCIL / WORK-ITEM DIRECTION FOR THIS REVISION (INCREMENTAL MERGE MODE):\n"
+                f"- When `CURRENT WORLD LAYOUT` is present below, your `world_regions`, `entities`, and `triggers` arrays are MERGED BY ID (`region_id`, `entity_id`, `trigger_id`) onto the existing layout!\n"
+                f"- DO NOT re-emit unchanged regions, entities, or triggers from `CURRENT WORLD LAYOUT`! Emit ONLY the newly added or modified `world_regions`, `entities`, and `triggers` (plus `remove_entity_ids` / `remove_trigger_ids` if any obsolete IDs must be deleted). All unchanged items are preserved automatically.\n"
+                f"{guidance.strip()}\n"
                 + (f"CURRENT WORLD LAYOUT TO EXPAND/REFINE:\n{current}\n" if current else "")
                 + "\n"
             )
@@ -3072,14 +3176,13 @@ class LeadGameplaySWEAgent:
                 "all `level_archetypes` and `world_structure` in `level_generation_strategy`. "
                 "On each `LevelRegionSpec`, set `archetype_id`, `procedural_chunk_grammar`, and `target_chunk_or_feature_count` when the strategy uses "
                 "runtime generation or repeated structural modules so `scenes.gd` knows how to populate each region.\n"
-                "- If a `CURRENT WORLD LAYOUT TO EXPAND/REFINE` is provided above, preserve existing regions and expand/refine the layout additively.\n"
+                "- If a `CURRENT WORLD LAYOUT TO EXPAND/REFINE` is provided above, output ONLY the added or modified `world_regions`, `entities`, and `triggers`—unchanged regions, entities, and triggers are merged automatically by ID.\n"
                 "ENTITIES: every distinct landmark, mechanism, region marker, spawn point and goal needed across ALL regions (including "
                 "everything visible in the concept art) must be a `LevelEntitySpec` with a unique id, exact world-space centre position and "
                 "size, initial state and associated asset id when applicable. Initial states must be UNSOLVED: no goal, mechanism or "
                 "objective may start already in its completed state — the player must cause every transition.\n"
                 "TRIGGERS: express every causal relationship as a `LevelTriggerSpec` between two DIFFERENT existing entities.\n"
-                "Rules: provide `deliberation` FIRST in every schema object (Rule 4); keep all entities inside `world_bounds`; "
-                "do not omit entities for brevity.\n\n"
+                "Rules: provide `deliberation` FIRST in every schema object (Rule 4); keep child item `deliberation` concise (1 sentence, <= 18 words); keep all entities inside `world_bounds`.\n\n"
                 f"{guidance_block}{feedback}"
                 f"--- GAME BIBLE ---\n{bible_text}\n"
             )
@@ -3091,14 +3194,18 @@ class LeadGameplaySWEAgent:
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_schema=LevelLayoutSpec,
-                        thinking_config=bounded_thinking_config(2048),
+                        thinking_config=bounded_thinking_config(1024),
                     ),
                 ),
                 label="LeadGameplaySWEAgent.formulate_level_layout",
             )
             if not resp.text:
                 raise StudioAgentError("Level layout generation returned an empty response")
-            layout = LevelLayoutSpec.model_validate_json(resp.text)
+            raw_layout = LevelLayoutSpec.model_validate_json(resp.text)
+            if existing_layout is not None and existing_is_valid and guidance.strip():
+                layout = merge_level_layout(existing_layout, raw_layout)
+            else:
+                layout = raw_layout
             prior_issues = validate_level_layout(layout, strategy=strategy)
             if existing_layout is not None and guidance.strip():
                 if layout.intended_world_scale_in_viewports < existing_layout.intended_world_scale_in_viewports * 0.9:
@@ -3158,6 +3265,7 @@ class LeadGameplaySWEAgent:
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=BeatPlanSpec,
+                thinking_config=bounded_thinking_config(1024),
             ),
         )
         if not resp.text:
@@ -3213,6 +3321,7 @@ class LeadGameplaySWEAgent:
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_schema=AtomicTestSynthesisPayload,
+                        thinking_config=bounded_thinking_config(1024),
                     ),
                 )
                 if not resp.text:
@@ -3308,6 +3417,7 @@ class LeadGameplaySWEAgent:
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=TrackAtomicDecompositionPlan,
+                thinking_config=bounded_thinking_config(1024),
             ),
         )
         plan = TrackAtomicDecompositionPlan.model_validate_json(resp.text)
@@ -3396,6 +3506,7 @@ class LeadGameplaySWEAgent:
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=AtomicTestSynthesisPayload,
+                thinking_config=bounded_thinking_config(1024),
             ),
         )
         payload = AtomicTestSynthesisPayload.model_validate_json(resp.text)
@@ -3496,6 +3607,7 @@ class LeadGameplaySWEAgent:
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_schema=SceneUnitVisualVerdict,
+                        thinking_config=bounded_thinking_config(512),
                     ),
                 )
                 if resp.text:
@@ -3772,10 +3884,16 @@ class LeadGameplaySWEAgent:
         return results
 
 
-    def _verify_and_heal_godot_syntax_and_probes(self, c_dir: Path) -> Dict[str, Path]:
+    def _verify_and_heal_godot_syntax_and_probes(
+        self,
+        c_dir: Path,
+        allowed_files: Optional[Set[str]] = None,
+    ) -> Dict[str, Path]:
         """Verifies Godot 4 syntax & 2-tick runtime execution across all .gd files in c_dir.
         When live Gemini client is active, uses the PEV surgical debugging cycle on the exact broken lines
         rather than dumping entire files; falls back to repair_godot_module for mock test clients.
+        When `allowed_files` is provided, only files within `allowed_files` may be modified so a worker
+        never mutates files locked by concurrent workers.
         Then re-injects telemetry probes from telemetry_manifest.json so Gate E remains satisfied.
         """
         from engine.sim.godot_verifier import verify_godot_cartridge_syntax
@@ -3785,15 +3903,20 @@ class LeadGameplaySWEAgent:
         self._last_syntax_heal_failed = False
         if not is_valid and diagnostics:
             if self._is_live_genai_client():
-                diag_summary = "\n".join(
-                    f"- {d.file_path.name}:{d.line_number}: {d.error_message}"
-                    for d in diagnostics[:8]
-                )
+                diag_lines = []
+                for d in diagnostics[:8]:
+                    try:
+                        d_rel = d.file_path.resolve().relative_to(c_dir.resolve()).as_posix()
+                    except Exception:
+                        d_rel = d.file_path.name
+                    diag_lines.append(f"- {d_rel}:{d.line_number}: {d.error_message}")
+                diag_summary = "\n".join(diag_lines)
                 pev_res = self.debug_and_patch_pev_cycle(
                     c_dir=c_dir,
                     defect_summary=f"Fix Godot 4 compiler and runtime script errors:\n{diag_summary}",
                     initial_diagnostics=diagnostics,
                     max_pev_cycles=4,
+                    allowed_files=allowed_files,
                 )
                 results.update(pev_res)
                 post_valid, _ = verify_godot_cartridge_syntax(c_dir)
@@ -3806,23 +3929,35 @@ class LeadGameplaySWEAgent:
                     diags_by_file: Dict[Path, List[str]] = {}
                     for diag in diagnostics:
                         if diag.file_path.is_file():
+                            try:
+                                rel_diag = diag.file_path.resolve().relative_to(c_dir.resolve()).as_posix()
+                            except Exception:
+                                rel_diag = diag.file_path.name
+                            if allowed_files is not None and rel_diag not in allowed_files:
+                                continue
                             entry = f"Line {diag.line_number}: {diag.error_message} (Raw: {diag.raw_line})"
                             diags_by_file.setdefault(diag.file_path, []).append(entry)
+                    if not diags_by_file:
+                        break
                     for file_path, diag_entries in diags_by_file.items():
+                        try:
+                            rel_key = file_path.resolve().relative_to(c_dir.resolve()).as_posix()
+                        except Exception:
+                            rel_key = file_path.name
                         broken_src = file_path.read_text(encoding="utf-8")
                         combined_diag = "\n".join(diag_entries)
-                        peer_ctx = self._extract_gd_peer_signatures(c_dir, exclude_file=file_path.name)
+                        peer_ctx = self._extract_gd_peer_signatures(c_dir, exclude_file=rel_key)
                         fixed_src = self.repair_godot_module(
-                            file_path.name,
+                            rel_key,
                             broken_src,
                             combined_diag,
                             peer_context=peer_ctx,
                         )
                         file_path.write_text(fixed_src, encoding="utf-8")
-                        results[file_path.name] = file_path
+                        results[rel_key] = file_path
 
         manifest_path = c_dir / "telemetry_manifest.json"
-        if manifest_path.is_file():
+        if manifest_path.is_file() and (allowed_files is None or "main.gd" in allowed_files):
             try:
                 from engine.studio.telemetry_architect import TelemetryArchitectAgent
                 from engine.studio.models import TelemetryProbeDesignSpec

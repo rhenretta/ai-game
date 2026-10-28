@@ -223,6 +223,35 @@ def _evaluate_qa_state_assertions(
         )
 
 
+def format_filmstrip_telemetry_progression(strip_path: Path) -> str:
+    """Formats the per-frame input and telemetry state progression saved alongside `strip_path`
+    (`.telemetry.json`) so TaskLead, SWE, QA, and Council reviewers see exact coordinates and state values."""
+    import json as _json
+
+    sidecar = Path(strip_path).with_suffix(".telemetry.json")
+    if not sidecar.is_file():
+        return ""
+    try:
+        data = _json.loads(sidecar.read_text(encoding="utf-8"))
+        frames = data.get("frames") if isinstance(data, dict) else None
+        if not isinstance(frames, list) or not frames:
+            return ""
+        parts: List[str] = []
+        for f in frames:
+            if not isinstance(f, dict):
+                continue
+            t = f.get("tick")
+            act = f.get("active_inputs") or "in:[idle]"
+            snap = f.get("snapshot_summary") or ""
+            if snap:
+                parts.append(f"tick {t} ({act}): {snap}")
+            else:
+                parts.append(f"tick {t} ({act})")
+        return "Captured Frame Telemetry: " + " -> ".join(parts) if parts else ""
+    except Exception:
+        return ""
+
+
 def capture_filmstrip(
     cartridge_dir: Path,
     ticks: List[int],
@@ -299,6 +328,7 @@ def capture_filmstrip(
     row_h = cell[1] + label_h + footer_h
     strip = Image.new("RGB", (cols * cell[0], rows * row_h), (24, 28, 36))
     draw = ImageDraw.Draw(strip)
+    frame_telemetry_records: List[Dict[str, Any]] = []
     for i, (t, p) in enumerate(frames):
         with Image.open(p) as im:
             thumb = im.convert("RGB").resize(cell, Image.Resampling.LANCZOS)
@@ -311,14 +341,34 @@ def capture_filmstrip(
             outline=(90, 105, 130),
             width=1,
         )
-        header_txt = f"[QA] tick {t}  {_active_inputs_at_tick(t, input_script, setup_script)}"
+        active_in = _active_inputs_at_tick(t, input_script, setup_script)
+        header_txt = f"[QA] tick {t}  {active_in}"
         draw.text((x + 6, y + 3), header_txt[:62], fill=(240, 240, 240))
+        snap_d = tick_snaps.get(t) if isinstance(tick_snaps.get(t), dict) else None
+        snap_txt_full = _format_snapshot_footer(snap_d, max_chars=96)
         if footer_h > 0:
-            snap_txt = _format_snapshot_footer(tick_snaps.get(t))
+            snap_txt = snap_txt_full[:58]
             if snap_txt:
                 draw.text((x + 6, y + label_h + cell[1] + 2), f"[QA] {snap_txt}"[:62], fill=(140, 215, 245))
+        frame_telemetry_records.append(
+            {
+                "tick": t,
+                "active_inputs": active_in,
+                "snapshot_summary": snap_txt_full,
+                "player_pos": snap_d.get("player_pos") if isinstance(snap_d, dict) else None,
+            }
+        )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     strip.save(out_path, "PNG")
+    try:
+        import json as _json
+
+        out_path.with_suffix(".telemetry.json").write_text(
+            _json.dumps({"ticks": [t for t, _ in frames], "frames": frame_telemetry_records}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
     _evaluate_qa_state_assertions(tick_snaps, state_assertions)
 

@@ -651,6 +651,8 @@ class CartridgeSemanticIndex:
                     except Exception:
                         pass
 
+        from engine.studio.proofs import format_filmstrip_telemetry_progression
+
         for bit in raw_board_items:
             iid = str(bit.get("item_id") or "").strip()
             if not iid:
@@ -658,17 +660,21 @@ class CartridgeSemanticIndex:
             revs = bit.get("revisions") or []
             latest_proof_img = ""
             rev_summaries: List[str] = []
+            telemetry_summaries: List[str] = []
             if isinstance(revs, list):
                 for r in revs[-2:]:
                     if isinstance(r, dict):
                         rev_summaries.append(
                             f"rev {r.get('revision_index', 0) + 1}: verdict={r.get('verdict') or 'pending'} | "
-                            f"notes={str(r.get('worker_notes') or '')[:300]} | feedback={str(r.get('feedback') or '')[:600]}"
+                            f"notes={str(r.get('worker_notes') or '')[:1000]} | feedback={str(r.get('feedback') or '')[:900]}"
                         )
                         for pp in (r.get("proof_paths") or []):
                             cand_p = Path(pp) if Path(pp).is_absolute() else (self.cartridge_dir / str(pp))
-                            if cand_p.is_file():
+                            if cand_p.is_file() and cand_p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
                                 latest_proof_img = str(cand_p)
+                                t_prog = format_filmstrip_telemetry_progression(cand_p)
+                                if t_prog and t_prog not in telemetry_summaries:
+                                    telemetry_summaries.append(t_prog)
             target_mods = bit.get("target_modules") or bit.get("owned_files") or []
             _add(
                 ContextChunk(
@@ -683,11 +689,79 @@ class CartridgeSemanticIndex:
                         f"Target Modules: {target_mods}\n"
                         f"Spec: {bit.get('spec', '')}\n"
                         f"Proof Spec: {bit.get('proof_spec', '')}\n"
-                        + (f"Recent Revisions:\n  " + "\n  ".join(rev_summaries) if rev_summaries else "")
+                        + (f"Recent Revisions:\n  " + "\n  ".join(rev_summaries) + "\n" if rev_summaries else "")
+                        + ("\n".join(telemetry_summaries) if telemetry_summaries else "")
                     ),
                     associated_image_path=latest_proof_img,
                 )
             )
+
+            # 5b. Build Execution Traces (`lead_trace_rev*.json`), Specialist Code Diffs & QA Telemetry Sidecars
+            safe_iid = re.sub(r"[^a-z0-9_]+", "_", iid.lower()).strip("_")
+            item_trace_dir = self.cartridge_dir / "artifacts" / "work_items" / safe_iid
+            if item_trace_dir.is_dir():
+                trace_files = sorted(
+                    item_trace_dir.glob("lead_trace_rev*.json"),
+                    key=lambda p: (
+                        int(m.group(1)) if (m := re.search(r"rev(\d+)", p.stem)) else -1,
+                        p.name,
+                    ),
+                )
+                trace_lines: List[str] = []
+                for tf in trace_files[-2:]:
+                    try:
+                        t_data = json.loads(tf.read_text(encoding="utf-8"))
+                    except Exception:
+                        continue
+                    if not isinstance(t_data, dict):
+                        continue
+                    t_rev = t_data.get("revision", 0)
+                    t_status = t_data.get("status", "")
+                    t_strat = str(t_data.get("current_strategy") or "")[:300]
+                    trace_lines.append(f"=== Execution Trace `{tf.name}` (rev={t_rev}, status={t_status}) ===")
+                    if t_strat:
+                        trace_lines.append(f"  Lead Strategy: {t_strat}")
+                    for turn in (t_data.get("turns") or [])[-6:]:
+                        if not isinstance(turn, dict):
+                            continue
+                        t_idx = turn.get("turn_index", 0)
+                        t_agent = turn.get("specialist_agent", "")
+                        t_brief = str(turn.get("brief") or "").replace("\n", " ")[:320]
+                        t_sum = str(turn.get("summary") or "").replace("\n", " ")[:420]
+                        t_files = turn.get("touched_files") or []
+                        trace_lines.append(
+                            f"  [Turn {t_idx} -> {t_agent}] touched={t_files}\n"
+                            f"    Brief: {t_brief}\n"
+                            f"    Outcome: {t_sum}"
+                        )
+                        diffs = turn.get("code_diffs")
+                        if isinstance(diffs, dict) and diffs:
+                            for d_file, d_text in list(diffs.items())[:4]:
+                                changed_lines = [
+                                    ln
+                                    for ln in str(d_text or "").splitlines()
+                                    if (ln.startswith("+") or ln.startswith("-"))
+                                    and not ln.startswith("+++")
+                                    and not ln.startswith("---")
+                                ]
+                                if changed_lines:
+                                    snippet = "\n      ".join(changed_lines[:18])
+                                    trace_lines.append(f"    Diff `{d_file}`:\n      {snippet}")
+                for strip_png in sorted(item_trace_dir.glob("*filmstrip*.png"))[-2:]:
+                    t_prog = format_filmstrip_telemetry_progression(strip_png)
+                    if t_prog:
+                        trace_lines.append(t_prog)
+                        latest_proof_img = str(strip_png)
+                if trace_lines:
+                    _add(
+                        ContextChunk(
+                            chunk_id=f"board:trace:{iid}",
+                            category="board_item",
+                            title=f"Build Execution Trace, Specialist Code Diffs & QA Telemetry for [{iid}]",
+                            content="\n".join(trace_lines)[:4800],
+                            associated_image_path=latest_proof_img,
+                        )
+                    )
 
         # 6. On-Disk GDScript / Shader / Scene Modules & Bidirectional Reference Graph
         code_graph = self.build_code_reference_graph()
@@ -764,11 +838,23 @@ class CartridgeSemanticIndex:
                 if rel_str not in imported_by_map[r]:
                     imported_by_map[r].append(rel_str)
 
+        from engine.studio.workers import _extract_gd_input_and_layer_semantics
+
         graph: Dict[str, Dict[str, Any]] = {}
         for rel_str, src in raw_sources.items():
             classes = re.findall(r"^\s*class\s+([A-Za-z0-9_]+)", src, flags=re.MULTILINE)
             signals = re.findall(r"^\s*signal\s+([A-Za-z0-9_]+(?:\([^)]*\))?)", src, flags=re.MULTILINE)
             funcs = re.findall(r"^\s*(?:static\s+)?func\s+([A-Za-z0-9_]+)\s*\(([^)]*)\)", src, flags=re.MULTILINE)
+            const_lines: List[str] = []
+            for m_const in re.finditer(
+                r"^const\s+([A-Za-z0-9_]+(?:\s*:\s*[A-Za-z0-9_]+)?\s*=\s*[^\n#]+)",
+                src,
+                flags=re.MULTILINE,
+            ):
+                c_decl = m_const.group(1).strip()
+                if len(c_decl) > 80:
+                    c_decl = c_decl[:77] + "..."
+                const_lines.append(c_decl)
             var_lines: List[str] = []
             for m_var in re.finditer(
                 r"^(?:@onready\s+|@export\s+)?var\s+([A-Za-z0-9_]+(?:\s*:\s*[A-Za-z0-9_]+)?(?:\s*=\s*[^\n#]+)?)",
@@ -779,6 +865,10 @@ class CartridgeSemanticIndex:
                 if len(v_decl) > 80:
                     v_decl = v_decl[:77] + "..."
                 var_lines.append(v_decl)
+            input_bindings: List[str] = []
+            layer_lines: List[str] = []
+            if rel_str.endswith(".gd"):
+                input_bindings, layer_lines = _extract_gd_input_and_layer_semantics(src)
             uniforms = re.findall(
                 r"^\s*uniform\s+([A-Za-z0-9_]+\s+[A-Za-z0-9_]+(?:\s*:\s*[^=;\n]+)?(?:\s*=\s*[^;\n]+)?)",
                 src,
@@ -797,8 +887,14 @@ class CartridgeSemanticIndex:
                 summary_lines.append(f"Signals: {signals[:16]}")
             if classes:
                 summary_lines.append(f"Inner Classes: {classes[:12]}")
+            if const_lines:
+                summary_lines.append(f"Constants: {const_lines[:18]}")
             if var_lines:
                 summary_lines.append(f"Top-Level Vars & Defaults: {var_lines[:28]}")
+            if input_bindings:
+                summary_lines.append(f"Input Action / Key Bindings (`KEY_*` / `Input.* -> effect`): {input_bindings[:18]}")
+            if layer_lines:
+                summary_lines.append(f"Collision Layers/Masks, z_index & CanvasModulate: {layer_lines[:16]}")
             if uniforms:
                 summary_lines.append(f"Shader Uniforms: {uniforms[:20]}")
             if bound_assets:
@@ -815,6 +911,53 @@ class CartridgeSemanticIndex:
                 "summary_content": "\n".join(summary_lines),
             }
         return graph
+
+    def get_transitive_related_modules(
+        self,
+        seed_modules: Sequence[str],
+        max_hops: int = 2,
+        code_graph: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> List[str]:
+        """Walks `imports` and `imported_by` edges in `build_code_reference_graph()` up to `max_hops`
+        starting from `seed_modules` (normalizing `res://` prefixes and bare basenames) and returns
+        all discovered module relative paths in BFS order."""
+        graph = code_graph if code_graph is not None else self.build_code_reference_graph()
+        if not graph:
+            return []
+        by_basename: Dict[str, List[str]] = {}
+        for k in graph:
+            by_basename.setdefault(Path(k).name, []).append(k)
+
+        queue: List[Tuple[str, int]] = []
+        visited: List[str] = []
+        for raw_seed in seed_modules:
+            s = str(raw_seed or "").strip().replace("\\", "/")
+            if s.startswith("res://"):
+                s = s[len("res://"):]
+            elif s.startswith("res:/"):
+                s = s[len("res:/"):]
+            s = s.lstrip("/")
+            if not s:
+                continue
+            resolved_seeds = [s] if s in graph else by_basename.get(Path(s).name, [])
+            for rs in resolved_seeds:
+                if rs not in visited:
+                    visited.append(rs)
+                    queue.append((rs, 0))
+
+        idx = 0
+        while idx < len(queue):
+            cur_mod, depth = queue[idx]
+            idx += 1
+            if depth >= max_hops:
+                continue
+            meta = graph.get(cur_mod) or {}
+            neighbors = list(meta.get("imports") or []) + list(meta.get("imported_by") or [])
+            for nb in neighbors:
+                if nb in graph and nb not in visited:
+                    visited.append(nb)
+                    queue.append((nb, depth + 1))
+        return visited
 
     def _load_embedding_cache(self) -> Dict[str, List[float]]:
         if not self.index_path.is_file():
@@ -1068,6 +1211,21 @@ class ContextCuratorAgent:
         trace_dir = (self.cartridge_dir / "artifacts" / "work_items" / safe_item) if safe_item else None
         cache_file = (trace_dir / f"context_pack_{cache_role}.json") if trace_dir is not None else None
 
+        intra_rev_sig = f"rev={current_rev}"
+        if trace_dir is not None and trace_dir.is_dir():
+            try:
+                active_trace = trace_dir / f"lead_trace_rev{current_rev}.json"
+                turn_count = 0
+                if active_trace.is_file():
+                    raw_t = json.loads(active_trace.read_text(encoding="utf-8"))
+                    if isinstance(raw_t, dict):
+                        turn_count = len(raw_t.get("turns") or [])
+                strip_files = sorted(trace_dir.glob("*filmstrip*.png"))
+                latest_strip_name = strip_files[-1].name if strip_files else ""
+                intra_rev_sig = f"rev={current_rev}|turns={turn_count}|strip={latest_strip_name}"
+            except Exception:
+                pass
+
         with _CURATOR_CACHE_LOCK:
             if reuse_revision_cache and cache_file is not None and cache_file.is_file():
                 try:
@@ -1075,6 +1233,7 @@ class ContextCuratorAgent:
                     if (
                         isinstance(cached, dict)
                         and cached.get("revision") == current_rev
+                        and cached.get("intra_rev_sig", f"rev={current_rev}") == intra_rev_sig
                         and cached.get("prompt_block")
                         and isinstance(cached.get("decision"), dict)
                     ):
@@ -1090,17 +1249,27 @@ class ContextCuratorAgent:
                         ]
                         chosen_image_paths: List[str] = []
                         for ip in (cached.get("selected_image_paths") or []):
-                            if ip and Path(ip).is_file() and str(ip) not in chosen_image_paths:
+                            if (
+                                ip
+                                and Path(ip).is_file()
+                                and Path(ip).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+                                and str(ip) not in chosen_image_paths
+                            ):
                                 chosen_image_paths.append(str(ip))
                         for ep in list(extra_image_paths or [])[-3:]:
-                            if ep and Path(ep).is_file() and str(ep) not in chosen_image_paths:
+                            if (
+                                ep
+                                and Path(ep).is_file()
+                                and Path(ep).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+                                and str(ep) not in chosen_image_paths
+                            ):
                                 chosen_image_paths.append(str(ep))
                         multimodal_parts: List[Any] = []
                         for img_str in chosen_image_paths:
                             p = Path(img_str)
-                            if not p.is_file():
+                            if not p.is_file() or p.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
                                 continue
-                            mime = "image/jpeg" if p.suffix.lower() in (".jpg", ".jpeg") else "image/png"
+                            mime = "image/jpeg" if p.suffix.lower() in (".jpg", ".jpeg") else ("image/webp" if p.suffix.lower() == ".webp" else "image/png")
                             n_low = p.name.lower()
                             qa_overlay_note = ""
                             if n_low.startswith("plate_"):
@@ -1152,22 +1321,35 @@ class ContextCuratorAgent:
             ranked_pairs = self.semantic_index.semantic_search(queries=queries, chunks=all_chunks, top_k=22)
             candidate_chunks = [c for c, _ in ranked_pairs]
             chunks_by_id: Dict[str, ContextChunk] = {c.chunk_id: c for c in candidate_chunks}
-            effective_extra_images: List[str] = list(extra_image_paths or [])
+            effective_extra_images: List[str] = [
+                str(ep)
+                for ep in (extra_image_paths or [])
+                if ep and Path(ep).is_file() and Path(ep).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+            ]
+            if trace_dir is not None and trace_dir.is_dir():
+                for strip_p in sorted(trace_dir.glob("*filmstrip*.png"))[-2:]:
+                    if str(strip_p) not in effective_extra_images:
+                        effective_extra_images.append(str(strip_p))
             if item_id:
-                own_board_cid = f"board:item:{item_id}"
-                for ch in all_chunks:
-                    if ch.chunk_id == own_board_cid:
-                        if own_board_cid not in chunks_by_id:
-                            ranked_pairs.insert(0, (ch, 1.0))
-                            candidate_chunks.insert(0, ch)
-                            chunks_by_id[own_board_cid] = ch
-                        if ch.associated_image_path and Path(ch.associated_image_path).is_file():
-                            if ch.associated_image_path not in effective_extra_images:
-                                effective_extra_images.insert(0, ch.associated_image_path)
-                        break
+                for pinned_cid in (f"board:trace:{item_id}", f"board:item:{item_id}"):
+                    for ch in all_chunks:
+                        if ch.chunk_id == pinned_cid:
+                            if pinned_cid not in chunks_by_id:
+                                ranked_pairs.insert(0, (ch, 1.0))
+                                candidate_chunks.insert(0, ch)
+                                chunks_by_id[pinned_cid] = ch
+                            if (
+                                ch.associated_image_path
+                                and Path(ch.associated_image_path).is_file()
+                                and Path(ch.associated_image_path).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+                            ):
+                                if ch.associated_image_path not in effective_extra_images:
+                                    effective_extra_images.insert(0, ch.associated_image_path)
+                            break
 
-            # Traverse 1-2 hops of the code reference graph (imports & imported_by) from target modules
-            # so any file referenced by or referencing the task's files is presented to the Curator LLM.
+            # Traverse up to 3 hops of the code reference graph (imports & imported_by) from target modules
+            # so any file referenced by or referencing the task's files (including 2-3 hop actor/physics dependencies
+            # like `main.gd -> entities.gd -> scenes/vehicles/tug_controller.gd`) is presented to the Curator LLM.
             code_graph = self.semantic_index.build_code_reference_graph()
             all_by_cid: Dict[str, ContextChunk] = {c.chunk_id: c for c in all_chunks}
             seed_mods: List[str] = []
@@ -1207,11 +1389,22 @@ class ContextCuratorAgent:
                     if imp_by in code_graph and imp_by not in graph_relations:
                         graph_relations[imp_by] = f"imports `{sm}`"
                         hop1_mods.append(imp_by)
+            hop2_mods: List[str] = []
             for h1 in hop1_mods:
                 meta = code_graph.get(h1) or {}
                 for imp in meta.get("imports", []):
                     if imp in code_graph and imp not in graph_relations:
                         graph_relations[imp] = f"2-hop import via `{h1}`"
+                        hop2_mods.append(imp)
+                for imp_by in meta.get("imported_by", []):
+                    if imp_by in code_graph and imp_by not in graph_relations:
+                        graph_relations[imp_by] = f"2-hop importer via `{h1}`"
+                        hop2_mods.append(imp_by)
+            for h2 in hop2_mods:
+                meta = code_graph.get(h2) or {}
+                for imp in meta.get("imports", []):
+                    if imp in code_graph and imp not in graph_relations:
+                        graph_relations[imp] = f"3-hop import via `{h2}`"
 
             for rel_mod, rel_reason in graph_relations.items():
                 cid = f"code:module:{rel_mod}"
@@ -1232,10 +1425,14 @@ class ContextCuratorAgent:
             # Collect available multimodal images from candidate chunks + any explicit `extra_image_paths`
             available_images: Dict[str, str] = {}
             for c in candidate_chunks:
-                if c.associated_image_path and Path(c.associated_image_path).is_file():
+                if (
+                    c.associated_image_path
+                    and Path(c.associated_image_path).is_file()
+                    and Path(c.associated_image_path).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+                ):
                     available_images[c.associated_image_path] = f"From {c.chunk_id} ({c.title})"
             for ep in effective_extra_images:
-                if ep and Path(ep).is_file():
+                if ep and Path(ep).is_file() and Path(ep).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
                     available_images[str(ep)] = f"Captured proof / prior revision image ({Path(ep).name})"
 
             candidate_lines: List[str] = []
@@ -1244,7 +1441,7 @@ class ContextCuratorAgent:
                 candidate_lines.append(
                     f"--- CHUNK id='{c.chunk_id}' category='{c.category}' similarity={sim:.3f}{img_tag} ---\n"
                     f"Title: {c.title}\n"
-                    f"{c.content[:1800]}\n"
+                    f"{c.content[:2400]}\n"
                 )
 
             images_block = (
@@ -1256,8 +1453,8 @@ class ContextCuratorAgent:
             prompt = (
                 f"You are the Studio Context Generator & Curator Agent.\n"
                 f"Your job is to inspect the semantically retrieved candidate chunks (spanning on-disk assets, Writers' Room council "
-                f"conversations, Game Bible & Rendering Strategy treatments, Production Board items, and GDScript code modules) and "
-                f"decide the exact context and multimodal images to inject for the target agent.\n\n"
+                f"conversations, Game Bible & Rendering Strategy treatments, Production Board items, build execution traces `board:trace:*`, "
+                f"and GDScript code modules) and decide the exact context and multimodal images to inject for the target agent.\n\n"
                 f"TARGET AGENT ROLE: {target_agent_role}\n"
                 f"WORK ITEM: id='{item_id}' kind='{item_kind}'\n"
                 f"TASK REQUEST / BRIEF:\n{task_request}\n\n"
@@ -1267,19 +1464,29 @@ class ContextCuratorAgent:
                 + "\n".join(candidate_lines)
                 + "\nINSTRUCTIONS:\n"
                 f"1. Select ONLY the chunks (`selected_chunk_ids`) that `{target_agent_role}` genuinely needs to execute or review `{item_id}` with high visual, mechanical, and architectural fidelity:\n"
+                f"   - Include `board:item:{item_id}`, `board:trace:...`, or other `board:item:...` chunks when `{target_agent_role}` needs to know the task spec, prior revision diffs, or captured frame telemetry.\n"
                 f"   - Include relevant Council utterances (`council:utterance:...`) where the Council discussed this feature, entity, level, or aesthetic.\n"
                 f"   - Include the relevant `design:rendering:treatment:...` and `design:visual_style_and_layers` / `asset:concept_mockup:...` chunks whenever `{target_agent_role}` is planning, building, or reviewing visual assets, entities, levels (`level_map`), mechanics, or UI.\n"
-                f"   - Include relevant `asset:catalog:...` and `board:item:...` chunks so `{target_agent_role}` knows which sprites/rigs/props already exist on disk vs. which are queued on the ProductionBoard.\n"
-                f"   - Inspect `code:module:...` chunks (especially `[GRAPH-LINKED: ...]` modules imported by or importing the task's target files) and include any referenced modules whose classes, variables, UI overlays, or signals interact with this task.\n"
-                f"2. In `selected_image_paths`, select the 16:9 Concept Art Mockup image path whenever `{target_agent_role}` is planning, implementing, fabricating, or reviewing visual, level, entity, or UI work, plus any relevant fabricated sprite plates or captured proof images.\n"
-                f"3. In `role_tailored_synthesis`, write a concise, high-signal synthesis specifically for `{target_agent_role}` connecting the Council's discussion, the target visual/rendering aesthetic, and the exact asset/code contracts for `{item_id}`.\n"
+                f"   - Include relevant `asset:catalog:...` chunks so `{target_agent_role}` knows which sprites/rigs/props already exist on disk.\n"
+                f"   - Inspect `code:module:...` chunks (especially `[GRAPH-LINKED: ...]` modules imported by or importing the task's target files, plus actor controllers whose input bindings, collision layers, or physics interact with this task) and include any referenced modules needed for cross-file root-cause diagnosis.\n"
+                f"2. In `selected_image_paths`, select the 16:9 Concept Art Mockup image path whenever `{target_agent_role}` is planning, implementing, fabricating, or reviewing visual, level, entity, or UI work, plus any relevant fabricated sprite plates or captured proof filmstrip images.\n"
+                f"3. In `role_tailored_synthesis`, write a concise, high-signal synthesis specifically for `{target_agent_role}` connecting the Council's discussion, prior build execution traces / frame telemetry coordinates, the target visual/rendering aesthetic, and the exact cross-file asset/code contracts (including input bindings and collision layers) for `{item_id}`.\n"
                 f"Provide `deliberation` FIRST."
             )
 
+            curator_multimodal_parts: List[Any] = []
+            for ep in effective_extra_images[-2:]:
+                ep_path = Path(ep)
+                if ep_path.is_file() and ep_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
+                    mime = "image/jpeg" if ep_path.suffix.lower() in (".jpg", ".jpeg") else ("image/webp" if ep_path.suffix.lower() == ".webp" else "image/png")
+                    curator_multimodal_parts.append(f"ATTACHED PROOF / REFERENCE IMAGE ({ep_path.name}):")
+                    curator_multimodal_parts.append(types.Part.from_bytes(data=ep_path.read_bytes(), mime_type=mime))
+
+            curator_contents: Any = ([prompt] + curator_multimodal_parts) if curator_multimodal_parts else prompt
             resp = call_gemini_with_transient_retry(
                 lambda: self.client.models.generate_content(
                     model=self.model_name,
-                    contents=prompt,
+                    contents=curator_contents,
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_schema=ContextCuratorDecision,
@@ -1294,7 +1501,7 @@ class ContextCuratorAgent:
                 )
             decision = ContextCuratorDecision.model_validate_json(resp.text)
 
-            # Resolve selected chunks (preserving curator order, falling back to top-ranked if none matched)
+            # Resolve selected chunks strictly from the Curator LLM's `selected_chunk_ids` decision
             chosen_chunks: List[ContextChunk] = []
             seen_cids: set[str] = set()
             for cid in decision.selected_chunk_ids:
@@ -1310,22 +1517,31 @@ class ContextCuratorAgent:
             chosen_image_paths = []
             for ip in decision.selected_image_paths:
                 cand_p = Path(ip) if Path(ip).is_absolute() else (self.cartridge_dir / ip)
-                if cand_p.is_file() and str(cand_p) not in chosen_image_paths:
+                if (
+                    cand_p.is_file()
+                    and cand_p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+                    and str(cand_p) not in chosen_image_paths
+                ):
                     chosen_image_paths.append(str(cand_p))
                     if len(chosen_image_paths) >= max_selected_images:
                         break
 
             # Ensure any explicitly passed or prior-revision `effective_extra_images` (such as latest proof filmstrips) are attached
             for ep in effective_extra_images[-3:]:
-                if ep and Path(ep).is_file() and str(ep) not in chosen_image_paths:
+                if (
+                    ep
+                    and Path(ep).is_file()
+                    and Path(ep).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+                    and str(ep) not in chosen_image_paths
+                ):
                     chosen_image_paths.append(str(ep))
 
             multimodal_parts = []
             for img_str in chosen_image_paths:
                 p = Path(img_str)
-                if not p.is_file():
+                if not p.is_file() or p.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
                     continue
-                mime = "image/jpeg" if p.suffix.lower() in (".jpg", ".jpeg") else "image/png"
+                mime = "image/jpeg" if p.suffix.lower() in (".jpg", ".jpeg") else ("image/webp" if p.suffix.lower() == ".webp" else "image/png")
                 desc = available_images.get(img_str) or f"Attached image ({p.name})"
                 n_low = p.name.lower()
                 qa_overlay_note = ""
@@ -1338,13 +1554,30 @@ class ContextCuratorAgent:
                 multimodal_parts.append(f"CURATED REFERENCE / PROOF IMAGE ({p.name} — {desc}){qa_overlay_note}:")
                 multimodal_parts.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime))
 
+            expanded_chosen_chunks: List[ContextChunk] = []
+            for c in chosen_chunks:
+                if c.chunk_id.startswith("code:module:"):
+                    rel_mod = c.chunk_id[len("code:module:") :].strip().lstrip("/")
+                    f_mod = self.cartridge_dir / rel_mod
+                    if f_mod.is_file() and rel_mod.endswith(".gd"):
+                        try:
+                            from engine.studio.swe import LeadGameplaySWEAgent
+                            raw_gd = f_mod.read_text(encoding="utf-8")
+                            rich_contract = LeadGameplaySWEAgent._summarize_non_target_gd_module(rel_mod, raw_gd)
+                            c = c.model_copy(
+                                update={"content": f"{c.content}\n\n--- MODULE CONTRACT & SEMANTICS ---\n{rich_contract}"}
+                            )
+                        except Exception:
+                            pass
+                expanded_chosen_chunks.append(c)
+
             chunk_sections = "\n\n".join(
-                f"[{c.chunk_id}] ({c.category}) {c.title}:\n{c.content}" for c in chosen_chunks
+                f"[{c.chunk_id}] ({c.category}) {c.title}:\n{c.content}" for c in expanded_chosen_chunks
             )
             prompt_block = (
                 f"\n=== SEMANTICALLY CURATED STUDIO CONTEXT (for {cache_role} on '{item_id or 'task'}') ===\n"
                 f"CURATOR SYNTHESIS:\n{decision.role_tailored_synthesis}\n\n"
-                f"RETRIEVED & SELECTED STUDIO KNOWLEDGE CHUNKS ({len(chosen_chunks)} selected from {len(all_chunks)} indexed chunks):\n"
+                f"RETRIEVED & SELECTED STUDIO KNOWLEDGE CHUNKS ({len(expanded_chosen_chunks)} selected from {len(all_chunks)} indexed chunks):\n"
                 f"{chunk_sections}\n"
                 f"=== END CURATED STUDIO CONTEXT ===\n"
             )
@@ -1354,6 +1587,7 @@ class ContextCuratorAgent:
                 payload_to_save = {
                     "item_id": item_id,
                     "revision": current_rev,
+                    "intra_rev_sig": intra_rev_sig,
                     "target_agent_role": target_agent_role,
                     "normalized_role": cache_role,
                     "total_indexed_chunks": len(all_chunks),

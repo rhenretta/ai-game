@@ -212,12 +212,13 @@ class CandidateASTInspector:
             }
 
         # 2b. GDScript files inspection
-        gd_files = sorted(c_dir.glob("*.gd"))
+        from engine.sim.godot_verifier import iter_cartridge_gd_files
+        gd_files = iter_cartridge_gd_files(c_dir, include_tests=False, exclude_helper_libs=True)
         gd_sources: Dict[str, str] = {}
         all_defined_gd_funcs: Set[str] = set()
 
         for f in gd_files:
-            rel_name = f.name
+            rel_name = f.relative_to(c_dir).as_posix()
             modules_inspected.append(rel_name)
             try:
                 code_str = f.read_text(encoding="utf-8", errors="replace")
@@ -232,15 +233,15 @@ class CandidateASTInspector:
             func_names: List[str] = []
             defined_classes_by_file[rel_name] = {f.stem}
 
-            # Track referenced symbols and preloads from GDScript (token splitting, zero regex heuristics)
+            # Track referenced symbols and preloads/loads from GDScript (token splitting, zero regex heuristics)
             for token_part in code_str.replace('"', " ").replace("'", " ").replace("(", " ").replace(")", " ").replace(".", " ").replace(":", " ").replace(",", " ").split():
                 clean_tok = token_part.strip()
                 if clean_tok:
                     all_referenced_symbols.add(clean_tok)
                     all_referenced_symbols.add(clean_tok.lower())
             for line in lines:
-                if "preload(" in line and ".gd" in line:
-                    for seg in line.split('"'):
+                if ("preload(" in line or "load(" in line) and ".gd" in line:
+                    for seg in line.replace("'", '"').split('"'):
                         if seg.startswith("res://") and seg.endswith(".gd"):
                             p_stem = Path(seg.replace("res://", "")).stem
                             all_referenced_symbols.add(p_stem)
@@ -402,7 +403,7 @@ class CandidateASTInspector:
                                     })
 
             if "scenes.gd" in gd_sources:
-                world_code = gd_sources.get("scenes.gd", "") + "\n" + gd_sources.get("main.gd", "") + "\n" + gd_sources.get("entities.gd", "")
+                world_code = "\n".join(gd_sources.values())
                 has_world_draw = any(
                     tok in world_code
                     for tok in (
@@ -1555,12 +1556,15 @@ class ChallengerGate:
 
         code_listings: List[str] = []
         if candidate_dir is not None and candidate_dir.is_dir():
-            for code_f in sorted(list(candidate_dir.glob("*.gd")) + list(candidate_dir.glob("*.py"))):
+            from engine.sim.godot_verifier import iter_cartridge_gd_files
+            all_code_files = list(iter_cartridge_gd_files(candidate_dir, include_tests=False, exclude_helper_libs=True)) + sorted(candidate_dir.glob("*.py"))
+            for code_f in all_code_files:
                 try:
+                    rel_f = code_f.relative_to(candidate_dir).as_posix()
                     src = code_f.read_text(encoding="utf-8", errors="replace")
                     if len(src) > 15000:
                         src = src[:15000] + "\n# ... [truncated] ..."
-                    code_listings.append(f"=== {code_f.name} ===\n{src}")
+                    code_listings.append(f"=== {rel_f} ===\n{src}")
                 except Exception:
                     pass
         code_section = ("\n\n--- CARTRIDGE SOURCE CODE ---\n" + "\n\n".join(code_listings) + "\n") if code_listings else ""

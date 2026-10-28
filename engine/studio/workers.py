@@ -16,13 +16,14 @@ import threading
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 from PIL import Image, ImageDraw
 
 from engine.studio.models import (
     AcceptanceCriterion,
     AssetRequirement,
+    AudioAssetPlanBatch,
     FilmstripPlan,
     GameRequirementsSpec,
     QAPostCaptureAudit,
@@ -143,6 +144,73 @@ ANIMATION_MODES = ("sprite_sheet", "articulated_parts")
 AUDIO_MODES = ("audio_bark", "sfx", "ambient_loop")
 
 
+class CartridgeFileLockTable:
+    """Thread-safe per-file lock manager with canonical lexicographical lock ordering
+    (preventing deadlocks), dynamic mid-task lock upgrade support, and a short-lived
+    `commit_gate` mutex for atomic file writes and headless Godot verification/capture.
+    """
+
+    _CANONICAL_ROOT_FILES = frozenset({
+        "main.gd",
+        "mechanics.gd",
+        "scenes.gd",
+        "entities.gd",
+        "ui_hud.gd",
+        "main.tscn",
+        "project.godot",
+    })
+
+    def __init__(self) -> None:
+        self._table_lock = threading.Lock()
+        self._owners: Dict[str, str] = {}
+        self.commit_gate = threading.RLock()
+
+    @classmethod
+    def normalize_path(cls, raw: str) -> str:
+        clean = str(raw or "").strip().replace("\\", "/")
+        if clean.startswith("res://"):
+            clean = clean[len("res://"):]
+        elif clean.startswith("res:/"):
+            clean = clean[len("res:/"):]
+        clean = clean.lstrip("/")
+        if "/" in clean and Path(clean).name in cls._CANONICAL_ROOT_FILES:
+            clean = Path(clean).name
+        return clean
+
+    def try_acquire_many(self, owner_id: str, paths: Sequence[str]) -> tuple[bool, List[str]]:
+        """Atomically acquires all `paths` in canonical sorted order for `owner_id`.
+        If any path is currently held by another owner, returns `(False, conflicting_paths)`
+        without mutating existing lock ownership.
+        """
+        canon = sorted({self.normalize_path(p) for p in (paths or []) if self.normalize_path(p)})
+        if not canon:
+            return True, []
+        with self._table_lock:
+            conflicts = [
+                p for p in canon
+                if p in self._owners and self._owners[p] != owner_id
+            ]
+            if conflicts:
+                return False, conflicts
+            for p in canon:
+                self._owners[p] = owner_id
+            return True, []
+
+    def held_paths(self, owner_id: str) -> set[str]:
+        with self._table_lock:
+            return {p for p, o in self._owners.items() if o == owner_id}
+
+    def all_held_paths(self) -> set[str]:
+        with self._table_lock:
+            return set(self._owners.keys())
+
+    def release_all(self, owner_id: str) -> None:
+        with self._table_lock:
+            to_remove = [p for p, o in self._owners.items() if o == owner_id]
+            for p in to_remove:
+                del self._owners[p]
+
+
 @dataclass
 class WorkerContext:
     """Everything workers need; `library_factory` lets tests inject a fake library."""
@@ -156,6 +224,7 @@ class WorkerContext:
     code_verify: Optional[Callable[[Path, Any], None]] = None     # (cartridge_dir, track) -> raises on failure
     filmstrip_fn: Optional[Callable[..., Path]] = None            # injectable for tests; defaults to proofs.capture_filmstrip
     code_lock: Any = None                                         # shared threading.Lock serialising whole-project code work
+    file_lock_table: Optional[CartridgeFileLockTable] = None      # optional per-file lock table for parallel modular SWE work
     board: Any = None                                             # optional ProductionBoard for dynamic task spawning (Tasks -> More Tasks)
     event_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None
 
@@ -417,48 +486,367 @@ def animation_handler(ctx: WorkerContext) -> Callable[[WorkItem], WorkerResult]:
     return lambda item: _fabricate_visual(ctx, item, ANIMATION_MODES)
 
 
-def render_waveform_image(wav_path: Path, out_path: Path, size: tuple = (900, 220)) -> Path:
-    """Draws a waveform + duration/peak caption so the council can 'see' audio."""
-    with wave.open(str(wav_path), "rb") as wf:
-        n_frames, rate, width, channels = wf.getnframes(), wf.getframerate(), wf.getsampwidth(), wf.getnchannels()
-        raw = wf.readframes(n_frames)
-    if width != 2:
-        raise StudioAgentError(f"Unsupported WAV sample width {width} for {wav_path}")
-    samples = struct.unpack("<" + "h" * (len(raw) // 2), raw)[::channels] if raw else ()
-    w, h = size
-    img = Image.new("RGB", size, (16, 18, 28))
+def plan_audio_requirements(
+    ctx: WorkerContext,
+    item: WorkItem,
+    allowed_modes: tuple = AUDIO_MODES,
+    attempts: int = 3,
+) -> List[AssetRequirement]:
+    """Interprets an audio work item (plus any Task Lead brief and Council revision feedback) into one or more
+    structured `AssetRequirement` items via `AudioAssetPlanBatch` (rationale first). When the specification or brief
+    requests multiple audio cues / a soundbank, plans a separate `AssetRequirement` for every requested `.wav` file."""
+    if not _is_live(ctx.client):
+        raise StudioAgentError("Audio asset planning requires an active google.genai Client (Rule 5)")
+    from google.genai import types
+
+    from engine.studio.context_curator import ContextCuratorAgent, is_real_genai_client
+
+    bible_path = ctx.cartridge_dir / "game_bible.json"
+    bible_text = (
+        compact_bible_json_for_prompt(bible_path.read_text(encoding="utf-8"), mode="audio_asset")
+        if bible_path.is_file()
+        else "{}"
+    )
+
+    prior_req = _item_dir(ctx, item) / "requirement.json"
+    prior_block = ""
+    if prior_req.is_file():
+        prior_block = f"PREVIOUS REQUIREMENT YOU PRODUCED FOR THIS ITEM (revise it per the feedback):\n{prior_req.read_text(encoding='utf-8')}\n"
+    feedback_block = ""
+    fb = [(r.revision_index + 1, r.feedback) for r in item.revisions if r.feedback]
+    if fb:
+        feedback_block = "COUNCIL FEEDBACK ON EARLIER REVISIONS (address ALL of it):\n" + "\n".join(f"  rev {n}: {t}" for n, t in fb) + "\n"
+    if getattr(item, "failure", ""):
+        feedback_block += f"PREVIOUS WORKER EXECUTION ERROR TO FIX:\n{item.failure[-600:]}\n"
+
+    curated_block = f"--- GAME BIBLE ---\n{bible_text}\n"
+    multimodal_parts: List[Any] = []
+    if is_real_genai_client(ctx.client):
+        curator = ContextCuratorAgent(
+            cartridge_dir=ctx.cartridge_dir,
+            client=ctx.client,
+            model_name=ctx.model_name,
+            board=ctx.board,
+            event_callback=ctx.event_callback,
+        )
+        pack = curator.curate_context(
+            target_agent_role="audio_designer",
+            task_request=f"{item.title}\nSPEC: {item.spec}\nPROOF: {item.proof_spec}\n{feedback_block}",
+            item_id=item.item_id,
+            item_kind=item.kind,
+        )
+        curated_block = f"{pack.prompt_block}\n"
+        multimodal_parts = list(pack.multimodal_parts)
+
+    issues: List[str] = []
+    for attempt in range(1, attempts + 1):
+        retry = "YOUR PREVIOUS ANSWER FAILED VALIDATION; FIX:\n- " + "\n- ".join(issues) + "\n\n" if issues else ""
+        prompt = (
+            f"{retry}You are the Audio Production Lead turning a council audio requirement (and any Task Lead brief) into an `AudioAssetPlanBatch`.\n"
+            f"COUNCIL REQUIREMENT [{item.item_id}] ({item.kind}): {item.title}\nSPEC: {item.spec}\nPROOF THE COUNCIL WILL JUDGE: {item.proof_spec}\n"
+            f"{feedback_block}{prior_block}"
+            f"CRITICAL MULTI-ASSET SOUNDBANK RULE:\n"
+            f"- Carefully read `SPEC`, `PROOF THE COUNCIL WILL JUDGE`, `COUNCIL FEEDBACK ON EARLIER REVISIONS`, and any `TASK LEAD BRIEF FOR AUDIO DESIGNER` / `Requested target path(s)`.\n"
+            f"- If the specification or brief requests a SINGLE audio file, populate `assets` with 1 `AssetRequirement`.\n"
+            f"- If the specification or brief enumerates MULTIPLE audio cues or a soundbank (e.g., 2 or more named `.wav` files or numbered audio events), you MUST populate `assets` with ONE separate `AssetRequirement` for **EVERY SINGLE requested audio cue** so that each cue is synthesized into its own `.wav` file on disk! Never collapse a multi-cue soundbank into a single `.wav` file.\n"
+            f"- For EACH `AssetRequirement` in `assets`:\n"
+            f"  * `fabrication_mode` must be one of {list(allowed_modes)} (`'sfx'` for one-shot effects, `'ambient_loop'` for continuous seamless loops, `'audio_bark'` for spoken voice lines).\n"
+            f"  * `target_path` must be a unique relative `.wav` path under `assets/` (e.g. `assets/audio/.../*.wav`) matching that cue's requested filename.\n"
+            f"  * `asset_id` should be `{item.item_id}` when `len(assets) == 1`, or the unique stem of `target_path` when `len(assets) > 1`.\n"
+            f"  * `visual_prompt_or_text` must describe ONLY that specific cue's acoustic texture, frequency band, envelope, or spoken dialogue.\n"
+            f"  * When `fabrication_mode == 'audio_bark'`, `visual_prompt_or_text` is sent directly to the neural TTS engine to synthesize ONE single spoken voice line into `target_path` (strictly bounded to [0.1s, 30.0s], max 45 words / 280 characters of direct spoken dialogue). NEVER concatenate multiple barks, speaker labels ('Kaelen barks:', 'Overseer Vhen:'), or parenthetical stage directions into `visual_prompt_or_text`!\n"
+            f"Provide `deliberation` FIRST.\n\n{curated_block}\n{retry}"
+        )
+        contents_arg: Any = ([prompt] + multimodal_parts) if multimodal_parts else prompt
+        record_turn_epistemic_context(
+            role="specialist",
+            curated_context=curated_block,
+            prompt_text=prompt,
+        )
+        resp = call_gemini_with_transient_retry(
+            lambda: ctx.client.models.generate_content(
+                model=ctx.model_name,
+                contents=contents_arg,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=AudioAssetPlanBatch,
+                    thinking_config=bounded_thinking_config(1536),
+                ),
+            ),
+            label=f"plan_audio_requirements[{item.item_id}]",
+        )
+        if not resp.text:
+            raise StudioAgentError(f"Audio asset planning for '{item.item_id}' returned an empty response")
+        raw_obj = json.loads(resp.text)
+        if isinstance(raw_obj, dict) and isinstance(raw_obj.get("assets"), list):
+            batch = AudioAssetPlanBatch.model_validate_json(resp.text)
+            reqs = list(batch.assets)
+        else:
+            reqs = [AssetRequirement.model_validate_json(resp.text)]
+
+        issues = []
+        if not reqs:
+            issues.append("`assets` must contain at least one `AssetRequirement`.")
+        seen_paths: set = set()
+        for idx, req in enumerate(reqs):
+            if req.fabrication_mode not in allowed_modes:
+                issues.append(f"Asset #{idx + 1} fabrication_mode '{req.fabrication_mode}' must be one of {list(allowed_modes)}.")
+            tpath = (req.target_path or "").strip().replace("\\", "/")
+            if tpath.startswith("res://"):
+                tpath = tpath[len("res://"):]
+            elif tpath.startswith("res:/"):
+                tpath = tpath[len("res:/"):]
+            tpath = tpath.lstrip("/")
+            if not tpath:
+                issues.append(f"Asset #{idx + 1} target_path is required (under assets/).")
+            elif not tpath.startswith("assets/") or ".." in tpath:
+                issues.append(f"Asset #{idx + 1} target_path '{tpath}' must be a relative path under assets/.")
+            else:
+                if not tpath.lower().endswith(".wav"):
+                    tpath = str(Path(tpath).with_suffix(".wav"))
+                req.target_path = tpath
+                if tpath in seen_paths:
+                    issues.append(
+                        f"Duplicate target_path '{tpath}' in `assets`; each audio cue in the batch must have its own distinct `.wav` target_path."
+                    )
+                seen_paths.add(tpath)
+            if req.fabrication_mode == "audio_bark":
+                words = (req.visual_prompt_or_text or "").strip().split()
+                chars = len((req.visual_prompt_or_text or "").strip())
+                if len(words) > 50 or chars > 320:
+                    issues.append(
+                        f"Asset #{idx + 1} ('{req.target_path}'): for fabrication_mode='audio_bark', visual_prompt_or_text must be a SINGLE concise spoken voice line "
+                        f"(<= 50 words and <= 320 characters); got {len(words)} words ({chars} chars)."
+                    )
+        if not issues:
+            safe_item_id = _safe_id(item.item_id)
+            used_ids: set = set()
+            for idx, req in enumerate(reqs):
+                if len(reqs) == 1:
+                    req.asset_id = item.item_id
+                else:
+                    stem_id = _safe_id(Path(req.target_path).stem)
+                    cand_id = stem_id if (stem_id and stem_id != "asset") else f"{safe_item_id}_{idx + 1}"
+                    if cand_id in used_ids:
+                        cand_id = f"{cand_id}_{idx + 1}"
+                    req.asset_id = cand_id
+                used_ids.add(req.asset_id)
+                for cat_cand in (ctx.cartridge_dir / "catalog.json", ctx.cartridge_dir / "assets" / "asset_library.json"):
+                    if cat_cand.is_file():
+                        try:
+                            cat_data = json.loads(cat_cand.read_text(encoding="utf-8"))
+                            entries = cat_data.get("entries", cat_data) if isinstance(cat_data, dict) else {}
+                            if isinstance(entries, dict):
+                                for other_id, entry_val in entries.items():
+                                    if other_id in (item.item_id, req.asset_id) or not isinstance(entry_val, dict):
+                                        continue
+                                    other_file = entry_val.get("file") or entry_val.get("file_path") or entry_val.get("target_path")
+                                    if other_file == req.target_path:
+                                        tp = Path(req.target_path)
+                                        req.target_path = str(tp.parent / f"{safe_item_id}_{tp.name}")
+                                        break
+                        except Exception:
+                            pass
+                if not req.name:
+                    req.name = Path(req.target_path).name
+            if len(reqs) == 1:
+                prior_req.write_text(reqs[0].model_dump_json(indent=2), encoding="utf-8")
+            else:
+                prior_req.write_text(
+                    AudioAssetPlanBatch(
+                        deliberation=reqs[0].deliberation,
+                        assets=reqs,
+                    ).model_dump_json(indent=2),
+                    encoding="utf-8",
+                )
+            return reqs
+        logger.info("Audio asset plan attempt %d/%d for %s invalid: %s", attempt, attempts, item.item_id, issues)
+    raise StudioAgentError(f"Audio asset planning for '{item.item_id}' still invalid after {attempts} attempts: {issues}")
+
+
+def render_waveform_image(
+    wav_path: Union[Path, Sequence[Path]],
+    out_path: Path,
+    size: tuple = (900, 220),
+) -> Path:
+    """Draws time-domain waveform(s) + FFT frequency-band spectrum + duration/peak/spectral telemetry so the Council
+    can visually inspect single audio assets or multi-cue soundbanks."""
+    if isinstance(wav_path, (str, Path)):
+        wav_paths = [Path(wav_path)]
+    else:
+        wav_paths = [Path(p) for p in wav_path if p]
+    if not wav_paths:
+        raise StudioAgentError("render_waveform_image requires at least one WAV file path.")
+
+    w = int(size[0])
+    panel_h = int(size[1]) if len(wav_paths) == 1 else max(165, int(size[1]) - 30)
+    total_h = panel_h * len(wav_paths)
+    img = Image.new("RGB", (w, total_h), (16, 18, 28))
     draw = ImageDraw.Draw(img)
-    mid = h // 2
-    draw.line([(0, mid), (w, mid)], fill=(60, 64, 90))
-    if samples:
-        step = max(1, len(samples) // w)
-        for x in range(w):
-            chunk = samples[x * step:(x + 1) * step]
-            if not chunk:
-                break
-            lo, hi = min(chunk) / 32768.0, max(chunk) / 32768.0
-            draw.line([(x, mid - int(hi * (mid - 8))), (x, mid - int(lo * (mid - 8)))], fill=(120, 220, 255))
-    peak = max((abs(s) for s in samples), default=0) / 32768.0
-    draw.text((8, 4), f"{wav_path.name}  {n_frames / max(1, rate):.2f}s  {rate}Hz  peak={peak:.2f}", fill=(230, 230, 230))
+
+    try:
+        import numpy as np
+    except Exception:
+        np = None  # type: ignore[assignment]
+
+    for idx, wp in enumerate(wav_paths):
+        y_top = idx * panel_h
+        y_bot = y_top + panel_h
+        if idx > 0:
+            draw.line([(0, y_top), (w, y_top)], fill=(56, 70, 105), width=2)
+        with wave.open(str(wp), "rb") as wf:
+            n_frames, rate, width, channels = wf.getnframes(), wf.getframerate(), wf.getsampwidth(), wf.getnchannels()
+            raw = wf.readframes(n_frames)
+        if width != 2:
+            raise StudioAgentError(f"Unsupported WAV sample width {width} for {wp}")
+        samples = struct.unpack("<" + "h" * (len(raw) // 2), raw)[::channels] if raw else ()
+        duration = n_frames / max(1, rate)
+        peak = max((abs(s) for s in samples), default=0) / 32768.0
+
+        wave_w = int(w * 0.66) if np is not None and samples else w
+        mid = y_top + (panel_h // 2) + 8
+        amp_half = max(16, (panel_h // 2) - 24)
+        draw.line([(0, mid), (wave_w - 8, mid)], fill=(60, 64, 90))
+        if samples:
+            step = max(1, len(samples) // max(1, wave_w - 12))
+            for x in range(wave_w - 12):
+                chunk = samples[x * step:(x + 1) * step]
+                if not chunk:
+                    break
+                lo, hi = min(chunk) / 32768.0, max(chunk) / 32768.0
+                draw.line(
+                    [(x + 6, mid - int(hi * amp_half)), (x + 6, mid - int(lo * amp_half))],
+                    fill=(120, 220, 255),
+                )
+
+        # Compute & draw FFT frequency-band spectrum on the right panel when numpy is available
+        spec_summary = ""
+        if np is not None and len(samples) >= 64:
+            arr = np.asarray(samples, dtype=np.float32) / 32768.0
+            arr = arr - float(np.mean(arr))
+            window = np.hanning(len(arr))
+            fft_mag = np.abs(np.fft.rfft(arr * window))
+            freqs = np.fft.rfftfreq(len(arr), d=1.0 / max(1, rate))
+            total_mag = float(np.sum(fft_mag)) or 1.0
+            centroid_hz = float(np.sum(freqs * fft_mag) / total_mag)
+            dom_idx = int(np.argmax(fft_mag[1:]) + 1) if len(fft_mag) > 1 else 0
+            dom_hz = float(freqs[dom_idx]) if dom_idx < len(freqs) else 0.0
+            spec_summary = f"  |  dom={dom_hz:.0f}Hz  centroid={centroid_hz:.0f}Hz"
+
+            bands = [
+                ("<150", 20.0, 150.0, (244, 114, 182)),
+                ("150-400", 150.0, 400.0, (251, 146, 60)),
+                ("0.4-1k", 400.0, 1000.0, (250, 204, 21)),
+                ("1-2.5k", 1000.0, 2500.0, (74, 222, 128)),
+                ("2.5-6k", 2500.0, 6000.0, (56, 189, 248)),
+                ("6k+", 6000.0, max(6500.0, rate / 2.0), (167, 139, 250)),
+            ]
+            band_energies: List[float] = []
+            for _, f_lo, f_hi, _ in bands:
+                mask = (freqs >= f_lo) & (freqs < f_hi)
+                val = float(np.sqrt(np.mean(np.square(fft_mag[mask])))) if np.any(mask) else 0.0
+                band_energies.append(val)
+            max_band = max(band_energies) or 1.0
+
+            sx0 = wave_w + 6
+            draw.line([( wave_w, y_top + 6), (wave_w, y_bot - 6)], fill=(45, 55, 80), width=1)
+            draw.text((sx0, y_top + 4), "FFT SPECTRUM (Hz bands)", fill=(180, 195, 220))
+            bar_area_top = y_top + 24
+            bar_area_bot = y_bot - 22
+            bar_max_h = max(16, bar_area_bot - bar_area_top)
+            avail_w = max(60, w - sx0 - 10)
+            col_w = avail_w // len(bands)
+            for b_idx, ((b_label, _, _, b_color), b_val) in enumerate(zip(bands, band_energies)):
+                norm_h = int(round((b_val / max_band) * bar_max_h)) if max_band > 0 else 0
+                bx0 = sx0 + b_idx * col_w + 3
+                bx1 = bx0 + max(8, col_w - 8)
+                by1 = bar_area_bot
+                by0 = max(bar_area_top, by1 - max(2, norm_h))
+                draw.rectangle([bx0, by0, bx1, by1], fill=b_color)
+                draw.text((bx0 - 1, bar_area_bot + 4), b_label[:6], fill=(165, 175, 200))
+
+        prefix = f"[{idx + 1}/{len(wav_paths)}] " if len(wav_paths) > 1 else ""
+        draw.text(
+            (8, y_top + 4),
+            f"{prefix}{wp.name}  {duration:.2f}s  {rate}Hz  peak={peak:.2f}{spec_summary}",
+            fill=(230, 235, 245),
+        )
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(out_path, "PNG")
     return out_path
 
 
-def audio_asset_handler(ctx: WorkerContext) -> Callable[[WorkItem], WorkerResult]:
+def audio_asset_handler(
+    ctx: WorkerContext,
+    force_regenerate: Optional[bool] = None,
+) -> Callable[[WorkItem], WorkerResult]:
     def handler(item: WorkItem) -> WorkerResult:
-        req = plan_asset_requirement(ctx, item, AUDIO_MODES)
+        reqs = plan_audio_requirements(ctx, item, AUDIO_MODES)
         if ctx.voice_agent is None:
             raise StudioAgentError(f"No voice/audio agent is configured; cannot build audio item '{item.item_id}'.")
         lib = ctx.new_library()
-        out = lib.fabricate_single_asset(req, force_regenerate=bool(item.revisions))
-        if out is None or not Path(out).is_file():
-            raise StudioAgentError(f"Audio fabrication of '{item.item_id}' produced no file.")
-        _merge_catalog_entry(ctx, lib, req.asset_id)
+        eff_force = bool(item.revisions) if force_regenerate is None else bool(force_regenerate)
+        batch_wavs: List[Path] = []
+        note_parts: List[str] = []
+        first_entry = None
+        for req in reqs:
+            record_turn_substep(
+                "generating_asset",
+                f"Synthesizing audio asset {req.target_path} (mode={req.fabrication_mode})",
+                details={"asset_id": req.asset_id, "target_path": req.target_path, "mode": req.fabrication_mode},
+            )
+            out = lib.fabricate_single_asset(req, force_regenerate=eff_force)
+            if out is None or not Path(out).is_file():
+                raise StudioAgentError(f"Audio fabrication of '{req.asset_id}' ({req.target_path}) produced no file.")
+            _merge_catalog_entry(ctx, lib, req.asset_id)
+            if first_entry is None:
+                first_entry = lib.catalog.entries.get(req.asset_id)
+            batch_wavs.append(Path(out))
+            note_parts.append(
+                f"Audio '{req.asset_id}' ({req.fabrication_mode}) -> {req.target_path}. "
+                f"Text/prompt: {(req.visual_prompt_or_text or req.description)[:200]}"
+            )
+        if first_entry is not None and item.item_id not in lib.catalog.entries:
+            if hasattr(first_entry, "model_copy"):
+                lib.catalog.entries[item.item_id] = first_entry.model_copy(update={"asset_id": item.item_id})
+            elif isinstance(first_entry, dict):
+                lib.catalog.entries[item.item_id] = {**first_entry, "asset_id": item.item_id}
+            else:
+                lib.catalog.entries[item.item_id] = first_entry
+            _merge_catalog_entry(ctx, lib, item.item_id)
+
         safe_id = _safe_id(item.item_id)
-        proof = render_waveform_image(Path(out), _item_dir(ctx, item) / f"waveform_{safe_id}_rev{len(item.revisions)}.png")
-        notes = f"Audio '{req.asset_id}' ({req.fabrication_mode}) -> {req.target_path}. Text/prompt: {(req.visual_prompt_or_text or req.description)[:300]}"
-        return WorkerResult(proof_images=[str(proof), str(out)], notes=notes)
+        item_dir = _item_dir(ctx, item)
+        manifest_file = item_dir / f"synthesized_wavs_rev{len(item.revisions)}.json"
+        accumulated_wavs: List[Path] = []
+        if manifest_file.is_file():
+            try:
+                for prev_p in json.loads(manifest_file.read_text(encoding="utf-8")):
+                    pp = Path(prev_p)
+                    if pp.is_file() and pp not in accumulated_wavs:
+                        accumulated_wavs.append(pp)
+            except Exception:
+                pass
+        for bw in batch_wavs:
+            if bw not in accumulated_wavs:
+                accumulated_wavs.append(bw)
+        manifest_file.write_text(json.dumps([str(p) for p in accumulated_wavs], indent=2), encoding="utf-8")
+
+        proof = render_waveform_image(
+            accumulated_wavs,
+            item_dir / f"waveform_{safe_id}_rev{len(item.revisions)}.png",
+        )
+        record_turn_substep(
+            "captured_proof",
+            f"Rendered waveform & FFT spectrum inspection proof for {len(accumulated_wavs)} audio cue(s)",
+            details={"proof_image": str(proof), "audio_files": [p.name for p in accumulated_wavs]},
+        )
+        notes = " | ".join(note_parts)
+        return WorkerResult(
+            proof_images=[str(proof)] + [str(p) for p in accumulated_wavs],
+            notes=notes,
+        )
 
     return handler
 
@@ -619,7 +1007,9 @@ def available_input_actions(cartridge_dir: Path) -> List[str]:
                 name = stripped.split("=", 1)[0].strip()
                 if name and name not in actions:
                     actions.append(name)
-    for gd_path in sorted(c_dir.glob("*.gd")):
+    from engine.sim.godot_verifier import iter_cartridge_gd_files
+
+    for gd_path in iter_cartridge_gd_files(c_dir, include_tests=False, exclude_helper_libs=True):
         try:
             src = gd_path.read_text(encoding="utf-8")
         except Exception:
@@ -640,31 +1030,116 @@ def available_input_actions(cartridge_dir: Path) -> List[str]:
     return actions
 
 
-def _summarize_cartridge_for_qa(cartridge_dir: Path, max_chars: int = 4000) -> str:
-    """Extracts a compact GDScript symbol, property, and asset catalog summary so the QA Director (`plan_filmstrip`)
-    can stage interactions, invoke setup methods, and assert state keys accurately."""
+def _extract_gd_input_and_layer_semantics(src: str) -> Tuple[List[str], List[str]]:
+    """Extracts (1) concise input-to-behavior mappings (`Input.*` / `KEY_*` / `MOUSE_BUTTON_*` conditions paired with
+    their immediate body statements) and (2) physics collision layer/mask & scene modulation lines from a `.gd` script."""
+    raw_lines = src.splitlines()
+    input_bindings: List[str] = []
+    layer_lines: List[str] = []
+    n_lines = len(raw_lines)
+    for idx, line in enumerate(raw_lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if any(
+            tok in stripped
+            for tok in ("collision_layer", "collision_mask", "CanvasModulate", "light_mode", "LIGHT_MODE_")
+        ):
+            if stripped not in layer_lines and len(layer_lines) < 6:
+                layer_lines.append(stripped[:90])
+        if (
+            "Input." in stripped
+            or _GD_KEY_RE.search(stripped)
+            or "MOUSE_BUTTON_" in stripped
+        ) and not stripped.startswith(("const ", "var ", "#")):
+            base_indent = len(line) - len(line.lstrip("\t "))
+            body_stmts: List[str] = []
+            if stripped.endswith(":"):
+                for j in range(idx + 1, min(idx + 5, n_lines)):
+                    nxt = raw_lines[j]
+                    nxt_s = nxt.strip()
+                    if not nxt_s or nxt_s.startswith("#"):
+                        continue
+                    nxt_indent = len(nxt) - len(nxt.lstrip("\t "))
+                    if nxt_indent <= base_indent:
+                        break
+                    body_stmts.append(nxt_s[:65])
+                    if len(body_stmts) >= 2:
+                        break
+            if body_stmts and all(
+                re.match(r"^(?:(?:el)?if\s+\w+:\s*)?_[A-Za-z0-9_]+\s*=\s*(?:true|false|event\.pressed)\b", s)
+                for s in body_stmts
+            ):
+                continue
+            cond_short = re.sub(r"event\s+is\s+InputEventKey\s+and\s+event\.pressed\s+and\s+", "", stripped)
+            cond_short = re.sub(r"^(?:el)?if\s+", "", cond_short).rstrip(":")
+            cond_short = re.sub(r"^_[A-Za-z0-9_]+\s+or\s+", "", cond_short)
+            entry = f"{cond_short[:65]} -> {'; '.join(body_stmts)}" if body_stmts else cond_short[:85]
+            if entry not in input_bindings and len(input_bindings) < 12:
+                input_bindings.append(entry)
+    return input_bindings, layer_lines
+
+
+def _summarize_cartridge_for_qa(cartridge_dir: Path, max_chars: int = 6500) -> str:
+    """Extracts a compact GDScript symbol, input-binding semantics, physics layer/mask, world_bounds,
+    and asset catalog summary so QA (`plan_filmstrip`), TaskLead, and Council reviewers see exact input
+    behaviors, spatial bounds, and all modules without truncation."""
+    from engine.sim.godot_verifier import iter_cartridge_gd_files
+
     c_dir = Path(cartridge_dir)
-    lines: List[str] = []
-    for gd_path in sorted(c_dir.glob("*.gd")):
+    header_lines: List[str] = []
+    layout_path = c_dir / "level_layout.json"
+    if layout_path.is_file():
+        try:
+            ldata = json.loads(layout_path.read_text(encoding="utf-8"))
+            if isinstance(ldata, dict):
+                wb = ldata.get("world_bounds")
+                regs = [
+                    f"{r.get('region_id')}:{r.get('bounds')}"
+                    for r in (ldata.get("world_regions") or [])[:8]
+                    if isinstance(r, dict)
+                ]
+                header_lines.append(f"- level_layout.json: world_bounds={wb} regions={regs}")
+        except Exception:
+            pass
+    input_map_lines: List[str] = []
+    layer_map_lines: List[str] = []
+    module_lines: List[str] = []
+    for gd_path in iter_cartridge_gd_files(c_dir, include_tests=False, exclude_helper_libs=True):
         if gd_path.name.startswith("test_"):
             continue
         try:
             src = gd_path.read_text(encoding="utf-8")
         except Exception:
             continue
+        rel_name = gd_path.relative_to(c_dir).as_posix()
         classes = re.findall(r"^\s*class\s+([A-Za-z0-9_]+)", src, flags=re.MULTILINE)
-        funcs = [
+        all_funcs = [
             (fn, args)
             for fn, args in re.findall(r"^\s*(?:static\s+)?func\s+([A-Za-z0-9_]+)\s*\(([^)]*)\)", src, flags=re.MULTILINE)
             if not fn.startswith("simulate_")
         ]
+        # Prioritize public functions in the compact per-file listing so internal `_build_*`/`_on_*` callbacks don't crowd out other files
+        pub_funcs = [(fn, args) for fn, args in all_funcs if not fn.startswith("_")] or all_funcs[:6]
         vars_top = re.findall(r"^var\s+([A-Za-z0-9_]+)", src, flags=re.MULTILINE)
         bound_assets = sorted(set(re.findall(r"(?:res://)?assets/[A-Za-z0-9_./-]+\.(?:png|wav|ogg|mp3)", src)))
-        func_sig = ", ".join(f"{fn}({args.strip()})" for fn, args in funcs[:18])
-        lines.append(
-            f"- {gd_path.name}: classes={classes[:8]} vars={vars_top[:14]} bound_assets={bound_assets} funcs=[{func_sig}]"
-        )
+        input_bindings, layer_lines = _extract_gd_input_and_layer_semantics(src)
+        if input_bindings:
+            input_map_lines.append(f"  * {rel_name}: {input_bindings}")
+        if layer_lines:
+            layer_map_lines.append(f"  * {rel_name}: {layer_lines}")
+        func_sig = ", ".join(f"{fn}({args.strip()})" for fn, args in pub_funcs[:6])
+        cls_part = f" classes={classes[:4]}" if classes else ""
+        asset_part = f" bound_assets={bound_assets[:4]}" if bound_assets else ""
+        mod_line = f"- {rel_name}:{cls_part} vars={vars_top[:6]}{asset_part} funcs=[{func_sig}]"
+        module_lines.append(mod_line[:195])
+    lines: List[str] = list(header_lines)
+    if input_map_lines:
+        lines.append("- input_bindings_by_module (exact key/action -> effect in code):\n" + "\n".join(input_map_lines))
+    if layer_map_lines:
+        lines.append("- physics_and_lighting_layers_by_module:\n" + "\n".join(layer_map_lines))
     cat_path = c_dir / "assets" / "asset_library.json"
+    cat_line = ""
     if cat_path.is_file():
         try:
             cat = json.loads(cat_path.read_text(encoding="utf-8"))
@@ -676,12 +1151,15 @@ def _summarize_cartridge_for_qa(cartridge_dir: Path, max_chars: int = 4000) -> s
                         f"tex_size={v.get('texture_pixel_size', [])}, hframes={v.get('hframes', 1)}, vframes={v.get('vframes', 1)} "
                         f"-> {v.get('res_path', '')})"
                     )
-                    for k, v in list(entries.items())[:24]
+                    for k, v in list(entries.items())[:18]
                     if isinstance(v, dict)
                 ]
-                lines.append(f"- asset_library.json ({len(entries)} assets on disk): {entry_Descs}")
+                cat_line = f"- asset_library.json ({len(entries)} assets on disk): {entry_Descs}"[:1400]
         except Exception:
             pass
+    lines.extend(module_lines)
+    if cat_line:
+        lines.append(cat_line)
     summary = "\n".join(lines)
     return summary[:max_chars]
 
@@ -728,11 +1206,22 @@ def validate_filmstrip_plan(plan: FilmstripPlan, actions: List[str], item_kind: 
                 issues.append(f"setup_call args_json for '{call.method_name}' must encode a JSON list.")
         except Exception:
             issues.append(f"setup_call args_json for '{call.method_name}' is not valid JSON.")
-    if item_kind in ("mechanic_code", "integration") and actions and not plan.input_segments and not getattr(plan, "setup_calls", None):
+    valid_setup_calls = [
+        c for c in (getattr(plan, "setup_calls", None) or [])
+        if c.method_name.strip()
+        and not c.method_name.strip().lower().startswith(_FORBIDDEN_SETUP_CALL_PREFIXES)
+        and c.method_name.strip().lower() not in _FORBIDDEN_SETUP_CALL_NAMES
+    ]
+    has_test_scene_gd = bool((getattr(plan, "test_scene_gd_content", "") or "").strip())
+    if item_kind in ("mechanic_code", "integration") and actions and not plan.input_segments and not valid_setup_calls and not has_test_scene_gd:
         issues.append(
-            f"FilmstripPlan for '{item_kind}' must include at least one `input_segments` entry (keyboard `actions` or `mouse_click_pos`) "
-            f"or scenario `setup_calls` demonstrating causal progression from the t=0 baseline."
+            f"FilmstripPlan for '{item_kind}' must include at least one `input_segments` entry (keyboard `actions` or `mouse_click_pos`), "
+            f"scenario `setup_calls`, or an isolated `test_scene_gd_content` harness demonstrating causal progression from the t=0 baseline."
         )
+    if has_test_scene_gd:
+        ts_code = (getattr(plan, "test_scene_gd_content", "") or "").strip()
+        if "extends " not in ts_code:
+            issues.append("`test_scene_gd_content` must be a valid GDScript 2.0 script starting with `extends Node2D` (or `extends Control`).")
     return issues
 
 
@@ -770,10 +1259,8 @@ def plan_filmstrip(ctx: WorkerContext, item: WorkItem, attempts: int = 3) -> Fil
             board=ctx.board,
             event_callback=ctx.event_callback,
         )
-        lead_pack_path = _item_dir(ctx, item) / "context_pack_task_lead.json"
-        curation_role = "task_lead" if lead_pack_path.is_file() else "qa_test_engineer"
         pack = curator.curate_context(
-            target_agent_role=curation_role,
+            target_agent_role="qa_test_engineer",
             task_request=f"{item.title}\nSPEC: {item.spec}\nPROOF: {item.proof_spec}",
             item_id=item.item_id,
             item_kind=item.kind,
@@ -796,8 +1283,11 @@ def plan_filmstrip(ctx: WorkerContext, item: WorkItem, attempts: int = 3) -> Fil
             f"REACTIVE TIMING TIP: When a secondary player input depends on dynamic physics or movement reaching a threshold (rather than a fixed tick guess), "
             f"populate `when_snapshot_key`, `when_operator` ('<=', '>=', '==', '!='), `when_value`, and `hold_ticks` on that `InputSegment` so the harness "
             f"fires the input at the exact tick the live simulation state satisfies the condition.\n"
+            f"ISOLATED TEST SCENES (`res://tests/test_<item_id>.tscn` + `test_scene_gd_content` vs `res://main.tscn`):\n"
+            f"  - For `mechanic_code` or `ui` tasks that require specific multi-node staging, hazard placement, or subsystem setup that is NOT already present at `t=0` in `res://main.tscn`, author an isolated test scene by setting `target_scene = 'res://tests/test_{_safe_id(item.item_id)}.tscn'` and writing a self-contained GDScript 2.0 (`extends Node2D`) test harness in `test_scene_gd_content`!\n"
+            f"  - Inside `test_scene_gd_content`, you can either instantiate `preload('res://main.gd').new()` (or preload specific feature modules like `res://entities.gd`, `res://scenes.gd`, `res://scenes/...`) in `_ready()`, stage the test scenario or expose custom `setup_calls` helper methods on your test scene root, and implement `func get_state_snapshot() -> Dictionary` so `main.gd` NEVER gets polluted with `func test_*()` staging helpers!\n"
+            f"  - For `level_map` or full-loop `integration` tasks (or when testing the unmodified main scene directly via `input_segments`), leave `target_scene` and `test_scene_gd_content` empty (`\"\"`) to boot `res://main.tscn`.\n"
             f"Also populate `state_assertions` for key observable state transitions (which are verified against live engine snapshots). "
-            f"If the item spec or QA verification brief explicitly targets an isolated subsystem test scene `.tscn` file (e.g. `res://tests/test_*.tscn`) rather than the integrated main scene, set `target_scene` to that `res://tests/...tscn` path; otherwise leave `target_scene` empty (`\"\"`) to boot `res://main.tscn`. "
             f"Use no input only if the item kind is a purely static layout preview. Provide `deliberation` FIRST.{retry}"
         )
         contents_arg: Any = ([prompt] + multimodal_parts) if multimodal_parts else prompt
@@ -831,35 +1321,37 @@ def plan_filmstrip(ctx: WorkerContext, item: WorkItem, attempts: int = 3) -> Fil
     raise StudioAgentError(f"Filmstrip plan for '{item.item_id}' still invalid after {attempts} attempts: {issues}")
 
 
-def _snapshot_modules(cartridge_dir: Path, modules: List[str]) -> Dict[str, Optional[str]]:
+def _snapshot_modules(
+    cartridge_dir: Path,
+    modules: List[str],
+    scoped_only: bool = False,
+) -> Dict[str, Optional[str]]:
     c_dir = Path(cartridge_dir)
     normalized_mods: List[str] = []
     for m in modules:
-        s = str(m or "").strip().replace("\\", "/")
-        if s.startswith("res://"):
-            s = s[len("res://"):]
-        elif s.startswith("res:/"):
-            s = s[len("res:/"):]
-        s = s.lstrip("/")
-        if s:
+        s = CartridgeFileLockTable.normalize_path(m)
+        if s and s not in normalized_mods:
             normalized_mods.append(s)
-    existing_rel_paths: List[str] = []
-    for ext in ("*.gd", "*.tscn", "*.gdshader"):
-        for p in sorted(c_dir.rglob(ext)):
-            try:
-                rel = p.relative_to(c_dir).as_posix()
-            except ValueError:
-                continue
-            if rel.startswith((".godot/", "artifacts/")):
-                continue
-            existing_rel_paths.append(rel)
-    all_names = list(
-        dict.fromkeys(
-            normalized_mods
-            + ["main.gd", "mechanics.gd", "scenes.gd", "entities.gd", "ui_hud.gd", "project.godot", "main.tscn"]
-            + existing_rel_paths
+    if scoped_only:
+        all_names = list(normalized_mods)
+    else:
+        existing_rel_paths: List[str] = []
+        for ext in ("*.gd", "*.tscn", "*.gdshader"):
+            for p in sorted(c_dir.rglob(ext)):
+                try:
+                    rel = p.relative_to(c_dir).as_posix()
+                except ValueError:
+                    continue
+                if rel.startswith((".godot/", "artifacts/")):
+                    continue
+                existing_rel_paths.append(rel)
+        all_names = list(
+            dict.fromkeys(
+                normalized_mods
+                + ["main.gd", "mechanics.gd", "scenes.gd", "entities.gd", "ui_hud.gd", "project.godot", "main.tscn"]
+                + existing_rel_paths
+            )
         )
-    )
     snap: Dict[str, Optional[str]] = {}
     for m in all_names:
         p = c_dir / m
@@ -867,7 +1359,11 @@ def _snapshot_modules(cartridge_dir: Path, modules: List[str]) -> Dict[str, Opti
     return snap
 
 
-def _restore_modules(cartridge_dir: Path, snap: Dict[str, Optional[str]]) -> None:
+def _restore_modules(
+    cartridge_dir: Path,
+    snap: Dict[str, Optional[str]],
+    scoped_only: bool = False,
+) -> None:
     c_dir = Path(cartridge_dir)
     for m, text in snap.items():
         p = c_dir / m
@@ -877,24 +1373,29 @@ def _restore_modules(cartridge_dir: Path, snap: Dict[str, Optional[str]]) -> Non
         else:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(text, encoding="utf-8")
-    for ext in ("*.gd", "*.tscn", "*.gdshader"):
-        for extra_p in sorted(c_dir.rglob(ext)):
-            try:
-                rel = extra_p.relative_to(c_dir).as_posix()
-            except ValueError:
-                continue
-            if rel.startswith((".godot/", "artifacts/")):
-                continue
-            if rel not in snap:
-                extra_p.unlink()
+    if not scoped_only:
+        for ext in ("*.gd", "*.tscn", "*.gdshader"):
+            for extra_p in sorted(c_dir.rglob(ext)):
+                try:
+                    rel = extra_p.relative_to(c_dir).as_posix()
+                except ValueError:
+                    continue
+                if rel.startswith((".godot/", "artifacts/")):
+                    continue
+                if rel not in snap:
+                    extra_p.unlink()
 
 
-def _compute_turn_code_diffs(cartridge_dir: Path, pre_snap: Dict[str, Optional[str]]) -> Dict[str, str]:
+def _compute_turn_code_diffs(
+    cartridge_dir: Path,
+    pre_snap: Dict[str, Optional[str]],
+    scoped_only: bool = False,
+) -> Dict[str, str]:
     """Computes unified diffs for any `.gd`, `.tscn`, `.gdshader`, or `project.godot` file created or modified since `pre_snap`."""
     import difflib
 
     c_dir = Path(cartridge_dir)
-    post_snap = _snapshot_modules(c_dir, list(pre_snap.keys()))
+    post_snap = _snapshot_modules(c_dir, list(pre_snap.keys()), scoped_only=scoped_only)
     all_keys = sorted(set(pre_snap.keys()) | set(post_snap.keys()))
     diffs: Dict[str, str] = {}
     for rel_path in all_keys:
@@ -1133,14 +1634,25 @@ def run_audio_designer_specialist(
             "spec": f"{item.spec}\n\nTASK LEAD BRIEF FOR AUDIO DESIGNER:\n{brief}{path_hint}",
         }
     )
-    res = audio_asset_handler(ctx)(sub_item)
+    res = audio_asset_handler(ctx, force_regenerate=bool(item.revisions) or (turn_index > 0))(sub_item)
+    touched_wavs: List[str] = []
+    for p in res.proof_images:
+        if str(p).lower().endswith(".wav"):
+            try:
+                rel = Path(p).relative_to(ctx.cartridge_dir).as_posix()
+            except ValueError:
+                rel = str(p)
+            if rel not in touched_wavs:
+                touched_wavs.append(rel)
+    if not touched_wavs:
+        touched_wavs = list(target_paths or [f"assets/audio/{sub_id}.wav"])
     return SpecialistReport(
         deliberation=f"Audio Designer executed brief for '{sub_id}'.",
         turn_index=turn_index,
         specialist_agent="audio_designer",
         brief=brief,
         summary=res.notes,
-        touched_files=list(target_paths or [f"assets/audio/{sub_id}.wav"]),
+        touched_files=touched_wavs,
         proof_images=list(res.proof_images),
     )
 
@@ -1306,6 +1818,14 @@ def run_script_writer_specialist(
     )
 
 
+def _file_sha256_or_none(path: Path) -> Optional[str]:
+    import hashlib
+
+    if not path.is_file():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def run_swe_engineer_specialist(
     ctx: WorkerContext,
     item: WorkItem,
@@ -1313,21 +1833,31 @@ def run_swe_engineer_specialist(
     target_paths: Optional[List[str]] = None,
     turn_index: int = 0,
     _lock_already_held: bool = False,
+    _task_baseline_snap_ref: Optional[Dict[str, Optional[str]]] = None,
 ) -> SpecialistReport:
     """Autonomous SWE Engineer specialist: architects or modifies GDScript modules, world/level layouts,
     scenes, entities, or UI based on the Task Lead's brief and verifies headless engine compilation/boot
     without forcing a bundled filmstrip capture."""
     import contextlib
     from engine.studio.context_curator import is_real_genai_client
+    from engine.studio.models import TrackCodeSynthesisPayload
 
     agent = ctx.swe_agent
     if agent is None:
         raise StudioAgentError(f"No SWE agent is configured; cannot execute swe_engineer for '{item.item_id}'.")
 
+    use_per_file_locks = ctx.file_lock_table is not None
     raw_lock = ctx.code_lock if ctx.code_lock is not None else threading.Lock()
-    lock_cm = contextlib.nullcontext() if _lock_already_held else raw_lock
+    if use_per_file_locks:
+        lock_cm: Any = contextlib.nullcontext()
+        commit_gate_cm: Any = ctx.file_lock_table.commit_gate
+    else:
+        lock_cm = contextlib.nullcontext() if _lock_already_held else raw_lock
+        commit_gate_cm = contextlib.nullcontext()
+
     fb = [(r.revision_index + 1, r.feedback) for r in item.revisions if r.feedback]
     canonical_root_gd = {"main.gd", "mechanics.gd", "scenes.gd", "entities.gd", "ui_hud.gd"}
+    excluded_mods = set(getattr(item, "excluded_modules", None) or [])
     explicit_code_modules: List[str] = []
     for raw_mod in (target_paths or item.target_modules):
         clean_mod = str(raw_mod or "").strip().replace("\\", "/")
@@ -1338,19 +1868,27 @@ def run_swe_engineer_specialist(
         clean_mod = clean_mod.lstrip("/")
         if "/" in clean_mod and Path(clean_mod).name in canonical_root_gd:
             clean_mod = Path(clean_mod).name
+        if clean_mod in excluded_mods:
+            continue
         if clean_mod.endswith(CODE_MODULE_SUFFIXES) and clean_mod not in explicit_code_modules:
             explicit_code_modules.append(clean_mod)
+    if not explicit_code_modules and item.target_modules:
+        for own_m in item.target_modules:
+            if own_m not in excluded_mods and own_m.endswith(CODE_MODULE_SUFFIXES):
+                explicit_code_modules.append(own_m)
     if item.kind == "level_map" and not explicit_code_modules and is_real_genai_client(ctx.client):
         explicit_code_modules = ["scenes.gd"]
     has_existing_layout = (ctx.cartridge_dir / "level_layout.json").is_file()
-    explicitly_targets_layout = any("level_layout" in str(p) for p in (target_paths or []))
+    explicitly_targets_layout = any("level_layout" in str(p) for p in (target_paths or [])) or (
+        "level_layout.json" in (brief or "").lower()
+    )
     wants_level_layout = (
         hasattr(agent, "formulate_level_layout")
         and (
             explicitly_targets_layout
             or (
                 item.kind == "level_map"
-                and (not has_existing_layout or not target_paths)
+                and (not has_existing_layout or not explicit_code_modules)
             )
             or (not explicit_code_modules and not hasattr(agent, "implement_requirement_track"))
         )
@@ -1359,145 +1897,335 @@ def run_swe_engineer_specialist(
     proof_images: List[str] = []
     summaries: List[str] = []
 
-    if wants_level_layout:
-        from engine.studio.proofs import render_level_map
-        guidance = f"[{item.item_id}] {item.title}: {item.spec}\nTask Lead Brief: {brief}"
-        if fb:
-            guidance += "\nFeedback to address:\n" + "\n".join(f"  rev {n}: {t}" for n, t in fb)
-        safe_id = _safe_id(item.item_id)
-        with lock_cm:
-            layout = agent.formulate_level_layout(ctx.cartridge_dir, force_refresh=True, guidance=guidance)
-            map_proof = render_level_map(layout, _item_dir(ctx, item) / f"level_map_{safe_id}_rev{len(item.revisions)}.png")
-        touched.append("level_layout.json")
-        proof_images.append(str(map_proof))
-        summaries.append(
-            f"Layout: {len(layout.world_regions)} regions, {len(layout.entities)} entities, "
-            f"{len(layout.triggers)} triggers; world {layout.world_bounds} (~{layout.intended_world_scale_in_viewports:.1f} screens)."
-        )
-    elif item.kind == "level_map" and has_existing_layout:
-        safe_id = _safe_id(item.item_id)
-        existing_map_proof = _item_dir(ctx, item) / f"level_map_{safe_id}_rev{len(item.revisions)}.png"
-        if existing_map_proof.is_file():
-            proof_images.append(str(existing_map_proof))
+    acquired_directly = False
+    try:
+        if use_per_file_locks and not _lock_already_held and ctx.file_lock_table is not None:
+            initial_locks = list(explicit_code_modules or ["main.gd"])
+            if wants_level_layout and "level_layout.json" not in initial_locks:
+                initial_locks.append("level_layout.json")
+            ok, conflicts = ctx.file_lock_table.try_acquire_many(item.item_id, initial_locks)
+            if not ok:
+                if ctx.board is not None and hasattr(ctx.board, "expand_item_target_modules"):
+                    ctx.board.expand_item_target_modules(item.item_id, initial_locks)
+                raise WorkerYielded(f"file_lock_busy:{','.join(conflicts)}")
+            acquired_directly = True
 
-    should_run_code = hasattr(agent, "implement_requirement_track") and (
-        bool(explicit_code_modules) or not wants_level_layout
-    )
-    if should_run_code:
-        modules = explicit_code_modules or ["main.gd"]
-        description = (
-            f"{item.spec}\n\n"
-            f"TASK LEAD BRIEF FOR SWE ENGINEER:\n{brief}\n\n"
-            f"COUNCIL WILL JUDGE: {item.proof_spec}"
+        if wants_level_layout:
+            from engine.studio.proofs import render_level_map
+            guidance = f"[{item.item_id}] {item.title}: {item.spec}\nTask Lead Brief: {brief}"
+            if fb:
+                guidance += "\nFeedback to address:\n" + "\n".join(f"  rev {n}: {t}" for n, t in fb)
+            safe_id = _safe_id(item.item_id)
+            with lock_cm:
+                with commit_gate_cm:
+                    layout = agent.formulate_level_layout(ctx.cartridge_dir, force_refresh=True, guidance=guidance)
+                    map_proof = render_level_map(layout, _item_dir(ctx, item) / f"level_map_{safe_id}_rev{len(item.revisions)}.png")
+            touched.append("level_layout.json")
+            proof_images.append(str(map_proof))
+            summaries.append(
+                f"Layout: {len(layout.world_regions)} regions, {len(layout.entities)} entities, "
+                f"{len(layout.triggers)} triggers; world {layout.world_bounds} (~{layout.intended_world_scale_in_viewports:.1f} screens)."
+            )
+        elif item.kind == "level_map" and has_existing_layout:
+            safe_id = _safe_id(item.item_id)
+            existing_map_proof = _item_dir(ctx, item) / f"level_map_{safe_id}_rev{len(item.revisions)}.png"
+            if existing_map_proof.is_file():
+                proof_images.append(str(existing_map_proof))
+
+        should_run_code = hasattr(agent, "implement_requirement_track") and (
+            bool(explicit_code_modules) or not wants_level_layout
         )
-        if fb:
-            description += "\n\nCOUNCIL FEEDBACK TO ADDRESS (all of it):\n" + "\n".join(f"  rev {n}: {t}" for n, t in fb)
-        track = RequirementTrack(
-            deliberation=item.deliberation,
-            id=item.item_id,
-            title=item.title,
-            description=description,
-            target_modules=modules,
-            acceptance_criteria=[
-                AcceptanceCriterion(
-                    deliberation="Task Lead brief and Council proof request form the acceptance criterion.",
-                    id=f"AC-{item.item_id}",
-                    description=brief or item.proof_spec or item.spec,
-                    verification_method="headless_playtest",
+        if should_run_code:
+            modules = explicit_code_modules or ["main.gd"]
+            scope_boundary_note = ""
+            if excluded_mods:
+                scope_boundary_note = (
+                    f"\n\nCOUNCIL SCOPE BOUNDARY (MANDATORY): Modules {sorted(excluded_mods)} have been assigned to a dedicated prerequisite task. "
+                    f"Do NOT include or modify {sorted(excluded_mods)} in your output—restrict your edits strictly to {modules}."
                 )
-            ],
-            status="in_progress",
-        )
-        bible_title = "game"
-        bible_path = ctx.cartridge_dir / "game_bible.json"
-        if bible_path.is_file():
-            try:
-                bible_title = json.loads(bible_path.read_text(encoding="utf-8")).get("game_title") or bible_title
-            except ValueError:
-                pass
-        req_spec = GameRequirementsSpec(
-            deliberation="Task-Lead-driven SWE specialist assignment",
-            game_title=bible_title,
-            requirements=[track],
-            asset_manifest=[],
-        )
-        import inspect
-        swe_extra_kwargs: Dict[str, Any] = {}
-        try:
-            sig = inspect.signature(agent.implement_requirement_track)
-            accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-            prior_rev_proofs: List[str] = []
+            attached_proof_paths: List[str] = []
+            item_art_dir = _item_dir(ctx, item)
+            cur_rev_idx = len(item.revisions)
+            if item_art_dir.is_dir():
+                for cand_png in sorted(item_art_dir.glob(f"*filmstrip*_rev{cur_rev_idx}.png")):
+                    if cand_png.is_file() and str(cand_png) not in attached_proof_paths:
+                        attached_proof_paths.append(str(cand_png))
             if item.revisions:
                 for p in (item.revisions[-1].proof_paths or []):
-                    if p and p not in prior_rev_proofs:
-                        prior_rev_proofs.append(p)
-            if accepts_var_kw or "extra_image_paths" in sig.parameters:
-                swe_extra_kwargs["extra_image_paths"] = prior_rev_proofs
-            if accepts_var_kw or "board" in sig.parameters:
-                swe_extra_kwargs["board"] = ctx.board
-        except Exception:
-            pass
-        turn_code_diffs: Dict[str, str] = {}
-        with lock_cm:
-            if (
-                is_real_genai_client(ctx.client)
-                and hasattr(agent, "formulate_level_layout")
-                and (ctx.cartridge_dir / "game_bible.json").is_file()
-                and not (ctx.cartridge_dir / "level_layout.json").is_file()
-            ):
+                    if p and Path(p).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp") and p not in attached_proof_paths:
+                        attached_proof_paths.append(p)
+            telemetry_note = ""
+            if attached_proof_paths:
                 try:
-                    agent.formulate_level_layout(ctx.cartridge_dir, force_refresh=False)
-                except Exception as layout_exc:
-                    logger.warning("Pre-code formulate_level_layout skipped: %s", layout_exc)
-            from engine.studio.models import TOKEN_USAGE_TRACKER
-            pre_turn_snap = _snapshot_modules(ctx.cartridge_dir, modules)
-            agent.implement_requirement_track(
-                track=track,
-                staging_dir=ctx.cartridge_dir,
-                requirements_spec=req_spec,
-                **swe_extra_kwargs,
+                    from engine.studio.proofs import format_filmstrip_telemetry_progression
+
+                    for p_path in attached_proof_paths:
+                        t_prog = format_filmstrip_telemetry_progression(Path(p_path))
+                        if t_prog:
+                            telemetry_note = f"\n\nLATEST QA FILMSTRIP ENGINE TELEMETRY ({Path(p_path).name}):\n  {t_prog}"
+                            break
+                except Exception:
+                    pass
+            description = (
+                f"{item.spec}\n\n"
+                f"TASK LEAD BRIEF FOR SWE ENGINEER:\n{brief}\n\n"
+                f"COUNCIL WILL JUDGE: {item.proof_spec}"
+                f"{scope_boundary_note}"
+                f"{telemetry_note}"
             )
-            if ctx.code_verify is not None:
-                record_turn_substep(
-                    "running_tests",
-                    f"Running headless engine verification & unit checks on {modules}",
-                    details={"modules": list(modules)},
-                )
+            if fb:
+                description += "\n\nCOUNCIL FEEDBACK TO ADDRESS (all of it):\n" + "\n".join(f"  rev {n}: {t}" for n, t in fb)
+            track = RequirementTrack(
+                deliberation=item.deliberation,
+                id=item.item_id,
+                title=item.title,
+                description=description,
+                target_modules=modules,
+                acceptance_criteria=[
+                    AcceptanceCriterion(
+                        deliberation="Task Lead brief and Council proof request form the acceptance criterion.",
+                        id=f"AC-{item.item_id}",
+                        description=brief or item.proof_spec or item.spec,
+                        verification_method="headless_playtest",
+                    )
+                ],
+                status="in_progress",
+            )
+            bible_title = "game"
+            bible_path = ctx.cartridge_dir / "game_bible.json"
+            if bible_path.is_file():
                 try:
-                    ctx.code_verify(ctx.cartridge_dir, track)
-                    TOKEN_USAGE_TRACKER.reset_swe_pev_streak()
-                except StudioPausedError:
-                    raise
-                except Exception as verify_exc:
-                    if is_real_genai_client(ctx.client):
-                        logger.warning(
-                            "SWE code_verify failed on first pass for '%s' (%s); retrying with prior_error feedback.",
-                            item.item_id,
-                            verify_exc,
-                        )
-                        record_turn_substep(
-                            "running_tests",
-                            f"Verification failed ({str(verify_exc)[:120]}); self-healing and re-verifying {modules}",
-                        )
-                        agent.implement_requirement_track(
-                            track=track,
-                            staging_dir=ctx.cartridge_dir,
-                            requirements_spec=req_spec,
-                            prior_error=str(verify_exc),
-                            **swe_extra_kwargs,
-                        )
-                        ctx.code_verify(ctx.cartridge_dir, track)
+                    bible_title = json.loads(bible_path.read_text(encoding="utf-8")).get("game_title") or bible_title
+                except ValueError:
+                    pass
+            req_spec = GameRequirementsSpec(
+                deliberation="Task-Lead-driven SWE specialist assignment",
+                game_title=bible_title,
+                requirements=[track],
+                asset_manifest=[],
+            )
+            stash_path = _item_dir(ctx, item) / f"stashed_swe_payload_rev{len(item.revisions)}.json"
+            stashed_bundle: Optional[TrackCodeSynthesisPayload] = None
+            if stash_path.is_file():
+                try:
+                    stash_data = json.loads(stash_path.read_text(encoding="utf-8"))
+                    if (
+                        isinstance(stash_data, dict)
+                        and stash_data.get("turn_index") == turn_index
+                        and stash_data.get("brief") == brief
+                        and isinstance(stash_data.get("payload"), dict)
+                    ):
+                        base_hashes = stash_data.get("base_hashes") or {}
+                        stale_files = [
+                            rel_f
+                            for rel_f, expected_hash in base_hashes.items()
+                            if _file_sha256_or_none(ctx.cartridge_dir / rel_f) != expected_hash
+                        ]
+                        if stale_files:
+                            logger.info(
+                                "Stashed SWE payload for '%s' invalidated because %s changed on disk while yielded; re-synthesizing.",
+                                item.item_id,
+                                stale_files,
+                            )
+                            stash_path.unlink(missing_ok=True)
+                        else:
+                            stashed_bundle = TrackCodeSynthesisPayload.model_validate(stash_data["payload"])
+                            logger.info("Loaded valid stashed SWE payload for '%s' (turn %d).", item.item_id, turn_index)
+                except Exception as stash_exc:
+                    logger.warning("Ignoring unreadable stashed SWE payload at %s: %s", stash_path, stash_exc)
+
+            turn_code_diffs: Dict[str, str] = {}
+            with lock_cm:
+                if (
+                    is_real_genai_client(ctx.client)
+                    and hasattr(agent, "formulate_level_layout")
+                    and (ctx.cartridge_dir / "game_bible.json").is_file()
+                    and not (ctx.cartridge_dir / "level_layout.json").is_file()
+                ):
+                    try:
+                        with commit_gate_cm:
+                            agent.formulate_level_layout(ctx.cartridge_dir, force_refresh=False)
+                    except Exception as layout_exc:
+                        logger.warning("Pre-code formulate_level_layout skipped: %s", layout_exc)
+                from engine.studio.models import TOKEN_USAGE_TRACKER
+                pre_turn_snap = _snapshot_modules(
+                    ctx.cartridge_dir,
+                    modules,
+                    scoped_only=use_per_file_locks,
+                )
+
+                def _pre_write_lock_check(normalized_files: List[str], payload_obj: Any) -> None:
+                    live_excluded: set[str] = set(excluded_mods)
+                    if ctx.board is not None and hasattr(ctx.board, "get"):
+                        try:
+                            live_b_item = ctx.board.get(item.item_id)
+                            live_excluded.update(getattr(live_b_item, "excluded_modules", None) or [])
+                            if live_b_item.state in ("blocked", "cancelled") or (
+                                hasattr(ctx.board, "_deps_satisfied") and not ctx.board._deps_satisfied(live_b_item)
+                            ):
+                                raise WorkerYielded("spawned_prerequisite_tasks")
+                        except WorkerYielded:
+                            raise
+                        except Exception:
+                            pass
+                    if live_excluded:
+                        if hasattr(payload_obj, "modified_files") and isinstance(payload_obj.modified_files, dict):
+                            pruned_keys = [
+                                k for k in list(payload_obj.modified_files.keys())
+                                if CartridgeFileLockTable.normalize_path(k) in live_excluded
+                            ]
+                            if pruned_keys and len(pruned_keys) < len(payload_obj.modified_files):
+                                for pk in pruned_keys:
+                                    payload_obj.modified_files.pop(pk, None)
+                                normalized_files[:] = [f for f in normalized_files if f not in live_excluded]
+                        non_excluded_files = [f for f in normalized_files if f not in live_excluded]
+                        if non_excluded_files and len(non_excluded_files) < len(normalized_files):
+                            if hasattr(payload_obj, "files") and isinstance(payload_obj.files, list):
+                                payload_obj.files = [
+                                    fspec for fspec in payload_obj.files
+                                    if CartridgeFileLockTable.normalize_path(getattr(fspec, "filename", "")) not in live_excluded
+                                ]
+                            if hasattr(payload_obj, "patches") and isinstance(payload_obj.patches, list):
+                                payload_obj.patches = [
+                                    pspec for pspec in payload_obj.patches
+                                    if CartridgeFileLockTable.normalize_path(getattr(pspec, "filename", "")) not in live_excluded
+                                ]
+                            normalized_files[:] = non_excluded_files
+                    if ctx.file_lock_table is not None:
+                        held = ctx.file_lock_table.held_paths(item.item_id)
+                        missing = [f for f in normalized_files if f not in held]
+                        if missing:
+                            ok_up, conflicts_up = ctx.file_lock_table.try_acquire_many(item.item_id, missing)
+                            if ctx.board is not None and hasattr(ctx.board, "expand_item_target_modules"):
+                                ctx.board.expand_item_target_modules(item.item_id, normalized_files)
+                            if not ok_up:
+                                base_hashes = {
+                                    rel_f: _file_sha256_or_none(ctx.cartridge_dir / rel_f)
+                                    for rel_f in normalized_files
+                                }
+                                stash_path.parent.mkdir(parents=True, exist_ok=True)
+                                stash_path.write_text(
+                                    json.dumps(
+                                        {
+                                            "turn_index": turn_index,
+                                            "brief": brief,
+                                            "required_files": normalized_files,
+                                            "base_hashes": base_hashes,
+                                            "payload": payload_obj.model_dump() if hasattr(payload_obj, "model_dump") else {},
+                                        },
+                                        indent=2,
+                                    ),
+                                    encoding="utf-8",
+                                )
+                                record_turn_substep(
+                                    "lock_yielded",
+                                    f"Stashed synthesized payload and yielding for busy file lock(s): {conflicts_up}",
+                                    details={"conflicts": conflicts_up, "required_files": normalized_files},
+                                    specialist_agent="swe_engineer",
+                                )
+                                raise WorkerYielded(f"file_lock_busy:{','.join(conflicts_up)}")
+                            extra_snap = _snapshot_modules(ctx.cartridge_dir, missing, scoped_only=True)
+                            live_turn_st = getattr(_ACTIVE_TURN_CTX, "state", None)
+                            baseline_ref = (
+                                live_turn_st.get("_task_baseline_snap_ref")
+                                if isinstance(live_turn_st, dict)
+                                else _task_baseline_snap_ref
+                            )
+                            for k_m, v_m in extra_snap.items():
+                                if k_m not in pre_turn_snap:
+                                    pre_turn_snap[k_m] = v_m
+                                if isinstance(baseline_ref, dict) and k_m not in baseline_ref:
+                                    baseline_ref[k_m] = v_m
+                            for k_m in missing:
+                                if k_m not in modules:
+                                    modules.append(k_m)
+                            record_turn_substep(
+                                "lock_upgraded",
+                                f"Dynamically acquired additional file lock(s): {missing}",
+                                details={"acquired": missing},
+                                specialist_agent="swe_engineer",
+                            )
+                    if stash_path.is_file():
+                        stash_path.unlink(missing_ok=True)
+
+                import inspect
+                swe_extra_kwargs: Dict[str, Any] = {}
+                try:
+                    sig = inspect.signature(agent.implement_requirement_track)
+                    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+                    if accepts_var_kw or "extra_image_paths" in sig.parameters:
+                        swe_extra_kwargs["extra_image_paths"] = list(attached_proof_paths)
+                    if accepts_var_kw or "board" in sig.parameters:
+                        swe_extra_kwargs["board"] = ctx.board
+                    if use_per_file_locks and ctx.file_lock_table is not None:
+                        if accepts_var_kw or "pre_write_hook" in sig.parameters:
+                            swe_extra_kwargs["pre_write_hook"] = _pre_write_lock_check
+                        if accepts_var_kw or "commit_gate" in sig.parameters:
+                            swe_extra_kwargs["commit_gate"] = ctx.file_lock_table.commit_gate
+                        if accepts_var_kw or "allowed_files" in sig.parameters:
+                            swe_extra_kwargs["allowed_files"] = ctx.file_lock_table.held_paths(item.item_id) | set(modules)
+                        if stashed_bundle is not None and (accepts_var_kw or "stashed_bundle" in sig.parameters):
+                            swe_extra_kwargs["stashed_bundle"] = stashed_bundle
+                except Exception:
+                    pass
+
+                agent.implement_requirement_track(
+                    track=track,
+                    staging_dir=ctx.cartridge_dir,
+                    requirements_spec=req_spec,
+                    **swe_extra_kwargs,
+                )
+                swe_extra_kwargs.pop("stashed_bundle", None)
+                if ctx.code_verify is not None:
+                    record_turn_substep(
+                        "running_tests",
+                        f"Running headless engine verification & unit checks on {modules}",
+                        details={"modules": list(modules)},
+                    )
+                    try:
+                        with commit_gate_cm:
+                            ctx.code_verify(ctx.cartridge_dir, track)
                         TOKEN_USAGE_TRACKER.reset_swe_pev_streak()
-                    else:
+                    except StudioPausedError:
                         raise
-            turn_code_diffs = _compute_turn_code_diffs(ctx.cartridge_dir, pre_turn_snap)
-        for m in list(modules) + list(turn_code_diffs.keys()):
-            if m not in touched:
-                touched.append(m)
-        summaries.append(
-            f"Implemented '{item.item_id}' in {modules}; engine verification passed. "
-            f"Available actions: {available_input_actions(ctx.cartridge_dir)}."
-        )
+                    except Exception as verify_exc:
+                        if is_real_genai_client(ctx.client):
+                            logger.warning(
+                                "SWE code_verify failed on first pass for '%s' (%s); retrying with prior_error feedback.",
+                                item.item_id,
+                                verify_exc,
+                            )
+                            record_turn_substep(
+                                "running_tests",
+                                f"Verification failed ({str(verify_exc)[:120]}); self-healing and re-verifying {modules}",
+                            )
+                            agent.implement_requirement_track(
+                                track=track,
+                                staging_dir=ctx.cartridge_dir,
+                                requirements_spec=req_spec,
+                                prior_error=str(verify_exc),
+                                **swe_extra_kwargs,
+                            )
+                            with commit_gate_cm:
+                                ctx.code_verify(ctx.cartridge_dir, track)
+                            TOKEN_USAGE_TRACKER.reset_swe_pev_streak()
+                        else:
+                            raise
+                turn_code_diffs = _compute_turn_code_diffs(
+                    ctx.cartridge_dir,
+                    pre_turn_snap,
+                    scoped_only=use_per_file_locks,
+                )
+            for m in list(modules) + list(turn_code_diffs.keys()):
+                if m not in touched:
+                    touched.append(m)
+            summaries.append(
+                f"Implemented '{item.item_id}' in {modules}; engine verification passed. "
+                f"Available actions: {available_input_actions(ctx.cartridge_dir)}."
+            )
+    finally:
+        if acquired_directly and ctx.file_lock_table is not None:
+            ctx.file_lock_table.release_all(item.item_id)
 
     from datetime import datetime, timezone
     return SpecialistReport(
@@ -1527,8 +2255,14 @@ def run_qa_test_engineer_specialist(
     based on the Task Lead's verification brief and returns the captured filmstrip proof and telemetry."""
     import contextlib
 
+    use_per_file_locks = ctx.file_lock_table is not None
     raw_lock = ctx.code_lock if ctx.code_lock is not None else threading.Lock()
-    lock_cm = contextlib.nullcontext() if _lock_already_held else raw_lock
+    if use_per_file_locks and ctx.file_lock_table is not None:
+        lock_cm: Any = contextlib.nullcontext()
+        commit_gate_cm: Any = ctx.file_lock_table.commit_gate
+    else:
+        lock_cm = contextlib.nullcontext() if _lock_already_held else raw_lock
+        commit_gate_cm = contextlib.nullcontext()
     qa_item = item.model_copy(
         update={
             "proof_spec": f"{item.proof_spec}\n\nTASK LEAD QA VERIFICATION BRIEF:\n{brief}".strip(),
@@ -1554,7 +2288,45 @@ def run_qa_test_engineer_specialist(
         safe_id = _safe_id(item.item_id)
         out_strip_path = _item_dir(ctx, item) / f"{strip_prefix}_{safe_id}_rev{len(item.revisions)}.png"
         resolved_scene = ""
+        qa_touched_files: List[str] = []
         raw_scene = (getattr(plan, "target_scene", "") or "").strip()
+        test_gd_code = (getattr(plan, "test_scene_gd_content", "") or "").strip()
+        if test_gd_code:
+            rel_scene_base = raw_scene
+            if rel_scene_base.startswith("res://"):
+                rel_scene_base = rel_scene_base[len("res://"):]
+            elif rel_scene_base.startswith("res:/"):
+                rel_scene_base = rel_scene_base[len("res:/"):]
+            rel_scene_base = rel_scene_base.lstrip("/")
+            if not rel_scene_base or rel_scene_base in ("main.tscn", "main.gd") or not rel_scene_base.startswith("tests/"):
+                rel_scene_base = f"tests/test_{safe_id}.tscn"
+            if rel_scene_base.endswith(".gd"):
+                rel_gd_path = rel_scene_base
+                rel_tscn_path = rel_scene_base[:-3] + ".tscn"
+            elif rel_scene_base.endswith(".tscn"):
+                rel_tscn_path = rel_scene_base
+                rel_gd_path = rel_scene_base[:-5] + ".gd"
+            else:
+                rel_tscn_path = f"{rel_scene_base}.tscn"
+                rel_gd_path = f"{rel_scene_base}.gd"
+            abs_gd_path = ctx.cartridge_dir / rel_gd_path
+            abs_tscn_path = ctx.cartridge_dir / rel_tscn_path
+            abs_gd_path.parent.mkdir(parents=True, exist_ok=True)
+            abs_gd_path.write_text(test_gd_code + "\n", encoding="utf-8")
+            tscn_content = (
+                '[gd_scene load_steps=2 format=3]\n\n'
+                f'[ext_resource type="Script" path="res://{rel_gd_path}" id="1_test"]\n\n'
+                '[node name="TestScene" type="Node2D"]\n'
+                'script = ExtResource("1_test")\n'
+            )
+            abs_tscn_path.write_text(tscn_content, encoding="utf-8")
+            raw_scene = f"res://{rel_tscn_path}"
+            qa_touched_files.extend([rel_gd_path, rel_tscn_path])
+            record_turn_substep(
+                "editing_file",
+                f"Authoring isolated QA test scene res://{rel_tscn_path} + res://{rel_gd_path}",
+                details={"files": [rel_gd_path, rel_tscn_path]},
+            )
         if not raw_scene:
             # Check if brief or target_paths explicitly specify a standalone test .tscn that exists on disk
             for cand_src in [brief or ""] + list(target_paths or []):
@@ -1576,35 +2348,46 @@ def run_qa_test_engineer_specialist(
             f"Rendering scene {resolved_scene or 'res://main.tscn'} across ticks {list(plan.capture_ticks)}",
             details={"scene": resolved_scene or "res://main.tscn", "ticks": list(plan.capture_ticks)},
         )
-        if ctx.filmstrip_fn is None:
-            from engine.studio.proofs import capture_filmstrip
-            strip = capture_filmstrip(
-                ctx.cartridge_dir,
-                ticks=list(plan.capture_ticks),
-                out_path=out_strip_path,
-                input_script=script,
-                setup_script=setup_calls or None,
-                verify_counterfactual=(item.kind != "level_map" and bool(script)),
-                state_assertions=list(getattr(plan, "state_assertions", None) or []),
-                target_scene=resolved_scene,
-            )
-        else:
-            strip = ctx.filmstrip_fn(
-                ctx.cartridge_dir,
-                ticks=list(plan.capture_ticks),
-                out_path=out_strip_path,
-                input_script=script,
-            )
+        with commit_gate_cm:
+            if ctx.filmstrip_fn is None:
+                from engine.studio.proofs import capture_filmstrip
+                strip = capture_filmstrip(
+                    ctx.cartridge_dir,
+                    ticks=list(plan.capture_ticks),
+                    out_path=out_strip_path,
+                    input_script=script,
+                    setup_script=setup_calls or None,
+                    verify_counterfactual=(item.kind != "level_map" and bool(script)),
+                    state_assertions=list(getattr(plan, "state_assertions", None) or []),
+                    target_scene=resolved_scene,
+                )
+            else:
+                strip = ctx.filmstrip_fn(
+                    ctx.cartridge_dir,
+                    ticks=list(plan.capture_ticks),
+                    out_path=out_strip_path,
+                    input_script=script,
+                )
         record_turn_substep(
             "captured_proof",
             f"Captured QA filmstrip {Path(strip).name}",
             details={"proof_image": str(strip)},
         )
     extra_qa = ""
+    if resolved_scene:
+        extra_qa += f" Target scene: {resolved_scene}."
     if setup_calls:
         extra_qa += f" Setup calls: {[c['method_name'] for c in setup_calls]}."
     if getattr(plan, "state_assertions", None):
         extra_qa += f" Assertions: {[(a.at_tick, a.snapshot_key, a.expected_value_or_change) for a in plan.state_assertions]}."
+    try:
+        from engine.studio.proofs import format_filmstrip_telemetry_progression
+
+        t_prog = format_filmstrip_telemetry_progression(Path(strip))
+        if t_prog:
+            extra_qa += f" {t_prog}."
+    except Exception:
+        pass
 
     summary = (
         f"Filmstrip ticks {plan.capture_ticks}. Plan: {plan.deliberation[:260]} "
@@ -1616,7 +2399,7 @@ def run_qa_test_engineer_specialist(
         specialist_agent="qa_test_engineer",
         brief=brief,
         summary=summary,
-        touched_files=[],
+        touched_files=qa_touched_files,
         proof_images=[str(strip)],
     )
 
@@ -1710,7 +2493,11 @@ def _build_task_lead_multimodal_parts(ctx: WorkerContext, collected_proofs: List
         except Exception:
             pass
 
-    valid_proofs = [Path(p_str) for p_str in collected_proofs if Path(p_str).is_file()]
+    valid_proofs = [
+        Path(p_str)
+        for p_str in collected_proofs
+        if Path(p_str).is_file() and Path(p_str).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+    ]
     filmstrips = [p for p in valid_proofs if "filmstrip" in p.name.lower()]
     non_filmstrips = [p for p in valid_proofs if "filmstrip" not in p.name.lower()]
     inspection_plates = [
@@ -1920,9 +2707,13 @@ def plan_task_lead_turn(
     prior_rev_proofs: List[str] = []
     if item.revisions:
         for p in (item.revisions[-1].proof_paths or []):
-            if p and p not in prior_rev_proofs:
+            if p and Path(p).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp") and p not in prior_rev_proofs:
                 prior_rev_proofs.append(p)
-    lead_image_paths = list(dict.fromkeys(prior_rev_proofs + list(collected_proofs)))
+    lead_image_paths = [
+        p
+        for p in dict.fromkeys(prior_rev_proofs + list(collected_proofs))
+        if p and Path(p).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+    ]
     active_curator: Optional[ContextCuratorAgent] = None
     already_included_cids: List[str] = []
     if is_real_genai_client(ctx.client):
@@ -1981,11 +2772,21 @@ def plan_task_lead_turn(
             if active_curator is not None
             else ""
         )
+        scope_notes_block = ""
+        if getattr(item, "excluded_modules", None):
+            scope_notes_block += (
+                f"EXCLUDED OUT-OF-SCOPE MODULES (pruned by Council—do NOT target or modify these files): {item.excluded_modules}\n"
+            )
+        if getattr(item, "shaping_notes", None):
+            council_bounds = [n for n in item.shaping_notes if "[Council Scope Boundary]" in str(n)]
+            if council_bounds:
+                scope_notes_block += "COUNCIL SCOPE BOUNDARY DIRECTIVES:\n  " + "\n  ".join(council_bounds) + "\n"
         prompt = (
             f"You are the Task Lead Strategist for TASK [{item.item_id}] ({item.kind}): {item.title}\n"
             f"SPEC: {item.spec}\n"
             f"PROOF THE COUNCIL WILL JUDGE: {item.proof_spec}\n"
             f"TARGET MODULES HINT: {item.target_modules}\n"
+            f"{scope_notes_block}"
             f"AVAILABLE AUTONOMOUS SPECIALISTS: {specialists}\n"
             f"{available_spec_lines}"
             f"INSTRUCTIONS:\n"
@@ -2008,7 +2809,7 @@ def plan_task_lead_turn(
             f"3. EMPATHETIC NEW-PLAYER PERSPECTIVE, TARGET PLAYER DNA, WHOLE-GAME LOOP & UNSOLVED t=0 BASELINE (for `mechanic_code`, `ui`, `integration`, `level_map`):\n"
             f"   - DELIVER THE LARGER POINT OF THE GAME (NEVER SHRINK INTO A 1-STEP TUTORIAL): Check `TARGET PLAYER STEAM DNA` and `WHOLE-GAME CORE LOOP & AGENCY DEPTH` below. You are building this game specifically for THIS player. Do NOT build 'the smallest slice possible' that reduces the game to a 4-step linear tutorial or a single pre-placed connection! Onboarding is ONLY the opening 60 seconds; the game itself must deliver the full `moment_to_moment_loop`, `minute_to_minute_loop`, and `session_loop` with genuine player construction, experimentation, optimization, or tactical depth (`core_loop.player_agency_and_optimization_depth`) and escalating goals (`goal_hierarchy`).\n"
             f"   - Think empathetically from the perspective of a brand-new player booting this game for the first time with zero external instructions. Strategize how THIS game communicates: (a) what the player is doing and why (their role, purpose, and stakes), (b) how they interact with the world and how actions causally connect (`input -> entity response -> world consequence`), and (c) what visual/audio feedback occurs when an action succeeds OR when an action is attempted before its prerequisite is met.\n"
-            f"   - UNSOLVED t=0 BASELINE (`test_unsolved_baseline_t0`) — NEVER CORRUPT `_ready()` FOR SUBSYSTEM QA PROOFS: `_ready()` at `t=0` is what the live human player boots into! `_ready()` MUST initialize the world in its unbuilt/unsolved starting state as defined by the Game Bible. NEVER pre-connect, pre-build, or pre-solve the player's work inside `_ready()` just so a downstream mechanic is visible at tick 0 in a QA screenshot—instead, instruct `'qa_test_engineer'` to use `input_segments` (mouse clicks/drags and keys) to construct and trigger the mechanic from the clean `t=0` state!\n"
+            f"   - UNSOLVED t=0 BASELINE (`test_unsolved_baseline_t0`) & ISOLATED QA TEST SCENES (`res://tests/test_<item_id>.tscn`) — NEVER POLLUTE `main.gd` WITH `func test_*()` HELPERS: `_ready()` at `t=0` in `main.gd` (`res://main.tscn`) is what the live human player boots into! `_ready()` MUST initialize the world in its unbuilt/unsolved starting state as defined by the Game Bible, and `main.gd` must NEVER be polluted with `func test_*()` staging functions. When proving a specific subsystem or mechanic that requires scenario staging, instruct `'qa_test_engineer'` either to drive `res://main.tscn` via `input_segments` from `t=0`, OR to author an isolated test scene at `res://tests/test_<item_id>.tscn` (`test_scene_gd_content`) that instantiates the relevant scene/modules and stages the test scenario cleanly inside `res://tests/`!\n"
             f"   - REAL INTERACTIVE VERBS & CAMERA NAVIGATION: Every core player verb in `core_loop.player_verbs` and the active slice's `scope_boundaries` (including mouse click/drag placement or connection, interactive component tuning/socketing, hazard clearing, and `Camera2D` panning/scrolling when `world_bounds` exceeds the 1280x720 viewport) MUST be wired to real `_unhandled_input` / `_input` / UI handlers and exercised via `input_segments` (`mouse_click_pos` or actions) in QA filmstrips.\n"
             f"   - Every input key/action bound in the codebase (`Available actions`) MUST have a discoverable in-world or HUD affordance—never bind hidden/secret keys that the player cannot know exist, and NEVER bind fake tutorial-skip keys (such as `KEY_TAB` or `set_onboarding_step`) that advance onboarding text without the player performing the actual in-world mechanic.\n"
             f"   - Never rig an input handler to bypass physics, force a win state, or teleport world state when a timing window is missed; instead, instruct `'qa_test_engineer'` to use reactive state triggers (`when_snapshot_key`, `when_operator`, `when_value`) to test timing-sensitive mechanics honestly.\n"
@@ -2019,6 +2820,7 @@ def plan_task_lead_turn(
             f"   - NEVER SUBMIT PLACEHOLDER STICKMEN, CLIPPED SPRITES, DUPLICATE OVERLAPPING GEOMETRY, OR SHRUNK VIEWPORT BACKGROUNDS: If the proof image or `QA Post-Capture Visual Audit` reports `qa_passed=False`, unaddressed Council defects, clipped/invisible sprites (`hframes > 1` on a single-frame texture), or a shrunk background that leaves dark void around the level, do NOT choose `submit_to_council`! Fix the root cause with `'visual_artist'` / `'swe_engineer'` and re-run `'qa_test_engineer'`.\n"
             f"   - Verify that active gameplay entities (`CharacterBody2D` / `Sprite2D` actors and floor/world geometry) are visibly rendered inside the 16:9 viewport and are NOT hidden behind an opaque full-screen background/border frame drawn at a higher `z_index` or foreground `CanvasLayer`.\n"
             f"5. Choose `action = 'delegate'` to send an open-ended natural-language `brief` to one of {specialists}, `action = 'spawn_tasks'` to create newly discovered tasks on the board, OR `action = 'submit_to_council'` ONLY after all required assets/code are built AND at least one proof image in `COLLECTED PROOF IMAGES SO FAR` visually proves the requirement.\n"
+            f"   - CONCISE DELIBERATION & BRIEF (NO RAW CODE IN BRIEF): Keep `deliberation` (<= 120 words) and `brief` (<= 180 words) focused and concise. NEVER write raw GDScript code blocks or paste whole functions inside `brief`—`swe_engineer` already reads the staging files directly! State the target file paths, class/function names, and behavioral/visual acceptance criteria.\n"
             f"   - CRITICAL SCHEMA FIELD ORDER WARNING: In `TaskLeadDecision`, `specialist_agent` and `brief` appear BEFORE `action` in the JSON schema! Decide your turn action inside `deliberation` and `current_strategy` first: whenever you are delegating to a specialist (`action = 'delegate'`), you MUST populate `specialist_agent` (one of {specialists}) and a non-empty `brief` BEFORE emitting `action = 'delegate'`! Never leave `specialist_agent` or `brief` empty when delegating.\n"
             f"Provide `deliberation` FIRST and `action` LAST.\n"
             f"{slice_context_block}"
@@ -2051,7 +2853,7 @@ def plan_task_lead_turn(
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=TaskLeadDecision,
-                    thinking_config=bounded_thinking_config(1536),
+                    thinking_config=bounded_thinking_config(768),
                 ),
             ),
             label=f"plan_task_lead_turn[{item.item_id}:t{len(turn_history)}]",
@@ -2159,7 +2961,12 @@ def _dispatch_to_specialist(
         return run_script_writer_specialist(ctx, item, decision.brief, decision.target_paths, turn_index=turn_index)
     if spec_name == "swe_engineer":
         return run_swe_engineer_specialist(
-            ctx, item, decision.brief, decision.target_paths, turn_index=turn_index, _lock_already_held=_lock_already_held
+            ctx,
+            item,
+            decision.brief,
+            decision.target_paths,
+            turn_index=turn_index,
+            _lock_already_held=_lock_already_held,
         )
     if spec_name == "qa_test_engineer":
         return run_qa_test_engineer_specialist(
@@ -2257,16 +3064,44 @@ def run_task_lead(
             }
         trace_path.write_text(json.dumps(trace_data, indent=2), encoding="utf-8")
 
+    use_per_file_locks = ctx.file_lock_table is not None
     code_lock = ctx.code_lock if ctx.code_lock is not None else threading.Lock()
     code_lock_held = False
     task_baseline_snap: Optional[Dict[str, Optional[str]]] = None
     last_verified_swe_snap: Optional[Dict[str, Optional[str]]] = None
     spawn_turn_bonus = sum(1 for t in turn_history if t.specialist_agent == "board_task_spawner")
     effective_max_turns = max_turns + spawn_turn_bonus
+    def _sync_live_board_state_or_yield(pending_dec: Optional[TaskLeadDecision] = None) -> None:
+        if ctx.board is None or not hasattr(ctx.board, "get"):
+            return
+        try:
+            live_item = ctx.board.get(item.item_id)
+        except Exception:
+            return
+        item.target_modules = list(live_item.target_modules or [])
+        item.excluded_modules = list(getattr(live_item, "excluded_modules", None) or [])
+        item.shaping_notes = list(live_item.shaping_notes or [])
+        item.depends_on = list(live_item.depends_on or [])
+        deps_ok = True
+        if hasattr(ctx.board, "_deps_satisfied"):
+            try:
+                deps_ok = bool(ctx.board._deps_satisfied(live_item))
+            except Exception:
+                deps_ok = True
+        if live_item.state in ("blocked", "cancelled") or not deps_ok:
+            _ACTIVE_TURN_CTX.state = None
+            _persist_trace(
+                status="waiting_for_spawned_tasks" if not deps_ok else "yielded",
+                pending=pending_dec,
+                include_active_turn=False,
+            )
+            raise WorkerYielded("spawned_prerequisite_tasks")
+
     try:
         from datetime import datetime, timezone
         turn_idx = len(turn_history)
         while turn_idx < effective_max_turns:
+            _sync_live_board_state_or_yield(pending_decision)
             if is_in_board_scheduler() and ctx.cartridge_dir is not None:
                 pause_file = ctx.cartridge_dir.parent / ".studio_paused.json"
                 if pause_file.is_file():
@@ -2358,6 +3193,13 @@ def run_task_lead(
             if decision.action == "submit_to_council":
                 submission_summary = decision.submission_summary or decision.current_strategy
                 chosen = [p for p in decision.selected_proof_paths if Path(p).is_file()]
+                if chosen and not any(Path(p).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp") for p in chosen):
+                    img_proofs = [
+                        p
+                        for p in collected_proofs
+                        if Path(p).is_file() and Path(p).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+                    ]
+                    chosen = img_proofs + [p for p in chosen if p not in img_proofs]
                 selected_proofs = chosen if chosen else list(collected_proofs)
                 _ACTIVE_TURN_CTX.state = None
                 _persist_trace(status="submitted", pending=None, include_active_turn=False)
@@ -2404,23 +3246,85 @@ def run_task_lead(
                 turn_idx += 1
                 continue
 
-            if decision.specialist_agent in ("swe_engineer", "qa_test_engineer") and not code_lock_held:
-                if is_in_board_scheduler():
-                    if not code_lock.acquire(blocking=False):
-                        _ACTIVE_TURN_CTX.state = None
-                        _persist_trace(status="yielded", pending=decision, include_active_turn=False)
-                        raise WorkerYielded(
-                            f"Waiting for code_lock to run {decision.specialist_agent} on turn {turn_idx + 1} of '{item.item_id}'"
+            if decision.specialist_agent in ("swe_engineer", "qa_test_engineer"):
+                _sync_live_board_state_or_yield(decision)
+                excluded_live = set(getattr(item, "excluded_modules", None) or [])
+                if excluded_live and decision.target_paths:
+                    decision.target_paths = [
+                        tp
+                        for tp in decision.target_paths
+                        if CartridgeFileLockTable.normalize_path(tp) not in excluded_live
+                    ]
+                if use_per_file_locks and ctx.file_lock_table is not None:
+                    if decision.specialist_agent == "swe_engineer":
+                        base_req_list = (
+                            list(decision.target_paths)
+                            if decision.target_paths
+                            else list(item.target_modules or [])
                         )
-                else:
-                    code_lock.acquire()
-                code_lock_held = True
-                if task_baseline_snap is None:
-                    task_baseline_snap = _snapshot_modules(
-                        ctx.cartridge_dir,
-                        list(item.target_modules or []) + ["project.godot", "main.tscn"],
-                    )
-                _persist_trace(status="in_progress", pending=None, include_active_turn=True)
+                        stash_cand = _item_dir(ctx, item) / f"stashed_swe_payload_rev{len(item.revisions)}.json"
+                        if stash_cand.is_file():
+                            try:
+                                st_data = json.loads(stash_cand.read_text(encoding="utf-8"))
+                                if isinstance(st_data, dict) and st_data.get("turn_index") == turn_idx:
+                                    for req_f in st_data.get("required_files") or []:
+                                        if req_f not in base_req_list:
+                                            base_req_list.append(req_f)
+                            except Exception:
+                                pass
+                        req_mods = [
+                            CartridgeFileLockTable.normalize_path(m)
+                            for m in base_req_list
+                            if CartridgeFileLockTable.normalize_path(m)
+                            and CartridgeFileLockTable.normalize_path(m) not in excluded_live
+                        ]
+                        req_code_mods = [
+                            m for m in req_mods
+                            if m.endswith(CODE_MODULE_SUFFIXES) or m == "level_layout.json"
+                        ]
+                        if not req_code_mods:
+                            req_code_mods = ["scenes.gd"] if item.kind == "level_map" else ["main.gd"]
+                        ok_lock, conflicts = ctx.file_lock_table.try_acquire_many(item.item_id, req_code_mods)
+                        if not ok_lock:
+                            if ctx.board is not None and hasattr(ctx.board, "expand_item_target_modules"):
+                                ctx.board.expand_item_target_modules(item.item_id, req_code_mods)
+                            _ACTIVE_TURN_CTX.state = None
+                            _persist_trace(status="yielded", pending=decision, include_active_turn=False)
+                            raise WorkerYielded(f"file_lock_busy:{','.join(conflicts)}")
+                        if ctx.board is not None and hasattr(ctx.board, "expand_item_target_modules"):
+                            ctx.board.expand_item_target_modules(
+                                item.item_id,
+                                list(ctx.file_lock_table.held_paths(item.item_id)),
+                            )
+                        code_lock_held = True
+                        if task_baseline_snap is None:
+                            task_baseline_snap = {}
+                        new_locked = [
+                            p for p in ctx.file_lock_table.held_paths(item.item_id)
+                            if p not in task_baseline_snap
+                        ]
+                        if new_locked:
+                            task_baseline_snap.update(
+                                _snapshot_modules(ctx.cartridge_dir, new_locked, scoped_only=True)
+                            )
+                        _persist_trace(status="in_progress", pending=None, include_active_turn=True)
+                elif not code_lock_held:
+                    if is_in_board_scheduler():
+                        if not code_lock.acquire(blocking=False):
+                            _ACTIVE_TURN_CTX.state = None
+                            _persist_trace(status="yielded", pending=decision, include_active_turn=False)
+                            raise WorkerYielded(
+                                f"Waiting for code_lock to run {decision.specialist_agent} on turn {turn_idx + 1} of '{item.item_id}'"
+                            )
+                    else:
+                        code_lock.acquire()
+                    code_lock_held = True
+                    if task_baseline_snap is None:
+                        task_baseline_snap = _snapshot_modules(
+                            ctx.cartridge_dir,
+                            list(item.target_modules or []) + ["project.godot", "main.tscn"],
+                        )
+                    _persist_trace(status="in_progress", pending=None, include_active_turn=True)
 
             if ctx.event_callback is not None:
                 try:
@@ -2440,10 +3344,18 @@ def run_task_lead(
 
             pre_dispatch_snap: Optional[Dict[str, Optional[str]]] = None
             if decision.specialist_agent == "swe_engineer":
+                snap_targets = (
+                    list(ctx.file_lock_table.held_paths(item.item_id))
+                    if (use_per_file_locks and ctx.file_lock_table is not None)
+                    else (list(item.target_modules or []) + list(decision.target_paths or []))
+                )
                 pre_dispatch_snap = _snapshot_modules(
                     ctx.cartridge_dir,
-                    list(item.target_modules or []) + list(decision.target_paths or []),
+                    snap_targets,
+                    scoped_only=use_per_file_locks,
                 )
+            if isinstance(getattr(_ACTIVE_TURN_CTX, "state", None), dict):
+                _ACTIVE_TURN_CTX.state["_task_baseline_snap_ref"] = task_baseline_snap
             try:
                 report = _dispatch_to_specialist(
                     ctx,
@@ -2453,13 +3365,22 @@ def run_task_lead(
                     _lock_already_held=code_lock_held,
                 )
                 if decision.specialist_agent == "swe_engineer" and report.verification_passed:
+                    if use_per_file_locks and ctx.file_lock_table is not None and pre_dispatch_snap is not None:
+                        for touched_m in report.touched_files:
+                            if touched_m not in pre_dispatch_snap and task_baseline_snap is not None and touched_m in task_baseline_snap:
+                                pre_dispatch_snap[touched_m] = task_baseline_snap[touched_m]
                     last_verified_swe_snap = _snapshot_modules(
                         ctx.cartridge_dir,
                         list(task_baseline_snap.keys())
                         if task_baseline_snap is not None
                         else (list(item.target_modules or []) + list(decision.target_paths or []) + ["project.godot", "main.tscn"]),
+                        scoped_only=use_per_file_locks,
                     )
-            except (WorkerYielded, StudioPausedError):
+            except WorkerYielded:
+                _ACTIVE_TURN_CTX.state = None
+                _persist_trace(status="yielded", pending=decision, include_active_turn=False)
+                raise
+            except StudioPausedError:
                 _ACTIVE_TURN_CTX.state = None
                 raise
             except Exception as spec_exc:
@@ -2477,8 +3398,16 @@ def run_task_lead(
                     and bool(qa_proofs or collected_proofs)
                 )
                 if can_recover_turn:
+                    if use_per_file_locks and ctx.file_lock_table is not None and pre_dispatch_snap is not None and task_baseline_snap is not None:
+                        for k_locked, v_base in task_baseline_snap.items():
+                            if k_locked not in pre_dispatch_snap:
+                                pre_dispatch_snap[k_locked] = v_base
                     partial_diffs = (
-                        _compute_turn_code_diffs(ctx.cartridge_dir, pre_dispatch_snap)
+                        _compute_turn_code_diffs(
+                            ctx.cartridge_dir,
+                            pre_dispatch_snap,
+                            scoped_only=use_per_file_locks,
+                        )
                         if pre_dispatch_snap is not None
                         else {}
                     )
@@ -2487,7 +3416,11 @@ def run_task_lead(
                         and pre_dispatch_snap is not None
                         and ctx.code_verify is not None
                     ):
-                        _restore_modules(ctx.cartridge_dir, pre_dispatch_snap)
+                        _restore_modules(
+                            ctx.cartridge_dir,
+                            pre_dispatch_snap,
+                            scoped_only=use_per_file_locks,
+                        )
                     logger.warning(
                         "Specialist '%s' failed on Turn #%d of '%s' (%s); reporting failure to Task Lead for self-correction.",
                         decision.specialist_agent,
@@ -2523,6 +3456,10 @@ def run_task_lead(
                     _ACTIVE_TURN_CTX.state = None
                     _persist_trace(status="failed", pending=None, include_active_turn=False)
                     raise
+            finally:
+                if use_per_file_locks and ctx.file_lock_table is not None and decision.specialist_agent == "swe_engineer":
+                    ctx.file_lock_table.release_all(item.item_id)
+                    code_lock_held = False
             live_st = getattr(_ACTIVE_TURN_CTX, "state", None) or {}
             if isinstance(live_st, dict):
                 report.step_log = list(live_st.get("step_log") or report.step_log or [])
@@ -2573,10 +3510,12 @@ def run_task_lead(
     except Exception:
         restore_snap = last_verified_swe_snap if last_verified_swe_snap is not None else task_baseline_snap
         if restore_snap is not None:
-            _restore_modules(ctx.cartridge_dir, restore_snap)
+            _restore_modules(ctx.cartridge_dir, restore_snap, scoped_only=use_per_file_locks)
         raise
     finally:
-        if code_lock_held:
+        if use_per_file_locks and ctx.file_lock_table is not None:
+            ctx.file_lock_table.release_all(item.item_id)
+        elif code_lock_held:
             code_lock.release()
 
     # If revising an item that previously fabricated asset plates (`plate_*.png`, `anim_sheet_*.png`, `waveform_*.png`),

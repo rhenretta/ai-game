@@ -17,7 +17,7 @@ from typing import Any, List, Literal, Optional
 import numpy as np
 from pydantic import Field
 
-from engine.studio.models import BaseEpistemicModel, StudioAgentError
+from engine.studio.models import BaseEpistemicModel, StudioAgentError, bounded_thinking_config
 
 logger = logging.getLogger("SfxSynth")
 
@@ -222,6 +222,7 @@ class SfxSynthesisDesigner:
                     response_mime_type="application/json",
                     response_schema=SfxRecipe,
                     temperature=self.temperature,
+                    thinking_config=bounded_thinking_config(512),
                 ),
             )
             if not response.text:

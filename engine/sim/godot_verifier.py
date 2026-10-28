@@ -108,6 +108,39 @@ def _resolve_inline_gdscript_location(c_dir: Path, inline_line: int, err_msg: st
 
 ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
 
+_IGNORED_CARTRIDGE_TOP_DIRS = {".godot", "artifacts", "assets", "res:", "__pycache__"}
+
+
+def iter_cartridge_gd_files(
+    cartridge_dir: Union[Path, str],
+    include_tests: bool = False,
+    exclude_helper_libs: bool = False,
+) -> List[Path]:
+    """Recursively discovers all `.gd` files in `cartridge_dir` (including `scenes/**`, `scripts/**`, `src/**`),
+    sorted by relative POSIX path. Excludes `.godot/`, `artifacts/`, and (when `include_tests=False`) `tests/`."""
+    c_dir = Path(cartridge_dir)
+    if not c_dir.is_dir():
+        return []
+    found: List[Tuple[str, Path]] = []
+    for p in c_dir.rglob("*.gd"):
+        if not p.is_file():
+            continue
+        try:
+            rel = p.relative_to(c_dir)
+        except ValueError:
+            continue
+        if rel.parts and rel.parts[0] in _IGNORED_CARTRIDGE_TOP_DIRS:
+            continue
+        if not include_tests and rel.parts and rel.parts[0] == "tests":
+            continue
+        rel_str = rel.as_posix()
+        if exclude_helper_libs and rel_str == "src/studio_rig_and_collider.gd":
+            continue
+        found.append((rel_str, p))
+    found.sort(key=lambda item: item[0])
+    return [p for _, p in found]
+
+
 
 def parse_godot_stderr(cartridge_dir: Union[Path, str], stderr_text: str) -> List[GDScriptDiagnostic]:
     """Parses Godot 4 stderr stream and extracts structured GDScript diagnostics."""

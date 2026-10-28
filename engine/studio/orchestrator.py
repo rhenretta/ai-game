@@ -439,7 +439,7 @@ class StudioOrchestrator:
             return None
         from engine.studio.models import set_active_gemini_dataset_context
         from engine.studio.production_board import BoardScheduler, ProductionBoard
-        from engine.studio.workers import WorkerContext, default_handlers
+        from engine.studio.workers import CartridgeFileLockTable, WorkerContext, default_handlers
 
         set_active_gemini_dataset_context(
             dataset_name=getattr(self.config, "dataset_name", "") or c_dir.name,
@@ -487,6 +487,7 @@ class StudioOrchestrator:
             swe_agent=swe_agent,
             model_name=self.config.model_name,
             code_verify=_verify,
+            file_lock_table=CartridgeFileLockTable(),
             event_callback=_board_event,
             board=board,
         )
@@ -1345,32 +1346,92 @@ class StudioOrchestrator:
                 return narrative_bible
 
             elif canonical_name == "VoiceActingAudioProducerAgent":
+                from engine.studio.audio import validate_wav_file
+                from engine.studio.models import DialogueBarkSpec, NarrativeCharacterSpec
+
                 audio_dir = staging_dir / "assets" / "audio"
                 audio_dir.mkdir(parents=True, exist_ok=True)
-                existing_wavs = list(audio_dir.glob("*.wav")) if audio_dir.is_dir() else []
+                existing_wavs = list(audio_dir.rglob("*.wav")) if audio_dir.is_dir() else []
                 board_managed = bool(
                     self._continuous_active
                     and self.production_board is not None
                     and self.production_board.items()
                 )
+                narrative = context.raw_outputs.get("Writer") or context.raw_outputs.get("NarrativeCharacterWriterAgent")
+                barks = list(getattr(narrative, "dialogue_barks", None) or []) if narrative else []
+                char_map = {c.character_id: c for c in (getattr(narrative, "characters", None) or [])} if narrative else {}
+                if not barks:
+                    for nar_fname in ("narrative.json", "narrative_bible.json"):
+                        nar_path = staging_dir / nar_fname
+                        if nar_path.is_file():
+                            try:
+                                nar_data = json.loads(nar_path.read_text(encoding="utf-8"))
+                                for b_raw in nar_data.get("dialogue_barks") or []:
+                                    if isinstance(b_raw, dict):
+                                        barks.append(DialogueBarkSpec.model_validate(b_raw))
+                                for c_raw in nar_data.get("characters") or []:
+                                    if isinstance(c_raw, dict) and c_raw.get("character_id"):
+                                        char_map[str(c_raw["character_id"])] = NarrativeCharacterSpec.model_validate(c_raw)
+                                if barks:
+                                    break
+                            except Exception:
+                                pass
+
                 if board_managed:
+                    synthesized_results = []
+                    for bark in barks:
+                        raw_clip = (getattr(bark, "voice_clip", "") or "").strip()
+                        if raw_clip.startswith("res://"):
+                            raw_clip = raw_clip[len("res://"):]
+                        raw_clip = raw_clip.lstrip("/")
+                        if not raw_clip:
+                            raw_clip = f"assets/audio/{bark.bark_id}.wav"
+                        if not raw_clip.endswith(".wav"):
+                            raw_clip = f"{raw_clip}.wav"
+                        target_path = staging_dir / raw_clip
+                        flat_path = audio_dir / Path(raw_clip).name
+                        ok_target, _, _ = validate_wav_file(target_path)
+                        ok_flat, _, _ = validate_wav_file(flat_path)
+                        if ok_target and not ok_flat and target_path != flat_path:
+                            shutil.copy2(target_path, flat_path)
+                            ok_flat = True
+                        elif ok_flat and not ok_target and target_path != flat_path:
+                            target_path.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(flat_path, target_path)
+                            ok_target = True
+                        if not ok_target:
+                            target_path.parent.mkdir(parents=True, exist_ok=True)
+                            char_obj = char_map.get(getattr(bark, "speaker_id", ""))
+                            res = agent.synthesize_voice_line(bark=bark, output_path=target_path, character=char_obj)
+                            synthesized_results.append(res)
+                            if target_path != flat_path and target_path.is_file():
+                                shutil.copy2(target_path, flat_path)
+                    existing_wavs = list(audio_dir.rglob("*.wav")) if audio_dir.is_dir() else []
                     dur_ms = (_time.perf_counter() - t_start) * 1000.0
                     self._publish_event(
                         "AGENT_STREAM",
                         canonical_name,
-                        f"Task-driven slice audio active ({len(existing_wavs)} audio clip(s) fabricated by slice tasks).",
-                        {"clips_count": len(existing_wavs)},
+                        f"Task-driven slice audio active ({len(existing_wavs)} audio clip(s) on disk; synthesized {len(synthesized_results)} missing narrative bark clip(s)).",
+                        {"clips_count": len(existing_wavs), "synthesized_barks": len(synthesized_results)},
                     )
-                    return existing_wavs
+                    return synthesized_results or existing_wavs
                 req_spec = context.raw_outputs.get("requirements_spec")
                 manifest_items = getattr(req_spec, "asset_manifest", []) if req_spec else []
                 missing_audio = False
                 if manifest_items:
                     for item in manifest_items:
                         iname = getattr(item, "name", "") or (item.get("name") if isinstance(item, dict) else "")
-                        if iname and iname.endswith(".wav") and not (audio_dir / iname).is_file():
-                            missing_audio = True
-                            break
+                        if iname and iname.endswith(".wav"):
+                            ok_wav, _, _ = validate_wav_file(audio_dir / iname)
+                            if not ok_wav:
+                                missing_audio = True
+                                break
+                for bark in barks:
+                    raw_clip = (getattr(bark, "voice_clip", "") or f"assets/audio/{bark.bark_id}.wav").lstrip("/")
+                    ok_wav, _, _ = validate_wav_file(staging_dir / raw_clip)
+                    if not ok_wav:
+                        missing_audio = True
+                        break
                 if existing_wavs and not missing_audio:
                     logger.info("Resumed %d existing voice clips from %s", len(existing_wavs), audio_dir)
                     dur_ms = (_time.perf_counter() - t_start) * 1000.0
@@ -1378,12 +1439,7 @@ class StudioOrchestrator:
                     self._publish_event("TOOL_INVOCATION", canonical_name, f"Resumed {len(existing_wavs)} voice clips.", {"tool_name": "synthesize_voice_line", "status": "success", "duration_ms": dur_ms})
                     return existing_wavs
 
-                narrative = context.raw_outputs.get("Writer") or context.raw_outputs.get("NarrativeCharacterWriterAgent")
-                barks = []
-                if narrative and getattr(narrative, "dialogue_barks", None):
-                    barks = list(narrative.dialogue_barks)
                 if not barks:
-                    from engine.studio.models import DialogueBarkSpec
                     barks = [
                         DialogueBarkSpec(
                             deliberation="Initial system deployment bark",
@@ -1395,15 +1451,22 @@ class StudioOrchestrator:
                             voice_clip="assets/audio/bark_start.wav",
                         )
                     ]
-                char_map = {c.character_id: c for c in getattr(narrative, "characters", [])} if narrative else {}
                 results = []
                 for bark in barks[:3]:
-                    wav_name = Path(bark.voice_clip).name if getattr(bark, "voice_clip", None) else f"{bark.bark_id}.wav"
+                    raw_clip = (getattr(bark, "voice_clip", "") or "").strip()
+                    if raw_clip.startswith("res://"):
+                        raw_clip = raw_clip[len("res://"):]
+                    raw_clip = raw_clip.lstrip("/")
+                    wav_name = Path(raw_clip).name if raw_clip else f"{bark.bark_id}.wav"
                     if not wav_name.endswith(".wav"):
                         wav_name = f"{wav_name}.wav"
-                    out_path = audio_dir / wav_name
+                    out_path = (staging_dir / raw_clip) if raw_clip.startswith("assets/audio/") else (audio_dir / wav_name)
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
                     char_obj = char_map.get(getattr(bark, "speaker_id", ""))
                     res = agent.synthesize_voice_line(bark=bark, output_path=out_path, character=char_obj)
+                    flat_path = audio_dir / wav_name
+                    if out_path != flat_path and out_path.is_file():
+                        shutil.copy2(out_path, flat_path)
                     results.append(res)
                 dur_ms = (_time.perf_counter() - t_start) * 1000.0
                 delib = getattr(results[0], "deliberation", f"Synthesized {len(results)} spoken WAV voice lines.") if results else "Synthesized voice audio."
@@ -1730,7 +1793,12 @@ class StudioOrchestrator:
         elif canonical_name == "TelemetryArchitectAgent":
             target_files = [staging_dir / "telemetry_manifest.json"]
         elif canonical_name == "LeadGameplaySWEAgent":
-            target_files = sorted(list(staging_dir.glob("*.py")) + list(staging_dir.glob("*.gd")) + list(staging_dir.glob("*.tscn")))
+            from engine.sim.godot_verifier import iter_cartridge_gd_files
+            target_files = sorted(
+                list(staging_dir.glob("*.py"))
+                + iter_cartridge_gd_files(staging_dir, include_tests=False, exclude_helper_libs=True)
+                + list(staging_dir.rglob("*.tscn"))
+            )
             if (staging_dir / "project.godot").is_file():
                 target_files.append(staging_dir / "project.godot")
         else:

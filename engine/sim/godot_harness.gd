@@ -74,6 +74,9 @@ func _load_setup_script(path: String) -> void:
 		return
 	setup_script = parsed
 
+func get_viewport() -> Viewport:
+	return render_viewport if render_viewport != null else root
+
 func _initialize() -> void:
 	Engine.max_physics_steps_per_frame = 1
 	if script_error != "":
