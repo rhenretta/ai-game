@@ -1139,3 +1139,48 @@ def test_qa_specialist_authors_isolated_test_scene(tmp_path):
     assert "Target scene: res://tests/test_dock_latch.tscn." in report.summary
 
 
+def test_compute_entrypoint_reachability_and_topology_chunk(tmp_path):
+    """Verifies that `compute_entrypoint_reachability` traces `project.godot` -> `main.tscn` -> `main.gd` -> `scenes.gd`
+    and distinguishes reachable production modules from unreferenced modules on disk while excluding `tests/`."""
+    from engine.studio.context_curator import CartridgeSemanticIndex, compute_entrypoint_reachability
+
+    (tmp_path / "project.godot").write_text(
+        '[application]\nconfig/name="Test"\nrun/main_scene="res://main.tscn"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "main.tscn").write_text(
+        '[gd_scene load_steps=2 format=3]\n'
+        '[ext_resource type="Script" path="res://main.gd" id="1_main"]\n'
+        '[node name="Main" type="Node2D"]\n'
+        'script = ExtResource("1_main")\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "main.gd").write_text(
+        'extends Node2D\nconst Scenes = preload("res://scenes.gd")\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "scenes.gd").write_text('extends Node2D\n', encoding="utf-8")
+    (tmp_path / "scenes" / "ui").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "scenes" / "ui" / "cockpit_hud.gd").write_text('extends CanvasLayer\n', encoding="utf-8")
+    (tmp_path / "tests").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "tests" / "test_cockpit_hud.gd").write_text(
+        'extends Node2D\nconst Hud = preload("res://scenes/ui/cockpit_hud.gd")\n',
+        encoding="utf-8",
+    )
+
+    reach = compute_entrypoint_reachability(tmp_path)
+    assert reach["main_scene"] == "res://main.tscn"
+    assert "main.tscn" in reach["reachable_from_entrypoint"]
+    assert "main.gd" in reach["reachable_from_entrypoint"]
+    assert "scenes.gd" in reach["reachable_from_entrypoint"]
+    assert "scenes/ui/cockpit_hud.gd" in reach["unreferenced_from_entrypoint"]
+    assert "tests/test_cockpit_hud.gd" not in reach["unreferenced_from_entrypoint"]
+
+    idx = CartridgeSemanticIndex(cartridge_dir=tmp_path, client=None)
+    chunks = idx.extract_corpus_chunks()
+    topo_chunk = next((c for c in chunks if c.chunk_id == "code:entrypoint_topology"), None)
+    assert topo_chunk is not None
+    assert "scenes/ui/cockpit_hud.gd" in topo_chunk.content
+
+
+

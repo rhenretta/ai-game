@@ -777,6 +777,20 @@ class CartridgeSemanticIndex:
                     content=meta["summary_content"],
                 )
             )
+        if code_graph:
+            reach = compute_entrypoint_reachability(self.cartridge_dir, code_graph=code_graph)
+            _add(
+                ContextChunk(
+                    chunk_id="code:entrypoint_topology",
+                    category="code_module",
+                    title=(
+                        f"Playable Entrypoint Reachability Map (`{reach['main_scene']}`: "
+                        f"{len(reach['reachable_from_entrypoint'])} reachable, "
+                        f"{len(reach['unreferenced_from_entrypoint'])} unreferenced on disk)"
+                    ),
+                    content=reach["summary_text"],
+                )
+            )
 
         return chunks
 
@@ -1211,7 +1225,7 @@ class ContextCuratorAgent:
         trace_dir = (self.cartridge_dir / "artifacts" / "work_items" / safe_item) if safe_item else None
         cache_file = (trace_dir / f"context_pack_{cache_role}.json") if trace_dir is not None else None
 
-        intra_rev_sig = f"rev={current_rev}"
+        intra_rev_sig = f"rev={current_rev}|turns=0|strip="
         if trace_dir is not None and trace_dir.is_dir():
             try:
                 active_trace = trace_dir / f"lead_trace_rev{current_rev}.json"
@@ -1227,13 +1241,20 @@ class ContextCuratorAgent:
                 pass
 
         with _CURATOR_CACHE_LOCK:
-            if reuse_revision_cache and cache_file is not None and cache_file.is_file():
+            candidate_cache_files: List[Path] = []
+            if cache_file is not None:
+                candidate_cache_files.append(cache_file)
+                if cache_role == "qa_test_engineer" and trace_dir is not None:
+                    candidate_cache_files.append(trace_dir / "context_pack_task_lead.json")
+            for cf in candidate_cache_files if reuse_revision_cache else []:
+                if not cf.is_file():
+                    continue
                 try:
-                    cached = json.loads(cache_file.read_text(encoding="utf-8"))
+                    cached = json.loads(cf.read_text(encoding="utf-8"))
                     if (
                         isinstance(cached, dict)
                         and cached.get("revision") == current_rev
-                        and cached.get("intra_rev_sig", f"rev={current_rev}") == intra_rev_sig
+                        and cached.get("intra_rev_sig", intra_rev_sig) == intra_rev_sig
                         and cached.get("prompt_block")
                         and isinstance(cached.get("decision"), dict)
                     ):
@@ -1912,4 +1933,97 @@ class ContextCuratorAgent:
         if pending_pack is not None and pending_pack.prompt_block:
             sections.append(pending_pack.prompt_block)
         return ("\n\n".join(sections) + "\n\n") if sections else ""
+
+
+def compute_entrypoint_reachability(
+    cartridge_dir: Path,
+    code_graph: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Computes the factual forward module reachability graph starting from `project.godot`'s `run/main_scene`
+    and any `[autoload]` singletons, partitioning production `.gd`/`.tscn`/`.gdshader` files (excluding `tests/**`
+    and `src/studio_rig_and_collider.gd`) into `reachable_from_entrypoint` vs `unreferenced_from_entrypoint`."""
+    c_dir = Path(cartridge_dir)
+    if code_graph is None:
+        idx = CartridgeSemanticIndex(cartridge_dir=c_dir, client=None)
+        code_graph = idx.build_code_reference_graph()
+
+    main_scene_res = "res://main.tscn"
+    autoload_roots: List[str] = []
+    proj_path = c_dir / "project.godot"
+    if proj_path.is_file():
+        try:
+            proj_text = proj_path.read_text(encoding="utf-8", errors="replace")
+            m_main = re.search(r'^\s*run/main_scene\s*=\s*"([^"]+)"', proj_text, flags=re.MULTILINE)
+            if m_main and m_main.group(1).strip():
+                main_scene_res = m_main.group(1).strip()
+            in_autoload = False
+            for raw_ln in proj_text.splitlines():
+                ln = raw_ln.strip()
+                if ln.startswith("[") and ln.endswith("]"):
+                    in_autoload = ln.lower() == "[autoload]"
+                    continue
+                if in_autoload and "=" in ln:
+                    m_auto = re.search(r'"\*?(?:res://)?([^"]+)"', ln)
+                    if m_auto:
+                        auto_rel = m_auto.group(1).strip().lstrip("/")
+                        if auto_rel and auto_rel not in autoload_roots:
+                            autoload_roots.append(auto_rel)
+        except Exception:
+            pass
+
+    main_rel = main_scene_res.replace("res://", "").lstrip("/")
+    seed_roots: List[str] = []
+    if main_rel in code_graph:
+        seed_roots.append(main_rel)
+    elif "main.tscn" in code_graph:
+        seed_roots.append("main.tscn")
+    elif "main.gd" in code_graph:
+        seed_roots.append("main.gd")
+    for ar in autoload_roots:
+        if ar in code_graph and ar not in seed_roots:
+            seed_roots.append(ar)
+
+    queue: List[str] = list(seed_roots)
+    reachable_set: set[str] = set(seed_roots)
+    q_idx = 0
+    while q_idx < len(queue):
+        cur = queue[q_idx]
+        q_idx += 1
+        meta = code_graph.get(cur) or {}
+        for imp in meta.get("imports") or []:
+            if imp in code_graph and imp not in reachable_set:
+                reachable_set.add(imp)
+                queue.append(imp)
+
+    production_modules = sorted(
+        k
+        for k in code_graph
+        if not k.startswith("tests/") and k != "src/studio_rig_and_collider.gd"
+    )
+    reachable_prod = [m for m in production_modules if m in reachable_set]
+    unreferenced_prod = [m for m in production_modules if m not in reachable_set]
+
+    lines = [
+        f"Playable Entrypoint (`project.godot` -> `run/main_scene`): {main_scene_res}",
+        f"Entrypoint Root Files: {seed_roots}",
+        f"Autoload Singletons: {autoload_roots or 'none'}",
+        f"Production Modules Reachable from Entrypoint ({len(reachable_prod)}): {reachable_prod}",
+        f"Production Modules on Disk NOT Currently Referenced from Entrypoint ({len(unreferenced_prod)}): {unreferenced_prod}",
+    ]
+    if unreferenced_prod:
+        lines.append("Unreferenced Module Summaries:")
+        for u_mod in unreferenced_prod[:16]:
+            u_meta = code_graph.get(u_mod) or {}
+            u_sum = str(u_meta.get("summary_content") or "").splitlines()[:4]
+            lines.append("  - " + " | ".join(u_sum))
+
+    return {
+        "main_scene": main_scene_res,
+        "entrypoint_roots": seed_roots,
+        "autoload_roots": autoload_roots,
+        "reachable_from_entrypoint": reachable_prod,
+        "unreferenced_from_entrypoint": unreferenced_prod,
+        "summary_text": "\n".join(lines),
+    }
+
 

@@ -47,6 +47,7 @@ from engine.studio.models import (
     NoveltyJudgement,
     ReviewBatch,
     ReviewDecision,
+    SliceAssemblyDecision,
     StudioAgentError,
     TaskShapingBatch,
     VisualMockupArtifact,
@@ -1216,6 +1217,8 @@ class CreativeWritersRoom:
         listen_check: WritersRoomListenCheck,
         game_bible: GameBibleSpec,
         dna_summary: str,
+        extra_context_block: str = "",
+        require_backlog_addition: bool = False,
     ) -> WritersRoomTurnProposal:
         """Executes the chosen specialist's turn to speak to the room and update the Living Game Bible."""
         role = specialist["role"]
@@ -1391,6 +1394,12 @@ class CreativeWritersRoom:
 
         def _validate(p: WritersRoomTurnProposal) -> List[str]:
             issues: List[str] = []
+            if require_backlog_addition and not p.backlog_additions:
+                issues.append(
+                    "The Executive Producer reported a live issue or steering directive on a drained Production Board; "
+                    "you MUST populate `backlog_additions` with at least one concrete `WorkItemProposal` (`integration`, `mechanic_code`, or `ui`) "
+                    "targeting the responsible script(s) so the worker pool executes the fix."
+                )
             if p.backlog_additions:
                 issues.extend(self.board.validate_proposals(p.backlog_additions))
                 issues.extend(self._unsupported_kind_issues(p.backlog_additions))
@@ -1402,7 +1411,8 @@ class CreativeWritersRoom:
                         issues.extend(self._unsupported_kind_issues(r.split_items))
             return issues
 
-        return self._structured_with_validation(prompt + "\n" + board_block, turn_schema, _validate)
+        full_turn_prompt = prompt + ("\n\n" + extra_context_block if extra_context_block else "") + "\n" + board_block
+        return self._structured_with_validation(full_turn_prompt, turn_schema, _validate)
 
     # ------------------------------------------------------------------
     # Production Board: proof review, revision-cap decisions and backlog draining
@@ -1901,21 +1911,61 @@ class CreativeWritersRoom:
         """Runs immediate CreativeDirector and GameplaySystemsEngineer turns to pivot the Game Bible and ProductionBoard
         when live Executive Producer steering arrives during _drain_backlog."""
         combined_steering = " | ".join(steered_notes)
+        board_was_drained = bool(self.board is not None and self.board.is_drained())
+        curated_code_block = ""
+        if candidate_dir is not None and Path(candidate_dir).is_dir() and is_real_genai_client(self.client):
+            try:
+                reach = compute_entrypoint_reachability(Path(candidate_dir))
+                curator = ContextCuratorAgent(
+                    cartridge_dir=Path(candidate_dir),
+                    client=self.client,
+                    model_name=self.model_name,
+                    board=self.board,
+                    game_bible=game_bible,
+                    event_callback=self.event_callback,
+                )
+                pack = curator.curate_context(
+                    target_agent_role="council_reviewer:GameplaySystemsEngineer",
+                    task_request=(
+                        f"Executive Producer Live Steering / Problem Report: {combined_steering}\n"
+                        f"Inspect the cartridge entrypoint (`run/main_scene`) and `.gd` scripts to identify the root cause "
+                        f"and raise/update the exact ProductionBoard task(s) needed to resolve it.\n"
+                        f"{reach.get('summary_text', '')}"
+                    ),
+                    item_id="executive_producer_steering",
+                    item_kind="integration",
+                )
+                curated_code_block = (
+                    f"=== CARTRIDGE CODEBASE & ENTRYPOINT CONTEXT FOR EXECUTIVE PRODUCER STEERING ===\n"
+                    f"{reach.get('summary_text', '')}\n\n"
+                    f"{pack.prompt_block}\n"
+                )
+            except Exception as cur_exc:
+                logger.warning("ContextCurator steering curation skipped: %s", cur_exc)
+
         for pivot_role in ("CreativeDirector", "GameplaySystemsEngineer"):
             spec = next((s for s in SPECIALIST_ROSTER if s["role"] == pivot_role), None)
             if spec is None:
                 continue
+            still_drained = bool(self.board is not None and self.board.is_drained())
+            must_add_task = bool(board_was_drained and still_drained and pivot_role == "GameplaySystemsEngineer")
             listen_check = WritersRoomListenCheck(
                 deliberation=f"Immediate pivot required to honor Executive Producer steering: {combined_steering}",
                 should_interject=True,
                 urgency_score=1.0,
-                intended_contribution_summary=f"Adapt the Game Bible and update/cancel/create ProductionBoard items to satisfy Executive Producer steering: {combined_steering}",
+                intended_contribution_summary=(
+                    f"Address Executive Producer steering ('{combined_steering}'): diagnose any reported runtime/gameplay/UX issue "
+                    f"against the cartridge scripts and raise a concrete `backlog_additions` task (`integration`, `mechanic_code`, or `ui`) "
+                    f"targeting the responsible `.gd` file(s) so the worker pool immediately fixes and verifies it."
+                ),
             )
             proposal = self._execute_specialist_turn(
                 specialist=spec,
                 listen_check=listen_check,
                 game_bible=game_bible,
                 dna_summary=dna_summary,
+                extra_context_block=curated_code_block,
+                require_backlog_addition=must_add_task,
             )
             self._apply_turn_proposal(
                 game_bible=game_bible,
@@ -2140,6 +2190,217 @@ class CreativeWritersRoom:
             self._persist_bible(game_bible, candidate_dir=candidate_dir)
         return total_changes
 
+    def _run_slice_assembly_check(
+        self,
+        game_bible: GameBibleSpec,
+        dna_summary: str,
+        candidate_dir: Optional[Path],
+        pass_index: int = 0,
+    ) -> int:
+        """Convenes the Council when all current Production Board tasks for the active slice are approved,
+        presenting the factual entrypoint reachability graph (`compute_entrypoint_reachability`) and a
+        lightweight 3-frame boot filmstrip (`ticks=[15, 60, 120]`) of `project.godot`'s `run/main_scene`
+        so the Council can decide whether all built systems are assembled in the playable entrypoint or
+        whether to add integration/assembly task(s) to the Production Board."""
+        if (
+            self.board is None
+            or candidate_dir is None
+            or not (Path(candidate_dir) / "project.godot").is_file()
+        ):
+            return 0
+        # Only run automatic slice assembly checks on live Gemini builds unless explicitly enabled in tests
+        if not is_real_genai_client(self.client) and not getattr(self, "enable_slice_assembly_check", False):
+            return 0
+
+        c_dir = Path(candidate_dir)
+        self._emit_activity(
+            agent_role="CreativeDirector",
+            status_text=f"Council is inspecting booted main scene & entrypoint module reachability (Assembly Check #{pass_index + 1})...",
+            active_agents=["CreativeDirector", "GameplaySystemsEngineer", "GameplayDesigner", "UXExperienceDesigner"],
+            phase="slice_assembly_check",
+        )
+
+        from engine.studio.context_curator import (
+            ContextCuratorAgent,
+            compute_entrypoint_reachability,
+        )
+        from engine.studio.proofs import format_filmstrip_telemetry_progression
+
+        reach = compute_entrypoint_reachability(c_dir)
+        parts: List[Any] = []
+        boot_telemetry_summary = ""
+        proof_out = c_dir / "artifacts" / "proofs" / f"filmstrip_slice_assembly_check_pass{pass_index}.png"
+        if is_real_genai_client(self.client) or getattr(self, "assembly_filmstrip_fn", None) is not None:
+            try:
+                filmstrip_fn = getattr(self, "assembly_filmstrip_fn", None)
+                if filmstrip_fn is not None:
+                    filmstrip_fn(c_dir, [15, 60, 120], proof_out)
+                else:
+                    from engine.studio.proofs import capture_filmstrip
+                    capture_filmstrip(
+                        cartridge_dir=c_dir,
+                        ticks=[15, 60, 120],
+                        out_path=proof_out,
+                        target_scene=reach.get("main_scene") or "res://main.tscn",
+                    )
+                if proof_out.is_file():
+                    part = self._load_image_part(proof_out)
+                    if part is not None:
+                        parts.append(part)
+                    boot_telemetry_summary = format_filmstrip_telemetry_progression(proof_out)
+            except Exception as cap_exc:
+                logger.warning("Slice assembly boot filmstrip capture skipped: %s", cap_exc)
+
+        curated_assembly_block = ""
+        if is_real_genai_client(self.client):
+            try:
+                curator = ContextCuratorAgent(
+                    cartridge_dir=c_dir,
+                    client=self.client,
+                    model_name=self.model_name,
+                    board=self.board,
+                    game_bible=game_bible,
+                    event_callback=self.event_callback,
+                )
+                pack = curator.curate_context(
+                    target_agent_role="council_reviewer:SliceAssemblyCouncil",
+                    task_request=(
+                        f"Evaluate whether all built modules, UI instruments, and gameplay systems for the active slice "
+                        f"are mounted and connected inside the playable entrypoint ({reach.get('main_scene')}).\n"
+                        f"{reach.get('summary_text', '')}"
+                    ),
+                    item_id=f"slice_assembly_check_pass{pass_index}",
+                    item_kind="integration",
+                )
+                curated_assembly_block = f"{pack.prompt_block}\n"
+            except Exception as cur_exc:
+                logger.warning("ContextCurator slice assembly curation skipped: %s", cur_exc)
+
+        approved_summaries: List[str] = []
+        for it in self.board.items():
+            if it.state == "approved":
+                last_notes = (it.revisions[-1].worker_notes if getattr(it, "revisions", None) else "") or ""
+                approved_summaries.append(
+                    f"  - [{it.item_id}] ({it.kind}) '{it.title}' | target_modules={it.target_modules} | notes={last_notes[:200]}"
+                )
+
+        bible_snapshot = self._format_bible_snapshot(game_bible)
+        prompt = (
+            f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n\n"
+            f"{bible_snapshot}\n\n"
+            f"{curated_assembly_block}"
+            f"=== PLAYABLE ENTRYPOINT REACHABILITY GRAPH ===\n{reach.get('summary_text', '')}\n\n"
+            f"=== MAIN SCENE OPENING BOOT TELEMETRY (ticks 15, 60, 120) ===\n{boot_telemetry_summary or '(not captured)'}\n\n"
+            f"=== APPROVED PRODUCTION BOARD ITEMS ({len(approved_summaries)} items) ===\n"
+            + ("\n".join(approved_summaries) or "  (none)")
+            + "\n\nYou are the Council (CreativeDirector, GameplaySystemsEngineer, GameplayDesigner, and UXExperienceDesigner) "
+            "performing the Slice Readiness & Whole-Game Assembly Check now that all currently queued Production Board items are approved.\n"
+            "INSTRUCTIONS:\n"
+            "1. Compare the Living Game Bible and the Approved Production Board items above against the `PLAYABLE ENTRYPOINT REACHABILITY GRAPH` "
+            "and the attached opening boot filmstrip/telemetry of the playable entrypoint (`run/main_scene`).\n"
+            "2. Because individual features were developed in modular `.gd` files and verified in isolated test scenes (`res://tests/test_*.tscn`), "
+            "check whether any built gameplay system, progression loop, or HUD/UI widget that belongs in the playable game is still unmounted or unwired "
+            "from the playable entrypoint scene tree (note: helper scripts or intentionally superseded prototypes do NOT need to be mounted—only systems that serve the actual game design).\n"
+            "3. Also inspect the attached opening boot filmstrip of `run/main_scene` across ALL frames (`tick 15`, `tick 60`, `tick 120`) for whole-game visual/HUD cohesion AND opening temporal stability: "
+            "verify that the player avatar and core interactive world entities remain stable and framed on screen across `t=15..120` (never plummeting/drifting out of the playfield under unintended gravity/forces or dragging the camera away from the player into empty background space), "
+            "that HUD widgets coexist cleanly without overlapping or occluding the playfield, and that there are zero leftover test-staging hacks in `main.gd`.\n"
+            "4. If everything needed for the active slice is already assembled and coherent in `run/main_scene`, set `backlog_additions=[]` and `is_slice_assembled=True`.\n"
+            "5. If any built system or UI instrument needs to be mounted/wired into the playable entrypoint (or if `run/main_scene` has a whole-game boot/HUD/wiring issue), "
+            "propose focused `integration` (or `mechanic_code`/`ui`) task(s) in `backlog_additions` BEFORE setting `is_slice_assembled=False`:\n"
+            "   - IMPORTANT FOR QA SCOPE: Deep per-mechanic edge cases were ALREADY verified in isolated `res://tests/test_*.tscn` scenes! "
+            "When writing `proof_spec` for an assembly/integration task on `run/main_scene`, keep the QA proof lightweight (verifying that `res://main.tscn` boots cleanly with all slice nodes/HUD widgets mounted in the scene tree and responsive to opening player controls over ~120-180 ticks—NEVER demand a multi-minute full-game playthrough in a single filmstrip).\n"
+            f"Buildable kinds right now: {self._supported_kinds() or 'all'}.\n"
+            "Return `SliceAssemblyDecision` with `deliberation` FIRST and `is_slice_assembled` strictly last."
+        )
+
+        def _validate_assembly(decision: SliceAssemblyDecision) -> List[str]:
+            issues: List[str] = []
+            if not decision.is_slice_assembled and not decision.backlog_additions:
+                issues.append(
+                    "is_slice_assembled=False requires at least one WorkItemProposal in backlog_additions "
+                    "(or set is_slice_assembled=True if no further integration tasks are needed)."
+                )
+            if decision.is_slice_assembled and decision.backlog_additions:
+                decision.is_slice_assembled = False
+            if decision.backlog_additions:
+                issues.extend(self.board.validate_proposals(decision.backlog_additions))
+                issues.extend(self._unsupported_kind_issues(decision.backlog_additions))
+            return issues
+
+        decision = self._structured_with_validation(
+            prompt,
+            SliceAssemblyDecision,
+            _validate_assembly,
+            temperature=0.3,
+            parts=parts,
+        )
+        self._emit_event(
+            "slice_assembly_check_completed",
+            {
+                "deliberation": decision.deliberation,
+                "pass_index": pass_index,
+                "is_slice_assembled": decision.is_slice_assembled,
+                "unmounted_or_disconnected_systems": decision.unmounted_or_disconnected_systems,
+                "spawned_item_ids": [p.item_id for p in (decision.backlog_additions or [])],
+            },
+        )
+        added: List[Any] = []
+        if not decision.is_slice_assembled and decision.backlog_additions:
+            active_slice_obj = game_bible.get_active_slice()
+            default_slice_id = active_slice_obj.slice_id if active_slice_obj is not None else ""
+            added = self.board.add_items(
+                decision.backlog_additions,
+                raised_by_role="GameplaySystemsEngineer",
+                slice_id=default_slice_id,
+            )
+
+        turn_idx = len(game_bible.writers_room_transcript)
+        if added:
+            spawned_summary = ", ".join(f"`{it.item_id}` ({it.title})" for it in added)
+            unmounted_note = (
+                f" Unmounted/disconnected modules detected: {', '.join(decision.unmounted_or_disconnected_systems)}."
+                if decision.unmounted_or_disconnected_systems
+                else ""
+            )
+            spoken = (
+                f"[Slice Assembly Check #{pass_index + 1}] All individual task proofs passed, so we booted `run/main_scene` and audited "
+                f"entrypoint reachability.{unmounted_note} Spawning whole-game assembly task(s): {spawned_summary}."
+            )
+            updates_list = [f"backlog:+{it.item_id}" for it in added]
+        else:
+            spoken = (
+                f"[Slice Assembly Check #{pass_index + 1}] Verified `run/main_scene` opening boot filmstrip and entrypoint reachability—"
+                f"all slice systems and HUD instruments are mounted and wired in the playable game."
+            )
+            updates_list = ["slice_assembly:verified"]
+
+        assembly_utt = WritersRoomUtterance(
+            deliberation=decision.deliberation,
+            utterance_id=f"utt_{turn_idx:02d}_GameplaySystemsEngineer_assembly_{pass_index}",
+            turn_index=turn_idx,
+            speaker_role="GameplaySystemsEngineer",
+            speaker_display_name="Gameplay Systems Engineer",
+            spoken_dialogue=spoken,
+            addressed_to=["CreativeDirector", "GameplayDesigner", "UXExperienceDesigner"],
+            bible_updates_summary=updates_list,
+        )
+        game_bible.writers_room_transcript.append(assembly_utt)
+        self._emit_event(
+            "writers_room_utterance",
+            {
+                "deliberation": assembly_utt.deliberation,
+                "utterance_id": assembly_utt.utterance_id,
+                "turn_index": assembly_utt.turn_index,
+                "speaker_role": assembly_utt.speaker_role,
+                "speaker_display_name": assembly_utt.speaker_display_name,
+                "spoken_dialogue": assembly_utt.spoken_dialogue,
+                "addressed_to": assembly_utt.addressed_to,
+                "bible_updates_summary": assembly_utt.bible_updates_summary,
+            },
+        )
+        self._persist_bible(game_bible, candidate_dir=candidate_dir)
+        return len(added)
+
     def _drain_backlog(
         self,
         game_bible: GameBibleSpec,
@@ -2168,6 +2429,8 @@ class CreativeWritersRoom:
             )
 
         last_progress_sig = _board_progress_sig()
+        assembly_passes = 0
+        max_assembly_passes = int(getattr(self, "max_assembly_passes", 2))
         while True:
             paused_dur = self._wait_if_paused(candidate_dir)
             if paused_dur > 0:
@@ -2175,9 +2438,27 @@ class CreativeWritersRoom:
             steered = self._consume_pending_steering(game_bible, candidate_dir=candidate_dir)
             if steered:
                 self._execute_steering_pivot_turns(game_bible, dna_summary, candidate_dir, steered)
+                if not self.board.is_drained():
+                    assembly_passes = 0
+                    if self.scheduler is not None:
+                        self.scheduler.start()
             self._handle_failed_items()
             applied = self._run_review_round(game_bible, dna_summary, candidate_dir)
             if self.board.is_drained():
+                if assembly_passes < max_assembly_passes:
+                    added_assembly = self._run_slice_assembly_check(
+                        game_bible=game_bible,
+                        dna_summary=dna_summary,
+                        candidate_dir=candidate_dir,
+                        pass_index=assembly_passes,
+                    )
+                    assembly_passes += 1
+                    if added_assembly > 0:
+                        if self.scheduler is not None:
+                            self.scheduler.start()
+                        last_progress_sig = _board_progress_sig()
+                        deadline = max(deadline, time.monotonic() + self.drain_timeout_s)
+                        continue
                 return
             cur_progress_sig = _board_progress_sig()
             if applied > 0 or steered or cur_progress_sig != last_progress_sig:
@@ -3000,7 +3281,8 @@ class CreativeWritersRoom:
         self._drain_backlog(game_bible, dna_summary, candidate_dir)
 
         # Synthesize final GenesisWorldSpec on the locked GameBibleSpec
-        game_bible.world_spec = self._synthesize_final_world_spec(game_bible, dna, target_episode)
+        if game_bible.world_spec is None or not already_in_production:
+            game_bible.world_spec = self._synthesize_final_world_spec(game_bible, dna, target_episode)
         if game_bible.world_spec and game_bible.world_spec.core_genre:
             game_bible.core_genre = game_bible.world_spec.core_genre
         game_bible.status = "locked"

@@ -330,3 +330,69 @@ def test_writers_room_turn_refinements_enrich_and_split_tasks_and_expose_to_ui(t
     assert any("Shaped/split 1 backlog item" in u for t in bible.writers_room_transcript for u in t.bible_updates_summary)
 
 
+def test_drain_backlog_runs_slice_assembly_check_and_builds_integration_task(tmp_path):
+    """Verifies that when initial board items drain, `_drain_backlog` runs `_run_slice_assembly_check`;
+    if the Council returns `is_slice_assembled=False` with an `integration` task proposal, the task is added
+    to `ProductionBoard`, built by workers, approved by the Council, and `_drain_backlog` exits once the
+    subsequent assembly check returns `is_slice_assembled=True`."""
+    from engine.studio.models import SliceAssemblyDecision
+
+    adds = {2: [P("isolated_hud", kind="mechanic_code", modules=("scenes/ui/cockpit_hud.gd",))]}
+    room, client, board, sched, candidate, order = build(tmp_path, adds, approve_all)
+    room.enable_slice_assembly_check = True
+    (candidate / "project.godot").write_text(
+        '[application]\nconfig/name="Test"\nrun/main_scene="res://main.tscn"\n',
+        encoding="utf-8",
+    )
+    (candidate / "main.gd").write_text("extends Node2D\n", encoding="utf-8")
+    (candidate / "scenes" / "ui").mkdir(parents=True, exist_ok=True)
+    (candidate / "scenes" / "ui" / "cockpit_hud.gd").write_text("extends CanvasLayer\n", encoding="utf-8")
+
+    assembly_calls = {"count": 0}
+    orig_generate = client.models.generate_content
+
+    def _gen_with_assembly(model, contents, config=None):
+        schema = getattr(config, "response_schema", None) if config else None
+        if getattr(schema, "__name__", "") == "SliceAssemblyDecision":
+            assembly_calls["count"] += 1
+            if assembly_calls["count"] == 1:
+                return base._FakeGeminiResponse(
+                    SliceAssemblyDecision(
+                        deliberation="scenes/ui/cockpit_hud.gd is unreferenced from main.gd; raise an integration task to mount it.",
+                        unmounted_or_disconnected_systems=["scenes/ui/cockpit_hud.gd"],
+                        backlog_additions=[
+                            P(
+                                "integrate_cockpit_hud_into_main",
+                                kind="integration",
+                                deps=("isolated_hud",),
+                                modules=("main.gd",),
+                            )
+                        ],
+                        is_slice_assembled=False,
+                    )
+                )
+            return base._FakeGeminiResponse(
+                SliceAssemblyDecision(
+                    deliberation="All slice systems are now mounted and playable in res://main.tscn.",
+                    unmounted_or_disconnected_systems=[],
+                    backlog_additions=[],
+                    is_slice_assembled=True,
+                )
+            )
+        return orig_generate(model, contents, config)
+
+    client.models.generate_content = _gen_with_assembly
+    try:
+        bible = room.run_writers_room(dna=base._sample_dna(), candidate_dir=candidate)
+    finally:
+        sched.stop()
+
+    assert bible.status == "locked"
+    assert assembly_calls["count"] == 2
+    integ_item = board.get("integrate_cockpit_hud_into_main")
+    assert integ_item is not None
+    assert integ_item.state == "approved"
+    assert order.index("isolated_hud") < order.index("integrate_cockpit_hud_into_main")
+
+
+

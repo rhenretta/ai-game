@@ -3147,6 +3147,30 @@ class ReviewBatch(BaseEpistemicModel):
     cap_decisions: List[CapDecision] = Field(default_factory=list, description="One decision per item that hit its revision cap or stalled.")
 
 
+class SliceAssemblyDecision(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Council evaluation when all current Production Board tasks for the active slice have been approved,
+    determining whether the built modules and assets are cohesively assembled in the playable entrypoint
+    or whether integration/assembly task(s) should be added to the Production Board before closing the slice.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Holistic evaluation of the booted main_scene filmstrip, live scene tree, and entrypoint module reachability against the Living Game Bible and completed board items.",
+    )
+    unmounted_or_disconnected_systems: List[str] = Field(
+        default_factory=list,
+        description="Specific built modules, UI instruments, or gameplay loops that are required for this slice's core loop but are not yet mounted or wired in the playable entrypoint.",
+    )
+    backlog_additions: List[WorkItemProposal] = Field(
+        default_factory=list,
+        description="New integration/assembly WorkItemProposal tasks to wire unmounted modules or fix whole-game boot/HUD/loop cohesion in the main scene (empty when is_slice_assembled=True).",
+    )
+    is_slice_assembled: bool = Field(
+        ...,
+        description="True ONLY when all built systems for the active slice are assembled and playable in the main entrypoint scene without needing further integration tasks (strictly last).",
+    )
+
+
 class RevisionRecord(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     One build attempt of a work item: what the worker produced and how the council responded.

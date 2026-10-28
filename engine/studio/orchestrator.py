@@ -917,7 +917,33 @@ class StudioOrchestrator:
                         thematic_biases=[],
                         preferred_palette_mood="retro_arcade",
                     )
-                if (staging_dir / "requirements_spec.json").is_file() and (staging_dir / "world_spec.json").is_file():
+                use_writers_room = (
+                    self.enable_writers_room
+                    if self.enable_writers_room is not None
+                    else self._is_live_genai_client()
+                )
+                board_needs_writers_room = False
+                if use_writers_room and self._continuous_production_enabled() and (staging_dir / "backlog.json").is_file():
+                    try:
+                        from engine.studio.production_board import ProductionBoard
+                        pb_check = ProductionBoard(staging_dir / "backlog.json")
+                        has_assembly_proof = any(
+                            (staging_dir / "artifacts" / "proofs").glob("filmstrip_slice_assembly_check_pass*.png")
+                        ) if (staging_dir / "artifacts" / "proofs").is_dir() else False
+                        if (
+                            not pb_check.is_drained()
+                            or (staging_dir / ".pending_steering.json").is_file()
+                            or (self._is_live_genai_client() and not has_assembly_proof)
+                        ):
+                            board_needs_writers_room = True
+                    except Exception as pb_chk_exc:
+                        logger.warning("Could not inspect backlog.json during resume check: %s", pb_chk_exc)
+
+                if (
+                    (staging_dir / "requirements_spec.json").is_file()
+                    and (staging_dir / "world_spec.json").is_file()
+                    and not board_needs_writers_room
+                ):
                     try:
                         world_spec = GenesisWorldSpec.model_validate_json((staging_dir / "world_spec.json").read_text(encoding="utf-8"))
                         req_spec = GameRequirementsSpec.model_validate_json((staging_dir / "requirements_spec.json").read_text(encoding="utf-8"))
@@ -1024,7 +1050,7 @@ class StudioOrchestrator:
                             json.dumps(manifest_preview, indent=2), encoding="utf-8"
                         )
 
-                if world_spec is None and use_writers_room:
+                if (world_spec is None or board_needs_writers_room) and use_writers_room:
                     evolution_report = context.raw_outputs.get("evolution_report") or context.raw_outputs.get("hypothesis_report")
                     if StudioBuildState.BRAINSTORMING in self.ALLOWED_TRANSITIONS.get(self.state, set()):
                         self.transition_to(

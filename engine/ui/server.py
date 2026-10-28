@@ -5384,18 +5384,39 @@ def create_app(
 
         now_iso = datetime.now(timezone.utc).isoformat()
         bible_data = target_bus.get_game_bible()
+        matched_cand = _resolve_matching_candidate_for_bible(bible_data) if isinstance(bible_data, dict) else None
+        if matched_cand is None and target_cartridges and target_cartridges.is_dir():
+            try:
+                cands = sorted(
+                    [d for d in target_cartridges.glob("candidate_*") if d.is_dir() and (d / "game_bible.json").is_file()],
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                if cands:
+                    matched_cand = cands[0]
+                    if not isinstance(bible_data, dict) or not bible_data.get("game_title"):
+                        bible_data = json.loads((matched_cand / "game_bible.json").read_text(encoding="utf-8"))
+            except Exception:
+                pass
 
         if req.feedback:
+            if matched_cand and (matched_cand / "game_bible.json").is_file():
+                try:
+                    disk_bible = json.loads((matched_cand / "game_bible.json").read_text(encoding="utf-8"))
+                    if isinstance(disk_bible, dict) and len(disk_bible.get("writers_room_transcript", [])) >= len((bible_data or {}).get("writers_room_transcript", [])):
+                        bible_data = disk_bible
+                except Exception:
+                    pass
             utt = {
                 "deliberation": req.deliberation,
                 "utterance_id": f"utt_exec_{uuid.uuid4().hex[:8]}",
-                "turn_index": (len(bible_data.get("writers_room_transcript", [])) + 1) if isinstance(bible_data, dict) else 1,
+                "turn_index": len(bible_data.get("writers_room_transcript", [])) if isinstance(bible_data, dict) else 1,
                 "speaker_role": "ExecutiveProducer",
                 "speaker_display_name": "Executive Producer (You)",
                 "spoken_dialogue": req.feedback,
                 "message": req.feedback,
-                "addressed_to": ["CreativeDirector", "GameplayDesigner", "UXExperienceDesigner"],
-                "referenced_roles": ["CreativeDirector"],
+                "addressed_to": ["CreativeDirector", "GameplaySystemsEngineer", "GameplayDesigner", "UXExperienceDesigner"],
+                "referenced_roles": ["CreativeDirector", "GameplaySystemsEngineer"],
                 "bible_updates_summary": ["Executive Producer creative direction injected"],
                 "artifact_emitted": None,
                 "timestamp_utc": now_iso,
@@ -5408,8 +5429,9 @@ def create_app(
                 "payload": utt,
             })
             if isinstance(bible_data, dict):
-                bible_data.setdefault("writers_room_transcript", []).append(utt)
-                matched_cand = _resolve_matching_candidate_for_bible(bible_data)
+                transcript = bible_data.setdefault("writers_room_transcript", [])
+                if not transcript or transcript[-1].get("spoken_dialogue") != req.feedback:
+                    transcript.append(utt)
                 if matched_cand and matched_cand.is_dir():
                     try:
                         sf = matched_cand / ".pending_steering.json"
@@ -5428,8 +5450,21 @@ def create_app(
                         logger.debug("Failed writing .pending_steering.json from greenlight handler: %s", sf_exc)
 
         if isinstance(bible_data, dict):
-            bible_data["status"] = "locked" if req.approved else "brainstorming"
+            if req.approved:
+                bible_data["status"] = "locked"
+            elif bible_data.get("status") not in ("in_production", "locked"):
+                bible_data["status"] = "brainstorming"
             bible_data["updated_at_utc"] = now_iso
+            if matched_cand and matched_cand.is_dir():
+                try:
+                    (matched_cand / "game_bible.json").write_text(
+                        json.dumps(bible_data, indent=2), encoding="utf-8"
+                    )
+                except Exception as gb_exc:
+                    logger.debug("Failed persisting game_bible.json on greenlight/steering: %s", gb_exc)
+            target_bus.publish_game_bible_update(bible_data)
+            if target_bus is not swarm_bus:
+                swarm_bus.publish_game_bible_update(bible_data)
             target_bus.publish_threadsafe({
                 "deliberation": f"Executive Producer {'approved and locked' if req.approved else 'steered'} Living Game Bible '{bible_data.get('game_title', '')}'.",
                 "event_type": SwarmEventType.GAME_BIBLE_UPDATED.value,
@@ -5450,11 +5485,54 @@ def create_app(
                 except Exception as db_exc:
                     logger.debug("Failed updating game_bible in DB on greenlight: %s", db_exc)
 
+        # If steering was injected while no Genesis build is actively running, automatically wake up the Studio
+        # in resume mode so the Council immediately responds in the transcript and dispatches any required tasks.
+        auto_resumed_job_id: Optional[str] = None
+        if req.feedback and not req.approved and matched_cand is not None and "PYTEST_CURRENT_TEST" not in os.environ:
+            try:
+                from engine.studio.daemon import StudioDaemon, StudioDaemonConfig, _genesis_build_lock
+                if not _genesis_build_lock.locked():
+                    auto_resumed_job_id = f"steer_{uuid.uuid4().hex[:8]}"
+                    cand_name = matched_cand.name
+                    target_bus._build_paused = False
+                    if target_bus is not swarm_bus:
+                        swarm_bus._build_paused = False
+                    try:
+                        pause_sentinel = target_cartridges / ".studio_paused.json"
+                        if pause_sentinel.is_file():
+                            pause_sentinel.unlink()
+                    except Exception:
+                        pass
+
+                    def _run_bg_steering_resume() -> None:
+                        try:
+                            cfg = StudioDaemonConfig(
+                                steam_profile="default",
+                                cartridges_root=target_cartridges,
+                                active_cartridge_dir=target_active,
+                                db_path=target_db,
+                                resume_current=True,
+                                resume_candidate_id=cand_name,
+                            )
+                            daemon_inst = StudioDaemon(config_obj=cfg, event_bus=target_bus)
+                            daemon_inst.run_genesis_cycle()
+                        except Exception as bg_exc:
+                            logger.error("Background steering resume failed: %s", bg_exc)
+
+                    threading.Thread(
+                        target=_run_bg_steering_resume,
+                        name=f"SteeringResume_{auto_resumed_job_id}",
+                        daemon=True,
+                    ).start()
+            except Exception as wake_exc:
+                logger.warning("Failed to auto-wake Studio on steering injection: %s", wake_exc)
+
         return JSONResponse({
             "deliberation": f"Recorded Executive Producer decision (approved={req.approved}, feedback_len={len(req.feedback)}).",
-            "status": "greenlit" if req.approved else "steering_injected",
+            "status": "greenlit" if req.approved else ("steering_resumed" if auto_resumed_job_id else "steering_injected"),
             "approved": req.approved,
             "feedback": req.feedback,
+            "auto_resumed_job_id": auto_resumed_job_id,
             "orchestrator": orch_result,
         })
 
@@ -5589,6 +5667,7 @@ def create_app(
         progress_event_types = {
             "STUDIO_DONE",
             "SLICE_VERIFIED",
+            "SLICE_ASSEMBLY_CHECK_COMPLETED",
             "backlog_item_approved",
             "backlog_item_submitted",
             "backlog_item_claimed",

@@ -643,7 +643,7 @@ def test_task_lead_restrategizes_and_pivots_on_council_request_changes(tmp_path)
         if "Task Lead Strategist" in text:
             lead_prompts.append(text)
             return next(lead_turns)
-        if "Visual/Audio Production Lead" in text:
+        if "Visual/Audio Production Lead" in text or "Audio Production Lead" in text:
             if "audio_asset" in text:
                 return bw.req_json("dive_whoosh", mode="sfx", asset_type="sfx", target="assets/audio/dive_whoosh.wav")
             return bw.req_json("diving_skiff", mode="static_sprite", target="assets/sprites/diving_skiff.png")
@@ -1161,7 +1161,7 @@ def test_task_lead_yields_on_busy_code_lock_persists_pending_decision_and_resume
         )
         assert vis_prop_done_event.wait(timeout=5.0), "Worker did not move on to vis_prop while code_enemy_ai was paused"
         assert board.get("vis_prop").state == "awaiting_review"
-        assert board.get("code_enemy_ai").state == "ready"
+        assert board.get("code_enemy_ai").state == "waiting_for_lock"
 
         # Now release code_lock so code_enemy_ai can resume from Turn 1
         code_lock.release()
