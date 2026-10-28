@@ -395,4 +395,127 @@ def test_drain_backlog_runs_slice_assembly_check_and_builds_integration_task(tmp
     assert order.index("isolated_hud") < order.index("integrate_cockpit_hud_into_main")
 
 
+def test_slice_playtest_script_and_conversational_council_roundtable(tmp_path: Path) -> None:
+    """Verifies that:
+    1. `_run_review_round` executes a sequential roundtable conversation where later panelists see earlier
+       panelists' observations (`EARLIER COUNCIL PANELIST OBSERVATIONS`) and emits `WritersRoomUtterance`s
+       with inline `proof_image_paths` and `artifact_emitted={'type': 'filmstrip', ...}`.
+    2. `_run_slice_assembly_check` builds a QA Slice Playtest Script (`res://tests/test_slice_playtest_*.tscn`),
+       executes the scripted playthrough, emits the `QATestEngineer` playtest utterance with the filmstrip,
+       convenes the multi-perspective `SlicePlaytestRoundtableTurn` conversation, and synthesizes `SliceAssemblyDecision`."""
+    from PIL import Image
+    from engine.studio.models import (
+        FilmstripPlan,
+        InputSegment,
+        ReviewBatch,
+        ReviewDecision,
+        SliceAssemblyDecision,
+        SlicePlaytestRoundtableTurn,
+    )
+
+    adds = {2: [P("core_movement", kind="mechanic_code", modules=("mechanics.gd",))]}
+    review_prompts: list[str] = []
+
+    def conversational_review(item_id: str, _awaiting: str, _full: str) -> ReviewDecision:
+        return ReviewDecision(
+            deliberation="Panelist deliberating on responsiveness and framing.",
+            validation_criteria_for_my_role="Requires >=30 deg/s rotation and zero UI overlap.",
+            item_id=item_id,
+            feedback="",
+            verdict="approve",
+        )
+
+    room, client, board, sched, candidate, order = build(tmp_path, adds, conversational_review)
+    room.enable_slice_assembly_check = True
+    room.enable_slice_playtest_discussion = True
+    (candidate / "project.godot").write_text(
+        '[application]\nconfig/name="Test"\nrun/main_scene="res://main.tscn"\n',
+        encoding="utf-8",
+    )
+    (candidate / "main.gd").write_text("extends Node2D\n", encoding="utf-8")
+    (candidate / "mechanics.gd").write_text("extends Node\n", encoding="utf-8")
+
+    def fake_playtest_planner(_w_ctx, playtest_item) -> FilmstripPlan:
+        return FilmstripPlan(
+            deliberation="Plan scripted playthrough of Slice 1 first goal.",
+            overlays_and_telemetry_strategy="Draw velocity and heading vectors in test scene.",
+            council_test_scene_summary="Instantiates res://main.tscn and scripts steering + primary verb through Goal 1.",
+            target_scene=f"res://tests/test_{playtest_item.item_id}.tscn",
+            test_scene_gd_content=(
+                "extends Node2D\n"
+                "func _ready() -> void:\n"
+                "\tadd_child(load('res://main.gd').new())\n"
+                "func get_state_snapshot() -> Dictionary:\n"
+                "\treturn {'player_pos': Vector2(120, 80), 'goal_1_complete': true}\n"
+            ),
+            capture_ticks=[15, 60, 120, 180],
+            input_segments=[
+                InputSegment(
+                    deliberation="Hold right input across ticks 20..160 to progress through Goal 1.",
+                    from_tick=20,
+                    to_tick=160,
+                    actions=["ui_right"],
+                )
+            ],
+        )
+
+    def fake_filmstrip_capture(_c_dir: Path, _ticks: list[int], out_path: Path) -> None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (64, 36), (10, 30, 50)).save(out_path)
+
+    room.assembly_playtest_planner_fn = fake_playtest_planner
+    room.assembly_filmstrip_fn = fake_filmstrip_capture
+
+    orig_generate = client.models.generate_content
+
+    def _gen_with_playtest_roundtable(model, contents, config=None):
+        schema = getattr(config, "response_schema", None) if config else None
+        sname = getattr(schema, "__name__", "")
+        if sname == "ReviewBatch":
+            prompt_str = "\n".join(str(c) for c in (contents if isinstance(contents, list) else [contents]))
+            review_prompts.append(prompt_str)
+        if sname == "SlicePlaytestRoundtableTurn":
+            return base._FakeGeminiResponse(
+                SlicePlaytestRoundtableTurn(
+                    deliberation="Evaluating slice playtest filmstrip and rate of motion.",
+                    validation_criteria_for_my_role="Responsive controls over 60-180 ticks and clear HUD.",
+                    spoken_dialogue="The scripted playtest progresses smoothly through the first goal with responsive steering.",
+                    addressed_to=["CreativeDirector", "GameplaySystemsEngineer"],
+                    observed_issues_or_gaps=[],
+                    is_playable_and_fun_from_my_perspective=True,
+                )
+            )
+        if sname == "SliceAssemblyDecision":
+            return base._FakeGeminiResponse(
+                SliceAssemblyDecision(
+                    deliberation="All panelists confirmed the slice playtest is playable and fun.",
+                    playability_and_fun_evaluation="Responsive human-scale controls and clean HUD verified across ticks 15..180.",
+                    spoken_dialogue="Slice 1 playtest verified by the Council; all systems are mounted and playable.",
+                    unmounted_or_disconnected_systems=[],
+                    backlog_additions=[],
+                    is_slice_assembled=True,
+                )
+            )
+        return orig_generate(model, contents, config)
+
+    client.models.generate_content = _gen_with_playtest_roundtable
+    try:
+        bible = room.run_writers_room(dna=base._sample_dna(), candidate_dir=candidate)
+    finally:
+        sched.stop()
+
+    assert bible.status == "locked"
+    # Second panelist in the review round saw the first panelist's observations
+    assert any("EARLIER COUNCIL PANELIST OBSERVATIONS IN THIS REVIEW ROUND" in p for p in review_prompts)
+    # QA Playtest scene was generated in tests/
+    assert any((candidate / "tests").glob("test_slice_playtest_*.tscn"))
+    # Writers' Room transcript includes QA Playtester utterance with filmstrip + specialist roundtable turns + Chair decision
+    roles_in_tx = [u.speaker_role for u in bible.writers_room_transcript]
+    assert "QATestEngineer" in roles_in_tx
+    qa_utts = [u for u in bible.writers_room_transcript if u.speaker_role == "QATestEngineer"]
+    assert qa_utts[0].proof_image_paths
+    assert qa_utts[0].artifact_emitted and qa_utts[0].artifact_emitted.get("type") == "filmstrip"
+
+
+
 

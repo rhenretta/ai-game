@@ -143,6 +143,7 @@ class LeadGameplaySWEAgent:
         self.visual_agent = visual_agent
         self.voice_agent = voice_agent
         self.last_deliberation: Optional[str] = None
+        self.last_diagnostic_test_scene_request: str = ""
 
     def _discover_sealed_assets(self, staging_dir: Path) -> Dict[str, List[str]]:
         """Discovers visual sprites, tiles, backgrounds, UI widgets, character portraits, visual mockups, and audio clips sealed upstream into staging_dir/assets/."""
@@ -627,6 +628,7 @@ class LeadGameplaySWEAgent:
         """
         if self.client is None:
             raise StudioAgentError("LeadGameplaySWEAgent requires an active google.genai Client (Rule 5: Zero Silent Fallbacks)")
+        self.last_diagnostic_test_scene_request = ""
 
         staging_dir.mkdir(parents=True, exist_ok=True)
         if stashed_bundle is not None:
@@ -891,6 +893,10 @@ class LeadGameplaySWEAgent:
                 f"- Instead of outputting speculative code, output your specific question in `self_question` and leave `patches` and `files` empty (`[]`).\n"
                 f"- `ContextCuratorAgent` will bring in the relevant context chunks on the next turn so YOU can answer your own question in `self_question_answer`.\n"
                 f"- On the turn after asking a `self_question`, FIRST write your concise, factual answer in `self_question_answer` (which will be retained in your context going forward) and THEN output `patches` (for existing files) and/or `files` (for brand-new files).\n\n"
+                f"RUNTIME DIAGNOSTIC TEST SCENE REQUEST (`diagnostic_test_scene_request` -> `qa_test_engineer` execution):\n"
+                f"- If you run into trouble fixing an issue or are uncertain what is causing an observed behavior at runtime, do NOT guess blindly!\n"
+                f"- Populate `diagnostic_test_scene_request` describing the diagnostic test scene, visual debug overlays, and `get_state_snapshot()` variables you need `qa_test_engineer` to capture (leaving `patches=[]` and `files=[]` if you need to inspect the diagnostic filmstrip and telemetry BEFORE modifying code).\n"
+                f"- `qa_test_engineer` will immediately build and run that diagnostic test scene and return the captured filmstrip and `[STATE_SNAPSHOT]` telemetry to you so you can implement the confirmed fix.\n\n"
                 f"EXISTING CARTRIDGE CODE IN STAGING:\n{existing_code_block}\n\n"
                 f"{prior_error_block}"
             )
@@ -979,11 +985,19 @@ class LeadGameplaySWEAgent:
                         raise CodeVerificationError(f"Empty response returned from Gemini for requirement track {track.id}")
 
                     bundle_dict = json.loads(response.text)
-                    if "files" in bundle_dict or "patches" in bundle_dict or "self_question" in bundle_dict:
+                    if (
+                        "files" in bundle_dict
+                        or "patches" in bundle_dict
+                        or "self_question" in bundle_dict
+                        or "diagnostic_test_scene_request" in bundle_dict
+                    ):
                         bundle = TrackCodeSynthesisPayload(**bundle_dict)
                     else:
                         bundle = OpenGenreCartridgeBundle(**bundle_dict)
                     self.last_deliberation = bundle.deliberation
+                    self.last_diagnostic_test_scene_request = (
+                        getattr(bundle, "diagnostic_test_scene_request", "") or ""
+                    ).strip()
                     break
                 except Exception as exc:
                     last_exc = exc
@@ -1067,6 +1081,24 @@ class LeadGameplaySWEAgent:
             if isinstance(last_exc, (CodeVerificationError, StudioAgentError)):
                 raise last_exc
             raise StudioAgentError(f"LeadGameplaySWEAgent failed for requirement track {track.id}: {last_exc}") from last_exc
+
+        if (
+            isinstance(bundle, TrackCodeSynthesisPayload)
+            and not bundle.files
+            and not bundle.patches
+            and not bundle.requested_assets
+            and self.last_diagnostic_test_scene_request
+        ):
+            try:
+                from engine.studio.workers import record_turn_substep
+                record_turn_substep(
+                    "requesting_diagnostic_scene",
+                    f"SWE Engineer requested QA diagnostic test scene: {self.last_diagnostic_test_scene_request[:140]}",
+                    details={"diagnostic_test_scene_request": self.last_diagnostic_test_scene_request},
+                )
+            except Exception:
+                pass
+            return {}
 
         return bundle.assemble_cartridge_directory(
             staging_dir,

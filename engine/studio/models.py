@@ -1434,6 +1434,15 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
         default="",
         description="Optional self-inquiry: If you lack critical context (e.g. an imported script's exact method/signal signature, node structure, shader uniforms, or design spec) needed to write code without guessing, output your specific question here and leave `patches` and `files` empty (`[]`). ContextCuratorAgent will fetch the needed context chunks so you can answer your own question on the next turn.",
     )
+    diagnostic_test_scene_request: str = Field(
+        default="",
+        description=(
+            "Optional runtime diagnostic request for `qa_test_engineer`: If you run into trouble fixing an issue or are uncertain what is "
+            "causing an observed behavior at runtime, describe the diagnostic test scene, visual debug overlays, "
+            "and `get_state_snapshot()` variables you need QA to capture. If you need to inspect that diagnostic output BEFORE writing code changes, "
+            "populate `diagnostic_test_scene_request` and leave `patches` and `files` empty (`[]`)."
+        ),
+    )
     requested_assets: List[AssetRequirement] = Field(
         default_factory=list,
         description="On-demand purpose-built assets (sprite sheets, articulated parts, props, tiles, parallax layers, UI, SFX) requested by the SWE agent for the Cartridge Asset Library."
@@ -2110,6 +2119,14 @@ class WritersRoomUtterance(BaseEpistemicModel):
     bible_updates_summary: List[str] = Field(
         default_factory=list,
         description="Summary of concrete additions/revisions made to the Living Game Bible during this turn."
+    )
+    proof_image_paths: List[str] = Field(
+        default_factory=list,
+        description="Optional paths to proof or slice-playtest filmstrips/renders attached to this utterance for inline Writers' Room UI display.",
+    )
+    artifact_emitted: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional structured artifact metadata (e.g. type='filmstrip' or 'mockup', title, file_path, notes) for inline UI card rendering.",
     )
     timestamp_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -2946,34 +2963,51 @@ class InputSegment(BaseEpistemicModel):
 
 class FilmstripPlan(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
-    How to demonstrate a built mechanic/level/UI to the council: scripted inputs, scenario setup hooks, state assertions,
-    optional isolated test scene script (`test_scene_gd_content`), plus the ticks to capture.
+    How the QA Engineer builds a test scene (`test_scene_gd_content`), renders diagnostic overlays/telemetry
+    (`overlays_and_telemetry_strategy`), executes scripted inputs (`input_segments`, `setup_calls`, `state_assertions`),
+    and summarizes the test scene for the Council (`council_test_scene_summary`).
     """
-    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why these inputs, scenario setup calls, isolated test scene (if any), and frames best prove the item meets its spec and the council's proof request.")
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this test scene architecture, diagnostic overlay/telemetry strategy, scripted inputs, and capture ticks best prove the item meets its spec and the council's proof request.")
+    overlays_and_telemetry_strategy: str = Field(
+        default="",
+        description=(
+            "QA Engineer's strategy for what visual diagnostic overlays (e.g. a test-only foreground CanvasLayer/Node2D._draw() "
+            "overlay in `test_scene_gd_content` drawing velocity vectors, collider bounds, target zones, camera framing markers, "
+            "or state callouts) and/or `get_state_snapshot()` telemetry keys are included in the test scene to prove the requirement."
+        ),
+    )
+    council_test_scene_summary: str = Field(
+        default="",
+        description=(
+            "Concise briefing written for the Council explaining: (1) what the test scene (`target_scene` / `test_scene_gd_content`) "
+            "instantiates and stages, (2) what scenario and inputs run across `capture_ticks`, and (3) what QA diagnostic overlays "
+            "or telemetry readouts are displayed so the Council knows what it is looking at."
+        ),
+    )
     target_scene: str = Field(
         default="",
-        description="Optional Godot scene path (e.g. 'res://tests/test_camera.tscn') to boot instead of 'res://main.tscn' when proving a feature in an isolated test scene.",
+        description="Godot test scene path (e.g. 'res://tests/test_<item_id>.tscn') built by QA to prove this requirement.",
     )
     test_scene_gd_content: str = Field(
         default="",
         description=(
-            "Optional complete GDScript 2.0 (`extends Node2D`) source code for an isolated QA test scene at `target_scene` "
+            "Complete GDScript 2.0 (`extends Node2D`) source code for the QA test scene at `target_scene` "
             "(e.g. `res://tests/test_<item_id>.gd` paired with `res://tests/test_<item_id>.tscn`). "
-            "Use this to stage subsystem or multi-entity test scenarios cleanly inside `res://tests/` so `main.gd` (`res://main.tscn`) "
-            "remains 100% pure playable game code without `func test_*()` staging helpers."
+            "Can instantiate isolated feature modules OR instantiate `res://main.tscn` as a child node, layer QA diagnostic overlays "
+            "on top, and implement `func get_state_snapshot() -> Dictionary` so production `main.gd` and `ui_hud.gd` stay 100% pure game code."
         ),
     )
     capture_ticks: List[int] = Field(default_factory=list, description="Ticks at which to capture a frame (1 to 12 frames).")
     input_segments: List[InputSegment] = Field(default_factory=list, description="Scripted inputs; empty means no input is applied.")
     setup_calls: List[QASetupCall] = Field(
         default_factory=list,
-        description="Optional QA scenario setup calls invoked by the test harness to stage hazards/interactions without hardcoding demo timers in main.gd.",
+        description="Optional QA scenario setup calls invoked by the test harness on the test scene.",
     )
     state_assertions: List[QAStateAssertion] = Field(
         default_factory=list,
         description="Observable state assertions verified by the QA harness across the captured ticks.",
     )
-    frame_expectations: List[str] = Field(default_factory=list, description="What each captured frame is expected to show, in tick order.")
+    frame_expectations: List[str] = Field(default_factory=list, description="Optional internal notes on what each captured tick tests.")
 
 
 class WorkItemProposal(BaseEpistemicModel):
@@ -2986,7 +3020,12 @@ class WorkItemProposal(BaseEpistemicModel):
     title: str = Field(..., description="Concise title.")
     spec: str = Field(
         ...,
-        description="Exactly what must be built, with the details the implementer needs. For 'visual_asset' items, each item maps 1-to-1 to a single PNG file and a single AssetRequirement entry—propose a separate 'visual_asset' WorkItemProposal for each distinct character, creature, or machine rig rather than bundling multiple rigs into one item.",
+        description=(
+            "What must be built or resolved: define the target player experience, behavioral requirements, system interactions, and acceptance criteria "
+            "(leaving low-level code diagnosis and implementation strategy to the Task Lead and SWE Engineer rather than prescribing narrow single-variable workarounds). "
+            "For 'visual_asset' items, each item maps 1-to-1 to a single PNG file and a single AssetRequirement entry—propose a separate 'visual_asset' "
+            "WorkItemProposal for each distinct character, creature, or machine rig rather than bundling multiple rigs into one item."
+        ),
     )
     proof_spec: str = Field(..., description="The evidence (image or images) the council wants to see to judge the result, e.g. which views, states or frames.")
     depends_on: List[str] = Field(default_factory=list, description="item_ids that must be approved before this can start.")
@@ -3093,6 +3132,14 @@ class ReviewDecision(BaseEpistemicModel):
     The council's review of an item that has returned with proof.
     """
     deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Close examination of the proof images against the spec and the game's design, including cross-task root-cause attribution.")
+    validation_criteria_for_my_role: str = Field(
+        default="",
+        description=(
+            "Before judging the proof, define from your specialist perspective what must be true for this change to genuinely work and feel right "
+            "for a human player in real gameplay (e.g., human-scale responsiveness and magnitude of motion/action over time under real player inputs, "
+            "absence of conflicting subsystems fighting player input, visual/UI harmony, and whether the QA test scene + debug overlays actually prove that behavior rather than a static or trivial state)."
+        ),
+    )
     item_id: str = Field(..., description="Item under review.")
     feedback: str = Field(default="", description="Concrete, actionable changes required for THIS item's own scope (empty when approving).")
     blocked_by_item_ids: List[str] = Field(
@@ -3143,31 +3190,105 @@ class ReviewBatch(BaseEpistemicModel):
     One reviewer's decisions for every item currently waiting on them.
     """
     deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Overall assessment of the proofs presented in this round.")
+    spoken_dialogue: str = Field(
+        default="",
+        description=(
+            "Natural first-person conversational contribution to the Council Review Roundtable in the Writers' Room, addressing fellow Council members, "
+            "stating what you determined needed to be validated from your perspective, responding to earlier reviewers' observations in this round, "
+            "and explaining what the proof frames, debug overlays, and telemetry actually show."
+        ),
+    )
+    addressed_to: List[str] = Field(
+        default_factory=list,
+        description="Fellow Council specialist role(s) you are addressing in this review roundtable.",
+    )
     review_decisions: List[ReviewDecision] = Field(default_factory=list, description="One decision per item awaiting review.")
     cap_decisions: List[CapDecision] = Field(default_factory=list, description="One decision per item that hit its revision cap or stalled.")
+
+
+class SlicePlaytestRoundtableTurn(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    One Council specialist's conversational turn evaluating the automated slice playthrough filmstrip and telemetry.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Specialist reasoning about what must be validated from your perspective for this slice to be playable and fun, and what the playthrough filmstrip and telemetry actually reveal.",
+    )
+    validation_criteria_for_my_role: str = Field(
+        default="",
+        description="What you determined must be true from your discipline's perspective (e.g., human-scale control responsiveness over time, subsystem harmony, UX clarity, visual/HUD layout cohesion, and genuine fun/agency through the slice goal).",
+    )
+    spoken_dialogue: str = Field(
+        ...,
+        description="Natural first-person conversational contribution to the Writers' Room discussing the slice playthrough filmstrip and telemetry with fellow Council members.",
+    )
+    addressed_to: List[str] = Field(
+        default_factory=list,
+        description="Fellow Council specialist role(s) you are addressing.",
+    )
+    observed_issues_or_gaps: List[str] = Field(
+        default_factory=list,
+        description="Concrete playability, responsiveness, visual/UI, or assembly issues observed in the slice playthrough (empty if none).",
+    )
+    is_playable_and_fun_from_my_perspective: bool = Field(
+        ...,
+        description="True ONLY if the slice playthrough proves the game is playable, responsive at human scale, and fun from your specialist perspective (strictly last).",
+    )
 
 
 class SliceAssemblyDecision(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     Council evaluation when all current Production Board tasks for the active slice have been approved,
     determining whether the built modules and assets are cohesively assembled in the playable entrypoint
-    or whether integration/assembly task(s) should be added to the Production Board before closing the slice.
+    and proven playable and fun through the slice playthrough, or whether integration/fix task(s)
+    should be added to the Production Board before closing the slice.
     """
     deliberation: str = Field(
         ...,
-        description="MANDATORY FIRST PROPERTY: Holistic evaluation of the booted main_scene filmstrip, live scene tree, and entrypoint module reachability against the Living Game Bible and completed board items.",
+        description="MANDATORY FIRST PROPERTY: Holistic evaluation of the slice playthrough filmstrip, live scene tree, and entrypoint module reachability against the Living Game Bible and completed board items.",
+    )
+    playability_and_fun_evaluation: str = Field(
+        default="",
+        description=(
+            "Evaluation of the automated slice playthrough filmstrip and telemetry: did the playthrough script achieve the slice goal using real player controls, "
+            "do controls/movement/actions respond at a playable human scale without fighting each other, and is the assembled experience cohesive, legible, and fun?"
+        ),
+    )
+    spoken_dialogue: str = Field(
+        default="",
+        description="Natural first-person conversational synthesis to the Writers' Room summarizing the Council's playtest roundtable findings and next steps.",
     )
     unmounted_or_disconnected_systems: List[str] = Field(
         default_factory=list,
-        description="Specific built modules, UI instruments, or gameplay loops that are required for this slice's core loop but are not yet mounted or wired in the playable entrypoint.",
+        description="Specific built modules, UI instruments, or gameplay loops that are required for this slice's core loop but are not yet mounted, wired, or playable in the entrypoint.",
     )
     backlog_additions: List[WorkItemProposal] = Field(
         default_factory=list,
-        description="New integration/assembly WorkItemProposal tasks to wire unmounted modules or fix whole-game boot/HUD/loop cohesion in the main scene (empty when is_slice_assembled=True).",
+        description="New integration or gameplay/UI fix WorkItemProposal tasks to wire unmounted modules or resolve playability/responsiveness/cohesion issues exposed by the slice playthrough (empty when is_slice_assembled=True).",
     )
     is_slice_assembled: bool = Field(
         ...,
-        description="True ONLY when all built systems for the active slice are assembled and playable in the main entrypoint scene without needing further integration tasks (strictly last).",
+        description="True ONLY when all built systems for the active slice are assembled in the main entrypoint AND the slice playthrough proves the game is playable, responsive at human scale, and fun without needing further tasks (strictly last).",
+    )
+
+
+class CouncilDiagnosticProbe(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Evaluated by the Council (`GameplaySystemsEngineer`) when an Executive Producer steering / bug report arrives,
+    determining whether the root cause is already clear from static code/context or whether `qa_test_engineer`
+    should first build and run a diagnostic test scene with overlays/telemetry to isolate the runtime cause.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Technical analysis of the reported issue against the cartridge scripts and whether the runtime root cause is already clear or requires a diagnostic QA test scene.",
+    )
+    diagnostic_qa_brief: str = Field(
+        default="",
+        description="When `needs_runtime_debug_scene=True`, a concrete brief for `qa_test_engineer` specifying what test scene to stage, what inputs/ticks to run, and what visual debug overlays or `get_state_snapshot()` telemetry to capture to isolate the root cause.",
+    )
+    needs_runtime_debug_scene: bool = Field(
+        ...,
+        description="True ONLY when you are not sure what is causing the reported issue from static code alone and need `qa_test_engineer` to run a diagnostic test scene with overlays/telemetry first (strictly last).",
     )
 
 
@@ -3303,19 +3424,39 @@ class QAPostCaptureAudit(BaseEpistemicModel):
     """
     deliberation: str = Field(
         ...,
-        description="MANDATORY FIRST PROPERTY: Objective frame-by-frame visual and behavioral inspection of the captured filmstrip image against the 16:9 Concept Art Mockup, task spec, proof spec, and any prior Council rejection feedback.",
+        description=(
+            "MANDATORY FIRST PROPERTY: Objective frame-by-frame visual and behavioral inspection of the captured filmstrip image "
+            "(Frame 1 through Frame N) against the 16:9 Concept Art Mockup, task spec, proof spec, and any prior Council rejection feedback. "
+            "Verify that the intended subjects, interactions, and scene elements remain visibly observable inside the 16:9 viewport across all captured frames."
+        ),
     )
     observed_frames_summary: str = Field(
         ...,
-        description="Honest description of what is actually visible in the captured frames (including whether entity sprites/rigs are visibly rendered vs. invisible/primitive shapes, whether terrain fills the viewport without grey borders, and what state transitions occurred).",
+        description=(
+            "Honest frame-by-frame description of what is ACTUALLY visible in the rendered pixels of each captured frame "
+            "(never pre-capture expectations or text telemetry assumptions)."
+        ),
+    )
+    post_capture_test_scene_summary: str = Field(
+        default="",
+        description=(
+            "Updated post-capture briefing for the Council explaining what the test scene staged, what inputs/overlays ran, "
+            "and what the rendered frames actually show."
+        ),
     )
     unaddressed_defects: List[str] = Field(
         default_factory=list,
-        description="List of any visual or behavioral defects still visible in the captured frames (e.g., invisible character sprite, crude procedural polygon stand-in where a textured asset was requested, unpadded grey border, or static non-responsive state).",
+        description=(
+            "List of any visual, framing, or behavioral defects visible in the captured frames (e.g., subjects disappearing from the viewport, "
+            "missing/clipped sprites, or unfulfilled acceptance criteria)."
+        ),
     )
     qa_passed: bool = Field(
         ...,
-        description="True ONLY if the captured frames visually and behaviorally satisfy the proof_spec and all prior Council feedback without workarounds or missing sprites.",
+        description=(
+            "True ONLY if every captured frame visually and behaviorally satisfies the proof_spec and keeps the relevant subjects "
+            "visibly observable inside the viewport across the scenario."
+        ),
     )
 
 

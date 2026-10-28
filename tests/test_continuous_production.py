@@ -50,7 +50,10 @@ class FakeSwe:
 
 def plan_json(ticks=(5, 20), segs=(), expectations=("before", "after")):
     return FilmstripPlan(
-        deliberation="show before/after", capture_ticks=list(ticks),
+        deliberation="show before/after",
+        overlays_and_telemetry_strategy="Draw velocity vector overlay and expose get_state_snapshot() telemetry.",
+        council_test_scene_summary="Test scene instantiates target module, injects input segments across ticks, and renders QA velocity overlay.",
+        capture_ticks=list(ticks),
         input_segments=[InputSegment(deliberation="d", from_tick=a, to_tick=b, actions=acts) for a, b, acts in segs],
         frame_expectations=list(expectations),
     ).model_dump_json()
@@ -2785,9 +2788,12 @@ def test_qa_plate_labels_pose_frame_and_causal_filmstrip_invariants(tmp_path: Pa
     issues = validate_filmstrip_plan(bad_plan, ["KEY_1", "KEY_SPACE"], item_kind="mechanic_code")
     assert any("set_onboarding_step" in iss for iss in issues)
     assert any("must include at least one `input_segments`" in iss for iss in issues)
+    assert any("council_test_scene_summary" in iss for iss in issues)
 
     good_plan = FilmstripPlan(
         deliberation="Authentic causal plan",
+        overlays_and_telemetry_strategy="Draw connection line overlay and expose node connection count in get_state_snapshot().",
+        council_test_scene_summary="Test scene instantiates res://tests/test_mechanic.tscn, clicks node A then node B at ticks 25-35, and renders QA connection overlay.",
         capture_ticks=[15, 60],
         setup_calls=[],
         input_segments=[
@@ -3303,6 +3309,99 @@ def test_task_lead_generic_multi_cell_asset_and_proof_strategy(tmp_path: Path):
         for c_i in range(2):
             quad_alpha = arr_after[r_i * 128:(r_i + 1) * 128, c_i * 128:(c_i + 1) * 128, 3]
             assert int(np.count_nonzero(quad_alpha > 24)) > 50, f"Quadrant ({r_i}, {c_i}) erased during catalog verification"
+
+
+def test_qa_test_scene_ownership_overlay_strategy_and_slim_harness(tmp_path: Path):
+    """Verifies that:
+    1. `run_qa_test_engineer_specialist` writes `res://tests/test_<item_id>.tscn` + `.gd` when `test_scene_gd_content` is provided,
+       passes `QA Test Scene Summary for Council:` and `QA Overlays & Telemetry Strategy:` in worker notes, and omits
+       `Pre-capture expected frames:` so reviewers evaluate actual rendered pixels rather than pre-capture predictions.
+    2. `godot_harness.gd` is stripped of the dead CPU software rasterizer (`_render_headless_scene_to_image`) and legacy
+       `flume_grid` checks.
+    """
+    from engine.studio.workers import run_qa_test_engineer_specialist
+
+    harness_src = (Path(__file__).resolve().parent.parent / "engine" / "sim" / "godot_harness.gd").read_text(encoding="utf-8")
+    assert "_render_headless_scene_to_image" not in harness_src
+    assert "flume_grid" not in harness_src
+
+    def responder(_prompt):
+        return FilmstripPlan(
+            deliberation="Build isolated test scene with velocity vector overlay.",
+            overlays_and_telemetry_strategy="Draw cyan velocity vector arrow in _draw() and expose velocity in get_state_snapshot().",
+            council_test_scene_summary="Instantiates res://tests/test_dive.tscn, injects dive action at ticks 5-15, and renders cyan velocity overlay.",
+            target_scene="res://tests/test_dive.tscn",
+            test_scene_gd_content="extends Node2D\nfunc get_state_snapshot() -> Dictionary:\n\treturn {'vel_y': 42.0}\n",
+            capture_ticks=[5, 20],
+            input_segments=[InputSegment(deliberation="d", from_tick=5, to_tick=15, actions=["dive"])],
+            frame_expectations=["Frame 1 baseline", "Frame 2 diving"],
+        ).model_dump_json()
+
+    ctx, _ = code_ctx(tmp_path, responder)
+    item = code_item("dive")
+    out = run_qa_test_engineer_specialist(ctx, item, "Build a test scene for dive mechanic with velocity vector overlay.")
+    assert (tmp_path / "tests" / "test_dive.gd").is_file()
+    assert (tmp_path / "tests" / "test_dive.tscn").is_file()
+    assert "QA Test Scene Summary for Council: Instantiates res://tests/test_dive.tscn" in out.summary
+    assert "QA Overlays & Telemetry Strategy: Draw cyan velocity vector arrow" in out.summary
+    assert "Pre-capture expected frames:" not in out.summary
+
+    # 3. Verify SWE Engineer `diagnostic_test_scene_request` triggers an immediate QA diagnostic test scene and feeds results back to SWE
+    from engine.studio.models import CouncilDiagnosticProbe
+    from engine.studio.workers import run_swe_engineer_specialist
+
+    assert list(CouncilDiagnosticProbe.model_fields.keys())[0] == "deliberation"
+
+    class _DiagSwe(FakeSwe):
+        def __init__(self):
+            super().__init__()
+            self.last_diagnostic_test_scene_request = ""
+            self.pass_idx = 0
+            self.received_descriptions = []
+
+        def implement_requirement_track(self, track, staging_dir, requirements_spec=None, **kw):
+            self.pass_idx += 1
+            self.received_descriptions.append(track.description)
+            if self.pass_idx == 1:
+                self.last_diagnostic_test_scene_request = "Build test scene showing entity coordinates and camera target across 60 ticks."
+                return {}
+            self.last_diagnostic_test_scene_request = ""
+            return super().implement_requirement_track(track, staging_dir, requirements_spec=requirements_spec, **kw)
+
+    diag_swe = _DiagSwe()
+    ctx_swe, _ = code_ctx(tmp_path, responder, swe=diag_swe)
+    swe_rep = run_swe_engineer_specialist(ctx_swe, item, "Fix camera framing when multiple entities move.")
+    assert diag_swe.pass_idx == 2
+    assert "SWE DIAGNOSTIC TEST SCENE RESULTS & TELEMETRY" in diag_swe.received_descriptions[1]
+    assert "[SWE Diagnostic QA Scene]:" in swe_rep.summary
+
+    # 4. Verify validate_task_lead_decision blocks submit_to_council when latest QA Post-Capture Visual Audit failed (verification_passed=False)
+    from engine.studio.models import SpecialistReport, TaskLeadDecision
+    from engine.studio.workers import validate_task_lead_decision
+
+    failed_qa_turn = SpecialistReport(
+        deliberation="Post-capture audit failed: active subject left the viewport in Frames 3-6.",
+        turn_index=1,
+        specialist_agent="qa_test_engineer",
+        brief="Verify scene framing",
+        summary="QA Post-Capture Visual Audit (qa_passed=False): subject left the viewport in frames 3-6.",
+        proof_images=[str(tmp_path / "filmstrip_failed.png")],
+        verification_passed=False,
+    )
+    submit_dec = TaskLeadDecision(
+        deliberation="Try to submit anyway",
+        current_strategy="Submit",
+        proof_strategy="Filmstrip",
+        action="submit_to_council",
+    )
+    gate_issues = validate_task_lead_decision(
+        submit_dec,
+        ["swe_engineer", "qa_test_engineer"],
+        [str(tmp_path / "filmstrip_failed.png")],
+        item_kind="mechanic_code",
+        turn_history=[failed_qa_turn],
+    )
+    assert any("Post-Capture Visual Audit failed" in iss for iss in gate_issues)
 
 
 

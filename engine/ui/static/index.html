@@ -8478,10 +8478,38 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
               <img src="${escapeHtml(mUrl)}" alt="${escapeHtml(mTitle)}" style="width: 100%; max-height: 160px; object-fit: cover; border-radius: 3px; cursor: pointer;" onclick="openMockupLightbox('${escapeJsAttr(mUrl)}', '${escapeJsAttr(mTitle)}', 'concept_mockup', '')" />
             </div>
           `;
+        } else if (aType === 'filmstrip') {
+          const rawPath = utt.artifact_emitted.path || utt.artifact_emitted.file_path || '';
+          const fUrl = formatProofUrl(rawPath);
+          const fCaption = utt.artifact_emitted.caption || rawPath.split('/').pop() || 'QA Proof Filmstrip';
+          if (fUrl) {
+            artifactBadge += `
+              <div style="margin-top: 6px; background: #040814; border: 1px solid var(--cyan); border-radius: 4px; padding: 6px;">
+                <div style="font-size: 10px; color: var(--cyan); font-weight: bold; margin-bottom: 4px;">🎞️ ${escapeHtml(fCaption)} <span style="color: var(--slate); font-weight: normal;">(click to inspect full resolution)</span></div>
+                <img src="${escapeHtml(fUrl)}" alt="${escapeHtml(fCaption)}" style="width: 100%; max-height: 220px; object-fit: contain; background: #02040a; border-radius: 3px; cursor: pointer;" onclick="openMockupLightbox('${escapeJsAttr(fUrl)}', '${escapeJsAttr(fCaption)}', 'filmstrip_proof', '')" />
+              </div>
+            `;
+          }
         } else if (aType === 'evolution') {
           artifactBadge += `<div style="margin-top: 4px; font-size: 10px; color: var(--green);">🌱 Logged Concept Evolution v${escapeHtml(utt.artifact_emitted.version || '')}: ${escapeHtml(utt.artifact_emitted.hypothesis || utt.artifact_emitted.evolved_premise || '')}</div>`;
         } else if (aType === 'storyboard') {
           artifactBadge += `<div style="margin-top: 4px; font-size: 10px; color: var(--amber);">🎬 Authored ${escapeHtml(utt.artifact_emitted.beats_count || 1)} Experience Storyboard Beat(s)</div>`;
+        }
+      }
+      if (Array.isArray(utt.proof_image_paths) && utt.proof_image_paths.length > 0) {
+        const alreadyRenderedPath = (utt.artifact_emitted && (utt.artifact_emitted.path || utt.artifact_emitted.file_path)) || '';
+        const extraProofs = utt.proof_image_paths.filter(p => p && p !== alreadyRenderedPath);
+        for (const pPath of extraProofs) {
+          const pUrl = formatProofUrl(pPath);
+          const pLabel = String(pPath).split('/').pop() || 'Proof Image';
+          if (pUrl) {
+            artifactBadge += `
+              <div style="margin-top: 6px; background: #040814; border: 1px solid var(--navy); border-radius: 4px; padding: 6px;">
+                <div style="font-size: 10px; color: var(--cyan); font-weight: bold; margin-bottom: 4px;">🎞️ Attached Proof: ${escapeHtml(pLabel)}</div>
+                <img src="${escapeHtml(pUrl)}" alt="${escapeHtml(pLabel)}" style="width: 100%; max-height: 200px; object-fit: contain; background: #02040a; border-radius: 3px; cursor: pointer;" onclick="openMockupLightbox('${escapeJsAttr(pUrl)}', '${escapeJsAttr(pLabel)}', 'filmstrip_proof', '')" />
+              </div>
+            `;
+          }
         }
       }
 

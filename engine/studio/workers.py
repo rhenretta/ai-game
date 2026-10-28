@@ -1222,7 +1222,50 @@ def validate_filmstrip_plan(plan: FilmstripPlan, actions: List[str], item_kind: 
         ts_code = (getattr(plan, "test_scene_gd_content", "") or "").strip()
         if "extends " not in ts_code:
             issues.append("`test_scene_gd_content` must be a valid GDScript 2.0 script starting with `extends Node2D` (or `extends Control`).")
+    if item_kind in ("mechanic_code", "ui", "integration", "level_map") and not (getattr(plan, "council_test_scene_summary", "") or "").strip():
+        issues.append(
+            "`council_test_scene_summary` must be populated with a concise briefing for the Council explaining what test scene is running, "
+            "what scenario/inputs are executed across `capture_ticks`, and what QA diagnostic overlays or telemetry readouts are displayed."
+        )
     return issues
+
+
+def _write_qa_test_scene_pair(
+    cartridge_dir: Path,
+    item_id: str,
+    test_gd_code: str,
+    raw_scene: str = "",
+) -> Tuple[str, str, str]:
+    safe_id = _safe_id(item_id)
+    rel_scene_base = (raw_scene or "").strip()
+    if rel_scene_base.startswith("res://"):
+        rel_scene_base = rel_scene_base[len("res://"):]
+    elif rel_scene_base.startswith("res:/"):
+        rel_scene_base = rel_scene_base[len("res:/"):]
+    rel_scene_base = rel_scene_base.lstrip("/")
+    if not rel_scene_base or rel_scene_base in ("main.tscn", "main.gd") or not rel_scene_base.startswith("tests/"):
+        rel_scene_base = f"tests/test_{safe_id}.tscn"
+    if rel_scene_base.endswith(".gd"):
+        rel_gd_path = rel_scene_base
+        rel_tscn_path = rel_scene_base[:-3] + ".tscn"
+    elif rel_scene_base.endswith(".tscn"):
+        rel_tscn_path = rel_scene_base
+        rel_gd_path = rel_scene_base[:-5] + ".gd"
+    else:
+        rel_tscn_path = f"{rel_scene_base}.tscn"
+        rel_gd_path = f"{rel_scene_base}.gd"
+    abs_gd_path = Path(cartridge_dir) / rel_gd_path
+    abs_tscn_path = Path(cartridge_dir) / rel_tscn_path
+    abs_gd_path.parent.mkdir(parents=True, exist_ok=True)
+    abs_gd_path.write_text(test_gd_code.strip() + "\n", encoding="utf-8")
+    tscn_content = (
+        '[gd_scene load_steps=2 format=3]\n\n'
+        f'[ext_resource type="Script" path="res://{rel_gd_path}" id="1_test"]\n\n'
+        '[node name="TestScene" type="Node2D"]\n'
+        'script = ExtResource("1_test")\n'
+    )
+    abs_tscn_path.write_text(tscn_content, encoding="utf-8")
+    return f"res://{rel_tscn_path}", rel_gd_path, rel_tscn_path
 
 
 def _serialize_input_segments(plan: FilmstripPlan) -> List[Dict[str, Any]]:
@@ -1271,23 +1314,30 @@ def plan_filmstrip(ctx: WorkerContext, item: WorkItem, attempts: int = 3) -> Fil
     for attempt in range(1, attempts + 1):
         retry = "\n\nYOUR PREVIOUS PLAN FAILED VALIDATION; FIX:\n- " + "\n- ".join(issues) if issues else ""
         prompt = (
-            f"You are the QA Director planning a short scripted playthrough that PROVES a built item to the design council.\n"
+            f"You are the QA Test Engineer designing and building a Godot 4.3 test scene and scripted playthrough that PROVES a built item to the design council.\n"
             f"ITEM [{item.item_id}] ({item.kind}): {item.title}\nSPEC: {item.spec}\nTHE COUNCIL WANTS TO SEE: {item.proof_spec}\n"
             f"Available input actions: {actions}.{context_block}\n"
-            f"Choose `capture_ticks` (1-{MAX_PROOF_FRAMES} frames, ticks 1-{MAX_PROOF_TICKS}, 60 ticks ~ 1 second), `input_segments` "
+            f"1. BUILD YOUR QA TEST SCENE (`target_scene` + `test_scene_gd_content`):\n"
+            f"   - Set `target_scene = 'res://tests/test_{_safe_id(item.item_id)}.tscn'` and write the complete GDScript 2.0 (`extends Node2D`) test scene in `test_scene_gd_content`.\n"
+            f"   - For isolated subsystem/mechanic/UI tasks, `test_scene_gd_content` can instantiate the specific feature script(s) or entities under test.\n"
+            f"   - For whole-game `integration` or `level_map` tasks (or when verifying behavior inside the full game), `test_scene_gd_content` can instantiate `preload('res://main.tscn').instantiate()` (or `preload('res://main.gd').new()`) as a child node in `_ready()` so it runs the real game entrypoint while allowing you to attach QA diagnostic overlays and custom telemetry on top!\n"
+            f"   - Keep production `main.gd` and `ui_hud.gd` 100% pure game code with ZERO debug overlays—all test staging and rich QA diagnostic overlays belong exclusively inside your `test_scene_gd_content`.\n"
+            f"2. STRATEGIZE DIAGNOSTIC OVERLAYS, HUMAN-SCALE RESPONSIVENESS & TELEMETRY (`overlays_and_telemetry_strategy`):\n"
+            f"   - Reason from first principles: what would a live human player experience when interacting with this feature, and what needs to be measured over time (`capture_ticks`, 60 ticks ~ 1 second) to prove the feature feels responsive, legible, and free of subsystem conflicts?\n"
+            f"   - For example, if the feature involves movement, steering, rotation, or physics controls, holding an input over 60–180 ticks (1–3 seconds) must produce a responsive, human-playable rate of change rather than a sluggish crawl or two subsystems fighting/canceling each other out!\n"
+            f"   - Build rich test-only visual diagnostic overlays inside `test_scene_gd_content` (e.g., a foreground `CanvasLayer` or `Node2D._draw()` node in `res://tests/test_*.tscn` that draws velocity/heading/force vectors, collider/trigger bounds, camera framing markers, or live delta readouts) AND include `'player_pos'` plus task-specific metrics in `func get_state_snapshot() -> Dictionary` so both the rendered frames and the `[QA] pos=...` bottom telemetry bar prove real progression.\n"
+            f"3. WRITE A CLEAR SUMMARY FOR THE COUNCIL (`council_test_scene_summary`):\n"
+            f"   - Write `council_test_scene_summary` explaining to the Council: (a) what your test scene instantiates and stages, (b) what scenario and inputs run across `capture_ticks`, and (c) what QA diagnostic overlays or telemetry readouts you added so the Council knows exactly what it is looking at.\n"
+            f"4. SCRIPT CAUSAL INPUTS & CAPTURE TICKS (`capture_ticks`, `input_segments`, `state_assertions`):\n"
+            f"   - Choose `capture_ticks` (1-{MAX_PROOF_FRAMES} frames, ticks 1-{MAX_PROOF_TICKS}, 60 ticks ~ 1 second), `input_segments` "
             f"(actions or KEY_* held over tick ranges, plus optional `mouse_click_pos`), and optional `setup_calls` (ONLY for scenario staging "
             f"such as spawning a hazard or positioning actors—NEVER call `simulate_*`, `force_*`, `complete_*`, or `set_onboarding_step` shortcuts that bypass real player input or physics) "
             f"so the captured frames show:\n"
-            f"  - Frame 1 (`capture_ticks[0]`, before player inputs take effect): the UNSOLVED t=0 baseline state (`test_unsolved_baseline_t0`), and\n"
-            f"  - Subsequent frames (`capture_ticks[1..]`): the authentic causal progression driven by `input_segments` (`actions` and/or `mouse_click_pos`).\n"
-            f"REACTIVE TIMING TIP: When a secondary player input depends on dynamic physics or movement reaching a threshold (rather than a fixed tick guess), "
-            f"populate `when_snapshot_key`, `when_operator` ('<=', '>=', '==', '!='), `when_value`, and `hold_ticks` on that `InputSegment` so the harness "
-            f"fires the input at the exact tick the live simulation state satisfies the condition.\n"
-            f"ISOLATED TEST SCENES (`res://tests/test_<item_id>.tscn` + `test_scene_gd_content` vs `res://main.tscn`):\n"
-            f"  - For `mechanic_code` or `ui` tasks that require specific multi-node staging, hazard placement, or subsystem setup that is NOT already present at `t=0` in `res://main.tscn`, author an isolated test scene by setting `target_scene = 'res://tests/test_{_safe_id(item.item_id)}.tscn'` and writing a self-contained GDScript 2.0 (`extends Node2D`) test harness in `test_scene_gd_content`!\n"
-            f"  - Inside `test_scene_gd_content`, you can either instantiate `preload('res://main.gd').new()` (or preload specific feature modules like `res://entities.gd`, `res://scenes.gd`, `res://scenes/...`) in `_ready()`, stage the test scenario or expose custom `setup_calls` helper methods on your test scene root, and implement `func get_state_snapshot() -> Dictionary` so `main.gd` NEVER gets polluted with `func test_*()` staging helpers!\n"
-            f"  - For `level_map` or full-loop `integration` tasks (or when testing the unmodified main scene directly via `input_segments`), leave `target_scene` and `test_scene_gd_content` empty (`\"\"`) to boot `res://main.tscn`.\n"
-            f"Also populate `state_assertions` for key observable state transitions (which are verified against live engine snapshots). "
+            f"     * Frame 1 (`capture_ticks[0]`, before player inputs take effect): the UNSOLVED t=0 baseline state (`test_unsolved_baseline_t0`), and\n"
+            f"     * Subsequent frames (`capture_ticks[1..]`): the authentic causal progression driven by `input_segments` (`actions` and/or `mouse_click_pos`). Never leave `input_segments` empty on an interactive mechanic, UI control, or integration task!\n"
+            f"   - REACTIVE TIMING TIP: When a secondary player input depends on dynamic physics or movement reaching a threshold, "
+            f"populate `when_snapshot_key`, `when_operator` ('<=', '>=', '==', '!='), `when_value`, and `hold_ticks` on that `InputSegment`.\n"
+            f"   - Populate `state_assertions` for key observable state transitions verified against `get_state_snapshot()`. "
             f"Use no input only if the item kind is a purely static layout preview. Provide `deliberation` FIRST.{retry}"
         )
         contents_arg: Any = ([prompt] + multimodal_parts) if multimodal_parts else prompt
@@ -1506,9 +1556,15 @@ def code_item_handler(ctx: WorkerContext) -> Callable[[WorkItem], WorkerResult]:
             extra_qa += f" Setup calls: {[c['method_name'] for c in setup_calls]}."
         if getattr(plan, "state_assertions", None):
             extra_qa += f" Assertions: {[(a.at_tick, a.snapshot_key, a.expected_value_or_change) for a in plan.state_assertions]}."
+        council_summary = (getattr(plan, "council_test_scene_summary", "") or "").strip()
+        overlays_strat = (getattr(plan, "overlays_and_telemetry_strategy", "") or "").strip()
+        qa_briefing = ""
+        if council_summary:
+            qa_briefing += f" QA Test Scene Summary for Council: {council_summary}"
+        if overlays_strat:
+            qa_briefing += f" QA Overlays & Telemetry: {overlays_strat}"
         notes = (
-            f"Implemented '{item.item_id}' in {modules}; engine verification passed. Filmstrip ticks {plan.capture_ticks}. "
-            f"Plan: {plan.deliberation[:300]} Expected frames: {plan.frame_expectations}{extra_qa}"
+            f"Implemented '{item.item_id}' in {modules}; engine verification passed. Filmstrip ticks {plan.capture_ticks}.{qa_briefing}{extra_qa}"
         )
         return WorkerResult(proof_images=[str(strip)], notes=notes)
 
@@ -2169,13 +2225,54 @@ def run_swe_engineer_specialist(
                 except Exception:
                     pass
 
-                agent.implement_requirement_track(
+                written_map = agent.implement_requirement_track(
                     track=track,
                     staging_dir=ctx.cartridge_dir,
                     requirements_spec=req_spec,
                     **swe_extra_kwargs,
                 )
                 swe_extra_kwargs.pop("stashed_bundle", None)
+                diag_req = (getattr(agent, "last_diagnostic_test_scene_request", "") or "").strip()
+                if diag_req:
+                    logger.info("SWE Engineer requested diagnostic test scene for '%s': %s", item.item_id, diag_req)
+                    record_turn_substep(
+                        "running_diagnostic_qa",
+                        f"Running QA diagnostic test scene requested by SWE Engineer: {diag_req[:120]}",
+                        details={"diagnostic_test_scene_request": diag_req},
+                        specialist_agent="qa_test_engineer",
+                    )
+                    qa_diag_report = run_qa_test_engineer_specialist(
+                        ctx,
+                        item,
+                        brief=f"[SWE DIAGNOSTIC TEST SCENE REQUEST — BUILD TEST SCENE WITH OVERLAYS/TELEMETRY TO ISOLATE ISSUE]:\n{diag_req}",
+                        turn_index=turn_index,
+                        _lock_already_held=True,
+                    )
+                    for p_img in qa_diag_report.proof_images:
+                        if p_img not in proof_images:
+                            proof_images.append(p_img)
+                        if "extra_image_paths" in swe_extra_kwargs and p_img not in swe_extra_kwargs["extra_image_paths"]:
+                            swe_extra_kwargs["extra_image_paths"].append(p_img)
+                    for q_tf in qa_diag_report.touched_files:
+                        if q_tf not in touched:
+                            touched.append(q_tf)
+                    summaries.append(f"[SWE Diagnostic QA Scene]: {qa_diag_report.summary}")
+                    if not written_map:
+                        track = track.model_copy(
+                            update={
+                                "description": (
+                                    f"{track.description}\n\n"
+                                    f"SWE DIAGNOSTIC TEST SCENE RESULTS & TELEMETRY (use this to implement the fix now):\n"
+                                    f"{qa_diag_report.summary}"
+                                )
+                            }
+                        )
+                        agent.implement_requirement_track(
+                            track=track,
+                            staging_dir=ctx.cartridge_dir,
+                            requirements_spec=req_spec,
+                            **swe_extra_kwargs,
+                        )
                 if ctx.code_verify is not None:
                     record_turn_substep(
                         "running_tests",
@@ -2389,9 +2486,79 @@ def run_qa_test_engineer_specialist(
     except Exception:
         pass
 
+    council_summary = (getattr(plan, "council_test_scene_summary", "") or "").strip()
+    overlays_strat = (getattr(plan, "overlays_and_telemetry_strategy", "") or "").strip()
+
+    qa_passed = True
+    audit_block = ""
+    if is_real_genai_client(ctx.client) and ctx.filmstrip_fn is None and Path(strip).is_file():
+        try:
+            from google.genai import types
+
+            record_turn_substep(
+                "auditing_captured_proof",
+                f"Running QA post-capture visual & framing audit on {Path(strip).name}",
+            )
+            audit_prompt = (
+                f"You are the Autonomous QA Test Engineer performing a SKEPTICAL POST-CAPTURE VISUAL AUDIT on the filmstrip you just captured for TASK [{item.item_id}] ({item.kind}): {item.title}\n"
+                f"SPEC: {item.spec}\n"
+                f"PROOF SPEC: {item.proof_spec}\n"
+                f"TASK LEAD BRIEF: {brief}\n"
+                f"CAPTURED TICKS: {list(plan.capture_ticks)}\n"
+                f"PRE-CAPTURE TEST SCENE SUMMARY: {council_summary}\n"
+                f"TELEMETRY SUMMARY: {extra_qa}\n\n"
+                f"INSTRUCTIONS:\n"
+                f"1. Inspect EVERY single frame of the attached `filmstrip_*.png` image from Frame 1 to the final frame.\n"
+                f"2. Strategize from first principles what a live player and the Design Council need to see verified for this specific task:\n"
+                f"   - Does the rendered viewport clearly frame the active subjects across all frames without losing them off-screen?\n"
+                f"   - Are UI/HUD panels, labels, and world/test overlays legible and free of text collisions, overlaps, or unintended production debug clutter?\n"
+                f"   - Are world-space indicators/vectors aligned with the actual visual sprites they represent?\n"
+                f"   - Across `CAPTURED TICKS` (60 ticks ~ 1 second), do the player inputs produce a responsive, human-playable rate of motion/change rather than a static image or a nearly imperceptible crawl?\n"
+                f"3. In `observed_frames_summary`, describe objectively what is ACTUALLY visible inside the 16:9 viewport of each frame.\n"
+                f"4. In `post_capture_test_scene_summary`, write a factual post-capture briefing for the Council explaining what the test scene staged, what inputs/overlays ran, and what the rendered frames show.\n"
+                f"5. If any frame fails visual framing, has overlapping/illegible UI, lacks test-scene diagnostic proof, or fails to show responsive progression, list each issue in `unaddressed_defects` and set `qa_passed = False`!\n"
+                f"Provide `deliberation` FIRST and `qa_passed` LAST."
+            )
+            audit_contents: Any = [
+                audit_prompt,
+                f"CAPTURED FILMSTRIP TO AUDIT ({Path(strip).name}):",
+                types.Part.from_bytes(data=Path(strip).read_bytes(), mime_type="image/png"),
+            ]
+            audit_resp = call_gemini_with_transient_retry(
+                lambda: ctx.client.models.generate_content(
+                    model=ctx.model_name,
+                    contents=audit_contents,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=QAPostCaptureAudit,
+                        thinking_config=bounded_thinking_config(512),
+                    ),
+                ),
+                label=f"qa_post_capture_audit[{item.item_id}]",
+            )
+            if audit_resp and audit_resp.text:
+                audit_obj = QAPostCaptureAudit.model_validate_json(audit_resp.text)
+                qa_passed = bool(audit_obj.qa_passed)
+                if (audit_obj.post_capture_test_scene_summary or "").strip():
+                    council_summary = audit_obj.post_capture_test_scene_summary.strip()
+                defects_str = "; ".join(audit_obj.unaddressed_defects) if audit_obj.unaddressed_defects else "none"
+                if not qa_passed or audit_obj.unaddressed_defects:
+                    audit_block = (
+                        f" QA Self-Check flagged issues for Task Lead (qa_passed={qa_passed}): "
+                        f"observed_frames={audit_obj.observed_frames_summary!r} | unaddressed_defects=[{defects_str}]."
+                    )
+                else:
+                    audit_block = f" Observed frames: {audit_obj.observed_frames_summary}"
+        except Exception as audit_exc:
+            logger.warning("QAPostCaptureAudit skipped for '%s': %s", item.item_id, audit_exc)
+
+    qa_briefing = ""
+    if council_summary:
+        qa_briefing += f" QA Test Scene Summary for Council: {council_summary}"
+    if overlays_strat:
+        qa_briefing += f" QA Overlays & Telemetry Strategy: {overlays_strat}"
     summary = (
-        f"Filmstrip ticks {plan.capture_ticks}. Plan: {plan.deliberation[:260]} "
-        f"Pre-capture expected frames: {plan.frame_expectations}{extra_qa}"
+        f"Filmstrip ticks {plan.capture_ticks}.{qa_briefing}{extra_qa}{audit_block}"
     )
     return SpecialistReport(
         deliberation=plan.deliberation,
@@ -2401,6 +2568,7 @@ def run_qa_test_engineer_specialist(
         summary=summary,
         touched_files=qa_touched_files,
         proof_images=[str(strip)],
+        verification_passed=qa_passed,
     )
 
 
@@ -2411,6 +2579,7 @@ def validate_task_lead_decision(
     board: Any = None,
     parent_item_id: str = "",
     item_kind: str = "",
+    turn_history: Optional[Sequence[SpecialistReport]] = None,
 ) -> List[str]:
     """Structural validation of a `TaskLeadDecision` turn."""
     issues: List[str] = []
@@ -2453,6 +2622,14 @@ def validate_task_lead_decision(
                     "Cannot submit_to_council for a 'level_map' task with only a 2D wireframe diagram (level_map_*.png). "
                     "You MUST delegate to 'qa_test_engineer' to capture a live in-engine Godot viewport filmstrip "
                     "(level_filmstrip_*.png / filmstrip_*.png) proving the world geometry, surface textures, and Camera2D traversal in Godot."
+                )
+        if turn_history:
+            qa_turns = [t for t in turn_history if getattr(t, "specialist_agent", "") == "qa_test_engineer"]
+            if qa_turns and getattr(qa_turns[-1], "verification_passed", True) is False:
+                issues.append(
+                    "Cannot submit_to_council because the latest 'qa_test_engineer' Post-Capture Visual Audit failed "
+                    f"(verification_passed=False: {str(getattr(qa_turns[-1], 'summary', ''))[-360:]}). "
+                    "You MUST delegate to 'swe_engineer' (or run a diagnostic test scene) to fix the visual/camera-framing defect and re-run 'qa_test_engineer' first."
                 )
         if decision.selected_proof_paths:
             unknown = [
@@ -2696,7 +2873,7 @@ def plan_task_lead_turn(
             "  - 'swe_engineer': architects or modifies GDScript modules (.gd), world/level layouts, scenes, entities, or UI and verifies headless engine compilation/boot.\n"
         ),
         "qa_test_engineer": (
-            "  - 'qa_test_engineer': designs and executes a scripted Godot headless test scenario (setup_calls, input_segments, mouse_click_pos, state_assertions, capture_ticks) and captures a multi-frame gameplay filmstrip proof image.\n"
+            "  - 'qa_test_engineer': builds a bespoke Godot test scene (`res://tests/test_<item_id>.tscn` + `.gd`), strategizes any needed QA diagnostic overlays or telemetry (`overlays_and_telemetry_strategy`), executes the scripted test scenario (`input_segments`, `mouse_click_pos`, `state_assertions`, `capture_ticks`), captures a multi-frame gameplay filmstrip proof image, and authors a `council_test_scene_summary` so the Council knows exactly what the test scene and overlays show.\n"
         ),
     }
     from engine.studio.context_curator import ContextCuratorAgent, SelfInquiryQAPair, is_real_genai_client
@@ -2794,7 +2971,12 @@ def plan_task_lead_turn(
             f"   - Creation Strategy (`current_strategy`): Plan every artifact, asset, multi-cell sheet/grid, rig, script, or GDScript module required by `SPEC`, and decide which specialist(s) in {specialists} to delegate to in sequence.\n"
             f"   - Proof Generation Strategy (`proof_strategy`): Plan how the final visual proof artifact(s) (`selected_proof_paths`) will be generated and verified to directly satisfy `PROOF THE COUNCIL WILL JUDGE` (`{item.proof_spec}`).\n"
             f"   - When delegating to `'visual_artist'` for a task that requires a multi-cell grid, sheet, or atlas of distinct visual states, icons, stages, or components (e.g. a 2x2 or NxM state sheet where each cell depicts a distinct graphic/state), explicitly specify the `grid_cols x grid_rows` layout and each cell's visual contents in row-major order in your `brief` so `'visual_artist'` populates `grid_cols`, `grid_rows`, and `cell_prompts`.\n"
+            f"   - HOLISTIC SYSTEMS THINKING, SUBSYSTEM HARMONY & HUMAN-SCALE RESPONSIVENESS:\n"
+            f"     * Never treat a single node's coordinate (`pos=(x, y)`) as proof that the whole scene works visually! Always reason across the complete interacting system: all active entities/nodes in the scene, how `Camera2D` computes its framing/target, how UI layers compose on screen, and how sibling subsystems interact.\n"
+            f"     * Check for subsystem conflicts and human-scale feel: when multiple components act on the same entity (e.g., player input controllers alongside damping/stabilization/constraint scripts), ensure they do not fight or cancel out active player commands, and verify that holding a player input over 1–2 seconds (60–120 ticks) produces a responsive, human-playable rate of motion/turn/action.\n"
+            f"     * If a prior task on the board or an earlier turn/revision already modified a script/property and the visual issue still occurs in the rendered viewport, treat the prior hypothesis as FALSIFIED/INCOMPLETE and inspect all other interacting nodes, camera targets, or scripts in the scene!\n"
             f"   - SELF-INQUIRY TOOL (`self_question` -> ContextCuratorAgent research -> `self_question_answer`): If you need to inspect a specific module's code, signals, or design spec that is not in your current context before writing your specialist `brief`, you may output a specific question in `self_question` (leaving `brief` empty). `ContextCuratorAgent` will fetch the relevant chunks on the next turn so YOU can answer your own question in `self_question_answer` and then delegate accurately.\n"
+            f"   - ON-DEMAND RUNTIME DIAGNOSTIC TEST SCENES ('I NEED MORE DEBUG INFO'): If a prior proof, Council `changes_requested` feedback, or bug report shows a runtime issue whose root cause is NOT already obvious from the existing filmstrip and code, do NOT guess blindly! Delegate to `'qa_test_engineer'` FIRST with a diagnostic brief asking QA to build/update `res://tests/test_<item_id>.tscn` with specific visual debug overlays and `get_state_snapshot()` telemetry keys to isolate the exact cause, then inspect the resulting diagnostic filmstrip on the next turn before briefing `'swe_engineer'`.\n"
             f"2. JUST-IN-TIME ASSET & SUB-TASK DISCOVERY (`action = 'spawn_tasks'` or `'delegate'` to `'visual_artist'`): Assets and animations are NOT built heavily upfront. As you plan or implement this task, reason out what specific assets, surface textures, animations, sounds, or sub-tasks are needed for THIS task in THIS slice.\n"
             f"   - HYBRID PROCEDURAL + GENERATED VISUAL CRAFT (THE BEST OF BOTH WORLDS):\n"
             f"     * NEVER rely on flat untextured `Polygon2D` slabs, blank monochrome backgrounds, or bare 8-point `Line2D` programmer-art zigzags! Instead, combine procedural generation (Simplex noise, cellular automata, Voronoi, spline contours, custom `ShaderMaterial`, `GPUParticles2D`) with fabricated visual assets from `'visual_artist'`:\n"
@@ -2809,7 +2991,9 @@ def plan_task_lead_turn(
             f"3. EMPATHETIC NEW-PLAYER PERSPECTIVE, TARGET PLAYER DNA, WHOLE-GAME LOOP & UNSOLVED t=0 BASELINE (for `mechanic_code`, `ui`, `integration`, `level_map`):\n"
             f"   - DELIVER THE LARGER POINT OF THE GAME (NEVER SHRINK INTO A 1-STEP TUTORIAL): Check `TARGET PLAYER STEAM DNA` and `WHOLE-GAME CORE LOOP & AGENCY DEPTH` below. You are building this game specifically for THIS player. Do NOT build 'the smallest slice possible' that reduces the game to a 4-step linear tutorial or a single pre-placed connection! Onboarding is ONLY the opening 60 seconds; the game itself must deliver the full `moment_to_moment_loop`, `minute_to_minute_loop`, and `session_loop` with genuine player construction, experimentation, optimization, or tactical depth (`core_loop.player_agency_and_optimization_depth`) and escalating goals (`goal_hierarchy`).\n"
             f"   - Think empathetically from the perspective of a brand-new player booting this game for the first time with zero external instructions. Strategize how THIS game communicates: (a) what the player is doing and why (their role, purpose, and stakes), (b) how they interact with the world and how actions causally connect (`input -> entity response -> world consequence`), and (c) what visual/audio feedback occurs when an action succeeds OR when an action is attempted before its prerequisite is met.\n"
-            f"   - UNSOLVED t=0 BASELINE (`test_unsolved_baseline_t0`) & ISOLATED QA TEST SCENES (`res://tests/test_<item_id>.tscn`) — NEVER POLLUTE `main.gd` WITH `func test_*()` HELPERS: `_ready()` at `t=0` in `main.gd` (`res://main.tscn`) is what the live human player boots into! `_ready()` MUST initialize the world in its unbuilt/unsolved starting state as defined by the Game Bible, and `main.gd` must NEVER be polluted with `func test_*()` staging functions. When proving a specific subsystem or mechanic that requires scenario staging, instruct `'qa_test_engineer'` either to drive `res://main.tscn` via `input_segments` from `t=0`, OR to author an isolated test scene at `res://tests/test_<item_id>.tscn` (`test_scene_gd_content`) that instantiates the relevant scene/modules and stages the test scenario cleanly inside `res://tests/`!\n"
+            f"   - UNSOLVED t=0 BASELINE (`test_unsolved_baseline_t0`) & QA TEST SCENE OWNERSHIP (`res://tests/test_<item_id>.tscn`) — NO DEBUG OVERLAYS IN PRODUCTION GAME (`res://main.tscn`):\n"
+            f"     * `_ready()` at `t=0` in `main.gd` (`res://main.tscn`) is what the live human player boots into! `_ready()` MUST initialize the world in its unbuilt/unsolved starting state as defined by the Game Bible, and production game scenes (`main.gd`, `scenes.gd`, `ui_hud.gd`, etc.) must NEVER contain `func test_*()` staging helpers or debug overlays (`[DEBUG]`, telemetry readouts, wireframe boxes).\n"
+            f"     * Conversely, in QA test scenes (`res://tests/test_<item_id>.tscn`), rich diagnostic overlays ARE essential! When delegating to `'qa_test_engineer'`, instruct QA to author `res://tests/test_<item_id>.tscn` (`test_scene_gd_content`), strategize what test-only diagnostic overlays (e.g., force/velocity/heading vectors, bounding boxes, anchor markers, or telemetry readouts drawn by the test scene) and `get_state_snapshot()` metrics (`player_pos`, angular/linear rates, etc.) are needed to prove both visual quality and human-scale responsiveness over time, and write a clear `council_test_scene_summary` for the Council!\n"
             f"   - REAL INTERACTIVE VERBS & CAMERA NAVIGATION: Every core player verb in `core_loop.player_verbs` and the active slice's `scope_boundaries` (including mouse click/drag placement or connection, interactive component tuning/socketing, hazard clearing, and `Camera2D` panning/scrolling when `world_bounds` exceeds the 1280x720 viewport) MUST be wired to real `_unhandled_input` / `_input` / UI handlers and exercised via `input_segments` (`mouse_click_pos` or actions) in QA filmstrips.\n"
             f"   - Every input key/action bound in the codebase (`Available actions`) MUST have a discoverable in-world or HUD affordance—never bind hidden/secret keys that the player cannot know exist, and NEVER bind fake tutorial-skip keys (such as `KEY_TAB` or `set_onboarding_step`) that advance onboarding text without the player performing the actual in-world mechanic.\n"
             f"   - Never rig an input handler to bypass physics, force a win state, or teleport world state when a timing window is missed; instead, instruct `'qa_test_engineer'` to use reactive state triggers (`when_snapshot_key`, `when_operator`, `when_value`) to test timing-sensitive mechanics honestly.\n"
@@ -2818,7 +3002,7 @@ def plan_task_lead_turn(
             f"   - In `filmstrip_*.png` contact sheets, the top (`[QA] tick N in:[...]`) and bottom (`[QA] pos=(...) ...`) bands outside each 16:9 frame border are external QA test-harness annotations—use them to verify coordinates/state, and never mistake them for in-game debug text.\n"
             f"   - In `plate_*.png` and `anim_sheet_*.png` / `anim_rig_*.png`, the dark/light square checkerboard grids, cyan bounding-box borders, and horizontal yellow/gold baseline ruler lines at the bottom of frames are external QA test-harness overlays drawn behind/around the transparent PNG—NEVER mistake those external QA overlays for cross-hatch grids or yellow line artifacts inside the sprite PNG!\n"
             f"   - NEVER SUBMIT PLACEHOLDER STICKMEN, CLIPPED SPRITES, DUPLICATE OVERLAPPING GEOMETRY, OR SHRUNK VIEWPORT BACKGROUNDS: If the proof image or `QA Post-Capture Visual Audit` reports `qa_passed=False`, unaddressed Council defects, clipped/invisible sprites (`hframes > 1` on a single-frame texture), or a shrunk background that leaves dark void around the level, do NOT choose `submit_to_council`! Fix the root cause with `'visual_artist'` / `'swe_engineer'` and re-run `'qa_test_engineer'`.\n"
-            f"   - Verify that active gameplay entities (`CharacterBody2D` / `Sprite2D` actors and floor/world geometry) are visibly rendered inside the 16:9 viewport and are NOT hidden behind an opaque full-screen background/border frame drawn at a higher `z_index` or foreground `CanvasLayer`.\n"
+            f"   - Verify that active gameplay entities and world geometry remain visibly framed inside the 16:9 viewport across ALL filmstrip frames and do NOT disappear off-screen or get hidden behind an opaque full-screen background/border frame drawn at a higher `z_index` or foreground `CanvasLayer`.\n"
             f"5. Choose `action = 'delegate'` to send an open-ended natural-language `brief` to one of {specialists}, `action = 'spawn_tasks'` to create newly discovered tasks on the board, OR `action = 'submit_to_council'` ONLY after all required assets/code are built AND at least one proof image in `COLLECTED PROOF IMAGES SO FAR` visually proves the requirement.\n"
             f"   - CONCISE DELIBERATION & BRIEF (NO RAW CODE IN BRIEF): Keep `deliberation` (<= 120 words) and `brief` (<= 180 words) focused and concise. NEVER write raw GDScript code blocks or paste whole functions inside `brief`—`swe_engineer` already reads the staging files directly! State the target file paths, class/function names, and behavioral/visual acceptance criteria.\n"
             f"   - CRITICAL SCHEMA FIELD ORDER WARNING: In `TaskLeadDecision`, `specialist_agent` and `brief` appear BEFORE `action` in the JSON schema! Decide your turn action inside `deliberation` and `current_strategy` first: whenever you are delegating to a specialist (`action = 'delegate'`), you MUST populate `specialist_agent` (one of {specialists}) and a non-empty `brief` BEFORE emitting `action = 'delegate'`! Never leave `specialist_agent` or `brief` empty when delegating.\n"
@@ -2937,6 +3121,7 @@ def plan_task_lead_turn(
             board=ctx.board,
             parent_item_id=item.item_id,
             item_kind=item.kind,
+            turn_history=turn_history,
         )
         if not issues:
             return decision

@@ -80,7 +80,11 @@ class ContextCuratorDecision(BaseModel):
     )
     role_tailored_synthesis: str = Field(
         ...,
-        description="Focused, high-signal briefing tailored to `target_agent_role` that connects the Council's design intent, visual/rendering targets, relevant existing or queued assets, and technical contracts for this specific task.",
+        description=(
+            "Strictly neutral, factual map of the retrieved context for `target_agent_role`: list what files, modules, "
+            "design specs, and artifacts are included and how they connect in the codebase. NEVER solve the problem, "
+            "propose code changes, diagnose bugs, or claim that a proof/telemetry confirms or passes a requirement."
+        ),
     )
     selected_chunk_ids: List[str] = Field(
         default_factory=list,
@@ -666,7 +670,7 @@ class CartridgeSemanticIndex:
                     if isinstance(r, dict):
                         rev_summaries.append(
                             f"rev {r.get('revision_index', 0) + 1}: verdict={r.get('verdict') or 'pending'} | "
-                            f"notes={str(r.get('worker_notes') or '')[:1000]} | feedback={str(r.get('feedback') or '')[:900]}"
+                            f"UNVERIFIED_WORKER_CLAIMS={str(r.get('worker_notes') or '')[:1000]} | feedback={str(r.get('feedback') or '')[:900]}"
                         )
                         for pp in (r.get("proof_paths") or []):
                             cand_p = Path(pp) if Path(pp).is_absolute() else (self.cartridge_dir / str(pp))
@@ -1491,19 +1495,11 @@ class ContextCuratorAgent:
                 f"   - Include relevant `asset:catalog:...` chunks so `{target_agent_role}` knows which sprites/rigs/props already exist on disk.\n"
                 f"   - Inspect `code:module:...` chunks (especially `[GRAPH-LINKED: ...]` modules imported by or importing the task's target files, plus actor controllers whose input bindings, collision layers, or physics interact with this task) and include any referenced modules needed for cross-file root-cause diagnosis.\n"
                 f"2. In `selected_image_paths`, select the 16:9 Concept Art Mockup image path whenever `{target_agent_role}` is planning, implementing, fabricating, or reviewing visual, level, entity, or UI work, plus any relevant fabricated sprite plates or captured proof filmstrip images.\n"
-                f"3. In `role_tailored_synthesis`, write a concise, high-signal synthesis specifically for `{target_agent_role}` connecting the Council's discussion, prior build execution traces / frame telemetry coordinates, the target visual/rendering aesthetic, and the exact cross-file asset/code contracts (including input bindings and collision layers) for `{item_id}`.\n"
+                f"3. STRICT EPISTEMIC NEUTRALITY IN `role_tailored_synthesis`: Your purpose is strictly to gather and organize context so `{target_agent_role}` can solve the problem—NOT to solve the problem, prescribe fixes, or judge proofs yourself! In `role_tailored_synthesis`, provide ONLY a factual, neutral inventory of the selected chunks, cross-file dependency links (`imports` / `imported_by`), and attached artifacts/telemetry. NEVER claim that a proof image or telemetry 'confirms', 'proves', or 'satisfies' a requirement, and NEVER tell `{target_agent_role}` what code to write or what verdict to reach.\n"
                 f"Provide `deliberation` FIRST."
             )
 
-            curator_multimodal_parts: List[Any] = []
-            for ep in effective_extra_images[-2:]:
-                ep_path = Path(ep)
-                if ep_path.is_file() and ep_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
-                    mime = "image/jpeg" if ep_path.suffix.lower() in (".jpg", ".jpeg") else ("image/webp" if ep_path.suffix.lower() == ".webp" else "image/png")
-                    curator_multimodal_parts.append(f"ATTACHED PROOF / REFERENCE IMAGE ({ep_path.name}):")
-                    curator_multimodal_parts.append(types.Part.from_bytes(data=ep_path.read_bytes(), mime_type=mime))
-
-            curator_contents: Any = ([prompt] + curator_multimodal_parts) if curator_multimodal_parts else prompt
+            curator_contents: Any = prompt
             resp = call_gemini_with_transient_retry(
                 lambda: self.client.models.generate_content(
                     model=self.model_name,
@@ -1597,7 +1593,8 @@ class ContextCuratorAgent:
             )
             prompt_block = (
                 f"\n=== SEMANTICALLY CURATED STUDIO CONTEXT (for {cache_role} on '{item_id or 'task'}') ===\n"
-                f"CURATOR SYNTHESIS:\n{decision.role_tailored_synthesis}\n\n"
+                f"NEUTRAL CONTEXT MAP (factual inventory of retrieved chunks & cross-module links — evaluate and solve independently):\n"
+                f"{decision.role_tailored_synthesis}\n\n"
                 f"RETRIEVED & SELECTED STUDIO KNOWLEDGE CHUNKS ({len(expanded_chosen_chunks)} selected from {len(all_chunks)} indexed chunks):\n"
                 f"{chunk_sections}\n"
                 f"=== END CURATED STUDIO CONTEXT ===\n"

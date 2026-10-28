@@ -203,6 +203,16 @@ class SwarmEventBus:
                 else:
                     self._game_bible = dict(payload)
 
+        elif etype in ("writers_room_utterance", "WRITERS_ROOM_UTTERANCE"):
+            if payload and isinstance(payload, dict):
+                if not isinstance(self._game_bible, dict):
+                    self._game_bible = {"writers_room_transcript": []}
+                tx = self._game_bible.setdefault("writers_room_transcript", [])
+                if isinstance(tx, list):
+                    uid = str(payload.get("utterance_id") or "")
+                    if not uid or not any(isinstance(u, dict) and u.get("utterance_id") == uid for u in tx):
+                        tx.append(dict(payload))
+
         elif str(etype).startswith("backlog_item_"):
             item_id = str(payload.get("item_id") or "").strip()
             if item_id:

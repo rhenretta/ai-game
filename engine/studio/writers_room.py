@@ -35,6 +35,7 @@ from engine.studio.models import (
     ConceptFragment,
     ConceptSeedProposal,
     ConceptSelection,
+    CouncilDiagnosticProbe,
     CreativeProvocationSet,
     validate_game_design,
     DirectorConvergenceCheck,
@@ -48,6 +49,7 @@ from engine.studio.models import (
     ReviewBatch,
     ReviewDecision,
     SliceAssemblyDecision,
+    SlicePlaytestRoundtableTurn,
     StudioAgentError,
     TaskShapingBatch,
     VisualMockupArtifact,
@@ -1609,6 +1611,7 @@ class CreativeWritersRoom:
         game_bible: GameBibleSpec,
         dna_summary: str,
         candidate_dir: Optional[Path],
+        prior_roundtable_notes: Optional[List[str]] = None,
     ) -> ReviewBatch:
         spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == role), None)
         who = f"the {spec['display_name']} ({role})" if spec else "the Creative Director"
@@ -1622,12 +1625,14 @@ class CreativeWritersRoom:
         by_id = {i.item_id: i for i in awaiting + deciding}
         mandate = self._role_review_mandate(role)
         filmstrip_guide = (
-            "HOW TO READ `filmstrip_*.png` QA CONTACT SHEETS & VERIFY WORKER CLAIMS:\n"
-            "- Each `filmstrip_*.png` proof is a multi-frame grid captured by the external QA Test Harness (640x360 per frame).\n"
-            "- Above each 16:9 game frame, the test harness prints the simulation tick and injected controller inputs (`[QA] tick N  in:[...]`).\n"
-            "- Below each 16:9 game frame, the test harness prints the live engine state snapshot (`[QA] pos=(...) ...`) specifically FOR YOU (the Council) to verify coordinates and state variables.\n"
-            "- These top and bottom margin bands outside the 16:9 frame border are external QA contact-sheet annotations—they are NOT rendered inside the game viewport and must NEVER be rejected as 'developer debug text overlays'.\n"
-            "- SKEPTICAL VISUAL VERIFICATION OF `UNVERIFIED_WORKER_CLAIMS`: The `UNVERIFIED_WORKER_CLAIMS` in an item's revision history are self-reported worker notes and pre-capture expectations—NEVER approve an item because `UNVERIFIED_WORKER_CLAIMS` claims a fix was made! You MUST visually verify every single point of prior revision `feedback` directly in the pixels of the attached proof image (and check any `QA Post-Capture Visual Audit` notes). Immediately `request_changes` if the proof image shows clipped/invisible sprite fragments (from wrong `hframes`/`vframes` slicing), shrunk background rectangles that leave dark void around the play area, or crude procedural polygons where fabricated textures/sprites were requested.\n\n"
+            "HOW TO READ `filmstrip_*.png` QA CONTACT SHEETS & STRATEGIZE YOUR SPECIALIST VALIDATION:\n"
+            "- STEP 1: DETERMINE WHAT MUST BE VALIDATED FOR YOUR ROLE (`validation_criteria_for_my_role`): Do NOT rubber-stamp items or follow a generic checklist. For each item, first determine from first principles what MUST be proven for this specific change to be genuinely playable, responsive, and cohesive from your specialist perspective.\n"
+            "- STEP 2: INSPECT THE FILMSTRIP, TELEMETRY & HUMAN-SCALE RESPONSIVENESS:\n"
+            "  * Above each 16:9 game frame, `[QA] tick N  in:[...]` shows the simulation tick (60 ticks ~ 1 second) and injected player inputs. Below each frame, `[QA] pos=(...) ...` shows the live state snapshot.\n"
+            "  * These external margin strips above/below the 16:9 border are QA contact-sheet headers/footers—never reject those external margin strips (or the external checkerboard/cyan border/yellow baseline in `plate_*.png`).\n"
+            "  * DEBUG OVERLAY POLICY (REQUIRED IN TEST SCENES, BANNED IN FINAL PRODUCTION GAME): In isolated or staged QA test scenes (`res://tests/test_<item_id>.tscn`), rich visual debug overlays (velocity/force vectors, target markers, state readouts) ARE expected and necessary to prove physics and state changes—if a proof is ambiguous without a visual vector/marker overlay, use `request_changes` to ask QA for that overlay in `res://tests/test_<item_id>.tscn`. Conversely, the final production game (`res://main.tscn`, `main.gd`, `ui_hud.gd`) must NEVER render raw developer debug text (`[DEBUG]`, telemetry dumps) on the player's HUD!\n"
+            "  * HUMAN-SCALE PLAYABILITY & SUBSYSTEM HARMONY: Check the rate of change across ticks (`60 ticks = 1.0s`). If a player holds a movement, steering, rotation, or interaction input for 60–180 ticks (1–3 seconds) and the entity barely turns or moves (e.g., 1 degree per second because a damping/stabilizer subsystem is fighting the player's input, or `[idle]` with zero inputs), you MUST `request_changes`!\n"
+            "  * VISUAL & UI INTEGRITY: Inspect every frame from Frame 1 to the final frame. If active subjects drift off-screen, if world indicators are detached from their sprites, or if HUD panels/labels overlap or collide with each other, you MUST `request_changes`!\n\n"
         )
         on_disk_sprites_block = ""
         curated_review_block = ""
@@ -1689,16 +1694,25 @@ class CreativeWritersRoom:
             "  1. If an unapproved task on the board (`in_progress`, `changes_requested`, `ready`, or `blocked`) ALREADY owns that shared module, add its `item_id` to `blocked_by_item_ids`, list the shared module path(s) in `out_of_scope_modules_to_prune`, and write `feedback` telling this item what remains in its own module once the blocker finishes.\n"
             "  2. If the task that originally built that shared module is already `approved` (or no open task owns fixing the shared bug), populate `spawned_prerequisite_tasks` with a focused `WorkItemProposal` targeting that shared module (and set `blocks_items` to include all affected open tasks on the board), and list the shared module path(s) in `out_of_scope_modules_to_prune` so this item is cleanly blocked on the dedicated fix without losing a revision attempt.\n\n"
         )
+        roundtable_block = ""
+        if prior_roundtable_notes:
+            roundtable_block = (
+                "EARLIER COUNCIL PANELIST OBSERVATIONS IN THIS REVIEW ROUND (converse directly with your peers in `spoken_dialogue` and `addressed_to`—build on their catches, add what your own specialist lens reveals, and challenge any premature approval if you spot a flaw):\n"
+                + "\n".join(f"  - {note}" for note in prior_roundtable_notes)
+                + "\n\n"
+            )
         prompt = (
             f"You are {who} reviewing work built by the implementation team for the game being designed.\n"
             f"{mandate}"
             f"{filmstrip_guide}"
             f"{cross_task_triage_guide}"
+            f"{roundtable_block}"
             f"ITEMS AWAITING YOUR REVIEW (proof images and Living Game Bible context are attached above):\n"
             + ("\n".join(self._format_item_for_review(i) for i in awaiting) or "  (none)")
             + f"\n\nITEMS THAT HIT THEIR REVISION CAP OR STALLED (you must decide):\n"
             + ("\n".join(self._format_item_for_review(i) for i in deciding) or "  (none)")
-            + "\n\nFor EVERY awaiting item give one `review_decisions` entry: examine the proof carefully against the spec, the proof_spec and the "
+            + "\n\nIn `spoken_dialogue` and `addressed_to`, speak directly to your fellow Council reviewers in the Writers' Room about what must be validated for this item from your specialist perspective and what you actually observe in the proof filmstrip/telemetry. "
+            "For EVERY awaiting item give one `review_decisions` entry: first state `validation_criteria_for_my_role`, examine the proof carefully against those criteria, the spec, the proof_spec, and the "
             "game's design, then `approve`, or `request_changes` with concrete, actionable feedback (never repeat feedback that was already given without "
             "saying what is still wrong; use `blocked_by_item_ids`, `spawned_prerequisite_tasks`, and `out_of_scope_modules_to_prune` when a defect belongs to a shared/external module). "
             "For EVERY capped/stalled item give one `cap_decisions` entry: `accept_as_is` (only if the result genuinely "
@@ -1785,9 +1799,87 @@ class CreativeWritersRoom:
             active_agents=roles,
             phase="proof_review",
         )
-        batches = self._map_parallel(
-            lambda r: self._review_as(r, groups[r][0], groups[r][1], game_bible, dna_summary, candidate_dir), roles
-        )
+        batches: List[ReviewBatch] = []
+        prior_roundtable_notes: List[str] = []
+        all_reviewed_items = list(awaiting_items) + list(self.board.needing_decision())
+        round_proof_paths: List[str] = []
+        for it in all_reviewed_items:
+            if getattr(it, "revisions", None):
+                for pp in (it.revisions[-1].proof_paths or []):
+                    if pp and str(pp) not in round_proof_paths:
+                        round_proof_paths.append(str(pp))
+
+        for idx_r, r in enumerate(roles):
+            batch = self._review_as(
+                r,
+                groups[r][0],
+                groups[r][1],
+                game_bible,
+                dna_summary,
+                candidate_dir,
+                prior_roundtable_notes=prior_roundtable_notes,
+            )
+            batches.append(batch)
+            spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == r), None)
+            disp_name = spec["display_name"] if spec else r
+            verdict_bits = [
+                f"`{d.item_id}` -> **{d.verdict}**"
+                + (f" (criteria: {d.validation_criteria_for_my_role})" if getattr(d, "validation_criteria_for_my_role", "") else "")
+                + (f": {d.feedback}" if d.feedback else "")
+                for d in batch.review_decisions
+            ]
+            spoken_text = (batch.spoken_dialogue or "").strip()
+            if not spoken_text:
+                spoken_text = f"[Council Proof Review] {'; '.join(verdict_bits) if verdict_bits else batch.deliberation}"
+            prior_roundtable_notes.append(f"[{disp_name} ({r})]: {spoken_text} | Verdicts: {'; '.join(verdict_bits)}")
+
+            turn_idx = len(game_bible.writers_room_transcript)
+            other_roles = [orole for orole in roles if orole != r] or ["CreativeDirector"]
+            addressed = [a for a in (batch.addressed_to or []) if a] or other_roles
+            updates_summary = [
+                f"review:{d.item_id}:{d.verdict}" for d in batch.review_decisions
+            ] + [
+                f"cap:{c.item_id}:{c.action}" for c in batch.cap_decisions
+            ]
+            attach_proofs = round_proof_paths if idx_r == 0 else []
+            art_emitted = (
+                {
+                    "type": "filmstrip",
+                    "path": round_proof_paths[0],
+                    "item_ids": [it.item_id for it in all_reviewed_items],
+                    "caption": f"Proof under Council Review: {', '.join(it.item_id for it in all_reviewed_items)}",
+                }
+                if idx_r == 0 and round_proof_paths
+                else None
+            )
+            rev_utt = WritersRoomUtterance(
+                deliberation=batch.deliberation,
+                utterance_id=f"utt_{turn_idx:02d}_{r}_review",
+                turn_index=turn_idx,
+                speaker_role=r,
+                speaker_display_name=disp_name,
+                spoken_dialogue=spoken_text,
+                addressed_to=addressed,
+                bible_updates_summary=updates_summary,
+                proof_image_paths=attach_proofs,
+                artifact_emitted=art_emitted,
+            )
+            game_bible.writers_room_transcript.append(rev_utt)
+            self._emit_event(
+                "writers_room_utterance",
+                {
+                    "deliberation": rev_utt.deliberation,
+                    "utterance_id": rev_utt.utterance_id,
+                    "turn_index": rev_utt.turn_index,
+                    "speaker_role": rev_utt.speaker_role,
+                    "speaker_display_name": rev_utt.speaker_display_name,
+                    "spoken_dialogue": rev_utt.spoken_dialogue,
+                    "addressed_to": rev_utt.addressed_to,
+                    "bible_updates_summary": rev_utt.bible_updates_summary,
+                    "proof_image_paths": rev_utt.proof_image_paths,
+                    "artifact_emitted": rev_utt.artifact_emitted,
+                },
+            )
         decisions_by_item: Dict[str, List[Tuple[str, ReviewDecision]]] = {}
         applied = 0
         for role, batch in zip(roles, batches):
@@ -1935,11 +2027,91 @@ class CreativeWritersRoom:
                     item_id="executive_producer_steering",
                     item_kind="integration",
                 )
+                recent_board_history = ""
+                if self.board is not None and hasattr(self.board, "items"):
+                    try:
+                        recent_items = [
+                            it for it in self.board.items()
+                            if getattr(it, "revisions", None)
+                        ][-5:]
+                        if recent_items:
+                            hist_lines = []
+                            for r_it in recent_items:
+                                last_rev = r_it.revisions[-1]
+                                hist_lines.append(
+                                    f"  - [{r_it.item_id}] ({r_it.state}, mods={r_it.target_modules}): {r_it.title}\n"
+                                    f"    spec: {r_it.spec[:260]}\n"
+                                    f"    latest_worker_notes: {last_rev.worker_notes[:320]}"
+                                )
+                            recent_board_history = (
+                                "\nRECENTLY EXECUTED PRODUCTION BOARD TASKS & WHAT THEY ALREADY CHANGED:\n"
+                                + "\n".join(hist_lines)
+                                + "\n"
+                            )
+                    except Exception:
+                        pass
                 curated_code_block = (
                     f"=== CARTRIDGE CODEBASE & ENTRYPOINT CONTEXT FOR EXECUTIVE PRODUCER STEERING ===\n"
-                    f"{reach.get('summary_text', '')}\n\n"
+                    f"{reach.get('summary_text', '')}\n"
+                    f"{recent_board_history}\n"
                     f"{pack.prompt_block}\n"
                 )
+                probe_prompt = (
+                    f"You are the GameplaySystemsEngineer evaluating an Executive Producer Live Steering / Problem Report:\n"
+                    f"REPORT: {combined_steering}\n\n"
+                    f"{curated_code_block}\n"
+                    f"PRIOR-HYPOTHESIS FALSIFICATION & SYSTEMS THINKING:\n"
+                    f"- Check `RECENTLY EXECUTED PRODUCTION BOARD TASKS` above: if a prior task already attempted to fix this symptom and the Executive Producer reports the issue still happens, treat that prior hypothesis as FALSIFIED/INCOMPLETE!\n"
+                    f"- Consider the ENTIRE interacting scene: all active entities/nodes, how `Camera2D` computes its framing/target, and world colliders.\n"
+                    f"- Determine whether the full system-wide root cause is ALREADY 100% clear from the static code above (`needs_runtime_debug_scene = False`), OR whether you need `qa_test_engineer` to build and run a diagnostic test scene (`res://tests/test_council_diag.tscn`) with visual debug overlays and `get_state_snapshot()` telemetry first (`needs_runtime_debug_scene = True` and populate `diagnostic_qa_brief`).\n"
+                    f"Provide `deliberation` FIRST and `needs_runtime_debug_scene` LAST."
+                )
+                diag_probe = self._structured_with_validation(
+                    probe_prompt,
+                    CouncilDiagnosticProbe,
+                    lambda p: (
+                        ["`diagnostic_qa_brief` must be non-empty when `needs_runtime_debug_scene=True`."]
+                        if p.needs_runtime_debug_scene and not p.diagnostic_qa_brief.strip()
+                        else []
+                    ),
+                )
+                if diag_probe.needs_runtime_debug_scene and diag_probe.diagnostic_qa_brief.strip():
+                    from engine.studio.models import WorkItem
+                    from engine.studio.workers import WorkerContext, run_qa_test_engineer_specialist
+
+                    self._emit_activity(
+                        agent_role="GameplaySystemsEngineer",
+                        status_text="Running QA diagnostic test scene to isolate runtime cause of Executive Producer report...",
+                        active_agents=["GameplaySystemsEngineer", "qa_test_engineer"],
+                        phase="steering_diagnostic",
+                    )
+                    diag_ctx = WorkerContext(
+                        cartridge_dir=Path(candidate_dir),
+                        client=self.client,
+                        model_name=self.model_name,
+                        board=self.board,
+                        event_callback=self.event_callback,
+                    )
+                    diag_item = WorkItem(
+                        deliberation=diag_probe.deliberation,
+                        item_id="council_diag",
+                        kind="integration",
+                        title=f"Diagnostic investigation: {combined_steering[:80]}",
+                        spec=diag_probe.diagnostic_qa_brief,
+                        proof_spec=diag_probe.diagnostic_qa_brief,
+                        target_modules=["main.gd"],
+                    )
+                    diag_report = run_qa_test_engineer_specialist(
+                        diag_ctx,
+                        diag_item,
+                        brief=f"[COUNCIL DIAGNOSTIC TEST SCENE REQUEST]:\n{diag_probe.diagnostic_qa_brief}",
+                    )
+                    curated_code_block += (
+                        f"\n=== LIVE QA DIAGNOSTIC TEST SCENE RESULTS & TELEMETRY ===\n"
+                        f"Council Diagnostic Hypothesis: {diag_probe.deliberation}\n"
+                        f"QA Diagnostic Summary & Telemetry: {diag_report.summary}\n"
+                        f"Diagnostic Filmstrip Path: {diag_report.proof_images}\n"
+                    )
             except Exception as cur_exc:
                 logger.warning("ContextCurator steering curation skipped: %s", cur_exc)
 
@@ -1954,9 +2126,10 @@ class CreativeWritersRoom:
                 should_interject=True,
                 urgency_score=1.0,
                 intended_contribution_summary=(
-                    f"Address Executive Producer steering ('{combined_steering}'): diagnose any reported runtime/gameplay/UX issue "
-                    f"against the cartridge scripts and raise a concrete `backlog_additions` task (`integration`, `mechanic_code`, or `ui`) "
-                    f"targeting the responsible `.gd` file(s) so the worker pool immediately fixes and verifies it."
+                    f"Address Executive Producer steering ('{combined_steering}'): if a prior task already attempted a narrow fix and the issue persists, "
+                    f"do NOT repeat the same single-node prescription—scope the `backlog_additions` task across the full interacting system "
+                    f"(all relevant entity classes in `entities.gd`, camera tracking/framing in `main.gd`/camera scripts, and level colliders) "
+                    f"and define holistic visual + camera-framing acceptance criteria in `proof_spec`."
                 ),
             )
             proposal = self._execute_specialist_turn(
@@ -2197,11 +2370,13 @@ class CreativeWritersRoom:
         candidate_dir: Optional[Path],
         pass_index: int = 0,
     ) -> int:
-        """Convenes the Council when all current Production Board tasks for the active slice are approved,
-        presenting the factual entrypoint reachability graph (`compute_entrypoint_reachability`) and a
-        lightweight 3-frame boot filmstrip (`ticks=[15, 60, 120]`) of `project.godot`'s `run/main_scene`
-        so the Council can decide whether all built systems are assembled in the playable entrypoint or
-        whether to add integration/assembly task(s) to the Production Board."""
+        """Convenes QA and the Council when all current Production Board tasks for the active slice are approved:
+        1. QA builds and executes an automated Slice Playtest Script (`res://tests/test_slice_playtest_<slice_id>_pass<pass_index>.tscn`)
+           that instantiates the live game entrypoint (`res://main.tscn`), forms the state where the game is at the current slice,
+           and scripts real player inputs (`input_segments`) playing through at least the first goal / core loop segment of the current slice.
+        2. The Council holds a multi-perspective Slice Playtest Roundtable conversation (`SlicePlaytestRoundtableTurn` + `SliceAssemblyDecision`)
+           inspecting the playtest filmstrip, telemetry, and entrypoint reachability to verify that the slice is assembled, playable at human scale,
+           free of production debug overlays, and fun—emitting the full filmstrip and conversation to the Writers' Room transcript and UI."""
         if (
             self.board is None
             or candidate_dir is None
@@ -2213,10 +2388,18 @@ class CreativeWritersRoom:
             return 0
 
         c_dir = Path(candidate_dir)
+        active_slice_obj = game_bible.get_active_slice()
+        active_slice_id = active_slice_obj.slice_id if active_slice_obj is not None else "slice_1"
+        active_slice_title = active_slice_obj.title if active_slice_obj is not None else "Slice 1"
+        active_slice_idx = active_slice_obj.slice_index if active_slice_obj is not None else 1
+
         self._emit_activity(
-            agent_role="CreativeDirector",
-            status_text=f"Council is inspecting booted main scene & entrypoint module reachability (Assembly Check #{pass_index + 1})...",
-            active_agents=["CreativeDirector", "GameplaySystemsEngineer", "GameplayDesigner", "UXExperienceDesigner"],
+            agent_role="QATestEngineer",
+            status_text=(
+                f"QA is building & running an automated Slice Playtest Script for '{active_slice_title}' "
+                f"(Playtest & Assembly Check #{pass_index + 1})..."
+            ),
+            active_agents=["QATestEngineer", "CreativeDirector", "GameplaySystemsEngineer", "GameplayDesigner", "UXExperienceDesigner"],
             phase="slice_assembly_check",
         )
 
@@ -2229,27 +2412,197 @@ class CreativeWritersRoom:
         reach = compute_entrypoint_reachability(c_dir)
         parts: List[Any] = []
         boot_telemetry_summary = ""
+        playtest_plan_summary = ""
+        playtest_assertion_failure = ""
         proof_out = c_dir / "artifacts" / "proofs" / f"filmstrip_slice_assembly_check_pass{pass_index}.png"
-        if is_real_genai_client(self.client) or getattr(self, "assembly_filmstrip_fn", None) is not None:
+        rel_proof_path = f"artifacts/proofs/filmstrip_slice_assembly_check_pass{pass_index}.png"
+
+        if (
+            is_real_genai_client(self.client)
+            or getattr(self, "assembly_filmstrip_fn", None) is not None
+            or getattr(self, "assembly_playtest_planner_fn", None) is not None
+        ):
             try:
                 filmstrip_fn = getattr(self, "assembly_filmstrip_fn", None)
-                if filmstrip_fn is not None:
-                    filmstrip_fn(c_dir, [15, 60, 120], proof_out)
+                playtest_planner_fn = getattr(self, "assembly_playtest_planner_fn", None)
+                if filmstrip_fn is not None and playtest_planner_fn is None:
+                    filmstrip_fn(c_dir, [15, 60, 120, 180], proof_out)
                 else:
+                    from engine.studio.production_board import WorkItem
                     from engine.studio.proofs import capture_filmstrip
-                    capture_filmstrip(
-                        cartridge_dir=c_dir,
-                        ticks=[15, 60, 120],
-                        out_path=proof_out,
-                        target_scene=reach.get("main_scene") or "res://main.tscn",
+                    from engine.studio.workers import WorkerContext, plan_filmstrip
+
+                    gh_obj = getattr(game_bible, "goal_hierarchy", None)
+                    if isinstance(gh_obj, list):
+                        gh_list = gh_obj
+                    elif gh_obj is not None:
+                        gh_list = list(getattr(gh_obj, "immediate_goals", None) or []) + list(
+                            getattr(gh_obj, "short_term_goals", None) or []
+                        )
+                    else:
+                        gh_list = []
+                    first_goals = (
+                        "; ".join(str(g) for g in gh_list[:2])
+                        if gh_list
+                        else "Complete the opening interactive objective of the current slice."
                     )
+                    raw_mechs = (
+                        getattr(active_slice_obj, "core_mechanics", None)
+                        or getattr(getattr(game_bible, "core_loop", None), "player_verbs", None)
+                        or []
+                    )
+                    slice_mechs = (
+                        ", ".join(str(m) for m in raw_mechs)
+                        if raw_mechs
+                        else "core player movement and primary interaction verbs"
+                    )
+                    slice_onboard = (
+                        getattr(active_slice_obj, "player_onboarding_and_communication_plan", "")
+                        if active_slice_obj is not None
+                        else ""
+                    )
+                    playtest_item_id = f"slice_playtest_{active_slice_id}_pass{pass_index}"
+                    playtest_item = WorkItem(
+                        deliberation=f"Synthesize automated Slice Playtest work item for {active_slice_id} (pass {pass_index}).",
+                        item_id=playtest_item_id,
+                        title=f"Automated Slice Playtest: {active_slice_title} (Slice #{active_slice_idx})",
+                        kind="integration",
+                        spec=(
+                            f"Build a Slice Playtest Script (`res://tests/test_{playtest_item_id}.tscn`) that instantiates the live "
+                            f"playable game entrypoint (`preload('{reach.get('main_scene') or 'res://main.tscn'}').instantiate()`) as a child node in `_ready()`, "
+                            f"forms the game state where the game is at Slice #{active_slice_idx} (`{active_slice_id}`: {active_slice_title}; "
+                            f"for Slice #1 this is the natural boot state of `res://main.tscn`, for later slices configure the slice starting state via `_ready()` / `setup_calls` without bypassing physics), "
+                            f"attaches test-only diagnostic overlays (velocity/heading vectors, target/goal markers, and rate-of-change telemetry including `player_pos`), "
+                            f"and scripts real player `input_segments` to play through at least the first goal / core loop segment of the current slice ({first_goals}) "
+                            f"exercising `{slice_mechs}`. Onboarding plan: {slice_onboard}"
+                        ),
+                        proof_spec=(
+                            f"Multi-frame gameplay filmstrip across 180-360 ticks proving that a player booting into Slice #{active_slice_idx} (`{active_slice_id}`) "
+                            f"can actively control the player entity at a responsive, human-playable rate of motion/turn/action, progress through at least the first goal "
+                            f"({first_goals}), and see clean, non-overlapping HUD instruments with zero production debug overlays."
+                        ),
+                        raised_by_role="QATestEngineer",
+                        target_modules=[reach.get("main_script") or "main.gd"],
+                        slice_id=active_slice_id,
+                    )
+                    w_ctx = WorkerContext(
+                        cartridge_dir=c_dir,
+                        client=self.client,
+                        model_name=self.model_name,
+                        event_callback=self.event_callback,
+                        board=self.board,
+                    )
+                    if playtest_planner_fn is not None:
+                        pt_plan = playtest_planner_fn(w_ctx, playtest_item)
+                    else:
+                        pt_plan = plan_filmstrip(w_ctx, playtest_item)
+
+                    playtest_plan_summary = (
+                        f"QA Slice Playtest Scene (`{pt_plan.target_scene}`): {pt_plan.council_test_scene_summary} | "
+                        f"Overlays & Telemetry Strategy: {pt_plan.overlays_and_telemetry_strategy} | "
+                        f"Ticks: {pt_plan.capture_ticks} | "
+                        f"Inputs: {[f'{s.from_tick}-{s.to_tick}:{s.actions or s.mouse_click_pos}' for s in (pt_plan.input_segments or [])]}"
+                    )
+                    if (pt_plan.test_scene_gd_content or "").strip():
+                        from engine.studio.workers import (
+                            _serialize_input_segments,
+                            _write_qa_test_scene_pair,
+                        )
+                        pt_plan.target_scene, _, _ = _write_qa_test_scene_pair(
+                            c_dir, playtest_item_id, pt_plan.test_scene_gd_content, pt_plan.target_scene
+                        )
+                    else:
+                        from engine.studio.workers import _serialize_input_segments
+                    proof_out.parent.mkdir(parents=True, exist_ok=True)
+                    script_segs = _serialize_input_segments(pt_plan)
+                    setup_calls_list = [
+                        {"at_tick": c.at_tick, "method_name": c.method_name, "args": json.loads(c.args_json or "[]")}
+                        for c in (getattr(pt_plan, "setup_calls", None) or [])
+                        if c.method_name.strip()
+                    ]
+                    try:
+                        if filmstrip_fn is not None:
+                            filmstrip_fn(c_dir, pt_plan.capture_ticks, proof_out)
+                        else:
+                            capture_filmstrip(
+                                cartridge_dir=c_dir,
+                                ticks=list(pt_plan.capture_ticks),
+                                out_path=proof_out,
+                                input_script=script_segs,
+                                setup_script=setup_calls_list or None,
+                                verify_counterfactual=bool(script_segs),
+                                state_assertions=list(getattr(pt_plan, "state_assertions", None) or []),
+                                target_scene=pt_plan.target_scene,
+                            )
+                    except Exception as run_exc:
+                        playtest_assertion_failure = str(run_exc)
+                        logger.warning("Slice playtest script reported failure/assertion error: %s", run_exc)
+                        if not proof_out.is_file() and filmstrip_fn is None:
+                            capture_filmstrip(
+                                cartridge_dir=c_dir,
+                                ticks=[15, 60, 120, 180],
+                                out_path=proof_out,
+                                target_scene=reach.get("main_scene") or "res://main.tscn",
+                            )
                 if proof_out.is_file():
                     part = self._load_image_part(proof_out)
                     if part is not None:
                         parts.append(part)
                     boot_telemetry_summary = format_filmstrip_telemetry_progression(proof_out)
             except Exception as cap_exc:
-                logger.warning("Slice assembly boot filmstrip capture skipped: %s", cap_exc)
+                playtest_assertion_failure = str(cap_exc)
+                logger.warning("Slice assembly playtest capture encountered error: %s", cap_exc)
+
+        # If a playtest plan was executed (or in live mode when proof_out exists), emit the QA Playtester utterance with inline filmstrip
+        qa_utt_emitted = False
+        if proof_out.is_file() and (
+            is_real_genai_client(self.client)
+            or getattr(self, "assembly_playtest_planner_fn", None) is not None
+            or getattr(self, "enable_slice_playtest_discussion", False)
+        ):
+            qa_turn_idx = len(game_bible.writers_room_transcript)
+            qa_spoken = (
+                f"[Automated Slice Playtest — {active_slice_title} (Pass #{pass_index + 1})] "
+                f"{playtest_plan_summary or 'Executed scripted slice playthrough on playable entrypoint.'}"
+            )
+            if playtest_assertion_failure:
+                qa_spoken += f" Playtest script flagged assertion/runtime failure: {playtest_assertion_failure}"
+            if boot_telemetry_summary:
+                qa_spoken += f" Telemetry progression: {boot_telemetry_summary[:360]}"
+            qa_utt = WritersRoomUtterance(
+                deliberation=playtest_plan_summary or "Captured automated slice playtest filmstrip for Council inspection.",
+                utterance_id=f"utt_{qa_turn_idx:02d}_QATestEngineer_slice_playtest_{pass_index}",
+                turn_index=qa_turn_idx,
+                speaker_role="QATestEngineer",
+                speaker_display_name="Autonomous QA Playtester",
+                spoken_dialogue=qa_spoken,
+                addressed_to=["GameplayDesigner", "UXExperienceDesigner", "VisualArtDirector", "GameplaySystemsEngineer", "CreativeDirector"],
+                bible_updates_summary=[f"slice_playtest:{active_slice_id}:pass_{pass_index}"],
+                proof_image_paths=[rel_proof_path],
+                artifact_emitted={
+                    "type": "filmstrip",
+                    "path": rel_proof_path,
+                    "slice_id": active_slice_id,
+                    "caption": f"Automated Slice Playtest Filmstrip — {active_slice_title} (Pass #{pass_index + 1})",
+                },
+            )
+            game_bible.writers_room_transcript.append(qa_utt)
+            self._emit_event(
+                "writers_room_utterance",
+                {
+                    "deliberation": qa_utt.deliberation,
+                    "utterance_id": qa_utt.utterance_id,
+                    "turn_index": qa_utt.turn_index,
+                    "speaker_role": qa_utt.speaker_role,
+                    "speaker_display_name": qa_utt.speaker_display_name,
+                    "spoken_dialogue": qa_utt.spoken_dialogue,
+                    "addressed_to": qa_utt.addressed_to,
+                    "bible_updates_summary": qa_utt.bible_updates_summary,
+                    "proof_image_paths": qa_utt.proof_image_paths,
+                    "artifact_emitted": qa_utt.artifact_emitted,
+                },
+            )
+            qa_utt_emitted = True
 
         curated_assembly_block = ""
         if is_real_genai_client(self.client):
@@ -2265,8 +2618,9 @@ class CreativeWritersRoom:
                 pack = curator.curate_context(
                     target_agent_role="council_reviewer:SliceAssemblyCouncil",
                     task_request=(
-                        f"Evaluate whether all built modules, UI instruments, and gameplay systems for the active slice "
-                        f"are mounted and connected inside the playable entrypoint ({reach.get('main_scene')}).\n"
+                        f"Evaluate the Automated Slice Playtest of '{active_slice_title}' ({active_slice_id}): "
+                        f"verify whether all built modules, UI instruments, and gameplay systems are mounted in {reach.get('main_scene')}, "
+                        f"and whether playing through the first goal of the slice is responsive at human scale, free of production debug overlays, and fun.\n"
                         f"{reach.get('summary_text', '')}"
                     ),
                     item_id=f"slice_assembly_check_pass{pass_index}",
@@ -2281,34 +2635,121 @@ class CreativeWritersRoom:
             if it.state == "approved":
                 last_notes = (it.revisions[-1].worker_notes if getattr(it, "revisions", None) else "") or ""
                 approved_summaries.append(
-                    f"  - [{it.item_id}] ({it.kind}) '{it.title}' | target_modules={it.target_modules} | notes={last_notes[:200]}"
+                    f"  - [{it.item_id}] ({it.kind}) '{it.title}' | target_modules={it.target_modules} | UNVERIFIED_WORKER_CLAIMS={last_notes[:200]}"
                 )
 
         bible_snapshot = self._format_bible_snapshot(game_bible)
-        prompt = (
+        shared_playtest_dossier = (
             f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n\n"
             f"{bible_snapshot}\n\n"
             f"{curated_assembly_block}"
             f"=== PLAYABLE ENTRYPOINT REACHABILITY GRAPH ===\n{reach.get('summary_text', '')}\n\n"
-            f"=== MAIN SCENE OPENING BOOT TELEMETRY (ticks 15, 60, 120) ===\n{boot_telemetry_summary or '(not captured)'}\n\n"
+            f"=== AUTOMATED SLICE PLAYTEST PLAN & SCENE SUMMARY ===\n{playtest_plan_summary or '(boot filmstrip capture)'}\n"
+            + (f"=== PLAYTEST ASSERTION / RUNTIME FAILURE ===\n{playtest_assertion_failure}\n\n" if playtest_assertion_failure else "\n")
+            + f"=== SLICE PLAYTEST TELEMETRY PROGRESSION ===\n{boot_telemetry_summary or '(not captured)'}\n\n"
             f"=== APPROVED PRODUCTION BOARD ITEMS ({len(approved_summaries)} items) ===\n"
             + ("\n".join(approved_summaries) or "  (none)")
-            + "\n\nYou are the Council (CreativeDirector, GameplaySystemsEngineer, GameplayDesigner, and UXExperienceDesigner) "
-            "performing the Slice Readiness & Whole-Game Assembly Check now that all currently queued Production Board items are approved.\n"
+        )
+
+        roundtable_transcript_lines: List[str] = []
+        if is_real_genai_client(self.client) or getattr(self, "enable_slice_playtest_discussion", False):
+            playtest_panel_roles = ["GameplayDesigner", "UXExperienceDesigner", "VisualArtDirector"]
+            self._emit_activity(
+                agent_role="CouncilReviewPanel",
+                status_text=f"Council specialists ({', '.join(playtest_panel_roles)}) are conversing on the Slice Playtest results...",
+                active_agents=playtest_panel_roles,
+                phase="slice_assembly_check",
+            )
+            for p_role in playtest_panel_roles:
+                spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == p_role), None)
+                disp_name = spec["display_name"] if spec else p_role
+                mandate = self._role_review_mandate(p_role)
+                prior_chat = (
+                    "\n".join(f"  - {line}" for line in roundtable_transcript_lines)
+                    if roundtable_transcript_lines
+                    else "  (You are opening the Council's Slice Playtest critique after QA's playthrough presentation.)"
+                )
+                turn_prompt = (
+                    f"{shared_playtest_dossier}\n\n"
+                    f"=== SLICE PLAYTEST ROUNDTABLE CONVERSATION SO FAR ===\n{prior_chat}\n\n"
+                    f"You are the {disp_name} ({p_role}) in the Writers' Room inspecting the Automated Slice Playtest filmstrip and telemetry for '{active_slice_title}' (`{active_slice_id}`).\n"
+                    f"{mandate}\n"
+                    "INSTRUCTIONS:\n"
+                    "1. Determine `validation_criteria_for_my_role`: what must be true in this slice playtest for the game to be genuinely playable, responsive at human scale, legible, and fun from your specialist perspective?\n"
+                    "2. Inspect every frame of the attached playtest filmstrip and telemetry progression:\n"
+                    "   - Does holding player control inputs over 60–180 ticks (1–3 seconds) produce a responsive, human-playable rate of motion/turn/action, or are subsystems fighting each other / crawling at 1 degree per second?\n"
+                    "   - Did the scripted playthrough make real causal progress toward the slice's first goal?\n"
+                    "   - Are HUD instruments clean, non-overlapping, and free of developer debug text (`[DEBUG]`, raw telemetry dumps) in the production game?\n"
+                    "   - Are all active gameplay entities framed inside the 16:9 viewport across all ticks?\n"
+                    "3. Converse directly with your fellow Council members in `spoken_dialogue` and `addressed_to`, list any defects in `observed_issues_or_gaps`, and set `is_playable_and_fun_from_my_perspective=False` if ANY playability, responsiveness, wiring, or visual/HUD issue remains.\n"
+                    "Provide `deliberation` FIRST and `is_playable_and_fun_from_my_perspective` strictly LAST."
+                )
+                turn_decision = self._structured_with_validation(
+                    turn_prompt,
+                    SlicePlaytestRoundtableTurn,
+                    lambda _t: [],
+                    temperature=0.35,
+                    parts=parts,
+                )
+                roundtable_transcript_lines.append(
+                    f"[{disp_name} ({p_role})] (is_playable_and_fun={turn_decision.is_playable_and_fun_from_my_perspective} | criteria={turn_decision.validation_criteria_for_my_role}): "
+                    f"{turn_decision.spoken_dialogue} | Issues: {turn_decision.observed_issues_or_gaps}"
+                )
+                t_idx = len(game_bible.writers_room_transcript)
+                p_utt = WritersRoomUtterance(
+                    deliberation=turn_decision.deliberation,
+                    utterance_id=f"utt_{t_idx:02d}_{p_role}_slice_playtest_{pass_index}",
+                    turn_index=t_idx,
+                    speaker_role=p_role,
+                    speaker_display_name=disp_name,
+                    spoken_dialogue=turn_decision.spoken_dialogue,
+                    addressed_to=turn_decision.addressed_to or ["CreativeDirector", "GameplaySystemsEngineer"],
+                    bible_updates_summary=[
+                        f"slice_playtest_vote:{p_role}:{'pass' if turn_decision.is_playable_and_fun_from_my_perspective else 'needs_work'}"
+                    ],
+                )
+                game_bible.writers_room_transcript.append(p_utt)
+                self._emit_event(
+                    "writers_room_utterance",
+                    {
+                        "deliberation": p_utt.deliberation,
+                        "utterance_id": p_utt.utterance_id,
+                        "turn_index": p_utt.turn_index,
+                        "speaker_role": p_utt.speaker_role,
+                        "speaker_display_name": p_utt.speaker_display_name,
+                        "spoken_dialogue": p_utt.spoken_dialogue,
+                        "addressed_to": p_utt.addressed_to,
+                        "bible_updates_summary": p_utt.bible_updates_summary,
+                        "proof_image_paths": p_utt.proof_image_paths,
+                        "artifact_emitted": p_utt.artifact_emitted,
+                    },
+                )
+
+        roundtable_summary_block = (
+            "=== COUNCIL SLICE PLAYTEST ROUNDTABLE DISCUSSION ===\n"
+            + "\n".join(f"  - {line}" for line in roundtable_transcript_lines)
+            + "\n\n"
+            if roundtable_transcript_lines
+            else ""
+        )
+        prompt = (
+            f"{shared_playtest_dossier}\n\n"
+            f"{roundtable_summary_block}"
+            "You are the Council Chair & Gameplay Systems Engineer synthesizing the Slice Playtest & Whole-Game Readiness Check now that all currently queued Production Board items are approved.\n"
             "INSTRUCTIONS:\n"
-            "1. Compare the Living Game Bible and the Approved Production Board items above against the `PLAYABLE ENTRYPOINT REACHABILITY GRAPH` "
-            "and the attached opening boot filmstrip/telemetry of the playable entrypoint (`run/main_scene`).\n"
-            "2. Because individual features were developed in modular `.gd` files and verified in isolated test scenes (`res://tests/test_*.tscn`), "
-            "check whether any built gameplay system, progression loop, or HUD/UI widget that belongs in the playable game is still unmounted or unwired "
-            "from the playable entrypoint scene tree (note: helper scripts or intentionally superseded prototypes do NOT need to be mounted—only systems that serve the actual game design).\n"
-            "3. Also inspect the attached opening boot filmstrip of `run/main_scene` across ALL frames (`tick 15`, `tick 60`, `tick 120`) for whole-game visual/HUD cohesion AND opening temporal stability: "
-            "verify that the player avatar and core interactive world entities remain stable and framed on screen across `t=15..120` (never plummeting/drifting out of the playfield under unintended gravity/forces or dragging the camera away from the player into empty background space), "
-            "that HUD widgets coexist cleanly without overlapping or occluding the playfield, and that there are zero leftover test-staging hacks in `main.gd`.\n"
-            "4. If everything needed for the active slice is already assembled and coherent in `run/main_scene`, set `backlog_additions=[]` and `is_slice_assembled=True`.\n"
-            "5. If any built system or UI instrument needs to be mounted/wired into the playable entrypoint (or if `run/main_scene` has a whole-game boot/HUD/wiring issue), "
+            "1. Compare the Living Game Bible, the Approved Production Board items, and the Council Slice Playtest Roundtable Discussion above against the `PLAYABLE ENTRYPOINT REACHABILITY GRAPH` "
+            "and the attached Slice Playtest filmstrip/telemetry of the playable entrypoint (`run/main_scene`).\n"
+            "2. Check whether any built gameplay system, progression loop, or HUD/UI widget that belongs in the playable game is still unmounted or unwired "
+            "from the playable entrypoint scene tree.\n"
+            "3. Evaluate `playability_and_fun_evaluation` across ALL frames of the attached Slice Playtest filmstrip:\n"
+            "   - Verify that player inputs produce a responsive, human-playable rate of motion/turn/action over 1–3 seconds (never fighting a damping/stabilizer script at 1 deg/sec, and never plummeting/drifting off-screen).\n"
+            "   - Verify that the scripted playtest can actively progress through the first goal of the current slice without assertion failures.\n"
+            "   - Verify that HUD widgets coexist cleanly without overlapping, and that there are ZERO developer debug overlays (`[DEBUG]`, telemetry dumps) or `func test_*()` hacks in production `main.gd` / `ui_hud.gd`.\n"
+            "4. In `spoken_dialogue`, address the Council in the Writers' Room summarizing the playtest verdict and what fixes (if any) are being queued.\n"
+            "5. If everything needed for the active slice is assembled, responsive, playable through the first goal, and coherent in `run/main_scene` (and no playtest assertion failed), set `backlog_additions=[]` and `is_slice_assembled=True`.\n"
+            "6. If any system is unmounted, if the playtest revealed sluggish/conflicting controls or assertion failures, or if `run/main_scene` has a visual/HUD/debug-overlay defect, "
             "propose focused `integration` (or `mechanic_code`/`ui`) task(s) in `backlog_additions` BEFORE setting `is_slice_assembled=False`:\n"
-            "   - IMPORTANT FOR QA SCOPE: Deep per-mechanic edge cases were ALREADY verified in isolated `res://tests/test_*.tscn` scenes! "
-            "When writing `proof_spec` for an assembly/integration task on `run/main_scene`, keep the QA proof lightweight (verifying that `res://main.tscn` boots cleanly with all slice nodes/HUD widgets mounted in the scene tree and responsive to opening player controls over ~120-180 ticks—NEVER demand a multi-minute full-game playthrough in a single filmstrip).\n"
+            "   - When writing `proof_spec` for a fix task, require a QA test scene (`res://tests/test_<item_id>.tscn`) with appropriate test-only diagnostic overlays and real `input_segments` proving the fix over ~120-240 ticks.\n"
             f"Buildable kinds right now: {self._supported_kinds() or 'all'}.\n"
             "Return `SliceAssemblyDecision` with `deliberation` FIRST and `is_slice_assembled` strictly last."
         )
@@ -2340,13 +2781,13 @@ class CreativeWritersRoom:
                 "deliberation": decision.deliberation,
                 "pass_index": pass_index,
                 "is_slice_assembled": decision.is_slice_assembled,
+                "playability_and_fun_evaluation": getattr(decision, "playability_and_fun_evaluation", ""),
                 "unmounted_or_disconnected_systems": decision.unmounted_or_disconnected_systems,
                 "spawned_item_ids": [p.item_id for p in (decision.backlog_additions or [])],
             },
         )
         added: List[Any] = []
         if not decision.is_slice_assembled and decision.backlog_additions:
-            active_slice_obj = game_bible.get_active_slice()
             default_slice_id = active_slice_obj.slice_id if active_slice_obj is not None else ""
             added = self.board.add_items(
                 decision.backlog_additions,
@@ -2355,6 +2796,7 @@ class CreativeWritersRoom:
             )
 
         turn_idx = len(game_bible.writers_room_transcript)
+        chair_dialogue = (getattr(decision, "spoken_dialogue", "") or "").strip()
         if added:
             spawned_summary = ", ".join(f"`{it.item_id}` ({it.title})" for it in added)
             unmounted_note = (
@@ -2362,18 +2804,38 @@ class CreativeWritersRoom:
                 if decision.unmounted_or_disconnected_systems
                 else ""
             )
-            spoken = (
-                f"[Slice Assembly Check #{pass_index + 1}] All individual task proofs passed, so we booted `run/main_scene` and audited "
-                f"entrypoint reachability.{unmounted_note} Spawning whole-game assembly task(s): {spawned_summary}."
+            play_note = (
+                f" Playtest evaluation: {decision.playability_and_fun_evaluation}"
+                if getattr(decision, "playability_and_fun_evaluation", "")
+                else ""
             )
+            spoken = (
+                chair_dialogue
+                or f"[Slice Playtest & Readiness Check #{pass_index + 1}] Audited scripted slice playthrough and entrypoint reachability.{unmounted_note}{play_note} "
+                f"Spawning task(s): {spawned_summary}."
+            )
+            if chair_dialogue and spawned_summary not in chair_dialogue:
+                spoken = f"{chair_dialogue} (Spawning: {spawned_summary})"
             updates_list = [f"backlog:+{it.item_id}" for it in added]
         else:
             spoken = (
-                f"[Slice Assembly Check #{pass_index + 1}] Verified `run/main_scene` opening boot filmstrip and entrypoint reachability—"
-                f"all slice systems and HUD instruments are mounted and wired in the playable game."
+                chair_dialogue
+                or f"[Slice Playtest & Readiness Check #{pass_index + 1}] Verified scripted slice playthrough and entrypoint reachability—"
+                f"the current slice is mounted, responsive at human scale, and playable through its opening goal."
             )
             updates_list = ["slice_assembly:verified"]
 
+        attach_chair_proofs = [rel_proof_path] if (proof_out.is_file() and not qa_utt_emitted) else []
+        chair_artifact = (
+            {
+                "type": "filmstrip",
+                "path": rel_proof_path,
+                "slice_id": active_slice_id,
+                "caption": f"Slice Playtest & Assembly Check Filmstrip — {active_slice_title} (Pass #{pass_index + 1})",
+            }
+            if (proof_out.is_file() and not qa_utt_emitted)
+            else None
+        )
         assembly_utt = WritersRoomUtterance(
             deliberation=decision.deliberation,
             utterance_id=f"utt_{turn_idx:02d}_GameplaySystemsEngineer_assembly_{pass_index}",
@@ -2381,8 +2843,10 @@ class CreativeWritersRoom:
             speaker_role="GameplaySystemsEngineer",
             speaker_display_name="Gameplay Systems Engineer",
             spoken_dialogue=spoken,
-            addressed_to=["CreativeDirector", "GameplayDesigner", "UXExperienceDesigner"],
+            addressed_to=["CreativeDirector", "GameplayDesigner", "UXExperienceDesigner", "VisualArtDirector"],
             bible_updates_summary=updates_list,
+            proof_image_paths=attach_chair_proofs,
+            artifact_emitted=chair_artifact,
         )
         game_bible.writers_room_transcript.append(assembly_utt)
         self._emit_event(
@@ -2396,6 +2860,8 @@ class CreativeWritersRoom:
                 "spoken_dialogue": assembly_utt.spoken_dialogue,
                 "addressed_to": assembly_utt.addressed_to,
                 "bible_updates_summary": assembly_utt.bible_updates_summary,
+                "proof_image_paths": assembly_utt.proof_image_paths,
+                "artifact_emitted": assembly_utt.artifact_emitted,
             },
         )
         self._persist_bible(game_bible, candidate_dir=candidate_dir)
