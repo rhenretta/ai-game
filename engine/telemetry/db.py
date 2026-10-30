@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import tempfile
 from typing import Any, Dict, List, Optional
+import uuid
 
 logger = logging.getLogger("TelemetryDB")
 
@@ -1051,6 +1052,498 @@ class TelemetryDB:
             return row_dict
         except Exception:
             return None
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Blind Playtester Persistence (Sessions, Turns, Compactions, Wishes)
+    # ------------------------------------------------------------------
+
+    def upsert_playtest_session(self, record: Dict[str, Any]) -> None:
+        """Inserts or updates a Blind Playtester session row in `playtest_sessions`."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        session_id = str(record["session_id"])
+        checkpoint_id = str(record.get("checkpoint_id") or "active")
+        candidate_id = record.get("candidate_id")
+        slice_id = record.get("slice_id")
+        initiated_by = str(record.get("initiated_by") or "operator")
+        game_title = str(record.get("game_title") or checkpoint_id)
+        game_description = str(record.get("game_description") or "")
+        status = str(record.get("status") or "running")
+        end_outcome = record.get("end_outcome")
+        end_summary = record.get("end_summary")
+        error_message = record.get("error_message")
+        turn_count = int(record.get("turn_count", 0) or 0)
+        sim_ticks_total = int(record.get("sim_ticks_total", 0) or 0)
+        sim_duration_sec = float(record.get("sim_duration_sec", 0.0) or 0.0)
+        compaction_count = int(record.get("compaction_count", 0) or 0)
+
+        rb = record.get("rulebook") if "rulebook" in record else record.get("rulebook_json", {})
+        rulebook_json = rb if isinstance(rb, str) else json.dumps(rb or {}, default=str)
+
+        imp = record.get("impressions") if "impressions" in record else record.get("impressions_json", {})
+        impressions_json = imp if isinstance(imp, str) else json.dumps(imp or {}, default=str)
+
+        sr = record.get("session_report") if "session_report" in record else record.get("session_report_json", {})
+        if hasattr(sr, "model_dump"):
+            session_report_json = sr.model_dump_json()
+        elif isinstance(sr, str):
+            session_report_json = sr
+        else:
+            session_report_json = json.dumps(sr or {}, default=str)
+
+        cj = record.get("compacted_journal") if "compacted_journal" in record else record.get("compacted_journal_json", {})
+        if hasattr(cj, "model_dump"):
+            compacted_journal_json = cj.model_dump_json()
+        elif isinstance(cj, str):
+            compacted_journal_json = cj
+        else:
+            compacted_journal_json = json.dumps(cj or {}, default=str)
+
+        current_plan = str(record.get("current_plan") or "")
+        current_mood = str(record.get("current_mood") or "")
+        prompt_tokens = int(record.get("prompt_tokens", 0) or 0)
+        cached_tokens = int(record.get("cached_tokens", 0) or 0)
+        output_tokens = int(record.get("output_tokens", 0) or 0)
+        thought_tokens = int(record.get("thought_tokens", 0) or 0)
+        video_path = record.get("video_path")
+        latest_frame_path = record.get("latest_frame_path")
+        started_at_utc = str(record.get("started_at_utc") or now_iso)
+        updated_at_utc = str(record.get("updated_at_utc") or now_iso)
+        ended_at_utc = record.get("ended_at_utc")
+        deliberation = str(record.get("deliberation") or f"Playtest session {session_id} state={status}.")
+
+        conn = self.get_write_connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO playtest_sessions (
+                    session_id, checkpoint_id, candidate_id, slice_id, initiated_by,
+                    game_title, game_description, status, end_outcome,
+                    end_summary, error_message, turn_count, sim_ticks_total,
+                    sim_duration_sec, compaction_count, rulebook_json,
+                    impressions_json, session_report_json,
+                    compacted_journal_json, current_plan, current_mood,
+                    prompt_tokens, cached_tokens, output_tokens, thought_tokens,
+                    video_path, latest_frame_path, started_at_utc, updated_at_utc,
+                    ended_at_utc, deliberation
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                ON CONFLICT(session_id) DO UPDATE SET
+                    initiated_by=COALESCE(excluded.initiated_by, playtest_sessions.initiated_by),
+                    status=excluded.status,
+                    end_outcome=excluded.end_outcome,
+                    end_summary=excluded.end_summary,
+                    error_message=excluded.error_message,
+                    turn_count=excluded.turn_count,
+                    sim_ticks_total=excluded.sim_ticks_total,
+                    sim_duration_sec=excluded.sim_duration_sec,
+                    compaction_count=excluded.compaction_count,
+                    rulebook_json=excluded.rulebook_json,
+                    impressions_json=excluded.impressions_json,
+                    session_report_json=CASE
+                        WHEN excluded.session_report_json IS NOT NULL AND excluded.session_report_json != '{}'
+                        THEN excluded.session_report_json
+                        ELSE playtest_sessions.session_report_json
+                    END,
+                    compacted_journal_json=excluded.compacted_journal_json,
+                    current_plan=excluded.current_plan,
+                    current_mood=excluded.current_mood,
+                    prompt_tokens=excluded.prompt_tokens,
+                    cached_tokens=excluded.cached_tokens,
+                    output_tokens=excluded.output_tokens,
+                    thought_tokens=excluded.thought_tokens,
+                    video_path=COALESCE(excluded.video_path, playtest_sessions.video_path),
+                    latest_frame_path=COALESCE(excluded.latest_frame_path, playtest_sessions.latest_frame_path),
+                    updated_at_utc=excluded.updated_at_utc,
+                    ended_at_utc=COALESCE(excluded.ended_at_utc, playtest_sessions.ended_at_utc),
+                    deliberation=excluded.deliberation
+                """,
+                (
+                    session_id, checkpoint_id, candidate_id, slice_id, initiated_by,
+                    game_title, game_description, status, end_outcome,
+                    end_summary, error_message, turn_count, sim_ticks_total,
+                    sim_duration_sec, compaction_count, rulebook_json,
+                    impressions_json, session_report_json,
+                    compacted_journal_json, current_plan, current_mood,
+                    prompt_tokens, cached_tokens, output_tokens, thought_tokens,
+                    video_path, latest_frame_path, started_at_utc, updated_at_utc,
+                    ended_at_utc, deliberation,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _hydrate_playtest_session_row(row_dict: Dict[str, Any]) -> Dict[str, Any]:
+        for json_col, out_col, fallback in (
+            ("rulebook_json", "rulebook", {}),
+            ("impressions_json", "impressions", {}),
+            ("session_report_json", "session_report", {}),
+            ("compacted_journal_json", "compacted_journal", {}),
+        ):
+            raw = row_dict.get(json_col)
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    row_dict[out_col] = json.loads(raw)
+                except Exception:
+                    row_dict[out_col] = fallback
+            else:
+                row_dict[out_col] = fallback
+        return row_dict
+
+    def get_playtest_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        conn = self.get_reader_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM playtest_sessions WHERE session_id = ?;", (session_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            return self._hydrate_playtest_session_row(dict(row))
+        finally:
+            conn.close()
+
+    def list_playtest_sessions(
+        self,
+        checkpoint_id: Optional[str] = None,
+        candidate_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        conn = self.get_reader_connection()
+        try:
+            cur = conn.cursor()
+            clauses: List[str] = []
+            params: List[Any] = []
+            if checkpoint_id:
+                clauses.append("checkpoint_id = ?")
+                params.append(checkpoint_id)
+            if candidate_id:
+                clauses.append("candidate_id = ?")
+                params.append(candidate_id)
+            where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            params.append(max(1, int(limit)))
+            cur.execute(
+                f"SELECT * FROM playtest_sessions {where_sql} ORDER BY started_at_utc DESC LIMIT ?;",
+                params,
+            )
+            return [self._hydrate_playtest_session_row(dict(r)) for r in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def insert_playtest_turn(self, turn: Dict[str, Any]) -> None:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        turn_id = str(turn.get("turn_id") or f"pt_turn_{uuid.uuid4().hex[:12]}")
+        act = turn.get("action") if "action" in turn else turn.get("action_json", {})
+        action_json = act if isinstance(act, str) else json.dumps(act or {}, default=str)
+        rbu = turn.get("rulebook_updates") if "rulebook_updates" in turn else turn.get("rulebook_updates_json", [])
+        rbu_json = rbu if isinstance(rbu, str) else json.dumps(rbu or [], default=str)
+        impu = turn.get("impression_updates") if "impression_updates" in turn else turn.get("impression_updates_json", [])
+        impu_json = impu if isinstance(impu, str) else json.dumps(impu or [], default=str)
+
+        conn = self.get_write_connection()
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO playtest_turns (
+                    turn_id, session_id, turn_index, sim_tick_start, sim_tick_end,
+                    video_timestamp_sec, cursor_start_x, cursor_start_y,
+                    cursor_end_x, cursor_end_y, current_plan, deliberation,
+                    action_json, rulebook_updates_json, impression_updates_json, append_log_line,
+                    mood_state, mood_note, screenshot_path, audio_clip_path,
+                    prompt_tokens, cached_tokens, output_tokens, thought_tokens,
+                    created_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    turn_id,
+                    str(turn["session_id"]),
+                    int(turn["turn_index"]),
+                    int(turn.get("sim_tick_start", 0) or 0),
+                    int(turn.get("sim_tick_end", 0) or 0),
+                    float(turn.get("video_timestamp_sec", 0.0) or 0.0),
+                    float(turn.get("cursor_start_x", 640.0)),
+                    float(turn.get("cursor_start_y", 360.0)),
+                    float(turn.get("cursor_end_x", 640.0)),
+                    float(turn.get("cursor_end_y", 360.0)),
+                    str(turn.get("current_plan") or ""),
+                    str(turn.get("deliberation") or ""),
+                    action_json,
+                    rbu_json,
+                    impu_json,
+                    str(turn.get("append_log_line") or ""),
+                    turn.get("mood_state"),
+                    turn.get("mood_note"),
+                    turn.get("screenshot_path"),
+                    turn.get("audio_clip_path"),
+                    int(turn.get("prompt_tokens", 0) or 0),
+                    int(turn.get("cached_tokens", 0) or 0),
+                    int(turn.get("output_tokens", 0) or 0),
+                    int(turn.get("thought_tokens", 0) or 0),
+                    str(turn.get("created_at_utc") or now_iso),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def list_playtest_turns(self, session_id: str) -> List[Dict[str, Any]]:
+        conn = self.get_reader_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT * FROM playtest_turns WHERE session_id = ? ORDER BY turn_index ASC;",
+                (session_id,),
+            )
+            rows: List[Dict[str, Any]] = []
+            for r in cur.fetchall():
+                d = dict(r)
+                for jcol, ocol, fb in (
+                    ("action_json", "action", {}),
+                    ("rulebook_updates_json", "rulebook_updates", []),
+                    ("impression_updates_json", "impression_updates", []),
+                ):
+                    raw = d.get(jcol)
+                    try:
+                        d[ocol] = json.loads(raw) if isinstance(raw, str) and raw else fb
+                    except Exception:
+                        d[ocol] = fb
+                rows.append(d)
+            return rows
+        finally:
+            conn.close()
+
+    def insert_playtest_compaction(self, rec: Dict[str, Any]) -> None:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        comp_id = str(rec.get("compaction_id") or f"pt_comp_{uuid.uuid4().hex[:12]}")
+        rb = rec.get("rulebook_snapshot") if "rulebook_snapshot" in rec else rec.get("rulebook_snapshot_json", {})
+        rb_json = rb if isinstance(rb, str) else json.dumps(rb or {}, default=str)
+        jr = rec.get("journal") if "journal" in rec else rec.get("journal_json", {})
+        jr_json = jr.model_dump_json() if hasattr(jr, "model_dump") else (jr if isinstance(jr, str) else json.dumps(jr or {}, default=str))
+
+        conn = self.get_write_connection()
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO playtest_compactions (
+                    compaction_id, session_id, compaction_index, covered_up_to_turn,
+                    carried_tail_turns, deliberation, rulebook_snapshot_json,
+                    journal_json, created_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    comp_id,
+                    str(rec["session_id"]),
+                    int(rec["compaction_index"]),
+                    int(rec["covered_up_to_turn"]),
+                    int(rec.get("carried_tail_turns", 5)),
+                    str(rec.get("deliberation") or ""),
+                    rb_json,
+                    jr_json,
+                    str(rec.get("created_at_utc") or now_iso),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def list_playtest_compactions(self, session_id: str) -> List[Dict[str, Any]]:
+        conn = self.get_reader_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT * FROM playtest_compactions WHERE session_id = ? ORDER BY compaction_index ASC;",
+                (session_id,),
+            )
+            out: List[Dict[str, Any]] = []
+            for r in cur.fetchall():
+                d = dict(r)
+                for jcol, ocol in (("rulebook_snapshot_json", "rulebook_snapshot"), ("journal_json", "journal")):
+                    raw = d.get(jcol)
+                    try:
+                        d[ocol] = json.loads(raw) if isinstance(raw, str) and raw else {}
+                    except Exception:
+                        d[ocol] = {}
+                out.append(d)
+            return out
+        finally:
+            conn.close()
+
+    def insert_playtest_wish(self, wish: Dict[str, Any]) -> str:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        wish_id = str(wish.get("wish_id") or f"wish_{uuid.uuid4().hex[:10]}")
+        conn = self.get_write_connection()
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO playtest_wishes (
+                    wish_id, session_id, turn_index, candidate_id, checkpoint_id,
+                    observed_on_slice_id, status, category, summary, rationale,
+                    mood_at_time, screenshot_path, video_timestamp_sec,
+                    producer_note, sent_at_utc, created_at_utc, deliberation
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    wish_id,
+                    str(wish["session_id"]),
+                    int(wish.get("turn_index", 0) or 0),
+                    wish.get("candidate_id"),
+                    str(wish.get("checkpoint_id") or "active"),
+                    wish.get("observed_on_slice_id"),
+                    str(wish.get("status") or "pending"),
+                    str(wish.get("category") or "gameplay_feel"),
+                    str(wish.get("summary") or ""),
+                    str(wish.get("rationale") or ""),
+                    wish.get("mood_at_time"),
+                    wish.get("screenshot_path"),
+                    float(wish.get("video_timestamp_sec", 0.0) or 0.0),
+                    wish.get("producer_note"),
+                    wish.get("sent_at_utc"),
+                    str(wish.get("created_at_utc") or now_iso),
+                    str(wish.get("deliberation") or ""),
+                ),
+            )
+            conn.commit()
+            return wish_id
+        finally:
+            conn.close()
+
+    def update_playtest_wish_status(
+        self,
+        wish_id: str,
+        status: str,
+        producer_note: Optional[str] = None,
+        sent_at_utc: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        conn = self.get_write_connection()
+        try:
+            conn.execute(
+                """
+                UPDATE playtest_wishes
+                SET status = ?,
+                    producer_note = COALESCE(?, producer_note),
+                    sent_at_utc = COALESCE(?, sent_at_utc)
+                WHERE wish_id = ?
+                """,
+                (status, producer_note, sent_at_utc, wish_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        matches = self.get_playtest_wishes_by_ids([wish_id])
+        return matches[0] if matches else None
+
+    def get_playtest_wishes_by_ids(self, wish_ids: List[str]) -> List[Dict[str, Any]]:
+        clean_ids = [str(w).strip() for w in (wish_ids or []) if str(w).strip()]
+        if not clean_ids:
+            return []
+        conn = self.get_reader_connection()
+        try:
+            cur = conn.cursor()
+            placeholders = ",".join("?" for _ in clean_ids)
+            cur.execute(
+                f"SELECT * FROM playtest_wishes WHERE wish_id IN ({placeholders}) ORDER BY created_at_utc ASC;",
+                clean_ids,
+            )
+            return [dict(r) for r in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def list_playtest_wishes(
+        self,
+        session_id: Optional[str] = None,
+        candidate_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        conn = self.get_reader_connection()
+        try:
+            cur = conn.cursor()
+            clauses: List[str] = []
+            params: List[Any] = []
+            if session_id:
+                clauses.append("session_id = ?")
+                params.append(session_id)
+            if candidate_id:
+                clauses.append("candidate_id = ?")
+                params.append(candidate_id)
+            if status:
+                clauses.append("status = ?")
+                params.append(status)
+            where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            params.append(max(1, int(limit)))
+            cur.execute(
+                f"SELECT * FROM playtest_wishes {where_sql} ORDER BY created_at_utc DESC LIMIT ?;",
+                params,
+            )
+            return [dict(r) for r in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def reset_playtest_session_data(
+        self,
+        session_id: str,
+        deliberation: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Wipes all turns, compactions, wishes, rulebook, impressions, report, and media references
+        for `session_id` while leaving the session row in `status='idle'` without starting it.
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+        delib_text = deliberation or (
+            f"Operator reset playtest session {session_id} data to a clean idle state without starting."
+        )
+        conn = self.get_write_connection()
+        try:
+            conn.execute("DELETE FROM playtest_turns WHERE session_id = ?;", (session_id,))
+            conn.execute("DELETE FROM playtest_compactions WHERE session_id = ?;", (session_id,))
+            conn.execute("DELETE FROM playtest_wishes WHERE session_id = ?;", (session_id,))
+            conn.execute(
+                """
+                UPDATE playtest_sessions
+                SET status = 'idle',
+                    turn_count = 0,
+                    sim_ticks_total = 0,
+                    sim_duration_sec = 0.0,
+                    compaction_count = 0,
+                    prompt_tokens = 0,
+                    cached_tokens = 0,
+                    output_tokens = 0,
+                    thought_tokens = 0,
+                    rulebook_json = '{}',
+                    impressions_json = '{}',
+                    session_report_json = '{}',
+                    compacted_journal_json = '{}',
+                    current_plan = 'Session data reset — click Run Playtester to start.',
+                    current_mood = 'idle',
+                    video_path = NULL,
+                    latest_frame_path = NULL,
+                    end_outcome = NULL,
+                    end_summary = NULL,
+                    error_message = NULL,
+                    ended_at_utc = NULL,
+                    updated_at_utc = ?,
+                    deliberation = ?
+                WHERE session_id = ?;
+                """,
+                (now_iso, delib_text, session_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return self.get_playtest_session(session_id)
+
+    def delete_playtest_session(self, session_id: str) -> None:
+        """Atomically deletes a playtest session and all of its child turns, compactions, and wishes."""
+        conn = self.get_write_connection()
+        try:
+            conn.execute("DELETE FROM playtest_turns WHERE session_id = ?;", (session_id,))
+            conn.execute("DELETE FROM playtest_compactions WHERE session_id = ?;", (session_id,))
+            conn.execute("DELETE FROM playtest_wishes WHERE session_id = ?;", (session_id,))
+            conn.execute("DELETE FROM playtest_sessions WHERE session_id = ?;", (session_id,))
+            conn.commit()
         finally:
             conn.close()
 

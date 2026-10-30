@@ -399,8 +399,22 @@ class StudioOrchestrator:
         }
 
     def cancel_active_build(self) -> None:
-        """Signals an active or paused Genesis build (e.g. waiting at Greenlight gate) to abort immediately so a new game can start."""
+        """Signals an active or paused Genesis build (e.g. waiting at Greenlight gate, in Writers' Room, or draining board)
+        to abort immediately so a new game can start."""
         self._abort_requested = True
+        if getattr(self, "writers_room", None) is not None:
+            self.writers_room._abort_requested = True
+        if getattr(self, "_board_scheduler", None) is not None:
+            try:
+                self._board_scheduler.stop()
+            except Exception:
+                pass
+        try:
+            from engine.studio.models import get_active_gemini_dataset_context, mark_candidate_build_aborted
+            mark_candidate_build_aborted(getattr(self, "_active_staging_dir", None))
+            mark_candidate_build_aborted(get_active_gemini_dataset_context().get("candidate_dir"))
+        except Exception:
+            pass
         self._greenlight_decision = {"approved": False, "aborted": True, "feedback": ""}
         if self._greenlight_event is not None:
             try:
@@ -556,6 +570,56 @@ class StudioOrchestrator:
         self.writers_room.board = board
         self.writers_room.scheduler = getattr(self, "_board_scheduler", None) if board is not None else None
         self._continuous_active = board is not None
+        if self._continuous_active and getattr(self.writers_room, "playtest_manager", None) is None:
+            bus_pt_mgr = getattr(self.event_bus, "_playtest_manager", None) if self.event_bus is not None else None
+            if bus_pt_mgr is None and self._is_live_genai_client():
+                from engine.playtest.session_manager import PlaytestSessionManager
+                t_db = self.writers_room.telemetry_db
+                pt_db_path = (
+                    Path(t_db.db_path)
+                    if (t_db is not None and getattr(t_db, "db_path", None) is not None)
+                    else (c_dir.parent.parent / "data" / "telemetry.db")
+                )
+                pt_db_path.parent.mkdir(parents=True, exist_ok=True)
+                bus_pt_mgr = PlaytestSessionManager(
+                    db_path=pt_db_path,
+                    cartridges_root=c_dir.parent,
+                    event_bus=self.event_bus,
+                )
+                if self.event_bus is not None:
+                    setattr(self.event_bus, "_playtest_manager", bus_pt_mgr)
+            if bus_pt_mgr is not None:
+                self.writers_room.playtest_manager = bus_pt_mgr
+
+        def _on_slice_checkpoint(gb: GameBibleSpec, completed_slice: Any, cand_path: Optional[Path]) -> None:
+            target_c_dir = Path(cand_path) if cand_path is not None else c_dir
+            if not (target_c_dir / "project.godot").is_file() and not (target_c_dir / "mechanics.py").is_file():
+                return
+            slice_id_str = getattr(completed_slice, "slice_id", "slice_0") or "slice_0"
+            slice_title_str = getattr(completed_slice, "title", slice_id_str) or slice_id_str
+            approved_ids = (
+                [it.item_id for it in board.items() if it.state == "approved"]
+                if board is not None
+                else [slice_id_str]
+            )
+            chk_track = RequirementTrack(
+                deliberation=f"Persisting verified checkpoint for completed vertical slice {slice_id_str} ('{slice_title_str}').",
+                id=f"{slice_id_str}_completed",
+                title=f"Slice Checkpoint: {slice_title_str}",
+                category="gameplay_mechanic",
+                description=getattr(completed_slice, "slice_objective", slice_title_str) or slice_title_str,
+                target_modules=["main.gd"],
+                acceptance_criteria=[],
+                status="completed",
+            )
+            self._persist_verified_checkpoint(
+                staging_dir=target_c_dir,
+                track=chk_track,
+                verified_tracks=approved_ids or [slice_id_str],
+                mirror_to_active=True,
+            )
+
+        self.writers_room.slice_checkpoint_callback = _on_slice_checkpoint
         try:
             bible = self.writers_room.run_writers_room(
                 dna=dna,
@@ -930,10 +994,34 @@ class StudioOrchestrator:
                         has_assembly_proof = any(
                             (staging_dir / "artifacts" / "proofs").glob("filmstrip_slice_assembly_check_pass*.png")
                         ) if (staging_dir / "artifacts" / "proofs").is_dir() else False
+                        needs_next_slice_iteration = False
+                        if self._is_live_genai_client() and (staging_dir / "game_bible.json").is_file():
+                            try:
+                                gb_check = GameBibleSpec.model_validate_json(
+                                    (staging_dir / "game_bible.json").read_text(encoding="utf-8")
+                                )
+                                target_s = (
+                                    int(self.writers_room.target_slices)
+                                    if getattr(self.writers_room, "target_slices", None) is not None
+                                    else max(2, int(os.environ.get("STUDIO_TARGET_SLICES", "2")))
+                                )
+                                completed_s = sum(
+                                    1 for s in (gb_check.slice_roadmap or []) if getattr(s, "status", "") == "completed"
+                                )
+                                if len(gb_check.slice_roadmap or []) < target_s or completed_s < target_s:
+                                    needs_next_slice_iteration = True
+                            except Exception:
+                                needs_next_slice_iteration = True
+                        has_resume_feedback = bool(
+                            getattr(self, "_creative_prompt", None)
+                            or getattr(self.writers_room, "_pending_steering", None)
+                        )
                         if (
                             not pb_check.is_drained()
                             or (staging_dir / ".pending_steering.json").is_file()
+                            or has_resume_feedback
                             or (self._is_live_genai_client() and not has_assembly_proof)
+                            or needs_next_slice_iteration
                         ):
                             board_needs_writers_room = True
                     except Exception as pb_chk_exc:
@@ -1373,7 +1461,7 @@ class StudioOrchestrator:
 
             elif canonical_name == "VoiceActingAudioProducerAgent":
                 from engine.studio.audio import validate_wav_file
-                from engine.studio.models import DialogueBarkSpec, NarrativeCharacterSpec
+                from engine.studio.models import CharacterSheet as NarrativeCharacterSpec, DialogueBarkSpec
 
                 audio_dir = staging_dir / "assets" / "audio"
                 audio_dir.mkdir(parents=True, exist_ok=True)
@@ -2297,13 +2385,14 @@ class StudioOrchestrator:
             if src.is_file():
                 shutil.copy2(src, checkpoint_dir / json_name)
 
-        # 3. Copy assets directory if present
-        assets_src = staging_dir / "assets"
-        if assets_src.is_dir():
-            assets_dst = checkpoint_dir / "assets"
-            if assets_dst.exists():
-                shutil.rmtree(assets_dst)
-            shutil.copytree(assets_src, assets_dst)
+        # 3. Copy assets and scenes directories if present
+        for subdir_name in ("assets", "scenes"):
+            sub_src = staging_dir / subdir_name
+            if sub_src.is_dir():
+                sub_dst = checkpoint_dir / subdir_name
+                if sub_dst.exists():
+                    shutil.rmtree(sub_dst)
+                shutil.copytree(sub_src, sub_dst)
 
         # 4. Compute cryptographic sha256 manifest
         sha256_manifest: Dict[str, str] = {}

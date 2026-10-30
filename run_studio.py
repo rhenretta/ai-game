@@ -96,6 +96,26 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="Path to SQLite WAL telemetry database",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="Resume or advance the latest (or --candidate) cartridge to the next slice",
+    )
+    parser.add_argument(
+        "--candidate",
+        type=str,
+        default=None,
+        help="Explicit candidate directory name to resume or advance (e.g., candidate_genesis_8dd157)",
+    )
+    parser.add_argument(
+        "--feedback",
+        "--prompt",
+        dest="feedback",
+        type=str,
+        default=None,
+        help="Optional Executive Producer feedback / creative direction for Genesis or next-slice reflection",
+    )
     return parser.parse_args(argv)
 
 
@@ -125,16 +145,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         steam_profile=args.steam_profile,
         cartridges_root=Path(args.cartridges_dir) if args.cartridges_dir else config.PROJECT_ROOT / "cartridges",
         db_path=Path(args.db_path) if args.db_path else config.DB_PATH,
+        creative_prompt=args.feedback if getattr(args, "feedback", None) else None,
+        resume_current=bool(getattr(args, "resume", False) or getattr(args, "candidate", None)),
+        resume_candidate_id=getattr(args, "candidate", None),
     )
 
     if not args.no_daemon:
         _active_daemon = StudioDaemon(config_obj=daemon_cfg)
     setup_signal_handlers(_active_daemon)
 
-    # If --once requested without ASGI server: execute single step and exit
+    # If --once requested without ASGI server: execute single step (or explicit resume/genesis cycle) and exit
     if args.once and args.no_daemon:
         daemon = StudioDaemon(config_obj=daemon_cfg)
-        daemon.step()
+        if daemon_cfg.resume_current or daemon_cfg.creative_prompt:
+            daemon.run_genesis_cycle()
+        else:
+            daemon.step()
         return 0
 
     print("=" * 64)

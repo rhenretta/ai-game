@@ -1084,10 +1084,20 @@ def _summarize_cartridge_for_qa(cartridge_dir: Path, max_chars: int = 6500) -> s
     """Extracts a compact GDScript symbol, input-binding semantics, physics layer/mask, world_bounds,
     and asset catalog summary so QA (`plan_filmstrip`), TaskLead, and Council reviewers see exact input
     behaviors, spatial bounds, and all modules without truncation."""
-    from engine.sim.godot_verifier import iter_cartridge_gd_files
+    from engine.sim.godot_verifier import find_broken_script_references, iter_cartridge_gd_files
 
-    c_dir = Path(cartridge_dir)
+    c_dir = Path(cartridge_dir).resolve()
     header_lines: List[str] = []
+    broken_refs = find_broken_script_references(c_dir, include_tests=False)
+    if broken_refs:
+        broken_desc = [
+            f"{d.file_path.relative_to(c_dir).as_posix()}:{d.line_number} -> {d.error_message}"
+            for d in broken_refs
+        ]
+        header_lines.append(
+            "- ⚠️ BROKEN / MISSING SCRIPT OR SCENE REFERENCES ON DISK (load/preload returns null at runtime — MUST FIX!): "
+            + " | ".join(broken_desc)
+        )
     layout_path = c_dir / "level_layout.json"
     if layout_path.is_file():
         try:
@@ -1176,6 +1186,8 @@ _FORBIDDEN_SETUP_CALL_NAMES = frozenset({
 
 
 def validate_filmstrip_plan(plan: FilmstripPlan, actions: List[str], item_kind: str = "") -> List[str]:
+    if (getattr(plan, "production_defect_report", "") or "").strip():
+        return []
     issues: List[str] = []
     ticks = plan.capture_ticks
     if not ticks or len(ticks) > MAX_PROOF_FRAMES:
@@ -1188,7 +1200,8 @@ def validate_filmstrip_plan(plan: FilmstripPlan, actions: List[str], item_kind: 
         unknown = [a for a in seg.actions if a not in actions]
         if unknown:
             issues.append(f"input segment uses unknown actions {unknown}; available actions: {actions}.")
-    for call in getattr(plan, "setup_calls", []) or []:
+    raw_setup_calls = list(getattr(plan, "setup_calls", None) or [])
+    for call in raw_setup_calls:
         if call.at_tick < 1 or call.at_tick > MAX_PROOF_TICKS:
             issues.append(f"setup_call at_tick={call.at_tick} must be within [1, {MAX_PROOF_TICKS}].")
         m_clean = call.method_name.strip()
@@ -1198,7 +1211,7 @@ def validate_filmstrip_plan(plan: FilmstripPlan, actions: List[str], item_kind: 
         elif m_lower.startswith(_FORBIDDEN_SETUP_CALL_PREFIXES) or m_lower in _FORBIDDEN_SETUP_CALL_NAMES:
             issues.append(
                 f"setup_call '{call.method_name}' is a 'simulate_*' / state-forcing shortcut that bypasses real player input/physics or forces onboarding/completion state. "
-                f"Drive gameplay mechanics and onboarding step transitions causally via `input_segments` (`actions`, `mouse_click_pos`, or `when_snapshot_key` reactive triggers)."
+                f"Drive gameplay mechanics and onboarding step transitions causally via `input_segments` (`actions`, `mouse_world_pos`, `mouse_click_pos`, or `when_snapshot_key` reactive triggers)."
             )
         try:
             parsed_args = json.loads(call.args_json or "[]")
@@ -1207,15 +1220,20 @@ def validate_filmstrip_plan(plan: FilmstripPlan, actions: List[str], item_kind: 
         except Exception:
             issues.append(f"setup_call args_json for '{call.method_name}' is not valid JSON.")
     valid_setup_calls = [
-        c for c in (getattr(plan, "setup_calls", None) or [])
+        c for c in raw_setup_calls
         if c.method_name.strip()
         and not c.method_name.strip().lower().startswith(_FORBIDDEN_SETUP_CALL_PREFIXES)
         and c.method_name.strip().lower() not in _FORBIDDEN_SETUP_CALL_NAMES
     ]
     has_test_scene_gd = bool((getattr(plan, "test_scene_gd_content", "") or "").strip())
-    if item_kind in ("mechanic_code", "integration") and actions and not plan.input_segments and not valid_setup_calls and not has_test_scene_gd:
+    if item_kind == "integration" and actions and not plan.input_segments and not valid_setup_calls:
         issues.append(
-            f"FilmstripPlan for '{item_kind}' must include at least one `input_segments` entry (keyboard `actions` or `mouse_click_pos`), "
+            "FilmstripPlan for 'integration' / slice playtest tasks must include `input_segments` "
+            "(`actions`, `mouse_world_pos`, or `mouse_click_pos`) demonstrating real player agency (or populate `production_defect_report` if the production game is broken/deadlocked)."
+        )
+    elif item_kind == "mechanic_code" and actions and not plan.input_segments and not valid_setup_calls and not has_test_scene_gd:
+        issues.append(
+            f"FilmstripPlan for '{item_kind}' must include at least one `input_segments` entry (keyboard `actions`, `mouse_world_pos`, or `mouse_click_pos`), "
             f"scenario `setup_calls`, or an isolated `test_scene_gd_content` harness demonstrating causal progression from the t=0 baseline."
         )
     if has_test_scene_gd:
@@ -1272,6 +1290,8 @@ def _serialize_input_segments(plan: FilmstripPlan) -> List[Dict[str, Any]]:
     script: List[Dict[str, Any]] = []
     for s in plan.input_segments:
         seg_d: Dict[str, Any] = {"from": s.from_tick, "to": s.to_tick, "actions": list(s.actions)}
+        if getattr(s, "mouse_world_pos", None) is not None:
+            seg_d["mouse_world_pos"] = list(s.mouse_world_pos)
         if getattr(s, "mouse_click_pos", None) is not None:
             seg_d["mouse_click_pos"] = list(s.mouse_click_pos)
         if getattr(s, "when_snapshot_key", ""):
@@ -1283,7 +1303,13 @@ def _serialize_input_segments(plan: FilmstripPlan) -> List[Dict[str, Any]]:
     return script
 
 
-def plan_filmstrip(ctx: WorkerContext, item: WorkItem, attempts: int = 3) -> FilmstripPlan:
+def plan_filmstrip(
+    ctx: WorkerContext,
+    item: WorkItem,
+    attempts: int = 3,
+    prior_capture_feedback: str = "",
+    prior_strip_path: Optional[Path] = None,
+) -> FilmstripPlan:
     """Asks the model how to demonstrate this item (inputs + scenario setup + frames), validated against the game's real input map and symbols."""
     if not _is_live(ctx.client):
         raise StudioAgentError("Filmstrip planning requires an active google.genai Client (Rule 5)")
@@ -1310,17 +1336,33 @@ def plan_filmstrip(ctx: WorkerContext, item: WorkItem, attempts: int = 3) -> Fil
         )
         context_block = f"{context_block}\n{pack.prompt_block}"
         multimodal_parts = list(pack.multimodal_parts)
+    if prior_strip_path is not None and Path(prior_strip_path).is_file():
+        try:
+            multimodal_parts.append(f"PASS 1 CAPTURED FILMSTRIP THAT FAILED STATE ASSERTIONS ({Path(prior_strip_path).name}):")
+            multimodal_parts.append(types.Part.from_bytes(data=Path(prior_strip_path).read_bytes(), mime_type="image/png"))
+        except Exception:
+            pass
+    prior_feedback_block = (
+        f"\n⚠️ PASS 1 PLAYTEST EXECUTION FEEDBACK & TELEMETRY (DIAGNOSE ROOT CAUSE: TEST INPUTS vs. PRODUCTION DEFECT):\n"
+        f"{prior_capture_feedback}\n"
+        f"- Inspect the attached Pass 1 filmstrip, frame-by-frame telemetry, and production script code above to determine WHY Pass 1 failed:\n"
+        f"  (A) If your QA play script missed a coordinate, forgot a prerequisite key/selection, or stopped too early, refine `input_segments` / `mouse_world_pos` / `capture_ticks`.\n"
+        f"  (B) If the production game code itself is unwired, broken, or deadlocked under valid player inputs (so a real human player could not succeed either), DO NOT compensate by mutating game state inside `test_scene_gd_content`! Instead, populate `production_defect_report` with your concrete root-cause diagnosis and tick/state evidence so `TaskLead` sends it back to `swe_engineer` to fix the game.\n"
+        if prior_capture_feedback
+        else ""
+    )
     issues: List[str] = []
     for attempt in range(1, attempts + 1):
         retry = "\n\nYOUR PREVIOUS PLAN FAILED VALIDATION; FIX:\n- " + "\n- ".join(issues) if issues else ""
         prompt = (
             f"You are the QA Test Engineer designing and building a Godot 4.3 test scene and scripted playthrough that PROVES a built item to the design council.\n"
             f"ITEM [{item.item_id}] ({item.kind}): {item.title}\nSPEC: {item.spec}\nTHE COUNCIL WANTS TO SEE: {item.proof_spec}\n"
-            f"Available input actions: {actions}.{context_block}\n"
-            f"1. BUILD YOUR QA TEST SCENE (`target_scene` + `test_scene_gd_content`):\n"
+            f"Available input actions: {actions}.{context_block}{prior_feedback_block}\n"
+            f"1. BUILD YOUR QA TEST SCENE (`target_scene` + `test_scene_gd_content`) OR REPORT A PRODUCTION DEFECT (`production_defect_report`):\n"
             f"   - Set `target_scene = 'res://tests/test_{_safe_id(item.item_id)}.tscn'` and write the complete GDScript 2.0 (`extends Node2D`) test scene in `test_scene_gd_content`.\n"
             f"   - For isolated subsystem/mechanic/UI tasks, `test_scene_gd_content` can instantiate the specific feature script(s) or entities under test.\n"
-            f"   - For whole-game `integration` or `level_map` tasks (or when verifying behavior inside the full game), `test_scene_gd_content` can instantiate `preload('res://main.tscn').instantiate()` (or `preload('res://main.gd').new()`) as a child node in `_ready()` so it runs the real game entrypoint while allowing you to attach QA diagnostic overlays and custom telemetry on top!\n"
+            f"   - For whole-game `integration` or `level_map` tasks (or when verifying behavior inside the full game), `test_scene_gd_content` can instantiate `preload('res://main.tscn').instantiate()` (or `preload('res://main.gd').new()`) as a child node in `_ready()` so it runs the real game entrypoint while allowing you to attach QA diagnostic overlays and custom telemetry on top.\n"
+            f"   - DIAGNOSTIC INTEGRITY & FULL COUNCIL TRANSPARENCY: Your job is to surface truth, never to manufacture a green check. The Council sees your exact `test_scene_gd_content` source code, `setup_calls`, visible HUD text telemetry, and live `res://main.tscn` parity comparison. Never inject mid-run state mutations (e.g. `if sim_tick == ...:` inventory/score grants) inside `test_scene_gd_content` to mask a broken mechanic; if inspecting the code or Pass 1 telemetry reveals a production bug or deadlock in the game itself, report it in `production_defect_report` so `swe_engineer` fixes the production code.\n"
             f"   - Keep production `main.gd` and `ui_hud.gd` 100% pure game code with ZERO debug overlays—all test staging and rich QA diagnostic overlays belong exclusively inside your `test_scene_gd_content`.\n"
             f"2. STRATEGIZE DIAGNOSTIC OVERLAYS, HUMAN-SCALE RESPONSIVENESS & TELEMETRY (`overlays_and_telemetry_strategy`):\n"
             f"   - Reason from first principles: what would a live human player experience when interacting with this feature, and what needs to be measured over time (`capture_ticks`, 60 ticks ~ 1 second) to prove the feature feels responsive, legible, and free of subsystem conflicts?\n"
@@ -1330,15 +1372,23 @@ def plan_filmstrip(ctx: WorkerContext, item: WorkItem, attempts: int = 3) -> Fil
             f"   - Write `council_test_scene_summary` explaining to the Council: (a) what your test scene instantiates and stages, (b) what scenario and inputs run across `capture_ticks`, and (c) what QA diagnostic overlays or telemetry readouts you added so the Council knows exactly what it is looking at.\n"
             f"4. SCRIPT CAUSAL INPUTS & CAPTURE TICKS (`capture_ticks`, `input_segments`, `state_assertions`):\n"
             f"   - Choose `capture_ticks` (1-{MAX_PROOF_FRAMES} frames, ticks 1-{MAX_PROOF_TICKS}, 60 ticks ~ 1 second), `input_segments` "
-            f"(actions or KEY_* held over tick ranges, plus optional `mouse_click_pos`), and optional `setup_calls` (ONLY for scenario staging "
+            f"(actions or KEY_* held over tick ranges, plus optional `mouse_world_pos` or `mouse_click_pos`), and optional `setup_calls` (ONLY for scenario staging "
             f"such as spawning a hazard or positioning actors—NEVER call `simulate_*`, `force_*`, `complete_*`, or `set_onboarding_step` shortcuts that bypass real player input or physics) "
             f"so the captured frames show:\n"
             f"     * Frame 1 (`capture_ticks[0]`, before player inputs take effect): the UNSOLVED t=0 baseline state (`test_unsolved_baseline_t0`), and\n"
-            f"     * Subsequent frames (`capture_ticks[1..]`): the authentic causal progression driven by `input_segments` (`actions` and/or `mouse_click_pos`). Never leave `input_segments` empty on an interactive mechanic, UI control, or integration task!\n"
+            f"     * Subsequent frames (`capture_ticks[1..]`): the authentic causal progression driven by `input_segments` (`actions`, `mouse_world_pos`, and/or `mouse_click_pos`). Never leave `input_segments` empty on an interactive mechanic, UI control, or integration task!\n"
+            f"   - WORLD-SPACE vs. SCREEN-SPACE MOUSE CLICKS (`mouse_world_pos` vs. `mouse_click_pos`):\n"
+            f"     * Whenever clicking an in-world location, terrain cell, spire/pedestal, or entity in a scene with a `Camera2D`, ALWAYS set `mouse_world_pos = [wx, wy]` using the exact 2D world coordinates from the level/world scripts! The harness automatically transforms `mouse_world_pos` through the active `Camera2D` canvas transform (`get_canvas_transform() * Vector2(wx, wy)`) so your click lands on the exact world target regardless of camera offset or zoom.\n"
+            f"     * Use `mouse_click_pos = [sx, sy]` ONLY when clicking screen-space `CanvasLayer` HUD buttons.\n"
+            f"   - STEP-BY-STEP CAUSAL CHAIN PLAYTESTING (NEVER SCRIPT A 1-CLICK SMOKE TRIGGER):\n"
+            f"     * Read the target scripts' input handlers (`_unhandled_input`, `_input`) and terrain/placement rules in `CARTRIDGE SYMBOLS & ASSETS AVAILABLE FOR QA STAGING` and the curated code chunks before scripting `input_segments`:\n"
+            f"       1. TOOL / MODE SELECTION: Check which tool/building slot starts active at `t=0` and which `KEY_*` or action selects the required intermediate/target structure (e.g., pressing `KEY_2` or `KEY_3` before clicking to place Slot 2 or Slot 3)!\n"
+            f"       2. VALID BUILDABLE WORLD COORDINATES: Check the terrain/placement validity rules (`is_placement_valid`, land/spire/pedestal polygons vs. invalid water/void) and choose exact 2D world coordinates `mouse_world_pos = [wx, wy]` that lie on valid buildable terrain along the physical trajectory.\n"
+            f"       3. ROTATION / TUNING: Check whether placed structures require rotation (`KEY_Q`, `KEY_E`, `KEY_R`) or impulse tuning so their physical surface normal / trajectory routes items into the goal.\n"
+            f"       4. STEP-BY-STEP `state_assertions`: Populate `state_assertions` for EACH link in the causal chain across ticks (e.g., tool slot selected -> structure placed count incremented `> baseline` -> intermediate interaction/ricochet count `> 0` -> final objective/delivery count `> baseline`), rather than only asserting on the final score at the last tick! That way, if any step fails in Pass 1, the telemetry pinpoints the exact link that needs adjustment.\n"
             f"   - REACTIVE TIMING TIP: When a secondary player input depends on dynamic physics or movement reaching a threshold, "
             f"populate `when_snapshot_key`, `when_operator` ('<=', '>=', '==', '!='), `when_value`, and `hold_ticks` on that `InputSegment`.\n"
-            f"   - Populate `state_assertions` for key observable state transitions verified against `get_state_snapshot()`. "
-            f"Use no input only if the item kind is a purely static layout preview. Provide `deliberation` FIRST.{retry}"
+            f"   - Use no input only if the item kind is a purely static layout preview. Provide `deliberation` FIRST.{retry}"
         )
         contents_arg: Any = ([prompt] + multimodal_parts) if multimodal_parts else prompt
         record_turn_epistemic_context(
@@ -2003,11 +2053,19 @@ def run_swe_engineer_specialist(
             item_art_dir = _item_dir(ctx, item)
             cur_rev_idx = len(item.revisions)
             if item_art_dir.is_dir():
-                for cand_png in sorted(item_art_dir.glob(f"*filmstrip*_rev{cur_rev_idx}.png")):
-                    if cand_png.is_file() and str(cand_png) not in attached_proof_paths:
-                        attached_proof_paths.append(str(cand_png))
-            if item.revisions:
-                for p in (item.revisions[-1].proof_paths or []):
+                rev_strips = [
+                    p
+                    for p in sorted(item_art_dir.glob(f"*filmstrip*_rev{cur_rev_idx}.png"))
+                    if p.is_file() and "_pass1." not in p.name.lower()
+                ] or [
+                    p
+                    for p in sorted(item_art_dir.glob(f"*filmstrip*_rev{cur_rev_idx}.png"))
+                    if p.is_file()
+                ]
+                if rev_strips:
+                    attached_proof_paths.append(str(rev_strips[-1]))
+            if not attached_proof_paths and item.revisions:
+                for p in (item.revisions[-1].proof_paths or [])[-1:]:
                     if p and Path(p).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp") and p not in attached_proof_paths:
                         attached_proof_paths.append(p)
             telemetry_note = ""
@@ -2267,7 +2325,7 @@ def run_swe_engineer_specialist(
                                 )
                             }
                         )
-                        agent.implement_requirement_track(
+                        written_map = agent.implement_requirement_track(
                             track=track,
                             staging_dir=ctx.cartridge_dir,
                             requirements_spec=req_spec,
@@ -2296,7 +2354,7 @@ def run_swe_engineer_specialist(
                                 "running_tests",
                                 f"Verification failed ({str(verify_exc)[:120]}); self-healing and re-verifying {modules}",
                             )
-                            agent.implement_requirement_track(
+                            written_map = agent.implement_requirement_track(
                                 track=track,
                                 staging_dir=ctx.cartridge_dir,
                                 requirements_spec=req_spec,
@@ -2313,11 +2371,34 @@ def run_swe_engineer_specialist(
                     pre_turn_snap,
                     scoped_only=use_per_file_locks,
                 )
-            for m in list(modules) + list(turn_code_diffs.keys()):
+            actual_modified: List[str] = []
+            for m_diff in turn_code_diffs.keys():
+                norm_m = CartridgeFileLockTable.normalize_path(str(m_diff))
+                if norm_m and norm_m not in actual_modified:
+                    actual_modified.append(norm_m)
+            if isinstance(written_map, dict):
+                for m_written in written_map.keys():
+                    norm_w = CartridgeFileLockTable.normalize_path(str(m_written))
+                    if norm_w and norm_w not in actual_modified:
+                        actual_modified.append(norm_w)
+            if not actual_modified and not is_real_genai_client(ctx.client) and written_map is None:
+                actual_modified = list(modules)
+            for m in actual_modified:
                 if m not in touched:
                     touched.append(m)
+            untouched_requested = [
+                CartridgeFileLockTable.normalize_path(str(m))
+                for m in modules
+                if CartridgeFileLockTable.normalize_path(str(m))
+                and CartridgeFileLockTable.normalize_path(str(m)) not in actual_modified
+            ]
+            untouched_suffix = (
+                f" (UNTOUCHED requested target_modules: {untouched_requested})"
+                if untouched_requested
+                else ""
+            )
             summaries.append(
-                f"Implemented '{item.item_id}' in {modules}; engine verification passed. "
+                f"Implemented '{item.item_id}' — verified modified on disk: {actual_modified}{untouched_suffix}; engine verification passed. "
                 f"Available actions: {available_input_actions(ctx.cartridge_dir)}."
             )
     finally:
@@ -2370,101 +2451,169 @@ def run_qa_test_engineer_specialist(
             "planning_qa",
             f"Planning headless QA filmstrip scenario & state assertions for '{item.item_id}'",
         )
-        plan = plan_filmstrip(ctx, qa_item)
-        script = _serialize_input_segments(plan)
-        setup_calls = [
-            {
-                "at_tick": c.at_tick,
-                "target_node_or_property": c.target_node_or_property,
-                "method_name": c.method_name,
-                "args_json": c.args_json,
-            }
-            for c in (getattr(plan, "setup_calls", None) or [])
-        ]
+        from engine.studio.context_curator import is_real_genai_client
+        from engine.studio.proofs import capture_filmstrip, format_filmstrip_telemetry_progression
+
         strip_prefix = "level_filmstrip" if item.kind == "level_map" else "filmstrip"
         safe_id = _safe_id(item.item_id)
         out_strip_path = _item_dir(ctx, item) / f"{strip_prefix}_{safe_id}_rev{len(item.revisions)}.png"
-        resolved_scene = ""
         qa_touched_files: List[str] = []
-        raw_scene = (getattr(plan, "target_scene", "") or "").strip()
-        test_gd_code = (getattr(plan, "test_scene_gd_content", "") or "").strip()
-        if test_gd_code:
-            rel_scene_base = raw_scene
-            if rel_scene_base.startswith("res://"):
-                rel_scene_base = rel_scene_base[len("res://"):]
-            elif rel_scene_base.startswith("res:/"):
-                rel_scene_base = rel_scene_base[len("res:/"):]
-            rel_scene_base = rel_scene_base.lstrip("/")
-            if not rel_scene_base or rel_scene_base in ("main.tscn", "main.gd") or not rel_scene_base.startswith("tests/"):
-                rel_scene_base = f"tests/test_{safe_id}.tscn"
-            if rel_scene_base.endswith(".gd"):
-                rel_gd_path = rel_scene_base
-                rel_tscn_path = rel_scene_base[:-3] + ".tscn"
-            elif rel_scene_base.endswith(".tscn"):
-                rel_tscn_path = rel_scene_base
-                rel_gd_path = rel_scene_base[:-5] + ".gd"
-            else:
-                rel_tscn_path = f"{rel_scene_base}.tscn"
-                rel_gd_path = f"{rel_scene_base}.gd"
-            abs_gd_path = ctx.cartridge_dir / rel_gd_path
-            abs_tscn_path = ctx.cartridge_dir / rel_tscn_path
-            abs_gd_path.parent.mkdir(parents=True, exist_ok=True)
-            abs_gd_path.write_text(test_gd_code + "\n", encoding="utf-8")
-            tscn_content = (
-                '[gd_scene load_steps=2 format=3]\n\n'
-                f'[ext_resource type="Script" path="res://{rel_gd_path}" id="1_test"]\n\n'
-                '[node name="TestScene" type="Node2D"]\n'
-                'script = ExtResource("1_test")\n'
-            )
-            abs_tscn_path.write_text(tscn_content, encoding="utf-8")
-            raw_scene = f"res://{rel_tscn_path}"
-            qa_touched_files.extend([rel_gd_path, rel_tscn_path])
+
+        def _stage_and_run_plan(cur_plan: FilmstripPlan) -> Tuple[Path, str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+            defect_rep = (getattr(cur_plan, "production_defect_report", "") or "").strip()
+            if defect_rep:
+                record_turn_substep(
+                    "error",
+                    f"QA diagnosed production defect: {defect_rep[:220]}",
+                )
+                raise StudioAgentError(f"QA Diagnostic Production Defect Report: {defect_rep}")
+            cur_script = _serialize_input_segments(cur_plan)
+            cur_setup_calls = [
+                {
+                    "at_tick": c.at_tick,
+                    "target_node_or_property": c.target_node_or_property,
+                    "method_name": c.method_name,
+                    "args_json": c.args_json,
+                }
+                for c in (getattr(cur_plan, "setup_calls", None) or [])
+            ]
+            cur_resolved_scene = ""
+            raw_scene = (getattr(cur_plan, "target_scene", "") or "").strip()
+            test_gd_code = (getattr(cur_plan, "test_scene_gd_content", "") or "").strip()
+            if test_gd_code:
+                rel_scene_base = raw_scene
+                if rel_scene_base.startswith("res://"):
+                    rel_scene_base = rel_scene_base[len("res://"):]
+                elif rel_scene_base.startswith("res:/"):
+                    rel_scene_base = rel_scene_base[len("res:/"):]
+                rel_scene_base = rel_scene_base.lstrip("/")
+                if not rel_scene_base or rel_scene_base in ("main.tscn", "main.gd") or not rel_scene_base.startswith("tests/"):
+                    rel_scene_base = f"tests/test_{safe_id}.tscn"
+                if rel_scene_base.endswith(".gd"):
+                    rel_gd_path = rel_scene_base
+                    rel_tscn_path = rel_scene_base[:-3] + ".tscn"
+                elif rel_scene_base.endswith(".tscn"):
+                    rel_tscn_path = rel_scene_base
+                    rel_gd_path = rel_scene_base[:-5] + ".gd"
+                else:
+                    rel_tscn_path = f"{rel_scene_base}.tscn"
+                    rel_gd_path = f"{rel_scene_base}.gd"
+                abs_gd_path = ctx.cartridge_dir / rel_gd_path
+                abs_tscn_path = ctx.cartridge_dir / rel_tscn_path
+                abs_gd_path.parent.mkdir(parents=True, exist_ok=True)
+                abs_gd_path.write_text(test_gd_code + "\n", encoding="utf-8")
+                tscn_content = (
+                    '[gd_scene load_steps=2 format=3]\n\n'
+                    f'[ext_resource type="Script" path="res://{rel_gd_path}" id="1_test"]\n\n'
+                    '[node name="TestScene" type="Node2D"]\n'
+                    'script = ExtResource("1_test")\n'
+                )
+                abs_tscn_path.write_text(tscn_content, encoding="utf-8")
+                raw_scene = f"res://{rel_tscn_path}"
+                for tf in (rel_gd_path, rel_tscn_path):
+                    if tf not in qa_touched_files:
+                        qa_touched_files.append(tf)
+                record_turn_substep(
+                    "editing_file",
+                    f"Authoring isolated QA test scene res://{rel_tscn_path} + res://{rel_gd_path}",
+                    details={"files": [rel_gd_path, rel_tscn_path]},
+                )
+            if not raw_scene:
+                for cand_src in [brief or ""] + list(target_paths or []):
+                    m_tscn = re.search(r"(?:res://)?(tests/[A-Za-z0-9_./-]+\.tscn)", str(cand_src))
+                    if m_tscn:
+                        raw_scene = f"res://{m_tscn.group(1)}"
+                        break
+            if raw_scene:
+                rel_scene = raw_scene
+                if rel_scene.startswith("res://"):
+                    rel_scene = rel_scene[len("res://"):]
+                elif rel_scene.startswith("res:/"):
+                    rel_scene = rel_scene[len("res:/"):]
+                rel_scene = rel_scene.lstrip("/")
+                if (ctx.cartridge_dir / rel_scene).is_file():
+                    cur_resolved_scene = f"res://{rel_scene}"
             record_turn_substep(
-                "editing_file",
-                f"Authoring isolated QA test scene res://{rel_tscn_path} + res://{rel_gd_path}",
-                details={"files": [rel_gd_path, rel_tscn_path]},
+                "rendering_scene",
+                f"Rendering scene {cur_resolved_scene or 'res://main.tscn'} across ticks {list(cur_plan.capture_ticks)}",
+                details={"scene": cur_resolved_scene or "res://main.tscn", "ticks": list(cur_plan.capture_ticks)},
             )
-        if not raw_scene:
-            # Check if brief or target_paths explicitly specify a standalone test .tscn that exists on disk
-            for cand_src in [brief or ""] + list(target_paths or []):
-                m_tscn = re.search(r"(?:res://)?(tests/[A-Za-z0-9_./-]+\.tscn)", str(cand_src))
-                if m_tscn:
-                    raw_scene = f"res://{m_tscn.group(1)}"
-                    break
-        if raw_scene:
-            rel_scene = raw_scene
-            if rel_scene.startswith("res://"):
-                rel_scene = rel_scene[len("res://"):]
-            elif rel_scene.startswith("res:/"):
-                rel_scene = rel_scene[len("res:/"):]
-            rel_scene = rel_scene.lstrip("/")
-            if (ctx.cartridge_dir / rel_scene).is_file():
-                resolved_scene = f"res://{rel_scene}"
-        record_turn_substep(
-            "rendering_scene",
-            f"Rendering scene {resolved_scene or 'res://main.tscn'} across ticks {list(plan.capture_ticks)}",
-            details={"scene": resolved_scene or "res://main.tscn", "ticks": list(plan.capture_ticks)},
-        )
-        with commit_gate_cm:
-            if ctx.filmstrip_fn is None:
-                from engine.studio.proofs import capture_filmstrip
-                strip = capture_filmstrip(
-                    ctx.cartridge_dir,
-                    ticks=list(plan.capture_ticks),
-                    out_path=out_strip_path,
-                    input_script=script,
-                    setup_script=setup_calls or None,
-                    verify_counterfactual=(item.kind != "level_map" and bool(script)),
-                    state_assertions=list(getattr(plan, "state_assertions", None) or []),
-                    target_scene=resolved_scene,
+            is_diagnostic_probe = (
+                item.item_id == "council_diag"
+                or str(brief or "").lstrip().startswith(
+                    ("[SWE DIAGNOSTIC TEST SCENE REQUEST", "[COUNCIL DIAGNOSTIC TEST SCENE REQUEST")
                 )
+            )
+            with commit_gate_cm:
+                if ctx.filmstrip_fn is None:
+                    cur_strip = capture_filmstrip(
+                        ctx.cartridge_dir,
+                        ticks=list(cur_plan.capture_ticks),
+                        out_path=out_strip_path,
+                        input_script=cur_script,
+                        setup_script=cur_setup_calls or None,
+                        verify_counterfactual=(item.kind != "level_map" and bool(cur_script)),
+                        state_assertions=list(getattr(cur_plan, "state_assertions", None) or []),
+                        target_scene=cur_resolved_scene,
+                        verify_entrypoint_parity=(item.kind == "integration" and not is_diagnostic_probe),
+                    )
+                else:
+                    cur_strip = ctx.filmstrip_fn(
+                        ctx.cartridge_dir,
+                        ticks=list(cur_plan.capture_ticks),
+                        out_path=out_strip_path,
+                        input_script=cur_script,
+                    )
+            return cur_strip, cur_resolved_scene, cur_script, cur_setup_calls
+
+        plan = plan_filmstrip(ctx, qa_item)
+        try:
+            strip, resolved_scene, script, setup_calls = _stage_and_run_plan(plan)
+        except StudioAgentError as qa_pass1_err:
+            err_str = str(qa_pass1_err)
+            is_assertion_fail = out_strip_path.is_file() and (
+                "QA filmstrip state assertions failed" in err_str
+                or "Entrypoint Parity Gate failed" in err_str
+            )
+            is_test_script_error = "Godot headless smoke check failed in res://tests/" in err_str
+            if is_real_genai_client(ctx.client) and ctx.filmstrip_fn is None and (is_assertion_fail or is_test_script_error):
+                t_prog_p1 = format_filmstrip_telemetry_progression(out_strip_path) if out_strip_path.is_file() else ""
+                logger.info(
+                    "QA Pass 1 failed for '%s' (%s); running Pass 2 self-correction.",
+                    item.item_id,
+                    qa_pass1_err,
+                )
+                record_turn_substep(
+                    "planning_qa",
+                    f"Self-correcting QA test scene/script after Pass 1 failure ({err_str[:140]})",
+                )
+                p1_copy: Optional[Path] = None
+                if out_strip_path.is_file():
+                    p1_copy = out_strip_path.with_name(out_strip_path.stem + "_pass1.png")
+                    try:
+                        p1_copy.write_bytes(out_strip_path.read_bytes())
+                    except Exception:
+                        p1_copy = out_strip_path
+                plan = plan_filmstrip(
+                    ctx,
+                    qa_item,
+                    prior_capture_feedback=f"{qa_pass1_err}\n{t_prog_p1}".strip(),
+                    prior_strip_path=p1_copy,
+                )
+                try:
+                    strip, resolved_scene, script, setup_calls = _stage_and_run_plan(plan)
+                except StudioAgentError as qa_pass2_err:
+                    if "Godot headless smoke check failed in res://tests/" in str(qa_pass2_err):
+                        for tf in qa_touched_files:
+                            if tf.startswith("tests/"):
+                                (ctx.cartridge_dir / tf).unlink(missing_ok=True)
+                    raise
             else:
-                strip = ctx.filmstrip_fn(
-                    ctx.cartridge_dir,
-                    ticks=list(plan.capture_ticks),
-                    out_path=out_strip_path,
-                    input_script=script,
-                )
+                if is_test_script_error:
+                    for tf in qa_touched_files:
+                        if tf.startswith("tests/"):
+                            (ctx.cartridge_dir / tf).unlink(missing_ok=True)
+                raise
         record_turn_substep(
             "captured_proof",
             f"Captured QA filmstrip {Path(strip).name}",
@@ -2647,28 +2796,34 @@ class _LegacyFakeClientDirectPayload(Exception):
     directly instead of a TaskLeadDecision schema."""
 
 
-def _build_task_lead_multimodal_parts(ctx: WorkerContext, collected_proofs: List[str]) -> List[Any]:
-    """Builds multimodal image parts (reference 16:9 Concept Art Mockup + latest collected proof images)
-    so the Task Lead Strategist can see the target visual aesthetic from Turn 0 onward and visually inspect
+def _build_task_lead_multimodal_parts(
+    ctx: WorkerContext,
+    collected_proofs: List[str],
+    item_kind: str = "level_map",
+) -> List[Any]:
+    """Builds multimodal image parts (reference 16:9 Concept Art Mockup when visual/spatial + latest collected proof image)
+    so the Task Lead Strategist can see the target visual aesthetic when relevant and visually inspect
     captured proofs before submitting to the Council."""
+    from engine.studio.context_curator import ContextCuratorAgent
     from google.genai import types
 
     parts: List[Any] = []
-    bible_path = Path(ctx.cartridge_dir) / "game_bible.json"
-    if bible_path.is_file():
-        try:
-            bible_data = json.loads(bible_path.read_text(encoding="utf-8"))
-            mockups = bible_data.get("visual_mockups") if isinstance(bible_data, dict) else None
-            if isinstance(mockups, list) and mockups:
-                rel = str(mockups[0].get("image_path") or "").strip()
-                if rel:
-                    mpath = Path(rel) if Path(rel).is_absolute() else (Path(ctx.cartridge_dir) / rel)
-                    if mpath.is_file():
-                        mime = "image/jpeg" if mpath.suffix.lower() in (".jpg", ".jpeg") else "image/png"
-                        parts.append(f"REFERENCE 16:9 CONCEPT ART MOCKUP ({mpath.name}):")
-                        parts.append(types.Part.from_bytes(data=mpath.read_bytes(), mime_type=mime))
-        except Exception:
-            pass
+    if ContextCuratorAgent._should_attach_concept_mockup("task_lead", item_kind):
+        bible_path = Path(ctx.cartridge_dir) / "game_bible.json"
+        if bible_path.is_file():
+            try:
+                bible_data = json.loads(bible_path.read_text(encoding="utf-8"))
+                mockups = bible_data.get("visual_mockups") if isinstance(bible_data, dict) else None
+                if isinstance(mockups, list) and mockups:
+                    rel = str(mockups[0].get("image_path") or "").strip()
+                    if rel:
+                        mpath = Path(rel) if Path(rel).is_absolute() else (Path(ctx.cartridge_dir) / rel)
+                        if mpath.is_file():
+                            mime = "image/jpeg" if mpath.suffix.lower() in (".jpg", ".jpeg") else "image/png"
+                            parts.append(f"REFERENCE 16:9 CONCEPT ART MOCKUP ({mpath.name}):")
+                            parts.append(types.Part.from_bytes(data=mpath.read_bytes(), mime_type=mime))
+            except Exception:
+                pass
 
     valid_proofs = [
         Path(p_str)
@@ -2845,6 +3000,28 @@ def plan_task_lead_turn(
         else:
             prior_revision_block += f"\nPREVIOUS WORKER EXECUTION ERROR TO FIX:\n{item.failure[-800:]}\n"
 
+    verified_modified_prod: List[str] = []
+    for t_rep in turn_history:
+        if getattr(t_rep, "specialist_agent", "") == "qa_test_engineer":
+            continue
+        for tf in (getattr(t_rep, "touched_files", None) or []):
+            norm_tf = CartridgeFileLockTable.normalize_path(str(tf))
+            if norm_tf and not norm_tf.startswith("tests/") and norm_tf not in verified_modified_prod:
+                verified_modified_prod.append(norm_tf)
+    untouched_target_prod: List[str] = []
+    for tm in (getattr(item, "target_modules", None) or []):
+        norm_tm = CartridgeFileLockTable.normalize_path(str(tm))
+        if (
+            norm_tm
+            and not norm_tm.startswith("tests/")
+            and norm_tm not in verified_modified_prod
+            and norm_tm not in untouched_target_prod
+        ):
+            untouched_target_prod.append(norm_tm)
+    verified_diff_block = (
+        f"VERIFIED PRODUCTION DISK DIFF SO FAR: modified={verified_modified_prod}, "
+        f"untouched_target_modules={untouched_target_prod}\n"
+    )
     turns_block = ""
     if turn_history:
         t_lines = [
@@ -2886,11 +3063,18 @@ def plan_task_lead_turn(
         for p in (item.revisions[-1].proof_paths or []):
             if p and Path(p).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp") and p not in prior_rev_proofs:
                 prior_rev_proofs.append(p)
-    lead_image_paths = [
+    turn_proof_imgs: List[str] = []
+    for t_rep in turn_history:
+        for p_img in (getattr(t_rep, "proof_images", None) or []):
+            if p_img and p_img not in turn_proof_imgs:
+                turn_proof_imgs.append(p_img)
+    current_turn_proofs = [
         p
-        for p in dict.fromkeys(prior_rev_proofs + list(collected_proofs))
+        for p in dict.fromkeys(list(collected_proofs) + turn_proof_imgs)
         if p and Path(p).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
     ]
+    raw_lead_images = current_turn_proofs[-1:] if current_turn_proofs else prior_rev_proofs[-1:]
+    lead_image_paths = list(raw_lead_images)
     active_curator: Optional[ContextCuratorAgent] = None
     already_included_cids: List[str] = []
     if is_real_genai_client(ctx.client):
@@ -2914,21 +3098,28 @@ def plan_task_lead_turn(
         )
         already_included_cids = [ch.chunk_id for ch in (pack.retrieved_chunks or [])]
         curated_lead_block = pack.prompt_block
-        multimodal_parts = list(pack.multimodal_parts) or _build_task_lead_multimodal_parts(ctx, lead_image_paths)
+        multimodal_parts = list(pack.multimodal_parts) or _build_task_lead_multimodal_parts(
+            ctx, lead_image_paths, item_kind=item.kind
+        )
         if collected_proofs and pack.multimodal_parts:
-            existing_labels = {p for p in multimodal_parts if isinstance(p, str)}
-            extra_proof_parts = _build_task_lead_multimodal_parts(ctx, collected_proofs)
+            existing_labels = [p for p in multimodal_parts if isinstance(p, str)]
+            extra_proof_parts = _build_task_lead_multimodal_parts(
+                ctx, list(collected_proofs)[-1:], item_kind=item.kind
+            )
             for idx_p in range(0, len(extra_proof_parts), 2):
                 lbl = extra_proof_parts[idx_p]
                 if (
                     isinstance(lbl, str)
                     and lbl.startswith("CAPTURED PROOF IMAGE")
-                    and lbl not in existing_labels
                     and idx_p + 1 < len(extra_proof_parts)
                 ):
-                    multimodal_parts.append(lbl)
-                    multimodal_parts.append(extra_proof_parts[idx_p + 1])
-                    existing_labels.add(lbl)
+                    m_fname = re.search(r"\(([^)—\]]+)", lbl)
+                    fname = m_fname.group(1).strip() if m_fname else ""
+                    already_attached = any((fname and fname in ex_lbl) or ex_lbl == lbl for ex_lbl in existing_labels)
+                    if not already_attached:
+                        multimodal_parts.append(lbl)
+                        multimodal_parts.append(extra_proof_parts[idx_p + 1])
+                        existing_labels.append(lbl)
 
     issues: List[str] = []
     resolved_inquiries: List[SelfInquiryQAPair] = (
@@ -2994,7 +3185,11 @@ def plan_task_lead_turn(
             f"   - UNSOLVED t=0 BASELINE (`test_unsolved_baseline_t0`) & QA TEST SCENE OWNERSHIP (`res://tests/test_<item_id>.tscn`) — NO DEBUG OVERLAYS IN PRODUCTION GAME (`res://main.tscn`):\n"
             f"     * `_ready()` at `t=0` in `main.gd` (`res://main.tscn`) is what the live human player boots into! `_ready()` MUST initialize the world in its unbuilt/unsolved starting state as defined by the Game Bible, and production game scenes (`main.gd`, `scenes.gd`, `ui_hud.gd`, etc.) must NEVER contain `func test_*()` staging helpers or debug overlays (`[DEBUG]`, telemetry readouts, wireframe boxes).\n"
             f"     * Conversely, in QA test scenes (`res://tests/test_<item_id>.tscn`), rich diagnostic overlays ARE essential! When delegating to `'qa_test_engineer'`, instruct QA to author `res://tests/test_<item_id>.tscn` (`test_scene_gd_content`), strategize what test-only diagnostic overlays (e.g., force/velocity/heading vectors, bounding boxes, anchor markers, or telemetry readouts drawn by the test scene) and `get_state_snapshot()` metrics (`player_pos`, angular/linear rates, etc.) are needed to prove both visual quality and human-scale responsiveness over time, and write a clear `council_test_scene_summary` for the Council!\n"
-            f"   - REAL INTERACTIVE VERBS & CAMERA NAVIGATION: Every core player verb in `core_loop.player_verbs` and the active slice's `scope_boundaries` (including mouse click/drag placement or connection, interactive component tuning/socketing, hazard clearing, and `Camera2D` panning/scrolling when `world_bounds` exceeds the 1280x720 viewport) MUST be wired to real `_unhandled_input` / `_input` / UI handlers and exercised via `input_segments` (`mouse_click_pos` or actions) in QA filmstrips.\n"
+            f"   - REAL INTERACTIVE VERBS & CAMERA NAVIGATION: Every core player verb in `core_loop.player_verbs` and the active slice's `scope_boundaries` (including mouse click/drag placement or connection, interactive component tuning/socketing, hazard clearing, and `Camera2D` panning/scrolling when `world_bounds` exceeds the 1280x720 viewport) MUST be wired to real `_unhandled_input` / `_input` / UI handlers and exercised via `input_segments` (`mouse_world_pos`, `mouse_click_pos`, or actions) in QA filmstrips.\n"
+            f"   - DIAGNOSING FAILED QA PLAYTESTS vs. BROKEN MECHANICS (ZERO SHORTCUTS — NEVER PRE-SOLVE THE GAME TO PASS QA):\n"
+            f"     * First check `CARTRIDGE SYMBOLS & FILES` below for any `⚠️ BROKEN / MISSING SCRIPT OR SCENE REFERENCES ON DISK`. If a builder/spawner script calls `load('res://...')` on a `.gd` file that does not exist on disk (or wraps it in `ResourceLoader.exists(...) else null`), placement/spawning silently no-ops! Delegate to `'swe_engineer'` to create the missing script or replace the broken reference with real node instantiation.\n"
+            f"     * REJECT GOALPOST-SHIFT & HITBOX-INFLATION SHORTCUTS: When a multi-step gameplay loop fails QA state assertions, NEVER work around the failure by moving/pre-spawning a target/receiver into the default un-deflected trajectory in `main.gd._ready()` or by inflating catch/collision radii beyond visual sprite bounds (24–48px)—even if a prior revision note or feedback comment suggested moving the goal! The engine's Counterfactual QA Check runs with `input_script = []` (zero player input) and automatically rejects any build where post-baseline progress assertions pass without player construction.\n"
+            f"     * DRIVE THE COMPLETE CAUSAL CHAIN: Instead of taking shortcuts: (a) instruct `'swe_engineer'` to expose step-by-step causal telemetry in `get_state_snapshot()` (selected tool slot, placement validity, placed structure counts, intermediate interaction/ricochet counts, and delivery/objective counts) and ensure placed structures genuinely route/process items with honest sprite-sized hitboxes, and (b) instruct `'qa_test_engineer'` in your `brief` with the exact multi-step causal input recipe (which `KEY_*` selects the required tool slot, which exact valid 2D world coordinates `mouse_world_pos = [wx, wy]` lie on buildable terrain along the path, what rotation/tuning keys are needed, and step-by-step `state_assertions` for every link in the chain).\n"
             f"   - Every input key/action bound in the codebase (`Available actions`) MUST have a discoverable in-world or HUD affordance—never bind hidden/secret keys that the player cannot know exist, and NEVER bind fake tutorial-skip keys (such as `KEY_TAB` or `set_onboarding_step`) that advance onboarding text without the player performing the actual in-world mechanic.\n"
             f"   - Never rig an input handler to bypass physics, force a win state, or teleport world state when a timing window is missed; instead, instruct `'qa_test_engineer'` to use reactive state triggers (`when_snapshot_key`, `when_operator`, `when_value`) to test timing-sensitive mechanics honestly.\n"
             f"   - Prevent duplicate rendering across modules: ensure a single authoritative module owns each world structure or visual effect so `main.gd`, `scenes.gd`, `entities.gd`, and `ui_hud.gd` do not draw overlapping copies of the same geometry or indicator.\n"
@@ -3003,6 +3198,7 @@ def plan_task_lead_turn(
             f"   - In `plate_*.png` and `anim_sheet_*.png` / `anim_rig_*.png`, the dark/light square checkerboard grids, cyan bounding-box borders, and horizontal yellow/gold baseline ruler lines at the bottom of frames are external QA test-harness overlays drawn behind/around the transparent PNG—NEVER mistake those external QA overlays for cross-hatch grids or yellow line artifacts inside the sprite PNG!\n"
             f"   - NEVER SUBMIT PLACEHOLDER STICKMEN, CLIPPED SPRITES, DUPLICATE OVERLAPPING GEOMETRY, OR SHRUNK VIEWPORT BACKGROUNDS: If the proof image or `QA Post-Capture Visual Audit` reports `qa_passed=False`, unaddressed Council defects, clipped/invisible sprites (`hframes > 1` on a single-frame texture), or a shrunk background that leaves dark void around the level, do NOT choose `submit_to_council`! Fix the root cause with `'visual_artist'` / `'swe_engineer'` and re-run `'qa_test_engineer'`.\n"
             f"   - Verify that active gameplay entities and world geometry remain visibly framed inside the 16:9 viewport across ALL filmstrip frames and do NOT disappear off-screen or get hidden behind an opaque full-screen background/border frame drawn at a higher `z_index` or foreground `CanvasLayer`.\n"
+            f"   - GROUND-TRUTH DISK DIFF AUDIT (`VERIFIED PRODUCTION DISK DIFF SO FAR`): Before choosing `submit_to_council`, check `untouched_target_modules` below! Never assume or claim in `submission_summary` that an untouched module (such as an input handler, HUD, or `main.gd`) was wired if `swe_engineer` only created an isolated entity script and left the consumer module untouched on disk. If an integration/consumer target module still needs wiring so the live player can actually trigger the feature in `res://main.tscn`, delegate to `'swe_engineer'` first!\n"
             f"5. Choose `action = 'delegate'` to send an open-ended natural-language `brief` to one of {specialists}, `action = 'spawn_tasks'` to create newly discovered tasks on the board, OR `action = 'submit_to_council'` ONLY after all required assets/code are built AND at least one proof image in `COLLECTED PROOF IMAGES SO FAR` visually proves the requirement.\n"
             f"   - CONCISE DELIBERATION & BRIEF (NO RAW CODE IN BRIEF): Keep `deliberation` (<= 120 words) and `brief` (<= 180 words) focused and concise. NEVER write raw GDScript code blocks or paste whole functions inside `brief`—`swe_engineer` already reads the staging files directly! State the target file paths, class/function names, and behavioral/visual acceptance criteria.\n"
             f"   - CRITICAL SCHEMA FIELD ORDER WARNING: In `TaskLeadDecision`, `specialist_agent` and `brief` appear BEFORE `action` in the JSON schema! Decide your turn action inside `deliberation` and `current_strategy` first: whenever you are delegating to a specialist (`action = 'delegate'`), you MUST populate `specialist_agent` (one of {specialists}) and a non-empty `brief` BEFORE emitting `action = 'delegate'`! Never leave `specialist_agent` or `brief` empty when delegating.\n"
@@ -3013,6 +3209,7 @@ def plan_task_lead_turn(
             f"{prior_revision_block}"
             f"{board_snapshot_block}"
             f"CARTRIDGE SYMBOLS & FILES:\n{qa_context or '(empty)'}{cat_block}"
+            f"{verified_diff_block}"
             f"COLLECTED PROOF IMAGES SO FAR: {collected_proofs}\n"
             f"{turns_block}"
             f"{retry}"
@@ -3570,16 +3767,29 @@ def run_task_lead(
                 raise
             except Exception as spec_exc:
                 qa_proofs: List[str] = []
+                qa_telemetry_str = ""
                 if decision.specialist_agent == "qa_test_engineer":
                     strip_prefix = "level_filmstrip" if item.kind == "level_map" else "filmstrip"
                     cand_strip = _item_dir(ctx, item) / f"{strip_prefix}_{_safe_id(item.item_id)}_rev{len(item.revisions)}.png"
                     if cand_strip.is_file():
                         qa_proofs.append(str(cand_strip))
+                        try:
+                            from engine.studio.proofs import format_filmstrip_telemetry_progression
+                            qa_telemetry_str = format_filmstrip_telemetry_progression(cand_strip)
+                        except Exception:
+                            qa_telemetry_str = ""
+                is_hard_qa_violation = (
+                    "Counterfactual QA check failed" in str(spec_exc)
+                    or "Entrypoint Parity Gate failed" in str(spec_exc)
+                    or "QA Diagnostic Production Defect Report" in str(spec_exc)
+                    or "runtime GDScript error" in str(spec_exc)
+                )
                 can_recover_turn = (
                     turn_idx + 1 < effective_max_turns
                     and decision.specialist_agent in ("qa_test_engineer", "swe_engineer")
                 ) or (
                     decision.specialist_agent == "qa_test_engineer"
+                    and not is_hard_qa_violation
                     and bool(qa_proofs or collected_proofs)
                 )
                 if can_recover_turn:
@@ -3627,9 +3837,11 @@ def run_task_lead(
                         specialist_agent=decision.specialist_agent,
                         brief=decision.brief,
                         summary=(
-                            f"ERROR from {decision.specialist_agent}: {spec_exc}\n"
-                            f"ACTION REQUIRED FOR TASK LEAD: Diagnose this failure and delegate a fix to 'swe_engineer' "
-                            f"(if GDScript/scene wiring or performance is broken) or 'qa_test_engineer' (if the QA test plan/setup_calls need adjustment)."
+                            f"ERROR from {decision.specialist_agent}: {spec_exc}"
+                            + (f"\n{qa_telemetry_str}" if qa_telemetry_str else "")
+                            + "\nACTION REQUIRED FOR TASK LEAD: Diagnose this failure using the error, captured telemetry, and `CARTRIDGE SYMBOLS & FILES` "
+                            "and delegate a fix to 'swe_engineer' (if GDScript/scene wiring, missing `load('res://...')` script, or physics is broken—NEVER pre-place target structures in `_ready()`) "
+                            "or 'qa_test_engineer' (if the QA play script/mouse_world_pos/input_segments need adjustment)."
                         ),
                         touched_files=list(partial_diffs.keys()),
                         proof_images=qa_proofs,
@@ -3659,9 +3871,14 @@ def run_task_lead(
                     report.timestamp_utc = datetime.now(timezone.utc).isoformat()
             _ACTIVE_TURN_CTX.state = None
             turn_history.append(report)
-            for p in report.proof_images:
-                if p not in collected_proofs and Path(p).is_file():
-                    collected_proofs.append(p)
+            if (
+                "Counterfactual QA check failed" not in str(report.summary)
+                and "Entrypoint Parity Gate failed" not in str(report.summary)
+                and "QA Diagnostic Production Defect Report" not in str(report.summary)
+            ):
+                for p in report.proof_images:
+                    if p not in collected_proofs and Path(p).is_file():
+                        collected_proofs.append(p)
             _persist_trace(status="in_progress", pending=None, include_active_turn=False)
             if ctx.event_callback is not None:
                 try:
@@ -3682,6 +3899,17 @@ def run_task_lead(
                     pass
             turn_idx += 1
         else:
+            qa_turns_hist = [t for t in turn_history if getattr(t, "specialist_agent", "") == "qa_test_engineer"]
+            if qa_turns_hist and (
+                "Counterfactual QA check failed" in str(getattr(qa_turns_hist[-1], "summary", ""))
+                or "Entrypoint Parity Gate failed" in str(getattr(qa_turns_hist[-1], "summary", ""))
+                or "QA Diagnostic Production Defect Report" in str(getattr(qa_turns_hist[-1], "summary", ""))
+            ):
+                _persist_trace(status="failed", pending=None)
+                raise StudioAgentError(
+                    f"Task Lead for '{item.item_id}' exhausted {effective_max_turns} turns with failing QA gate: "
+                    f"{str(getattr(qa_turns_hist[-1], 'summary', ''))[-600:]}"
+                )
             if not collected_proofs:
                 _persist_trace(status="failed", pending=None)
                 raise StudioAgentError(
@@ -3716,8 +3944,29 @@ def run_task_lead(
                 ):
                     selected_proofs.insert(0, prev_p)
 
+    final_mod_prod: List[str] = []
+    for t_rep in turn_history:
+        if getattr(t_rep, "specialist_agent", "") == "qa_test_engineer":
+            continue
+        for tf in (getattr(t_rep, "touched_files", None) or []):
+            norm_tf = CartridgeFileLockTable.normalize_path(str(tf))
+            if norm_tf and not norm_tf.startswith("tests/") and norm_tf not in final_mod_prod:
+                final_mod_prod.append(norm_tf)
+    final_untouched_prod: List[str] = []
+    for tm in (getattr(item, "target_modules", None) or []):
+        norm_tm = CartridgeFileLockTable.normalize_path(str(tm))
+        if (
+            norm_tm
+            and not norm_tm.startswith("tests/")
+            and norm_tm not in final_mod_prod
+            and norm_tm not in final_untouched_prod
+        ):
+            final_untouched_prod.append(norm_tm)
+    verified_diff_tag = (
+        f"[VERIFIED DISK DIFF: modified={final_mod_prod}, untouched_target_modules={final_untouched_prod}]"
+    )
     turn_summaries = " | ".join(f"[Turn {t.turn_index} {t.specialist_agent}] {t.summary}" for t in turn_history)
-    notes = f"Strategy: {last_strategy}"
+    notes = f"{verified_diff_tag} | Strategy: {last_strategy}"
     if submission_summary and submission_summary != last_strategy:
         notes += f" | Summary: {submission_summary}"
     if turn_summaries:

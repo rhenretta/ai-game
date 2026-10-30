@@ -596,6 +596,11 @@ class StudioDaemon:
 
                         if self.config.creative_prompt:
                             self.orchestrator._creative_prompt = self.config.creative_prompt
+                            if self.config.resume_current and hasattr(self.orchestrator, "enqueue_user_steering"):
+                                try:
+                                    self.orchestrator.enqueue_user_steering(self.config.creative_prompt)
+                                except Exception:
+                                    pass
                         plan = None
                         if self.config.resume_current and (staging_dir / "world_spec.json").is_file():
                             try:
@@ -686,6 +691,10 @@ class StudioDaemon:
                     return True
                 else:
                     rej = getattr(report, "rejection_trace", None) if report else "No build report"
+                    from engine.studio.models import is_candidate_build_aborted
+                    if is_candidate_build_aborted(staging_dir) or "Cancelled by user" in str(rej):
+                        logger.info("Genesis build in %s cancelled by new game request.", staging_dir.name)
+                        return False
                     logger.error("Genesis build failed quality gates: %s", rej)
                     self.event_bus.publish_threadsafe({
                         "deliberation": f"Genesis build rejected by quality gates: {rej}",
@@ -696,6 +705,10 @@ class StudioDaemon:
                     })
                     return False
             except Exception as exc:
+                from engine.studio.models import is_candidate_build_aborted
+                if is_candidate_build_aborted(staging_dir) or "cancelled" in str(exc).lower() or "preempted" in str(exc).lower():
+                    logger.info("Previous Genesis build in %s preempted cleanly: %s", staging_dir.name, exc)
+                    return False
                 logger.critical("Error during genesis cycle: %s", exc, exc_info=True)
                 self.event_bus.publish_threadsafe({
                     "deliberation": f"Genesis cycle encountered error: {exc}",

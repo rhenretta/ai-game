@@ -413,6 +413,9 @@ class DialogueBarkSpec(BaseEpistemicModel):
     duration: float = Field(default=4.5)
 
 
+NarrativeCharacterSpec = CharacterSheet
+
+
 class NarrativeBible(BaseEpistemicModel):
     deliberation: str = Field(..., description="Rationale-first deliberation on narrative cohesion and character arcs.")
     bible_id: str = Field(default_factory=lambda: f"bible_{uuid.uuid4().hex[:8]}")
@@ -2941,7 +2944,11 @@ class InputSegment(BaseEpistemicModel):
     actions: List[str] = Field(default_factory=list, description="Input action names or KEY_* names, chosen only from the game's available actions.")
     mouse_click_pos: Optional[Tuple[float, float]] = Field(
         default=None,
-        description="Optional (x, y) viewport coordinate to click at from_tick and release at to_tick.",
+        description="Optional (x, y) screen/viewport coordinate to click at from_tick and release at to_tick (use for HUD/CanvasLayer buttons).",
+    )
+    mouse_world_pos: Optional[Tuple[float, float]] = Field(
+        default=None,
+        description="Optional 2D world-space coordinate (wx, wy) to move/click the mouse at during this segment; automatically transformed through the active Camera2D canvas transform at runtime. Preferred over `mouse_click_pos` whenever clicking in-world entities, terrain cells, or placement targets.",
     )
     when_snapshot_key: str = Field(
         default="",
@@ -2965,9 +2972,19 @@ class FilmstripPlan(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     How the QA Engineer builds a test scene (`test_scene_gd_content`), renders diagnostic overlays/telemetry
     (`overlays_and_telemetry_strategy`), executes scripted inputs (`input_segments`, `setup_calls`, `state_assertions`),
-    and summarizes the test scene for the Council (`council_test_scene_summary`).
+    summarizes the test scene for the Council (`council_test_scene_summary`), or reports an authentic defect in
+    production code (`production_defect_report`) when the game itself is broken or deadlocked.
     """
-    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this test scene architecture, diagnostic overlay/telemetry strategy, scripted inputs, and capture ticks best prove the item meets its spec and the council's proof request.")
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this test scene architecture, diagnostic overlay/telemetry strategy, scripted inputs, and capture ticks best prove the item meets its spec (or why the production code itself is broken/deadlocked).")
+    production_defect_report: str = Field(
+        default="",
+        description=(
+            "Leave empty ('') when executing a valid QA proof capture. Populate ONLY when inspecting the cartridge code "
+            "or Pass 1 runtime telemetry proves that the production game code itself is broken, unwired, or deadlocked "
+            "under honest player inputs—describing the exact root cause and tick/state evidence so TaskLead delegates "
+            "a production fix to `swe_engineer` instead of faking state mutations inside `test_scene_gd_content`."
+        ),
+    )
     overlays_and_telemetry_strategy: str = Field(
         default="",
         description=(
@@ -3269,6 +3286,225 @@ class SliceAssemblyDecision(BaseEpistemicModel):
     is_slice_assembled: bool = Field(
         ...,
         description="True ONLY when all built systems for the active slice are assembled in the main entrypoint AND the slice playthrough proves the game is playable, responsive at human scale, and fun without needing further tasks (strictly last).",
+    )
+
+
+class BlindPlaytestCouncilTurn(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    One Council specialist's conversational turn deliberating on the Blind AI Playtester's end-of-slice
+    Experience Report, auto-delivered player wishes, discovered controls rulebook, and session screenshots.
+    """
+    deliberation: str = Field(
+        ...,
+        description=(
+            "MANDATORY FIRST PROPERTY: Specialist reasoning analyzing the Blind Playtester's unguided session report, "
+            "sparse pillar impressions, player wishes, and visual screenshots from your discipline's perspective."
+        ),
+    )
+    domain_reaction_to_blind_player: str = Field(
+        default="",
+        description="Your discipline-specific diagnosis of what resonated with an unprimed player versus what caused confusion, friction, silence, or lack of fun.",
+    )
+    spoken_dialogue: str = Field(
+        ...,
+        description="Natural first-person conversational contribution to the Writers' Room discussing the Blind Playtester's experience and wishes with fellow Council members.",
+    )
+    addressed_to: List[str] = Field(
+        default_factory=list,
+        description="Fellow Council specialist role(s) you are addressing.",
+    )
+    priority_fixes_or_refinements: List[str] = Field(
+        default_factory=list,
+        description="Concrete, current-slice fixes or UX/gameplay/visual/audio refinements needed before approving this slice (empty if remaining ideas belong in future slices).",
+    )
+    recommends_slice_approval: bool = Field(
+        ...,
+        description="True if this slice delivers an intuitive, cohesive, playable experience ready for approval (carrying broader expansion wishes forward); False if targeted current-slice iteration is needed first (strictly last).",
+    )
+
+
+class BlindPlaytestCouncilVerdict(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Council Creative Director synthesis of the Blind Playtester's Experience Report, wishes, and specialist
+    roundtable—deciding whether to iterate on the current slice (`iterate_current_slice`) or approve it (`approve_slice`).
+    """
+    deliberation: str = Field(
+        ...,
+        description=(
+            "MANDATORY FIRST PROPERTY: Holistic synthesis weighing the Blind Playtester's 6-pillar Experience Report, "
+            "auto-delivered player wishes, fun rating, screenshots, and specialist roundtable perspectives against the active slice scope."
+        ),
+    )
+    player_experience_synthesis: str = Field(
+        ...,
+        description="Concise synthesis of what the Blind Playtester experienced, what worked, and which wishes/pain points require immediate current-slice iteration versus next-slice expansion.",
+    )
+    spoken_dialogue: str = Field(
+        ...,
+        description="Natural first-person Creative Director synthesis in the Writers' Room announcing the Council's decision and action plan.",
+    )
+    next_slice_carryover_notes: List[str] = Field(
+        default_factory=list,
+        description="Non-blocking player wishes, feature desires, and experience takeaways to carry directly into the next slice's reflection & strategy planning.",
+    )
+    backlog_additions: List[WorkItemProposal] = Field(
+        default_factory=list,
+        description="Targeted current-slice WorkItemProposal tasks to fix onboarding/control confusion, UX legibility, gameplay friction, missing audio/visual feedback, or progression blockers (empty when verdict='approve_slice').",
+    )
+    verdict: Literal["approve_slice", "iterate_current_slice"] = Field(
+        ...,
+        description="Set 'iterate_current_slice' when concrete current-slice UX/gameplay/visual/audio fixes are needed in backlog_additions; set 'approve_slice' when the slice is intuitive, playable, and ready to close (strictly last).",
+    )
+
+
+class SliceStateReflectionTurn(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    One Council specialist's first-principles reflection on the current empirical state of the game
+    at the end of a slice, diagnosing what is missing in cohesion, intuitiveness ('knowing how to play'),
+    depth/fun for the target player, sense of accomplishment, and short-term / long-term goals before
+    strategizing the next slice.
+    """
+    deliberation: str = Field(
+        ...,
+        description=(
+            "MANDATORY FIRST PROPERTY: First-principles reflection as a game maker examining the rendered filmstrip, "
+            "scene tree, and codebase of the current slice through the eyes of the target player (SteamPlayerDNA)."
+        ),
+    )
+    honest_current_state_critique: str = Field(
+        ...,
+        description=(
+            "Brutally honest assessment of what a human player actually sees and experiences booting res://main.tscn right now "
+            "(calling out any disconnected widget/slider dashboards, center-occluding panels, leaked debug harnesses, static/unreactive world visuals, or un-cohesive systems)."
+        ),
+    )
+    how_to_play_and_intuitiveness_gaps: str = Field(
+        ...,
+        description=(
+            "Diagnosis of whether a brand-new player sitting down right now with zero outside explanation knows how to play: "
+            "what their controls do, what is interactive, and how their actions causally affect the game world."
+        ),
+    )
+    depth_and_fun_gaps: str = Field(
+        ...,
+        description=(
+            "Diagnosis of whether the current interaction loop is genuinely entertaining, interesting, and mechanically deep for this specific player's DNA—identifying "
+            "where meaningful decisions, tension, resource/timing trade-offs, or dynamic world pushback are missing."
+        ),
+    )
+    accomplishment_and_goals_gaps: str = Field(
+        ...,
+        description=(
+            "Diagnosis of what short-term goals (immediate 15-60s actionable targets), long-term goals (overarching session progression milestones), "
+            "and visceral sense of accomplishment/reward are missing or unfelt in the current build."
+        ),
+    )
+    strategy_for_next_slice: str = Field(
+        ...,
+        description=(
+            "Concrete strategy from your specialist discipline for how the next slice must evolve the game to make it cohesive, "
+            "intuitive to play, mechanically deep, and driven by rewarding short-term and long-term goals."
+        ),
+    )
+    spoken_dialogue: str = Field(
+        ...,
+        description="Natural first-person conversational contribution to the Writers' Room Slice Reflection Roundtable.",
+    )
+    addressed_to: List[str] = Field(
+        default_factory=list,
+        description="Fellow Council specialist role(s) you are addressing or challenging.",
+    )
+    current_slice_quality_score: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Honest quality and player-experience score of the current slice in [0.0, 1.0] (strictly last per Rule 4).",
+    )
+
+
+class NextSliceStrategyPlan(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Master strategy synthesized by the CreativeDirector after the Council's Slice Reflection Roundtable,
+    defining how the next slice transforms the game's cohesion, onboarding/intuitiveness, depth/fun,
+    short-term & long-term goals, and sense of accomplishment for the target player.
+    """
+    deliberation: str = Field(
+        ...,
+        description=(
+            "MANDATORY FIRST PROPERTY: Holistic synthesis of the Council's empirical reflection on the current slice "
+            "and the strategic blueprint for making the next slice a cohesive, intuitive, deep, and rewarding game for the target player."
+        ),
+    )
+    spoken_dialogue: str = Field(
+        ...,
+        description="Natural first-person address to the Writers' Room summarizing the reflection findings and laying out the master strategy for the next slice.",
+    )
+    current_slice_honest_diagnosis: str = Field(
+        ...,
+        description="Consolidated diagnosis of the current slice's shortcomings in cohesion, knowing how to play, depth/fun, accomplishment, and short/long-term goals.",
+    )
+    cohesion_and_world_integration_strategy: str = Field(
+        ...,
+        description=(
+            "Strategy for unifying the viewport into a living, reactive game world in the next slice "
+            "(eliminating any center-occluding UI boxes or debug harnesses and visually connecting player actions to physical world reactions)."
+        ),
+    )
+    how_to_play_and_onboarding_strategy: str = Field(
+        ...,
+        description=(
+            "Strategy for ensuring a player booting the game immediately and intuitively knows how to play, what controls to use, "
+            "why they are acting, and how the world responds."
+        ),
+    )
+    depth_and_interesting_decisions_strategy: str = Field(
+        ...,
+        description=(
+            "Strategy for introducing genuine mechanical depth, dynamic world pushback/hazards, and meaningful trade-offs/decisions "
+            "tailored to the target player's SteamPlayerDNA."
+        ),
+    )
+    short_term_and_long_term_goals_strategy: str = Field(
+        ...,
+        description=(
+            "Concrete short-term goals (immediate 15-60s objectives) and long-term goals (multi-stage session progression arc) "
+            "that will be visibly tracked and playable on screen in the next slice."
+        ),
+    )
+    sense_of_accomplishment_and_reward_strategy: str = Field(
+        ...,
+        description=(
+            "Strategy for how completing short-term and long-term goals delivers an unmistakable sense of accomplishment "
+            "(visceral visual/audio/world transformation, milestone ceremonies, and meaningful progression rewards/unlocks)."
+        ),
+    )
+    next_slice_spec: GameSliceSpec = Field(
+        ...,
+        description="The newly strategized GameSliceSpec for the next slice (with status='active').",
+    )
+    updated_core_loop: Optional[CoreLoopSpec] = Field(
+        default=None,
+        description="Optional evolved CoreLoopSpec deepening moment-to-moment, minute-to-minute, and session loops, agency, and reward cadence.",
+    )
+    updated_onboarding_plan: Optional[OnboardingPlan] = Field(
+        default=None,
+        description="Optional evolved OnboardingPlan ensuring intuitive in-game 'how to play' guidance and causal feedback.",
+    )
+    updated_goal_hierarchy: Optional[GoalHierarchy] = Field(
+        default=None,
+        description="Optional evolved GoalHierarchy defining explicit immediate, short-term, and long-term goals, progress feedback, and rewards.",
+    )
+    updated_engagement_plan: Optional[EngagementPlan] = Field(
+        default=None,
+        description="Optional evolved EngagementPlan deepening variety injectors, pacing curve, and mastery.",
+    )
+    updated_diegetic_ui_philosophy: Optional[str] = Field(
+        default=None,
+        description="Optional updated UI/HUD philosophy ensuring non-occluding perimeter instruments and clear goal/control legibility.",
+    )
+    backlog_additions: List[WorkItemProposal] = Field(
+        default_factory=list,
+        description="Initial high-level WorkItemProposal tasks on the Production Board to execute the next-slice strategy.",
     )
 
 
@@ -3984,6 +4220,25 @@ def is_studio_paused(candidate_dir: Optional[Path] = None) -> bool:
     return False
 
 
+def _check_gateway_abort(candidate_dir: Optional[Path] = None, label: str = "generate_content") -> None:
+    """Raises `StudioPausedError` immediately if the active orchestrator or `candidate_dir` has been aborted/preempted."""
+    if is_candidate_build_aborted(candidate_dir):
+        raise StudioPausedError(
+            f"Aborted outbound Gemini API call '{label}' because build for '{Path(candidate_dir).name if candidate_dir else 'candidate'}' was cancelled by a new game request."
+        )
+    try:
+        from engine.ui.server import swarm_bus as _sb
+        orch = getattr(_sb, "_active_orchestrator", None)
+        if orch is not None and getattr(orch, "_abort_requested", False):
+            raise StudioPausedError(
+                f"Aborted outbound Gemini API call '{label}' because active build was cancelled."
+            )
+    except StudioPausedError:
+        raise
+    except Exception:
+        pass
+
+
 def wait_if_studio_paused(
     candidate_dir: Optional[Path] = None,
     *,
@@ -4003,24 +4258,16 @@ def wait_if_studio_paused(
         if fail_fast is not None
         else (_os.environ.get("STUDIO_FAIL_FAST_ON_PAUSE") == "1")
     )
+    _check_gateway_abort(candidate_dir, label=label)
     t0 = _time.monotonic()
     while is_studio_paused(candidate_dir):
         if should_fail_fast:
             raise StudioPausedError(
                 f"Blocked outbound Gemini API call '{label}' because Studio build is PAUSED (.studio_paused.json)."
             )
-        try:
-            from engine.ui.server import swarm_bus as _sb
-            orch = getattr(_sb, "_active_orchestrator", None)
-            if orch is not None and getattr(orch, "_abort_requested", False):
-                raise StudioPausedError(
-                    f"Aborted outbound Gemini API call '{label}' while Studio build was paused."
-                )
-        except StudioPausedError:
-            raise
-        except Exception:
-            pass
+        _check_gateway_abort(candidate_dir, label=label)
         _time.sleep(0.2)
+    _check_gateway_abort(candidate_dir, label=label)
     return max(0.0, _time.monotonic() - t0)
 
 
@@ -4238,7 +4485,45 @@ _ACTIVE_DATASET_CONTEXT: Dict[str, Any] = {
     "candidate_dir": None,
     "store_logs": True,
 }
+_ABORTED_CANDIDATE_NAMES: Set[str] = set()
 _THREAD_LOCAL_GEMINI_CALL_CTX = _gateway_threading.local()
+
+
+def mark_candidate_build_aborted(candidate_dir: Optional[Union[Path, str]] = None) -> None:
+    """Marks a candidate directory (or the currently active dataset candidate_dir) as aborted/preempted
+    so any in-flight or paused thread working on that candidate exits immediately via `StudioPausedError`."""
+    with _ACTIVE_DATASET_LOCK:
+        target = candidate_dir if candidate_dir is not None else _ACTIVE_DATASET_CONTEXT.get("candidate_dir")
+        if target:
+            name = Path(target).name.strip()
+            if name and name != "active":
+                _ABORTED_CANDIDATE_NAMES.add(name)
+
+
+def clear_candidate_build_aborted(candidate_dir: Optional[Union[Path, str]] = None) -> None:
+    """Clears the aborted state for a specific candidate directory when explicitly resumed."""
+    with _ACTIVE_DATASET_LOCK:
+        if candidate_dir is None:
+            _ABORTED_CANDIDATE_NAMES.clear()
+        else:
+            name = Path(candidate_dir).name.strip()
+            _ABORTED_CANDIDATE_NAMES.discard(name)
+
+
+def is_candidate_build_aborted(candidate_dir: Optional[Union[Path, str]] = None) -> bool:
+    """Returns True if `candidate_dir` (or the thread-local candidate_dir) has been marked aborted."""
+    eff_c_dir = (
+        Path(candidate_dir)
+        if candidate_dir
+        else getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "candidate_dir", None)
+    )
+    if not eff_c_dir:
+        return False
+    name = Path(eff_c_dir).name.strip()
+    if not name:
+        return False
+    with _ACTIVE_DATASET_LOCK:
+        return name in _ABORTED_CANDIDATE_NAMES
 
 
 def sanitize_gemini_label_value(raw: Any, max_len: int = 63) -> str:
@@ -4273,7 +4558,10 @@ def set_active_gemini_dataset_context(
         if dataset_name is not None:
             _ACTIVE_DATASET_CONTEXT["dataset_name"] = str(dataset_name).strip()
         if candidate_dir is not None:
-            _ACTIVE_DATASET_CONTEXT["candidate_dir"] = Path(candidate_dir) if candidate_dir else None
+            c_path = Path(candidate_dir) if candidate_dir else None
+            _ACTIVE_DATASET_CONTEXT["candidate_dir"] = c_path
+            if c_path is not None and c_path.name.strip():
+                _ABORTED_CANDIDATE_NAMES.discard(c_path.name.strip())
         if store_logs is not None:
             _ACTIVE_DATASET_CONTEXT["store_logs"] = bool(store_logs)
         return dict(_ACTIVE_DATASET_CONTEXT)
@@ -4523,6 +4811,7 @@ def install_studio_gemini_guardrails(
                                 else kwargs
                             )
                         res = fn(*args, **call_kwargs)
+                        _check_gateway_abort(ctx_c_dir, label=lbl)
                         break
                     except StudioPausedError:
                         raise
@@ -4587,8 +4876,10 @@ def call_gemini_with_transient_retry(
             _THREAD_LOCAL_GEMINI_CALL_CTX.candidate_dir = candidate_dir
         try:
             res = call_fn()
+            _check_gateway_abort(candidate_dir, label=label)
             stats = TOKEN_USAGE_TRACKER.record_response(res, label=label)
-            _emit_gateway_llm_activity(label, stats)
+            if stats is not None:
+                _emit_gateway_llm_activity(label, stats)
             if stats is not None and stats["cached_tokens"] > 0:
                 _log.debug(
                     "%s token usage: prompt=%d cached=%d (%.1f%%) output=%d thoughts=%d",

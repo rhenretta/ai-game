@@ -332,9 +332,10 @@ static func create_tiled_surface(
             return (64, 64)
 
     def sanitize_misplaced_portraits_in_sprites_dir(self) -> List[Path]:
-        """Moves or copies any *_portrait.png or portrait_*.png files from assets/sprites/ into
-        assets/portraits/ with clean alpha background extraction, preventing portraits from
-        masquerading as in-world entity sprites.
+        """Moves or copies any misplaced single-frame *_portrait.png or portrait_*.png files from
+        assets/sprites/ into assets/portraits/ with clean alpha background extraction, preventing
+        single-frame bust portraits from masquerading as in-world entity sprites while preserving
+        explicitly authored sprite sheets and catalog-registered sprite assets.
         """
         from engine.studio.visual import VisualArtSpriteDesignerAgent
 
@@ -342,12 +343,47 @@ static func create_tiled_surface(
         if not self.sprites_dir.is_dir():
             return cleaned_paths
 
+        registered_sprite_filenames: set[str] = set()
+        for entry in self.catalog.entries.values():
+            fp = str(getattr(entry, "file_path", "") or "")
+            rp = str(getattr(entry, "res_path", "") or "")
+            fab_mode = str(getattr(entry, "fabrication_mode", "") or "")
+            asset_type = str(getattr(entry, "asset_type", "") or "")
+            hframes = int(getattr(entry, "hframes", 1) or 1)
+            vframes = int(getattr(entry, "vframes", 1) or 1)
+            is_Explicit_sprite = (
+                fab_mode != "portrait"
+                or asset_type != "portrait"
+                or hframes > 1
+                or vframes > 1
+            )
+            if is_Explicit_sprite:
+                if fp.startswith("assets/sprites/"):
+                    registered_sprite_filenames.add(Path(fp).name)
+                if rp.startswith("res://assets/sprites/"):
+                    registered_sprite_filenames.add(Path(rp.replace("res://", "")).name)
+
         for png_file in list(self.sprites_dir.glob("*.png")):
+            if png_file.name in registered_sprite_filenames:
+                stale_entry = self.catalog.entries.get(png_file.stem)
+                if (
+                    stale_entry is not None
+                    and getattr(stale_entry, "asset_type", "") == "portrait"
+                    and str(getattr(stale_entry, "deliberation", "")).startswith(
+                        "Cleaned and indexed character portrait"
+                    )
+                ):
+                    self.catalog.entries.pop(png_file.stem, None)
+                continue
             stem_lower = png_file.stem.lower()
             if "portrait" in stem_lower:
                 dest_portrait = self.portraits_dir / png_file.name
                 try:
                     with Image.open(png_file) as raw_img:
+                        w, h = raw_img.size
+                        if w > 0 and h > 0 and max(w, h) >= min(w, h) * 1.5:
+                            # Multi-frame horizontal/vertical sprite strip; never squish to 1:1
+                            continue
                         cleaned = VisualArtSpriteDesignerAgent.extract_clean_alpha_sprite(
                             raw_img,
                             target_size=(256, 256),

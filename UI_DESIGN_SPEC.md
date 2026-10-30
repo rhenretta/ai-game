@@ -425,3 +425,39 @@ During long-running autonomous game genesis builds, players and developers need 
    - **Drawer Tab 3 ("Checkpoints")**: Dedicated drawer panel showing the Checkpoint Progression Timeline with requirement badges, verification timestamps, file inventories, SHA-256 manifests, and one-click "Activate / Play" buttons.
    - **WebSocket Sync**: Responds to `CHECKPOINT_VERIFIED` events broadcast over WebSocket, triggering automatic UI refreshes without requiring page reloads.
 
+---
+
+## 11. Decoupled Blind Playtester Studio, Experience Reports & Council Deliberation
+
+### 11.1 Overview, Zero-Leak Player Isolation & Dual Initiation Modes
+Mission Control includes a dedicated **🧪 Blind Playtester** workspace powered by `engine/playtest/` (`BlindPlaytesterAgent`, `GodotPlaytestBridge`, `PlaytestSessionManager`). Unlike internal QA smoke/filmstrip harnesses, the Blind Playtester experiences verified checkpoints strictly as a cold external human player—receiving **only** a Steam-style `BlindStoreCard` (`game_title` + short pitch), live 1280×720 viewport screenshots (with `0..1000` normalized screen-coordinate smooth cursor pointing and desktop pointer arrow parity), and captured in-game audio clips, with zero access to `.gd` source code, `GameBibleSpec`, `backlog.json`, or internal state dictionaries.
+
+Sessions distinguish provenance via `initiated_by` (`"operator"` vs `"council"`), rendered in the session header as **`[👤 Manual]`** or **`[🏛️ Council]`**:
+- **Manual Operator Runs (`initiated_by="operator"`)**: Persist sparse 6-pillar impressions, the end-of-session `PlaytestExperienceReport`, and the `1600×720` side-by-side broadcast MP4 (`replay.mp4`) for Mission Control inspection while keeping generated `PlaytestWishDraft` items in `status="pending"` until the operator explicitly curates and forwards selected wishes to the Council.
+- **Automated End-of-Slice Council Runs (`initiated_by="council"`)**: Invoked automatically by `CreativeWritersRoom._run_end_of_slice_blind_playtest` after `_run_slice_assembly_check` passes; marks all generated wishes `status="sent_to_council"` and delivers the full `PlaytestExperienceReport`, 6-pillar impressions, rulebook, wishes, and viewport screenshots to the Council to decide between `iterate_current_slice` and `approve_slice` (`BlindPlaytestCouncilVerdict`).
+
+### 11.2 Observability Sub-Views, Accessibility & Session Controls (`engine/ui/static/index.html`)
+1. **Accessible 4-Tab Observability Panel (`role="tablist"`, `role="tab"`, `role="tabpanel"`)**:
+   - Supports roving `tabindex` (`0` / `-1`) and `ArrowLeft` / `ArrowRight` / `Home` / `End` keyboard navigation across four views:
+     - **🎬 Live Feed & Broadcast**: Live viewport stream / `1600×720` composited `replay.mp4` player alongside the chronological rationale-first turn deliberation stream (with mood pills, `[RULEBOOK+]`, `[IMPRESSION+]` emerald badges, and `[WISH]` indicators).
+     - **📖 Emergent Rulebook**: Empirically discovered control mappings and game mechanics (`rulebook_json`).
+     - **📋 Impressions & Report**: Live 6-pillar player impression cards (`graphics_and_visuals`, `gameplay_and_feel`, `sound_and_audio`, `intuitiveness_and_controls`, `goals_and_pacing`, `world_and_atmosphere`) plus the synthesized end-of-session `PlaytestExperienceReport` scorecard (`overall_fun_rating` `1..10`, standout highlights, friction points, and top recommendations).
+     - **💡 Player Wishlist**: Filterable `PlaytestWishDraft` cards with batch selection, dismiss controls, and explicit **Send Selected to Council** dispatch.
+2. **Lifecycle & Reset Controls**:
+   - **Start / Pause / Resume / Stop**: Stopping a session cleanly finalizes the `PlaytestExperienceReport` and muxes (or recovers via `_recover_unmuxed_session_video`) `replay.mp4`.
+   - **Stopped-vs-Running Reset (`action="reset"`)**: Resetting a stopped, completed, failed, or idle session wipes turns, impressions, reports, wishes, and disk media back to a clean `status="idle"` slate **without** starting a new run; resetting an actively `running` or `paused` session discards in-flight artifacts (`discard_on_stop`) and immediately restarts fresh from Turn 0.
+
+### 11.3 SQLite WAL Persistence & REST Endpoints (`engine/telemetry/schema.sql`, `engine/ui/server.py`)
+1. **SQLite WAL Tables (`data/telemetry.db`)**:
+   - `playtest_sessions`: Session lifecycle (`idle`, `starting`, `running`, `paused`, `stopping`, `stopped`, `completed`, `failed`), `initiated_by` (`operator` | `council`), checkpoint/slice metadata, emergent `rulebook_json`, sparse 6-pillar `impressions_json`, end-of-session `session_report_json` (`PlaytestExperienceReport`), `compacted_journal_json`, token usage, and composited MP4 `video_path`.
+   - `playtest_turns`: Chronological rationale-first (`deliberation` first) turn records storing cursor trajectories, `action_json`, `rulebook_updates_json`, `impression_updates_json`, `mood_state` / `mood_note`, `screenshot_path`, and `audio_clip_path`.
+   - `playtest_compactions`: Periodic long-horizon memory compactions (`PlaytestCompactedJournal`) preserving recent raw turns while carrying `rulebook_json` and `impressions_json` forward without breaking byte-0 prefix caching.
+   - `playtest_wishes`: Structured player-perspective feedback items (`PlaytestWishDraft`) with `status` (`pending`, `sent_to_council`, `dismissed`).
+2. **REST API Endpoints**:
+   - `GET /api/playtest/sessions` & `POST /api/playtest/sessions/start`: List sessions or launch a new blind playtest against any verified checkpoint (`initiated_by` defaults to `"operator"`).
+   - `GET /api/playtest/sessions/{session_id}` & `POST /api/playtest/sessions/{session_id}/control`: Inspect live turn timeline / rulebook / impressions / experience report, or `pause`, `resume`, `stop`, or `reset` a session.
+   - `GET /api/playtest/sessions/{session_id}/video` & `GET /api/playtest/sessions/{session_id}/media/{filename}`: Stream the composited `1600×720` MP4 session broadcast (recovering unmuxed frames on demand if interrupted) and per-turn viewport/audio captures.
+   - `GET /api/playtest/wishes`, `POST /api/playtest/wishes/send-to-council`, & `POST /api/playtest/wishes/{wish_id}/dismiss`: Triage authentic player wishes directly into live Writers' Room steering so the Council discusses and schedules improvements in the active slice.
+
+
+

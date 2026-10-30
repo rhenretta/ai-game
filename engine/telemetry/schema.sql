@@ -214,5 +214,111 @@ CREATE INDEX IF NOT EXISTS idx_studio_requirements_build_id ON studio_requiremen
 CREATE INDEX IF NOT EXISTS idx_studio_checkpoints_build_id ON studio_checkpoints(build_id);
 CREATE INDEX IF NOT EXISTS idx_studio_game_bibles_updated ON studio_game_bibles(updated_at_utc);
 
+-- Decoupled Blind Playtester Sessions, Turns, Compactions & Wishes
+CREATE TABLE IF NOT EXISTS playtest_sessions (
+    session_id TEXT PRIMARY KEY,
+    checkpoint_id TEXT NOT NULL,
+    candidate_id TEXT,
+    slice_id TEXT,
+    initiated_by TEXT NOT NULL DEFAULT 'operator',
+    game_title TEXT NOT NULL,
+    game_description TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    end_outcome TEXT,
+    end_summary TEXT,
+    error_message TEXT,
+    turn_count INTEGER DEFAULT 0,
+    sim_ticks_total INTEGER DEFAULT 0,
+    sim_duration_sec REAL DEFAULT 0.0,
+    compaction_count INTEGER DEFAULT 0,
+    rulebook_json TEXT DEFAULT '{}',
+    impressions_json TEXT DEFAULT '{}',
+    session_report_json TEXT DEFAULT '{}',
+    compacted_journal_json TEXT DEFAULT '{}',
+    current_plan TEXT DEFAULT '',
+    current_mood TEXT DEFAULT '',
+    prompt_tokens INTEGER DEFAULT 0,
+    cached_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    thought_tokens INTEGER DEFAULT 0,
+    video_path TEXT,
+    latest_frame_path TEXT,
+    started_at_utc TEXT NOT NULL,
+    updated_at_utc TEXT NOT NULL,
+    ended_at_utc TEXT,
+    deliberation TEXT
+);
+
+CREATE TABLE IF NOT EXISTS playtest_turns (
+    turn_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    turn_index INTEGER NOT NULL,
+    sim_tick_start INTEGER DEFAULT 0,
+    sim_tick_end INTEGER DEFAULT 0,
+    video_timestamp_sec REAL DEFAULT 0.0,
+    cursor_start_x REAL DEFAULT 640.0,
+    cursor_start_y REAL DEFAULT 360.0,
+    cursor_end_x REAL DEFAULT 640.0,
+    cursor_end_y REAL DEFAULT 640.0,
+    current_plan TEXT DEFAULT '',
+    deliberation TEXT NOT NULL,
+    action_json TEXT NOT NULL DEFAULT '{}',
+    rulebook_updates_json TEXT DEFAULT '[]',
+    impression_updates_json TEXT DEFAULT '[]',
+    append_log_line TEXT NOT NULL DEFAULT '',
+    mood_state TEXT,
+    mood_note TEXT,
+    screenshot_path TEXT,
+    audio_clip_path TEXT,
+    prompt_tokens INTEGER DEFAULT 0,
+    cached_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    thought_tokens INTEGER DEFAULT 0,
+    created_at_utc TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES playtest_sessions(session_id)
+);
+
+CREATE TABLE IF NOT EXISTS playtest_compactions (
+    compaction_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    compaction_index INTEGER NOT NULL,
+    covered_up_to_turn INTEGER NOT NULL,
+    carried_tail_turns INTEGER DEFAULT 5,
+    deliberation TEXT NOT NULL,
+    rulebook_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    journal_json TEXT NOT NULL DEFAULT '{}',
+    created_at_utc TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES playtest_sessions(session_id)
+);
+
+CREATE TABLE IF NOT EXISTS playtest_wishes (
+    wish_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    turn_index INTEGER NOT NULL,
+    candidate_id TEXT,
+    checkpoint_id TEXT NOT NULL,
+    observed_on_slice_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    category TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    rationale TEXT NOT NULL,
+    mood_at_time TEXT,
+    screenshot_path TEXT,
+    video_timestamp_sec REAL DEFAULT 0.0,
+    producer_note TEXT,
+    sent_at_utc TEXT,
+    created_at_utc TEXT NOT NULL,
+    deliberation TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES playtest_sessions(session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_playtest_sessions_checkpoint ON playtest_sessions(checkpoint_id);
+CREATE INDEX IF NOT EXISTS idx_playtest_sessions_candidate ON playtest_sessions(candidate_id);
+CREATE INDEX IF NOT EXISTS idx_playtest_sessions_started ON playtest_sessions(started_at_utc);
+CREATE INDEX IF NOT EXISTS idx_playtest_turns_session ON playtest_turns(session_id, turn_index);
+CREATE INDEX IF NOT EXISTS idx_playtest_compactions_session ON playtest_compactions(session_id, compaction_index);
+CREATE INDEX IF NOT EXISTS idx_playtest_wishes_session ON playtest_wishes(session_id);
+CREATE INDEX IF NOT EXISTS idx_playtest_wishes_candidate ON playtest_wishes(candidate_id, status);
+
 
 

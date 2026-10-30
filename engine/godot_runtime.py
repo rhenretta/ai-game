@@ -108,7 +108,11 @@ def verify_godot_binary(binary_path: Path) -> str:
         os.chmod(binary_path, 0o755)
     _ensure_apple_silicon_native_binary(binary_path)
 
-    res = subprocess.run([str(binary_path), "--version"], capture_output=True, text=True, timeout=15)
+    ver_cmd = [str(binary_path)]
+    if platform.system() == "Darwin":
+        ver_cmd.extend(["-ApplePersistenceIgnoreState", "YES"])
+    ver_cmd.append("--version")
+    res = subprocess.run(ver_cmd, capture_output=True, text=True, timeout=15)
     if res.returncode != 0:
         raise RuntimeError(f"Godot binary verification failed (code {res.returncode}): {res.stderr}")
     version_str = res.stdout.strip()
@@ -269,6 +273,12 @@ def ensure_godot_background_render_binary(cache_dir: Optional[Path] = None) -> P
                 with bg_plist.open("wb") as f:
                     plistlib.dump(bg_data, f)
                 subprocess.run(["codesign", "--force", "--deep", "--sign", "-", str(bg_app)], capture_output=True)
+            # Suppress macOS AppKit NSPersistentUIRestorer modal dialogs on background headless/offscreen runs
+            subprocess.run(
+                ["defaults", "write", "org.godotengine.godot.background", "ApplePersistenceIgnoreState", "-bool", "YES"],
+                capture_output=True,
+                timeout=5,
+            )
         except Exception as plist_exc:
             logger.warning("Could not configure Info.plist on GodotBackground.app: %s", plist_exc)
 
@@ -285,6 +295,8 @@ def run_godot_command(
     """Executes a Godot CLI command with automatic binary location."""
     binary = godot_bin or ensure_godot_binary()
     cmd = [str(binary)]
+    if platform.system() == "Darwin" and "-ApplePersistenceIgnoreState" not in args:
+        cmd.extend(["-ApplePersistenceIgnoreState", "YES"])
     if headless and "--headless" not in args:
         cmd.append("--headless")
     cmd.extend(args)

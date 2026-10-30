@@ -1201,6 +1201,661 @@ def test_yield_on_file_lock_sets_waiting_for_lock_status_and_resumes_when_releas
     assert resumed[0].waiting_on_locks == []
 
 
+def test_slice_assembly_load_image_part_and_narrative_character_spec_alias(tmp_path):
+    """Verifies that CreativeWritersRoom._load_image_part loads PNG filmstrips into multimodal Parts
+    during _run_slice_assembly_check without raising AttributeError, and NarrativeCharacterSpec is importable."""
+    from PIL import Image
+    from engine.studio.models import (
+        CharacterSheet,
+        GameBibleSpec,
+        GameSliceSpec,
+        NarrativeCharacterSpec,
+        NextSliceStrategyPlan,
+        SliceAssemblyDecision,
+        SliceStateReflectionTurn,
+    )
+    from engine.studio.writers_room import CreativeWritersRoom
+
+    assert NarrativeCharacterSpec is CharacterSheet
+
+    # Rule 4: Rationale-First field order invariants on SliceStateReflectionTurn & NextSliceStrategyPlan
+    refl_fields = list(SliceStateReflectionTurn.model_fields.keys())
+    assert refl_fields[0] == "deliberation"
+    assert refl_fields[-1] == "current_slice_quality_score"
+    strat_fields = list(NextSliceStrategyPlan.model_fields.keys())
+    assert strat_fields[0] == "deliberation"
+
+    (tmp_path / "project.godot").write_text('[application]\nrun/main_scene="res://main.tscn"\n', encoding="utf-8")
+    (tmp_path / "main.tscn").write_text('[gd_scene format=3]\n[node name="Main" type="Node2D"]\n', encoding="utf-8")
+    (tmp_path / "main.gd").write_text("extends Node2D\n", encoding="utf-8")
+
+    board = ProductionBoard(tmp_path / "backlog.json")
+    room = CreativeWritersRoom(client=object(), board=board)
+    room.enable_slice_assembly_check = True
+
+    def _fake_filmstrip(c_dir, ticks, out_path):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (160, 90), (30, 50, 70)).save(out_path, "PNG")
+
+    room.assembly_filmstrip_fn = _fake_filmstrip
+
+    captured_parts = []
+
+    def _fake_structured(prompt, schema, validate_fn, **kwargs):
+        if schema is SliceAssemblyDecision:
+            captured_parts.extend(kwargs.get("parts") or [])
+            dec = SliceAssemblyDecision(
+                deliberation="Inspected rendered filmstrip; slice is assembled.",
+                unmounted_or_disconnected_systems=[],
+                playability_and_fun_evaluation="Responsive and clear.",
+                spoken_dialogue="Slice assembly verified with attached filmstrip.",
+                backlog_additions=[],
+                is_slice_assembled=True,
+            )
+            assert validate_fn(dec) == []
+            return dec
+        raise AssertionError(f"Unexpected schema {schema}")
+
+    room._structured_with_validation = _fake_structured
+
+    bible = GameBibleSpec(
+        deliberation="d",
+        game_title="Test Game",
+        core_genre="Simulation",
+        slice_roadmap=[
+            GameSliceSpec(
+                deliberation="d",
+                slice_id="slice_0_core",
+                slice_index=0,
+                title="Slice 0",
+                slice_objective="Core loop",
+                player_acclimation_and_mechanics_focus="Controls",
+                status="active",
+            )
+        ],
+        active_slice_index=0,
+    )
+    spawned = room._run_slice_assembly_check(bible, "Player DNA", tmp_path, pass_index=0)
+    assert spawned == 0
+    assert len(captured_parts) == 1
+    assert hasattr(captured_parts[0], "inline_data")
+
+
+def test_slice_reflection_roundtable_and_next_slice_strategy_in_slice_expansion(tmp_path):
+    """Verifies that run_slice_expansion empirically inspects the current slice, runs the 5-specialist
+    SliceStateReflectionTurn roundtable, synthesizes the Creative Director's NextSliceStrategyPlan across
+    cohesion, how-to-play, mechanical depth, short/long-term goals, and sense of accomplishment, updates
+    the Living Game Bible, and drains the Slice 1 backlog."""
+    from PIL import Image
+    from engine.studio.models import (
+        CoreLoopSpec,
+        EngagementPlan,
+        GameBibleSpec,
+        GameSliceSpec,
+        GoalHierarchy,
+        GoalSpec,
+        NextSliceStrategyPlan,
+        OnboardingPlan,
+        OnboardingStep,
+        ReviewBatch,
+        ReviewDecision,
+        SliceStateReflectionTurn,
+        WritersRoomTurnProposal,
+    )
+    from engine.studio.writers_room import CreativeWritersRoom
+
+    (tmp_path / "project.godot").write_text('[application]\nrun/main_scene="res://main.tscn"\n', encoding="utf-8")
+    (tmp_path / "main.tscn").write_text('[gd_scene format=3]\n[node name="Main" type="Node2D"]\n', encoding="utf-8")
+    (tmp_path / "main.gd").write_text("extends Node2D\n", encoding="utf-8")
+
+    proof_img = tmp_path / "proof_slice1.png"
+    Image.new("RGB", (64, 36), (40, 80, 120)).save(proof_img, "PNG")
+
+    board = ProductionBoard(tmp_path / "backlog.json")
+    # Seed and approve a Slice 0 item so the board starts with Slice 0 completed
+    board.add_items([P("slice0_core", kind="mechanic_code", modules=("mechanics.gd",))], "GameplayDesigner", slice_id="slice_0_core")
+    board.claim_ready()
+    board.submit_result("slice0_core", WorkerResult(proof_images=[str(proof_img)], notes="done"))
+    board.apply_review(ReviewDecision(deliberation="ok", item_id="slice0_core", verdict="approve"))
+    assert board.is_drained()
+
+    def _worker(item):
+        return WorkerResult(proof_images=[str(proof_img)], notes=f"built {item.item_id}")
+
+    sched = BoardScheduler(board, {"mechanic_code": _worker, "ui": _worker, "integration": _worker}, max_workers=2)
+    events = []
+    checkpoints = []
+    room = CreativeWritersRoom(
+        client=object(),
+        board=board,
+        scheduler=sched,
+        drain_poll_s=0.02,
+        event_callback=lambda t, p: events.append((t, p)),
+        slice_checkpoint_callback=lambda gb, sl, cd: checkpoints.append((sl.slice_id, sl.status)),
+    )
+    room.enable_slice_reflection_roundtable = True
+    room.assembly_filmstrip_fn = lambda c_dir, ticks, out_path: Image.new("RGB", (128, 72), (20, 30, 40)).save(out_path, "PNG")
+
+    reflection_roles_called = []
+
+    def _fake_structured(prompt, schema, validate_fn, **kwargs):
+        if schema is SliceStateReflectionTurn:
+            # Verify multimodal filmstrip part was attached to the reflection turn
+            assert any(hasattr(p, "inline_data") for p in (kwargs.get("parts") or []))
+            for r in ("UXExperienceDesigner", "GameplayDesigner", "LevelAndProgressionDesigner", "VisualArtDirector", "GameplaySystemsEngineer"):
+                if f"({r}). Your specialty focus:" in prompt:
+                    reflection_roles_called.append(r)
+                    break
+            turn = SliceStateReflectionTurn(
+                deliberation="Evaluating current slice from first principles.",
+                honest_current_state_critique="Center of viewport is occluded by a static control panel; world feels disconnected.",
+                how_to_play_and_intuitiveness_gaps="Player lacks interactive onboarding prompts and clear causal feedback.",
+                depth_and_fun_gaps="Sliders have no dynamic world hazards or meaningful resource trade-offs.",
+                accomplishment_and_goals_gaps="Short-term and long-term goals are not visibly celebrated on completion.",
+                strategy_for_next_slice="Dock compact controls to peripheral HUD, add interactive 60s tutorial + hazard depth + milestone rewards.",
+                spoken_dialogue="We need to open up the center viewport, teach the controls diegetically, and add real hazard trade-offs and milestone payoffs.",
+                addressed_to=["CreativeDirector"],
+                current_slice_quality_score=0.35,
+            )
+            assert validate_fn(turn) == []
+            return turn
+        if schema is NextSliceStrategyPlan:
+            plan = NextSliceStrategyPlan(
+                deliberation="Synthesizing Council reflection into Slice 1 strategy.",
+                spoken_dialogue="Council, for Slice 1 we are opening the viewport, adding guided onboarding, hazard depth, and milestone rewards.",
+                current_slice_honest_diagnosis="Slice 0 built raw controls in a center box without cohesive world framing, onboarding, or rewarding goals.",
+                cohesion_and_world_integration_strategy="Move instruments to a peripheral dock so the living 2D world fills 80% of the viewport.",
+                how_to_play_and_onboarding_strategy="Add step-by-step diegetic control callouts and immediate world reaction in the first 60 seconds.",
+                depth_and_interesting_decisions_strategy="Introduce dynamic environmental pressure anomalies requiring trade-offs between speed and stability.",
+                short_term_and_long_term_goals_strategy="Display active short-term objective tracker and long-term shift progression bar.",
+                sense_of_accomplishment_and_reward_strategy="Trigger visual/audio milestone celebration and unlock upgraded capability on each completed goal.",
+                next_slice_spec=GameSliceSpec(
+                    deliberation="Slice 1 transforms the prototype into a cohesive, intuitive, deep game.",
+                    slice_id="slice_1_cohesive_depth_and_goals",
+                    slice_index=1,
+                    title="Slice 1: Cohesive World, Onboarding & Strategic Depth",
+                    slice_objective="Deliver an unobstructed living world, intuitive onboarding, dynamic hazard trade-offs, and rewarding short/long-term goals.",
+                    player_acclimation_and_mechanics_focus="Interactive 60s onboarding + dynamic hazard trade-offs.",
+                    expansion_from_prior_slice="Replaces center-blocking panel with peripheral HUD, adds interactive tutorial, hazard depth, and goal rewards.",
+                    scope_boundaries=["Peripheral HUD & world view", "Interactive onboarding & goal celebrations"],
+                    status="active",
+                ),
+                updated_core_loop=CoreLoopSpec(
+                    deliberation="Updated loop with clear risk/reward depth.",
+                    player_verbs=["Throttle", "Stabilize", "Deploy Countermeasure"],
+                    player_agency_and_optimization_model="Balance speed vs stability across shifting strata.",
+                    moment_to_moment_loop="Read world hazard -> adjust control -> observe immediate physical response.",
+                    minute_to_minute_loop="Complete short-term milestone while balancing stability vs. speed.",
+                    session_loop="Advance through multi-stage progression tiers and unlock upgrades.",
+                ),
+                updated_onboarding_plan=OnboardingPlan(
+                    deliberation="Updated onboarding plan.",
+                    world_introduction="Camera frames the living world with peripheral instruments.",
+                    purpose_and_stakes_framing="Highlight first short-term objective with diegetic prompt.",
+                    causal_chain_and_feedback_strategy="Controls visually drive world machinery.",
+                    steps=[
+                        OnboardingStep(
+                            deliberation="s0",
+                            step_index=0,
+                            concept_introduced="Primary throttle",
+                            diegetic_method="Highlighted prompt",
+                        ),
+                        OnboardingStep(
+                            deliberation="s1",
+                            step_index=1,
+                            concept_introduced="Stability margin",
+                            diegetic_method="Peripheral gauge pulse",
+                        ),
+                        OnboardingStep(
+                            deliberation="s2",
+                            step_index=2,
+                            concept_introduced="Milestone completion",
+                            diegetic_method="Celebration banner",
+                        ),
+                    ],
+                ),
+                updated_goal_hierarchy=GoalHierarchy(
+                    deliberation="Updated multi-horizon goals.",
+                    goals=[
+                        GoalSpec(
+                            deliberation="g1",
+                            goal_id="goal_short_1",
+                            horizon="short_term",
+                            description="Reach Milestone 1 while surviving pressure surge",
+                            reward="Unlock stabilizer upgrade",
+                        ),
+                        GoalSpec(
+                            deliberation="g2",
+                            goal_id="goal_long_1",
+                            horizon="long_term",
+                            description="Complete full expedition shift across all strata",
+                            reward="Mastery rank",
+                        ),
+                    ],
+                    progression_structure="Top-right objective tracker with milestone celebration banner.",
+                ),
+                updated_engagement_plan=EngagementPlan(
+                    deliberation="Updated engagement plan.",
+                    entertainment_pillars=["Tactile mastery", "Risk-reward tension"],
+                    variety_injectors=["Dynamic pressure anomalies"],
+                    pacing_and_intensity_curve="Escalates across strata with relief at milestone checkpoints.",
+                ),
+                updated_diegetic_ui_philosophy="Compact peripheral dock keeping 80%+ of the 16:9 viewport unobstructed.",
+                backlog_additions=[],
+            )
+            assert validate_fn(plan) == []
+            return plan
+        if schema is WritersRoomTurnProposal:
+            # Verify the Master Strategy context block is injected into specialist decomposition prompts
+            assert "MASTER STRATEGY FOR SLICE #1" in prompt
+            if "You are the Lead Gameplay & Godot Systems Engineer (GameplaySystemsEngineer)" in prompt:
+                prop = WritersRoomTurnProposal(
+                    deliberation="Seed Slice 1 implementation task.",
+                    spoken_dialogue="Seeding `slice1_world_onboarding_and_depth` for Slice 1.",
+                    addressed_to=["CreativeDirector"],
+                    backlog_additions=[
+                        P("slice1_world_onboarding_and_depth", kind="mechanic_code", modules=("mechanics.gd", "ui_hud.gd"))
+                    ],
+                )
+            else:
+                prop = WritersRoomTurnProposal(
+                    deliberation="Specialist Slice 1 design contribution.",
+                    spoken_dialogue="Contributing Slice 1 design updates.",
+                    addressed_to=["GameplaySystemsEngineer"],
+                    backlog_additions=[],
+                )
+            assert validate_fn(prop) == []
+            return prop
+        if schema is ReviewBatch:
+            awaiting = [i.item_id for i in board.awaiting_review()]
+            batch = ReviewBatch(
+                deliberation="Approve Slice 1 task.",
+                spoken_dialogue="Slice 1 task verified.",
+                review_decisions=[ReviewDecision(deliberation="ok", item_id=iid, verdict="approve") for iid in awaiting],
+            )
+            assert validate_fn(batch) == []
+            return batch
+        raise AssertionError(f"Unexpected schema {schema}")
+
+    room._structured_with_validation = _fake_structured
+
+    bible = GameBibleSpec(
+        deliberation="d",
+        game_title="Deep Shift",
+        core_genre="Simulation",
+        slice_roadmap=[
+            GameSliceSpec(
+                deliberation="d",
+                slice_id="slice_0_core",
+                slice_index=0,
+                title="Slice 0",
+                slice_objective="Initial prototype",
+                player_acclimation_and_mechanics_focus="Basic controls",
+                status="active",
+            )
+        ],
+        active_slice_index=0,
+    )
+
+    try:
+        updated_bible = room.run_slice_expansion(bible, candidate_dir=tmp_path)
+    finally:
+        sched.stop()
+
+    assert reflection_roles_called == [
+        "UXExperienceDesigner",
+        "GameplayDesigner",
+        "LevelAndProgressionDesigner",
+        "VisualArtDirector",
+        "GameplaySystemsEngineer",
+    ]
+    assert len(updated_bible.slice_roadmap) == 2
+    assert updated_bible.slice_roadmap[0].status == "completed"
+    assert updated_bible.slice_roadmap[1].slice_id == "slice_1_cohesive_depth_and_goals"
+    assert updated_bible.slice_roadmap[1].status == "completed"
+    assert updated_bible.onboarding_plan is not None
+    assert "diegetic prompt" in updated_bible.onboarding_plan.purpose_and_stakes_framing
+    assert updated_bible.goal_hierarchy is not None
+    assert "Milestone 1" in updated_bible.goal_hierarchy.goals[0].description
+    assert board.get("slice1_world_onboarding_and_depth").state == "approved"
+    assert board.get("slice1_world_onboarding_and_depth").slice_id == "slice_1_cohesive_depth_and_goals"
+    assert ("slice_1_cohesive_depth_and_goals", "completed") in checkpoints
+    event_types = [t for t, _ in events]
+    assert "slice_strategy_synthesized" in event_types
+    assert "slice_completed" in event_types
+
+
+def test_resumed_drained_slice_with_optional_user_feedback(tmp_path: Path):
+    """Verifies that resuming a drained Slice 0 cartridge in `run_writers_room` advances to Slice 1
+    both when optional user feedback is provided (via `creative_prompt` or `.pending_steering.json`)
+    and passes that feedback into the Slice State Reflection Roundtable, `NextSliceStrategyPlan`,
+    and specialist task decomposition."""
+    from PIL import Image
+    from engine.studio.models import (
+        CoreLoopSpec,
+        EngagementPlan,
+        ExperienceStoryboardBeat,
+        GameBibleSpec,
+        GameSliceSpec,
+        GenesisWorldSpec,
+        GoalHierarchy,
+        GoalSpec,
+        LevelArchetypeSpec,
+        LevelGenerationStrategy,
+        NextSliceStrategyPlan,
+        OnboardingPlan,
+        OnboardingStep,
+        ReviewBatch,
+        ReviewDecision,
+        SliceStateReflectionTurn,
+        WritersRoomTurnProposal,
+        WritersRoomUtterance,
+    )
+    from engine.studio.writers_room import CreativeWritersRoom
+
+    proof_img = tmp_path / "proof0.png"
+    Image.new("RGB", (64, 36), (30, 60, 90)).save(proof_img, "PNG")
+
+    board = ProductionBoard(tmp_path / "backlog.json")
+    board.add_items(
+        [P("slice0_item", kind="mechanic_code", modules=("main.gd",))],
+        "GameplaySystemsEngineer",
+        slice_id="slice_0_full_core_loop",
+    )
+    board.claim_ready()
+    board.submit_result("slice0_item", WorkerResult(proof_images=[str(proof_img)], notes="done"))
+    board.apply_review(ReviewDecision(deliberation="ok", item_id="slice0_item", verdict="approve"))
+    assert board.is_drained()
+
+    sched = BoardScheduler(
+        board,
+        {
+            "mechanic_code": lambda it: WorkerResult(
+                proof_images=[str(proof_img)],
+                notes=f"Implemented {it.item_id}",
+            )
+        },
+        max_workers=2,
+    )
+
+    room = CreativeWritersRoom(
+        client=object(),
+        board=board,
+        scheduler=sched,
+        drain_poll_s=0.01,
+        drain_timeout_s=5.0,
+        max_parallel_calls=1,
+    )
+    room.enable_slice_reflection_roundtable = True
+    room.max_assembly_passes = 0
+
+    user_feedback = "Make the onboarding intuitive in the first 30 seconds and give the player clear short-term and long-term goals."
+    reflection_prompts_seen: list[str] = []
+    strategy_prompts_seen: list[str] = []
+    decomposition_prompts_seen: list[str] = []
+
+    def _fake_structured(prompt, schema, validate_fn, **kwargs):
+        if schema is SliceStateReflectionTurn:
+            reflection_prompts_seen.append(prompt)
+            turn = SliceStateReflectionTurn(
+                deliberation="Reflecting on Slice 0 with optional Executive Producer feedback.",
+                honest_current_state_critique="Slice 0 is a disconnected control box without clear goals.",
+                how_to_play_and_intuitiveness_gaps="Needs 30-second interactive onboarding.",
+                depth_and_fun_gaps="Needs meaningful trade-offs.",
+                accomplishment_and_goals_gaps="Needs explicit short-term and long-term goals.",
+                strategy_for_next_slice="Implement interactive 30s tutorial and multi-horizon goal HUD.",
+                spoken_dialogue="Incorporating user feedback and our diagnosis for Slice 1.",
+                addressed_to=["CreativeDirector"],
+                current_slice_quality_score=0.4,
+            )
+            assert validate_fn(turn) == []
+            return turn
+        if schema is NextSliceStrategyPlan:
+            strategy_prompts_seen.append(prompt)
+            plan = NextSliceStrategyPlan(
+                deliberation="Synthesizing Council reflection and Executive Producer feedback into Slice 1 strategy.",
+                spoken_dialogue="Locking Slice 1 strategy.",
+                current_slice_honest_diagnosis="Slice 0 lacked onboarding and clear goals.",
+                cohesion_and_world_integration_strategy="Integrate controls into peripheral HUD around the world.",
+                how_to_play_and_onboarding_strategy="Interactive 30-second diegetic tutorial.",
+                depth_and_interesting_decisions_strategy="Add dynamic hazard trade-offs.",
+                short_term_and_long_term_goals_strategy="Add short-term milestone and long-term shift tracker.",
+                sense_of_accomplishment_and_reward_strategy="Celebrate completed milestones with upgrades.",
+                next_slice_spec=GameSliceSpec(
+                    deliberation="Slice 1 spec.",
+                    slice_id="slice_1_feedback_driven",
+                    slice_index=1,
+                    title="Slice 1: Guided Onboarding & Goal Depth",
+                    slice_objective="Deliver 30s onboarding and multi-horizon goals.",
+                    player_acclimation_and_mechanics_focus="Guided 30s onboarding + hazard trade-offs.",
+                    expansion_from_prior_slice="Adds 30s tutorial and goal hierarchy.",
+                    scope_boundaries=["Onboarding + Goal HUD"],
+                    status="active",
+                ),
+                backlog_additions=[],
+            )
+            assert validate_fn(plan) == []
+            return plan
+        if schema is WritersRoomTurnProposal:
+            decomposition_prompts_seen.append(prompt)
+            if "You are the Lead Gameplay & Godot Systems Engineer (GameplaySystemsEngineer)" in prompt:
+                prop = WritersRoomTurnProposal(
+                    deliberation="Seed Slice 1 task.",
+                    spoken_dialogue="Seeding `slice1_feedback_task`.",
+                    addressed_to=["CreativeDirector"],
+                    backlog_additions=[
+                        P("slice1_feedback_task", kind="mechanic_code", modules=("main.gd",))
+                    ],
+                )
+            else:
+                prop = WritersRoomTurnProposal(
+                    deliberation="Design contribution.",
+                    spoken_dialogue="Contributing Slice 1 design.",
+                    addressed_to=["GameplaySystemsEngineer"],
+                    backlog_additions=[],
+                )
+            assert validate_fn(prop) == []
+            return prop
+        if schema is ReviewBatch:
+            awaiting = [i.item_id for i in board.awaiting_review()]
+            batch = ReviewBatch(
+                deliberation="Approve Slice 1 task.",
+                spoken_dialogue="Approved.",
+                review_decisions=[ReviewDecision(deliberation="ok", item_id=iid, verdict="approve") for iid in awaiting],
+            )
+            assert validate_fn(batch) == []
+            return batch
+        raise AssertionError(f"Unexpected schema {schema}")
+
+    room._structured_with_validation = _fake_structured
+
+    existing_bible = GameBibleSpec(
+        deliberation="d",
+        status="locked",
+        game_title="Caisson Shift",
+        core_genre="Simulation",
+        elevator_pitch="Operate a subterranean caisson through hazardous strata.",
+        core_fantasy="Master heavy subterranean machinery under pressure.",
+        first_60_seconds_hook="Drop into the caisson and engage the primary auger.",
+        diegetic_ui_philosophy="Peripheral industrial gauges.",
+        visual_style_guide="Crisp 2D cross-section.",
+        audio_direction_guide="Heavy hydraulic hums.",
+        gameplay_pillars=["Pressure management", "Strata excavation"],
+        level_generation_strategy=LevelGenerationStrategy(
+            deliberation="d",
+            generation_approach="Vertical strata cross-section",
+            world_structure="Multi-layer subterranean shaft",
+            level_archetypes=[
+                LevelArchetypeSpec(
+                    deliberation="a1",
+                    archetype_id="alluvial_silt",
+                    purpose="Onboarding layer",
+                    visual_identity="Warm silt",
+                    signature_challenge="Steady excavation",
+                )
+            ],
+            generation_rules=["Always place milestone markers every 10m"],
+            difficulty_and_pacing_curve="Escalates with depth.",
+        ),
+        core_loop=CoreLoopSpec(
+            deliberation="d",
+            player_verbs=["Excavate", "Stabilize", "Vent"],
+            player_agency_and_optimization_depth="Balance excavation speed against pore pressure.",
+            moment_to_moment_loop="Adjust auger and slurry pressure -> watch caisson sink.",
+            minute_to_minute_loop="Clear a 10m stratum ring and lock segments.",
+            session_loop="Complete full shift down to bedrock.",
+        ),
+        onboarding_plan=OnboardingPlan(
+            deliberation="d",
+            world_introduction="Cross-section view of the caisson shaft.",
+            purpose_and_stakes_framing="Reach target depth before shift timer expires.",
+            causal_chain_and_feedback_strategy="Gauges and shaft vibrations reflect pressure.",
+            steps=[
+                OnboardingStep(deliberation="s0", step_index=0, concept_introduced="Auger", diegetic_method="Prompt"),
+                OnboardingStep(deliberation="s1", step_index=1, concept_introduced="Slurry", diegetic_method="Gauge"),
+                OnboardingStep(deliberation="s2", step_index=2, concept_introduced="Stroke", diegetic_method="Marker"),
+            ],
+        ),
+        goal_hierarchy=GoalHierarchy(
+            deliberation="d",
+            goals=[
+                GoalSpec(deliberation="g1", goal_id="g_short", horizon="short_term", description="Sink 5m", reward="Seal"),
+                GoalSpec(deliberation="g2", goal_id="g_mid", horizon="mid_term", description="Clear clay layer", reward="Upgrade"),
+                GoalSpec(deliberation="g3", goal_id="g_long", horizon="long_term", description="Reach bedrock", reward="Victory"),
+            ],
+            progression_structure="Depth milestones.",
+        ),
+        engagement_plan=EngagementPlan(
+            deliberation="d",
+            entertainment_pillars=["Tactile machinery", "Depth tension"],
+            variety_injectors=["Gas pockets", "Quick-clay surges"],
+            pacing_and_intensity_curve="Escalating pressure with depth.",
+        ),
+        experience_storyboard=[
+            ExperienceStoryboardBeat(
+                deliberation="b1",
+                beat_index=0,
+                phase_title="Opening",
+                player_emotional_state="Weight and power",
+                sensory_and_camera_staging="Caisson shaft cross-section",
+                diegetic_teaching_moment="Prompt to engage auger",
+                narrative_integration="Shift 800 begins",
+            ),
+        ],
+        slice_roadmap=[
+            GameSliceSpec(
+                deliberation="d",
+                slice_id="slice_0_full_core_loop",
+                slice_index=0,
+                title="Slice 0",
+                slice_objective="Initial build",
+                player_acclimation_and_mechanics_focus="Core controls",
+                status="completed",
+            )
+        ],
+        active_slice_index=0,
+        writers_room_transcript=[
+            WritersRoomUtterance(
+                deliberation="d",
+                turn_index=0,
+                speaker_role="CreativeDirector",
+                speaker_display_name="Creative Director",
+                spoken_dialogue="Locked Living Game Bible for production",
+                bible_updates_summary=["Locked Living Game Bible for production"],
+            )
+        ],
+        world_spec=GenesisWorldSpec(
+            deliberation="d",
+            game_title="Caisson Shift",
+            core_genre="Simulation",
+            thematic_premise="Subterranean caisson operation.",
+            aesthetic_style="Industrial 2D",
+            palette_mood="grim_dark",
+            world_lore="Deep excavation.",
+            conflict_tone="High-pressure survival",
+            conflict_narrative="Survive pore pressure surges while sinking the caisson.",
+            gameplay_pacing="methodical",
+            pacing_score=0.5,
+            target_difficulty=0.6,
+            mechanics_guidelines=["Balance pressure and excavation."],
+        ),
+    )
+
+    try:
+        result_bible = room.run_writers_room(
+            existing_bible=existing_bible,
+            candidate_dir=tmp_path,
+            creative_prompt=user_feedback,
+        )
+    finally:
+        sched.stop()
+
+    assert len(result_bible.slice_roadmap) == 2
+    assert result_bible.slice_roadmap[1].slice_id == "slice_1_feedback_driven"
+    assert result_bible.slice_roadmap[1].status == "completed"
+    assert any(user_feedback in p for p in reflection_prompts_seen)
+    assert any(user_feedback in p for p in strategy_prompts_seen)
+    assert any(user_feedback in p for p in decomposition_prompts_seen)
+    assert any(
+        u.speaker_role == "ExecutiveProducer" and user_feedback in u.spoken_dialogue
+        for u in result_bible.writers_room_transcript
+    )
+
+
+def test_new_game_preempts_paused_old_candidate_build(tmp_path: Path):
+    """Verifies that starting a new game from scratch while an older candidate build is paused
+    marks the older candidate aborted BEFORE unpausing, so the old build raises StudioPausedError
+    instead of waking up and resuming."""
+    import json
+    from engine.studio.models import (
+        StudioPausedError,
+        clear_candidate_build_aborted,
+        is_candidate_build_aborted,
+        set_active_gemini_dataset_context,
+        wait_if_studio_paused,
+    )
+    from engine.ui.server import SwarmEventBus
+
+    cand_old = tmp_path / "candidate_genesis_old123"
+    cand_old.mkdir(parents=True)
+    pause_sentinel = tmp_path / ".studio_paused.json"
+    pause_sentinel.write_text(json.dumps({"paused": True}), encoding="utf-8")
+
+    set_active_gemini_dataset_context(dataset_name="old_run", candidate_dir=cand_old)
+    assert not is_candidate_build_aborted(cand_old)
+
+    bus = SwarmEventBus()
+    bus._active_build_id = "build_candidate_genesis_old123"
+
+    caught_errors: List[Exception] = []
+
+    def _paused_old_worker() -> None:
+        try:
+            wait_if_studio_paused(candidate_dir=cand_old, label="CreativeWritersRoom[SliceStateReflectionTurn]")
+        except Exception as exc:
+            caught_errors.append(exc)
+
+    worker_thread = threading.Thread(target=_paused_old_worker, daemon=True)
+    worker_thread.start()
+    time.sleep(0.05)
+
+    # Simulate commissioning a New Game from Scratch: reset_for_new_genesis_build FIRST, then unlink pause sentinel
+    bus.reset_for_new_genesis_build(
+        build_id="build_gen_new999",
+        creative_prompt="A bright, fun factory automation game",
+    )
+    assert is_candidate_build_aborted(cand_old)
+    pause_sentinel.unlink(missing_ok=True)
+
+    worker_thread.join(timeout=2.0)
+    assert not worker_thread.is_alive()
+    assert len(caught_errors) == 1
+    assert isinstance(caught_errors[0], StudioPausedError)
+    clear_candidate_build_aborted(cand_old)
+
+
+
+
 
 
 

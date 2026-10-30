@@ -80,6 +80,9 @@ class OpenGenreCartridgeBundle(BaseEpistemicModel):
         self,
         target_dir: Path,
         swe_agent: Optional[Any] = None,
+        pre_write_hook: Optional[Any] = None,
+        commit_gate: Optional[Any] = None,
+        allowed_files: Optional[Set[str]] = None,
     ) -> Dict[str, Path]:
         """Assembles, verifies, and writes modular cartridge files to target_dir.
         Returns dictionary mapping filename -> Path.
@@ -691,6 +694,14 @@ class LeadGameplaySWEAgent:
                 game_bible=game_bible,
             )
             active_curator = curator
+            eff_item_kind = "mechanic_code"
+            if board is not None and hasattr(board, "get"):
+                try:
+                    b_it = board.get(track.id)
+                    if b_it is not None and getattr(b_it, "kind", None):
+                        eff_item_kind = str(b_it.kind)
+                except Exception:
+                    pass
             pack = curator.curate_context(
                 target_agent_role="swe_engineer",
                 task_request=(
@@ -698,7 +709,7 @@ class LeadGameplaySWEAgent:
                     f"{track.description}\n"
                 ),
                 item_id=track.id,
-                item_kind="mechanic_code",
+                item_kind=eff_item_kind,
                 extra_image_paths=extra_image_paths,
             )
             already_included_cids = [ch.chunk_id for ch in (pack.retrieved_chunks or [])]
@@ -775,6 +786,7 @@ class LeadGameplaySWEAgent:
 
         target_module_set = {str(m).strip() for m in (getattr(track, "target_modules", None) or []) if str(m).strip()}
         existing_code_summary = []
+        summarized_only_mods: Set[str] = set()
         for mod_name, code in existing_modules.items():
             error_references_mod = bool(prior_error and mod_name in prior_error)
             if (
@@ -784,6 +796,7 @@ class LeadGameplaySWEAgent:
                 and not error_references_mod
                 and len(code) > 2000
             ):
+                summarized_only_mods.add(mod_name)
                 sig_summary = self._summarize_non_target_gd_module(mod_name, code)
                 existing_code_summary.append(
                     f"--- Existing {mod_name} (Cross-Module API Signature & State Contract; {len(code)} bytes on disk — untouched unless needed) ---\n{sig_summary}"
@@ -856,9 +869,10 @@ class LeadGameplaySWEAgent:
                 f"     * NEVER set `render_target_update_mode = SubViewport.UPDATE_ALWAYS` on an accumulation `SubViewport` that uses `render_target_clear_mode = SubViewport.CLEAR_MODE_NEVER` (causes severe GPU tile-memory load/store stalls and <1 FPS frame rates). Instead, use `SubViewport.UPDATE_ONCE` and trigger `render_target_update_mode = SubViewport.UPDATE_ONCE` only when a new stroke is queued.\n"
                 f"     * NEVER call `queue_redraw()` unconditionally every frame inside `_process(delta)` on a node whose `_draw()` loops over a 2D grid or a growing array of strokes/corridors. Only call `queue_redraw()` when grid/stroke state changes, coalesce/deduplicate stroke segments with a minimum distance threshold (`p1.distance_to(p2) >= 8.0`), and let GPU fragment shaders (`u_time`) animate continuous surface waves without CPU `CanvasItem` re-tessellation.\n"
                 f"     * NEVER dynamically allocate and `add_child()` hundreds of individual per-cell `CollisionShape2D` nodes inside `_physics_process()`.\n"
-                f"   - MANDATORY 24,000 Hz PCM WAV AUDIO LOADING & COOLDOWN: All synthesized WAV voice clips in 'res://assets/audio/*.wav' are 24,000 Hz, 16-bit mono PCM. When loading via FileAccess.get_file_as_bytes(ProjectSettings.globalize_path(path)), you MUST strip the 44-byte RIFF header (`stream.data = bytes.slice(44) if bytes.size() > 44 else bytes`), set `stream.format = AudioStreamWAV.FORMAT_16_BITS`, `stream.mix_rate = 24000` (NEVER 44100, which causes high-pitched chipmunk distortion!), and `stream.stereo = false`. Furthermore, enforce a non-overlapping playback guard (`if not audio_player.playing:`) and a minimum cooldown (>= 8.0 seconds) so voice barks NEVER spam or repeat every few seconds.\n"
+                f"   - GODOT 4 `AudioStreamWAV` RAW PCM API REFERENCE: All synthesized WAV clips in 'res://assets/audio/*.wav' are 24,000 Hz, 16-bit mono PCM. When loading via `FileAccess.get_file_as_bytes(ProjectSettings.globalize_path(path))`, strip the 44-byte RIFF header (`stream.data = bytes.slice(44) if bytes.size() > 44 else bytes`) and set `stream.format = AudioStreamWAV.FORMAT_16_BITS`, `stream.mix_rate = 24000`, and `stream.stereo = false`. Note that in Godot 4 `AudioStreamWAV.new()` defaults to `loop_mode = AudioStreamWAV.LOOP_DISABLED`; streams intended to loop continuously require `stream.loop_mode = AudioStreamWAV.LOOP_FORWARD`, `stream.loop_begin = 0`, and `stream.loop_end = int(stream.data.size() / (4 if stream.stereo else 2))`, whereas one-shot voice/SFX clips use `LOOP_DISABLED` with non-overlapping playback guards.\n"
                 f"6. UI/UX, CLEAR VIEWPORT & RECOVERABLE GAMEPLAY:\n"
                 f"   - Guide the player and present game state, controls, and feedback according to the Living Game Bible's UI & onboarding philosophy (`diegetic_ui_philosophy` and `onboarding_plan`).\n"
+                f"   - LIVE STATE TRUTH & FIRST-TIME PLAYER EMPATHY: Ensure all HUD readouts, affordability states, and contextual prompts bind to live authoritative game state rather than static placeholder strings, and verify from a first-time player's perspective that `t=0` orientation and event triggers remain clear and non-repetitive.\n"
                 f"   - ABSOLUTE BAN ON DEBUG/TELEMETRY HUD PANELS IN `ui_hud.gd`: NEVER draw QA test results, `HEADLESS MECHANICS & TELEMETRY VERIFICATION`, `ALL PASS` badges, `headless_test_results` dicts, or raw float telemetry dashboards onto `ui_hud.gd` or the game viewport. QA assertions and filmstrip annotations are rendered externally by the QA Test Renderer. `ui_hud.gd` must contain ONLY player-facing UI designed for the game.\n"
                 f"   - NEVER blind the player on startup with >30% opaque full-screen overlays or frost, and NEVER lock out player controls with an unrecoverable game-over screen in the first 30 seconds.\n"
                 f"   - Use `get_global_mouse_position()` for accurate HiDPI world-space mouse picking.\n"
@@ -871,10 +885,15 @@ class LeadGameplaySWEAgent:
                 f"   - NEVER pass arguments to move_and_slide().\n"
                 f"8. 1:1 VISUAL-TO-PHYSICAL COLLIDER & BOUNDARY ALIGNMENT:\n"
                 f"   - Every solid surface, obstacle, boundary wall, or interactive zone rendered visually MUST have matching `StaticBody2D`, `CollisionPolygon2D`, `CollisionShape2D`, or `Area2D` geometry aligned 1:1 with its visual representation so entities never clip through solid boundaries or float over empty space.\n"
-                f"9. ABSOLUTE BAN ON PRE-SOLVED t=0 LEVELS, PRE-WIRED DIORAMAS, SHALLOW TUTORIAL STUBS, SELF-PLAYING `sim_tick` / `playtest_timer` DEMO LOOPS & FAKE DISCONNECTED SIMULATIONS:\n"
+                f"9. ABSOLUTE BAN ON PRE-SOLVED t=0 LEVELS, PRE-WIRED DIORAMAS, SHALLOW TUTORIAL STUBS, SELF-PLAYING `sim_tick` / `playtest_timer` DEMO LOOPS, FAKE DISCONNECTED SIMULATIONS & TEST-GAMING SHORTCUTS:\n"
                 f"   - DELIVER THE LARGER POINT OF THE GAME (NOT A TINY TUTORIAL SLICE): Onboarding is ONLY the opening 60 seconds of play; never reduce the game to a linear 4-step tutorial checklist or a single 1-click lock-and-key connection! Implement the full playable system described in `CORE LOOP` (`moment_to_moment_loop`, `minute_to_minute_loop`, `session_loop`, and `player_agency_and_optimization_depth`) and `GOAL HIERARCHY` (short-, mid-, and long-term goals) so the player has a genuine toolkit/sandbox to build, experiment, optimize, or strategize across multiple stages with no single pre-scripted solution.\n"
                 f"   - UNSOLVED t=0 BASELINE (`test_unsolved_baseline_t0`) & ZERO `func test_*()` POLLUTION IN `main.gd`: `_ready()` at `t = 0` in `main.gd` (`res://main.tscn`) is the live starting state for the human player! NEVER pre-solve, pre-connect, pre-place completed player structures, or pre-complete the game objective inside `_ready()` (`is_completed` MUST be `false` and player-built connections/systems MUST start unbuilt/unsolved at `t=0`) just to make a downstream mechanic visible at tick 0 in a QA capture, and NEVER add `func test_*()` scenario-staging helper functions to `main.gd`! Isolated QA scenario staging belongs strictly in `res://tests/test_<item_id>.gd` + `res://tests/test_<item_id>.tscn` authored by `qa_test_engineer` (or driven via `input_segments`).\n"
-                f"   - REAL INTERACTIVE VERBS & CAMERA NAVIGATION: Wire every player verb in the Game Bible's `core_loop.player_verbs` and active slice `scope_boundaries` (including mouse click/drag placement or connection via `InputEventMouseButton` / `get_global_mouse_position()`, keyboard actions, component socketing/tuning, and `Camera2D` panning/navigation when `world_bounds` exceeds 1280x720) to authentic `_unhandled_input` / `_input` / UI handlers. NEVER bind a fake tutorial-skip key (like `KEY_TAB`) that advances onboarding labels without the player performing the actual in-world mechanic that completes the step.\n"
+                f"   - GAMEPLAY CRAFTSMANSHIP & ANTI-CHEAT MANDATE (ZERO SHORTCUTS TO PASS QA ASSERTIONS):\n"
+                f"     * NO HITBOX / RADIUS INFLATION: Collision shapes, trigger zones, and catch/interaction radii MUST match the physical visual bounds of their sprite/structure (typically 24–48px). NEVER inflate a catch/trigger radius (e.g., to 100–200px+) or vertical tolerance to turn a precision mechanic into an unmissable giant magnet just to make a QA state assertion pass!\n"
+                f"     * NO GOALPOST SHIFTING INTO UN-INTERACTED PATHS: NEVER place, move, or pre-spawn a target/receiver/goal into the default un-deflected/un-routed trajectory of an emitter/spawner so that the objective completes without player construction or routing. The engine's Counterfactual QA Check runs the exact same simulation with `input_script = []` (zero player inputs) and automatically fails any build where post-baseline progress assertions pass without player intervention—even if a prior revision note or feedback comment mistakenly suggested moving the goal into the default trajectory!\n"
+                f"     * NO HOLLOW `ResourceLoader.exists()` NULL STUBS: Every selectable tool, structure, or entity in a builder/HUD/mechanic MUST instantiate a real, functional node with visuals and gameplay logic. Never wrap a missing script path in `if ResourceLoader.exists(...) else null` that leaves a tool slot silently doing nothing when clicked.\n"
+                f"     * EXPOSE STEP-BY-STEP CAUSAL TELEMETRY IN `get_state_snapshot()`: Expose clear snapshot keys for every link in the player's causal chain (e.g., active tool/slot selection, placement validity at cursor, placed structure counts, intermediate interaction/ricochet counts, and final objective/delivery counts) so QA can script and verify each step honestly.\n"
+                f"   - CAUSAL REACHABILITY OF PLAYER VERBS FROM `t=0`: Wire every player verb in the Game Bible's `core_loop.player_verbs` and active slice `scope_boundaries` (including mouse interactions, keyboard actions, and `Camera2D` navigation when `world_bounds` exceeds 1280x720) to authentic `_unhandled_input` / `_input` / UI handlers, and trace the dependency chain from the live `t=0` state in `deliberation` to verify that every action is causally reachable without circular deadlocks or input-dispatch shadowing. NEVER bind a fake tutorial-skip key (like `KEY_TAB`) that advances onboarding labels without the player performing the actual in-world mechanic.\n"
                 f"   - NEVER write self-playing tick-sequenced or timer-sequenced demo loops in `_process` or `_physics_process` (e.g., `if sim_tick == 62:`, `if playtest_timer < 1.0:`, `handle_automated_playtest_cadence`, `auto_test_phase`, `current_demo_status`, `user_override_lockout`) that automatically trigger player actions, movement, choices, or objective resolutions on a frame counter or timer. All gameplay actions must be driven by real input handlers (`_input`, `_unhandled_input`, `Input.is_action_pressed`, `Input.is_key_pressed`), and test scenario staging is performed externally by the QA Test Renderer (`setup_calls` and `input_segments`).\n"
                 f"   - All systemic state transitions and mechanics MUST compute authentic state updates from the game's actual rules and entity interactions (`system_interactions`)—NEVER fake state completion out of thin air.\n"
                 f"10. RATIONALE-FIRST EPISTEMIC RULE (Rule 4): deliberation MUST be provided FIRST in every payload before files and code.\n\n"
@@ -960,14 +979,18 @@ class LeadGameplaySWEAgent:
                 )
             except Exception:
                 pass
-            contents_payload: Any = (
-                [turn_prompt] + multimodal_mockup_parts
-                if (multimodal_mockup_parts and self._is_live_genai_client())
-                else turn_prompt
-            )
             bundle = None
+            attempt_validation_note = ""
             for g_attempt in range(1, max_gemini_retries + 1):
                 try:
+                    eff_turn_prompt = (
+                        f"{turn_prompt}\n\n{attempt_validation_note}" if attempt_validation_note else turn_prompt
+                    )
+                    contents_payload: Any = (
+                        [eff_turn_prompt] + multimodal_mockup_parts
+                        if (multimodal_mockup_parts and self._is_live_genai_client())
+                        else eff_turn_prompt
+                    )
                     lbl_suffix = f":q{inquiry_turn}" if inquiry_turn > 0 else ""
                     response = call_gemini_with_transient_retry(
                         lambda: self.client.models.generate_content(
@@ -991,7 +1014,14 @@ class LeadGameplaySWEAgent:
                         or "self_question" in bundle_dict
                         or "diagnostic_test_scene_request" in bundle_dict
                     ):
-                        bundle = TrackCodeSynthesisPayload(**bundle_dict)
+                        cand_bundle = TrackCodeSynthesisPayload(**bundle_dict)
+                        if self._is_live_genai_client():
+                            self._validate_no_large_file_clobber(
+                                cand_bundle,
+                                staging_dir=staging_dir,
+                                summarized_only_mods=summarized_only_mods,
+                            )
+                        bundle = cand_bundle
                     else:
                         bundle = OpenGenreCartridgeBundle(**bundle_dict)
                     self.last_deliberation = bundle.deliberation
@@ -999,6 +1029,12 @@ class LeadGameplaySWEAgent:
                         getattr(bundle, "diagnostic_test_scene_request", "") or ""
                     ).strip()
                     break
+                except CodeVerificationError as cv_exc:
+                    last_exc = cv_exc
+                    attempt_validation_note = (
+                        f"CRITICAL PAYLOAD VALIDATION ERROR ON ATTEMPT #{g_attempt} — FIX IMMEDIATELY:\n{cv_exc}"
+                    )
+                    logger.warning("Gemini attempt %d/%d validation rejected for track %s: %s", g_attempt, max_gemini_retries, track.id, cv_exc)
                 except Exception as exc:
                     last_exc = exc
                     logger.warning("Gemini attempt %d/%d for track %s failed: %s", g_attempt, max_gemini_retries, track.id, exc)
@@ -1109,6 +1145,48 @@ class LeadGameplaySWEAgent:
         )
 
     synthesize_requirement_track = implement_requirement_track
+
+    def _validate_no_large_file_clobber(
+        self,
+        bundle: TrackCodeSynthesisPayload,
+        staging_dir: Path,
+        summarized_only_mods: Optional[Set[str]] = None,
+    ) -> None:
+        """Rejects full-file overwrites (`files`) of non-target modules whose full source was NOT
+        loaded in the prompt (`summarized_only_mods`), guiding SWE to inspect the full module via
+        `self_question` first rather than regenerating an unread file from its signature summary."""
+        if not isinstance(bundle, TrackCodeSynthesisPayload) or not bundle.files:
+            return
+        summarized_set = set(summarized_only_mods or ())
+        if not summarized_set:
+            return
+        summarized_clobbered: List[str] = []
+        for fspec in bundle.files:
+            fn_norm = (
+                str(getattr(fspec, "filename", "") or "")
+                .strip()
+                .replace("\\", "/")
+                .removeprefix("res://")
+                .lstrip("/")
+            )
+            if not fn_norm or not fn_norm.endswith(".gd") or fn_norm.startswith("tests/"):
+                continue
+            disk_path = Path(staging_dir) / fn_norm
+            if not disk_path.is_file():
+                continue
+            if fn_norm in summarized_set:
+                try:
+                    existing_line_count = len(disk_path.read_text(encoding="utf-8").splitlines())
+                except Exception:
+                    existing_line_count = 0
+                summarized_clobbered.append(f"{fn_norm} ({existing_line_count} lines, summarized in prompt)")
+        if summarized_clobbered:
+            raise CodeVerificationError(
+                f"Full-file `files` overwrite rejected for unread/summarized module(s) {summarized_clobbered}: "
+                "you were only shown a signature summary of this file, not its full source code. "
+                "To modify an unread module safely, first output a `self_question` (`patches=[]`, `files=[]`) "
+                "requesting its full source lines so ContextCuratorAgent loads it into your context on the next turn."
+            )
 
     def verify_cartridge_cross_module_imports(self, cartridge_dir: Path, raise_on_error: bool = True) -> Tuple[bool, List[str]]:
         """Statically verifies inter-module imports across Python files in cartridge_dir.
@@ -2244,6 +2322,52 @@ class LeadGameplaySWEAgent:
             )
         return "\n\n".join(out_blocks)
 
+    def _filter_diagnostics_for_allowed_files(
+        self,
+        c_dir: Path,
+        diagnostics: List[Any],
+        allowed_files: Optional[Set[str]],
+    ) -> List[Any]:
+        """Filters Godot diagnostics to files within `allowed_files` when provided (and re-points
+        cascading `Could not preload resource script "res://X.gd"` caller diagnostics to `X.gd`
+        when `X.gd` is in `allowed_files`), so a parallel worker never wastes PEV cycles trying
+        to patch files locked by another task."""
+        if not diagnostics or allowed_files is None:
+            return list(diagnostics or [])
+        from engine.sim.godot_verifier import GDScriptDiagnostic
+
+        norm_allowed = {
+            str(f or "").replace("res://", "").lstrip("/")
+            for f in allowed_files
+            if str(f or "").strip()
+        }
+        scoped: List[Any] = []
+        repointed_targets: Set[str] = set()
+        for d in diagnostics:
+            d_file = getattr(d, "file_path", None)
+            try:
+                rel_d = Path(d_file).resolve().relative_to(c_dir.resolve()).as_posix() if d_file else ""
+            except Exception:
+                rel_d = Path(d_file).name if d_file else ""
+            if rel_d in norm_allowed:
+                scoped.append(d)
+                continue
+            msg = str(getattr(d, "error_message", d) or "")
+            if "Could not preload resource script" in msg or "Failed to load script" in msg:
+                for m_uri in re.findall(r'res://([^\s"\']+\.gd)', msg):
+                    clean_target = m_uri.lstrip("/")
+                    if clean_target in norm_allowed and clean_target not in repointed_targets:
+                        repointed_targets.add(clean_target)
+                        scoped.append(
+                            GDScriptDiagnostic(
+                                file_path=c_dir / clean_target,
+                                line_number=1,
+                                error_message=f"Script failed to compile when preloaded ({msg}); check syntax and types in {clean_target}.",
+                                raw_line=getattr(d, "raw_line", msg),
+                            )
+                        )
+        return scoped
+
     def _apply_surgical_patches(
         self,
         c_dir: Path,
@@ -2282,7 +2406,9 @@ class LeadGameplaySWEAgent:
         from engine.studio.asset_library import CartridgeAssetLibrary
 
         results: Dict[str, Path] = {}
-        current_diagnostics = list(initial_diagnostics or [])
+        current_diagnostics = self._filter_diagnostics_for_allowed_files(
+            c_dir, list(initial_diagnostics or []), allowed_files
+        )
         current_defect = defect_summary
 
         asset_summary = ""
@@ -2512,7 +2638,17 @@ class LeadGameplaySWEAgent:
             # -----------------------------------------------------------------
             # PEV PHASE 3: VERIFY (Headless Godot compiler + 2-tick runtime check)
             # -----------------------------------------------------------------
-            is_valid, new_diagnostics = verify_godot_cartridge_syntax(c_dir)
+            try:
+                is_valid, raw_new_diagnostics = verify_godot_cartridge_syntax(
+                    c_dir, extra_files=sorted(allowed_files) if allowed_files else None
+                )
+            except TypeError:
+                is_valid, raw_new_diagnostics = verify_godot_cartridge_syntax(c_dir)
+            new_diagnostics = self._filter_diagnostics_for_allowed_files(
+                c_dir, raw_new_diagnostics, allowed_files
+            )
+            if allowed_files is not None and not new_diagnostics:
+                is_valid = True
             # Also check if any file still contains broken `AssetLib.` calls
             lingering_assetlib: List[str] = []
             for gd_p in iter_cartridge_gd_files(c_dir, include_tests=False, exclude_helper_libs=True):
@@ -3931,7 +4067,17 @@ class LeadGameplaySWEAgent:
         from engine.sim.godot_verifier import verify_godot_cartridge_syntax
         results: Dict[str, Path] = {}
 
-        is_valid, diagnostics = verify_godot_cartridge_syntax(c_dir)
+        try:
+            is_valid, raw_diagnostics = verify_godot_cartridge_syntax(
+                c_dir, extra_files=sorted(allowed_files) if allowed_files else None
+            )
+        except TypeError:
+            is_valid, raw_diagnostics = verify_godot_cartridge_syntax(c_dir)
+        diagnostics = self._filter_diagnostics_for_allowed_files(
+            c_dir, raw_diagnostics, allowed_files
+        )
+        if allowed_files is not None and not diagnostics:
+            is_valid = True
         self._last_syntax_heal_failed = False
         if not is_valid and diagnostics:
             if self._is_live_genai_client():
@@ -3951,7 +4097,17 @@ class LeadGameplaySWEAgent:
                     allowed_files=allowed_files,
                 )
                 results.update(pev_res)
-                post_valid, _ = verify_godot_cartridge_syntax(c_dir)
+                try:
+                    post_valid, post_raw_diags = verify_godot_cartridge_syntax(
+                        c_dir, extra_files=sorted(allowed_files) if allowed_files else None
+                    )
+                except TypeError:
+                    post_valid, post_raw_diags = verify_godot_cartridge_syntax(c_dir)
+                post_diags = self._filter_diagnostics_for_allowed_files(
+                    c_dir, post_raw_diags, allowed_files
+                )
+                if allowed_files is not None and not post_diags:
+                    post_valid = True
                 self._last_syntax_heal_failed = not post_valid
             else:
                 for fix_attempt in range(3):

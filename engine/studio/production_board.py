@@ -313,6 +313,15 @@ class ProductionBoard:
                 issues.append(f"item_id '{p.item_id}' already exists on the board.")
             if not p.item_id.strip():
                 issues.append("item_id must not be empty.")
+            bad_test_mods = [
+                m for m in (getattr(p, "target_modules", None) or [])
+                if str(m or "").strip().replace("\\", "/").removeprefix("res://").lstrip("/").startswith("tests/")
+            ]
+            if bad_test_mods:
+                issues.append(
+                    f"Item '{p.item_id}' targets QA test file(s) {bad_test_mods} in `target_modules`. "
+                    "Production Board tasks must target production game scripts (never `tests/test_*`); QA test harnesses are authored exclusively by `qa_test_engineer` during proof verification."
+                )
         known = existing | set(batch_ids)
         for p in proposals:
             for d in p.depends_on:

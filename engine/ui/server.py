@@ -315,6 +315,16 @@ class SwarmEventBus:
             "updated_at_utc": now_iso,
         }
         with self._thread_lock:
+            try:
+                from engine.studio.models import get_active_gemini_dataset_context, mark_candidate_build_aborted
+                mark_candidate_build_aborted(get_active_gemini_dataset_context().get("candidate_dir"))
+                prev_bid = str(getattr(self, "_active_build_id", "") or "").strip()
+                if prev_bid.startswith("build_"):
+                    prev_bid = prev_bid[len("build_"):]
+                if prev_bid.startswith("candidate_"):
+                    mark_candidate_build_aborted(prev_bid)
+            except Exception:
+                pass
             old_orch = getattr(self, "_active_orchestrator", None)
             if old_orch is not None:
                 try:
@@ -1858,6 +1868,7 @@ def create_app(
     cartridges_root: Optional[Path] = None,
     active_cartridge_dir: Optional[Path] = None,
     event_bus: Optional[SwarmEventBus] = None,
+    playtest_manager: Optional[Any] = None,
 ) -> Starlette:
     """Factory function creating the Starlette ASGI application for Studio Observability."""
     target_bus = event_bus or swarm_bus
@@ -2856,7 +2867,7 @@ def create_app(
             body = {}
 
         profile_tag = str(body.get("profile_tag", "default") or "default")
-        creative_prompt = str(body.get("creative_prompt", "") or "").strip()
+        creative_prompt = str(body.get("creative_prompt") or body.get("feedback") or "").strip()
         pause_for_greenlight = body.get("pause_for_greenlight")
         reset_active = bool(body.get("reset_active", False))
         resume_current = bool(body.get("resume_current", False))
@@ -2864,52 +2875,15 @@ def create_app(
         job_id = f"gen_{uuid.uuid4().hex[:8]}"
         build_id = f"build_{job_id}"
 
-        target_bus._build_paused = False
-        if target_bus is not swarm_bus:
-            swarm_bus._build_paused = False
-        try:
-            pause_sentinel = target_cartridges / ".studio_paused.json"
-            if pause_sentinel.is_file():
-                pause_sentinel.unlink()
-        except Exception:
-            pass
-        orch_active = getattr(target_bus, "_active_orchestrator", None)
-        if orch_active is not None and getattr(orch_active, "_board_scheduler", None) is not None:
-            try:
-                orch_active._board_scheduler.resume()
-            except Exception:
-                pass
-
         if pause_for_greenlight is not None:
             target_bus._pause_for_greenlight = bool(pause_for_greenlight)
             if target_bus is not swarm_bus:
                 swarm_bus._pause_for_greenlight = bool(pause_for_greenlight)
 
-        resumed_cand_name: Optional[str] = None
-        if resume_current:
-            try:
-                from engine.studio.daemon import rehydrate_resumable_candidate_from_db
-                rehydrated_dir = rehydrate_resumable_candidate_from_db(
-                    db_path=target_db,
-                    cartridges_root=target_cartridges,
-                    preferred_candidate_id=candidate_id,
-                )
-                if rehydrated_dir is not None:
-                    resumed_cand_name = rehydrated_dir.name
-                    build_id = f"build_{resumed_cand_name}"
-                    target_bus._active_build_id = build_id
-                    if target_bus is not swarm_bus:
-                        swarm_bus._active_build_id = build_id
-                    gb_file = rehydrated_dir / "game_bible.json"
-                    if gb_file.is_file():
-                        gb_data = json.loads(gb_file.read_text(encoding="utf-8"))
-                        target_bus.publish_game_bible_update(gb_data)
-                        if target_bus is not swarm_bus:
-                            swarm_bus.publish_game_bible_update(gb_data)
-            except Exception as rehyd_exc:
-                logger.warning("Rehydration during resume trigger encountered warning: %s", rehyd_exc)
-        else:
-            # Initialize a clean brainstorming session when starting a new game from scratch
+        # If starting a new game from scratch, abort any active/paused build BEFORE unlinking .studio_paused.json
+        # so a paused worker thread cannot wake up and resume the old candidate build.
+        initial_bible: Optional[Dict[str, Any]] = None
+        if not resume_current:
             if reset_active and "PYTEST_CURRENT_TEST" not in os.environ:
                 try:
                     old_cp_meta = target_active / "checkpoint_metadata.json"
@@ -2928,13 +2902,101 @@ def create_app(
                         build_id=build_id,
                         creative_prompt=creative_prompt,
                     )
-                await target_bus.broadcast({
-                    "deliberation": initial_bible["deliberation"],
-                    "event_type": SwarmEventType.GAME_BIBLE_UPDATED.value,
-                    "agent_name": "CreativeWritersRoom",
-                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                    "payload": initial_bible,
-                })
+
+        target_bus._build_paused = False
+        if target_bus is not swarm_bus:
+            swarm_bus._build_paused = False
+        try:
+            pause_sentinel = target_cartridges / ".studio_paused.json"
+            if pause_sentinel.is_file():
+                pause_sentinel.unlink()
+        except Exception:
+            pass
+        if resume_current:
+            orch_active = getattr(target_bus, "_active_orchestrator", None)
+            if orch_active is not None and getattr(orch_active, "_board_scheduler", None) is not None:
+                try:
+                    orch_active._board_scheduler.resume()
+                except Exception:
+                    pass
+
+        resumed_cand_name: Optional[str] = None
+        if resume_current:
+            try:
+                from engine.studio.daemon import rehydrate_resumable_candidate_from_db
+                rehydrated_dir = rehydrate_resumable_candidate_from_db(
+                    db_path=target_db,
+                    cartridges_root=target_cartridges,
+                    preferred_candidate_id=candidate_id,
+                )
+                if rehydrated_dir is not None:
+                    resumed_cand_name = rehydrated_dir.name
+                    try:
+                        from engine.studio.models import clear_candidate_build_aborted
+                        clear_candidate_build_aborted(rehydrated_dir)
+                    except Exception:
+                        pass
+                    build_id = f"build_{resumed_cand_name}"
+                    target_bus._active_build_id = build_id
+                    if target_bus is not swarm_bus:
+                        swarm_bus._active_build_id = build_id
+                    gb_file = rehydrated_dir / "game_bible.json"
+                    if gb_file.is_file():
+                        gb_data = json.loads(gb_file.read_text(encoding="utf-8"))
+                        if creative_prompt:
+                            now_iso_resume = datetime.now(timezone.utc).isoformat()
+                            utt_resume = {
+                                "deliberation": f"Executive Producer provided feedback for resumed slice iteration: {creative_prompt}",
+                                "utterance_id": f"utt_exec_{uuid.uuid4().hex[:8]}",
+                                "turn_index": len(gb_data.get("writers_room_transcript", [])),
+                                "speaker_role": "ExecutiveProducer",
+                                "speaker_display_name": "Executive Producer (You)",
+                                "spoken_dialogue": creative_prompt,
+                                "message": creative_prompt,
+                                "addressed_to": [
+                                    "CreativeDirector",
+                                    "GameplayDesigner",
+                                    "LevelAndProgressionDesigner",
+                                    "UXExperienceDesigner",
+                                    "GameplaySystemsEngineer",
+                                ],
+                                "referenced_roles": ["CreativeDirector", "GameplayDesigner"],
+                                "bible_updates_summary": ["Executive Producer slice feedback injected"],
+                                "artifact_emitted": None,
+                                "timestamp_utc": now_iso_resume,
+                            }
+                            transcript_resume = gb_data.setdefault("writers_room_transcript", [])
+                            if not transcript_resume or transcript_resume[-1].get("spoken_dialogue") != creative_prompt:
+                                transcript_resume.append(utt_resume)
+                                gb_file.write_text(json.dumps(gb_data, indent=2), encoding="utf-8")
+                            try:
+                                sf_resume = rehydrated_dir / ".pending_steering.json"
+                                existing_sf_resume: List[str] = []
+                                if sf_resume.is_file():
+                                    try:
+                                        raw_sfr = json.loads(sf_resume.read_text(encoding="utf-8"))
+                                        if isinstance(raw_sfr, list):
+                                            existing_sf_resume = [str(x).strip() for x in raw_sfr if str(x).strip()]
+                                    except Exception:
+                                        existing_sf_resume = []
+                                if creative_prompt not in existing_sf_resume:
+                                    existing_sf_resume.append(creative_prompt)
+                                sf_resume.write_text(json.dumps(existing_sf_resume, indent=2), encoding="utf-8")
+                            except Exception as sf_err:
+                                logger.debug("Failed writing .pending_steering.json during resume trigger: %s", sf_err)
+                        target_bus.publish_game_bible_update(gb_data)
+                        if target_bus is not swarm_bus:
+                            swarm_bus.publish_game_bible_update(gb_data)
+            except Exception as rehyd_exc:
+                logger.warning("Rehydration during resume trigger encountered warning: %s", rehyd_exc)
+        elif initial_bible is not None:
+            await target_bus.broadcast({
+                "deliberation": initial_bible["deliberation"],
+                "event_type": SwarmEventType.GAME_BIBLE_UPDATED.value,
+                "agent_name": "CreativeWritersRoom",
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "payload": initial_bible,
+            })
 
         event = {
             "deliberation": (
@@ -2984,8 +3046,9 @@ def create_app(
             else:
                 def _run_bg_genesis() -> None:
                     try:
-                        # Wait briefly if a previous cancelled build is finishing cleanup
-                        for _ in range(50):
+                        # Wait for any cancelled/preempted build to release _genesis_build_lock
+                        max_wait_iters = 600 if (reset_active or resume_current or creative_prompt) else 50
+                        for _ in range(max_wait_iters):
                             if not _genesis_build_lock.locked():
                                 break
                             time.sleep(0.1)
@@ -6055,6 +6118,308 @@ def create_app(
         )
         return JSONResponse(resp_obj.model_dump())
 
+    _playtest_mgr_holder: List[Any] = [playtest_manager]
+    _playtest_mgr_lock = threading.Lock()
+    if playtest_manager is not None and target_bus is not None:
+        setattr(target_bus, "_playtest_manager", playtest_manager)
+
+    def _get_playtest_manager():
+        with _playtest_mgr_lock:
+            if _playtest_mgr_holder[0] is None and target_bus is not None:
+                bus_mgr = getattr(target_bus, "_playtest_manager", None)
+                if bus_mgr is not None:
+                    _playtest_mgr_holder[0] = bus_mgr
+            if _playtest_mgr_holder[0] is None:
+                from engine.playtest.session_manager import PlaytestSessionManager
+                resolved_pt_db = (
+                    target_db
+                    if target_db is not None
+                    else (target_cartridges.parent / "data" / "telemetry.db")
+                )
+                resolved_pt_db.parent.mkdir(parents=True, exist_ok=True)
+                _playtest_mgr_holder[0] = PlaytestSessionManager(
+                    db_path=resolved_pt_db,
+                    cartridges_root=target_cartridges,
+                    event_bus=target_bus,
+                )
+                if target_bus is not None:
+                    setattr(target_bus, "_playtest_manager", _playtest_mgr_holder[0])
+            return _playtest_mgr_holder[0]
+
+    async def playtest_sessions_list_handler(request):
+        """GET /api/playtest/sessions: Lists Blind Playtester sessions, playable slice/checkpoint targets, and pending wishes."""
+        mgr = _get_playtest_manager()
+        cp_filter = request.query_params.get("checkpoint_id") or None
+        cand_filter = request.query_params.get("candidate_id") or None
+        db = mgr._db()
+        sessions = db.list_playtest_sessions(checkpoint_id=cp_filter, candidate_id=cand_filter, limit=60)
+        for s in sessions:
+            has_vid = bool(s.get("video_path") and Path(str(s["video_path"])).is_file())
+            if not has_vid and s.get("status") in ("stopped", "completed", "error"):
+                recovered = mgr._recover_unmuxed_session_video(s, db)
+                has_vid = bool(recovered and Path(recovered).is_file())
+            s["has_video"] = has_vid
+            s["latest_frame_name"] = Path(str(s["latest_frame_path"])).name if s.get("latest_frame_path") else None
+        pending_wishes = db.list_playtest_wishes(status="pending", limit=100)
+        targets = mgr.list_playable_targets()
+        return JSONResponse({
+            "deliberation": f"Listed {len(sessions)} Blind Playtester sessions and {len(targets)} playable slice/checkpoint targets.",
+            "sessions": sessions,
+            "playable_targets": targets,
+            "pending_wishes_count": len(pending_wishes),
+        })
+
+    async def playtest_session_start_handler(request):
+        """POST /api/playtest/sessions/start: Launches a decoupled Blind Playtester session on a checkpoint or completed slice."""
+        from engine.playtest.models import PlaytestSessionStartRequest
+        from engine.studio.models import StudioAgentError
+
+        try:
+            raw_body = await request.json() if await request.body() else {}
+        except Exception:
+            return JSONResponse({"deliberation": "Malformed JSON payload.", "error": "Invalid JSON body"}, status_code=400)
+        try:
+            req = PlaytestSessionStartRequest(**raw_body)
+            mgr = _get_playtest_manager()
+            sess = mgr.start_session(req)
+            return JSONResponse({
+                "deliberation": f"Started Blind Playtester session '{sess.get('session_id')}' on '{sess.get('game_title')}'.",
+                "session": sess,
+            })
+        except StudioAgentError as exc:
+            return JSONResponse({"deliberation": str(exc), "error": str(exc)}, status_code=400)
+        except Exception as exc:
+            logger.error("Failed starting playtest session: %s", exc)
+            return JSONResponse({"deliberation": f"Playtest start failed: {exc}", "error": str(exc)}, status_code=422)
+
+    async def playtest_session_detail_handler(request):
+        """GET /api/playtest/sessions/{session_id}: Full observability snapshot (turns, mood shifts, rulebook, journal, wishes)."""
+        session_id = request.path_params.get("session_id", "")
+        mgr = _get_playtest_manager()
+        detail = mgr.get_session_detail(session_id)
+        if detail is None:
+            return JSONResponse(
+                {"deliberation": f"Playtest session '{session_id}' not found.", "error": "Session not found"},
+                status_code=404,
+            )
+        return JSONResponse(detail)
+
+    async def playtest_session_control_handler(request):
+        """POST /api/playtest/sessions/{session_id}/control: Pause, resume, stop, or reset a Blind Playtester session."""
+        from engine.playtest.models import PlaytestSessionControlRequest
+        from engine.studio.models import StudioAgentError
+
+        session_id = request.path_params.get("session_id", "")
+        try:
+            raw_body = await request.json()
+            req = PlaytestSessionControlRequest(**raw_body)
+        except Exception as exc:
+            return JSONResponse({"deliberation": f"Invalid control payload: {exc}", "error": str(exc)}, status_code=400)
+        try:
+            mgr = _get_playtest_manager()
+            updated = mgr.control_session(session_id, req.action)
+            return JSONResponse({
+                "deliberation": f"Executed '{req.action}' on Blind Playtester session '{session_id}'.",
+                "action": req.action,
+                "session": updated,
+            })
+        except StudioAgentError as exc:
+            return JSONResponse({"deliberation": str(exc), "error": str(exc)}, status_code=404)
+
+    async def playtest_session_video_handler(request):
+        """GET /api/playtest/sessions/{session_id}/video: HTTP 206 Range-capable streaming of 1600x720 replay.mp4."""
+        from engine.studio.models import StudioAgentError
+
+        session_id = request.path_params.get("session_id", "")
+        mgr = _get_playtest_manager()
+        try:
+            mp4_path = mgr.resolve_session_media_file(session_id, "replay.mp4")
+        except FileNotFoundError:
+            return JSONResponse({"error": "Replay video not yet available for this session"}, status_code=404)
+        except StudioAgentError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        resp = _serve_file_with_range_support(mp4_path, "video/mp4", request)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+    async def playtest_session_media_handler(request):
+        """GET /api/playtest/sessions/{session_id}/media/{filename}: Serves screenshots, live preview frames, and turn WAV clips."""
+        from engine.studio.models import StudioAgentError
+
+        session_id = request.path_params.get("session_id", "")
+        filename = request.path_params.get("filename", "")
+        mgr = _get_playtest_manager()
+        try:
+            media_path = mgr.resolve_session_media_file(session_id, filename)
+        except FileNotFoundError:
+            return JSONResponse({"error": f"Media file '{filename}' not found"}, status_code=404)
+        except StudioAgentError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+        low = filename.lower()
+        if low.endswith(".png"):
+            mtype = "image/png"
+        elif low.endswith((".jpg", ".jpeg")):
+            mtype = "image/jpeg"
+        elif low.endswith(".wav"):
+            resp = _serve_file_with_range_support(media_path, "audio/wav", request)
+            resp.headers["Cache-Control"] = "no-cache"
+            return resp
+        elif low.endswith(".mp4"):
+            resp = _serve_file_with_range_support(media_path, "video/mp4", request)
+            resp.headers["Cache-Control"] = "no-cache"
+            return resp
+        else:
+            mtype = "application/octet-stream"
+        return FileResponse(str(media_path), media_type=mtype, headers={"Cache-Control": "no-cache"})
+
+    async def playtest_wishes_list_handler(request):
+        """GET /api/playtest/wishes: Lists player-submitted wish items across sessions."""
+        mgr = _get_playtest_manager()
+        session_id = request.query_params.get("session_id") or None
+        candidate_id = request.query_params.get("candidate_id") or None
+        status = request.query_params.get("status") or None
+        wishes = mgr._db().list_playtest_wishes(
+            session_id=session_id,
+            candidate_id=candidate_id,
+            status=status,
+            limit=200,
+        )
+        for w in wishes:
+            w["screenshot_name"] = Path(str(w["screenshot_path"])).name if w.get("screenshot_path") else None
+        return JSONResponse({
+            "deliberation": f"Retrieved {len(wishes)} Blind Playtester wish item(s).",
+            "wishes": wishes,
+        })
+
+    async def playtest_wish_dismiss_handler(request):
+        """POST /api/playtest/wishes/{wish_id}/dismiss: Marks a pending wish item dismissed."""
+        wish_id = request.path_params.get("wish_id", "")
+        mgr = _get_playtest_manager()
+        updated = mgr._db().update_playtest_wish_status(wish_id=wish_id, status="dismissed")
+        if updated is None:
+            return JSONResponse({"deliberation": f"Wish '{wish_id}' not found.", "error": "Wish not found"}, status_code=404)
+        return JSONResponse({
+            "deliberation": f"Dismissed Blind Playtester wish '{wish_id}'.",
+            "wish": updated,
+        })
+
+    async def playtest_wishes_send_handler(request):
+        """POST /api/playtest/wishes/send-to-council: Approves 1 or N wishes (single-click or batch)
+        and dispatches them immediately into the Council's steering + multimodal screenshot queue,
+        auto-waking `SteeringResume` if no Genesis build is currently running.
+        """
+        from engine.playtest.models import PlaytestWishDispatchRequest
+        from engine.studio.models import StudioAgentError
+
+        try:
+            raw_body = await request.json()
+            req = PlaytestWishDispatchRequest(**raw_body)
+        except Exception as exc:
+            return JSONResponse({"deliberation": f"Invalid wish dispatch request: {exc}", "error": str(exc)}, status_code=400)
+
+        mgr = _get_playtest_manager()
+        try:
+            updated_wishes, cand_dir, spoken_msg = mgr.dispatch_wishes_to_council(req.wish_ids, req.producer_note)
+        except StudioAgentError as exc:
+            return JSONResponse({"deliberation": str(exc), "error": str(exc)}, status_code=400)
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # Notify any live orchestrator / Writers' Room in memory immediately
+        orch = getattr(target_bus, "_active_orchestrator", None) or getattr(swarm_bus, "_active_orchestrator", None)
+        if orch is not None:
+            wr = getattr(orch, "writers_room", None)
+            if wr is not None and hasattr(wr, "queue_live_steering"):
+                try:
+                    wr.queue_live_steering(spoken_msg, candidate_dir=cand_dir)
+                except Exception:
+                    pass
+
+        # Append immediate visible utterance onto game_bible.json so Writers' Room UI shows it right away
+        gb_file = cand_dir / "game_bible.json"
+        if gb_file.is_file():
+            try:
+                gb_data = json.loads(gb_file.read_text(encoding="utf-8"))
+                if isinstance(gb_data, dict):
+                    tx = gb_data.setdefault("writers_room_transcript", [])
+                    utt = {
+                        "deliberation": req.deliberation,
+                        "utterance_id": f"utt_playtest_{uuid.uuid4().hex[:8]}",
+                        "turn_index": len(tx),
+                        "speaker_role": "ExecutiveProducer",
+                        "speaker_display_name": "Executive Producer (Blind Playtester Wish)",
+                        "spoken_dialogue": spoken_msg,
+                        "message": spoken_msg,
+                        "addressed_to": ["CreativeDirector", "GameplayDesigner", "UXExperienceDesigner", "GameplaySystemsEngineer"],
+                        "referenced_roles": ["GameplayDesigner", "UXExperienceDesigner", "GameplaySystemsEngineer"],
+                        "bible_updates_summary": [f"Dispatched {len(updated_wishes)} Blind Playtester wish(es)"],
+                        "artifact_emitted": None,
+                        "timestamp_utc": now_iso,
+                    }
+                    tx.append(utt)
+                    gb_data["updated_at_utc"] = now_iso
+                    gb_file.write_text(json.dumps(gb_data, indent=2), encoding="utf-8")
+                    target_bus.publish_game_bible_update(gb_data)
+                    target_bus.publish_threadsafe({
+                        "deliberation": req.deliberation,
+                        "event_type": SwarmEventType.WRITERS_ROOM_UTTERANCE.value,
+                        "agent_name": "ExecutiveProducer",
+                        "timestamp_utc": now_iso,
+                        "payload": utt,
+                    })
+            except Exception as gb_exc:
+                logger.debug("Could not append playtest wish utterance to game_bible.json: %s", gb_exc)
+
+        # Auto-wake StudioDaemon in resume mode if Studio build lock is currently idle
+        auto_resumed_job_id: Optional[str] = None
+        if "PYTEST_CURRENT_TEST" not in os.environ:
+            try:
+                from engine.studio.daemon import StudioDaemon, StudioDaemonConfig, _genesis_build_lock
+                if not _genesis_build_lock.locked():
+                    auto_resumed_job_id = f"ptwish_{uuid.uuid4().hex[:8]}"
+                    cand_name = cand_dir.name
+                    target_bus._build_paused = False
+                    if target_bus is not swarm_bus:
+                        swarm_bus._build_paused = False
+                    try:
+                        pause_sentinel = target_cartridges / ".studio_paused.json"
+                        if pause_sentinel.is_file():
+                            pause_sentinel.unlink()
+                    except Exception:
+                        pass
+
+                    def _run_bg_wish_resume() -> None:
+                        try:
+                            cfg = StudioDaemonConfig(
+                                steam_profile="default",
+                                cartridges_root=target_cartridges,
+                                active_cartridge_dir=target_active,
+                                db_path=target_db,
+                                resume_current=True,
+                                resume_candidate_id=cand_name,
+                            )
+                            daemon_inst = StudioDaemon(config_obj=cfg, event_bus=target_bus)
+                            daemon_inst.run_genesis_cycle()
+                        except Exception as bg_exc:
+                            logger.error("Background playtest wish resume failed: %s", bg_exc)
+
+                    threading.Thread(
+                        target=_run_bg_wish_resume,
+                        name=f"SteeringResume_{auto_resumed_job_id}",
+                        daemon=True,
+                    ).start()
+            except Exception as wake_exc:
+                logger.warning("Failed to auto-wake Studio on playtest wish dispatch: %s", wake_exc)
+
+        return JSONResponse({
+            "deliberation": f"Dispatched {len(updated_wishes)} Blind Playtester wish(es) to Council on '{cand_dir.name}'.",
+            "status": "council_resumed" if auto_resumed_job_id else "queued_for_active_council",
+            "candidate_id": cand_dir.name,
+            "auto_resumed_job_id": auto_resumed_job_id,
+            "wishes": updated_wishes,
+        })
+
     routes = [
         Route("/", endpoint=index_handler, methods=["GET"]),
         Route("/health", endpoint=health_handler, methods=["GET"]),
@@ -6077,6 +6442,15 @@ def create_app(
         Route("/api/cartridges/active", endpoint=active_cartridge_handler, methods=["GET"]),
         Route("/api/checkpoints", endpoint=checkpoints_handler, methods=["GET"]),
         Route("/api/checkpoints/{checkpoint_id}/activate", endpoint=activate_checkpoint_handler, methods=["POST"]),
+        Route("/api/playtest/sessions", endpoint=playtest_sessions_list_handler, methods=["GET"]),
+        Route("/api/playtest/sessions/start", endpoint=playtest_session_start_handler, methods=["POST"]),
+        Route("/api/playtest/sessions/{session_id}", endpoint=playtest_session_detail_handler, methods=["GET"]),
+        Route("/api/playtest/sessions/{session_id}/control", endpoint=playtest_session_control_handler, methods=["POST"]),
+        Route("/api/playtest/sessions/{session_id}/video", endpoint=playtest_session_video_handler, methods=["GET"]),
+        Route("/api/playtest/sessions/{session_id}/media/{filename}", endpoint=playtest_session_media_handler, methods=["GET"]),
+        Route("/api/playtest/wishes", endpoint=playtest_wishes_list_handler, methods=["GET"]),
+        Route("/api/playtest/wishes/send-to-council", endpoint=playtest_wishes_send_handler, methods=["POST"]),
+        Route("/api/playtest/wishes/{wish_id}/dismiss", endpoint=playtest_wish_dismiss_handler, methods=["POST"]),
         Route("/api/artifacts", endpoint=artifacts_inventory_handler, methods=["GET"]),
         Route("/api/steam/dna", endpoint=steam_dna_handler, methods=["GET"]),
         Route("/api/info", endpoint=info_handler, methods=["GET"]),
@@ -6140,6 +6514,11 @@ def create_app(
         try:
             yield
         finally:
+            if _playtest_mgr_holder[0] is not None:
+                try:
+                    _playtest_mgr_holder[0].shutdown()
+                except Exception:
+                    pass
             if daemon_inst is not None:
                 try:
                     daemon_inst.stop()

@@ -524,9 +524,25 @@ func _push_input_event(ev: InputEvent) -> void:
 		mev.global_position = mev.position
 		if render_viewport != null:
 			render_viewport.warp_mouse(mev.position)
+		if root != null:
+			root.warp_mouse(mev.position)
 	if render_viewport != null:
 		render_viewport.push_input(ev, true)
-	root.push_input(ev)
+	elif root != null:
+		root.push_input(ev)
+
+func _resolve_scripted_mouse_pos(entry: Dictionary) -> Variant:
+	var world_pos = entry.get("mouse_world_pos", null)
+	if typeof(world_pos) == TYPE_ARRAY and world_pos.size() >= 2:
+		var wpt = Vector2(float(world_pos[0]), float(world_pos[1]))
+		var vp: Viewport = main_scene_node.get_viewport() if main_scene_node != null else get_viewport()
+		if vp != null:
+			return vp.get_canvas_transform() * wpt
+		return wpt
+	var click_pos = entry.get("mouse_click_pos", null)
+	if typeof(click_pos) == TYPE_ARRAY and click_pos.size() >= 2:
+		return Vector2(float(click_pos[0]), float(click_pos[1]))
+	return null
 
 func _emit_action_and_key_event(action: String, is_pressed: bool) -> void:
 	if not InputMap.has_action(action):
@@ -690,12 +706,12 @@ func _apply_scripted_inputs(tick: int) -> void:
 		if tick == last + 1:
 			for rel_action in entry.get("actions", []):
 				_emit_action_and_key_event(String(rel_action), false)
-			var rel_click = entry.get("mouse_click_pos", null)
-			if typeof(rel_click) == TYPE_ARRAY and rel_click.size() >= 2:
+			var rel_pos = _resolve_scripted_mouse_pos(entry)
+			if rel_pos != null:
 				var rel_ev = InputEventMouseButton.new()
 				rel_ev.button_index = MOUSE_BUTTON_LEFT
 				rel_ev.pressed = false
-				rel_ev.position = Vector2(float(rel_click[0]), float(rel_click[1]))
+				rel_ev.position = rel_pos
 				_push_input_event(rel_ev)
 			continue
 		if tick < first or tick > last:
@@ -707,17 +723,17 @@ func _apply_scripted_inputs(tick: int) -> void:
 				_active_scripted_actions.append(act_str)
 			if tick == first:
 				_emit_action_and_key_event(act_str, true)
-		var click_pos = entry.get("mouse_click_pos", null)
-		if typeof(click_pos) == TYPE_ARRAY and click_pos.size() >= 2 and tick == first:
-			var cpos = Vector2(float(click_pos[0]), float(click_pos[1]))
+		var target_mpos = _resolve_scripted_mouse_pos(entry)
+		if target_mpos != null:
 			var motion_ev = InputEventMouseMotion.new()
-			motion_ev.position = cpos
+			motion_ev.position = target_mpos
 			_push_input_event(motion_ev)
-			var click_ev = InputEventMouseButton.new()
-			click_ev.button_index = MOUSE_BUTTON_LEFT
-			click_ev.pressed = true
-			click_ev.position = cpos
-			_push_input_event(click_ev)
+			if tick == first:
+				var click_ev = InputEventMouseButton.new()
+				click_ev.button_index = MOUSE_BUTTON_LEFT
+				click_ev.pressed = true
+				click_ev.position = target_mpos
+				_push_input_event(click_ev)
 
 func _apply_synthetic_inputs(tick: int, passive_end: int) -> void:
 	_release_all_inputs()
@@ -923,6 +939,8 @@ func _audit_scene_tree(node: Node, in_ui: bool = false) -> Dictionary:
 		"audio_players_found": 0,
 		"audio_streams_loaded": 0,
 		"audio_mix_rates": [],
+		"audio_players_detail": [],
+		"visible_ui_texts": [],
 		"center_occluding_panels": [],
 		"fullscreen_occlusion_detected": false,
 		"fullscreen_occlusion_nodes": [],
@@ -1020,10 +1038,19 @@ func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
 			)
 	if (node is AudioStreamPlayer) or (node is AudioStreamPlayer2D):
 		report["audio_players_found"] = int(report["audio_players_found"]) + 1
+		var a_loop = -1
 		if node.stream != null:
 			report["audio_streams_loaded"] = int(report["audio_streams_loaded"]) + 1
 			if node.stream is AudioStreamWAV:
 				report["audio_mix_rates"].append(int(node.stream.mix_rate))
+				a_loop = int(node.stream.loop_mode)
+		if report["audio_players_detail"].size() < 12:
+			report["audio_players_detail"].append({
+				"node": str(node.name),
+				"has_stream": node.stream != null,
+				"playing": bool(node.playing),
+				"loop_mode": a_loop
+			})
 	if (node is Sprite2D and node.texture != null) or (node is TextureRect and node.texture != null):
 		report["textures_loaded_count"] = int(report["textures_loaded_count"]) + 1
 		if node is Sprite2D and not current_in_ui:
@@ -1063,6 +1090,16 @@ func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
 	if current_in_ui:
 		if node is Control:
 			report["ui_control_nodes"] = int(report["ui_control_nodes"]) + 1
+			if node.is_visible_in_tree() and report["visible_ui_texts"].size() < 16:
+				var ui_txt = ""
+				if node is Label:
+					ui_txt = String(node.text).strip_edges()
+				elif node is Button:
+					ui_txt = String(node.text).strip_edges()
+				elif node is RichTextLabel:
+					ui_txt = String(node.get_parsed_text()).strip_edges()
+				if ui_txt != "" and ui_txt.length() <= 160 and not report["visible_ui_texts"].has(ui_txt):
+					report["visible_ui_texts"].append(ui_txt)
 			if (node is Panel or node is PanelContainer) and node.get_parent() is CanvasLayer:
 				var p = node.position
 				if p.x > 360.0 and p.x < 760.0 and p.y > 220.0 and p.y < 540.0:

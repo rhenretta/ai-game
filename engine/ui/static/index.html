@@ -1745,7 +1745,8 @@
       gap: 8px;
     }
     dialog#bible-mockup-lightbox,
-    dialog#new-game-modal {
+    dialog#new-game-modal,
+    dialog#next-slice-modal {
       margin: auto;
       max-width: 90vw;
       max-height: 90vh;
@@ -1756,11 +1757,13 @@
       padding: 18px;
       box-shadow: 0 20px 60px rgba(0, 0, 0, 0.9);
     }
-    dialog#new-game-modal {
+    dialog#new-game-modal,
+    dialog#next-slice-modal {
       width: min(560px, 92vw);
     }
     dialog#bible-mockup-lightbox::backdrop,
-    dialog#new-game-modal::backdrop {
+    dialog#new-game-modal::backdrop,
+    dialog#next-slice-modal::backdrop {
       background: rgba(0, 0, 0, 0.82);
       backdrop-filter: blur(4px);
     }
@@ -2123,6 +2126,10 @@
           <button id="ws-tab-telemetry" class="workspace-tab-btn" type="button" style="padding: 4px 10px; font-size: 11px;">
             <span>📡 Swarm DAG &amp; Telemetry</span>
           </button>
+          <button id="ws-tab-playtester" class="workspace-tab-btn" type="button" style="padding: 4px 10px; font-size: 11px;">
+            <span>🧪 Blind Playtester</span>
+            <span id="header-playtest-wish-badge" style="display: none; background: rgba(255, 163, 0, 0.25); border: 1px solid var(--amber); padding: 1px 6px; border-radius: 10px; font-size: 9.5px; color: var(--yellow);">0</span>
+          </button>
         </div>
       </nav>
     </div>
@@ -2231,6 +2238,33 @@
     </form>
   </dialog>
 
+  <!-- Native HTML <dialog closedby="any"> Modal for Next Slice Iteration & Optional Feedback -->
+  <dialog id="next-slice-modal" closedby="any" aria-labelledby="next-slice-modal-title">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; border-bottom: 1px solid var(--navy); padding-bottom: 8px;">
+      <div>
+        <strong id="next-slice-modal-title" style="color: var(--cyan); font-size: 15px;">🚀 Iterate to Next Slice</strong>
+        <div id="next-slice-modal-subtitle" style="font-size: 11px; color: var(--light-gray); margin-top: 2px;">The Council will empirically inspect the current game state, reflect on cohesion, onboarding, mechanical depth, and short/long-term goals, and strategize the next slice.</div>
+      </div>
+      <button id="btn-close-next-slice-modal" type="button" class="drawer-close-btn" title="Close (Esc)">✕</button>
+    </div>
+    <form id="form-next-slice" style="display: flex; flex-direction: column; gap: 12px;">
+      <div>
+        <label for="input-next-slice-feedback" style="display: block; font-size: 11.5px; font-weight: bold; color: var(--cyan); margin-bottom: 6px;">
+          Executive Producer Feedback / Direction <span style="color: var(--light-gray); font-weight: normal;">(Optional — leave blank for 100% autonomous Council reflection &amp; strategy)</span>
+        </label>
+        <textarea id="input-next-slice-feedback" rows="4" class="stream-input" style="width: 100%; resize: vertical; font-family: inherit; line-height: 1.4;" placeholder="Optionally share what felt off, what needs more depth, how onboarding or goals should improve — or leave blank to let the agents diagnose and strategize on their own..."></textarea>
+      </div>
+      <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 4px;">
+        <button id="btn-cancel-next-slice" type="button" class="btn-primary" style="background: rgba(95, 87, 79, 0.25); border-color: var(--slate); color: var(--light-gray);">
+          <span>Cancel</span>
+        </button>
+        <button id="btn-confirm-next-slice" type="submit" class="btn-primary btn-genesis-cta">
+          <span>🚀 Reflect &amp; Build Next Slice</span>
+        </button>
+      </div>
+    </form>
+  </dialog>
+
   <!-- WORKSPACE 2: Creative Writers' Room & Living Game Bible -->
   <section id="workspace-game-bible" style="display: block; margin-bottom: 12px;" aria-label="Writers Room and Living Game Bible">
     <div id="bible-greenlight-bar" class="bible-greenlight-bar">
@@ -2264,6 +2298,7 @@
     <div class="writers-room-grid">
       <!-- Unified Full-Width Studio Workspace: Production Board, Built Renders, Game Bible & Writers' Room -->
       <div class="panel" style="padding: 12px 14px;">
+        <div id="studio-slice-selector-bar" style="display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; padding: 8px 12px; background: linear-gradient(90deg, rgba(13, 27, 58, 0.85), rgba(6, 13, 30, 0.92)); border: 1px solid var(--navy); border-left: 3px solid var(--cyan); border-radius: 6px;"></div>
         <div class="bible-subtabs" style="align-items: center; justify-content: space-between;">
           <div style="display: flex; gap: 6px; flex-wrap: wrap;">
             <button type="button" class="bible-subtab-btn active" data-bible-tab="board">
@@ -2472,6 +2507,168 @@
         <div id="bible-subview-dna" class="bible-subview">
           <div id="bible-dna-container" style="display: flex; flex-direction: column; gap: 14px;">
             <div class="blueprint-empty">Loading scanned Steam Player DNA, logarithmic engagement weights, multi-dimensional affinity vectors, and Writers' Room concept genesis provenance...</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Decoupled Blind Playtester Workspace -->
+  <section id="workspace-playtester" style="display: none; margin-bottom: 14px;" aria-label="Blind AI Playtester Lab">
+    <div class="panel" style="display: flex; flex-direction: column; gap: 12px;">
+      <!-- Top Control & Session Header -->
+      <div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; padding-bottom: 10px; border-bottom: 1px solid var(--border-subtle);">
+        <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px;">
+          <span style="font-size: 12px; font-weight: 800; color: var(--cyan); letter-spacing: 0.4px;">🧪 BLIND PLAYTESTER</span>
+          <select id="pt-target-select" style="background: #050b1a; color: var(--white); border: 1px solid var(--navy); border-radius: 5px; padding: 5px 8px; font-size: 11px; min-width: 220px;" title="Select a completed slice or verified checkpoint to playtest blind">
+            <option value="">Select completed slice / checkpoint...</option>
+          </select>
+          <label style="display: inline-flex; align-items: center; gap: 4px; font-size: 10.5px; color: var(--light-gray);" title="Maximum turns safety ceiling (player stops earlier via end_playtest when done or stuck)">
+            Max Turns:
+            <input id="pt-max-turns" type="number" min="5" max="1000" value="150" style="width: 58px; background: #050b1a; color: var(--white); border: 1px solid var(--navy); border-radius: 4px; padding: 3px 5px; font-size: 11px;">
+          </label>
+          <label style="display: inline-flex; align-items: center; gap: 4px; font-size: 10.5px; color: var(--light-gray); cursor: pointer;" title="Send non-silent 16kHz game audio clips alongside screenshots">
+            <input id="pt-audio-toggle" type="checkbox" checked>
+            🔊 Audio
+          </label>
+          <button id="btn-pt-start" type="button" class="btn-primary" style="background: rgba(0, 228, 54, 0.2); border: 1px solid var(--green); color: var(--green); padding: 5px 11px; font-size: 11px; font-weight: 800;">
+            ▶ Run Playtester
+          </button>
+        </div>
+
+        <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 6px;">
+          <select id="pt-session-select" style="background: #050b1a; color: var(--light-gray); border: 1px solid var(--navy); border-radius: 5px; padding: 4px 8px; font-size: 11px; max-width: 260px;" title="Switch between active and historical playtest runs">
+            <option value="">No playtest sessions yet</option>
+          </select>
+          <span id="pt-status-pill" style="padding: 3px 8px; border-radius: 4px; font-size: 10.5px; font-weight: 800; font-family: var(--font-mono); background: rgba(148,163,184,0.16); color: var(--slate); border: 1px solid var(--navy);">IDLE</span>
+          <button id="btn-pt-pause" type="button" class="btn-activate-checkpoint" style="padding: 4px 9px; font-size: 10.5px;" disabled>⏸ Pause</button>
+          <button id="btn-pt-resume" type="button" class="btn-activate-checkpoint" style="padding: 4px 9px; font-size: 10.5px; display: none;">▶ Resume</button>
+          <button id="btn-pt-stop" type="button" class="btn-activate-checkpoint" style="padding: 4px 9px; font-size: 10.5px;" disabled>⏹ Stop</button>
+          <button id="btn-pt-reset" type="button" class="btn-activate-checkpoint" style="padding: 4px 9px; font-size: 10.5px;" disabled title="Reset session data (clears data without starting when stopped; restarts from Turn 0 when running)">🔄 Reset</button>
+          <span id="pt-token-readout" style="font-family: var(--font-mono); font-size: 10px; color: var(--cyan); padding: 3px 7px; background: rgba(41,173,255,0.1); border-radius: 4px;">0 turns • 0% cache</span>
+        </div>
+      </div>
+
+      <!-- Blindfold Briefing Banner -->
+      <div id="pt-store-card-banner" style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 12px; background: #060d1f; border: 1px solid rgba(41, 173, 255, 0.25); border-radius: 6px; font-size: 11px;">
+        <div>
+          <span style="color: var(--cyan); font-weight: 800;">🕶️ Opaque-Box Player Knowledge (Title + Store Blurb Only):</span>
+          <span id="pt-blind-title" style="color: var(--white); font-weight: 700; margin-left: 6px;">—</span>
+          <span id="pt-blind-desc" style="color: var(--light-gray); margin-left: 6px;">Launch a playtest on any completed slice or checkpoint. Runs independently of Studio builds.</span>
+        </div>
+        <div id="pt-mood-pill" style="padding: 3px 9px; border-radius: 12px; background: rgba(41,173,255,0.18); border: 1px solid var(--cyan); color: var(--white); font-size: 10.5px; font-weight: 800;">Mood: —</div>
+      </div>
+
+      <!-- Main 2-Column Split: Viewport/Replay Video (Left) + Observability & Wish Inbox (Right) -->
+      <div style="display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(340px, 1fr); gap: 14px; align-items: start;">
+        <!-- Left: Live Viewport & 1600x720 Broadcast Replay Video -->
+        <div style="display: flex; flex-direction: column; gap: 8px; background: #050914; border: 1px solid var(--navy); border-radius: 8px; padding: 10px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <div style="display: inline-flex; gap: 6px;">
+              <button id="btn-pt-view-live" type="button" class="workspace-tab-btn active" style="padding: 3px 9px; font-size: 10.5px;">🔴 Live Player Screen</button>
+              <button id="btn-pt-view-video" type="button" class="workspace-tab-btn" style="padding: 3px 9px; font-size: 10.5px;">🎬 Broadcast Replay MP4 (1600×720)</button>
+            </div>
+            <label style="display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--light-gray); cursor: pointer;" title="Automatically pause video playback when crossing a mood shift or wish timestamp so you can read at your own pace">
+              <input id="pt-autopause-markers" type="checkbox">
+              ⏸ Auto-Pause on Feedback Markers
+            </label>
+          </div>
+
+          <!-- Live Frame Stage -->
+          <div id="pt-live-stage" style="position: relative; width: 100%; aspect-ratio: 16 / 9; background: #03060e; border-radius: 6px; overflow: hidden; display: flex; align-items: center; justify-content: center; border: 1px solid rgba(41,173,255,0.18);">
+            <img id="pt-live-img" alt="Live Blind Playtester Viewport" width="1280" height="720" style="width: 100%; height: 100%; object-fit: contain; display: none;">
+            <div id="pt-live-empty" style="color: var(--slate); font-size: 12px; text-align: center; padding: 20px;">
+              No active playtest frame yet. Select a completed slice or checkpoint and click <strong>▶ Run Playtester</strong>.
+            </div>
+          </div>
+
+          <!-- Broadcast Replay Video Stage (1280x720 Game + 320x720 Sticky AI HUD = 1600x720) -->
+          <div id="pt-video-stage" style="display: none; flex-direction: column; gap: 6px;">
+            <video id="pt-replay-video" controls width="1600" height="720" preload="metadata" playsinline style="width: 100%; height: auto; aspect-ratio: 1600 / 720; background: #03060e; border-radius: 6px; border: 1px solid rgba(41,173,255,0.25); display: block;"></video>
+            <div id="pt-video-unavailable-note" style="display: none; font-size: 11px; color: var(--amber); padding: 6px 8px; background: rgba(255,163,0,0.1); border-radius: 4px;">
+              Replay MP4 is muxed automatically when you <strong>⏸ Pause</strong>, <strong>⏹ Stop</strong>, or when the player finishes the session.
+            </div>
+          </div>
+
+          <!-- Active Intent & Input Telemetry Strip -->
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 9px; background: #081126; border-radius: 5px; font-size: 11px;">
+            <div style="color: var(--light-gray);">
+              <strong style="color: var(--cyan);">Active Plan:</strong>
+              <span id="pt-active-plan-text">Waiting to start...</span>
+            </div>
+            <div id="pt-cursor-readout" style="font-family: var(--font-mono); font-size: 10px; color: var(--green);">Cursor: (640, 360)</div>
+          </div>
+
+          <!-- Clickable Mood & Wish Scrubber Markers -->
+          <div style="display: flex; flex-direction: column; gap: 4px;">
+            <div style="font-size: 10px; font-weight: 700; color: var(--slate); text-transform: uppercase;">Mood Shifts &amp; Wish Timeline Markers (Click to Seek Replay)</div>
+            <div id="pt-video-markers" style="display: flex; flex-wrap: wrap; gap: 5px; min-height: 22px;">
+              <span style="font-size: 10.5px; color: var(--slate);">Markers appear here whenever the player's mood shifts or a wish is filed.</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right: 4-Tab Observability, Experience Report & Wish Approval Inbox -->
+        <div style="display: flex; flex-direction: column; gap: 10px; background: #050914; border: 1px solid var(--navy); border-radius: 8px; padding: 10px; max-height: 760px;">
+          <div role="tablist" aria-label="Playtest observability views" style="display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid var(--border-subtle); padding-bottom: 8px;">
+            <button id="pt-tab-btn-feed" type="button" role="tab" aria-selected="true" aria-controls="pt-obs-view-feed" tabindex="0" class="workspace-tab-btn pt-obs-tab active" data-pt-tab="feed" style="padding: 4px 8px; font-size: 10.5px;">💬 Mood &amp; Turn Feed</button>
+            <button id="pt-tab-btn-report" type="button" role="tab" aria-selected="false" aria-controls="pt-obs-view-report" tabindex="-1" class="workspace-tab-btn pt-obs-tab" data-pt-tab="report" style="padding: 4px 8px; font-size: 10.5px;">📋 Impressions &amp; Report</button>
+            <button id="pt-tab-btn-memory" type="button" role="tab" aria-selected="false" aria-controls="pt-obs-view-memory" tabindex="-1" class="workspace-tab-btn pt-obs-tab" data-pt-tab="memory" style="padding: 4px 8px; font-size: 10.5px;">🧠 Rulebook &amp; Memory</button>
+            <button id="pt-tab-btn-wishes" type="button" role="tab" aria-selected="false" aria-controls="pt-obs-view-wishes" tabindex="-1" class="workspace-tab-btn pt-obs-tab" data-pt-tab="wishes" style="padding: 4px 8px; font-size: 10.5px;">
+              <span>✨ Wishes → Council</span>
+              <span id="pt-tab-wish-count" style="background: var(--navy); padding: 1px 5px; border-radius: 8px; font-size: 9.5px; color: var(--yellow);">0</span>
+            </button>
+          </div>
+
+          <!-- Subview 1: Mood Shifts & Full Uncompacted Turn Log -->
+          <div id="pt-obs-view-feed" role="tabpanel" aria-labelledby="pt-tab-btn-feed" style="display: flex; flex-direction: column; gap: 10px; overflow-y: auto; max-height: 680px; padding-right: 4px;">
+            <div id="pt-end-summary-banner" style="display: none; padding: 8px 10px; border-radius: 6px; background: rgba(0,228,54,0.12); border: 1px solid var(--green); font-size: 11px; color: var(--white);"></div>
+            <div>
+              <div style="font-size: 10px; font-weight: 800; color: var(--cyan); text-transform: uppercase; margin-bottom: 5px;">Sparse Mood Shifts (Emitted Only on Genuine Mood Change)</div>
+              <div id="pt-mood-shifts-list" style="display: flex; flex-direction: column; gap: 6px;">
+                <div style="font-size: 11px; color: var(--slate);">No mood shifts logged yet.</div>
+              </div>
+            </div>
+            <div style="border-top: 1px solid var(--border-subtle); padding-top: 8px;">
+              <div style="font-size: 10px; font-weight: 800; color: var(--cyan); text-transform: uppercase; margin-bottom: 5px;">Full Uncompacted Turn Tape</div>
+              <div id="pt-turns-list" style="display: flex; flex-direction: column; gap: 6px;">
+                <div style="font-size: 11px; color: var(--slate);">No turns executed yet.</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Subview 1B: Sparse Running Impressions & End-of-Session Experience Report -->
+          <div id="pt-obs-view-report" role="tabpanel" aria-labelledby="pt-tab-btn-report" style="display: none; flex-direction: column; gap: 10px; overflow-y: auto; max-height: 680px; padding-right: 4px;">
+            <div id="pt-report-container" style="display: flex; flex-direction: column; gap: 10px; font-size: 11px; color: var(--light-gray);">
+              <div style="color: var(--slate);">Sparse experience impressions update here during play, and the complete Session Experience Report is generated automatically when the run stops or completes.</div>
+            </div>
+          </div>
+
+          <!-- Subview 2: Permanent How-To-Play Rulebook & Compacted Episodic Memory -->
+          <div id="pt-obs-view-memory" role="tabpanel" aria-labelledby="pt-tab-btn-memory" style="display: none; flex-direction: column; gap: 10px; overflow-y: auto; max-height: 680px; padding-right: 4px;">
+            <div id="pt-memory-container" style="display: flex; flex-direction: column; gap: 10px; font-size: 11px; color: var(--light-gray);">
+              <div style="color: var(--slate);">Rulebook and compacted episodic journal will appear here as the player learns how to play.</div>
+            </div>
+          </div>
+
+          <!-- Subview 3: Wish Inbox (1-Click Send OR Batch Send to Council) -->
+          <div id="pt-obs-view-wishes" role="tabpanel" aria-labelledby="pt-tab-btn-wishes" style="display: none; flex-direction: column; gap: 10px; overflow-y: auto; max-height: 680px; padding-right: 4px;">
+            <div style="display: flex; flex-direction: column; gap: 6px; padding: 8px; background: #081126; border: 1px solid var(--navy); border-radius: 6px;">
+              <label for="pt-producer-note" style="font-size: 10px; font-weight: 700; color: var(--light-gray);">Optional Producer Note to Council</label>
+              <input id="pt-producer-note" type="text" placeholder="e.g., Fix onboarding prompt in current slice..." style="width: 100%; background: #050b1a; color: var(--white); border: 1px solid var(--navy); border-radius: 4px; padding: 5px 8px; font-size: 11px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; gap: 6px; flex-wrap: wrap;">
+                <label style="display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--light-gray); cursor: pointer;">
+                  <input id="pt-select-all-wishes" type="checkbox">
+                  Select All Pending
+                </label>
+                <button id="btn-pt-send-batch" type="button" class="btn-primary" style="background: rgba(41,173,255,0.2); border: 1px solid var(--cyan); color: var(--cyan); padding: 4px 10px; font-size: 10.5px; font-weight: 800;" disabled>
+                  🚀 Send Selected (0) to Council
+                </button>
+              </div>
+            </div>
+            <div id="pt-wishes-list" style="display: flex; flex-direction: column; gap: 8px;">
+              <div style="font-size: 11px; color: var(--slate);">No player wishes submitted yet.</div>
+            </div>
           </div>
         </div>
       </div>
@@ -3653,18 +3850,36 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         evType === 'GENESIS_TRIGGERED' ||
         evType === 'GENESIS_STARTING' ||
         evType === 'REQUIREMENTS_SPEC_GENERATED' ||
-        evType === 'WRITERS_ROOM_UTTERANCE'
+        evType === 'WRITERS_ROOM_UTTERANCE' ||
+        evType === 'WRITERS_ROOM_ACTIVITY' ||
+        evType === 'GAME_BIBLE_UPDATED' ||
+        evType === 'STUDIO_LIVE_ACTIVITY'
       ) {
         _lastBuildStoppedByErrorOrPromote = false;
+        if (_lastBuildError) {
+          const evMs = ev.timestamp_utc ? Date.parse(ev.timestamp_utc) : Date.now();
+          const errMs = _lastBuildError.timestamp_utc ? Date.parse(_lastBuildError.timestamp_utc) : 0;
+          if (!errMs || Number.isNaN(errMs) || (!Number.isNaN(evMs) && evMs > errMs)) {
+            _lastBuildError = null;
+          }
+        }
       } else if (evType === 'REQUIREMENT_STATUS_UPDATE') {
         const st = ((ev.payload && ev.payload.status) || '').toLowerCase();
         if (st === 'in_progress' || st === 'completed') {
           _lastBuildStoppedByErrorOrPromote = false;
+          _lastBuildError = null;
         }
       } else if (evType === 'STATE_CHANGE' || (ev.payload && ev.payload.lifecycle_state)) {
         const newSt = ((ev.payload && (ev.payload.lifecycle_state || ev.payload.state)) || '').toUpperCase();
         if (['ANALYZING', 'SYNTHESIZING', 'VERIFYING', 'BRAINSTORMING'].includes(newSt)) {
           _lastBuildStoppedByErrorOrPromote = false;
+          if (_lastBuildError) {
+            const evMs = ev.timestamp_utc ? Date.parse(ev.timestamp_utc) : Date.now();
+            const errMs = _lastBuildError.timestamp_utc ? Date.parse(_lastBuildError.timestamp_utc) : 0;
+            if (!errMs || Number.isNaN(errMs) || (!Number.isNaN(evMs) && evMs > errMs)) {
+              _lastBuildError = null;
+            }
+          }
         } else if (newSt === 'PROMOTED' || newSt === 'AWAITING_GREENLIGHT') {
           _lastBuildStoppedByErrorOrPromote = true;
           _resumeOptimisticUntil = 0;
@@ -3785,8 +4000,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         if (!_isErrorDismissed(ps.last_error)) {
           _lastBuildError = ps.last_error;
         }
-      } else if (ps.build_actively_running) {
-        // Clear stale build-stopping banner once build is actively running again
+      } else if (ps.build_actively_running || ps.last_error === null) {
+        // Clear stale build-stopping banner once build is actively running again or server reports no active error
+        _lastBuildError = null;
       }
       if (ps.last_event_timestamp_utc) {
         const parsedTs = Date.parse(ps.last_event_timestamp_utc);
@@ -3854,10 +4070,17 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const totalTracks = tracks.length;
       const completedCount = tracks.filter(t => ['completed', 'satisfied'].includes((t.status || '').toLowerCase())).length;
       const running = isBuildActivelyRunning();
-      const pbCounts = (latestProductionBoard && (latestProductionBoard.counts_by_state || latestProductionBoard.counts))
-        ? (latestProductionBoard.counts_by_state || latestProductionBoard.counts)
-        : null;
-      const pbTotal = latestProductionBoard ? (latestProductionBoard.total_items || (pbCounts && pbCounts.total) || 0) : 0;
+      const sliceItemsForHeader = typeof getSliceScopedBoardItems === 'function'
+        ? getSliceScopedBoardItems(cachedGameBible, latestProductionBoard)
+        : ((latestProductionBoard && Array.isArray(latestProductionBoard.items)) ? latestProductionBoard.items : []);
+      const pbCounts = sliceItemsForHeader.length > 0
+        ? computeBoardCounts(sliceItemsForHeader)
+        : ((latestProductionBoard && (latestProductionBoard.counts_by_state || latestProductionBoard.counts))
+            ? (latestProductionBoard.counts_by_state || latestProductionBoard.counts)
+            : null);
+      const pbTotal = sliceItemsForHeader.length > 0
+        ? sliceItemsForHeader.length
+        : (latestProductionBoard ? (latestProductionBoard.total_items || (pbCounts && pbCounts.total) || 0) : 0);
       const pbApproved = pbCounts ? (pbCounts.approved || 0) : 0;
       const pbInProg = pbCounts ? (pbCounts.in_progress || 0) : 0;
 
@@ -3921,11 +4144,11 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           statusPill.style.background = 'rgba(41, 173, 255, 0.2)';
           statusPill.style.borderColor = 'var(--cyan)';
           statusPill.style.color = 'var(--cyan)';
-          setHtmlIfChanged(statusPill, `<span>✅ COMPLETE${escapeHtml(progressSuffix)}</span>`);
+          setHtmlIfChanged(statusPill, `<span>✅ SLICE COMPLETE${escapeHtml(progressSuffix)}</span>`);
         }
         btn.dataset.buildMode = 'completed';
-        btn.title = 'All items are verified. Click to re-run verification or finalize.';
-        setHtmlIfChanged(btn, `<span>🔄 Re-Verify</span>`);
+        btn.title = 'Current slice is complete. Click to reflect & iterate to the next slice (optionally enter feedback in the steering box first).';
+        setHtmlIfChanged(btn, `<span>🚀 Next Slice</span>`);
         return;
       }
 
@@ -4070,11 +4293,19 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             if (data.event_type === 'connected' || data.event_type === 'echo') {
               return;
             }
+            const evTypeLower = (data.event_type || '').toLowerCase();
+            if (evTypeLower.startsWith('playtest_')) {
+              if (typeof handleLivePlaytestEvent === 'function') {
+                handleLivePlaytestEvent(data);
+              }
+              if (evTypeLower !== 'playtest_wishes_dispatched') {
+                return;
+              }
+            }
             observeEventForBuildActivity(data);
             if (data.deliberation) {
               addDeliberation(data);
             }
-            const evTypeLower = (data.event_type || '').toLowerCase();
             if (
               evTypeLower === 'writers_room_utterance' ||
               evTypeLower === 'concept_evolution_logged' ||
@@ -4227,10 +4458,15 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       }
 
       _lastBuildStoppedByErrorOrPromote = false;
+      _lastBuildError = null;
+      const errBannerReset = document.getElementById('studio-build-error-banner');
+      if (errBannerReset) errBannerReset.style.display = 'none';
       _isBuildPaused = false;
       _userPinnedCartridge = false;
       _selectedCartridgeId = '';
       _activeCandidateId = '';
+      _selectedSliceMode = 'current';
+      _pinnedSliceId = '';
       latestProductionBoard = {
         board_id: 'new_game',
         game_title: 'New Game Concept (Brainstorming Live...)',
@@ -4381,12 +4617,22 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     }
     window.pauseActiveGameBuild = pauseActiveGameBuild;
 
-    async function triggerResumeGameBuild() {
+    async function triggerResumeGameBuild(optionalFeedback) {
       _isBuildPaused = false;
       _lastBuildStoppedByErrorOrPromote = false;
+      _lastBuildError = null;
+      const errBannerResume = document.getElementById('studio-build-error-banner');
+      if (errBannerResume) errBannerResume.style.display = 'none';
       _resumeOptimisticUntil = Date.now() + 15000;
       const togglePause = document.getElementById('toggle-pause-greenlight');
       if (togglePause) togglePause.checked = false;
+      const steeringInputEl = document.getElementById('input-steering-feedback');
+      const feedbackText = typeof optionalFeedback === 'string'
+        ? optionalFeedback.trim()
+        : (steeringInputEl ? steeringInputEl.value.trim() : '');
+      if (steeringInputEl && feedbackText) {
+        steeringInputEl.value = '';
+      }
       updateHeaderBuildStatus();
       if (typeof updateStudioPulseRibbon === 'function') updateStudioPulseRibbon();
       if (typeof updateBibleProductionBanner === 'function') updateBibleProductionBanner();
@@ -4396,7 +4642,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         : (_activeCandidateId || '');
 
       addDeliberation({
-        deliberation: `Resuming game build${targetCand ? ` for ${targetCand}` : ''} from persisted Living Game Bible and Production Board...`,
+        deliberation: `Resuming / advancing game build${targetCand ? ` for ${targetCand}` : ''} from persisted Living Game Bible and Production Board${feedbackText ? ` with feedback: "${feedbackText}"` : ' (autonomous reflection & strategy)'}...`,
         agent_name: 'MissionControlGateway',
         event_type: 'genesis_triggered'
       });
@@ -4420,11 +4666,13 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            deliberation: `Operator requested resume of game build${targetCand ? ` (${targetCand})` : ''} from Mission Control`,
+            deliberation: `Operator requested resume / next-slice iteration of game build${targetCand ? ` (${targetCand})` : ''} from Mission Control${feedbackText ? ` with feedback: ${feedbackText}` : ''}`,
             profile_tag: 'default',
             resume_current: true,
             reset_active: false,
             candidate_id: targetCand || undefined,
+            creative_prompt: feedbackText || undefined,
+            feedback: feedbackText || undefined,
           })
         });
         const data = await res.json();
@@ -4448,11 +4696,33 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     }
     window.triggerResumeGameBuild = triggerResumeGameBuild;
 
+    function openNextSliceModal() {
+      const modal = document.getElementById('next-slice-modal');
+      const feedbackEl = document.getElementById('input-next-slice-feedback');
+      const steeringInputEl = document.getElementById('input-steering-feedback');
+      if (feedbackEl && steeringInputEl && steeringInputEl.value.trim() && !feedbackEl.value.trim()) {
+        feedbackEl.value = steeringInputEl.value.trim();
+      }
+      if (modal && typeof modal.showModal === 'function') {
+        modal.showModal();
+        if (feedbackEl) {
+          setTimeout(() => feedbackEl.focus(), 30);
+        }
+      } else {
+        triggerResumeGameBuild(feedbackEl ? feedbackEl.value.trim() : '');
+      }
+    }
+    window.openNextSliceModal = openNextSliceModal;
+
     document.getElementById('btn-resume-genesis')?.addEventListener('click', (e) => {
       const btn = e.currentTarget;
       const mode = btn ? btn.dataset.buildMode : 'resumable';
       if (mode === 'running' && !_isBuildPaused) {
         pauseActiveGameBuild();
+        return;
+      }
+      if (mode === 'completed') {
+        openNextSliceModal();
         return;
       }
       triggerResumeGameBuild();
@@ -5682,9 +5952,25 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       saveObservabilityState();
     }
 
+    function filterTasksByActiveSlice(rawTasks) {
+      const list = Array.isArray(rawTasks) ? rawTasks : [];
+      if (typeof getSliceScopedBoardItems !== 'function') return list;
+      const scopedBoardItems = getSliceScopedBoardItems(cachedGameBible, latestProductionBoard);
+      if (!scopedBoardItems || scopedBoardItems.length === 0) return list;
+      const allowedIds = new Set(scopedBoardItems.map(it => String(it.id || it.item_id || '').trim()).filter(Boolean));
+      const allBoardItems = (latestProductionBoard && Array.isArray(latestProductionBoard.items)) ? latestProductionBoard.items : [];
+      if (allowedIds.size >= allBoardItems.length && allBoardItems.length > 0) return list;
+      return list.filter(t => {
+        const reqId = String(t.requirement_id || (t.Metadata && t.Metadata.item_id) || '').trim();
+        if (reqId && allowedIds.has(reqId)) return true;
+        return !reqId;
+      });
+    }
+
     function updateTaskMetrics(tasks) {
-      const total = tasks.length;
-      const promoted = tasks.filter(t => (t.status || '').toLowerCase() === 'completed').length;
+      const scoped = filterTasksByActiveSlice(tasks);
+      const total = scoped.length;
+      const promoted = scoped.filter(t => (t.status || '').toLowerCase() === 'completed').length;
       if (metricTotalTasks) metricTotalTasks.textContent = total;
       if (metricPromotedTasks) metricPromotedTasks.textContent = promoted;
       if (headerTaskCount) headerTaskCount.textContent = total;
@@ -5702,7 +5988,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       observabilityState.filters.requirementId = reqId;
       observabilityState.filters.status = status;
 
-      let filtered = observabilityState.cachedTasks || [];
+      let filtered = filterTasksByActiveSlice(observabilityState.cachedTasks || []);
 
       if (agent) {
         filtered = filtered.filter(t => (t.agent_name === agent || t.agent_role === agent));
@@ -6046,7 +6332,14 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         return;
       }
 
-      const tracks = specData.requirements || [];
+      const rawTracks = specData.requirements || [];
+      const scopedBoardItems = typeof getSliceScopedBoardItems === 'function'
+        ? getSliceScopedBoardItems(cachedGameBible, latestProductionBoard)
+        : [];
+      const allowedTrackIds = new Set(scopedBoardItems.map(it => String(it.id || it.item_id || '').trim()).filter(Boolean));
+      const tracks = allowedTrackIds.size > 0
+        ? rawTracks.filter(t => allowedTrackIds.has(String(t.id || '').trim()))
+        : rawTracks;
       if (tabCountBacklog) tabCountBacklog.textContent = tracks.length;
 
       let totalCriteria = 0;
@@ -6240,6 +6533,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
                 python3 run_game.py --checkpoint ${escapeHtml(cp.checkpoint_id)}
               </div>
               <div style="display: flex; gap: 6px; align-items: center;">
+                <button type="button" class="btn-activate-checkpoint" onclick="launchBlindPlaytestForCheckpoint('${escapeJsAttr(cp.checkpoint_id)}')" title="Run the Blind AI Playtester on this verified checkpoint">
+                  🧪 AI Playtest
+                </button>
                 <button type="button" class="btn-activate-checkpoint" onclick="launchCurrentGame('${escapeHtml(cp.checkpoint_id)}')" title="Launch this checkpoint directly in a Godot 4.3 window">
                   🕹️ Launch
                 </button>
@@ -6387,21 +6683,36 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     function switchMainWorkspace(workspaceName) {
       const wsTelemetry = document.getElementById('workspace-telemetry');
       const wsBible = document.getElementById('workspace-game-bible');
+      const wsPlaytester = document.getElementById('workspace-playtester');
       const tabTelemetry = document.getElementById('ws-tab-telemetry');
       const tabBible = document.getElementById('ws-tab-bible');
+      const tabPlaytester = document.getElementById('ws-tab-playtester');
       const tabRendersShortcut = document.getElementById('ws-tab-renders-shortcut');
       if (workspaceName === 'bible') {
         if (wsTelemetry) wsTelemetry.style.display = 'none';
+        if (wsPlaytester) wsPlaytester.style.display = 'none';
         if (wsBible) wsBible.style.display = 'block';
         if (tabTelemetry) tabTelemetry.classList.remove('active');
+        if (tabPlaytester) tabPlaytester.classList.remove('active');
         if (tabBible) tabBible.classList.add('active');
         if (tabRendersShortcut) tabRendersShortcut.classList.remove('active');
         loadGameBible();
+      } else if (workspaceName === 'playtester') {
+        if (wsTelemetry) wsTelemetry.style.display = 'none';
+        if (wsBible) wsBible.style.display = 'none';
+        if (wsPlaytester) wsPlaytester.style.display = 'block';
+        if (tabTelemetry) tabTelemetry.classList.remove('active');
+        if (tabBible) tabBible.classList.remove('active');
+        if (tabPlaytester) tabPlaytester.classList.add('active');
+        if (tabRendersShortcut) tabRendersShortcut.classList.remove('active');
+        if (typeof loadPlaytestSessions === 'function') loadPlaytestSessions();
       } else {
         if (wsTelemetry) wsTelemetry.style.display = 'grid';
         if (wsBible) wsBible.style.display = 'none';
+        if (wsPlaytester) wsPlaytester.style.display = 'none';
         if (tabTelemetry) tabTelemetry.classList.add('active');
         if (tabBible) tabBible.classList.remove('active');
+        if (tabPlaytester) tabPlaytester.classList.remove('active');
         if (tabRendersShortcut) tabRendersShortcut.classList.remove('active');
       }
     }
@@ -6781,10 +7092,352 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       return `/api/artifacts/content?path=${encodeURIComponent(relPath)}&raw=true`;
     }
 
+    // =========================================================================
+    // Slice-Scoped Iteration Partitioning (Writers' Room, Task Board & Progress)
+    // =========================================================================
+    let _selectedSliceMode = 'current'; // 'current' | 'pinned' | 'all'
+    let _pinnedSliceId = '';
+    const _lastSliceCountByCartridge = {};
+
+    function resolveSliceContext(bibleArg, boardArg) {
+      const bible = bibleArg || cachedGameBible || {};
+      const board = boardArg || latestProductionBoard || bible.production_board || null;
+      const allItems = (board && Array.isArray(board.items)) ? board.items : [];
+      const rawRoadmap = Array.isArray(bible.slice_roadmap) ? bible.slice_roadmap : [];
+
+      const sliceMap = new Map();
+      for (const s of rawRoadmap) {
+        if (!s || typeof s !== 'object') continue;
+        const sid = String(s.slice_id || `slice_${s.slice_index ?? sliceMap.size}`).trim();
+        const sidx = typeof s.slice_index === 'number' ? s.slice_index : sliceMap.size;
+        sliceMap.set(sid, {
+          slice_id: sid,
+          slice_index: sidx,
+          title: s.title || `Slice #${sidx}`,
+          status: String(s.status || 'active').toLowerCase(),
+          slice_objective: s.slice_objective || '',
+          player_acclimation_and_mechanics_focus: s.player_acclimation_and_mechanics_focus || '',
+          expansion_from_prior_slice: s.expansion_from_prior_slice || '',
+          scope_boundaries: s.scope_boundaries || '',
+        });
+      }
+
+      // Discover any slice_ids present on board items that aren't in slice_roadmap yet
+      for (const it of allItems) {
+        const sid = String(it && it.slice_id || '').trim();
+        if (sid && !sliceMap.has(sid)) {
+          const m = sid.match(/^slice_(\d+)/i);
+          const inferredIdx = m ? Number(m[1]) : sliceMap.size;
+          sliceMap.set(sid, {
+            slice_id: sid,
+            slice_index: inferredIdx,
+            title: `Slice #${inferredIdx}: ${sid.replace(/^slice_\d+_?/i, '').replace(/_/g, ' ') || 'Iteration'}`,
+            status: 'active',
+            slice_objective: '',
+            player_acclimation_and_mechanics_focus: '',
+            expansion_from_prior_slice: '',
+            scope_boundaries: '',
+          });
+        }
+      }
+
+      if (sliceMap.size === 0) {
+        sliceMap.set('slice_0', {
+          slice_id: 'slice_0',
+          slice_index: 0,
+          title: 'Slice #0: Core Playable Foundation',
+          status: 'active',
+          slice_objective: bible.first_60_seconds_hook || '',
+          player_acclimation_and_mechanics_focus: '',
+          expansion_from_prior_slice: '',
+          scope_boundaries: '',
+        });
+      }
+
+      const slices = Array.from(sliceMap.values()).sort((a, b) => a.slice_index - b.slice_index);
+
+      // Determine the current slice being built
+      let currentSlice = slices[slices.length - 1];
+      if (typeof bible.active_slice_index === 'number') {
+        const byActiveIdx = slices.find(s => s.slice_index === bible.active_slice_index);
+        if (byActiveIdx) currentSlice = byActiveIdx;
+      }
+      // If a higher-index slice exists with active status or board items, prefer it as currentSlice
+      const highestActive = [...slices].reverse().find(s =>
+        s.status === 'active' || s.status === 'in_progress' || allItems.some(it => it.slice_id === s.slice_id && it.status !== 'approved')
+      );
+      if (highestActive && highestActive.slice_index >= currentSlice.slice_index) {
+        currentSlice = highestActive;
+      }
+
+      // Auto-advance to currentSlice whenever a new slice appears on this cartridge
+      const cartKey = String(bible.cartridge_id || _selectedCartridgeId || _activeCandidateId || 'active');
+      const prevCount = _lastSliceCountByCartridge[cartKey] || 0;
+      if (slices.length > prevCount && prevCount > 0) {
+        _selectedSliceMode = 'current';
+        _pinnedSliceId = currentSlice.slice_id;
+      }
+      _lastSliceCountByCartridge[cartKey] = slices.length;
+
+      let activeSlice = currentSlice;
+      if (_selectedSliceMode === 'all') {
+        activeSlice = null;
+      } else if (_selectedSliceMode === 'pinned' && _pinnedSliceId) {
+        const found = slices.find(s => s.slice_id === _pinnedSliceId);
+        if (found) {
+          activeSlice = found;
+        } else {
+          _selectedSliceMode = 'current';
+          activeSlice = currentSlice;
+        }
+      }
+
+      return {
+        slices,
+        currentSlice,
+        activeSlice,
+        mode: _selectedSliceMode,
+      };
+    }
+
+    function filterBoardItemsForSlice(allItems, sliceObj, totalSlicesCount = 1) {
+      const items = Array.isArray(allItems) ? allItems : [];
+      if (!sliceObj) return items;
+      return items.filter(it => {
+        const itemSid = String(it && it.slice_id || '').trim();
+        if (itemSid === sliceObj.slice_id) return true;
+        if (!itemSid && sliceObj.slice_index === 0) return true;
+        if (totalSlicesCount === 1 && sliceObj.slice_index === 0) return true;
+        const m = itemSid.match(/^slice_(\d+)/i);
+        if (m && Number(m[1]) === sliceObj.slice_index) return true;
+        return false;
+      });
+    }
+
+    function getSliceScopedBoardItems(bibleArg, boardArg) {
+      const bible = bibleArg || cachedGameBible || {};
+      const board = boardArg || latestProductionBoard || bible.production_board || null;
+      const allItems = (board && Array.isArray(board.items)) ? board.items : [];
+      const ctx = resolveSliceContext(bible, board);
+      if (!ctx.activeSlice) return allItems;
+      return filterBoardItemsForSlice(allItems, ctx.activeSlice, ctx.slices.length);
+    }
+
+    function partitionTranscriptBySlice(transcriptArr, slices, allBoardItems) {
+      const tx = Array.isArray(transcriptArr) ? transcriptArr : [];
+      const bySliceId = new Map();
+      for (const s of slices) {
+        bySliceId.set(s.slice_id, []);
+      }
+      if (slices.length === 0 || tx.length === 0) {
+        return bySliceId;
+      }
+
+      // Map each board item ID to its slice_index for fast lookup
+      const itemSliceIndex = new Map();
+      for (const it of (Array.isArray(allBoardItems) ? allBoardItems : [])) {
+        if (!it || !it.id) continue;
+        const sid = String(it.slice_id || '').trim();
+        const sMatch = slices.find(s => s.slice_id === sid);
+        if (sMatch) {
+          itemSliceIndex.set(String(it.id), sMatch.slice_index);
+        }
+      }
+
+      let currentIdx = slices[0].slice_index;
+      for (let i = 0; i < tx.length; i++) {
+        const u = tx[i] || {};
+        const uid = String(u.utterance_id || '');
+        const summaryArr = Array.isArray(u.bible_updates_summary)
+          ? u.bible_updates_summary.map(x => String(x || ''))
+          : [String(u.bible_updates_summary || '')];
+        const summaryStr = summaryArr.join(' ');
+        const msgStr = String(u.spoken_dialogue || u.message || '');
+
+        // Check if this utterance marks the start of a newer slice (slice_index >= 1)
+        for (const s of slices) {
+          if (s.slice_index <= currentIdx) continue;
+          const k = s.slice_index;
+          const isReflectionCaptureForNext =
+            summaryStr.includes('slice_reflection_capture:') &&
+            (uid.includes(`_slice_${k - 1}_reflection`) || summaryStr.includes(slices[Math.max(0, k - 1)]?.slice_id || ''));
+          const isSliceKReflectionOrStrategy =
+            uid.includes(`_slice_${k}_reflection`) ||
+            uid.includes(`_slice_${k}_strategy`) ||
+            summaryStr.includes(`slice_reflection:slice_${k}`) ||
+            summaryStr.includes(`next_slice_strategy:${s.slice_id}`) ||
+            summaryStr.includes(`'${s.slice_id}'`) ||
+            summaryStr.includes(`"${s.slice_id}"`);
+          // Also check if this is an ExecutiveProducer turn immediately preceding Slice k reflection/strategy
+          const nextU = tx[i + 1] || null;
+          const nextSummary = nextU
+            ? (Array.isArray(nextU.bible_updates_summary) ? nextU.bible_updates_summary.join(' ') : String(nextU.bible_updates_summary || ''))
+            : '';
+          const nextUid = nextU ? String(nextU.utterance_id || '') : '';
+          const isExecProducerStartingSliceK =
+            u.speaker_role === 'ExecutiveProducer' &&
+            (nextSummary.includes('slice_reflection_capture:') || nextUid.includes(`_slice_${k}_reflection`) || nextSummary.includes(s.slice_id));
+
+          if (isReflectionCaptureForNext || isSliceKReflectionOrStrategy || isExecProducerStartingSliceK) {
+            currentIdx = k;
+            break;
+          }
+          // Check if utterance shapes or reviews a board item belonging to Slice k
+          const bracketMatch = msgStr.match(/\[([a-z0-9_]+)\]/i);
+          if (bracketMatch && itemSliceIndex.get(bracketMatch[1]) === k) {
+            currentIdx = k;
+            break;
+          }
+        }
+
+        const targetSlice = slices.find(s => s.slice_index === currentIdx) || slices[slices.length - 1];
+        const bucket = bySliceId.get(targetSlice.slice_id);
+        if (bucket) bucket.push(u);
+      }
+
+      return bySliceId;
+    }
+
+    function getSliceScopedTranscript(bibleArg, boardArg) {
+      const bible = bibleArg || cachedGameBible || {};
+      const board = boardArg || latestProductionBoard || bible.production_board || null;
+      const fullTx = Array.isArray(bible.writers_room_transcript) ? bible.writers_room_transcript : [];
+      const ctx = resolveSliceContext(bible, board);
+      if (!ctx.activeSlice || ctx.slices.length <= 1) {
+        return fullTx;
+      }
+      const allItems = (board && Array.isArray(board.items)) ? board.items : [];
+      const partitioned = partitionTranscriptBySlice(fullTx, ctx.slices, allItems);
+      return partitioned.get(ctx.activeSlice.slice_id) || [];
+    }
+
+    window.selectStudioSliceScope = function(sliceIdOrMode) {
+      if (!sliceIdOrMode || sliceIdOrMode === 'current') {
+        _selectedSliceMode = 'current';
+        _pinnedSliceId = '';
+      } else if (sliceIdOrMode === 'all') {
+        _selectedSliceMode = 'all';
+        _pinnedSliceId = '';
+      } else {
+        const ctx = resolveSliceContext(cachedGameBible, latestProductionBoard);
+        if (ctx.currentSlice && sliceIdOrMode === ctx.currentSlice.slice_id) {
+          _selectedSliceMode = 'current';
+          _pinnedSliceId = sliceIdOrMode;
+        } else {
+          _selectedSliceMode = 'pinned';
+          _pinnedSliceId = String(sliceIdOrMode);
+        }
+      }
+      _lastTranscriptKeys = [];
+      _lastShowcaseSignature = '';
+      if (cachedGameBible) {
+        renderGameBible(cachedGameBible);
+      } else {
+        renderSliceSelectorBar();
+        renderProductionBoardPanel();
+        updateStudioPulseRibbon();
+      }
+      if (_latestArtifactsData) {
+        renderBuiltRendersShowcase(_latestArtifactsData, _selectedCartridgeId || _activeCandidateId);
+      }
+      if (observabilityState && observabilityState.cachedRequirementsSpec && typeof renderBacklog === 'function') {
+        renderBacklog(observabilityState.cachedRequirementsSpec);
+      }
+      if (observabilityState && Array.isArray(observabilityState.cachedTasks)) {
+        if (typeof updateTaskMetrics === 'function') updateTaskMetrics(observabilityState.cachedTasks);
+        if (typeof applyTaskFilters === 'function') applyTaskFilters();
+      }
+    };
+
+    function renderSliceSelectorBar() {
+      const barEl = document.getElementById('studio-slice-selector-bar');
+      if (!barEl) return;
+      const bible = cachedGameBible || {};
+      const board = latestProductionBoard || bible.production_board || null;
+      const allItems = (board && Array.isArray(board.items)) ? board.items : [];
+      const fullTx = Array.isArray(bible.writers_room_transcript) ? bible.writers_room_transcript : [];
+      const ctx = resolveSliceContext(bible, board);
+      const txBySlice = partitionTranscriptBySlice(fullTx, ctx.slices, allItems);
+
+      const pillsHtml = ctx.slices.map(s => {
+        const sItems = filterBoardItemsForSlice(allItems, s, ctx.slices.length);
+        const sApproved = sItems.filter(it => it.status === 'approved').length;
+        const sTotal = sItems.length;
+        const sTxCount = (txBySlice.get(s.slice_id) || []).length;
+        const isCurrentBuildSlice = Boolean(ctx.currentSlice && ctx.currentSlice.slice_id === s.slice_id);
+        const isSelected = Boolean(ctx.activeSlice && ctx.activeSlice.slice_id === s.slice_id);
+        const isDone = s.status === 'completed' || (sTotal > 0 && sApproved === sTotal && !isCurrentBuildSlice);
+        const icon = isDone ? '✅' : (isCurrentBuildSlice ? '⚡' : '🟢');
+        const statusTag = isCurrentBuildSlice ? 'CURRENT SLICE' : (isDone ? 'COMPLETED' : 'PLANNED');
+        const shortTitle = String(s.title || `Slice #${s.slice_index}`).replace(/^Slice\s*#?\d+\s*[:\-—]\s*/i, '');
+        const borderCol = isSelected ? (isCurrentBuildSlice ? 'var(--green)' : 'var(--cyan)') : 'var(--navy)';
+        const bgCol = isSelected
+          ? (isCurrentBuildSlice ? 'rgba(0, 228, 54, 0.18)' : 'rgba(41, 173, 255, 0.2)')
+          : '#050b1a';
+        const playtestSliceBtn = isDone ? `
+          <span role="button" tabindex="0"
+                onclick="event.stopPropagation(); launchBlindPlaytestForSlice('${escapeJsAttr(s.slice_id)}', '${escapeJsAttr(_selectedCartridgeId || _activeCandidateId || '')}')"
+                title="Run Blind AI Playtester on completed Slice #${s.slice_index}"
+                style="font-size: 9.5px; font-weight: 800; padding: 1px 6px; border-radius: 4px; background: rgba(41, 173, 255, 0.22); border: 1px solid var(--cyan); color: var(--cyan); cursor: pointer;">
+            🧪 Playtest
+          </span>
+        ` : '';
+        return `
+          <button type="button"
+                  onclick="selectStudioSliceScope('${escapeJsAttr(s.slice_id)}')"
+                  title="${escapeHtml(s.slice_objective || s.title)}"
+                  style="display: inline-flex; align-items: center; gap: 7px; padding: 5px 11px; border-radius: 6px; border: 1.5px solid ${borderCol}; background: ${bgCol}; color: var(--white); font-size: 11px; cursor: pointer; transition: all 0.15s ease;">
+            <span style="font-weight: 800; color: ${isCurrentBuildSlice ? 'var(--green)' : 'var(--cyan)'};">${icon} Slice #${s.slice_index}: ${escapeHtml(shortTitle)}</span>
+            <span style="font-family: monospace; font-size: 9.5px; padding: 1px 5px; border-radius: 4px; background: rgba(0,0,0,0.45); color: ${isDone ? 'var(--green)' : 'var(--amber)'};">${sApproved}/${sTotal} Tasks · ${sTxCount}💬</span>
+            <span style="font-size: 9px; font-weight: 800; letter-spacing: 0.4px; padding: 1px 5px; border-radius: 3px; background: ${isCurrentBuildSlice ? 'rgba(0, 228, 54, 0.22)' : 'rgba(41, 173, 255, 0.14)'}; color: ${isCurrentBuildSlice ? 'var(--green)' : 'var(--light-gray)'};">${statusTag}</span>
+            ${playtestSliceBtn}
+          </button>
+        `;
+      }).join('');
+
+      const allSelected = ctx.mode === 'all';
+      const allBtnHtml = ctx.slices.length > 1 ? `
+        <button type="button"
+                onclick="selectStudioSliceScope('all')"
+                title="View combined items and utterances across all slices"
+                style="display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px; border-radius: 6px; border: 1px solid ${allSelected ? 'var(--amber)' : 'var(--navy)'}; background: ${allSelected ? 'rgba(255, 163, 0, 0.18)' : '#050b1a'}; color: ${allSelected ? 'var(--yellow)' : 'var(--slate)'}; font-size: 10px; font-weight: 700; cursor: pointer;">
+          📚 All Slices (${allItems.length} Tasks · ${fullTx.length}💬)
+        </button>
+      ` : '';
+
+      const activeS = ctx.activeSlice;
+      const detailsHtml = activeS && (activeS.slice_objective || activeS.expansion_from_prior_slice || activeS.player_acclimation_and_mechanics_focus) ? `
+        <div style="display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--light-gray); padding-top: 4px; border-top: 1px dashed rgba(41, 173, 255, 0.22);">
+          ${activeS.slice_objective ? `<div><strong style="color: var(--cyan);">🎯 Slice #${activeS.slice_index} Objective:</strong> ${escapeHtml(activeS.slice_objective)}</div>` : ''}
+          ${activeS.expansion_from_prior_slice ? `<div><strong style="color: var(--green);">🚀 Strategy &amp; Iteration Focus:</strong> ${escapeHtml(activeS.expansion_from_prior_slice)}</div>` : ''}
+          ${activeS.player_acclimation_and_mechanics_focus ? `<div style="font-size: 10.5px; color: var(--peach);"><strong>🕹️ Player Onboarding &amp; Feel:</strong> ${escapeHtml(activeS.player_acclimation_and_mechanics_focus)}</div>` : ''}
+        </div>
+      ` : '';
+
+      setHtmlIfChanged(barEl, `
+        <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <span style="font-size: 10.5px; font-weight: 800; color: var(--cyan); text-transform: uppercase; letter-spacing: 0.5px;">🔪 Active Slice View:</span>
+            ${pillsHtml}
+          </div>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span style="font-size: 10px; color: var(--slate);">Showing only ${activeS ? `Slice #${activeS.slice_index}` : 'All Slices'} in Writers' Room &amp; Task Board</span>
+            ${allBtnHtml}
+          </div>
+        </div>
+        ${detailsHtml}
+      `);
+    }
+
     function renderProductionBoardPanel() {
       const board = latestProductionBoard;
-      const items = board && Array.isArray(board.items) ? board.items : [];
-      const counts = board && board.counts ? board.counts : computeBoardCounts(items);
+      const allBoardItems = board && Array.isArray(board.items) ? board.items : [];
+      const sliceCtx = resolveSliceContext(cachedGameBible, board);
+      const items = sliceCtx.activeSlice
+        ? filterBoardItemsForSlice(allBoardItems, sliceCtx.activeSlice, sliceCtx.slices.length)
+        : allBoardItems;
+      const counts = computeBoardCounts(items);
+      renderSliceSelectorBar();
 
       const countBadge = document.getElementById('bible-count-board');
       if (countBadge) {
@@ -6796,7 +7449,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         const activeWorkers = items.filter(it => it.status === 'in_progress').map(it => `${it.id} (${it.owner_role})`);
         const waitingLocks = items.filter(it => it.status === 'waiting_for_lock').map(it => it.id);
         const reviewItems = items.filter(it => it.status === 'awaiting_review').map(it => it.id);
-        const parts = [`Rev #${board.revision || 0}`];
+        const sliceLabel = sliceCtx.activeSlice ? `Slice #${sliceCtx.activeSlice.slice_index}` : `All Slices (${sliceCtx.slices.length})`;
+        const parts = [`${sliceLabel} • Rev #${board.revision || 0}`];
         if (activeWorkers.length > 0) parts.push(`🔨 Working: ${activeWorkers.join(', ')}`);
         if (waitingLocks.length > 0) parts.push(`⏸️ Waiting Lock: ${waitingLocks.join(', ')}`);
         if (reviewItems.length > 0) parts.push(`🔍 In Review: ${reviewItems.join(', ')}`);
@@ -7910,11 +8564,18 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const countApproved = document.getElementById('pulse-count-approved');
 
       const bible = cachedGameBible || {};
-      const transcript = Array.isArray(bible.writers_room_transcript) ? bible.writers_room_transcript : [];
+      const fullTranscript = Array.isArray(bible.writers_room_transcript) ? bible.writers_room_transcript : [];
+      const sliceCtxForBible = resolveSliceContext(bible, latestProductionBoard || bible.production_board);
+      const transcript = getSliceScopedTranscript(bible, latestProductionBoard || bible.production_board);
+      renderSliceSelectorBar();
 
       const board = latestProductionBoard || bible.production_board || (observabilityState.cachedRequirementsSpec && observabilityState.cachedRequirementsSpec.production_board) || null;
-      const items = board && Array.isArray(board.items) ? board.items : [];
-      const counts = board && board.counts ? board.counts : computeBoardCounts(items);
+      const allBoardItems = board && Array.isArray(board.items) ? board.items : [];
+      const items = sliceCtxForBible.activeSlice
+        ? filterBoardItemsForSlice(allBoardItems, sliceCtxForBible.activeSlice, sliceCtxForBible.slices.length)
+        : allBoardItems;
+      const counts = computeBoardCounts(items);
+      const sliceTagPrefix = sliceCtxForBible.activeSlice ? `Slice #${sliceCtxForBible.activeSlice.slice_index}: ` : '';
 
       const inProgItems = items.filter(it => it.status === 'in_progress');
       const waitingLockItems = items.filter(it => it.status === 'waiting_for_lock');
@@ -7949,7 +8610,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           const pct = Math.min(100, Math.max(2, Math.round((weightedDone / totalCount) * 100)));
           progEl.setAttribute('max', '100');
           progEl.setAttribute('value', String(pct));
-          if (pctLabel) pctLabel.textContent = `${approvedCount}/${totalCount} Verified (${pct}% Weighted)`;
+          if (pctLabel) pctLabel.textContent = `${sliceTagPrefix}${approvedCount}/${totalCount} Verified (${pct}% Weighted)`;
           if (countsLabel) {
             const waitPart = waitingLockItems.length > 0 ? ` · ${waitingLockItems.length} waiting lock` : '';
             countsLabel.textContent = `${inProgItems.length} working${waitPart} · ${reviewItems.length} in review · ${changesItems.length} revising · ${(counts.ready || 0) + (counts.blocked || 0)} queued`;
@@ -8139,11 +8800,14 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
               candidateErr = null;
             }
           }
-          if (candidateErr && candidateErr.timestamp_utc && board && board.updated_at) {
+          if (candidateErr && candidateErr.timestamp_utc) {
             const errMs = Date.parse(candidateErr.timestamp_utc);
-            const boardMs = Date.parse(board.updated_at);
-            if (!Number.isNaN(errMs) && !Number.isNaN(boardMs) && boardMs > errMs + 5000) {
+            const boardMs = (board && board.updated_at) ? Date.parse(board.updated_at) : 0;
+            const bibleMs = (cachedGameBible && cachedGameBible.updated_at_utc) ? Date.parse(cachedGameBible.updated_at_utc) : 0;
+            const latestProgressMs = Math.max(boardMs || 0, bibleMs || 0, _lastActivityTimestampMs || 0);
+            if (!Number.isNaN(errMs) && latestProgressMs > errMs + 2000) {
               candidateErr = null;
+              _lastBuildError = null;
             }
           }
         }
@@ -8398,7 +9062,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     function syncCouncilDeckStatus(transcriptArr) {
       const tx = Array.isArray(transcriptArr)
         ? transcriptArr
-        : (cachedGameBible && Array.isArray(cachedGameBible.writers_room_transcript) ? cachedGameBible.writers_room_transcript : []);
+        : getSliceScopedTranscript(cachedGameBible, latestProductionBoard);
       const countsByRole = {};
       for (const u of tx) {
         const r = u && u.speaker_role ? String(u.speaker_role) : '';
@@ -8578,7 +9242,10 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         togglePause.checked = bible.pause_for_greenlight;
       }
 
-      const transcript = Array.isArray(bible.writers_room_transcript) ? bible.writers_room_transcript : [];
+      const fullTranscript = Array.isArray(bible.writers_room_transcript) ? bible.writers_room_transcript : [];
+      const sliceCtxForBible = resolveSliceContext(bible, latestProductionBoard || bible.production_board);
+      const transcript = getSliceScopedTranscript(bible, latestProductionBoard || bible.production_board);
+      renderSliceSelectorBar();
       const evolutions = Array.isArray(bible.concept_evolution) && bible.concept_evolution.length > 0
         ? bible.concept_evolution
         : (Array.isArray(bible.concept_evolution_log) ? bible.concept_evolution_log : []);
@@ -8622,11 +9289,16 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const cutscenes = Array.isArray(nb.cutscenes) ? nb.cutscenes : [];
       const pillars = Array.isArray(bible.gameplay_pillars) ? bible.gameplay_pillars : [];
 
-      // Header counts & badges
+      // Header counts & badges (scoped to active/selected slice)
       const hdrTurnCount = document.getElementById('header-bible-turn-count');
       if (hdrTurnCount) hdrTurnCount.textContent = String(transcript.length);
       const turnCounter = document.getElementById('writers-room-turn-counter');
-      if (turnCounter) turnCounter.textContent = `${transcript.length} Utterances`;
+      if (turnCounter) {
+        const sTag = (sliceCtxForBible.activeSlice && sliceCtxForBible.slices.length > 1)
+          ? `Slice #${sliceCtxForBible.activeSlice.slice_index}: `
+          : '';
+        turnCounter.textContent = `${sTag}${transcript.length} Utterances`;
+      }
 
       const countEvo = document.getElementById('bible-count-evolution');
       if (countEvo) countEvo.textContent = String(evolutions.length + storyboard.length);
@@ -9035,7 +9707,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           setHtmlIfChanged(signoffContainer, signoffHtml);
         }
       } else {
-        const pbItems = (latestProductionBoard && Array.isArray(latestProductionBoard.items)) ? latestProductionBoard.items : [];
+        const pbItems = getSliceScopedBoardItems(bible, latestProductionBoard || bible.production_board);
         const pbApproved = pbItems.filter(it => it.status === 'approved').length;
         if (signoffCountEl) {
           signoffCountEl.textContent = pbItems.length > 0 ? `${pbApproved}/${pbItems.length}` : '0/6';
@@ -9043,7 +9715,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         if (signoffContainer) {
           setHtmlIfChanged(
             signoffContainer,
-            `<div class="blueprint-empty">No final promotion Sign-Off Council report recorded yet for <code>${escapeHtml(effCartForBible || 'active')}</code>.${pbItems.length > 0 ? ` (${pbApproved}/${pbItems.length} Production Board work items have passed per-item Specialist Council proof review.)` : ''}</div>`
+            `<div class="blueprint-empty">No final promotion Sign-Off Council report recorded yet for <code>${escapeHtml(effCartForBible || 'active')}</code>.${pbItems.length > 0 ? ` (${pbApproved}/${pbItems.length} Production Board work items in the active slice have passed per-item Specialist Council proof review.)` : ''}</div>`
           );
         }
       }
@@ -9089,19 +9761,30 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       if (btnApprove) {
         if (st === 'awaiting_greenlight' || orchState === 'AWAITING_GREENLIGHT') {
           btnApprove.disabled = false;
+          btnApprove.dataset.actionMode = 'greenlight';
           btnApprove.innerHTML = '✅ Greenlight &amp; Build';
           btnApprove.style.opacity = '1';
         } else if (st === 'locked' || st === 'greenlit' || boardItems.length > 0) {
           const allDone = boardItems.length > 0
             ? boardItems.every(it => String(it.status || it.state || '').toLowerCase() === 'approved')
             : (tracks.length > 0 && tracks.every(t => ['completed', 'satisfied'].includes((t.status || '').toLowerCase())));
-          btnApprove.disabled = true;
-          btnApprove.innerHTML = allDone
-            ? '✅ Greenlit — Cartridge Built'
-            : (_isBuildPaused ? '⏸️ Build Paused' : (running ? '⚙️ Greenlit — Building Game...' : '⏸️ Greenlit — Ready to Resume'));
-          btnApprove.style.opacity = '0.85';
+          if (allDone && !running) {
+            btnApprove.disabled = false;
+            btnApprove.dataset.actionMode = 'next_slice';
+            btnApprove.title = 'Reflect on the current slice and strategize + build the next slice (optionally enter feedback in the box to the left first)';
+            btnApprove.innerHTML = '🚀 Iterate Next Slice';
+            btnApprove.style.opacity = '1';
+          } else {
+            btnApprove.disabled = true;
+            btnApprove.dataset.actionMode = 'greenlight';
+            btnApprove.innerHTML = _isBuildPaused
+              ? '⏸️ Build Paused'
+              : (running ? '⚙️ Greenlit — Building Game...' : '⏸️ Greenlit — Ready to Resume');
+            btnApprove.style.opacity = '0.85';
+          }
         } else {
           btnApprove.disabled = false;
+          btnApprove.dataset.actionMode = 'greenlight';
           btnApprove.innerHTML = '✅ Greenlight &amp; Build';
           btnApprove.style.opacity = '1';
         }
@@ -9212,9 +9895,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const audioList = Array.isArray(artifactsData.audio_clips) ? artifactsData.audio_clips : [];
       const codeModules = Array.isArray(artifactsData.code_modules) ? artifactsData.code_modules : [];
 
-      const boardItems = (latestProductionBoard && Array.isArray(latestProductionBoard.items))
-        ? latestProductionBoard.items
-        : [];
+      const boardItems = typeof getSliceScopedBoardItems === 'function'
+        ? getSliceScopedBoardItems(cachedGameBible, latestProductionBoard)
+        : ((latestProductionBoard && Array.isArray(latestProductionBoard.items)) ? latestProductionBoard.items : []);
       const boardProofImages = [];
       const seenProofFiles = new Set(seenSpriteNames);
       for (const it of boardItems) {
@@ -9618,6 +10301,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       _userPinnedCartridge = true;
       _selectedCartridgeId = cartridgeId;
       _activeCandidateId = cartridgeId;
+      _selectedSliceMode = 'current';
+      _pinnedSliceId = '';
       _lastShowcaseSignature = '';
       _lastAudioClipsSignature = null;
       _lastCodeModulesSignature = null;
@@ -9752,6 +10437,10 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const inputEl = document.getElementById('input-steering-feedback');
       const btnApprove = document.getElementById('btn-approve-greenlight');
       const feedback = inputEl ? inputEl.value.trim() : '';
+      if (approved && btnApprove && btnApprove.dataset.actionMode === 'next_slice') {
+        openNextSliceModal();
+        return;
+      }
       if (approved && btnApprove) {
         btnApprove.disabled = true;
         btnApprove.innerHTML = '⏳ Greenlighting &amp; Starting Build...';
@@ -9778,9 +10467,845 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       }
     }
 
+    // =========================================================================
+    // Decoupled Blind Playtester Workspace Controller
+    // =========================================================================
+    let _activePlaytestSessionId = null;
+    let _playtestSessionsCache = [];
+    let _playtestTargetsCache = [];
+    let _playtestSelectedWishIds = new Set();
+    let _playtestViewMode = 'live'; // 'live' | 'video'
+    let _playtestMarkers = [];
+    let _playtestLastAutoPausedMarkerKey = null;
+    let _playtestVideoLoadedKey = '';
+
+    function formatPlaytestClock(sec) {
+      const s = Math.max(0, Number(sec || 0));
+      const mins = Math.floor(s / 60);
+      const rem = (s - mins * 60).toFixed(1).padStart(4, '0');
+      return `${String(mins).padStart(2, '0')}:${rem}`;
+    }
+
+    function switchPlaytestObsSubtab(tabName) {
+      document.querySelectorAll('.pt-obs-tab').forEach(btn => {
+        const isActive = btn.getAttribute('data-pt-tab') === tabName;
+        btn.classList.toggle('active', isActive);
+        btn.setAttribute('aria-selected', isActive ? 'true' : 'false');
+        btn.setAttribute('tabindex', isActive ? '0' : '-1');
+      });
+      ['feed', 'report', 'memory', 'wishes'].forEach(name => {
+        const el = document.getElementById(`pt-obs-view-${name}`);
+        if (el) el.style.display = (name === tabName) ? 'flex' : 'none';
+      });
+    }
+
+    function switchPlaytestStageView(mode) {
+      _playtestViewMode = (mode === 'video') ? 'video' : 'live';
+      const liveBtn = document.getElementById('btn-pt-view-live');
+      const vidBtn = document.getElementById('btn-pt-view-video');
+      const liveStage = document.getElementById('pt-live-stage');
+      const vidStage = document.getElementById('pt-video-stage');
+      if (liveBtn) liveBtn.classList.toggle('active', _playtestViewMode === 'live');
+      if (vidBtn) vidBtn.classList.toggle('active', _playtestViewMode === 'video');
+      if (liveStage) liveStage.style.display = (_playtestViewMode === 'live') ? 'flex' : 'none';
+      if (vidStage) vidStage.style.display = (_playtestViewMode === 'video') ? 'flex' : 'none';
+    }
+
+    function updateHeaderPlaytestWishBadge(pendingCount) {
+      const badge = document.getElementById('header-playtest-wish-badge');
+      if (!badge) return;
+      const n = Number(pendingCount || 0);
+      badge.textContent = String(n);
+      badge.style.display = n > 0 ? 'inline-block' : 'none';
+    }
+
+    async function loadPlaytestSessions(preferredSessionId = null) {
+      try {
+        const res = await fetch('/api/playtest/sessions');
+        if (!res.ok) return;
+        const data = await res.json();
+        _playtestSessionsCache = Array.isArray(data.sessions) ? data.sessions : [];
+        _playtestTargetsCache = Array.isArray(data.playable_targets) ? data.playable_targets : [];
+        updateHeaderPlaytestWishBadge(data.pending_wishes_count || 0);
+
+        const targetSel = document.getElementById('pt-target-select');
+        if (targetSel) {
+          const prevVal = targetSel.value;
+          const opts = _playtestTargetsCache.map((t, idx) => {
+            const val = JSON.stringify({
+              checkpoint_id: t.checkpoint_id || null,
+              candidate_id: t.candidate_id || null,
+              slice_id: t.slice_id || null,
+            });
+            return `<option value="${escapeHtml(val)}" ${idx === 0 && !prevVal ? 'selected' : ''}>${escapeHtml(t.label || t.checkpoint_id)}</option>`;
+          });
+          targetSel.innerHTML = opts.length
+            ? opts.join('')
+            : '<option value="">No playable checkpoints or completed slices found</option>';
+          if (prevVal && Array.from(targetSel.options).some(o => o.value === prevVal)) {
+            targetSel.value = prevVal;
+          }
+        }
+
+        const sessSel = document.getElementById('pt-session-select');
+        if (preferredSessionId) {
+          _activePlaytestSessionId = preferredSessionId;
+        } else if (!_activePlaytestSessionId && _playtestSessionsCache.length > 0) {
+          _activePlaytestSessionId = _playtestSessionsCache[0].session_id;
+        }
+        if (sessSel) {
+          if (_playtestSessionsCache.length === 0) {
+            sessSel.innerHTML = '<option value="">No playtest sessions yet</option>';
+          } else {
+            sessSel.innerHTML = _playtestSessionsCache.map(s => {
+              const st = String(s.status || 'running').toUpperCase();
+              const who = s.initiated_by === 'council' ? '🏛️ Council' : '👤 Manual';
+              const label = `[${who} • ${st}] ${s.game_title || s.checkpoint_id} (${s.turn_count || 0}t)`;
+              const sel = s.session_id === _activePlaytestSessionId ? 'selected' : '';
+              return `<option value="${escapeHtml(s.session_id)}" ${sel}>${escapeHtml(label)}</option>`;
+            }).join('');
+          }
+        }
+
+        if (_activePlaytestSessionId) {
+          await loadPlaytestSessionDetail(_activePlaytestSessionId);
+        }
+      } catch (e) {
+        console.warn('Failed loading playtest sessions:', e);
+      }
+    }
+
+    async function loadPlaytestSessionDetail(sessionId) {
+      if (!sessionId) return;
+      try {
+        const res = await fetch(`/api/playtest/sessions/${encodeURIComponent(sessionId)}`);
+        if (!res.ok) return;
+        const detail = await res.json();
+        renderPlaytestSessionDetail(detail);
+      } catch (e) {
+        console.warn('Failed loading playtest session detail:', e);
+      }
+    }
+
+    function renderPlaytestSessionDetail(detail) {
+      if (!detail || !detail.session) return;
+      const sess = detail.session;
+      const turns = Array.isArray(detail.turns) ? detail.turns : [];
+      const wishes = Array.isArray(detail.wishes) ? detail.wishes : [];
+      const compactions = Array.isArray(detail.compactions) ? detail.compactions : [];
+      const tok = detail.token_summary || {};
+
+      // Status & Control buttons
+      const status = String(sess.status || 'idle').toLowerCase();
+      const statusPill = document.getElementById('pt-status-pill');
+      if (statusPill) {
+        statusPill.textContent = status.toUpperCase();
+        if (status === 'running') {
+          statusPill.style.background = 'rgba(0, 228, 54, 0.2)';
+          statusPill.style.color = 'var(--green)';
+          statusPill.style.borderColor = 'var(--green)';
+        } else if (status === 'paused') {
+          statusPill.style.background = 'rgba(255, 163, 0, 0.2)';
+          statusPill.style.color = 'var(--yellow)';
+          statusPill.style.borderColor = 'var(--amber)';
+        } else if (status === 'error') {
+          statusPill.style.background = 'rgba(255, 0, 77, 0.2)';
+          statusPill.style.color = 'var(--pink)';
+          statusPill.style.borderColor = 'var(--neon-red)';
+        } else if (status === 'idle') {
+          statusPill.style.background = 'rgba(148, 163, 184, 0.16)';
+          statusPill.style.color = 'var(--slate)';
+          statusPill.style.borderColor = 'var(--navy)';
+        } else {
+          statusPill.style.background = 'rgba(41, 173, 255, 0.16)';
+          statusPill.style.color = 'var(--cyan)';
+          statusPill.style.borderColor = 'var(--cyan)';
+        }
+      }
+
+      const pauseBtn = document.getElementById('btn-pt-pause');
+      const resumeBtn = document.getElementById('btn-pt-resume');
+      const stopBtn = document.getElementById('btn-pt-stop');
+      const resetBtn = document.getElementById('btn-pt-reset');
+      if (pauseBtn) {
+        pauseBtn.style.display = status === 'paused' ? 'none' : 'inline-flex';
+        pauseBtn.disabled = status !== 'running';
+      }
+      if (resumeBtn) {
+        resumeBtn.style.display = status === 'paused' ? 'inline-flex' : 'none';
+        resumeBtn.disabled = status !== 'paused';
+      }
+      if (stopBtn) stopBtn.disabled = (status !== 'running' && status !== 'paused');
+      if (resetBtn) resetBtn.disabled = (status === 'idle' && turns.length === 0 && wishes.length === 0);
+
+      // Token & Prefix Cache readout
+      const tokEl = document.getElementById('pt-token-readout');
+      if (tokEl) {
+        const totalK = ((tok.total_tokens || 0) / 1000).toFixed(1);
+        tokEl.textContent = `${sess.turn_count || 0} turns • ${tok.cache_hit_pct || 0}% cache • ${totalK}k tok`;
+      }
+
+      // Blindfold Store Card Banner
+      const titleEl = document.getElementById('pt-blind-title');
+      const descEl = document.getElementById('pt-blind-desc');
+      const moodEl = document.getElementById('pt-mood-pill');
+      const planEl = document.getElementById('pt-active-plan-text');
+      if (titleEl) titleEl.textContent = sess.game_title || sess.checkpoint_id || 'Untitled';
+      if (descEl) descEl.textContent = sess.game_description ? `"${sess.game_description}"` : '(No store blurb — discovering purely from screen & audio)';
+      if (moodEl) moodEl.textContent = `Mood: ${sess.current_mood || 'observing'}`;
+      if (planEl) planEl.textContent = sess.current_plan || 'Observing game state...';
+
+      // Live frame image
+      const liveImg = document.getElementById('pt-live-img');
+      const liveEmpty = document.getElementById('pt-live-empty');
+      if (sess.latest_frame_name && liveImg) {
+        liveImg.src = `/api/playtest/sessions/${encodeURIComponent(sess.session_id)}/media/${encodeURIComponent(sess.latest_frame_name)}?t=${encodeURIComponent(sess.updated_at_utc || Date.now())}`;
+        liveImg.style.display = 'block';
+        if (liveEmpty) liveEmpty.style.display = 'none';
+      } else {
+        if (liveImg) {
+          liveImg.removeAttribute('src');
+          liveImg.style.display = 'none';
+        }
+        if (liveEmpty) liveEmpty.style.display = 'block';
+      }
+
+      // Replay MP4 video source
+      const vidEl = document.getElementById('pt-replay-video');
+      const vidUnavail = document.getElementById('pt-video-unavailable-note');
+      if (vidEl) {
+        if (sess.has_video) {
+          const vKey = `${sess.session_id}_${sess.status}_${sess.turn_count}_${sess.sim_ticks_total || 0}`;
+          if (_playtestVideoLoadedKey !== vKey) {
+            _playtestVideoLoadedKey = vKey;
+            vidEl.src = `/api/playtest/sessions/${encodeURIComponent(sess.session_id)}/video?v=${encodeURIComponent(vKey)}`;
+            try { vidEl.load(); } catch (_) {}
+          }
+          vidEl.style.display = 'block';
+          if (vidUnavail) vidUnavail.style.display = 'none';
+          if (status === 'completed' || status === 'stopped' || status === 'error') {
+            switchPlaytestStageView('video');
+          }
+        } else {
+          if (_playtestVideoLoadedKey) {
+            _playtestVideoLoadedKey = '';
+            try { vidEl.pause(); vidEl.removeAttribute('src'); vidEl.load(); } catch (_) {}
+          }
+          vidEl.style.display = 'none';
+          if (vidUnavail) vidUnavail.style.display = 'block';
+          if (status === 'idle') {
+            switchPlaytestStageView('live');
+          }
+        }
+      }
+
+      // End summary / error banner
+      const endBanner = document.getElementById('pt-end-summary-banner');
+      if (endBanner) {
+        if (sess.error_message) {
+          endBanner.style.display = 'block';
+          endBanner.style.background = 'rgba(255, 0, 77, 0.14)';
+          endBanner.style.borderColor = 'var(--neon-red)';
+          endBanner.innerHTML = `<strong>⚠️ Playtest Runtime Error:</strong><br><pre style="white-space: pre-wrap; margin: 4px 0 0; font-size: 10px;">${escapeHtml(sess.error_message)}</pre>`;
+        } else if (sess.end_summary) {
+          endBanner.style.display = 'block';
+          endBanner.style.background = 'rgba(0, 228, 54, 0.12)';
+          endBanner.style.borderColor = 'var(--green)';
+          endBanner.innerHTML = `<strong>🏁 Player Stopped (${escapeHtml(sess.end_outcome || 'completed')}):</strong> ${escapeHtml(sess.end_summary)}`;
+        } else {
+          endBanner.style.display = 'none';
+        }
+      }
+
+      // Build clickable timeline markers + Mood Shifts stream
+      const PILLAR_LABELS = {
+        graphics_and_visuals: 'Graphics & Visuals',
+        gameplay_and_feel: 'Gameplay & Feel',
+        sound_and_audio: 'Sound & Audio',
+        intuitiveness_and_controls: 'Intuitiveness & Controls',
+        goals_and_pacing: 'Goals & Pacing',
+        world_and_atmosphere: 'World & Atmosphere',
+      };
+      _playtestMarkers = [];
+      const moodTurns = turns.filter(t => t.mood_state && t.mood_note);
+      moodTurns.forEach(t => {
+        _playtestMarkers.push({
+          key: `mood_${t.turn_index}`,
+          kind: 'mood',
+          sec: Number(t.video_timestamp_sec || 0),
+          label: `💬 [${formatPlaytestClock(t.video_timestamp_sec)}] ${t.mood_state}`,
+          detail: t.mood_note,
+        });
+      });
+      turns.forEach(t => {
+        const impArr = Array.isArray(t.impression_updates) ? t.impression_updates : [];
+        impArr.forEach((iu, idx) => {
+          const pName = PILLAR_LABELS[iu.pillar] || iu.pillar || 'Impression';
+          _playtestMarkers.push({
+            key: `imp_${t.turn_index}_${idx}`,
+            kind: 'impression',
+            sec: Number(t.video_timestamp_sec || 0),
+            label: `📝 [${formatPlaytestClock(t.video_timestamp_sec)}] ${pName}`,
+            detail: iu.impression || '',
+          });
+        });
+      });
+      wishes.forEach(w => {
+        _playtestMarkers.push({
+          key: `wish_${w.wish_id}`,
+          kind: 'wish',
+          sec: Number(w.video_timestamp_sec || 0),
+          label: `✨ [${formatPlaytestClock(w.video_timestamp_sec)}] Wish: ${w.summary}`,
+          detail: w.rationale,
+        });
+      });
+      _playtestMarkers.sort((a, b) => a.sec - b.sec);
+
+      const markersContainer = document.getElementById('pt-video-markers');
+      if (markersContainer) {
+        if (_playtestMarkers.length === 0) {
+          markersContainer.innerHTML = '<span style="font-size: 10.5px; color: var(--slate);">Markers appear here whenever the player\'s mood shifts, an impression updates, or a wish is filed.</span>';
+        } else {
+          markersContainer.innerHTML = _playtestMarkers.map(m => {
+            const isWish = m.kind === 'wish';
+            const isImp = m.kind === 'impression';
+            const border = isWish ? 'var(--amber)' : (isImp ? 'var(--green)' : 'var(--cyan)');
+            const bg = isWish ? 'rgba(255, 163, 0, 0.16)' : (isImp ? 'rgba(0, 228, 54, 0.14)' : 'rgba(41, 173, 255, 0.14)');
+            return `<button type="button" onclick="seekPlaytestReplay(${m.sec})" title="${escapeHtml(m.detail)}" style="padding: 2px 7px; border-radius: 10px; border: 1px solid ${border}; background: ${bg}; color: var(--white); font-size: 10px; cursor: pointer;">${escapeHtml(m.label)}</button>`;
+          }).join('');
+        }
+      }
+
+      // Render Sparse Running Impressions & End-of-Session Experience Report
+      const repContainer = document.getElementById('pt-report-container');
+      if (repContainer) {
+        const isCouncilRun = sess.initiated_by === 'council';
+        const provBanner = isCouncilRun
+          ? `<div style="padding: 7px 10px; border-radius: 6px; background: rgba(41,173,255,0.14); border: 1px solid var(--cyan); color: var(--white); font-size: 10.5px;">
+               <strong style="color: var(--cyan);">🏛️ Council End-of-Slice Playtest:</strong> Experience Report &amp; all generated wishes are automatically delivered directly to the Council for slice deliberation.
+             </div>`
+          : `<div style="padding: 7px 10px; border-radius: 6px; background: rgba(148,163,184,0.12); border: 1px solid var(--navy); color: var(--light-gray); font-size: 10.5px;">
+               <strong style="color: var(--yellow);">👤 Manual Operator Playtest:</strong> Experience Report is saved for your review. Wishes stay <em>Pending</em> and are never auto-delivered to the Council unless you click Send.
+             </div>`;
+
+        const rep = (sess.session_report && typeof sess.session_report === 'object') ? sess.session_report : {};
+        const hasFullReport = Boolean(rep.overall_experience_summary);
+        const imps = (sess.impressions && typeof sess.impressions === 'object') ? sess.impressions : {};
+        const impEntries = Object.entries(imps);
+
+        let fullReportHtml = '';
+        if (hasFullReport) {
+          const rating = Number(rep.overall_fun_rating || 0);
+          const ratingColor = rating >= 7 ? 'var(--green)' : (rating >= 5 ? 'var(--yellow)' : 'var(--pink)');
+          const highlights = Array.isArray(rep.key_highlights) ? rep.key_highlights : [];
+          const painPoints = Array.isArray(rep.key_pain_points) ? rep.key_pain_points : [];
+          const reportPillars = [
+            ['🎨 Graphics & Visuals', rep.graphics_and_visuals],
+            ['🎮 Gameplay & Feel', rep.gameplay_and_feel],
+            ['🔊 Sound & Audio', rep.sound_and_audio],
+            ['🧭 Intuitiveness & Onboarding', rep.intuitiveness_and_onboarding],
+            ['🎯 Goals, Pacing & Accomplishment', rep.goals_pacing_and_accomplishment],
+            ['🌍 World & Atmosphere', rep.world_and_atmosphere],
+          ].filter(([, val]) => val);
+
+          fullReportHtml = `
+            <div style="padding: 10px; border-radius: 7px; background: #071226; border: 1px solid rgba(0,228,54,0.35); display: flex; flex-direction: column; gap: 8px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+                <span style="font-size: 10.5px; font-weight: 800; color: var(--green); text-transform: uppercase;">🏁 Session Experience Report</span>
+                <span style="padding: 2px 8px; border-radius: 10px; background: rgba(0,0,0,0.35); border: 1px solid ${ratingColor}; color: ${ratingColor}; font-family: var(--font-mono); font-size: 10.5px; font-weight: 800;">Fun Rating: ${rating}/10</span>
+              </div>
+              <div style="color: var(--white); line-height: 1.4;">${escapeHtml(rep.overall_experience_summary)}</div>
+              <div style="display: flex; flex-direction: column; gap: 5px;">
+                ${reportPillars.map(([label, text]) => `
+                  <div style="padding: 6px 8px; background: #050c1b; border-radius: 5px; border-left: 2px solid var(--cyan);">
+                    <div style="font-size: 10px; font-weight: 800; color: var(--cyan);">${escapeHtml(label)}</div>
+                    <div style="color: var(--light-gray); margin-top: 2px; line-height: 1.35;">${escapeHtml(String(text))}</div>
+                  </div>
+                `).join('')}
+              </div>
+              ${highlights.length ? `
+                <div>
+                  <div style="font-size: 10px; font-weight: 800; color: var(--green); text-transform: uppercase;">✨ Key Highlights</div>
+                  <ul style="margin: 3px 0 0 16px; padding: 0; color: var(--white);">${highlights.map(h => `<li>${escapeHtml(String(h))}</li>`).join('')}</ul>
+                </div>
+              ` : ''}
+              ${painPoints.length ? `
+                <div>
+                  <div style="font-size: 10px; font-weight: 800; color: var(--amber); text-transform: uppercase;">⚠️ Key Pain Points</div>
+                  <ul style="margin: 3px 0 0 16px; padding: 0; color: var(--white);">${painPoints.map(p => `<li>${escapeHtml(String(p))}</li>`).join('')}</ul>
+                </div>
+              ` : ''}
+            </div>
+          `;
+        } else if (status === 'running' || status === 'paused') {
+          fullReportHtml = `<div style="padding: 8px 10px; border-radius: 6px; background: #071022; border: 1px dashed rgba(41,173,255,0.3); color: var(--slate); font-size: 10.5px;">Full 6-pillar <strong>Session Experience Report</strong> will be synthesized automatically as soon as this session completes or is stopped.</div>`;
+        }
+
+        const sparseImpHtml = impEntries.length > 0
+          ? impEntries.map(([k, v]) => `
+              <div style="padding: 6px 8px; background: #081226; border-radius: 5px; border-left: 3px solid var(--green);">
+                <div style="font-size: 10px; font-weight: 800; color: var(--green);">${escapeHtml(PILLAR_LABELS[k] || k)}</div>
+                <div style="color: var(--white); margin-top: 2px; line-height: 1.35;">${escapeHtml(String(v))}</div>
+              </div>
+            `).join('')
+          : '<div style="color: var(--slate);">No sparse pillar impressions recorded yet — the player updates these only when forming or revising an impression.</div>';
+
+        repContainer.innerHTML = `
+          ${provBanner}
+          ${fullReportHtml}
+          <div style="border-top: 1px solid var(--border-subtle); padding-top: 8px;">
+            <div style="font-size: 10px; font-weight: 800; color: var(--green); text-transform: uppercase; margin-bottom: 5px;">
+              📝 Sparse Running Pillar Impressions (Non-Repetitive Live Notes)
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 5px;">${sparseImpHtml}</div>
+          </div>
+        `;
+      }
+
+      // Render Mood Shifts Stream
+      const moodListEl = document.getElementById('pt-mood-shifts-list');
+      if (moodListEl) {
+        if (moodTurns.length === 0) {
+          moodListEl.innerHTML = '<div style="font-size: 11px; color: var(--slate);">No mood shifts emitted yet — player only speaks up when mood or understanding genuinely changes.</div>';
+        } else {
+          moodListEl.innerHTML = moodTurns.slice().reverse().map(t => `
+            <div onclick="seekPlaytestReplay(${Number(t.video_timestamp_sec || 0)})" style="padding: 7px 9px; border-radius: 6px; background: #081226; border-left: 3px solid var(--cyan); cursor: pointer;">
+              <div style="display: flex; justify-content: space-between; font-size: 10px; color: var(--cyan); font-weight: 800; margin-bottom: 3px;">
+                <span>Turn #${t.turn_index} • ${escapeHtml(String(t.mood_state).toUpperCase())}</span>
+                <span style="font-family: var(--font-mono); color: var(--slate);">${formatPlaytestClock(t.video_timestamp_sec)}</span>
+              </div>
+              <div style="font-size: 11px; color: var(--white); line-height: 1.35;">${escapeHtml(t.mood_note)}</div>
+            </div>
+          `).join('');
+        }
+      }
+
+      // Render Uncompacted Turn Tape
+      const turnsListEl = document.getElementById('pt-turns-list');
+      if (turnsListEl) {
+        if (turns.length === 0) {
+          const cursorReadout = document.getElementById('pt-cursor-readout');
+          if (cursorReadout) cursorReadout.textContent = 'Cursor: (640, 360)';
+          turnsListEl.innerHTML = status === 'idle'
+            ? '<div style="font-size: 11px; color: var(--slate);">Session data reset — click <strong>▶ Run Playtester</strong> to start.</div>'
+            : '<div style="font-size: 11px; color: var(--slate);">Waiting for Turn #1...</div>';
+        } else {
+          const lastTurn = turns[turns.length - 1];
+          const cursorReadout = document.getElementById('pt-cursor-readout');
+          if (cursorReadout && lastTurn) {
+            cursorReadout.textContent = `Cursor: (${Math.round(lastTurn.cursor_end_x || 640)}, ${Math.round(lastTurn.cursor_end_y || 360)})`;
+          }
+          turnsListEl.innerHTML = turns.slice().reverse().map(tr => {
+            const audioHtml = tr.audio_clip_name ? `
+              <audio controls preload="none" src="/api/playtest/sessions/${encodeURIComponent(sess.session_id)}/media/${encodeURIComponent(tr.audio_clip_name)}" style="height: 24px; width: 100%; margin-top: 4px;"></audio>
+            ` : '';
+            const scrUrl = tr.screenshot_name
+              ? `/api/playtest/sessions/${encodeURIComponent(sess.session_id)}/media/${encodeURIComponent(tr.screenshot_name)}`
+              : '';
+            return `
+              <details style="background: #070e1f; border: 1px solid rgba(41,173,255,0.16); border-radius: 5px; padding: 6px 8px; font-size: 10.5px;">
+                <summary style="cursor: pointer; color: var(--light-gray); font-family: var(--font-mono); font-size: 10px;">
+                  <strong style="color: var(--cyan);">T#${tr.turn_index}</strong> [${formatPlaytestClock(tr.video_timestamp_sec)}] ${escapeHtml(tr.append_log_line || '')}
+                </summary>
+                <div style="margin-top: 6px; display: flex; flex-direction: column; gap: 5px; color: var(--light-gray);">
+                  <div><strong style="color: var(--cyan);">Player Deliberation:</strong> ${escapeHtml(tr.deliberation || '')}</div>
+                  <div><strong style="color: var(--green);">Active Plan:</strong> ${escapeHtml(tr.current_plan || '')}</div>
+                  ${scrUrl ? `<a href="${scrUrl}" target="_blank" rel="noopener" style="color: var(--cyan); font-size: 10px;">🖼️ View Turn #${tr.turn_index} Screenshot</a>` : ''}
+                  ${audioHtml}
+                </div>
+              </details>
+            `;
+          }).join('');
+        }
+      }
+
+      // Render Permanent Rulebook + Compacted Episodic Journal
+      const memEl = document.getElementById('pt-memory-container');
+      if (memEl) {
+        const rb = (sess.rulebook && typeof sess.rulebook === 'object') ? sess.rulebook : {};
+        const rbEntries = Object.entries(rb);
+        const cj = (sess.compacted_journal && typeof sess.compacted_journal === 'object') ? sess.compacted_journal : {};
+        const rbHtml = rbEntries.length > 0
+          ? rbEntries.map(([k, v]) => `<div style="padding: 4px 7px; background: #081226; border-radius: 4px;"><strong style="color: var(--green);">${escapeHtml(k)}:</strong> ${escapeHtml(String(v))}</div>`).join('')
+          : '<div style="color: var(--slate);">No controls or rules confirmed yet.</div>';
+
+        const renderListSection = (title, arr) => {
+          if (!Array.isArray(arr) || arr.length === 0) return '';
+          return `
+            <div style="margin-top: 6px;">
+              <div style="font-weight: 800; color: var(--cyan); font-size: 10px; text-transform: uppercase;">${escapeHtml(title)}</div>
+              <ul style="margin: 3px 0 0 16px; padding: 0;">${arr.map(x => `<li>${escapeHtml(String(x))}</li>`).join('')}</ul>
+            </div>
+          `;
+        };
+
+        memEl.innerHTML = `
+          <div>
+            <div style="font-size: 10px; font-weight: 800; color: var(--green); text-transform: uppercase; margin-bottom: 4px;">
+              🔒 Permanent How-To-Play Rulebook (Code-Merged — Never Summarized Away)
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 4px;">${rbHtml}</div>
+          </div>
+          <div style="border-top: 1px solid var(--border-subtle); padding-top: 8px;">
+            <div style="font-size: 10px; font-weight: 800; color: var(--cyan); text-transform: uppercase; margin-bottom: 4px;">
+              📚 Compacted Episodic Memory (${compactions.length} Compaction Pass${compactions.length === 1 ? '' : 'es'})
+            </div>
+            ${cj.fun_and_aesthetic_impressions ? `<div style="padding: 6px 8px; background: rgba(41,173,255,0.1); border-radius: 5px; margin-bottom: 6px;"><strong>Running Fun &amp; Aesthetic Impression:</strong> ${escapeHtml(cj.fun_and_aesthetic_impressions)}</div>` : ''}
+            ${renderListSection('Story & Exploration Chronicle', cj.episodic_story_and_world_chronicle)}
+            ${renderListSection('World Landmarks Mental Map', cj.world_landmarks_map)}
+            ${renderListSection('Already Tried / Dead-Ends', cj.failed_attempts_and_dead_ends)}
+            ${renderListSection('Open Questions & Hypotheses', cj.open_questions_and_hypotheses)}
+            ${!compactions.length ? '<div style="color: var(--slate); margin-top: 4px;">Compaction runs every 30 turns (carrying the latest 5 turns verbatim across the seam).</div>' : ''}
+          </div>
+        `;
+      }
+
+      // Render Wish Inbox (1-Click Send + Batch Checkboxes)
+      renderPlaytestWishInbox(sess, wishes);
+    }
+
+    function renderPlaytestWishInbox(sess, wishes) {
+      const wishCountEl = document.getElementById('pt-tab-wish-count');
+      const pendingWishes = wishes.filter(w => w.status === 'pending');
+      if (wishCountEl) wishCountEl.textContent = String(pendingWishes.length);
+
+      // Clean stale selected IDs
+      const validPendingIds = new Set(pendingWishes.map(w => w.wish_id));
+      for (const id of Array.from(_playtestSelectedWishIds)) {
+        if (!validPendingIds.has(id)) _playtestSelectedWishIds.delete(id);
+      }
+      updatePlaytestBatchButtonState();
+
+      const listEl = document.getElementById('pt-wishes-list');
+      if (!listEl) return;
+      if (wishes.length === 0) {
+        listEl.innerHTML = '<div style="font-size: 11px; color: var(--slate);">No player wish items submitted yet.</div>';
+        return;
+      }
+
+      listEl.innerHTML = wishes.map(w => {
+        const isPending = w.status === 'pending';
+        const isSent = w.status === 'sent_to_council';
+        const checked = _playtestSelectedWishIds.has(w.wish_id) ? 'checked' : '';
+        const scrUrl = w.screenshot_name
+          ? `/api/playtest/sessions/${encodeURIComponent(w.session_id)}/media/${encodeURIComponent(w.screenshot_name)}`
+          : '';
+        const statusBadge = isSent
+          ? '<span style="color: var(--green); font-size: 9.5px; font-weight: 800;">✓ SENT TO COUNCIL</span>'
+          : (isPending ? '<span style="color: var(--yellow); font-size: 9.5px; font-weight: 800;">● PENDING APPROVAL</span>' : '<span style="color: var(--slate); font-size: 9.5px;">DISMISSED</span>');
+
+        return `
+          <div style="padding: 8px 10px; border-radius: 6px; background: #081226; border: 1px solid ${isPending ? 'rgba(255,163,0,0.45)' : 'var(--navy)'}; display: flex; flex-direction: column; gap: 6px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; gap: 6px;">
+              <label style="display: inline-flex; align-items: center; gap: 6px; font-size: 10.5px; font-weight: 800; color: var(--cyan); cursor: ${isPending ? 'pointer' : 'default'};">
+                ${isPending ? `<input type="checkbox" class="pt-wish-checkbox" data-wish-id="${escapeHtml(w.wish_id)}" ${checked}>` : ''}
+                <span>[${escapeHtml(w.category)}] T#${w.turn_index}</span>
+              </label>
+              ${statusBadge}
+            </div>
+            <div style="font-size: 11.5px; font-weight: 700; color: var(--white);">${escapeHtml(w.summary)}</div>
+            <div style="font-size: 11px; color: var(--light-gray); line-height: 1.35;">${escapeHtml(w.rationale)}</div>
+            <div style="font-size: 9.5px; color: var(--slate);">
+              Observed on: <code>${escapeHtml(w.observed_on_slice_id || w.checkpoint_id || 'active')}</code> • Mood: <strong>${escapeHtml(w.mood_at_time || '—')}</strong>
+              ${scrUrl ? ` • <a href="${scrUrl}" target="_blank" rel="noopener" style="color: var(--cyan);">🖼️ Screenshot</a>` : ''}
+            </div>
+            ${isPending ? `
+              <div style="display: flex; justify-content: flex-end; gap: 6px; padding-top: 4px; border-top: 1px solid rgba(255,255,255,0.06);">
+                <button type="button" class="btn-activate-checkpoint" onclick="dismissPlaytestWish('${escapeJsAttr(w.wish_id)}')" style="padding: 3px 8px; font-size: 10px;">✕ Dismiss</button>
+                <button type="button" class="btn-primary" onclick="dispatchPlaytestWishes(['${escapeJsAttr(w.wish_id)}'])" style="background: rgba(0,228,54,0.2); border: 1px solid var(--green); color: var(--green); padding: 3px 9px; font-size: 10px; font-weight: 800;" title="Send this single wish immediately to the Council">
+                  ⚡ Send to Council
+                </button>
+              </div>
+            ` : ''}
+          </div>
+        `;
+      }).join('');
+
+      listEl.querySelectorAll('.pt-wish-checkbox').forEach(cb => {
+        cb.addEventListener('change', () => {
+          const wid = cb.getAttribute('data-wish-id');
+          if (!wid) return;
+          if (cb.checked) _playtestSelectedWishIds.add(wid);
+          else _playtestSelectedWishIds.delete(wid);
+          updatePlaytestBatchButtonState();
+        });
+      });
+    }
+
+    function updatePlaytestBatchButtonState() {
+      const btn = document.getElementById('btn-pt-send-batch');
+      if (!btn) return;
+      const count = _playtestSelectedWishIds.size;
+      btn.disabled = count === 0;
+      btn.textContent = `🚀 Send Selected (${count}) to Council`;
+    }
+
+    window.seekPlaytestReplay = function(sec) {
+      switchPlaytestStageView('video');
+      const vid = document.getElementById('pt-replay-video');
+      if (vid && vid.src) {
+        vid.currentTime = Math.max(0, Number(sec || 0));
+        vid.play().catch(() => {});
+      }
+    };
+
+    window.dispatchPlaytestWishes = async function(wishIds) {
+      if (!Array.isArray(wishIds) || wishIds.length === 0) return;
+      const noteEl = document.getElementById('pt-producer-note');
+      const producerNote = noteEl ? noteEl.value.trim() : '';
+      try {
+        const res = await fetch('/api/playtest/wishes/send-to-council', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deliberation: `Executive Producer approved ${wishIds.length} Blind Playtester wish(es) for immediate Council ingestion.`,
+            wish_ids: wishIds,
+            producer_note: producerNote || null,
+          }),
+        });
+        if (res.ok) {
+          wishIds.forEach(id => _playtestSelectedWishIds.delete(id));
+          if (noteEl && wishIds.length > 1) noteEl.value = '';
+          await loadPlaytestSessions(_activePlaytestSessionId);
+          if (typeof loadGameBible === 'function') loadGameBible();
+        }
+      } catch (e) {
+        console.warn('Failed dispatching playtest wishes to Council:', e);
+      }
+    };
+
+    window.dismissPlaytestWish = async function(wishId) {
+      if (!wishId) return;
+      try {
+        const res = await fetch(`/api/playtest/wishes/${encodeURIComponent(wishId)}/dismiss`, { method: 'POST' });
+        if (res.ok) {
+          _playtestSelectedWishIds.delete(wishId);
+          await loadPlaytestSessions(_activePlaytestSessionId);
+        }
+      } catch (e) {
+        console.warn('Failed dismissing wish:', e);
+      }
+    };
+
+    async function startPlaytestSession(payloadOverride = null) {
+      let reqBody = payloadOverride;
+      if (!reqBody) {
+        const targetSel = document.getElementById('pt-target-select');
+        const maxTurnsEl = document.getElementById('pt-max-turns');
+        const audioEl = document.getElementById('pt-audio-toggle');
+        let parsedTarget = {};
+        if (targetSel && targetSel.value) {
+          try { parsedTarget = JSON.parse(targetSel.value); } catch (_) {}
+        }
+        reqBody = {
+          deliberation: 'Operator started Blind Playtester session from Mission Control.',
+          checkpoint_id: parsedTarget.checkpoint_id || null,
+          candidate_id: parsedTarget.candidate_id || null,
+          slice_id: parsedTarget.slice_id || null,
+          max_turns: Math.max(5, Math.min(1000, Number(maxTurnsEl?.value || 150))),
+          enable_audio_perception: Boolean(audioEl ? audioEl.checked : true),
+        };
+      }
+      switchPlaytestStageView('live');
+      try {
+        const res = await fetch('/api/playtest/sessions/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reqBody),
+        });
+        const data = await res.json();
+        if (res.ok && data.session) {
+          _activePlaytestSessionId = data.session.session_id;
+          _playtestVideoLoadedKey = '';
+          await loadPlaytestSessions(_activePlaytestSessionId);
+        } else {
+          alert(`Could not start Blind Playtester: ${data.error || 'Unknown error'}`);
+        }
+      } catch (e) {
+        console.warn('Failed starting playtester:', e);
+      }
+    }
+
+    async function controlPlaytestSession(action) {
+      if (!_activePlaytestSessionId) return;
+      const statusPill = document.getElementById('pt-status-pill');
+      const stopBtn = document.getElementById('btn-pt-stop');
+      const pauseBtn = document.getElementById('btn-pt-pause');
+      if (action === 'stop' || action === 'pause' || action === 'reset') {
+        if (statusPill) statusPill.textContent = action === 'stop' ? 'MUXING VIDEO...' : (action === 'pause' ? 'PAUSING...' : 'RESETTING...');
+        if (stopBtn) stopBtn.disabled = true;
+        if (pauseBtn) pauseBtn.disabled = true;
+      }
+      try {
+        const res = await fetch(`/api/playtest/sessions/${encodeURIComponent(_activePlaytestSessionId)}/control`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deliberation: `Operator issued '${action}' control command on Blind Playtester.`,
+            action,
+          }),
+        });
+        const data = await res.json();
+        if (res.ok && data.session) {
+          _activePlaytestSessionId = data.session.session_id;
+          _playtestVideoLoadedKey = '';
+          await loadPlaytestSessions(_activePlaytestSessionId);
+        }
+      } catch (e) {
+        console.warn(`Failed '${action}' on playtester:`, e);
+        await loadPlaytestSessionDetail(_activePlaytestSessionId);
+      }
+    }
+
+    window.launchBlindPlaytestForCheckpoint = async function(checkpointId) {
+      if (!checkpointId) return;
+      switchMainWorkspace('playtester');
+      await startPlaytestSession({
+        deliberation: `Operator launched Blind Playtester directly on verified checkpoint '${checkpointId}'.`,
+        checkpoint_id: checkpointId,
+        max_turns: Number(document.getElementById('pt-max-turns')?.value || 150),
+        enable_audio_perception: Boolean(document.getElementById('pt-audio-toggle')?.checked ?? true),
+      });
+    };
+
+    window.launchBlindPlaytestForSlice = async function(sliceId, candidateId) {
+      if (!sliceId) return;
+      switchMainWorkspace('playtester');
+      await startPlaytestSession({
+        deliberation: `Operator launched Blind Playtester directly on completed slice '${sliceId}'.`,
+        slice_id: sliceId,
+        candidate_id: candidateId || null,
+        max_turns: Number(document.getElementById('pt-max-turns')?.value || 150),
+        enable_audio_perception: Boolean(document.getElementById('pt-audio-toggle')?.checked ?? true),
+      });
+    };
+
+    function handleLivePlaytestEvent(ev) {
+      const p = (ev && ev.payload) ? ev.payload : {};
+      const evType = String(ev.event_type || '').toLowerCase();
+      if (p.session_id && (!_activePlaytestSessionId || (evType === 'playtest_session_status' && p.status === 'running'))) {
+        _activePlaytestSessionId = p.session_id;
+        if (evType === 'playtest_session_status' && p.status === 'running') {
+          _playtestVideoLoadedKey = '';
+          switchPlaytestStageView('live');
+        }
+      }
+      if (evType === 'playtest_frame_update' && p.session_id === _activePlaytestSessionId && p.frame_name) {
+        const liveImg = document.getElementById('pt-live-img');
+        const liveEmpty = document.getElementById('pt-live-empty');
+        const cursorReadout = document.getElementById('pt-cursor-readout');
+        if (liveImg) {
+          liveImg.src = `/api/playtest/sessions/${encodeURIComponent(p.session_id)}/media/${encodeURIComponent(p.frame_name)}?t=${Date.now()}`;
+          liveImg.style.display = 'block';
+          if (liveEmpty) liveEmpty.style.display = 'none';
+        }
+        if (cursorReadout && p.cursor_x !== undefined) {
+          cursorReadout.textContent = `Cursor: (${Math.round(p.cursor_x)}, ${Math.round(p.cursor_y)})`;
+        }
+        return;
+      }
+      if (evType === 'playtest_wish_created' || evType === 'playtest_wishes_dispatched') {
+        loadPlaytestSessions(_activePlaytestSessionId);
+        return;
+      }
+      if (
+        evType === 'playtest_turn_completed' ||
+        evType === 'playtest_impression_updated' ||
+        evType === 'playtest_report_ready' ||
+        evType === 'playtest_session_status' ||
+        evType === 'playtest_video_ready' ||
+        evType === 'playtest_compacted'
+      ) {
+        if (p.session_id === _activePlaytestSessionId && evType !== 'playtest_session_status') {
+          loadPlaytestSessionDetail(_activePlaytestSessionId);
+        } else {
+          loadPlaytestSessions(_activePlaytestSessionId);
+        }
+      }
+    }
+
+    function initPlaytesterWorkspace() {
+      document.getElementById('ws-tab-playtester')?.addEventListener('click', () => switchMainWorkspace('playtester'));
+      document.getElementById('btn-pt-start')?.addEventListener('click', () => startPlaytestSession());
+      document.getElementById('btn-pt-pause')?.addEventListener('click', () => controlPlaytestSession('pause'));
+      document.getElementById('btn-pt-resume')?.addEventListener('click', () => controlPlaytestSession('resume'));
+      document.getElementById('btn-pt-stop')?.addEventListener('click', () => controlPlaytestSession('stop'));
+      document.getElementById('btn-pt-reset')?.addEventListener('click', () => controlPlaytestSession('reset'));
+
+      document.getElementById('pt-session-select')?.addEventListener('change', (e) => {
+        const sid = e.target.value;
+        if (sid) {
+          _activePlaytestSessionId = sid;
+          _playtestVideoLoadedKey = '';
+          loadPlaytestSessionDetail(sid);
+        }
+      });
+
+      document.getElementById('btn-pt-view-live')?.addEventListener('click', () => switchPlaytestStageView('live'));
+      document.getElementById('btn-pt-view-video')?.addEventListener('click', () => switchPlaytestStageView('video'));
+
+      const obsTabs = Array.from(document.querySelectorAll('.pt-obs-tab'));
+      obsTabs.forEach((btn, idx) => {
+        btn.addEventListener('click', () => {
+          const t = btn.getAttribute('data-pt-tab');
+          if (t) switchPlaytestObsSubtab(t);
+        });
+        btn.addEventListener('keydown', (ev) => {
+          let nextIdx = -1;
+          if (ev.key === 'ArrowRight') nextIdx = (idx + 1) % obsTabs.length;
+          else if (ev.key === 'ArrowLeft') nextIdx = (idx - 1 + obsTabs.length) % obsTabs.length;
+          else if (ev.key === 'Home') nextIdx = 0;
+          else if (ev.key === 'End') nextIdx = obsTabs.length - 1;
+          if (nextIdx >= 0) {
+            ev.preventDefault();
+            const targetBtn = obsTabs[nextIdx];
+            const t = targetBtn.getAttribute('data-pt-tab');
+            if (t) switchPlaytestObsSubtab(t);
+            targetBtn.focus();
+          }
+        });
+      });
+
+      document.getElementById('pt-select-all-wishes')?.addEventListener('change', (e) => {
+        const checkAll = Boolean(e.target.checked);
+        document.querySelectorAll('.pt-wish-checkbox').forEach(cb => {
+          cb.checked = checkAll;
+          const wid = cb.getAttribute('data-wish-id');
+          if (wid) {
+            if (checkAll) _playtestSelectedWishIds.add(wid);
+            else _playtestSelectedWishIds.delete(wid);
+          }
+        });
+        updatePlaytestBatchButtonState();
+      });
+
+      document.getElementById('btn-pt-send-batch')?.addEventListener('click', () => {
+        const ids = Array.from(_playtestSelectedWishIds);
+        if (ids.length > 0) window.dispatchPlaytestWishes(ids);
+      });
+
+      // Optional Auto-Pause on Feedback Markers during Replay Video playback
+      const vidEl = document.getElementById('pt-replay-video');
+      if (vidEl) {
+        vidEl.addEventListener('timeupdate', () => {
+          const autoPauseEl = document.getElementById('pt-autopause-markers');
+          if (!autoPauseEl || !autoPauseEl.checked || vidEl.paused) return;
+          const cur = vidEl.currentTime;
+          for (const m of _playtestMarkers) {
+            if (Math.abs(cur - m.sec) < 0.22 && _playtestLastAutoPausedMarkerKey !== m.key) {
+              _playtestLastAutoPausedMarkerKey = m.key;
+              vidEl.pause();
+              break;
+            }
+          }
+        });
+      }
+    }
+
     function initWritersRoomWorkspace() {
       document.getElementById('ws-tab-telemetry')?.addEventListener('click', () => switchMainWorkspace('telemetry'));
       document.getElementById('ws-tab-bible')?.addEventListener('click', () => switchMainWorkspace('bible'));
+      initPlaytesterWorkspace();
 
       const transcriptList = document.getElementById('writers-room-transcript-list');
       if (transcriptList) {
@@ -9836,10 +11361,28 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         await triggerNewGameFromScratch({ creativePrompt, pauseForGreenlight });
       });
 
+      const nextSliceModal = document.getElementById('next-slice-modal');
+      const closeNextSliceModal = () => {
+        if (nextSliceModal && typeof nextSliceModal.close === 'function') {
+          nextSliceModal.close();
+        }
+      };
+      document.getElementById('btn-close-next-slice-modal')?.addEventListener('click', closeNextSliceModal);
+      document.getElementById('btn-cancel-next-slice')?.addEventListener('click', closeNextSliceModal);
+      document.getElementById('form-next-slice')?.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const feedbackEl = document.getElementById('input-next-slice-feedback');
+        const feedbackText = feedbackEl ? feedbackEl.value.trim() : '';
+        closeNextSliceModal();
+        if (feedbackEl) feedbackEl.value = '';
+        await triggerResumeGameBuild(feedbackText);
+      });
+
       // Fallback for browsers without native HTMLDialogElement.prototype.closedBy support
       if (typeof HTMLDialogElement !== 'undefined' && !('closedBy' in HTMLDialogElement.prototype)) {
         document.querySelectorAll('dialog[closedby="any"]').forEach(dlg => {
           dlg.addEventListener('click', (event) => {
+            if (event.target !== dlg) return;
             const rect = dlg.getBoundingClientRect();
             const isInDialog =
               rect.top <= event.clientY &&

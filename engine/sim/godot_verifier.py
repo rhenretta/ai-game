@@ -142,6 +142,53 @@ def iter_cartridge_gd_files(
 
 
 
+_MISSING_RESOURCE_STDERR_RE = re.compile(
+    r'ERROR:\s*(?:Resource file not found:\s*(res://[^\s()]+)|Cannot open file\s*["\'](res://[^"\']+)["\'])'
+)
+_SCRIPT_OR_SCENE_LOAD_RE = re.compile(
+    r'\b(?:preload|load)\(\s*["\'](res://[^"\']+\.(?:gd|tscn|gdshader))["\']\s*\)'
+)
+
+
+def find_broken_script_references(
+    cartridge_dir: Union[Path, str],
+    include_tests: bool = False,
+) -> List[GDScriptDiagnostic]:
+    """Scans cartridge `.gd` files for `load('res://...')` / `preload('res://...')` calls
+    referencing `.gd`, `.tscn`, or `.gdshader` files that do not exist on disk (Rule 5: no silent null fallbacks)."""
+    c_dir = Path(cartridge_dir).resolve()
+    broken: List[GDScriptDiagnostic] = []
+    for gd_file in iter_cartridge_gd_files(c_dir, include_tests=include_tests, exclude_helper_libs=True):
+        try:
+            lines = gd_file.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for idx, raw_line in enumerate(lines):
+            code_part = raw_line.split("#", 1)[0]
+            if not code_part.strip():
+                continue
+            for m in _SCRIPT_OR_SCENE_LOAD_RE.finditer(code_part):
+                res_uri = m.group(1).strip()
+                rel_target = res_uri.replace("res://", "").lstrip("/")
+                target_path = c_dir / rel_target
+                if target_path.is_file():
+                    continue
+                broken.append(
+                    GDScriptDiagnostic(
+                        file_path=gd_file,
+                        line_number=idx + 1,
+                        error_message=(
+                            f"Broken script/scene resource reference: '{res_uri}' does not exist on disk "
+                            f"(referenced in {gd_file.relative_to(c_dir).as_posix()}:{idx + 1}). "
+                            f"Do NOT mask this with ResourceLoader.exists() or null checks (Rule 5)—either create '{rel_target}' "
+                            f"or replace the dead load('{res_uri}') with an inline Node2D/Sprite2D construction so spawning/placement genuinely works!"
+                        ),
+                        raw_line=raw_line.strip(),
+                    )
+                )
+    return broken
+
+
 def parse_godot_stderr(cartridge_dir: Union[Path, str], stderr_text: str) -> List[GDScriptDiagnostic]:
     """Parses Godot 4 stderr stream and extracts structured GDScript diagnostics."""
     diagnostics: List[GDScriptDiagnostic] = []
@@ -243,38 +290,84 @@ def parse_godot_stderr(cartridge_dir: Union[Path, str], stderr_text: str) -> Lis
                         raw_line=line,
                     )
                 )
+            elif not matched:
+                m_res = _MISSING_RESOURCE_STDERR_RE.search(line)
+                if m_res:
+                    missing_uri = (m_res.group(1) or m_res.group(2) or "").strip()
+                    if missing_uri.endswith((".gd", ".tscn", ".gdshader")):
+                        ref_matches = [
+                            d for d in find_broken_script_references(c_dir, include_tests=True)
+                            if missing_uri in d.error_message
+                        ]
+                        if ref_matches:
+                            for rm in ref_matches:
+                                if rm not in diagnostics:
+                                    diagnostics.append(rm)
+                        else:
+                            diagnostics.append(
+                                GDScriptDiagnostic(
+                                    file_path=c_dir / "main.gd",
+                                    line_number=1,
+                                    error_message=line,
+                                    raw_line=line,
+                                )
+                            )
 
-    # Filter out cascading preload errors ("Could not preload resource script 'res://X.gd'")
-    # when X.gd itself already has a direct syntax/parse diagnostic
+    return _filter_cascading_preload_diagnostics(diagnostics)
+
+
+def _filter_cascading_preload_diagnostics(
+    diagnostics: List[GDScriptDiagnostic],
+) -> List[GDScriptDiagnostic]:
+    """Removes cascading `Could not preload resource script 'res://X.gd'` / `Failed to load script`
+    diagnostics when `X.gd` itself already has a direct syntax/parse diagnostic in `diagnostics`,
+    and sorts direct syntax/parse errors ahead of any remaining preload diagnostics."""
+    if not diagnostics:
+        return diagnostics
     direct_broken_files = {
         d.file_path.name
         for d in diagnostics
         if "Could not preload resource script" not in d.error_message
         and "Failed to load script" not in d.error_message
     }
-    if direct_broken_files:
-        filtered: List[GDScriptDiagnostic] = []
-        for d in diagnostics:
+    filtered: List[GDScriptDiagnostic] = []
+    for d in diagnostics:
+        if (
+            direct_broken_files
+            and (
+                "Could not preload resource script" in d.error_message
+                or "Failed to load script" in d.error_message
+            )
+            and any(bf in d.error_message for bf in direct_broken_files)
+        ):
+            continue
+        filtered.append(d)
+    if not filtered:
+        filtered = list(diagnostics)
+    filtered.sort(
+        key=lambda d: (
+            1
             if (
                 "Could not preload resource script" in d.error_message
                 or "Failed to load script" in d.error_message
-            ) and any(bf in d.error_message for bf in direct_broken_files):
-                continue
-            filtered.append(d)
-        if filtered:
-            diagnostics = filtered
-
-    return diagnostics
+            )
+            else 0
+        )
+    )
+    return filtered
 
 
 def verify_godot_cartridge_syntax(
     cartridge_dir: Union[Path, str],
     timeout: float = 30.0,
+    extra_files: Optional[List[str]] = None,
 ) -> Tuple[bool, List[GDScriptDiagnostic]]:
-    """Validates Godot 4 cartridge syntax and project integrity headlessly across all .gd files
-    plus a 2-tick runtime initialization check.
+    """Validates Godot 4 cartridge syntax and project integrity headlessly across production .gd files
+    (plus any explicit `extra_files`) and a 2-tick runtime initialization check.
     Returns (is_valid, diagnostics).
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     c_dir = Path(cartridge_dir).resolve()
     if not (c_dir / "project.godot").is_file():
         return False, [
@@ -288,12 +381,25 @@ def verify_godot_cartridge_syntax(
 
     diagnostics: List[GDScriptDiagnostic] = []
 
-    # 1. Run check-only on every .gd script in the cartridge so dynamically loaded scripts are also compiled
-    gd_files = [
-        p for p in sorted(c_dir.rglob("*.gd"))
-        if p.is_file() and not any(part in (".godot", "res:", "artifacts") for part in p.relative_to(c_dir).parts)
-    ]
-    for gd_file in gd_files:
+    # 1. Run check-only on target .gd scripts when `extra_files` (task-scoped allowed_files) is provided,
+    # or across all production .gd scripts (excluding isolated QA harnesses in tests/) for whole-cartridge verification.
+    scoped_gd_files: List[Path] = []
+    if extra_files:
+        seen_paths: set[Path] = set()
+        for rel_extra in extra_files:
+            clean_rel = str(rel_extra or "").replace("res://", "").lstrip("/")
+            if clean_rel.endswith(".gd"):
+                cand_p = (c_dir / clean_rel).resolve()
+                if cand_p.is_file() and cand_p not in seen_paths:
+                    scoped_gd_files.append(cand_p)
+                    seen_paths.add(cand_p)
+    gd_files = (
+        scoped_gd_files
+        if scoped_gd_files
+        else list(iter_cartridge_gd_files(c_dir, include_tests=False, exclude_helper_libs=True))
+    )
+
+    def _check_single_gd(gd_file: Path) -> List[GDScriptDiagnostic]:
         rel_gd = str(gd_file.relative_to(c_dir)).replace("\\", "/")
         res_script = run_godot_command(
             ["--path", str(c_dir), "--check-only", "--script", f"res://{rel_gd}"],
@@ -301,7 +407,15 @@ def verify_godot_cartridge_syntax(
             timeout=timeout,
             headless=True,
         )
-        script_diags = parse_godot_stderr(c_dir, res_script.stderr)
+        return parse_godot_stderr(c_dir, res_script.stderr)
+
+    if len(gd_files) > 1:
+        with ThreadPoolExecutor(max_workers=min(4, len(gd_files))) as pool:
+            per_file_diags = list(pool.map(_check_single_gd, gd_files))
+    else:
+        per_file_diags = [_check_single_gd(f) for f in gd_files]
+
+    for script_diags in per_file_diags:
         for d in script_diags:
             if d not in diagnostics:
                 diagnostics.append(d)
@@ -327,6 +441,11 @@ def verify_godot_cartridge_syntax(
         if d not in diagnostics:
             diagnostics.append(d)
 
+    for broken_ref in find_broken_script_references(c_dir, include_tests=False):
+        if broken_ref not in diagnostics:
+            diagnostics.append(broken_ref)
+
+    diagnostics = _filter_cascading_preload_diagnostics(diagnostics)
     is_valid = (res.returncode == 0) and (len(diagnostics) == 0)
     return is_valid, diagnostics
 

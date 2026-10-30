@@ -100,7 +100,9 @@ def _active_inputs_at_tick(
                 for a in seg.get("actions", []):
                     if str(a) not in acts:
                         acts.append(str(a))
-                if seg.get("mouse_click_pos"):
+                if seg.get("mouse_world_pos"):
+                    acts.append(f"click_world@{seg['mouse_world_pos']}")
+                elif seg.get("mouse_click_pos"):
                     acts.append(f"click@{seg['mouse_click_pos']}")
         if acts:
             parts.append(f"in:[{','.join(acts[:3])}]")
@@ -149,6 +151,57 @@ def _resolve_snapshot_key(snap: Dict[str, Any], key_path: str) -> Tuple[bool, An
     return True, cur
 
 
+def _check_single_assertion_against_snap(
+    snap: Dict[str, Any],
+    key: str,
+    exp: str,
+) -> Tuple[Optional[bool], Any]:
+    """Evaluates a single `(key, exp)` expectation against `snap`.
+    Returns `(passed, actual_val)` where `passed` is `None` if `key` is absent or `exp` is not a structured comparison."""
+    import re as _re
+
+    found, actual_val = _resolve_snapshot_key(snap, key)
+    if not found:
+        return None, None
+    cmp_re = _re.compile(r"^\s*(==|!=|>=|<=|>|<)\s*(-?\d+(?:\.\d+)?|true|false|[A-Za-z0-9_]+)\s*$", _re.IGNORECASE)
+    exact_re = _re.compile(r"^\s*(-?\d+(?:\.\d+)?|true|false)\s*$", _re.IGNORECASE)
+    m_cmp = cmp_re.match(exp)
+    m_exact = exact_re.match(exp) if not m_cmp else None
+    op = m_cmp.group(1) if m_cmp else ("==" if m_exact else "")
+    rhs_raw = m_cmp.group(2) if m_cmp else (m_exact.group(1) if m_exact else "")
+    if not op:
+        return None, actual_val
+    try:
+        if rhs_raw.lower() in ("true", "false") or isinstance(actual_val, bool):
+            lhs_b = bool(actual_val) if isinstance(actual_val, bool) else str(actual_val).strip().lower() in ("true", "1")
+            rhs_b = rhs_raw.lower() == "true"
+            ok = (lhs_b == rhs_b) if op == "==" else (lhs_b != rhs_b)
+        elif isinstance(actual_val, (int, float)):
+            lhs_f = float(actual_val)
+            rhs_f = float(rhs_raw)
+            if op == "==":
+                ok = abs(lhs_f - rhs_f) <= 0.05
+            elif op == "!=":
+                ok = abs(lhs_f - rhs_f) > 0.05
+            elif op == ">=":
+                ok = lhs_f >= rhs_f - 1e-4
+            elif op == "<=":
+                ok = lhs_f <= rhs_f + 1e-4
+            elif op == ">":
+                ok = lhs_f > rhs_f
+            elif op == "<":
+                ok = lhs_f < rhs_f
+            else:
+                ok = True
+        else:
+            lhs_s = str(actual_val).strip().lower()
+            rhs_s = rhs_raw.strip().lower()
+            ok = (lhs_s == rhs_s) if op == "==" else (lhs_s != rhs_s)
+        return ok, actual_val
+    except Exception:
+        return None, actual_val
+
+
 def _evaluate_qa_state_assertions(
     tick_snaps: Union[Dict[int, Dict[str, Any]], List[Dict[str, Any]]],
     state_assertions: Optional[List[Any]],
@@ -163,10 +216,6 @@ def _evaluate_qa_state_assertions(
             for idx, s in enumerate(tick_snaps)
             if isinstance(s, dict)
         }
-    import re as _re
-
-    cmp_re = _re.compile(r"^\s*(==|!=|>=|<=|>|<)\s*(-?\d+(?:\.\d+)?|true|false|[A-Za-z0-9_]+)\s*$", _re.IGNORECASE)
-    exact_re = _re.compile(r"^\s*(-?\d+(?:\.\d+)?|true|false)\s*$", _re.IGNORECASE)
     failures: List[str] = []
     for raw_a in state_assertions:
         at_t = int(getattr(raw_a, "at_tick", 0) if not isinstance(raw_a, dict) else raw_a.get("at_tick", 0))
@@ -178,44 +227,8 @@ def _evaluate_qa_state_assertions(
         ).strip()
         if at_t not in tick_snaps or not key or not exp:
             continue
-        found, actual_val = _resolve_snapshot_key(tick_snaps[at_t], key)
-        if not found:
-            continue
-        m_cmp = cmp_re.match(exp)
-        m_exact = exact_re.match(exp) if not m_cmp else None
-        op = m_cmp.group(1) if m_cmp else ("==" if m_exact else "")
-        rhs_raw = m_cmp.group(2) if m_cmp else (m_exact.group(1) if m_exact else "")
-        if not op:
-            continue
-        try:
-            if rhs_raw.lower() in ("true", "false") or isinstance(actual_val, bool):
-                lhs_b = bool(actual_val) if isinstance(actual_val, bool) else str(actual_val).strip().lower() in ("true", "1")
-                rhs_b = rhs_raw.lower() == "true"
-                ok = (lhs_b == rhs_b) if op == "==" else (lhs_b != rhs_b)
-            elif isinstance(actual_val, (int, float)):
-                lhs_f = float(actual_val)
-                rhs_f = float(rhs_raw)
-                if op == "==":
-                    ok = abs(lhs_f - rhs_f) <= 0.05
-                elif op == "!=":
-                    ok = abs(lhs_f - rhs_f) > 0.05
-                elif op == ">=":
-                    ok = lhs_f >= rhs_f - 1e-4
-                elif op == "<=":
-                    ok = lhs_f <= rhs_f + 1e-4
-                elif op == ">":
-                    ok = lhs_f > rhs_f
-                elif op == "<":
-                    ok = lhs_f < rhs_f
-                else:
-                    ok = True
-            else:
-                lhs_s = str(actual_val).strip().lower()
-                rhs_s = rhs_raw.strip().lower()
-                ok = (lhs_s == rhs_s) if op == "==" else (lhs_s != rhs_s)
-        except Exception:
-            continue
-        if not ok:
+        ok, actual_val = _check_single_assertion_against_snap(tick_snaps[at_t], key, exp)
+        if ok is False:
             failures.append(f"tick {at_t}: expected `{key}` {exp}, got {actual_val!r}")
     if failures:
         raise StudioAgentError(
@@ -224,8 +237,9 @@ def _evaluate_qa_state_assertions(
 
 
 def format_filmstrip_telemetry_progression(strip_path: Path) -> str:
-    """Formats the per-frame input and telemetry state progression saved alongside `strip_path`
-    (`.telemetry.json`) so TaskLead, SWE, QA, and Council reviewers see exact coordinates and state values."""
+    """Formats the per-frame input, telemetry state progression, visible HUD text, audio state, and
+    live entrypoint parity saved alongside `strip_path` (`.telemetry.json`) so TaskLead, SWE, QA,
+    and Council reviewers observe ground-truth runtime state directly."""
     import json as _json
 
     sidecar = Path(strip_path).with_suffix(".telemetry.json")
@@ -233,7 +247,9 @@ def format_filmstrip_telemetry_progression(strip_path: Path) -> str:
         return ""
     try:
         data = _json.loads(sidecar.read_text(encoding="utf-8"))
-        frames = data.get("frames") if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            return ""
+        frames = data.get("frames")
         if not isinstance(frames, list) or not frames:
             return ""
         parts: List[str] = []
@@ -247,9 +263,38 @@ def format_filmstrip_telemetry_progression(strip_path: Path) -> str:
                 parts.append(f"tick {t} ({act}): {snap}")
             else:
                 parts.append(f"tick {t} ({act})")
-        return "Captured Frame Telemetry: " + " -> ".join(parts) if parts else ""
+        if not parts:
+            return ""
+        out_sections = ["Captured Frame Telemetry: " + " -> ".join(parts)]
+        scene_obs = data.get("scene_audit")
+        if isinstance(scene_obs, dict):
+            ui_txts = scene_obs.get("visible_ui_texts")
+            if isinstance(ui_txts, list) and ui_txts:
+                out_sections.append(f"Visible HUD/UI Texts: {ui_txts[:16]}")
+            aud_det = scene_obs.get("audio_players_detail")
+            if isinstance(aud_det, list) and aud_det:
+                out_sections.append(f"Audio Players Runtime State: {aud_det[:8]}")
+        parity_obs = data.get("main_scene_parity")
+        if isinstance(parity_obs, dict) and parity_obs:
+            out_sections.append(f"Live Main Scene Parity: {parity_obs}")
+        return " | ".join(out_sections)
     except Exception:
         return ""
+
+
+def _resolve_cartridge_main_scene(cartridge_dir: Path) -> str:
+    proj = Path(cartridge_dir) / "project.godot"
+    if proj.is_file():
+        try:
+            for line in proj.read_text(encoding="utf-8").splitlines():
+                s = line.strip()
+                if s.startswith("run/main_scene="):
+                    val = s.split("=", 1)[1].strip().strip('"').strip("'")
+                    if val:
+                        return val
+        except Exception:
+            pass
+    return "res://main.tscn"
 
 
 def capture_filmstrip(
@@ -263,6 +308,7 @@ def capture_filmstrip(
     verify_counterfactual: bool = False,
     state_assertions: Optional[List[Any]] = None,
     target_scene: str = "",
+    verify_entrypoint_parity: bool = False,
 ) -> Path:
     """Runs the real game, captures the viewport at `ticks` (driven by `input_script` and `setup_script` if given),
     and composes a labelled QA proof strip with external input & state telemetry."""
@@ -345,9 +391,9 @@ def capture_filmstrip(
         header_txt = f"[QA] tick {t}  {active_in}"
         draw.text((x + 6, y + 3), header_txt[:62], fill=(240, 240, 240))
         snap_d = tick_snaps.get(t) if isinstance(tick_snaps.get(t), dict) else None
-        snap_txt_full = _format_snapshot_footer(snap_d, max_chars=96)
+        snap_txt_full = _format_snapshot_footer(snap_d, max_chars=600)
         if footer_h > 0:
-            snap_txt = snap_txt_full[:58]
+            snap_txt = _format_snapshot_footer(snap_d, max_chars=58)
             if snap_txt:
                 draw.text((x + 6, y + label_h + cell[1] + 2), f"[QA] {snap_txt}"[:62], fill=(140, 215, 245))
         frame_telemetry_records.append(
@@ -360,22 +406,72 @@ def capture_filmstrip(
         )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     strip.save(out_path, "PNG")
-    try:
-        import json as _json
+    scene_audit_summary: Dict[str, Any] = {}
+    if isinstance(audit_dict, dict):
+        if audit_dict.get("visible_ui_texts"):
+            scene_audit_summary["visible_ui_texts"] = list(audit_dict.get("visible_ui_texts") or [])[:24]
+        if audit_dict.get("audio_players_detail"):
+            scene_audit_summary["audio_players_detail"] = list(audit_dict.get("audio_players_detail") or [])[:12]
 
-        out_path.with_suffix(".telemetry.json").write_text(
-            _json.dumps({"ticks": [t for t, _ in frames], "frames": frame_telemetry_records}, indent=2),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
+    def _write_telemetry_sidecar(parity_summary: Optional[Dict[str, Any]] = None) -> None:
+        try:
+            import json as _json
+
+            payload: Dict[str, Any] = {
+                "ticks": [t for t, _ in frames],
+                "frames": frame_telemetry_records,
+            }
+            if scene_audit_summary:
+                payload["scene_audit"] = scene_audit_summary
+            if parity_summary:
+                payload["main_scene_parity"] = parity_summary
+            out_path.with_suffix(".telemetry.json").write_text(
+                _json.dumps(payload, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    _write_telemetry_sidecar()
 
     _evaluate_qa_state_assertions(tick_snaps, state_assertions)
+
+    passive_clock_keys = {
+        "tick",
+        "node_count",
+        "elapsed_time",
+        "time",
+        "time_elapsed",
+        "frame",
+        "fps",
+        "delta",
+        "sim_time",
+        "uptime",
+    }
+
+    def _norm_snap(val: Any) -> Any:
+        if isinstance(val, dict):
+            return {
+                k: _norm_snap(v)
+                for k, v in val.items()
+                if str(k).lower() not in passive_clock_keys
+            }
+        if isinstance(val, (list, tuple)):
+            return [_norm_snap(x) for x in val]
+        if isinstance(val, float):
+            return int(round(val))
+        if isinstance(val, str) and val.startswith("(") and val.endswith(")") and "," in val:
+            try:
+                parts = [float(p.strip()) for p in val[1:-1].split(",")]
+                return "(" + ", ".join(str(int(round(p))) for p in parts) + ")"
+            except ValueError:
+                return val
+        return val
 
     if verify_counterfactual and (input_script or setup_script) and len(set(ticks)) >= 2:
         ctrl_sim = GodotHeadlessSimulator(
             cartridge_dir, capture_viewport=False, capture_ticks=ticks, input_script=[],
-            setup_script=[], max_ticks=max(ticks), telemetry_mode="null",
+            setup_script=setup_script, max_ticks=max(ticks), telemetry_mode="null",
             target_scene=target_scene,
         )
         ctrl_sim.run_until_complete()
@@ -391,47 +487,148 @@ def capture_filmstrip(
                         f"by tick {t_last} with zero player input! Ensure objectives require active player agency and never auto-complete at start."
                     )
         if t_first in ctrl_snaps and t_last in ctrl_snaps and t_last in tick_snaps:
-            passive_clock_keys = {
-                "tick",
-                "node_count",
-                "elapsed_time",
-                "time",
-                "time_elapsed",
-                "frame",
-                "fps",
-                "delta",
-                "sim_time",
-                "uptime",
-            }
-
-            def _norm_snap(val: Any) -> Any:
-                if isinstance(val, dict):
-                    return {
-                        k: _norm_snap(v)
-                        for k, v in val.items()
-                        if str(k).lower() not in passive_clock_keys
-                    }
-                if isinstance(val, (list, tuple)):
-                    return [_norm_snap(x) for x in val]
-                if isinstance(val, float):
-                    return int(round(val))
-                if isinstance(val, str) and val.startswith("(") and val.endswith(")") and "," in val:
-                    try:
-                        parts = [float(p.strip()) for p in val[1:-1].split(",")]
-                        return "(" + ", ".join(str(int(round(p))) for p in parts) + ")"
-                    except ValueError:
-                        return val
-                return val
-
             c0 = _norm_snap(ctrl_snaps[t_first])
             c_end = _norm_snap(ctrl_snaps[t_last])
             a_end = _norm_snap(tick_snaps[t_last])
-            # If the zero-input control run changed state across ticks AND ended in the exact same state as the scripted run,
-            # the game is running a self-playing demo timer rather than responding to the QA input script.
-            if c0 != c_end and c_end == a_end:
+            # If the zero-input control run ended in the exact same state as the scripted run:
+            # - either a self-playing demo timer ran (`c0 != c_end`), OR
+            # - `setup_script` did all the state mutation and `input_script` was a dead no-op!
+            if input_script and c_end == a_end:
+                raise StudioAgentError(
+                    f"Counterfactual QA check failed: running with zero player inputs (input_script=[]) produced the exact same end state "
+                    f"at tick {t_last} ({c_end}) as the scripted run! Either player inputs in the game script are dead/unwired, or a self-playing timer/setup call bypassed real player agency."
+                )
+            if not input_script and c0 != c_end and c_end == a_end:
                 raise StudioAgentError(
                     f"Counterfactual QA check failed: running with zero inputs (input_script=[]) produced the exact same state transition "
                     f"from tick {t_first} to tick {t_last} ({c_end}) as the scripted run. Remove self-playing sim_tick demo timers from main.gd/scenes.gd."
                 )
+            # Also check if post-baseline progress assertions (assertions at tick > t_first that were NOT satisfied at t_first)
+            # were ALL satisfied during the zero-input control run (e.g. when pre-placed structures auto-solve the goal on a timer).
+            if state_assertions and isinstance(ctrl_snaps.get(t_first), dict):
+                passive_clock_lower = {k.lower() for k in passive_clock_keys}
+                post_progress_assertions: List[Tuple[int, str, str, bool]] = []
+                for raw_a in state_assertions:
+                    at_t = int(getattr(raw_a, "at_tick", 0) if not isinstance(raw_a, dict) else raw_a.get("at_tick", 0))
+                    key = str(getattr(raw_a, "snapshot_key", "") if not isinstance(raw_a, dict) else raw_a.get("snapshot_key", "")).strip()
+                    exp = str(
+                        getattr(raw_a, "expected_value_or_change", "")
+                        if not isinstance(raw_a, dict)
+                        else raw_a.get("expected_value_or_change", "")
+                    ).strip()
+                    if at_t <= t_first or at_t not in ctrl_snaps or not key or not exp or key.lower() in passive_clock_lower:
+                        continue
+                    ok_t0, _ = _check_single_assertion_against_snap(ctrl_snaps[t_first], key, exp)
+                    ok_ctrl, _ = _check_single_assertion_against_snap(ctrl_snaps[at_t], key, exp)
+                    if ok_t0 is False and ok_ctrl is not None:
+                        post_progress_assertions.append((at_t, key, exp, ok_ctrl))
+                if post_progress_assertions and all(ok_c for _, _, _, ok_c in post_progress_assertions):
+                    auto_passed_desc = [f"tick {at_t}: `{key}` {exp}" for at_t, key, exp, _ in post_progress_assertions]
+                    raise StudioAgentError(
+                        "Counterfactual QA check failed: zero-input control run (input_script=[]) satisfied all post-baseline progress "
+                        f"assertions ({', '.join(auto_passed_desc)}) with ZERO player input! Do not pre-solve or pre-place the player's "
+                        "required construction/routing loop in _ready(); require active player input to achieve the target state."
+                    )
+
+    if verify_entrypoint_parity and len(set(ticks)) >= 2:
+        main_scene_res = _resolve_cartridge_main_scene(cartridge_dir)
+        main_rel = main_scene_res.removeprefix("res://").lstrip("/")
+        norm_target = (target_scene or "").strip()
+        sorted_t = sorted(set(ticks))
+        t_first, t_last = sorted_t[0], sorted_t[-1]
+        if (cartridge_dir / main_rel).is_file():
+            if norm_target and norm_target != main_scene_res:
+                main_sim = GodotHeadlessSimulator(
+                    cartridge_dir,
+                    capture_viewport=False,
+                    capture_ticks=ticks,
+                    input_script=input_script,
+                    setup_script=None,
+                    max_ticks=max(ticks),
+                    telemetry_mode="null",
+                    target_scene=main_scene_res,
+                )
+                main_sim.run_until_complete()
+                main_errs = [
+                    f"{d.file_path.name}:{d.line_number} - {d.error_message}"
+                    for d in (getattr(main_sim, "runtime_diagnostics", None) or [])
+                    if getattr(d, "file_path", None) is not None and str(d.file_path).endswith(".gd")
+                ] + list(getattr(main_sim, "script_errors", None) or [])
+                if main_errs:
+                    raise StudioAgentError(
+                        f"Entrypoint Parity Gate failed: live playable entrypoint '{main_scene_res}' raised runtime GDScript error(s): "
+                        + " | ".join(str(e) for e in main_errs[:5])
+                    )
+                main_snaps = dict(getattr(main_sim, "tick_snapshots", {}) or {})
+                m_t0 = _norm_snap(main_snaps.get(t_first, {}))
+                w_t0 = _norm_snap(tick_snaps.get(t_first, {}))
+                m_last = _norm_snap(main_snaps.get(t_last, {}))
+                w_last = _norm_snap(tick_snaps.get(t_last, {}))
+
+                t0_diverged_keys: List[str] = []
+                if isinstance(m_t0, dict) and isinstance(w_t0, dict):
+                    for k, mv0 in m_t0.items():
+                        if k == "player_pos" or k not in w_t0:
+                            continue
+                        if mv0 != w_t0[k]:
+                            t0_diverged_keys.append(f"{k} (main_t0={mv0!r} vs wrapper_t0={w_t0[k]!r})")
+
+                diverged_last: List[str] = []
+                if isinstance(m_last, dict) and isinstance(w_last, dict):
+                    for k, mv in m_last.items():
+                        if k not in w_last:
+                            continue
+                        if k == "player_pos" and isinstance(m_t0, dict) and isinstance(w_t0, dict) and m_t0.get(k) != w_t0.get(k):
+                            continue
+                        if mv != w_last[k]:
+                            diverged_last.append(f"{k} (main={mv!r} vs test_wrapper={w_last[k]!r})")
+
+                parity_record: Dict[str, Any] = {
+                    "main_scene": main_scene_res,
+                    "target_scene": norm_target,
+                    "staged_distinct_t0": bool(t0_diverged_keys or setup_script),
+                    "t0_diverged_keys": t0_diverged_keys[:8],
+                    "t_last_diverged_keys": diverged_last[:8],
+                    "main_t0": m_t0,
+                    "main_t_last": m_last,
+                }
+                _write_telemetry_sidecar(parity_record)
+
+                if not t0_diverged_keys and not setup_script:
+                    if input_script and t_first in main_snaps and t_last in main_snaps:
+                        if m_t0 == m_last:
+                            raise StudioAgentError(
+                                f"Entrypoint Parity Gate failed: scripted player inputs produced ZERO gameplay state change in live '{main_scene_res}' "
+                                f"from tick {t_first} to tick {t_last} ({m_last}). Ensure player verbs and input handlers are wired in '{main_scene_res}', not only inside '{norm_target}'."
+                            )
+                    if state_assertions and main_snaps:
+                        main_keys_any: set[str] = set()
+                        for ms in main_snaps.values():
+                            if isinstance(ms, dict):
+                                main_keys_any.update(ms.keys())
+                        shared_assertions = [
+                            a for a in state_assertions
+                            if (str(getattr(a, "snapshot_key", "") if not isinstance(a, dict) else a.get("snapshot_key", "")).strip() in main_keys_any)
+                        ]
+                        if shared_assertions:
+                            try:
+                                _evaluate_qa_state_assertions(main_snaps, shared_assertions)
+                            except StudioAgentError as parity_assert_err:
+                                raise StudioAgentError(
+                                    f"Entrypoint Parity Gate failed: state assertions passed inside QA wrapper '{norm_target}' "
+                                    f"but FAILED when running the exact same player inputs on live '{main_scene_res}': {parity_assert_err}"
+                                ) from parity_assert_err
+                    if diverged_last:
+                        raise StudioAgentError(
+                            f"Entrypoint Parity Gate failed: QA wrapper scene '{norm_target}' started at the same t={t_first} state as '{main_scene_res}' "
+                            f"but mutated or diverged during execution on game state key(s): {', '.join(diverged_last[:8])}. "
+                            f"Do not inject mid-run state mutations inside `tests/test_*.gd`; if the production game is deadlocked or broken, report it via `production_defect_report`."
+                        )
+            elif input_script and t_first in tick_snaps and t_last in tick_snaps:
+                if _norm_snap(tick_snaps[t_first]) == _norm_snap(tick_snaps[t_last]):
+                    raise StudioAgentError(
+                        f"Entrypoint Parity Gate failed: scripted player inputs produced ZERO gameplay state change in live '{main_scene_res}' "
+                        f"from tick {t_first} to tick {t_last} ({_norm_snap(tick_snaps[t_last])})."
+                    )
 
     return out_path
