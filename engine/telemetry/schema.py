@@ -171,6 +171,9 @@ CREATE TABLE IF NOT EXISTS playtest_sessions (
     sim_duration_sec REAL DEFAULT 0.0,
     compaction_count INTEGER DEFAULT 0,
     rulebook_json TEXT DEFAULT '{}',
+    field_notes_json TEXT DEFAULT '{}',
+    questions_json TEXT DEFAULT '{}',
+    bugs_found_json TEXT DEFAULT '{}',
     impressions_json TEXT DEFAULT '{}',
     session_report_json TEXT DEFAULT '{}',
     compacted_journal_json TEXT DEFAULT '{}',
@@ -204,7 +207,10 @@ CREATE TABLE IF NOT EXISTS playtest_turns (
     current_plan TEXT DEFAULT '',
     deliberation TEXT NOT NULL,
     action_json TEXT NOT NULL DEFAULT '{}',
+    field_note_updates_json TEXT DEFAULT '[]',
+    question_updates_json TEXT DEFAULT '[]',
     rulebook_updates_json TEXT DEFAULT '[]',
+    bug_reports_json TEXT DEFAULT '[]',
     impression_updates_json TEXT DEFAULT '[]',
     append_log_line TEXT NOT NULL DEFAULT '',
     mood_state TEXT,
@@ -302,12 +308,25 @@ def init_studio_schema(conn: sqlite3.Connection) -> None:
             cursor.execute("ALTER TABLE playtest_sessions ADD COLUMN initiated_by TEXT NOT NULL DEFAULT 'operator';")
         if "impressions_json" not in sess_cols:
             cursor.execute("ALTER TABLE playtest_sessions ADD COLUMN impressions_json TEXT DEFAULT '{}';")
+        if "field_notes_json" not in sess_cols:
+            cursor.execute("ALTER TABLE playtest_sessions ADD COLUMN field_notes_json TEXT DEFAULT '{}';")
+        if "questions_json" not in sess_cols:
+            cursor.execute("ALTER TABLE playtest_sessions ADD COLUMN questions_json TEXT DEFAULT '{}';")
+        if "bugs_found_json" not in sess_cols:
+            cursor.execute("ALTER TABLE playtest_sessions ADD COLUMN bugs_found_json TEXT DEFAULT '{}';")
         if "session_report_json" not in sess_cols:
             cursor.execute("ALTER TABLE playtest_sessions ADD COLUMN session_report_json TEXT DEFAULT '{}';")
 
     cursor.execute("PRAGMA table_info(playtest_turns);")
     turn_cols = {r[1] for r in cursor.fetchall()}
-    if turn_cols and "impression_updates_json" not in turn_cols:
-        cursor.execute("ALTER TABLE playtest_turns ADD COLUMN impression_updates_json TEXT DEFAULT '[]';")
+    if turn_cols:
+        if "impression_updates_json" not in turn_cols:
+            cursor.execute("ALTER TABLE playtest_turns ADD COLUMN impression_updates_json TEXT DEFAULT '[]';")
+        if "field_note_updates_json" not in turn_cols:
+            cursor.execute("ALTER TABLE playtest_turns ADD COLUMN field_note_updates_json TEXT DEFAULT '[]';")
+        if "question_updates_json" not in turn_cols:
+            cursor.execute("ALTER TABLE playtest_turns ADD COLUMN question_updates_json TEXT DEFAULT '[]';")
+        if "bug_reports_json" not in turn_cols:
+            cursor.execute("ALTER TABLE playtest_turns ADD COLUMN bug_reports_json TEXT DEFAULT '[]';")
 
     conn.commit()

@@ -26,6 +26,7 @@ import pytest
 
 from engine.playtest.agent import (
     BlindPlaytesterAgent,
+    _playtest_non_thinking_config,
     build_blind_player_system_prompt,
     compute_frame_mse,
     create_isolated_playtest_genai_client,
@@ -33,14 +34,18 @@ from engine.playtest.agent import (
 )
 from engine.playtest.godot_bridge import TurnObservation, write_pcm16_to_wav
 from engine.playtest.models import (
+    DEFAULT_PLAYTEST_MODEL,
     BlindStoreCard,
     PlaytestBudgetExceededError,
+    PlaytestBugReport,
     PlaytestCompactedJournal,
     PlaytestEndDecision,
     PlaytestExperienceReport,
+    PlaytestFieldNoteUpdate,
     PlaytestImpressionUpdate,
     PlaytestMoodNote,
     PlaytestMotorAction,
+    PlaytestQuestionUpdate,
     PlaytestRulebookUpdate,
     PlaytestSessionConfig,
     PlaytestSessionControlRequest,
@@ -158,6 +163,9 @@ def test_all_playtest_models_enforce_rationale_first_deliberation():
         PlaytestSessionConfig,
         PlaytestMotorAction,
         PlaytestRulebookUpdate,
+        PlaytestFieldNoteUpdate,
+        PlaytestQuestionUpdate,
+        PlaytestBugReport,
         PlaytestImpressionUpdate,
         PlaytestMoodNote,
         PlaytestWishDraft,
@@ -175,7 +183,9 @@ def test_all_playtest_models_enforce_rationale_first_deliberation():
         field_names = list(cls.model_fields.keys())
         assert field_names[0] == "deliberation", f"{cls.__name__} must place 'deliberation' at index 0, got {field_names}"
 
-    # Verify terminal decision/score fields are strictly LAST (Rule 4)
+    # Verify terminal decision/score/status/severity fields are strictly LAST (Rule 4)
+    assert list(PlaytestQuestionUpdate.model_fields.keys())[-1] == "status"
+    assert list(PlaytestBugReport.model_fields.keys())[-1] == "severity"
     assert list(PlaytestExperienceReport.model_fields.keys())[-1] == "overall_fun_rating"
     assert list(BlindPlaytestCouncilTurn.model_fields.keys())[-1] == "recommends_slice_approval"
     assert list(BlindPlaytestCouncilVerdict.model_fields.keys())[-1] == "verdict"
@@ -637,6 +647,281 @@ def test_sparse_impressions_non_repetition_compaction_and_experience_report(tmp_
     rep_contents = fake_client.calls[3]["contents"]
     assert len(rep_contents[:-1]) == 1 + 3
     assert rep_contents[0].parts[0].text == fake_client.calls[0]["contents"][0].parts[0].text
+
+
+def test_fast_non_thinking_model_config_and_live_notebook_questions_bugs_mood_and_audio_transition(tmp_path: Path):
+    assert DEFAULT_PLAYTEST_MODEL == "gemini-3.5-flash-lite"
+    lite_tc = _playtest_non_thinking_config("gemini-3.5-flash-lite")
+    assert lite_tc.thinking_level == types.ThinkingLevel.MINIMAL
+    flash_tc = _playtest_non_thinking_config("gemini-3.8-flash")
+    assert flash_tc.thinking_budget == 0
+
+    card = BlindStoreCard(
+        deliberation="Test player notes, questions, bug spotting, live mood, and perceptual change note.",
+        checkpoint_id="cp_notebook",
+        game_title="Clockwork Terrace",
+        game_description="An atmospheric mechanical terrace.",
+    )
+    cfg = PlaytestSessionConfig(compaction_interval_turns=6, compaction_overlap_turns=1)
+
+    # Turn 1: Logs a field note + open question + sets current_mood="intrigued" (without explicit mood_shift)
+    t1 = _turn_payload(1, plan="Test clicking the brass dial")
+    t1["field_note_updates"] = [
+        {
+            "deliberation": "Noting brass dial at top-left.",
+            "topic": "Brass Dial",
+            "observation": "Shows three unlit notches above a small lever.",
+        }
+    ]
+    t1["question_updates"] = [
+        {
+            "deliberation": "Wondering what the brass dial controls.",
+            "question_key": "brass_dial_purpose",
+            "question": "What does the brass dial in the corner control?",
+            "answer": None,
+            "status": "open",
+        },
+        {
+            "deliberation": "Wondering why the side arch is sealed.",
+            "question_key": "sealed_arch_reason",
+            "question": "Why is the eastern stone arch barred?",
+            "answer": None,
+            "status": "open",
+        },
+    ]
+    t1["impression_updates"] = [
+        {
+            "deliberation": "Initial audio impression while background music plays.",
+            "pillar": "sound_and_audio",
+            "impression": "Pleasant ambient chime loop plays on boot.",
+        }
+    ]
+    t1["current_mood"] = "intrigued"
+
+    # Turn 2: Audio stops -> answers first question + logs a bug + revises audio impression + shifts mood to puzzled
+    t2 = _turn_payload(2, plan="Inspect eastern arch")
+    t2["question_updates"] = [
+        {
+            "deliberation": "Clicking the lever lit one notch on the brass dial.",
+            "question_key": "brass_dial_purpose",
+            "question": "What does the brass dial in the corner control?",
+            "answer": "Pulling the lever charges one notch on the brass dial.",
+            "status": "answered",
+        }
+    ]
+    t2["bug_reports"] = [
+        {
+            "deliberation": "Ambient audio abruptly cut out to silence.",
+            "bug_key": "ambient_audio_dropout",
+            "category": "audio_glitch",
+            "summary": "Ambient audio cut out completely after opening seconds",
+            "details": "Background sound played briefly on Turn 1 and then dropped to total silence.",
+            "severity": "major",
+        }
+    ]
+    t2["impression_updates"] = [
+        {
+            "deliberation": "Revising earlier audio impression now that sound dropped out.",
+            "pillar": "sound_and_audio",
+            "impression": "Opening chime sounded nice briefly, then audio cut out completely.",
+        }
+    ]
+    t2["current_mood"] = "puzzled"
+
+    # Turn 3: Still silent -> verify Perceptual Change Note is NOT spammed every turn!
+    t3 = _turn_payload(3, plan="Try right-click on eastern arch")
+    t3["current_mood"] = "puzzled"
+
+    report_payload = {
+        "deliberation": "Summarizing session with answered/unanswered questions and spotted audio glitch.",
+        "overall_experience_summary": "Figured out the dial lever, though audio cut out early and the eastern arch stayed barred.",
+        "graphics_and_visuals": "Readable brass and stone contrast.",
+        "gameplay_and_feel": "Lever click felt responsive.",
+        "sound_and_audio": "Opening chime cut out to complete silence after the first turn.",
+        "intuitiveness_and_onboarding": "Dial notches made lever progress clear once tested.",
+        "goals_pacing_and_accomplishment": "Charged one dial notch; arch remained locked.",
+        "world_and_atmosphere": "Quiet mechanical terrace vibe.",
+        "key_highlights": ["Clear dial notch response"],
+        "key_pain_points": ["Ambient audio cut out after first turn"],
+        "bugs_and_glitches_observed": ["Ambient audio dropped out completely after opening seconds"],
+        "unanswered_questions_and_mysteries": ["Why is the eastern stone arch barred?"],
+        "overall_fun_rating": 5,
+    }
+
+    fake_client = _QueuedFakeGeminiClient(
+        [
+            {"payload": t1},
+            {"payload": t2},
+            {"payload": t3},
+            {"payload": report_payload},
+        ]
+    )
+    agent = BlindPlaytesterAgent(store_card=card, config=cfg, client=fake_client)
+
+    obs1 = _make_obs(tmp_path, 1, marker_x=30, audio_is_silent=False)
+    obs2 = _make_obs(tmp_path, 2, marker_x=80, audio_is_silent=True)
+    obs3 = _make_obs(tmp_path, 3, marker_x=130, audio_is_silent=True)
+
+    dec1, tape1, _ = agent.decide_turn(1, obs1)
+    assert agent.current_mood == "intrigued"
+    assert dec1.mood_shift is not None and dec1.mood_shift.mood == "intrigued"
+    assert "NOTE+[Brass Dial=" in tape1
+    assert "QUESTION+[OPEN(brass_dial_purpose)=" in tape1
+    # Verify NO per-turn Audio Note spam on Turn 1
+    t1_tail = fake_client.calls[0]["contents"][-1].parts[0].text
+    assert "Audio Note:" not in t1_tail
+    assert "Perceptual Change Note:" not in t1_tail
+
+    dec2, tape2, _ = agent.decide_turn(2, obs2)
+    # Turn 2 transitioned from audible -> silent: Perceptual Change Note appears ONCE on transition!
+    t2_tail = fake_client.calls[1]["contents"][-1].parts[0].text
+    assert "Perceptual Change Note: Game audio stopped and is now silent." in t2_tail
+    assert "Open Questions You Are Trying To Answer" in t2_tail
+    assert agent.current_mood == "puzzled"
+    assert agent.questions["brass_dial_purpose"]["status"] == "answered"
+    assert "Pulling the lever" in agent.questions["brass_dial_purpose"]["answer"]
+    assert "ambient_audio_dropout" in agent.bugs_found
+    assert "QUESTION+[ANSWERED(brass_dial_purpose)=" in tape2
+    assert "BUG+[audio_glitch/major:" in tape2
+
+    agent.decide_turn(3, obs3)
+    # Turn 3 remained silent -> transition note is NOT repeated!
+    t3_tail = fake_client.calls[2]["contents"][-1].parts[0].text
+    assert "Perceptual Change Note:" not in t3_tail
+    assert "Questions Already Answered" in t3_tail
+    assert "Bugs & Glitches Already Logged" in t3_tail
+
+    rep, _ = agent.generate_experience_report(
+        end_status="completed",
+        end_outcome="completed",
+        final_screenshot_path=obs3.screenshot_path,
+    )
+    rep_prompt_text = fake_client.calls[3]["contents"][-1].parts[0].text
+    assert "Player Mood Trajectory: curious (T#0) -> intrigued (T#1) -> puzzled (T#2)" in rep_prompt_text
+    assert "Brass Dial: Shows three unlit notches" in rep_prompt_text
+    assert "Answered During Play:" in rep_prompt_text
+    assert "Still Unanswered At End Of Session:" in rep_prompt_text
+    assert "Ambient audio cut out completely" in rep_prompt_text
+    assert rep.bugs_and_glitches_observed == ["Ambient audio dropped out completely after opening seconds"]
+    assert rep.unanswered_questions_and_mysteries == ["Why is the eastern stone arch barred?"]
+
+
+def test_mood_dedup_anti_ping_pong_and_same_spot_click_continuity_note(tmp_path: Path):
+    card = BlindStoreCard(
+        deliberation="Verify mood deduplication, bounce-back throttling, post-turn rule confirmation, and click-streak note.",
+        checkpoint_id="cp_mood_and_clicks",
+        game_title="Lantern Relay",
+        game_description="Connect lantern relays across a misty terrace.",
+    )
+    sys_prompt = build_blind_player_system_prompt(card)
+    assert "motor_action` executes AFTER your turn decision" in sys_prompt
+    rating_desc = PlaytestExperienceReport.model_fields["overall_fun_rating"].description
+    assert "played itself" in rating_desc
+
+    # T1: explicit mood_shift="curious" when already "curious" -> MUST be deduplicated/suppressed!
+    t1 = _turn_payload(
+        1,
+        plan="Click corner crest #1",
+        mood_shift={"deliberation": "Still curious.", "mood": "curious", "note": "Looking around."},
+    )
+    t1["motor_action"]["mouse_x"] = 850.0
+    t1["motor_action"]["mouse_y"] = 220.0
+    t1["motor_action"]["mouse_button_action"] = "left_click"
+
+    # T2: genuine shift to "satisfied" + clicks same spot #2
+    t2 = _turn_payload(
+        2,
+        plan="Click corner crest #2",
+        mood_shift={"deliberation": "First lantern lit.", "mood": "satisfied", "note": "Lantern lit nicely."},
+    )
+    t2["motor_action"]["mouse_x"] = 852.0
+    t2["motor_action"]["mouse_y"] = 219.0
+    t2["motor_action"]["mouse_button_action"] = "left_click"
+
+    # T3: duplicate "satisfied" -> MUST be suppressed! + clicks same spot #3
+    t3 = _turn_payload(
+        3,
+        plan="Click corner crest #3",
+        mood_shift={"deliberation": "Still satisfied.", "mood": "satisfied", "note": "Still clicking crest."},
+    )
+    t3["motor_action"]["mouse_x"] = 849.0
+    t3["motor_action"]["mouse_y"] = 221.0
+    t3["motor_action"]["mouse_button_action"] = "left_click"
+
+    # T4: bounce-back to "curious" within 8 turns -> MUST be suppressed (anti-ping-pong)!
+    # Also on T4 input, `Action Continuity Note` MUST appear in ephemeral tail because streak == 3!
+    # Moves to a new spot (300, 500) so streak resets.
+    t4 = _turn_payload(4, plan="Try central switch instead")
+    t4["current_mood"] = "curious"
+    t4["motor_action"]["mouse_x"] = 300.0
+    t4["motor_action"]["mouse_y"] = 500.0
+    t4["motor_action"]["mouse_button_action"] = "left_click"
+
+    # T5: genuine new mood "frustrated" accompanied by a bug report -> MUST record cleanly!
+    t5 = _turn_payload(5, plan="Log unresponsive decorative crest")
+    t5["current_mood"] = "frustrated"
+    t5["bug_reports"] = [
+        {
+            "deliberation": "Corner crest looked like a button but never changed any counter.",
+            "bug_key": "unresponsive_crest",
+            "category": "input_ui_bug",
+            "summary": "Corner crest badge looks interactive but does nothing",
+            "details": "Clicked corner badge 3 times and counters stayed unchanged.",
+            "severity": "minor",
+        }
+    ]
+
+    fake_client = _QueuedFakeGeminiClient(
+        [
+            {"payload": t1},
+            {"payload": t2},
+            {"payload": t3},
+            {"payload": t4},
+            {"payload": t5},
+        ]
+    )
+    agent = BlindPlaytesterAgent(store_card=card, client=fake_client)
+
+    obs = [_make_obs(tmp_path, i, marker_x=20 * i) for i in range(1, 6)]
+
+    dec1, tape1, _ = agent.decide_turn(1, obs[0])
+    assert dec1.mood_shift is None
+    assert "MOOD[" not in tape1
+    assert len(agent.mood_history) == 0
+
+    dec2, tape2, _ = agent.decide_turn(2, obs[1])
+    assert dec2.mood_shift is not None and dec2.mood_shift.mood == "satisfied"
+    assert "MOOD[satisfied:" in tape2
+    assert len(agent.mood_history) == 1
+
+    dec3, tape3, _ = agent.decide_turn(3, obs[2])
+    assert dec3.mood_shift is None
+    assert "MOOD[" not in tape3
+    assert len(agent.mood_history) == 1
+    assert agent._same_spot_click_streak == 3
+
+    dec4, tape4, _ = agent.decide_turn(4, obs[3])
+    # Verify Turn 4 ephemeral tail warned about 3 consecutive clicks on (850, 220) while keeping byte-0 prefix intact
+    t4_tail = fake_client.calls[3]["contents"][-1].parts[0].text
+    assert "Action Continuity Note: You have clicked nearly the same spot" in t4_tail
+    assert "3 turns in a row" in t4_tail
+    assert fake_client.calls[3]["contents"][0].parts[0].text == fake_client.calls[0]["contents"][0].parts[0].text
+    # Rapid bounce-back to "curious" was suppressed
+    assert dec4.mood_shift is None
+    assert agent.current_mood == "satisfied"
+    assert "MOOD[" not in tape4
+
+    dec5, tape5, _ = agent.decide_turn(5, obs[4])
+    # Streak reset after clicking (300, 500), so Turn 5 tail has NO Action Continuity Note
+    t5_tail = fake_client.calls[4]["contents"][-1].parts[0].text
+    assert "Action Continuity Note:" not in t5_tail
+    # Genuine shift to "frustrated" on bug discovery recorded!
+    assert dec5.mood_shift is not None and dec5.mood_shift.mood == "frustrated"
+    assert agent.current_mood == "frustrated"
+    assert [m["mood"] for m in agent.mood_history] == ["satisfied", "frustrated"]
+    assert "MOOD[frustrated:" in tape5
+
+
 
 
 

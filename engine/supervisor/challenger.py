@@ -434,6 +434,13 @@ class CandidateASTInspector:
                     })
 
             all_gd_concat = "\n".join(gd_sources.values())
+            tscn_concat = "\n".join(
+                tf.read_text(encoding="utf-8", errors="ignore")
+                for tf in sorted(c_dir.rglob("*.tscn"))
+                if "tests" not in tf.relative_to(c_dir).parts
+            )
+            all_ref_concat = all_gd_concat + "\n" + tscn_concat
+            board_managed = (c_dir / "backlog.json").is_file()
             sprites_dir = c_dir / "assets" / "sprites"
             if sprites_dir.is_dir():
                 png_files = [
@@ -444,17 +451,36 @@ class CandidateASTInspector:
                 for p in png_files:
                     base_id = p.stem[:-6] if p.stem.endswith("_sheet") else p.stem
                     logical_sprites.setdefault(base_id, p)
-                if logical_sprites and "assets/sprites" not in all_gd_concat and "asset_library.json" not in all_gd_concat:
-                    hollow_stubs.append({
-                        "file": "scenes.gd" if "scenes.gd" in gd_sources else "main.gd",
-                        "module": "scenes.gd" if "scenes.gd" in gd_sources else "main.gd",
-                        "function": "load_sprites",
-                        "line": 1,
-                        "stmt": "unbound sprite assets",
-                        "reason": (
-                            "Synthesized PNG sprites exist in assets/sprites/, but zero .gd scripts load or display them."
-                        ),
-                    })
+                if logical_sprites and "asset_library.json" not in all_ref_concat:
+                    if "assets/sprites" not in all_ref_concat:
+                        hollow_stubs.append({
+                            "file": "scenes.gd" if "scenes.gd" in gd_sources else "main.gd",
+                            "module": "scenes.gd" if "scenes.gd" in gd_sources else "main.gd",
+                            "function": "load_sprites",
+                            "line": 1,
+                            "stmt": "unbound sprite assets",
+                            "reason": (
+                                "Synthesized PNG sprites exist in assets/sprites/, but zero .gd scripts load or display them."
+                            ),
+                        })
+                    elif not board_managed:
+                        unbound_names = [
+                            p.name
+                            for base_id, p in logical_sprites.items()
+                            if (p.name not in all_ref_concat and base_id not in all_ref_concat)
+                        ]
+                        if unbound_names:
+                            hollow_stubs.append({
+                                "file": "scenes.gd" if "scenes.gd" in gd_sources else "main.gd",
+                                "module": "scenes.gd" if "scenes.gd" in gd_sources else "main.gd",
+                                "function": "load_sprites",
+                                "line": 1,
+                                "stmt": "unbound sprite assets",
+                                "reason": (
+                                    f"VisualArtDirector veto: synthesized PNG sprite(s) {unbound_names} in assets/sprites/ "
+                                    f"are never loaded or bound in any .gd/.tscn module."
+                                ),
+                            })
 
             audio_dir = c_dir / "assets" / "audio"
             if audio_dir.is_dir() and list(audio_dir.glob("*.wav")):
@@ -472,6 +498,21 @@ class CandidateASTInspector:
                             f"files, ResourceLoader.exists() returns false for raw .wav files, producing zero sound. "
                             f"Must load raw PCM .wav files via FileAccess.get_file_as_bytes(ProjectSettings.globalize_path(path)) "
                             f"(stripping the 44-byte RIFF header) into an AudioStreamWAV (FORMAT_16_BITS, mix_rate=24000)."
+                        ),
+                    })
+                elif any(
+                    bad_rate in all_gd_concat.replace(" ", "")
+                    for bad_rate in ("mix_rate=44100", "mix_rate=48000")
+                ):
+                    hollow_stubs.append({
+                        "file": target_audio_mod,
+                        "module": target_audio_mod,
+                        "function": "play_bark",
+                        "line": 1,
+                        "stmt": "mix_rate = 44100",
+                        "reason": (
+                            f"AudioAtmosphereDesigner veto: {target_audio_mod} sets AudioStreamWAV mix_rate to 44100/48000 Hz "
+                            f"instead of 24000 Hz, causing high-pitched chipmunk distortion on Gemini TTS WAV clips."
                         ),
                     })
 
@@ -779,9 +820,10 @@ class CandidateVisualPlaytester:
             cpath = Path(candidate_dir).resolve()
             is_godot = (cpath / "project.godot").is_file()
         elif active_sim is not None:
-            is_godot = getattr(active_sim, "is_godot", False) or "Godot" in active_sim.__class__.__name__
-            if hasattr(active_sim, "cartridge_path"):
-                cpath = Path(active_sim.cartridge_path).resolve()
+            is_godot = (getattr(active_sim, "is_godot", False) is True) or ("Godot" in active_sim.__class__.__name__)
+            raw_cpath = getattr(active_sim, "cartridge_path", None)
+            if isinstance(raw_cpath, (str, Path)):
+                cpath = Path(raw_cpath).resolve()
 
         if active_sim is None and cpath is not None:
             if is_godot:
@@ -1207,6 +1249,19 @@ class MultiAgentSignOffCouncil:
                     remedies.append("Fix the failing atomic unit invariants verified in res://tests/test_*.gd.")
 
             if role == "VisualArtDirector":
+                for stub in hollow_stubs:
+                    reason = str(stub.get("reason", ""))
+                    stmt = str(stub.get("stmt", ""))
+                    fn_name = str(stub.get("function", ""))
+                    if (
+                        "visualartdirector" in reason.lower()
+                        or "unbound sprite" in reason.lower()
+                        or "unbound sprite" in stmt.lower()
+                        or fn_name in ("load_sprites", "_draw")
+                    ):
+                        approved = False
+                        defects.append(reason or f"Unbound sprite or missing world renderer in {stub.get('module', 'scenes.gd')}.")
+                        remedies.append("Load and bind all synthesized PNG sprites in assets/sprites/ onto visible world nodes.")
                 if blank_detected:
                     approved = False
                     defects.append("Blank monochrome canvas detected during visual playtest.")

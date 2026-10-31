@@ -90,14 +90,15 @@ func _initialize() -> void:
 		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_TRANSPARENT, true)
 		DisplayServer.window_set_position(Vector2i(-4000, -4000))
 		root.transparent_bg = true
-		render_viewport = SubViewport.new()
-		render_viewport.name = "HarnessOffscreenViewport"
-		render_viewport.size = Vector2i(1280, 720)
-		render_viewport.size_2d_override = Vector2i(1280, 720)
-		render_viewport.transparent_bg = false
-		render_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
-		render_viewport.handle_input_locally = true
-		root.add_child(render_viewport)
+	render_viewport = SubViewport.new()
+	render_viewport.name = "HarnessOffscreenViewport"
+	render_viewport.size = Vector2i(1280, 720)
+	render_viewport.size_2d_override = Vector2i(1280, 720)
+	render_viewport.transparent_bg = false
+	render_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	render_viewport.handle_input_locally = true
+	render_viewport.physics_object_picking = true
+	root.add_child(render_viewport)
 	var main_path = ProjectSettings.get_setting("application/run/main_scene", "res://main.tscn")
 	if target_scene_override != "":
 		var cand_scene = target_scene_override
@@ -522,9 +523,7 @@ func _push_input_event(ev: InputEvent) -> void:
 	if ev is InputEventMouse:
 		var mev = ev as InputEventMouse
 		mev.global_position = mev.position
-		if render_viewport != null:
-			render_viewport.warp_mouse(mev.position)
-		if root != null:
+		if DisplayServer.get_name() != "headless" and root != null:
 			root.warp_mouse(mev.position)
 	if render_viewport != null:
 		render_viewport.push_input(ev, true)

@@ -1183,4 +1183,160 @@ def test_compute_entrypoint_reachability_and_topology_chunk(tmp_path):
     assert "scenes/ui/cockpit_hud.gd" in topo_chunk.content
 
 
+def test_work_item_attempt_count_matches_timeline_and_includes_active_and_failed_retries(tmp_path):
+    """Verifies that `compute_work_item_attempt_count` and `ProductionBoard` track the exact 1-based
+    attempt number across active `in_progress` runs, Council revisions, and archived `lead_trace_rev*_failed*.json`
+    worker retries—eliminating the off-by-N card badge discrepancy."""
+    import json
+    from engine.studio.models import RevisionRecord, WorkItem, WorkItemProposal
+    from engine.studio.production_board import ProductionBoard, WorkerResult, compute_work_item_attempt_count
+
+    board_path = tmp_path / "backlog.json"
+    board = ProductionBoard(path=board_path)
+    board.add_items(
+        [
+            WorkItemProposal(
+                deliberation="Test cumulative attempt_count across retries and active execution.",
+                item_id="integration_flow_fix",
+                kind="integration",
+                title="Wire End-to-End Flow",
+                spec="Wire entity signals to simulation.",
+                proof_spec="Filmstrip proving flow.",
+                target_modules=["main.gd", "scenes/mechanics/builder.gd"],
+                raised_by_role="GameplaySystemsEngineer",
+            )
+        ]
+    )
+
+    # Unstarted ready item -> attempt_count == 0
+    assert board.get("integration_flow_fix").attempt_count == 0
+
+    # Claimed for Attempt #1 -> attempt_count == 1 immediately (even before rev0 submits)
+    claimed = board.claim_ready()
+    assert len(claimed) == 1
+    assert claimed[0].attempt_count == 1
+    assert board.get("integration_flow_fix").attempt_count == 1
+
+    work_dir = tmp_path / "artifacts" / "work_items" / "integration_flow_fix"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / "lead_trace_rev0.json").write_text(
+        json.dumps({"status": "submitted", "turns": []}),
+        encoding="utf-8",
+    )
+    proof_img = work_dir / "filmstrip_rev0.png"
+    proof_img.write_bytes(b"png")
+    board.submit_result("integration_flow_fix", WorkerResult(proof_images=[str(proof_img)], notes="rev0"))
+    assert board.get("integration_flow_fix").attempt_count == 1
+
+    # Simulate Attempt #1 rejected by Council (revisions len=1), Attempt #2 archived as failed1,
+    # and Attempt #3 currently executing (`in_progress`, `lead_trace_rev1.json`).
+    raw_item = {
+        "item_id": "integration_flow_fix",
+        "state": "in_progress",
+        "revisions": [RevisionRecord(revision_index=0, feedback="Fix signal wire").model_dump()],
+        "failure_count": 0,
+    }
+    (work_dir / "lead_trace_rev1_failed1.json").write_text(
+        json.dumps({"status": "failed", "turns": [{"turn_index": 0}]}),
+        encoding="utf-8",
+    )
+    (work_dir / "lead_trace_rev1.json").write_text(
+        json.dumps({"status": "in_progress", "turns": [{"turn_index": 0}]}),
+        encoding="utf-8",
+    )
+    assert compute_work_item_attempt_count(tmp_path, raw_item) == 3
+
+    # Also verify `expand_item_target_modules` and `_load` never pollute `target_modules` with `tests/*`
+    updated_mods = board.expand_item_target_modules(
+        "integration_flow_fix",
+        ["tests/test_integration_flow_fix.gd", "res://tests/test_integration_flow_fix.tscn", "scenes/entities/node_a.gd"],
+    )
+    assert "scenes/entities/node_a.gd" in updated_mods
+    assert all(not m.startswith("tests/") for m in updated_mods)
+
+
+def test_swe_vs_qa_test_harness_boundary_and_council_guardrail():
+    """Verifies that:
+    1) `validate_task_lead_decision` rejects `swe_engineer` delegations targeting `tests/*`;
+    2) `LeadGameplaySWEAgent._validate_no_qa_test_harness_edits` rejects `tests/*`-only payloads on
+       production tracks while cleanly pruning stray `tests/*` files when paired with production files;
+    3) `CreativeWritersRoom._role_review_mandate` explicitly forbids Council feedback from ordering
+       `_physics_process()` gameplay calls inside `tests/test_<item_id>.gd`."""
+    import pytest
+    from engine.studio.models import (
+        AcceptanceCriterion,
+        ModuleFileSpec,
+        RequirementTrack,
+        TaskLeadDecision,
+        TrackCodeSynthesisPayload,
+    )
+    from engine.studio.swe import CodeVerificationError, LeadGameplaySWEAgent
+    from engine.studio.workers import validate_task_lead_decision
+    from engine.studio.writers_room import CreativeWritersRoom
+
+    bad_dec = TaskLeadDecision(
+        deliberation="Delegate test harness edit to SWE.",
+        current_strategy="Edit test script.",
+        specialist_agent="swe_engineer",
+        target_paths=["tests/test_flow.gd"],
+        brief="Update tests/test_flow.gd.",
+        action="delegate",
+    )
+    issues = validate_task_lead_decision(bad_dec, ["swe_engineer", "qa_test_engineer"], [])
+    assert any("swe_engineer cannot target QA test harness" in iss for iss in issues)
+
+    swe = LeadGameplaySWEAgent(client=None)
+    prod_track = RequirementTrack(
+        deliberation="Wire signal in production builder module.",
+        id="integration_flow",
+        title="Wire Flow",
+        description="Connect emitter signal to simulation.",
+        target_modules=["main.gd", "scenes/mechanics/builder.gd"],
+        acceptance_criteria=[
+            AcceptanceCriterion(
+                deliberation="Verify live signal flow.",
+                id="AC-1",
+                description="Signal triggers spawn.",
+                verification_method="headless_playtest",
+            )
+        ],
+    )
+    only_test_bundle = TrackCodeSynthesisPayload(
+        deliberation="Try scripting _physics_process in tests/test_integration_flow.gd.",
+        files=[
+            ModuleFileSpec(
+                deliberation="Wrapper test file.",
+                filename="tests/test_integration_flow.gd",
+                content="extends Node2D\n",
+            )
+        ],
+    )
+    with pytest.raises(CodeVerificationError, match="Rejected `swe_engineer` edits targeting QA test harness"):
+        swe._validate_no_qa_test_harness_edits(only_test_bundle, prod_track)
+
+    mixed_bundle = TrackCodeSynthesisPayload(
+        deliberation="Update production builder and stray test wrapper.",
+        files=[
+            ModuleFileSpec(
+                deliberation="Production builder update.",
+                filename="scenes/mechanics/builder.gd",
+                content="extends Node2D\n",
+            ),
+            ModuleFileSpec(
+                deliberation="Stray wrapper file.",
+                filename="res://tests/test_integration_flow.gd",
+                content="extends Node2D\n",
+            ),
+        ],
+    )
+    swe._validate_no_qa_test_harness_edits(mixed_bundle, prod_track)
+    assert [f.filename for f in mixed_bundle.files] == ["scenes/mechanics/builder.gd"]
+
+    for role in ("CreativeDirector", "GameplayDesigner", "GameplaySystemsEngineer"):
+        mandate = CreativeWritersRoom._role_review_mandate(role)
+        assert "_physics_process()" in mandate
+        assert "Entrypoint Parity Gate" in mandate
+
+
+
 

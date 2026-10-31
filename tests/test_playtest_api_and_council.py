@@ -703,6 +703,8 @@ def test_end_of_slice_council_blind_playtest_deliberation_iterates_then_approves
                         "world_and_atmosphere": "Quiet atmospheric courtyard.",
                         "key_highlights": ["Smooth lift activation"],
                         "key_pain_points": ["Switch blends into wall without hover highlight"],
+                        "bugs_and_glitches_observed": ["Switch click produced zero audio feedback"],
+                        "unanswered_questions_and_mysteries": ["Why is the upper deck hatch sealed?"],
                         "overall_fun_rating": 6,
                     }
                 else:
@@ -717,6 +719,8 @@ def test_end_of_slice_council_blind_playtest_deliberation_iterates_then_approves
                         "world_and_atmosphere": "Inviting observatory courtyard.",
                         "key_highlights": ["Immediate hover affordance", "Rewarding lift transition"],
                         "key_pain_points": [],
+                        "bugs_and_glitches_observed": [],
+                        "unanswered_questions_and_mysteries": [],
                         "overall_fun_rating": 9,
                     }
                 return SimpleNamespace(text=json.dumps(rep), usage_metadata=usage)
@@ -725,9 +729,39 @@ def test_end_of_slice_council_blind_playtest_deliberation_iterates_then_approves
                 "deliberation": f"Pass {run_num} blind playtest turn.",
                 "current_plan": "Click courtyard switch and complete slice check.",
                 "turn_log_entry": "Tested courtyard switch interaction.",
+                "field_note_updates": [
+                    {
+                        "deliberation": "Observing stone switch near lift.",
+                        "topic": "Courtyard Switch",
+                        "observation": "Recessed stone panel next to the central lift.",
+                    }
+                ],
+                "question_updates": [
+                    {
+                        "deliberation": "Asking what the stone panel controls.",
+                        "question_key": "stone_panel_effect",
+                        "question": "What does clicking the recessed stone panel do?",
+                        "answer": "Starts the central lift ascent." if run_num == 1 else None,
+                        "status": "answered" if run_num == 1 else "open",
+                    }
+                ],
                 "rulebook_updates": [
                     {"deliberation": "Left click toggles courtyard switch", "key_or_topic": "Left Click", "behavior": "Activates switch"}
                 ],
+                "bug_reports": (
+                    [
+                        {
+                            "deliberation": "Switch click lacked audio cue.",
+                            "bug_key": "silent_switch_click",
+                            "category": "audio_glitch",
+                            "summary": "Switch click plays no sound effect",
+                            "details": "Clicking the switch triggered lift motion silently.",
+                            "severity": "minor",
+                        }
+                    ]
+                    if run_num == 0
+                    else []
+                ),
                 "impression_updates": [
                     {
                         "deliberation": "Recording sparse intuitiveness impression.",
@@ -840,6 +874,7 @@ def test_end_of_slice_council_blind_playtest_deliberation_iterates_then_approves
 
     verdict_calls = {"count": 0}
     roundtable_multimodal_png_counts: List[int] = []
+    roundtable_prompts: List[str] = []
 
     def _council_generate_content(*, model: str, contents: Any, config: Any) -> Any:
         schema_cls = getattr(config, "response_schema", None)
@@ -859,6 +894,8 @@ def test_end_of_slice_council_blind_playtest_deliberation_iterates_then_approves
                     if getattr(p, "inline_data", None) is not None and p.inline_data.mime_type == "image/png"
                 )
                 roundtable_multimodal_png_counts.append(png_cnt)
+                if isinstance(contents[-1], str):
+                    roundtable_prompts.append(contents[-1])
             is_second_pass = verdict_calls["count"] >= 1
             turn_obj = BlindPlaytestCouncilTurn(
                 deliberation="Evaluated Blind Playtester report, sparse impressions, and screenshots.",
@@ -974,9 +1011,13 @@ def test_end_of_slice_council_blind_playtest_deliberation_iterates_then_approves
         assert len(s_wishes) == 1
         assert s_wishes[0]["status"] == "sent_to_council"
 
-    # 3. Verify Council Roundtable specialists received multimodal PNG screenshots from the Blind Playtester
+    # 3. Verify Council Roundtable specialists received multimodal PNG screenshots + full report, wishes, bugs, notes, and questions
     assert len(roundtable_multimodal_png_counts) == 8  # 4 specialists × 2 passes
     assert all(cnt >= 1 for cnt in roundtable_multimodal_png_counts)
+    assert any("Switch click plays no sound effect" in p for p in roundtable_prompts)
+    assert any("Courtyard Switch: Recessed stone panel" in p for p in roundtable_prompts)
+    assert any("What does clicking the recessed stone panel do?" in p for p in roundtable_prompts)
+    assert any("Add hover highlight to courtyard switch" in p for p in roundtable_prompts)
 
     # 4. Verify Writers' Room transcript includes BlindPlaytester report, 4 specialist turns, and CreativeDirector verdict
     roles_in_tx = [u.speaker_role for u in bible.writers_room_transcript]
@@ -1001,4 +1042,682 @@ def test_end_of_slice_council_blind_playtest_deliberation_iterates_then_approves
     assert "BLIND PLAYTESTER EXPERIENCE REPORT & CARRYOVER FROM `slice_0`" in dossier_text
     assert "Overall Fun Rating: 9/10" in dossier_text
     assert "harmonic telescope alignment puzzle" in dossier_text
+
+
+def test_async_council_initiated_session_auto_delivers_full_report_and_wishes_to_council(tmp_path: Path):
+    """Verifies that a playtest session created with `initiated_by='council'` via `/api/playtest/sessions/start`
+    automatically delivers the FULL final PlaytestExperienceReport + all wishes + bugs + questions + field notes
+    to the Council's steering + multimodal report queue upon completion.
+    """
+    import time
+
+    db_path, cartridges_root, active_dir, cand_dir = _setup_workspace(tmp_path)
+
+    def _council_session_llm_factory() -> Any:
+        def _gen(*, model: str, contents: Any, config: Any) -> Any:
+            schema = getattr(config, "response_schema", None)
+            props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+            usage = SimpleNamespace(
+                prompt_token_count=800,
+                cached_content_token_count=400,
+                candidates_token_count=150,
+                thoughts_token_count=0,
+            )
+            if "overall_experience_summary" in props:
+                rep = {
+                    "deliberation": "Synthesizing full report for Council-initiated session.",
+                    "overall_experience_summary": "Could inspect the HUD, but clicking the main valve did not advance the pressure gauge.",
+                    "graphics_and_visuals": "Clean industrial sprites.",
+                    "gameplay_and_feel": "Valve click lacked state response.",
+                    "sound_and_audio": "Opening steam hiss stopped after Turn 1.",
+                    "intuitiveness_and_onboarding": "Valve icon looked clickable, yet gauge stayed at 0.",
+                    "goals_pacing_and_accomplishment": "Blocked at initial pressure check.",
+                    "world_and_atmosphere": "Cohesive brass boiler-room aesthetic.",
+                    "key_highlights": ["Readable gauge dial"],
+                    "key_pain_points": ["Main valve click did not increase pressure"],
+                    "bugs_and_glitches_observed": ["Clicking main valve never increments pressure gauge"],
+                    "unanswered_questions_and_mysteries": ["Does the secondary lever need to be unlocked first?"],
+                    "overall_fun_rating": 3,
+                }
+                return SimpleNamespace(text=json.dumps(rep), usage_metadata=usage)
+
+            turn_payload = {
+                "deliberation": "Testing main valve click and noting gauge state.",
+                "current_plan": "Click main valve and watch pressure gauge.",
+                "turn_log_entry": "Clicked main valve; gauge stayed at 0.",
+                "field_note_updates": [
+                    {"deliberation": "Noting gauge.", "topic": "Pressure Gauge", "observation": "Reads 0/10 PSI at top-left."}
+                ],
+                "question_updates": [
+                    {
+                        "deliberation": "Wondering about secondary lever.",
+                        "question_key": "secondary_lever_lock",
+                        "question": "Does the secondary lever need to be unlocked first?",
+                        "answer": None,
+                        "status": "open",
+                    }
+                ],
+                "rulebook_updates": [],
+                "bug_reports": [
+                    {
+                        "deliberation": "Valve click had zero effect.",
+                        "bug_key": "valve_no_response",
+                        "category": "progression_blocker",
+                        "summary": "Main valve click never increments pressure gauge",
+                        "details": "Left-clicking directly on the central valve left PSI at 0.",
+                        "severity": "blocker",
+                    }
+                ],
+                "impression_updates": [],
+                "current_mood": "frustrated",
+                "motor_action": {
+                    "deliberation": "Click valve.",
+                    "mouse_x": 500.0,
+                    "mouse_y": 500.0,
+                    "mouse_button_action": "left_click",
+                    "drag_from_x": None,
+                    "drag_from_y": None,
+                    "hold_keys": [],
+                    "tap_keys": [],
+                    "duration_ms": 500,
+                    "inspect_high_res_next": False,
+                },
+                "mood_shift": None,
+                "submit_wish": {
+                    "deliberation": "Need valve feedback.",
+                    "category": "progression_blocker",
+                    "summary": "Wire main valve click to pressure gauge or show locked tooltip",
+                    "rationale": "Clicking the primary focal object gives zero feedback.",
+                },
+                "end_playtest": {
+                    "deliberation": "Blocked on valve.",
+                    "outcome": "stuck_cannot_progress",
+                    "closing_thoughts": "Cannot advance past 0 PSI.",
+                },
+            }
+            return SimpleNamespace(text=json.dumps(turn_payload), usage_metadata=usage)
+
+        return SimpleNamespace(models=SimpleNamespace(generate_content=_gen))
+
+    bus = SwarmEventBus()
+    pt_mgr = PlaytestSessionManager(
+        db_path=db_path,
+        cartridges_root=cartridges_root,
+        sessions_root=tmp_path / "sessions_council_async",
+        event_bus=bus,
+        client_factory=_council_session_llm_factory,
+        bridge_factory=_FakeBridge,
+    )
+    app = create_app(
+        db_path=db_path,
+        active_cartridge_dir=active_dir,
+        cartridges_root=cartridges_root,
+        event_bus=bus,
+        playtest_manager=pt_mgr,
+    )
+
+    with TestClient(app) as client:
+        start_res = client.post(
+            "/api/playtest/sessions/start",
+            json={
+                "checkpoint_id": "candidate_001_slice_0",
+                "candidate_id": "candidate_001",
+                "slice_id": "slice_0",
+                "initiated_by": "council",
+                "max_turns": 5,
+            },
+        )
+        assert start_res.status_code == 200
+        sid = start_res.json()["session"]["session_id"]
+
+        deadline = time.time() + 10.0
+        det = {}
+        while time.time() < deadline:
+            r = client.get(f"/api/playtest/sessions/{sid}")
+            det = r.json()
+            if det["session"]["status"] in ("completed", "stopped", "error"):
+                break
+            time.sleep(0.05)
+
+        assert det["session"]["status"] == "completed"
+        assert det["session"]["current_mood"] == "frustrated"
+        assert "valve_no_response" in det["session"]["bugs_found"]
+        assert "Pressure Gauge" in det["session"]["field_notes"]
+        assert "secondary_lever_lock" in det["session"]["questions"]
+        assert det["wishes"][0]["status"] == "sent_to_council"
+
+    reports_file = cand_dir / ".pending_council_playtest_reports.json"
+    steering_file = cand_dir / ".pending_steering.json"
+    assert reports_file.is_file()
+    assert steering_file.is_file()
+
+    # Verify CreativeWritersRoom consumes the full report + wishes + bugs + notes + questions + screenshots!
+    captured_council_calls: List[Any] = []
+
+    def _council_pivot_gen(*, model: str, contents: Any, config: Any) -> Any:
+        captured_council_calls.append(contents)
+        proposal = WritersRoomTurnProposal(
+            deliberation="Reviewed full Council blind playtest report, bug report, and wish.",
+            spoken_dialogue="Fixing the main valve click handler and steam loop right away.",
+            addressed_to=["CreativeDirector"],
+            backlog_additions=[
+                {
+                    "deliberation": "Wire main valve click to pressure gauge and loop steam audio.",
+                    "item_id": "fix_valve_and_steam_loop",
+                    "title": "Main Valve Click Response & Steam Loop",
+                    "kind": "integration",
+                    "spec": "Connect main valve click signal to increment pressure gauge and keep steam audio looping.",
+                    "target_modules": ["main.gd"],
+                    "depends_on": [],
+                    "blocks_items": [],
+                    "proof_spec": "Verify valve click increments PSI in res://tests/test_fix_valve_and_steam_loop.tscn.",
+                }
+            ],
+            ready_to_lock_bible=False,
+        )
+        return SimpleNamespace(
+            text=proposal.model_dump_json(),
+            usage_metadata=SimpleNamespace(
+                prompt_token_count=1200,
+                cached_content_token_count=0,
+                candidates_token_count=150,
+                thoughts_token_count=40,
+            ),
+        )
+
+    board = ProductionBoard(path=cand_dir / "production_board.json")
+    wr = CreativeWritersRoom(
+        client=SimpleNamespace(models=SimpleNamespace(generate_content=_council_pivot_gen)),
+        board=board,
+    )
+    loaded_bible = GameBibleSpec.model_validate_json((cand_dir / "game_bible.json").read_text(encoding="utf-8"))
+    steered = wr._consume_pending_steering(loaded_bible, candidate_dir=cand_dir)
+    assert len(steered) == 1
+    assert "Fun Rating: 3/10" in steered[0]
+    wr._execute_steering_pivot_turns(loaded_bible, "Puzzle player profile.", cand_dir, steered)
+
+    assert not reports_file.exists()
+    assert len(captured_council_calls) >= 1
+    council_prompt_str = captured_council_calls[0][-1]
+    assert "COUNCIL-INITIATED BLIND PLAYTEST FULL REPORT & WISHES" in council_prompt_str
+    assert "Overall Fun Rating: 3/10" in council_prompt_str
+    assert "Main valve click never increments pressure gauge" in council_prompt_str
+    assert "Pressure Gauge: Reads 0/10 PSI" in council_prompt_str
+    assert "Does the secondary lever need to be unlocked first?" in council_prompt_str
+    assert "Wire main valve click to pressure gauge or show locked tooltip" in council_prompt_str
+
+
+def test_council_blind_playtest_gate_includes_mid_session_screenshots_action_tape_and_skeptical_audit(tmp_path: Path):
+    """Verifies that even when a fast playtester files 0 bugs, 0 wishes, and an optimistic 9/10 rating,
+    `_run_end_of_slice_blind_playtest` equips the Council with:
+    1) Up to 5 evenly spaced screenshots across the session (not just Turn 1 & Final),
+    2) The full `BLIND PLAYER CHRONOLOGICAL ACTION TAPE` showing repeated same-spot clicks, and
+    3) Explicit skeptical audit instructions against no-op loops and auto-playing shortcuts.
+    """
+    from engine.studio.models import (
+        BlindPlaytestCouncilTurn,
+        BlindPlaytestCouncilVerdict,
+        WorkItemProposal,
+    )
+
+    db_path, cartridges_root, _active_dir, cand_dir = _setup_workspace(tmp_path)
+    bible = GameBibleSpec.model_validate_json((cand_dir / "game_bible.json").read_text(encoding="utf-8"))
+    bible.slice_roadmap[0].status = "in_progress"
+
+    turn_counter = {"n": 0}
+
+    def _optimistic_playtester_factory() -> Any:
+        def _gen(*, model: str, contents: Any, config: Any) -> Any:
+            schema = getattr(config, "response_schema", None)
+            props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+            usage = SimpleNamespace(
+                prompt_token_count=900,
+                cached_content_token_count=500,
+                candidates_token_count=120,
+                thoughts_token_count=0,
+            )
+            if "overall_experience_summary" in props:
+                rep = {
+                    "deliberation": "Optimistic summary despite repetitive clicking.",
+                    "overall_experience_summary": "Clicked the decorative crest repeatedly and enjoyed the scenery.",
+                    "graphics_and_visuals": "Bright clean shapes.",
+                    "gameplay_and_feel": "Smooth cursor feel.",
+                    "sound_and_audio": "Silent session.",
+                    "intuitiveness_and_onboarding": "Easy to spot crest.",
+                    "goals_pacing_and_accomplishment": "Clicked crest several times.",
+                    "world_and_atmosphere": "Calm courtyard.",
+                    "key_highlights": ["Clean colors"],
+                    "key_pain_points": [],
+                    "bugs_and_glitches_observed": [],
+                    "unanswered_questions_and_mysteries": [],
+                    "overall_fun_rating": 9,
+                }
+                return SimpleNamespace(text=json.dumps(rep), usage_metadata=usage)
+
+            turn_counter["n"] += 1
+            idx = turn_counter["n"]
+            turn_payload = {
+                "deliberation": f"Turn {idx} clicking static corner emblem.",
+                "current_plan": "Keep clicking corner emblem.",
+                "turn_log_entry": f"Clicked static emblem at (910, 210) on step {idx}.",
+                "field_note_updates": [],
+                "question_updates": [],
+                "rulebook_updates": [],
+                "bug_reports": [],
+                "impression_updates": [],
+                "current_mood": "curious",
+                "motor_action": {
+                    "deliberation": "Click corner emblem.",
+                    "mouse_x": 910.0,
+                    "mouse_y": 210.0,
+                    "mouse_button_action": "left_click",
+                    "drag_from_x": None,
+                    "drag_from_y": None,
+                    "hold_keys": [],
+                    "tap_keys": [],
+                    "duration_ms": 450,
+                    "inspect_high_res_next": False,
+                },
+                "mood_shift": None,
+                "submit_wish": None,
+                "end_playtest": (
+                    {
+                        "deliberation": "Done clicking.",
+                        "outcome": "completed",
+                        "closing_thoughts": "Finished clicking.",
+                    }
+                    if idx >= 6
+                    else None
+                ),
+            }
+            return SimpleNamespace(text=json.dumps(turn_payload), usage_metadata=usage)
+
+        return SimpleNamespace(models=SimpleNamespace(generate_content=_gen))
+
+    pt_mgr = PlaytestSessionManager(
+        db_path=db_path,
+        cartridges_root=cartridges_root,
+        sessions_root=tmp_path / "sessions_skeptical_audit",
+        event_bus=SwarmEventBus(),
+        client_factory=_optimistic_playtester_factory,
+        bridge_factory=_FakeBridge,
+    )
+    board = ProductionBoard(path=cand_dir / "production_board.json")
+
+    captured_png_counts: List[int] = []
+    captured_labels: List[str] = []
+    captured_prompts: List[str] = []
+
+    def _skeptical_council_gen(*, model: str, contents: Any, config: Any) -> Any:
+        schema_cls = getattr(config, "response_schema", None)
+        schema_name = getattr(schema_cls, "__name__", "")
+        usage = SimpleNamespace(prompt_token_count=1200, cached_content_token_count=0, candidates_token_count=150, thoughts_token_count=30)
+        if isinstance(contents, list):
+            png_cnt = sum(
+                1
+                for p in contents[:-1]
+                if getattr(p, "inline_data", None) is not None and p.inline_data.mime_type == "image/png"
+            )
+            captured_png_counts.append(png_cnt)
+            for p in contents[:-1]:
+                if isinstance(p, str) and p.startswith("BLIND PLAYTESTER SCREENSHOT"):
+                    captured_labels.append(p)
+            if isinstance(contents[-1], str):
+                captured_prompts.append(contents[-1])
+
+        if schema_name == "BlindPlaytestCouncilTurn":
+            t_obj = BlindPlaytestCouncilTurn(
+                deliberation="Action tape shows 6 identical clicks at (910, 210) despite 9/10 rating; voting iterate.",
+                domain_reaction_to_blind_player="Player clicked static corner emblem 6 times in a row without real progression.",
+                spoken_dialogue="Ignore the 9/10—look at the action tape: 6 identical clicks at (910, 210) with zero progression.",
+                addressed_to=["CreativeDirector"],
+                priority_fixes_or_refinements=["Replace ambiguous decorative badge or wire real interactive feedback"],
+                recommends_slice_approval=False,
+            )
+            return SimpleNamespace(text=t_obj.model_dump_json(), usage_metadata=usage)
+
+        if schema_name == "BlindPlaytestCouncilVerdict":
+            v_obj = BlindPlaytestCouncilVerdict(
+                deliberation="Rejecting inflated 9/10 rating based on action tape and mid-session screenshots.",
+                player_experience_synthesis="Playtester looped 6 times on a non-interactive emblem with silent audio.",
+                spoken_dialogue="Iterating on slice_0 to resolve the non-interactive UI loop.",
+                next_slice_carryover_notes=[],
+                backlog_additions=[
+                    WorkItemProposal(
+                        deliberation="Resolve non-interactive UI confusion.",
+                        item_id="fix_ui_affordance_clarity",
+                        kind="ui",
+                        title="Clarify Interactive vs Decorative HUD Affordances",
+                        spec="Ensure HUD status badges do not mimic clickable buttons in ui_hud.gd.",
+                        proof_spec="Verify HUD affordances in headless test.",
+                        target_modules=["ui_hud.gd"],
+                    )
+                ],
+                verdict="iterate_current_slice",
+            )
+            return SimpleNamespace(text=v_obj.model_dump_json(), usage_metadata=usage)
+
+        raise AssertionError(f"Unexpected schema: {schema_name}")
+
+    wr = CreativeWritersRoom(
+        client=SimpleNamespace(models=SimpleNamespace(generate_content=_skeptical_council_gen)),
+        board=board,
+        playtest_manager=pt_mgr,
+        telemetry_db=TelemetryDB(db_path),
+    )
+    wr.enable_end_of_slice_blind_playtest = True
+    wr.slice_playtest_max_turns = 10
+
+    added_count = wr._run_end_of_slice_blind_playtest(
+        bible,
+        "Puzzle player profile.",
+        cand_dir,
+        pass_index=0,
+    )
+    assert added_count == 1
+    assert [it.item_id for it in board.items()] == ["fix_ui_affordance_clarity"]
+
+    # Council received all 5 screenshot slots (Opening + 3 Mid-Session + Final), not just 2!
+    assert all(c == 5 for c in captured_png_counts)
+    assert any("Mid-Session Progress" in lbl for lbl in captured_labels)
+    # Council received the full 6-turn Chronological Action Tape and skeptical audit mandate!
+    assert any("=== BLIND PLAYER CHRONOLOGICAL ACTION TAPE (6 turns) ===" in p for p in captured_prompts)
+    assert any("move_to=(910,210) mouse=left_click" in p for p in captured_prompts)
+    assert any("Never rubber-stamp an inflated `overall_fun_rating`" in p for p in captured_prompts)
+
+
+def test_playtest_session_history_archive_multi_run_and_council_verdict_preservation(tmp_path: Path):
+    """Verifies that every playtester session for a game/slice is permanently archived and watchable:
+    - Multiple Council Gate passes on the same slice (`pass_index=0` iterate, `pass_index=1` approve)
+      preserve distinct per-pass JSON reports and distinct `council_review` verdicts per session.
+    - Manual operator runs on the same slice increment `game_run_number` and `slice_run_number` cleanly.
+    - `GET /api/playtest/sessions` supports game & slice filtering and exposes `games_catalog` + run numbers.
+    - `GET /api/playtest/sessions/{id}` denormalizes `[0..1000]` coordinates into `1280x720` `action_px`
+      and keeps every run's turn screenshots watchable.
+    - Disk `session_archive.json` snapshots restore historical sessions if SQLite is rebuilt.
+    """
+    import time
+    from engine.studio.models import (
+        BlindPlaytestCouncilTurn,
+        BlindPlaytestCouncilVerdict,
+        WorkItemProposal,
+    )
+
+    db_path, cartridges_root, active_dir, cand_dir = _setup_workspace(tmp_path)
+    sessions_root = tmp_path / "sessions_archive_test"
+    bible = GameBibleSpec.model_validate_json((cand_dir / "game_bible.json").read_text(encoding="utf-8"))
+    bible.slice_roadmap[0].status = "in_progress"
+    (cand_dir / "game_bible.json").write_text(bible.model_dump_json(indent=2), encoding="utf-8")
+
+    run_seq = {"idx": 0}
+
+    def _multi_run_playtester_factory() -> Any:
+        run_seq["idx"] += 1
+        current_run = run_seq["idx"]
+        local_turn = {"n": 0}
+        fun_by_run = {1: 5, 2: 9, 3: 8}
+
+        def _gen(*, model: str, contents: Any, config: Any) -> Any:
+            schema = getattr(config, "response_schema", None)
+            props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+            usage = SimpleNamespace(
+                prompt_token_count=800,
+                cached_content_token_count=400,
+                candidates_token_count=110,
+                thoughts_token_count=0,
+            )
+            if "overall_experience_summary" in props:
+                rep = {
+                    "deliberation": f"Synthesizing report for run #{current_run}.",
+                    "overall_experience_summary": f"Completed playtest run #{current_run}.",
+                    "graphics_and_visuals": "Clean silhouettes.",
+                    "gameplay_and_feel": "Responsive controls.",
+                    "sound_and_audio": "Subtle cues.",
+                    "intuitiveness_and_onboarding": "Readable layout.",
+                    "goals_pacing_and_accomplishment": "Clear objective.",
+                    "world_and_atmosphere": "Cohesive mood.",
+                    "key_highlights": [f"Highlight from run #{current_run}"],
+                    "key_pain_points": ["Minor friction"] if current_run == 1 else [],
+                    "bugs_and_glitches_observed": [],
+                    "unanswered_questions_and_mysteries": [],
+                    "overall_fun_rating": fun_by_run.get(current_run, 8),
+                }
+                return SimpleNamespace(text=json.dumps(rep), usage_metadata=usage)
+
+            local_turn["n"] += 1
+            t_n = local_turn["n"]
+            norm_x = 500.0 if current_run == 1 else (750.0 if current_run == 2 else 250.0)
+            norm_y = 500.0 if current_run == 1 else 250.0
+            turn_payload = {
+                "deliberation": f"Run {current_run} turn {t_n} testing interaction.",
+                "current_plan": f"Execute run {current_run} plan.",
+                "turn_log_entry": f"Run {current_run} clicked ({norm_x}, {norm_y}).",
+                "field_note_updates": [],
+                "question_updates": [],
+                "rulebook_updates": [],
+                "bug_reports": [],
+                "impression_updates": [],
+                "current_mood": "curious" if current_run == 1 else "engaged",
+                "motor_action": {
+                    "deliberation": "Click target.",
+                    "mouse_x": norm_x,
+                    "mouse_y": norm_y,
+                    "mouse_button_action": "left_click",
+                    "drag_from_x": None,
+                    "drag_from_y": None,
+                    "hold_keys": [],
+                    "tap_keys": ["SPACE"] if t_n == 1 else [],
+                    "duration_ms": 400,
+                    "inspect_high_res_next": False,
+                },
+                "mood_shift": None,
+                "submit_wish": None,
+                "end_playtest": (
+                    {
+                        "deliberation": "Finished short run.",
+                        "outcome": "completed",
+                        "closing_thoughts": f"Done run {current_run}.",
+                    }
+                    if t_n >= 2
+                    else None
+                ),
+            }
+            return SimpleNamespace(text=json.dumps(turn_payload), usage_metadata=usage)
+
+        return SimpleNamespace(models=SimpleNamespace(generate_content=_gen))
+
+    bus = SwarmEventBus()
+    pt_mgr = PlaytestSessionManager(
+        db_path=db_path,
+        cartridges_root=cartridges_root,
+        sessions_root=sessions_root,
+        event_bus=bus,
+        client_factory=_multi_run_playtester_factory,
+        bridge_factory=_FakeBridge,
+    )
+    board = ProductionBoard(path=cand_dir / "production_board.json")
+
+    council_pass_state = {"pass_idx": 0}
+
+    def _council_gen(*, model: str, contents: Any, config: Any) -> Any:
+        schema_cls = getattr(config, "response_schema", None)
+        schema_name = getattr(schema_cls, "__name__", "")
+        usage = SimpleNamespace(prompt_token_count=900, cached_content_token_count=0, candidates_token_count=120, thoughts_token_count=20)
+        is_first_pass = council_pass_state["pass_idx"] == 0
+
+        if schema_name == "BlindPlaytestCouncilTurn":
+            t_obj = BlindPlaytestCouncilTurn(
+                deliberation="Reviewing slice run.",
+                domain_reaction_to_blind_player="Observed player interaction.",
+                spoken_dialogue="Let us iterate once." if is_first_pass else "Slice looks ready to ship.",
+                addressed_to=["CreativeDirector"],
+                priority_fixes_or_refinements=["Tighten feedback"] if is_first_pass else [],
+                recommends_slice_approval=not is_first_pass,
+            )
+            return SimpleNamespace(text=t_obj.model_dump_json(), usage_metadata=usage)
+
+        if schema_name == "BlindPlaytestCouncilVerdict":
+            v_obj = BlindPlaytestCouncilVerdict(
+                deliberation="Pass 0 needs polish." if is_first_pass else "Pass 1 verified all fixes.",
+                player_experience_synthesis=(
+                    "Pass 0 revealed minor onboarding friction."
+                    if is_first_pass
+                    else "Pass 1 played smoothly from start to finish."
+                ),
+                spoken_dialogue="Iterating slice_0." if is_first_pass else "Approving slice_0!",
+                next_slice_carryover_notes=[] if is_first_pass else ["Carry momentum into slice_1"],
+                backlog_additions=(
+                    [
+                        WorkItemProposal(
+                            deliberation="Polish interaction feedback.",
+                            item_id="polish_feedback_pass0",
+                            kind="mechanic_code",
+                            title="Polish Interaction Feedback",
+                            spec="Improve feedback clarity in player.gd.",
+                            proof_spec="Headless test passes.",
+                            target_modules=["player.gd"],
+                        )
+                    ]
+                    if is_first_pass
+                    else []
+                ),
+                verdict="iterate_current_slice" if is_first_pass else "approve_slice",
+            )
+            return SimpleNamespace(text=v_obj.model_dump_json(), usage_metadata=usage)
+
+        raise AssertionError(f"Unexpected schema: {schema_name}")
+
+    wr = CreativeWritersRoom(
+        client=SimpleNamespace(models=SimpleNamespace(generate_content=_council_gen)),
+        board=board,
+        playtest_manager=pt_mgr,
+        telemetry_db=TelemetryDB(db_path),
+    )
+    wr.enable_end_of_slice_blind_playtest = True
+    wr.slice_playtest_max_turns = 5
+
+    # Pass #0 -> iterate_current_slice (fun=5)
+    council_pass_state["pass_idx"] = 0
+    added_p0 = wr._run_end_of_slice_blind_playtest(bible, "Profile", cand_dir, pass_index=0)
+    assert added_p0 == 1
+    board.get("polish_feedback_pass0").state = "approved"
+    board._persist()
+
+    # Pass #1 -> approve_slice (fun=9)
+    council_pass_state["pass_idx"] = 1
+    added_p1 = wr._run_end_of_slice_blind_playtest(bible, "Profile", cand_dir, pass_index=1)
+    assert added_p1 == 0
+    bible.slice_roadmap[0].status = "completed"
+    (cand_dir / "game_bible.json").write_text(bible.model_dump_json(indent=2), encoding="utf-8")
+
+    # Both per-pass Council report files must exist without Pass #1 clobbering Pass #0!
+    p0_report_path = cand_dir / "artifacts" / "blind_playtest_report_slice_0_pass0.json"
+    p1_report_path = cand_dir / "artifacts" / "blind_playtest_report_slice_0_pass1.json"
+    assert p0_report_path.is_file()
+    assert p1_report_path.is_file()
+    assert json.loads(p0_report_path.read_text(encoding="utf-8"))["council_verdict"] == "iterate_current_slice"
+    assert json.loads(p1_report_path.read_text(encoding="utf-8"))["council_verdict"] == "approve_slice"
+
+    app = create_app(
+        db_path=db_path,
+        active_cartridge_dir=active_dir,
+        cartridges_root=cartridges_root,
+        event_bus=bus,
+        playtest_manager=pt_mgr,
+    )
+
+    with TestClient(app) as client:
+        # Verify new Session Archive & Watch Theatre UI elements are served
+        html = client.get("/").text
+        assert 'id="pt-session-archive-drawer"' in html
+        assert 'id="pt-session-history-cards"' in html
+        assert 'id="pt-frames-stage"' in html
+        assert 'id="pt-frame-reticle-svg"' in html
+        assert 'id="pt-replay-transport-bar"' in html
+        assert 'id="pt-turn-scrubber"' in html
+
+        # Trigger Run #3 as a manual operator run on the completed slice_0
+        start_res = client.post(
+            "/api/playtest/sessions/start",
+            json={
+                "deliberation": "Operator re-playing slice_0 to compare against Council runs.",
+                "candidate_id": "candidate_001",
+                "slice_id": "slice_0",
+                "max_turns": 5,
+            },
+        )
+        assert start_res.status_code == 200
+        manual_sid = start_res.json()["session"]["session_id"]
+
+        for _ in range(40):
+            det = client.get(f"/api/playtest/sessions/{manual_sid}").json()
+            if det["session"]["status"] == "completed":
+                break
+            time.sleep(0.05)
+        assert det["session"]["status"] == "completed"
+
+        # Query archive filtered by candidate_001 + slice_0
+        list_res = client.get("/api/playtest/sessions?candidate_id=candidate_001&slice_id=slice_0")
+        assert list_res.status_code == 200
+        list_payload = list_res.json()
+        sessions = list_payload["sessions"]
+        assert len(sessions) == 3
+        assert any(g["candidate_id"] == "candidate_001" for g in list_payload["games_catalog"])
+
+        # Sessions are returned newest-first (Run #3, Run #2, Run #1) with chronological run numbers intact
+        by_run_num = {s["game_run_number"]: s for s in sessions}
+        assert set(by_run_num.keys()) == {1, 2, 3}
+        assert [by_run_num[i]["slice_run_number"] for i in (1, 2, 3)] == [1, 2, 3]
+        assert by_run_num[1]["initiated_by"] == "council"
+        assert by_run_num[1]["overall_fun_rating"] == 5
+        assert by_run_num[1]["council_review"]["verdict"] == "iterate_current_slice"
+        assert by_run_num[1]["council_review"]["spawned_item_ids"] == ["polish_feedback_pass0"]
+        assert by_run_num[1]["slice_index"] == 0
+
+        assert by_run_num[2]["initiated_by"] == "council"
+        assert by_run_num[2]["overall_fun_rating"] == 9
+        assert by_run_num[2]["council_review"]["verdict"] == "approve_slice"
+
+        assert by_run_num[3]["initiated_by"] == "operator"
+        assert by_run_num[3]["overall_fun_rating"] == 8
+        assert by_run_num[3]["council_review"] is None
+
+        # Every single historical run can be opened and watched turn-by-turn with denormalized 1280x720 coordinates
+        for run_idx, expected_px in ((1, (640.0, 360.0)), (2, (960.0, 180.0)), (3, (320.0, 180.0))):
+            sid = by_run_num[run_idx]["session_id"]
+            d_res = client.get(f"/api/playtest/sessions/{sid}")
+            assert d_res.status_code == 200
+            d_json = d_res.json()
+            assert d_json["session"]["game_run_number"] == run_idx
+            assert len(d_json["turns"]) == 2
+            t0 = d_json["turns"][0]
+            assert t0["action_px"]["target_x"] == expected_px[0]
+            assert t0["action_px"]["target_y"] == expected_px[1]
+            assert t0["action_px"]["mouse_button_action"] == "left_click"
+            assert t0["screenshot_name"]
+            scr_res = client.get(f"/api/playtest/sessions/{sid}/media/{t0['screenshot_name']}")
+            assert scr_res.status_code == 200
+            assert len(scr_res.content) > 0
+
+            # Per-session immutable archive JSON exists in both sessions_root and cartridge artifacts
+            assert (sessions_root / sid / "session_archive.json").is_file()
+            assert (cand_dir / "artifacts" / "playtest_sessions" / f"{sid}.json").is_file()
+
+    # Verify DB disaster recovery: fresh SQLite file restores all 3 archived sessions from disk snapshots!
+    fresh_db_path = tmp_path / "fresh_restored_telemetry.db"
+    restored_mgr = PlaytestSessionManager(
+        db_path=fresh_db_path,
+        cartridges_root=cartridges_root,
+        sessions_root=sessions_root,
+        event_bus=SwarmEventBus(),
+    )
+    restored_listing = restored_mgr.list_enriched_sessions(candidate_id="candidate_001", slice_id="slice_0")
+    assert len(restored_listing["sessions"]) == 3
+    restored_by_run = {s["game_run_number"]: s for s in restored_listing["sessions"]}
+    assert restored_by_run[1]["council_review"]["verdict"] == "iterate_current_slice"
+    assert restored_by_run[2]["council_review"]["verdict"] == "approve_slice"
+    assert len(restored_mgr.get_session_detail(restored_by_run[1]["session_id"])["turns"]) == 2
+
+
+
 

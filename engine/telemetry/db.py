@@ -1081,6 +1081,15 @@ class TelemetryDB:
         rb = record.get("rulebook") if "rulebook" in record else record.get("rulebook_json", {})
         rulebook_json = rb if isinstance(rb, str) else json.dumps(rb or {}, default=str)
 
+        fn = record.get("field_notes") if "field_notes" in record else record.get("field_notes_json", {})
+        field_notes_json = fn if isinstance(fn, str) else json.dumps(fn or {}, default=str)
+
+        qs = record.get("questions") if "questions" in record else record.get("questions_json", {})
+        questions_json = qs if isinstance(qs, str) else json.dumps(qs or {}, default=str)
+
+        bf = record.get("bugs_found") if "bugs_found" in record else record.get("bugs_found_json", {})
+        bugs_found_json = bf if isinstance(bf, str) else json.dumps(bf or {}, default=str)
+
         imp = record.get("impressions") if "impressions" in record else record.get("impressions_json", {})
         impressions_json = imp if isinstance(imp, str) else json.dumps(imp or {}, default=str)
 
@@ -1122,6 +1131,7 @@ class TelemetryDB:
                     game_title, game_description, status, end_outcome,
                     end_summary, error_message, turn_count, sim_ticks_total,
                     sim_duration_sec, compaction_count, rulebook_json,
+                    field_notes_json, questions_json, bugs_found_json,
                     impressions_json, session_report_json,
                     compacted_journal_json, current_plan, current_mood,
                     prompt_tokens, cached_tokens, output_tokens, thought_tokens,
@@ -1129,7 +1139,7 @@ class TelemetryDB:
                     ended_at_utc, deliberation
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 ON CONFLICT(session_id) DO UPDATE SET
                     initiated_by=COALESCE(excluded.initiated_by, playtest_sessions.initiated_by),
@@ -1142,6 +1152,9 @@ class TelemetryDB:
                     sim_duration_sec=excluded.sim_duration_sec,
                     compaction_count=excluded.compaction_count,
                     rulebook_json=excluded.rulebook_json,
+                    field_notes_json=excluded.field_notes_json,
+                    questions_json=excluded.questions_json,
+                    bugs_found_json=excluded.bugs_found_json,
                     impressions_json=excluded.impressions_json,
                     session_report_json=CASE
                         WHEN excluded.session_report_json IS NOT NULL AND excluded.session_report_json != '{}'
@@ -1166,6 +1179,7 @@ class TelemetryDB:
                     game_title, game_description, status, end_outcome,
                     end_summary, error_message, turn_count, sim_ticks_total,
                     sim_duration_sec, compaction_count, rulebook_json,
+                    field_notes_json, questions_json, bugs_found_json,
                     impressions_json, session_report_json,
                     compacted_journal_json, current_plan, current_mood,
                     prompt_tokens, cached_tokens, output_tokens, thought_tokens,
@@ -1181,6 +1195,9 @@ class TelemetryDB:
     def _hydrate_playtest_session_row(row_dict: Dict[str, Any]) -> Dict[str, Any]:
         for json_col, out_col, fallback in (
             ("rulebook_json", "rulebook", {}),
+            ("field_notes_json", "field_notes", {}),
+            ("questions_json", "questions", {}),
+            ("bugs_found_json", "bugs_found", {}),
             ("impressions_json", "impressions", {}),
             ("session_report_json", "session_report", {}),
             ("compacted_journal_json", "compacted_journal", {}),
@@ -1239,8 +1256,14 @@ class TelemetryDB:
         turn_id = str(turn.get("turn_id") or f"pt_turn_{uuid.uuid4().hex[:12]}")
         act = turn.get("action") if "action" in turn else turn.get("action_json", {})
         action_json = act if isinstance(act, str) else json.dumps(act or {}, default=str)
+        fnu = turn.get("field_note_updates") if "field_note_updates" in turn else turn.get("field_note_updates_json", [])
+        fnu_json = fnu if isinstance(fnu, str) else json.dumps(fnu or [], default=str)
+        qu = turn.get("question_updates") if "question_updates" in turn else turn.get("question_updates_json", [])
+        qu_json = qu if isinstance(qu, str) else json.dumps(qu or [], default=str)
         rbu = turn.get("rulebook_updates") if "rulebook_updates" in turn else turn.get("rulebook_updates_json", [])
         rbu_json = rbu if isinstance(rbu, str) else json.dumps(rbu or [], default=str)
+        bru = turn.get("bug_reports") if "bug_reports" in turn else turn.get("bug_reports_json", [])
+        bru_json = bru if isinstance(bru, str) else json.dumps(bru or [], default=str)
         impu = turn.get("impression_updates") if "impression_updates" in turn else turn.get("impression_updates_json", [])
         impu_json = impu if isinstance(impu, str) else json.dumps(impu or [], default=str)
 
@@ -1252,11 +1275,12 @@ class TelemetryDB:
                     turn_id, session_id, turn_index, sim_tick_start, sim_tick_end,
                     video_timestamp_sec, cursor_start_x, cursor_start_y,
                     cursor_end_x, cursor_end_y, current_plan, deliberation,
-                    action_json, rulebook_updates_json, impression_updates_json, append_log_line,
+                    action_json, field_note_updates_json, question_updates_json,
+                    rulebook_updates_json, bug_reports_json, impression_updates_json, append_log_line,
                     mood_state, mood_note, screenshot_path, audio_clip_path,
                     prompt_tokens, cached_tokens, output_tokens, thought_tokens,
                     created_at_utc
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     turn_id,
@@ -1272,7 +1296,10 @@ class TelemetryDB:
                     str(turn.get("current_plan") or ""),
                     str(turn.get("deliberation") or ""),
                     action_json,
+                    fnu_json,
+                    qu_json,
                     rbu_json,
+                    bru_json,
                     impu_json,
                     str(turn.get("append_log_line") or ""),
                     turn.get("mood_state"),
@@ -1303,7 +1330,10 @@ class TelemetryDB:
                 d = dict(r)
                 for jcol, ocol, fb in (
                     ("action_json", "action", {}),
+                    ("field_note_updates_json", "field_note_updates", []),
+                    ("question_updates_json", "question_updates", []),
                     ("rulebook_updates_json", "rulebook_updates", []),
+                    ("bug_reports_json", "bug_reports", []),
                     ("impression_updates_json", "impression_updates", []),
                 ):
                     raw = d.get(jcol)
@@ -1513,6 +1543,9 @@ class TelemetryDB:
                     output_tokens = 0,
                     thought_tokens = 0,
                     rulebook_json = '{}',
+                    field_notes_json = '{}',
+                    questions_json = '{}',
+                    bugs_found_json = '{}',
                     impressions_json = '{}',
                     session_report_json = '{}',
                     compacted_journal_json = '{}',

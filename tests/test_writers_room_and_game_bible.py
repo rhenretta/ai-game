@@ -1254,3 +1254,91 @@ def test_live_agent_observability_events_emitted(tmp_path: Path):
     assert {"genesis_provocations", "genesis_fragments", "genesis_collision", "genesis_selection", "listening", "speaking", "convergence_check"} <= phases
     assert all(isinstance(e.get("payload", {}).get("active_agents"), list) for e in activity_events)
 
+
+def test_council_shaping_and_review_prompts_enforce_systemic_invariants_over_coordinate_patches(tmp_path: Path):
+    from engine.studio.models import (
+        ReviewBatch,
+        ReviewDecision,
+        TaskShapingBatch,
+        WorkItemProposal,
+        WorkItemRefinement,
+    )
+    from engine.studio.production_board import ProductionBoard
+
+    room, _ = _make_room(tmp_path)
+    board = ProductionBoard(tmp_path / "backlog.json")
+    added = board.add_items(
+        [
+            WorkItemProposal(
+                deliberation="d",
+                item_id="mechanic_placement_sync",
+                title="Synchronize Placement Tool With World Geometry",
+                kind="mechanic_code",
+                spec="Allow placing structures across valid terrain polygons.",
+                proof_spec="Verify placement across multiple regions.",
+                target_modules=["scenes/mechanics/placement_tool.gd"],
+            )
+        ],
+        raised_by_role="GameplayDesigner",
+        slice_id="slice_0",
+    )
+    room.board = board
+
+    # 1. Role review mandate teaches systemic spatial contracts over coordinate whitelisting
+    mandate = room._role_review_mandate("LevelAndProgressionDesigner")
+    assert "never instruct workers to whitelist a specific `(x, y)` coordinate" in mandate
+
+    # 2. Stage 2 Council task-shaping prompt instructs specialists to specify generalizable world-wide invariants
+    shaping_prompts = []
+    room._structured_with_validation = lambda prompt, schema_cls, validator, temperature=None, parts=None: (
+        shaping_prompts.append(prompt),
+        TaskShapingBatch(
+            deliberation="d",
+            backlog_refinements=[
+                WorkItemRefinement(
+                    deliberation="d",
+                    item_id="mechanic_placement_sync",
+                    action="no_input",
+                )
+            ],
+        ),
+    )[1]
+    room._run_full_council_direction_pass(
+        game_bible=_complete_design_bible(),
+        dna_summary="dna",
+        bible_snapshot="bible",
+        candidate_dir=tmp_path,
+    )
+    assert shaping_prompts
+    assert all("Specify generalizable, world-wide invariants" in p for p in shaping_prompts)
+    assert all("never prescribe hardcoded `(x, y)` coordinate whitelists" in p for p in shaping_prompts)
+
+    # 3. Council proof review prompt enforces systemic root-cause diagnosis over coordinate point-patches
+    review_prompts = []
+    room._structured_with_validation = lambda prompt, schema_cls, validator, temperature=None, parts=None: (
+        review_prompts.append(prompt),
+        ReviewBatch(
+            deliberation="d",
+            spoken_dialogue="Checking systemic spatial rules.",
+            review_decisions=[
+                ReviewDecision(
+                    deliberation="d",
+                    validation_criteria_for_my_role="Placement works across all valid world regions.",
+                    item_id="mechanic_placement_sync",
+                    verdict="approve",
+                )
+            ],
+        ),
+    )[1]
+    room._review_as(
+        role="UXExperienceDesigner",
+        awaiting=added,
+        deciding=[],
+        game_bible=_complete_design_bible(),
+        dna_summary="dna",
+        candidate_dir=tmp_path,
+    )
+    assert len(review_prompts) == 1
+    assert "SYSTEMIC INVARIANTS OVER COORDINATE POINT-PATCHES" in review_prompts[0]
+
+

@@ -2030,6 +2030,12 @@ def test_f33_zero_legacy_branding_tokens_repository_wide():
     forbidden = "".join(chr(c) for c in (106, 111, 97, 110))
     targets = ["engine", "cartridges", "config.py", "run_game.py", "verify_engine.py"]
     excluded_dirs = {".git", ".venv", ".pytest_cache", "__pycache__", ".agents", "teamwork"}
+    binary_suffixes = {
+        ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".ico",
+        ".mp4", ".mov", ".webm", ".wav", ".mp3", ".ogg", ".flac",
+        ".ttf", ".otf", ".woff", ".woff2", ".db", ".sqlite", ".sqlite3",
+        ".pyc", ".pyo", ".so", ".dylib", ".ctex", ".scn", ".res",
+    }
     project_root = Path("/Users/rhenretta/workspace/rhenretta/ai-game")
 
     violations = []
@@ -2037,7 +2043,12 @@ def test_f33_zero_legacy_branding_tokens_repository_wide():
         path = project_root / target
         if not path.exists():
             continue
-        files = [path] if path.is_file() else [p for p in path.rglob("*") if p.is_file() and not any(x in p.parts for x in excluded_dirs)]
+        files = [path] if path.is_file() else [
+            p for p in path.rglob("*")
+            if p.is_file()
+            and not any(x in p.parts for x in excluded_dirs)
+            and p.suffix.lower() not in binary_suffixes
+        ]
         for f in files:
             content = f.read_text(encoding="utf-8", errors="ignore")
             for line_no, line in enumerate(content.splitlines(), start=1):

@@ -1019,6 +1019,8 @@ class StudioOrchestrator:
                         if (
                             not pb_check.is_drained()
                             or (staging_dir / ".pending_steering.json").is_file()
+                            or (staging_dir / ".pending_playtest_wishes.json").is_file()
+                            or (staging_dir / ".pending_council_playtest_reports.json").is_file()
                             or has_resume_feedback
                             or (self._is_live_genai_client() and not has_assembly_proof)
                             or needs_next_slice_iteration
@@ -1035,13 +1037,23 @@ class StudioOrchestrator:
                     try:
                         world_spec = GenesisWorldSpec.model_validate_json((staging_dir / "world_spec.json").read_text(encoding="utf-8"))
                         req_spec = GameRequirementsSpec.model_validate_json((staging_dir / "requirements_spec.json").read_text(encoding="utf-8"))
+                        # Re-arm continuous ProductionBoard state when resuming an already-drained board cartridge
+                        # into post-slice verification & promotion so Tier 2/Tier 3 specialists recognize board-managed assets/tracks.
+                        if self._continuous_production_enabled() and (staging_dir / "backlog.json").is_file():
+                            from engine.studio.production_board import ProductionBoard
+
+                            pb_resumed = ProductionBoard(staging_dir / "backlog.json")
+                            if pb_resumed.items():
+                                self.production_board = pb_resumed
+                                self._continuous_active = True
+                                req_spec = self._reconcile_requirements_with_board(req_spec)
                         # Reset any rejected or interrupted in_progress tracks to pending so resumed builds retry them
                         reset_any = False
                         for trk in getattr(req_spec, "requirements", []):
                             if getattr(trk, "status", "") in ("rejected", "in_progress"):
                                 trk.status = "pending"
                                 reset_any = True
-                        if reset_any:
+                        if reset_any or self._continuous_active:
                             (staging_dir / "requirements_spec.json").write_text(
                                 req_spec.model_dump_json(indent=2), encoding="utf-8"
                             )
@@ -2066,7 +2078,15 @@ class StudioOrchestrator:
                             "metrics": {"compilation_pass": True, "smoke_pass": True, "resumed": True},
                         },
                     )
-                self._persist_verified_checkpoint(staging_dir, track, completed_track_ids, mirror_to_active=False)
+                existing_ckpt_meta = (
+                    PROJECT_ROOT
+                    / "cartridges"
+                    / "checkpoints"
+                    / f"{staging_dir.name}_{track.id}"
+                    / "checkpoint_metadata.json"
+                )
+                if not existing_ckpt_meta.is_file():
+                    self._persist_verified_checkpoint(staging_dir, track, completed_track_ids, mirror_to_active=False)
                 continue
 
             synthesized_any_track = True
@@ -2345,6 +2365,50 @@ class StudioOrchestrator:
             results["level.json"] = staging_dir / "level.json"
         return results
 
+    @staticmethod
+    def _clear_immutable_and_writable(path_obj: Union[Path, str]) -> None:
+        """Clears user-immutable flags (e.g. macOS UF_IMMUTABLE / uchg) and ensures owner write permission."""
+        import stat as _stat
+
+        p_str = str(path_obj)
+        if hasattr(os, "chflags"):
+            try:
+                st = os.stat(p_str, follow_symlinks=False)
+                if getattr(st, "st_flags", 0):
+                    os.chflags(p_str, 0)
+            except OSError:
+                pass
+        try:
+            st_mode = os.stat(p_str, follow_symlinks=False).st_mode
+            if not (st_mode & _stat.S_IWUSR):
+                os.chmod(p_str, st_mode | _stat.S_IWUSR)
+        except OSError:
+            pass
+
+    @classmethod
+    def _rmtree_force(cls, target_dir: Path) -> None:
+        """Removes a directory tree cleanly even if prior files carried immutable/read-only flags."""
+        if not target_dir.exists():
+            return
+
+        def _onerror(func: Any, path_str: str, _exc_info: Any) -> None:
+            cls._clear_immutable_and_writable(path_str)
+            parent = os.path.dirname(path_str)
+            if parent:
+                cls._clear_immutable_and_writable(parent)
+            func(path_str)
+
+        shutil.rmtree(target_dir, onerror=_onerror)
+
+    @classmethod
+    def _copy2_unlocked(cls, src: Union[Path, str], dst: Union[Path, str]) -> str:
+        """Copies a file while ensuring destination files in checkpoints/active never retain immutable flags."""
+        if os.path.exists(dst):
+            cls._clear_immutable_and_writable(dst)
+        out = shutil.copy2(src, dst)
+        cls._clear_immutable_and_writable(out)
+        return out
+
     def _persist_verified_checkpoint(
         self,
         staging_dir: Path,
@@ -2368,7 +2432,7 @@ class StudioOrchestrator:
         for pattern in ["*.py", "*.gd", "*.tscn", "project.godot"]:
             for code_f in staging_dir.glob(pattern):
                 if code_f.is_file():
-                    shutil.copy2(code_f, checkpoint_dir / code_f.name)
+                    self._copy2_unlocked(code_f, checkpoint_dir / code_f.name)
 
         # 2. Copy specification and metadata files
         for json_name in [
@@ -2383,7 +2447,7 @@ class StudioOrchestrator:
         ]:
             src = staging_dir / json_name
             if src.is_file():
-                shutil.copy2(src, checkpoint_dir / json_name)
+                self._copy2_unlocked(src, checkpoint_dir / json_name)
 
         # 3. Copy assets and scenes directories if present
         for subdir_name in ("assets", "scenes"):
@@ -2391,8 +2455,8 @@ class StudioOrchestrator:
             if sub_src.is_dir():
                 sub_dst = checkpoint_dir / subdir_name
                 if sub_dst.exists():
-                    shutil.rmtree(sub_dst)
-                shutil.copytree(sub_src, sub_dst)
+                    self._rmtree_force(sub_dst)
+                shutil.copytree(sub_src, sub_dst, copy_function=self._copy2_unlocked)
 
         # 4. Compute cryptographic sha256 manifest
         sha256_manifest: Dict[str, str] = {}
@@ -2451,13 +2515,13 @@ class StudioOrchestrator:
         if should_mirror:
             tmp_active = PROJECT_ROOT / "cartridges" / f".active_checkpoint_tmp_{uuid.uuid4().hex[:6]}"
             try:
-                shutil.copytree(checkpoint_dir, tmp_active)
+                shutil.copytree(checkpoint_dir, tmp_active, copy_function=self._copy2_unlocked)
                 if active_dir.exists():
                     old_active = PROJECT_ROOT / "cartridges" / f".active_old_{uuid.uuid4().hex[:6]}"
                     active_dir.rename(old_active)
                     tmp_active.rename(active_dir)
                     try:
-                        shutil.rmtree(old_active)
+                        self._rmtree_force(old_active)
                     except Exception:
                         pass
                 else:

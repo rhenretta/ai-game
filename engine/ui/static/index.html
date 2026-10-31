@@ -2099,6 +2099,244 @@
       height: 92px;
       image-rendering: pixelated;
     }
+    .prompt-inspector-shell {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      margin-top: 5px;
+    }
+    .prompt-inspector-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      flex-wrap: wrap;
+      padding: 4px 6px;
+      background: #030816;
+      border: 1px solid var(--navy);
+      border-radius: 4px;
+    }
+    .prompt-toolbar-btn {
+      background: #07122b;
+      border: 1px solid var(--navy);
+      color: var(--cyan);
+      border-radius: 3px;
+      padding: 2px 7px;
+      font-size: 9.5px;
+      font-weight: 700;
+      font-family: monospace;
+      cursor: pointer;
+    }
+    .prompt-toolbar-btn:hover {
+      border-color: var(--cyan);
+      color: var(--white);
+    }
+    .prompt-section-details {
+      background: #030918;
+      border: 1px solid var(--navy);
+      border-left: 2px solid var(--peach);
+      border-radius: 4px;
+      padding: 4px 8px;
+    }
+    .prompt-section-details > summary {
+      cursor: pointer;
+      font-size: 10.5px;
+      font-weight: 700;
+      color: var(--white);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      list-style: none;
+    }
+    .prompt-section-details > summary::-webkit-details-marker {
+      display: none;
+    }
+    .prompt-section-caret::before {
+      content: '▸';
+      display: inline-block;
+      margin-right: 5px;
+      color: var(--cyan);
+      transition: transform 0.12s ease;
+    }
+    details[open] > summary .prompt-section-caret::before {
+      transform: rotate(90deg);
+    }
+    .prompt-subsection-details {
+      background: #020611;
+      border: 1px solid rgba(41, 173, 255, 0.2);
+      border-left: 2px solid var(--cyan);
+      border-radius: 3px;
+      padding: 3px 7px;
+    }
+    .prompt-subsection-details > summary {
+      cursor: pointer;
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--light-gray);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      list-style: none;
+    }
+    .prompt-subsection-details > summary::-webkit-details-marker {
+      display: none;
+    }
+    .prompt-heavy-pre {
+      margin: 5px 0 2px 0;
+      padding: 8px 10px;
+      background: #02050e;
+      border: 1px solid var(--navy);
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 10px;
+      line-height: 1.45;
+      color: var(--light-gray);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      overflow-x: auto;
+      max-height: 540px;
+      overflow-y: auto;
+      resize: vertical;
+    }
+    .chronology-deferred-turn {
+      content-visibility: auto;
+      contain-intrinsic-size: auto none auto 180px;
+    }
+    .pt-branded-controls {
+      color-scheme: dark;
+      accent-color: #29adff;
+    }
+    @supports not (accent-color: #29adff) {
+      .pt-branded-controls input[type="range"] {
+        -webkit-appearance: none;
+        appearance: none;
+        height: 6px;
+        background: #0d1f3c;
+        border-radius: 999px;
+        border: 1px solid rgba(41, 173, 255, 0.45);
+      }
+      .pt-branded-controls input[type="range"]::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: #29adff;
+        border: 2px solid #040914;
+        cursor: pointer;
+      }
+      .pt-branded-controls input[type="range"]::-moz-range-thumb {
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: #29adff;
+        border: 2px solid #040914;
+        cursor: pointer;
+      }
+    }
+    .pt-archive-drawer {
+      background: #050a18;
+      border: 1px solid rgba(41, 173, 255, 0.28);
+      border-radius: 8px;
+      padding: 8px 12px;
+    }
+    .pt-archive-drawer > summary {
+      list-style: none;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      user-select: none;
+    }
+    .pt-archive-drawer > summary::-webkit-details-marker {
+      display: none;
+    }
+    .pt-slice-filter-pill {
+      padding: 3px 9px;
+      border-radius: 999px;
+      border: 1px solid var(--navy);
+      background: #071024;
+      color: var(--light-gray);
+      font-size: 10px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 0.14s ease;
+    }
+    .pt-slice-filter-pill:hover {
+      border-color: var(--cyan);
+      color: var(--white);
+    }
+    .pt-slice-filter-pill.active {
+      border-color: var(--cyan);
+      background: rgba(41, 173, 255, 0.2);
+      color: var(--white);
+    }
+    .pt-session-cards-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(235px, 1fr));
+      gap: 8px;
+      max-height: 230px;
+      overflow-y: auto;
+      padding: 2px 2px 4px 0;
+    }
+    .pt-session-card {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      text-align: left;
+      padding: 8px 10px;
+      border-radius: 7px;
+      border: 1px solid rgba(41, 173, 255, 0.2);
+      background: #071022;
+      color: var(--white);
+      cursor: pointer;
+      transition: border-color 0.14s ease, background 0.14s ease, transform 0.12s ease;
+    }
+    .pt-session-card:hover {
+      border-color: var(--cyan);
+      background: #0a1730;
+    }
+    .pt-session-card.active {
+      border: 1.5px solid var(--green);
+      background: rgba(0, 228, 54, 0.1);
+      box-shadow: 0 0 0 1px rgba(0, 228, 54, 0.22);
+    }
+    .pt-transport-bar {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 8px 10px;
+      background: #071126;
+      border: 1px solid rgba(41, 173, 255, 0.24);
+      border-radius: 6px;
+    }
+    .pt-speed-btn {
+      padding: 2px 6px;
+      border-radius: 4px;
+      border: 1px solid var(--navy);
+      background: #050b1a;
+      color: var(--light-gray);
+      font-family: var(--font-mono);
+      font-size: 9.5px;
+      cursor: pointer;
+    }
+    .pt-speed-btn.active {
+      border-color: var(--cyan);
+      background: rgba(41, 173, 255, 0.22);
+      color: var(--white);
+      font-weight: 800;
+    }
+    .pt-turn-row-deferred {
+      content-visibility: auto;
+      contain-intrinsic-size: auto none auto 56px;
+    }
+    .pt-turn-row-active {
+      border-color: var(--green) !important;
+      background: rgba(0, 228, 54, 0.1) !important;
+    }
   </style>
 </head>
 <body>
@@ -2128,7 +2366,8 @@
           </button>
           <button id="ws-tab-playtester" class="workspace-tab-btn" type="button" style="padding: 4px 10px; font-size: 11px;">
             <span>🧪 Blind Playtester</span>
-            <span id="header-playtest-wish-badge" style="display: none; background: rgba(255, 163, 0, 0.25); border: 1px solid var(--amber); padding: 1px 6px; border-radius: 10px; font-size: 9.5px; color: var(--yellow);">0</span>
+            <span id="header-playtest-run-count" style="display: none; background: var(--navy); padding: 1px 6px; border-radius: 10px; font-size: 9.5px; color: var(--cyan);" title="Recorded playtest runs for the selected game">0</span>
+            <span id="header-playtest-wish-badge" style="display: none; background: rgba(255, 163, 0, 0.25); border: 1px solid var(--amber); padding: 1px 6px; border-radius: 10px; font-size: 9.5px; color: var(--yellow);" title="Pending player wishes">0</span>
           </button>
         </div>
       </nav>
@@ -2514,7 +2753,7 @@
   </section>
 
   <!-- Decoupled Blind Playtester Workspace -->
-  <section id="workspace-playtester" style="display: none; margin-bottom: 14px;" aria-label="Blind AI Playtester Lab">
+  <section id="workspace-playtester" class="pt-branded-controls" style="display: none; margin-bottom: 14px;" aria-label="Blind AI Playtester Lab">
     <div class="panel" style="display: flex; flex-direction: column; gap: 12px;">
       <!-- Top Control & Session Header -->
       <div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; padding-bottom: 10px; border-bottom: 1px solid var(--border-subtle);">
@@ -2531,13 +2770,13 @@
             <input id="pt-audio-toggle" type="checkbox" checked>
             🔊 Audio
           </label>
-          <button id="btn-pt-start" type="button" class="btn-primary" style="background: rgba(0, 228, 54, 0.2); border: 1px solid var(--green); color: var(--green); padding: 5px 11px; font-size: 11px; font-weight: 800;">
-            ▶ Run Playtester
+          <button id="btn-pt-start" type="button" class="btn-primary" style="background: rgba(0, 228, 54, 0.2); border: 1px solid var(--green); color: var(--green); padding: 5px 11px; font-size: 11px; font-weight: 800;" title="Start a brand-new recorded Blind Playtest session (all previous runs stay saved in the archive below)">
+            ▶ Run New Session
           </button>
         </div>
 
         <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 6px;">
-          <select id="pt-session-select" style="background: #050b1a; color: var(--light-gray); border: 1px solid var(--navy); border-radius: 5px; padding: 4px 8px; font-size: 11px; max-width: 260px;" title="Switch between active and historical playtest runs">
+          <select id="pt-session-select" style="background: #050b1a; color: var(--light-gray); border: 1px solid var(--navy); border-radius: 5px; padding: 4px 8px; font-size: 11px; max-width: 280px;" title="Quick-switch between active and historical playtest runs">
             <option value="">No playtest sessions yet</option>
           </select>
           <span id="pt-status-pill" style="padding: 3px 8px; border-radius: 4px; font-size: 10.5px; font-weight: 800; font-family: var(--font-mono); background: rgba(148,163,184,0.16); color: var(--slate); border: 1px solid var(--navy);">IDLE</span>
@@ -2549,28 +2788,65 @@
         </div>
       </div>
 
+      <!-- Recorded Session History & Slice Run Archive Browser -->
+      <details id="pt-session-archive-drawer" class="pt-archive-drawer" open>
+        <summary>
+          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <span class="prompt-section-caret" style="color: var(--cyan); font-size: 11px;"></span>
+            <span style="font-size: 11.5px; font-weight: 800; color: var(--cyan); letter-spacing: 0.3px;">📜 RECORDED PLAYTEST SESSIONS — WATCH EVERY RUN BY GAME &amp; SLICE</span>
+            <span id="pt-archive-count-badge" style="padding: 2px 8px; border-radius: 999px; background: rgba(41,173,255,0.16); border: 1px solid rgba(41,173,255,0.4); color: var(--white); font-family: var(--font-mono); font-size: 10px; font-weight: 800;">0 runs</span>
+          </div>
+          <span id="pt-archive-active-filter-note" style="font-size: 10px; color: var(--slate);">Click any recorded session card below to watch its replay video or step turn-by-turn</span>
+        </summary>
+        <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 9px; padding-top: 8px; border-top: 1px dashed rgba(41, 173, 255, 0.22);">
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+              <label for="pt-archive-game-select" style="font-size: 10px; font-weight: 800; color: var(--cyan); text-transform: uppercase;">🎮 Game:</label>
+              <select id="pt-archive-game-select" style="background: #050b1a; color: var(--white); border: 1px solid var(--navy); border-radius: 5px; padding: 4px 8px; font-size: 10.5px; min-width: 210px;">
+                <option value="selected">Selected Game</option>
+                <option value="all">All Games</option>
+              </select>
+              <div id="pt-archive-slice-pills" role="group" aria-label="Filter recorded playtest sessions by slice" style="display: flex; flex-wrap: wrap; gap: 5px;"></div>
+            </div>
+            <div id="pt-archive-source-pills" role="group" aria-label="Filter recorded playtest sessions by source" style="display: inline-flex; gap: 5px; flex-wrap: wrap;">
+              <button type="button" class="pt-slice-filter-pill active" data-pt-source="all">All Runs</button>
+              <button type="button" class="pt-slice-filter-pill" data-pt-source="council">🏛️ Council Gates</button>
+              <button type="button" class="pt-slice-filter-pill" data-pt-source="operator">👤 Manual</button>
+            </div>
+          </div>
+          <div id="pt-session-history-cards" class="pt-session-cards-grid">
+            <div style="font-size: 11px; color: var(--slate); padding: 6px;">No playtest sessions recorded yet.</div>
+          </div>
+        </div>
+      </details>
+
       <!-- Blindfold Briefing Banner -->
       <div id="pt-store-card-banner" style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 12px; background: #060d1f; border: 1px solid rgba(41, 173, 255, 0.25); border-radius: 6px; font-size: 11px;">
-        <div>
-          <span style="color: var(--cyan); font-weight: 800;">🕶️ Opaque-Box Player Knowledge (Title + Store Blurb Only):</span>
-          <span id="pt-blind-title" style="color: var(--white); font-weight: 700; margin-left: 6px;">—</span>
-          <span id="pt-blind-desc" style="color: var(--light-gray); margin-left: 6px;">Launch a playtest on any completed slice or checkpoint. Runs independently of Studio builds.</span>
+        <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 6px;">
+          <span id="pt-session-run-badge" style="display: none; padding: 2px 7px; border-radius: 4px; background: rgba(0,228,54,0.18); border: 1px solid var(--green); color: var(--green); font-family: var(--font-mono); font-size: 10px; font-weight: 800;">Run #1</span>
+          <span style="color: var(--cyan); font-weight: 800;">🕶️ Opaque-Box Player Knowledge:</span>
+          <span id="pt-blind-title" style="color: var(--white); font-weight: 700;">—</span>
+          <span id="pt-blind-desc" style="color: var(--light-gray);">Launch a playtest on any completed slice or checkpoint. Runs independently of Studio builds.</span>
         </div>
-        <div id="pt-mood-pill" style="padding: 3px 9px; border-radius: 12px; background: rgba(41,173,255,0.18); border: 1px solid var(--cyan); color: var(--white); font-size: 10.5px; font-weight: 800;">Mood: —</div>
+        <div style="display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap;">
+          <span id="pt-slice-provenance-pill" style="display: none; padding: 3px 8px; border-radius: 12px; background: rgba(255,163,0,0.16); border: 1px solid var(--amber); color: var(--yellow); font-size: 10px; font-weight: 800;"></span>
+          <div id="pt-mood-pill" style="padding: 3px 9px; border-radius: 12px; background: rgba(41,173,255,0.18); border: 1px solid var(--cyan); color: var(--white); font-size: 10.5px; font-weight: 800;">Mood: —</div>
+        </div>
       </div>
 
       <!-- Main 2-Column Split: Viewport/Replay Video (Left) + Observability & Wish Inbox (Right) -->
       <div style="display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(340px, 1fr); gap: 14px; align-items: start;">
-        <!-- Left: Live Viewport & 1600x720 Broadcast Replay Video -->
+        <!-- Left: Live Viewport, 1600x720 Broadcast Replay Video & Turn-by-Turn Frame Inspector -->
         <div style="display: flex; flex-direction: column; gap: 8px; background: #050914; border: 1px solid var(--navy); border-radius: 8px; padding: 10px;">
           <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
-            <div style="display: inline-flex; gap: 6px;">
+            <div style="display: inline-flex; gap: 6px; flex-wrap: wrap;">
               <button id="btn-pt-view-live" type="button" class="workspace-tab-btn active" style="padding: 3px 9px; font-size: 10.5px;">🔴 Live Player Screen</button>
               <button id="btn-pt-view-video" type="button" class="workspace-tab-btn" style="padding: 3px 9px; font-size: 10.5px;">🎬 Broadcast Replay MP4 (1600×720)</button>
+              <button id="btn-pt-view-frames" type="button" class="workspace-tab-btn" style="padding: 3px 9px; font-size: 10.5px;">🕹️ Turn-by-Turn Frames &amp; Clicks</button>
             </div>
             <label style="display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--light-gray); cursor: pointer;" title="Automatically pause video playback when crossing a mood shift or wish timestamp so you can read at your own pace">
               <input id="pt-autopause-markers" type="checkbox">
-              ⏸ Auto-Pause on Feedback Markers
+              ⏸ Auto-Pause on Markers
             </label>
           </div>
 
@@ -2578,7 +2854,7 @@
           <div id="pt-live-stage" style="position: relative; width: 100%; aspect-ratio: 16 / 9; background: #03060e; border-radius: 6px; overflow: hidden; display: flex; align-items: center; justify-content: center; border: 1px solid rgba(41,173,255,0.18);">
             <img id="pt-live-img" alt="Live Blind Playtester Viewport" width="1280" height="720" style="width: 100%; height: 100%; object-fit: contain; display: none;">
             <div id="pt-live-empty" style="color: var(--slate); font-size: 12px; text-align: center; padding: 20px;">
-              No active playtest frame yet. Select a completed slice or checkpoint and click <strong>▶ Run Playtester</strong>.
+              No active playtest frame yet. Select a recorded session above to watch, or click <strong>▶ Run New Session</strong>.
             </div>
           </div>
 
@@ -2586,7 +2862,48 @@
           <div id="pt-video-stage" style="display: none; flex-direction: column; gap: 6px;">
             <video id="pt-replay-video" controls width="1600" height="720" preload="metadata" playsinline style="width: 100%; height: auto; aspect-ratio: 1600 / 720; background: #03060e; border-radius: 6px; border: 1px solid rgba(41,173,255,0.25); display: block;"></video>
             <div id="pt-video-unavailable-note" style="display: none; font-size: 11px; color: var(--amber); padding: 6px 8px; background: rgba(255,163,0,0.1); border-radius: 4px;">
-              Replay MP4 is muxed automatically when you <strong>⏸ Pause</strong>, <strong>⏹ Stop</strong>, or when the player finishes the session.
+              Broadcast MP4 is muxed automatically when paused, stopped, or completed — you can still step through every captured turn screenshot in <strong>🕹️ Turn-by-Turn Frames &amp; Clicks</strong>!
+            </div>
+          </div>
+
+          <!-- Turn-by-Turn Frame & Action Reticle Stage (1280x720 with SVG Cursor/Click/Drag Overlay) -->
+          <div id="pt-frames-stage" style="display: none; flex-direction: column; gap: 6px;">
+            <div style="position: relative; width: 100%; aspect-ratio: 16 / 9; background: #03060e; border-radius: 6px; overflow: hidden; display: flex; align-items: center; justify-content: center; border: 1px solid rgba(41,173,255,0.25);">
+              <img id="pt-frame-replay-img" alt="Turn-by-Turn Playtest Frame" width="1280" height="720" style="width: 100%; height: 100%; object-fit: contain; display: none;">
+              <svg id="pt-frame-reticle-svg" viewBox="0 0 1280 720" preserveAspectRatio="xMidYMid meet" aria-hidden="true" style="position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; display: none;"></svg>
+              <div id="pt-frame-replay-empty" style="color: var(--slate); font-size: 12px; text-align: center; padding: 20px;">
+                No captured turn screenshots in this session.
+              </div>
+            </div>
+            <audio id="pt-frame-turn-audio" controls loading="lazy" preload="none" style="display: none; width: 100%; height: 28px;"></audio>
+          </div>
+
+          <!-- Unified Replay Transport, Turn Scrubber & Speed Controls -->
+          <div id="pt-replay-transport-bar" class="pt-transport-bar" style="display: none;">
+            <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+              <div style="display: inline-flex; align-items: center; gap: 5px; flex-wrap: wrap;">
+                <button id="btn-pt-step-first" type="button" class="btn-activate-checkpoint" style="padding: 3px 7px; font-size: 10px;" title="Jump to Turn #1">⏮ T#1</button>
+                <button id="btn-pt-step-prev" type="button" class="btn-activate-checkpoint" style="padding: 3px 8px; font-size: 10px;" title="Step to previous turn">◀ Prev</button>
+                <button id="btn-pt-replay-playpause" type="button" class="btn-primary" style="background: rgba(41,173,255,0.2); border: 1px solid var(--cyan); color: var(--white); padding: 3px 10px; font-size: 10px; font-weight: 800;" title="Play or pause synchronized run playback">▶ Play</button>
+                <button id="btn-pt-step-next" type="button" class="btn-activate-checkpoint" style="padding: 3px 8px; font-size: 10px;" title="Step to next turn">Next ▶</button>
+                <button id="btn-pt-step-last" type="button" class="btn-activate-checkpoint" style="padding: 3px 7px; font-size: 10px;" title="Jump to final turn">⏭ End</button>
+              </div>
+              <div style="display: inline-flex; align-items: center; gap: 4px;" role="group" aria-label="Replay playback speed">
+                <span style="font-size: 9.5px; color: var(--slate); font-weight: 700;">Speed:</span>
+                <button type="button" class="pt-speed-btn" data-pt-speed="0.5">0.5×</button>
+                <button type="button" class="pt-speed-btn active" data-pt-speed="1">1×</button>
+                <button type="button" class="pt-speed-btn" data-pt-speed="1.5">1.5×</button>
+                <button type="button" class="pt-speed-btn" data-pt-speed="2">2×</button>
+                <button type="button" class="pt-speed-btn" data-pt-speed="4">4×</button>
+              </div>
+            </div>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <label for="pt-turn-scrubber" style="font-size: 10px; font-weight: 800; color: var(--cyan); white-space: nowrap;">Turn Scrubber:</label>
+              <input id="pt-turn-scrubber" type="range" min="1" max="1" value="1" style="flex: 1; cursor: pointer;">
+              <span id="pt-turn-scrubber-label" style="font-family: var(--font-mono); font-size: 10px; color: var(--white); min-width: 112px; text-align: right;">T#1 / 1 (00:00.0)</span>
+            </div>
+            <div id="pt-synced-turn-banner" style="padding: 6px 8px; border-radius: 5px; background: #040a18; border-left: 3px solid var(--cyan); font-size: 10.5px; color: var(--light-gray); line-height: 1.35;">
+              Select or play a turn to see synchronized player thought, cursor action, and world observation.
             </div>
           </div>
 
@@ -2613,7 +2930,7 @@
           <div role="tablist" aria-label="Playtest observability views" style="display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid var(--border-subtle); padding-bottom: 8px;">
             <button id="pt-tab-btn-feed" type="button" role="tab" aria-selected="true" aria-controls="pt-obs-view-feed" tabindex="0" class="workspace-tab-btn pt-obs-tab active" data-pt-tab="feed" style="padding: 4px 8px; font-size: 10.5px;">💬 Mood &amp; Turn Feed</button>
             <button id="pt-tab-btn-report" type="button" role="tab" aria-selected="false" aria-controls="pt-obs-view-report" tabindex="-1" class="workspace-tab-btn pt-obs-tab" data-pt-tab="report" style="padding: 4px 8px; font-size: 10.5px;">📋 Impressions &amp; Report</button>
-            <button id="pt-tab-btn-memory" type="button" role="tab" aria-selected="false" aria-controls="pt-obs-view-memory" tabindex="-1" class="workspace-tab-btn pt-obs-tab" data-pt-tab="memory" style="padding: 4px 8px; font-size: 10.5px;">🧠 Rulebook &amp; Memory</button>
+            <button id="pt-tab-btn-memory" type="button" role="tab" aria-selected="false" aria-controls="pt-obs-view-memory" tabindex="-1" class="workspace-tab-btn pt-obs-tab" data-pt-tab="memory" style="padding: 4px 8px; font-size: 10.5px;">🧠 Notes, Questions &amp; Rulebook</button>
             <button id="pt-tab-btn-wishes" type="button" role="tab" aria-selected="false" aria-controls="pt-obs-view-wishes" tabindex="-1" class="workspace-tab-btn pt-obs-tab" data-pt-tab="wishes" style="padding: 4px 8px; font-size: 10.5px;">
               <span>✨ Wishes → Council</span>
               <span id="pt-tab-wish-count" style="background: var(--navy); padding: 1px 5px; border-radius: 8px; font-size: 9.5px; color: var(--yellow);">0</span>
@@ -2624,7 +2941,7 @@
           <div id="pt-obs-view-feed" role="tabpanel" aria-labelledby="pt-tab-btn-feed" style="display: flex; flex-direction: column; gap: 10px; overflow-y: auto; max-height: 680px; padding-right: 4px;">
             <div id="pt-end-summary-banner" style="display: none; padding: 8px 10px; border-radius: 6px; background: rgba(0,228,54,0.12); border: 1px solid var(--green); font-size: 11px; color: var(--white);"></div>
             <div>
-              <div style="font-size: 10px; font-weight: 800; color: var(--cyan); text-transform: uppercase; margin-bottom: 5px;">Sparse Mood Shifts (Emitted Only on Genuine Mood Change)</div>
+              <div style="font-size: 10px; font-weight: 800; color: var(--cyan); text-transform: uppercase; margin-bottom: 5px;">Player Mood Trajectory &amp; Shifts</div>
               <div id="pt-mood-shifts-list" style="display: flex; flex-direction: column; gap: 6px;">
                 <div style="font-size: 11px; color: var(--slate);">No mood shifts logged yet.</div>
               </div>
@@ -3629,19 +3946,23 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       } else if (evTypeLower === 'backlog_item_started') {
         _lastBuildStoppedByErrorOrPromote = false;
         _lastRetryNotice = '';
-        const resumedTag = p.resumed ? 'Resuming' : 'Worker fabricating';
+        const resumedTurnIdx = Math.max(0, Number(p.resumed_turn_index || 0) || 0);
+        const resumedTag = (p.resumed || resumedTurnIdx > 0) ? 'Resuming' : 'Worker fabricating';
         const itemId = p.item_id || '';
         const ownerRole = p.owner_role || agent || 'TaskLead';
-        _lastActivityHeadline = `⚡ ${resumedTag} ${p.kind || 'item'} "${itemId}" (${ownerRole}, Rev #${(p.revision || 0) + 1})...`;
+        const turnSuffix = resumedTurnIdx > 0 ? `, Turn #${resumedTurnIdx + 1}` : '';
+        _lastActivityHeadline = `⚡ ${resumedTag} ${p.kind || 'item'} "${itemId}" (${ownerRole}, Rev #${(p.revision || 0) + 1}${turnSuffix})...`;
         if (itemId) {
           _liveRunningAgents['item_' + itemId] = {
             key: 'item_' + itemId,
             itemId: itemId,
             ownerRole: ownerRole,
             specialist: 'TaskLead',
-            turnIndex: 1,
+            turnIndex: resumedTurnIdx + 1,
             agentLabel: `${ownerRole} [${itemId}]`,
-            action: `${resumedTag} ${p.kind || 'work item'} (initializing Task Lead)...`,
+            action: resumedTurnIdx > 0
+              ? `Resuming ${p.kind || 'work item'} at Turn #${resumedTurnIdx + 1}...`
+              : `${resumedTag} ${p.kind || 'work item'} (initializing Task Lead)...`,
             startedAtMs: effectiveStartMs,
           };
         }
@@ -3815,6 +4136,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           };
           if (!_isErrorDismissed(candErr)) {
             _lastBuildError = candErr;
+            if (typeof renderProductionBoard === 'function' && latestProductionBoard) {
+              renderProductionBoard(latestProductionBoard);
+            }
           }
         }
       } else if (evTypeLower === 'context_curator_packed') {
@@ -3900,6 +4224,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           };
           if (!_isErrorDismissed(candErr)) {
             _lastBuildError = candErr;
+            if (typeof renderProductionBoard === 'function' && latestProductionBoard) {
+              renderProductionBoard(latestProductionBoard);
+            }
           }
         }
         if (['StudioDaemon', 'BuildSupervisor', 'StudioOrchestrator', 'LeadGameplaySWEAgent', 'MissionControlGateway'].includes(agent)) {
@@ -3996,6 +4323,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       if (typeof ps.is_paused === 'boolean' && Date.now() >= _resumeOptimisticUntil) {
         _isBuildPaused = ps.is_paused;
       }
+      const prevErrKey = _getErrorDismissKey(_lastBuildError);
       if (ps.last_error && typeof ps.last_error === 'object') {
         if (!_isErrorDismissed(ps.last_error)) {
           _lastBuildError = ps.last_error;
@@ -4003,6 +4331,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       } else if (ps.build_actively_running || ps.last_error === null) {
         // Clear stale build-stopping banner once build is actively running again or server reports no active error
         _lastBuildError = null;
+      }
+      if (_getErrorDismissKey(_lastBuildError) !== prevErrKey && typeof renderProductionBoard === 'function' && latestProductionBoard) {
+        renderProductionBoard(latestProductionBoard);
       }
       if (ps.last_event_timestamp_utc) {
         const parsedTs = Date.parse(ps.last_event_timestamp_utc);
@@ -4070,19 +4401,36 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const totalTracks = tracks.length;
       const completedCount = tracks.filter(t => ['completed', 'satisfied'].includes((t.status || '').toLowerCase())).length;
       const running = isBuildActivelyRunning();
-      const sliceItemsForHeader = typeof getSliceScopedBoardItems === 'function'
-        ? getSliceScopedBoardItems(cachedGameBible, latestProductionBoard)
-        : ((latestProductionBoard && Array.isArray(latestProductionBoard.items)) ? latestProductionBoard.items : []);
+      const boardObjHeader = latestProductionBoard || (cachedGameBible && cachedGameBible.production_board) || reqResp.production_board || null;
+      const allBoardItemsHeader = (boardObjHeader && Array.isArray(boardObjHeader.items)) ? boardObjHeader.items : [];
+      const sliceCtxHeader = typeof resolveSliceContext === 'function'
+        ? resolveSliceContext(cachedGameBible || {}, boardObjHeader)
+        : { slices: [], currentSlice: null, activeSlice: null };
+      const sliceItemsForHeader = (sliceCtxHeader.currentSlice && typeof filterBoardItemsForSlice === 'function')
+        ? filterBoardItemsForSlice(allBoardItemsHeader, sliceCtxHeader.currentSlice, (sliceCtxHeader.slices || []).length)
+        : allBoardItemsHeader;
       const pbCounts = sliceItemsForHeader.length > 0
         ? computeBoardCounts(sliceItemsForHeader)
-        : ((latestProductionBoard && (latestProductionBoard.counts_by_state || latestProductionBoard.counts))
-            ? (latestProductionBoard.counts_by_state || latestProductionBoard.counts)
+        : ((boardObjHeader && (boardObjHeader.counts_by_state || boardObjHeader.counts))
+            ? (boardObjHeader.counts_by_state || boardObjHeader.counts)
             : null);
       const pbTotal = sliceItemsForHeader.length > 0
         ? sliceItemsForHeader.length
-        : (latestProductionBoard ? (latestProductionBoard.total_items || (pbCounts && pbCounts.total) || 0) : 0);
+        : (boardObjHeader ? (boardObjHeader.total_items || (pbCounts && pbCounts.total) || 0) : 0);
       const pbApproved = pbCounts ? (pbCounts.approved || 0) : 0;
       const pbInProg = pbCounts ? (pbCounts.in_progress || 0) : 0;
+      const allBoardTerminal = allBoardItemsHeader.length > 0
+        && allBoardItemsHeader.every(it => ['approved', 'cancelled'].includes(String(it.status || it.state || '').toLowerCase()));
+      const bibleStatusHeader = String((cachedGameBible && cachedGameBible.status) || '').toLowerCase();
+      const explicitSlices = (cachedGameBible && Array.isArray(cachedGameBible.slice_roadmap)) ? cachedGameBible.slice_roadmap : [];
+      const hasUnfinishedExplicitSlice = bibleStatusHeader !== 'locked'
+        && explicitSlices.length > 0
+        && explicitSlices.some(s => ['active', 'in_progress'].includes(String(s && s.status || '').toLowerCase()));
+      const isSliceComplete = !_lastBuildError && (
+        allBoardItemsHeader.length > 0
+          ? (allBoardTerminal && !hasUnfinishedExplicitSlice)
+          : (pbTotal > 0 ? (pbApproved === pbTotal && !hasUnfinishedExplicitSlice) : (totalTracks > 0 && completedCount === totalTracks))
+      );
 
       const ps = _serverProcessStatus || {};
       const procAlive = Boolean(ps.is_process_alive);
@@ -4138,7 +4486,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         return;
       }
 
-      if ((pbTotal > 0 && pbApproved === pbTotal) || (totalTracks > 0 && completedCount === totalTracks)) {
+      if (isSliceComplete) {
         if (statusPill) {
           statusPill.title = procTooltip;
           statusPill.style.background = 'rgba(41, 173, 255, 0.2)';
@@ -6680,7 +7028,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       return utt.utterance_id || `turn_${utt.turn_index || (idx + 1)}_${utt.speaker_role || 'CreativeDirector'}`;
     }
 
-    function switchMainWorkspace(workspaceName) {
+    function switchMainWorkspace(workspaceName, opts = {}) {
       const wsTelemetry = document.getElementById('workspace-telemetry');
       const wsBible = document.getElementById('workspace-game-bible');
       const wsPlaytester = document.getElementById('workspace-playtester');
@@ -6688,6 +7036,13 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const tabBible = document.getElementById('ws-tab-bible');
       const tabPlaytester = document.getElementById('ws-tab-playtester');
       const tabRendersShortcut = document.getElementById('ws-tab-renders-shortcut');
+      if (workspaceName !== 'playtester') {
+        if (typeof stopPlaytestFramesPlayback === 'function') stopPlaytestFramesPlayback();
+        const ptVid = document.getElementById('pt-replay-video');
+        if (ptVid && !ptVid.paused) {
+          try { ptVid.pause(); } catch (_) {}
+        }
+      }
       if (workspaceName === 'bible') {
         if (wsTelemetry) wsTelemetry.style.display = 'none';
         if (wsPlaytester) wsPlaytester.style.display = 'none';
@@ -6705,7 +7060,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         if (tabBible) tabBible.classList.remove('active');
         if (tabPlaytester) tabPlaytester.classList.add('active');
         if (tabRendersShortcut) tabRendersShortcut.classList.remove('active');
-        if (typeof loadPlaytestSessions === 'function') loadPlaytestSessions();
+        if (!opts.skipAutoReload && typeof loadPlaytestSessions === 'function') {
+          loadPlaytestSessions(_activePlaytestSessionId);
+        }
       } else {
         if (wsTelemetry) wsTelemetry.style.display = 'grid';
         if (wsBible) wsBible.style.display = 'none';
@@ -6849,6 +7206,14 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         }
       }
 
+      const computedAttemptCount = revs.length
+        + Number(rawIt.failure_count || 0)
+        + ((stVal === 'in_progress' || stVal === 'waiting_for_lock') ? 1 : 0);
+      const resolvedAttemptCount = Math.max(
+        Number(rawIt.attempt_count || 0),
+        computedAttemptCount
+      );
+
       return {
         ...rawIt,
         id: idVal,
@@ -6861,7 +7226,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         owner_role: ownerVal,
         target_files: targetFilesVal,
         dependencies: depsVal,
-        attempt_count: rawIt.attempt_count || revs.length || 0,
+        attempt_count: resolvedAttemptCount,
         shaping_notes: Array.isArray(rawIt.shaping_notes) ? rawIt.shaping_notes : [],
         spawned_by_item_id: rawIt.spawned_by_item_id || '',
         worker_notes: workerNotesVal,
@@ -6902,8 +7267,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         ? (_selectedCartridgeId || _activeCandidateId || '')
         : (bibleCand || _activeCandidateId || _selectedCartridgeId || '');
 
-      // If not pinned to a different cartridge and game_bible already provided production_board
-      if (!_userPinnedCartridge && cachedGameBible && cachedGameBible.production_board && Array.isArray(cachedGameBible.production_board.items)) {
+      // Use enriched game_bible.production_board whenever not pinned or when bibleCand already matches targetCand
+      if ((!_userPinnedCartridge || (bibleCand && bibleCand === targetCand)) && cachedGameBible && cachedGameBible.production_board && Array.isArray(cachedGameBible.production_board.items)) {
         const pbItems = cachedGameBible.production_board.items;
         const isBrainstorming = String(cachedGameBible.status || '').toLowerCase() === 'brainstorming';
         if (pbItems.length > 0 || isBrainstorming) {
@@ -7359,6 +7724,11 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const ctx = resolveSliceContext(bible, board);
       const txBySlice = partitionTranscriptBySlice(fullTx, ctx.slices, allItems);
 
+      const effCartridge = _selectedCartridgeId || _activeCandidateId || 'active';
+      const gamePlaytestRuns = (typeof getPlaytestRunsForCartridge === 'function')
+        ? getPlaytestRunsForCartridge('selected')
+        : [];
+
       const pillsHtml = ctx.slices.map(s => {
         const sItems = filterBoardItemsForSlice(allItems, s, ctx.slices.length);
         const sApproved = sItems.filter(it => it.status === 'approved').length;
@@ -7374,10 +7744,23 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         const bgCol = isSelected
           ? (isCurrentBuildSlice ? 'rgba(0, 228, 54, 0.18)' : 'rgba(41, 173, 255, 0.2)')
           : '#050b1a';
+        const sliceRuns = gamePlaytestRuns.filter(r => r.slice_id === s.slice_id);
+        const latestRatedRun = sliceRuns.find(r => r.overall_fun_rating !== null && r.overall_fun_rating !== undefined);
+        const ratingSuffix = latestRatedRun ? ` • ★${latestRatedRun.overall_fun_rating}/10` : '';
+        const watchSliceRunsBtn = sliceRuns.length > 0 ? `
+          <span role="button" tabindex="0"
+                onclick="event.stopPropagation(); openPlaytestArchiveForSlice('${escapeJsAttr(s.slice_id)}', '${escapeJsAttr(effCartridge)}')"
+                onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();event.stopPropagation();openPlaytestArchiveForSlice('${escapeJsAttr(s.slice_id)}', '${escapeJsAttr(effCartridge)}');}"
+                title="Watch ${sliceRuns.length} recorded Blind Playtester session(s) for Slice #${s.slice_index}"
+                style="font-size: 9.5px; font-weight: 800; padding: 1px 6px; border-radius: 4px; background: rgba(0, 228, 54, 0.2); border: 1px solid var(--green); color: var(--green); cursor: pointer;">
+            🎬 ${sliceRuns.length} Run${sliceRuns.length === 1 ? '' : 's'}${escapeHtml(ratingSuffix)}
+          </span>
+        ` : '';
         const playtestSliceBtn = isDone ? `
           <span role="button" tabindex="0"
                 onclick="event.stopPropagation(); launchBlindPlaytestForSlice('${escapeJsAttr(s.slice_id)}', '${escapeJsAttr(_selectedCartridgeId || _activeCandidateId || '')}')"
-                title="Run Blind AI Playtester on completed Slice #${s.slice_index}"
+                onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();event.stopPropagation();launchBlindPlaytestForSlice('${escapeJsAttr(s.slice_id)}', '${escapeJsAttr(_selectedCartridgeId || _activeCandidateId || '')}');}"
+                title="Run a new Blind AI Playtester session on completed Slice #${s.slice_index}"
                 style="font-size: 9.5px; font-weight: 800; padding: 1px 6px; border-radius: 4px; background: rgba(41, 173, 255, 0.22); border: 1px solid var(--cyan); color: var(--cyan); cursor: pointer;">
             🧪 Playtest
           </span>
@@ -7390,12 +7773,21 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             <span style="font-weight: 800; color: ${isCurrentBuildSlice ? 'var(--green)' : 'var(--cyan)'};">${icon} Slice #${s.slice_index}: ${escapeHtml(shortTitle)}</span>
             <span style="font-family: monospace; font-size: 9.5px; padding: 1px 5px; border-radius: 4px; background: rgba(0,0,0,0.45); color: ${isDone ? 'var(--green)' : 'var(--amber)'};">${sApproved}/${sTotal} Tasks · ${sTxCount}💬</span>
             <span style="font-size: 9px; font-weight: 800; letter-spacing: 0.4px; padding: 1px 5px; border-radius: 3px; background: ${isCurrentBuildSlice ? 'rgba(0, 228, 54, 0.22)' : 'rgba(41, 173, 255, 0.14)'}; color: ${isCurrentBuildSlice ? 'var(--green)' : 'var(--light-gray)'};">${statusTag}</span>
+            ${watchSliceRunsBtn}
             ${playtestSliceBtn}
           </button>
         `;
       }).join('');
 
       const allSelected = ctx.mode === 'all';
+      const watchAllGameRunsBtn = gamePlaytestRuns.length > 0 ? `
+        <button type="button"
+                onclick="openPlaytestArchiveForGame('${escapeJsAttr(effCartridge)}')"
+                title="Browse and watch all ${gamePlaytestRuns.length} recorded playtester runs for this game"
+                style="display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px; border-radius: 6px; border: 1px solid var(--green); background: rgba(0, 228, 54, 0.16); color: var(--green); font-size: 10px; font-weight: 800; cursor: pointer;">
+          🎬 Watch Runs (${gamePlaytestRuns.length})
+        </button>
+      ` : '';
       const allBtnHtml = ctx.slices.length > 1 ? `
         <button type="button"
                 onclick="selectStudioSliceScope('all')"
@@ -7420,8 +7812,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             <span style="font-size: 10.5px; font-weight: 800; color: var(--cyan); text-transform: uppercase; letter-spacing: 0.5px;">🔪 Active Slice View:</span>
             ${pillsHtml}
           </div>
-          <div style="display: flex; align-items: center; gap: 8px;">
+          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
             <span style="font-size: 10px; color: var(--slate);">Showing only ${activeS ? `Slice #${activeS.slice_index}` : 'All Slices'} in Writers' Room &amp; Task Board</span>
+            ${watchAllGameRunsBtn}
             ${allBtnHtml}
           </div>
         </div>
@@ -7623,10 +8016,14 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             ${formatStructuredSpecHtml(it.description || '', it.proof_spec || '')}
             ${formatCouncilShapingNotesHtml(it.shaping_notes, it.spawned_by_item_id)}
             ${(it.failure && (st === 'failed' || st === 'needs_decision') && !_isErrorDismissed({ item_id: it.id, message: it.failure })) ? (() => {
-              const failLines = String(it.failure).split('\n').map(l => l.trim()).filter(Boolean);
+              const failLines = String(it.failure)
+                .split('\n')
+                .map(l => l.trim())
+                .filter(l => Boolean(l) && !/^ACTION REQUIRED FOR TASK LEAD:/i.test(l));
+              const excLine = [...failLines].reverse().find(l => /(Error|Exception):/.test(l));
               const failSummary = (failLines.length > 1 && /^Traceback \(most recent call last\):/i.test(failLines[0]))
-                ? failLines[failLines.length - 1]
-                : (failLines[0] || String(it.failure));
+                ? (excLine || failLines[failLines.length - 1])
+                : (excLine || failLines[0] || String(it.failure));
               return `
               <details data-details-key="err-${escapeHtml(it.id)}-${escapeHtml(st)}" ${st === 'failed' ? 'open' : ''} style="background: rgba(255, 0, 77, 0.12); border: 1px solid var(--neon-red); border-left: 3px solid var(--neon-red); border-radius: 5px; padding: 6px 10px; font-size: 10.5px; color: var(--pink); min-width: 0; overflow-wrap: anywhere;">
                 <summary style="cursor: pointer; font-weight: 800; color: var(--neon-red); display: flex; align-items: center; justify-content: space-between; gap: 8px;">
@@ -7971,7 +8368,334 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       `;
     }
 
-    function formatTurnEpistemicDetailsHtml(t, globalContextPacks = [], globalInquiries = []) {
+    window.togglePromptSectionsAll = function(containerId, openState) {
+      const root = document.getElementById(containerId);
+      if (!root) return;
+      root.querySelectorAll('details.prompt-section-details, details.prompt-subsection-details').forEach(d => {
+        d.open = Boolean(openState);
+      });
+    };
+
+    window.togglePromptRawView = function(containerId, btnEl) {
+      const root = document.getElementById(containerId);
+      if (!root) return;
+      const secWrap = root.querySelector('.prompt-sections-wrap');
+      const rawWrap = root.querySelector('.prompt-raw-wrap');
+      if (!secWrap || !rawWrap) return;
+      const showingRaw = rawWrap.style.display !== 'none';
+      rawWrap.style.display = showingRaw ? 'none' : 'block';
+      secWrap.style.display = showingRaw ? 'flex' : 'none';
+      if (btnEl) {
+        btnEl.textContent = showingRaw ? '📄 Raw Full Text' : '🗂️ Section View';
+      }
+    };
+
+    window.copyPromptFullText = async function(containerId, btnEl) {
+      const root = document.getElementById(containerId);
+      if (!root) return;
+      const rawCode = root.querySelector('.prompt-raw-code');
+      const txt = rawCode ? (rawCode.textContent || '') : '';
+      if (!txt || !navigator.clipboard) return;
+      try {
+        await navigator.clipboard.writeText(txt);
+        if (btnEl) {
+          const orig = btnEl.textContent;
+          btnEl.textContent = '✅ Copied!';
+          setTimeout(() => { btnEl.textContent = orig; }, 1400);
+        }
+      } catch (e) {
+        // ignore clipboard denial
+      }
+    };
+
+    function parseNestedPromptSubsections(sectionLines) {
+      const joined = sectionLines.join('\n');
+      // 1. Curated Studio Context chunks: [namespace:id] (category) Title
+      const chunkRe = /^\[([a-z0-9_]+:[^\]]+)\]\s*(?:\(([^)]+)\))?\s*(.*)$/i;
+      const chunkHits = [];
+      for (let i = 0; i < sectionLines.length; i++) {
+        const m = sectionLines[i].match(chunkRe);
+        if (m) chunkHits.push({ idx: i, id: m[1], cat: m[2] || 'context', rest: m[3] || '' });
+      }
+      if (chunkHits.length >= 2) {
+        const preamble = sectionLines.slice(0, chunkHits[0].idx).join('\n').trim();
+        const subs = chunkHits.map((hit, hIdx) => {
+          const endIdx = (hIdx + 1 < chunkHits.length) ? chunkHits[hIdx + 1].idx : sectionLines.length;
+          const bodyLines = sectionLines.slice(hit.idx, endIdx);
+          const bodyText = bodyLines.join('\n');
+          const catLower = String(hit.cat).toLowerCase();
+          const icon = catLower.includes('code') ? '📄' : (catLower.includes('board') ? '📋' : (catLower.includes('asset') ? '🎨' : '🧩'));
+          const cleanRest = hit.rest.trim().slice(0, 95);
+          return {
+            key: `chunk_${hit.id}_${hIdx}`,
+            title: `${icon} [${hit.id}] ${cleanRest}${hit.rest.trim().length > 95 ? '…' : ''}`,
+            meta: `${hit.cat} • ${bodyLines.length} lines • ${bodyText.length.toLocaleString()} chars`,
+            content: bodyText,
+          };
+        });
+        return { preamble, subs };
+      }
+
+      // 2. Existing Cartridge Code files: --- Existing <filename> ... --- or === FILE: ... ===
+      const fileRe = /^(?:---\s*(Existing\s+.+?)\s*---|===\s*(FILE:\s*.+?)\s*===)\s*$/;
+      const fileHits = [];
+      for (let i = 0; i < sectionLines.length; i++) {
+        const m = sectionLines[i].match(fileRe);
+        if (m) fileHits.push({ idx: i, label: (m[1] || m[2] || '').trim() });
+      }
+      if (fileHits.length >= 1) {
+        const preamble = sectionLines.slice(0, fileHits[0].idx).join('\n').trim();
+        const subs = fileHits.map((hit, fIdx) => {
+          const endIdx = (fIdx + 1 < fileHits.length) ? fileHits[fIdx + 1].idx : sectionLines.length;
+          const bodyLines = sectionLines.slice(hit.idx, endIdx);
+          const bodyText = bodyLines.join('\n');
+          return {
+            key: `file_${fIdx}_${hit.label.slice(0, 40)}`,
+            title: `📄 ${hit.label}`,
+            meta: `${bodyLines.length} lines • ${bodyText.length.toLocaleString()} chars`,
+            content: bodyText,
+          };
+        });
+        return { preamble, subs };
+      }
+
+      // 3. Large numbered specification or instruction blocks (1. ..., 2. ..., etc.)
+      if (joined.length > 2200) {
+        const numRe = /^(\d+)\.\s+([^\n]+)/;
+        const numHits = [];
+        for (let i = 0; i < sectionLines.length; i++) {
+          const m = sectionLines[i].match(numRe);
+          if (m) {
+            const rawRest = m[2].trim();
+            const colonIdx = rawRest.indexOf(':');
+            const label = (colonIdx > 2 && colonIdx <= 95)
+              ? rawRest.slice(0, colonIdx).trim()
+              : (rawRest.slice(0, 88).trim() + (rawRest.length > 88 ? '…' : ''));
+            numHits.push({ idx: i, num: m[1], label });
+          }
+        }
+        if (numHits.length >= 3) {
+          const preamble = sectionLines.slice(0, numHits[0].idx).join('\n').trim();
+          const subs = numHits.map((hit, nIdx) => {
+            const endIdx = (nIdx + 1 < numHits.length) ? numHits[nIdx + 1].idx : sectionLines.length;
+            const bodyLines = sectionLines.slice(hit.idx, endIdx);
+            const bodyText = bodyLines.join('\n');
+            return {
+              key: `rule_${hit.num}_${nIdx}`,
+              title: `§${hit.num}. ${hit.label}`,
+              meta: `${bodyLines.length} lines • ${bodyText.length.toLocaleString()} chars`,
+              content: bodyText,
+            };
+          });
+          return { preamble, subs };
+        }
+      }
+
+      return { preamble: '', subs: [] };
+    }
+
+    function parsePromptIntoCollapsibleSections(rawText) {
+      const text = String(rawText || '');
+      if (!text) return [];
+      const lines = text.split('\n');
+      const rawSections = [];
+      let current = null;
+      let inCuratedBlock = false;
+      let inCodeBlock = false;
+      let forceSplitNext = false;
+
+      const pushNewSection = (title, firstLine) => {
+        current = { title: String(title || 'Section').trim(), lines: [firstLine] };
+        rawSections.push(current);
+      };
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmed = line.trim();
+        const atColZero = line.length > 0 && line[0] !== ' ' && line[0] !== '\t';
+
+        if (atColZero) {
+          // Closing === END ... === banner closes current curated/banner block cleanly
+          if (/^===\s*END\b/i.test(trimmed)) {
+            if (!current) {
+              pushNewSection('Context Footer', line);
+            } else {
+              current.lines.push(line);
+            }
+            inCuratedBlock = false;
+            forceSplitNext = true;
+            continue;
+          }
+
+          // Opening === SECTION === banner (when not inside curated context chunk traces)
+          const bannerMatch = !inCuratedBlock ? trimmed.match(/^===\s*(.+?)\s*===$/) : null;
+          if (bannerMatch && !/^FILE:/i.test(bannerMatch[1])) {
+            const bTitle = bannerMatch[1].trim();
+            inCuratedBlock = /CURATED STUDIO CONTEXT/i.test(bTitle);
+            inCodeBlock = false;
+            forceSplitNext = false;
+            pushNewSection(bTitle, line);
+            continue;
+          }
+
+          if (!inCuratedBlock) {
+            const roleAssignMatch = trimmed.match(/^You are the (Lead Gameplay SWE|Task Lead|QA|Visual|Audio|Narrative)[^\n]*/i);
+            if (roleAssignMatch) {
+              inCodeBlock = false;
+              forceSplitNext = false;
+              pushNewSection('Requirement Track & Acceptance Criteria', line);
+              continue;
+            }
+
+            const upperHeaderMatch = trimmed.match(/^([A-Z][A-Z0-9 _/&().,'"#—+-]{3,}):(?:\s+(.*))?$/);
+            if (upperHeaderMatch) {
+              const hdrName = upperHeaderMatch[1].trim();
+              const isPostCodeBreak = /^(CRITICAL|PRIOR|PREVIOUS|COLLECTED PROOF|ACTION REQUIRED|SELF-INQUIRY|RUNTIME DIAGNOSTIC)/i.test(hdrName);
+              if (!inCodeBlock || isPostCodeBreak) {
+                inCodeBlock = /^(EXISTING CARTRIDGE CODE|CARTRIDGE SYMBOLS & FILES)/i.test(hdrName);
+                forceSplitNext = false;
+                pushNewSection(hdrName, line);
+                continue;
+              }
+            }
+
+            if (forceSplitNext && trimmed.length > 0) {
+              forceSplitNext = false;
+              const previewLabel = trimmed.slice(0, 64) + (trimmed.length > 64 ? '…' : '');
+              pushNewSection(`Prompt Continuation (${previewLabel})`, line);
+              continue;
+            }
+          }
+        }
+
+        if (!current) {
+          const firstLabel = trimmed ? (trimmed.slice(0, 64) + (trimmed.length > 64 ? '…' : '')) : 'Preamble & Role Context';
+          pushNewSection(firstLabel, line);
+        } else {
+          current.lines.push(line);
+        }
+      }
+
+      // Merge consecutive 1-line metadata headers (e.g. TARGET MODULES HINT + AVAILABLE SPECIALISTS) so UI stays uncluttered
+      const merged = [];
+      for (const sec of rawSections) {
+        const nonEmptyCount = sec.lines.filter(l => l.trim().length > 0).length;
+        const totalChars = sec.lines.join('\n').length;
+        const prev = merged.length > 0 ? merged[merged.length - 1] : null;
+        if (
+          prev &&
+          prev._isCompactMeta &&
+          nonEmptyCount <= 1 &&
+          totalChars < 260
+        ) {
+          prev.lines.push(...sec.lines);
+          prev.title = `${prev._firstTitle} + Metadata`;
+        } else {
+          const isCompact = nonEmptyCount <= 1 && totalChars < 260;
+          merged.push({
+            title: sec.title,
+            _firstTitle: sec.title,
+            _isCompactMeta: isCompact,
+            lines: sec.lines,
+          });
+        }
+      }
+
+      return merged.map((sec, idx) => {
+        const content = sec.lines.join('\n');
+        const { preamble, subs } = parseNestedPromptSubsections(sec.lines);
+        return {
+          key: `sec_${idx}_${sec.title.replace(/[^a-z0-9]+/gi, '_').slice(0, 36)}`,
+          index: idx + 1,
+          title: sec.title,
+          lineCount: sec.lines.length,
+          charCount: content.length,
+          content,
+          preamble,
+          subs,
+        };
+      });
+    }
+
+    function formatCollapsiblePromptViewerHtml(rawText, keyPrefix, headerLabel, accentVar = 'var(--peach)') {
+      const fullText = String(rawText || '');
+      if (!fullText) return '';
+      const safeId = `prompt_insp_${String(keyPrefix || 'p').replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+      const sections = parsePromptIntoCollapsibleSections(fullText);
+      const totalLines = fullText.split('\n').length;
+
+      const sectionsHtml = sections.map(sec => {
+        const hasSubs = Array.isArray(sec.subs) && sec.subs.length > 0;
+        const bodyHtml = hasSubs ? `
+          <div style="margin-top: 5px; display: flex; flex-direction: column; gap: 4px;">
+            ${sec.preamble ? `<pre tabindex="0" class="prompt-heavy-pre" style="max-height: 220px;"><code>${escapeHtml(sec.preamble)}</code></pre>` : ''}
+            ${sec.subs.map(sub => `
+              <details class="prompt-subsection-details" data-details-key="${escapeHtml(safeId + '_' + sec.key + '_' + sub.key)}">
+                <summary>
+                  <span style="min-width: 0; overflow-wrap: anywhere;"><span class="prompt-section-caret"></span>${escapeHtml(sub.title)}</span>
+                  <span style="font-family: monospace; font-size: 9px; color: var(--slate); white-space: nowrap;">${escapeHtml(sub.meta)}</span>
+                </summary>
+                <pre tabindex="0" class="prompt-heavy-pre"><code>${escapeHtml(sub.content)}</code></pre>
+              </details>
+            `).join('')}
+          </div>
+        ` : `<pre tabindex="0" class="prompt-heavy-pre"><code>${escapeHtml(sec.content)}</code></pre>`;
+
+        const subBadge = hasSubs ? `${sec.subs.length} items • ` : '';
+        return `
+          <details class="prompt-section-details" data-details-key="${escapeHtml(safeId + '_' + sec.key)}" style="border-left-color: ${accentVar};">
+            <summary>
+              <span style="min-width: 0; overflow-wrap: anywhere;"><span class="prompt-section-caret"></span><span style="color: ${accentVar}; font-family: monospace; font-size: 9.5px; margin-right: 4px;">#${sec.index}</span>${escapeHtml(sec.title)}</span>
+              <span style="font-family: monospace; font-size: 9.5px; color: var(--slate); white-space: nowrap;">${subBadge}${sec.lineCount.toLocaleString()} lines • ${sec.charCount.toLocaleString()} chars</span>
+            </summary>
+            ${bodyHtml}
+          </details>
+        `;
+      }).join('');
+
+      return `
+        <details data-details-key="${escapeHtml(safeId + '_root')}" style="margin-top: 5px; background: #040917; border: 1px solid var(--navy); border-left: 2px solid ${accentVar}; border-radius: 4px; padding: 5px 8px;">
+          <summary style="cursor: pointer; font-size: 10.5px; font-weight: 700; color: ${accentVar}; display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <span>${headerLabel}</span>
+            <span style="font-family: monospace; font-size: 9.5px; color: var(--slate);">${sections.length} section${sections.length === 1 ? '' : 's'} • ${totalLines.toLocaleString()} lines • ${fullText.length.toLocaleString()} chars (100% untruncated)</span>
+          </summary>
+          <div id="${escapeHtml(safeId)}" class="prompt-inspector-shell">
+            <div class="prompt-inspector-toolbar">
+              <div style="display: flex; gap: 5px; flex-wrap: wrap;">
+                <button type="button" class="prompt-toolbar-btn" onclick="togglePromptSectionsAll('${escapeJsAttr(safeId)}', true)">⊞ Expand All</button>
+                <button type="button" class="prompt-toolbar-btn" onclick="togglePromptSectionsAll('${escapeJsAttr(safeId)}', false)">⊟ Collapse All</button>
+                <button type="button" class="prompt-toolbar-btn" onclick="togglePromptRawView('${escapeJsAttr(safeId)}', this)">📄 Raw Full Text</button>
+              </div>
+              <button type="button" class="prompt-toolbar-btn" onclick="copyPromptFullText('${escapeJsAttr(safeId)}', this)">📋 Copy Full (${fullText.length.toLocaleString()} chars)</button>
+            </div>
+            <div class="prompt-sections-wrap" style="display: flex; flex-direction: column; gap: 4px;">
+              ${sectionsHtml}
+            </div>
+            <div class="prompt-raw-wrap" style="display: none;">
+              <pre tabindex="0" class="prompt-heavy-pre" style="max-height: 640px;"><code class="prompt-raw-code">${escapeHtml(fullText)}</code></pre>
+            </div>
+          </div>
+        </details>
+      `;
+    }
+
+    function formatCollapsibleDeliberationHtml(labelHtml, text, keySuffix, borderCol, bgRgba) {
+      const full = String(text || '').trim();
+      if (!full) return '';
+      const oneLinePreview = full.replace(/\s+/g, ' ').slice(0, 125) + (full.length > 125 ? '…' : '');
+      return `
+        <details data-details-key="${escapeHtml(keySuffix)}" style="font-size: 10.5px; color: var(--light-gray); background: ${bgRgba}; border: 1px solid var(--navy); border-left: 2px solid ${borderCol}; padding: 5px 8px; border-radius: 4px;">
+          <summary style="cursor: pointer; display: flex; justify-content: space-between; align-items: baseline; gap: 8px;">
+            <span style="min-width: 0; overflow-wrap: anywhere;">${labelHtml} <span style="font-weight: 400; color: var(--light-gray);">${escapeHtml(oneLinePreview)}</span></span>
+            <span style="font-family: monospace; font-size: 9.5px; color: var(--slate); white-space: nowrap;">${full.length.toLocaleString()} chars</span>
+          </summary>
+          <div style="margin-top: 6px; padding-top: 5px; border-top: 1px dashed var(--navy); color: var(--white); white-space: pre-wrap; line-height: 1.45; overflow-wrap: anywhere;">${escapeHtml(full)}</div>
+        </details>
+      `;
+    }
+
+    function formatTurnEpistemicDetailsHtml(t, globalContextPacks = [], globalInquiries = [], turnKeyPrefix = '') {
+      const tPrefix = turnKeyPrefix || `t_${t.turn_index ?? 0}_${t.specialist_agent || 'ag'}`;
       const inquiries = [
         ...(Array.isArray(t.lead_self_inquiries) ? t.lead_self_inquiries.map(q => ({ ...q, _role: 'task_lead' })) : []),
         ...(Array.isArray(t.self_inquiries) ? t.self_inquiries.map(q => ({ ...q, _role: t.specialist_agent || 'specialist' })) : []),
@@ -7986,7 +8710,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       ) || globalContextPacks[0] || null;
 
       const inquiriesHtml = effInquiries.length > 0 ? `
-        <details style="margin-top: 6px; background: rgba(0, 228, 54, 0.05); border: 1px solid rgba(0, 228, 54, 0.3); border-radius: 4px; padding: 5px 8px;">
+        <details data-details-key="${escapeHtml(tPrefix + '_inquiries')}" style="margin-top: 6px; background: rgba(0, 228, 54, 0.05); border: 1px solid rgba(0, 228, 54, 0.3); border-radius: 4px; padding: 5px 8px;">
           <summary style="cursor: pointer; font-size: 10.5px; font-weight: 700; color: var(--yellow);">
             ❓ Internal Questions Asked &amp; Answered (${effInquiries.length} Self-Inquiry Q&amp;A${effInquiries.length === 1 ? '' : 's'})
           </summary>
@@ -8003,52 +8727,39 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       ` : '';
 
       const contextHtml = (curatedCtx || matchingPack) ? `
-        <details style="margin-top: 6px; background: #040917; border: 1px solid var(--navy); border-radius: 4px; padding: 5px 8px;">
-          <summary style="cursor: pointer; font-size: 10.5px; font-weight: 700; color: var(--cyan);">
-            🧠 Curated Context Generated for this Turn ${matchingPack ? `(${(matchingPack.selected_chunk_ids || []).length} chunks selected for ${escapeHtml(matchingPack.target_agent_role)})` : ''}
+        <details data-details-key="${escapeHtml(tPrefix + '_curated_ctx_wrap')}" style="margin-top: 6px; background: #040917; border: 1px solid var(--navy); border-radius: 4px; padding: 5px 8px;">
+          <summary style="cursor: pointer; font-size: 10.5px; font-weight: 700; color: var(--cyan); display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <span>🧠 Curated Context Generated for this Turn ${matchingPack ? `(${(matchingPack.selected_chunk_ids || []).length} chunks selected for ${escapeHtml(matchingPack.target_agent_role)})` : ''}</span>
+            ${curatedCtx ? `<span style="font-family: monospace; font-size: 9.5px; color: var(--slate);">${curatedCtx.length.toLocaleString()} chars</span>` : ''}
           </summary>
           <div style="margin-top: 6px; display: flex; flex-direction: column; gap: 6px;">
             ${matchingPack && matchingPack.role_tailored_synthesis ? `
-              <div style="font-size: 10.5px; color: var(--white); background: rgba(41, 173, 255, 0.08); border-left: 2px solid var(--cyan); padding: 6px 8px; border-radius: 3px;">
-                <strong>Context Curator Role-Tailored Synthesis:</strong> ${escapeHtml(matchingPack.role_tailored_synthesis)}
+              <details data-details-key="${escapeHtml(tPrefix + '_pack_synth')}" style="font-size: 10.5px; color: var(--white); background: rgba(41, 173, 255, 0.08); border: 1px solid var(--navy); border-left: 2px solid var(--cyan); padding: 5px 8px; border-radius: 3px;">
+                <summary style="cursor: pointer; font-weight: 700; color: var(--cyan);">📦 Context Curator Role-Tailored Synthesis &amp; Selected Chunk IDs</summary>
+                <div style="margin-top: 5px; white-space: pre-wrap;">${escapeHtml(matchingPack.role_tailored_synthesis)}</div>
                 <div style="color: var(--slate); font-size: 9.5px; margin-top: 4px;">Selected Chunks: <code>${escapeHtml((matchingPack.selected_chunk_ids || []).join(', '))}</code></div>
-              </div>
+              </details>
             ` : ''}
-            ${curatedCtx ? `
-              <pre tabindex="0" style="margin: 0; padding: 8px 10px; background: #030712; border: 1px solid var(--navy); border-radius: 4px; font-family: monospace; font-size: 10px; color: var(--light-gray); white-space: pre-wrap; overflow-x: auto; max-height: 260px;"><code>${escapeHtml(curatedCtx)}</code></pre>
-            ` : ''}
+            ${curatedCtx ? formatCollapsiblePromptViewerHtml(curatedCtx, `${tPrefix}_curated`, '📚 Curated Context Sections & Chunks', 'var(--cyan)') : ''}
           </div>
         </details>
       ` : '';
 
+      const totalPromptSummaryParts = [];
+      if (promptTxt) totalPromptSummaryParts.push(`Specialist: ${promptTxt.length.toLocaleString()} chars`);
+      if (leadPromptTxt) totalPromptSummaryParts.push(`Task Lead: ${leadPromptTxt.length.toLocaleString()} chars`);
+
       const promptHtml = (promptTxt || leadPromptTxt || t.deliberation || t.lead_deliberation) ? `
-        <details style="margin-top: 6px; background: #040917; border: 1px solid var(--navy); border-radius: 4px; padding: 5px 8px;">
-          <summary style="cursor: pointer; font-size: 10.5px; font-weight: 700; color: var(--peach);">
-            📝 Turn Prompt &amp; Epistemic Deliberation ${promptTxt ? `(${promptTxt.length.toLocaleString()} chars)` : ''}
+        <details data-details-key="${escapeHtml(tPrefix + '_prompts_root')}" style="margin-top: 6px; background: #040917; border: 1px solid var(--navy); border-radius: 4px; padding: 5px 8px;">
+          <summary style="cursor: pointer; font-size: 10.5px; font-weight: 700; color: var(--peach); display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <span>📝 Turn Prompts &amp; Epistemic Deliberation</span>
+            ${totalPromptSummaryParts.length > 0 ? `<span style="font-family: monospace; font-size: 9.5px; color: var(--slate);">${escapeHtml(totalPromptSummaryParts.join(' • '))}</span>` : ''}
           </summary>
-          <div style="margin-top: 6px; display: flex; flex-direction: column; gap: 6px;">
-            ${t.lead_deliberation ? `
-              <div style="font-size: 10.5px; color: var(--light-gray); background: rgba(255, 163, 0, 0.07); border-left: 2px solid var(--amber); padding: 6px 8px; border-radius: 3px; white-space: pre-wrap;">
-                <strong style="color: var(--amber);">🧭 Task Lead Deliberation:</strong> ${escapeHtml(t.lead_deliberation)}
-              </div>
-            ` : ''}
-            ${t.deliberation && t.deliberation !== t.lead_deliberation ? `
-              <div style="font-size: 10.5px; color: var(--light-gray); background: rgba(41, 173, 255, 0.07); border-left: 2px solid var(--cyan); padding: 6px 8px; border-radius: 3px; white-space: pre-wrap;">
-                <strong style="color: var(--cyan);">🤖 Specialist Deliberation:</strong> ${escapeHtml(t.deliberation)}
-              </div>
-            ` : ''}
-            ${promptTxt ? `
-              <div>
-                <div style="font-size: 10px; font-weight: 700; color: var(--peach); margin-bottom: 3px;">Full Prompt Sent to Model:</div>
-                <pre tabindex="0" style="margin: 0; padding: 8px 10px; background: #030712; border: 1px solid var(--navy); border-radius: 4px; font-family: monospace; font-size: 10px; color: var(--light-gray); white-space: pre-wrap; overflow-x: auto; max-height: 280px;"><code>${escapeHtml(promptTxt)}</code></pre>
-              </div>
-            ` : ''}
-            ${leadPromptTxt ? `
-              <details style="margin-top: 4px;">
-                <summary style="cursor: pointer; font-size: 10px; color: var(--amber);">View Task Lead Planning Prompt (${leadPromptTxt.length.toLocaleString()} chars)</summary>
-                <pre tabindex="0" style="margin: 4px 0 0 0; padding: 8px 10px; background: #030712; border: 1px solid var(--navy); border-radius: 4px; font-family: monospace; font-size: 10px; color: var(--light-gray); white-space: pre-wrap; overflow-x: auto; max-height: 240px;"><code>${escapeHtml(leadPromptTxt)}</code></pre>
-              </details>
-            ` : ''}
+          <div style="margin-top: 6px; display: flex; flex-direction: column; gap: 5px;">
+            ${t.lead_deliberation ? formatCollapsibleDeliberationHtml('<strong style="color: var(--amber);">🧭 Task Lead Deliberation:</strong>', t.lead_deliberation, `${tPrefix}_lead_delib`, 'var(--amber)', 'rgba(255, 163, 0, 0.07)') : ''}
+            ${(t.deliberation && t.deliberation !== t.lead_deliberation) ? formatCollapsibleDeliberationHtml('<strong style="color: var(--cyan);">🤖 Specialist Deliberation:</strong>', t.deliberation, `${tPrefix}_spec_delib`, 'var(--cyan)', 'rgba(41, 173, 255, 0.07)') : ''}
+            ${promptTxt ? formatCollapsiblePromptViewerHtml(promptTxt, `${tPrefix}_spec_prompt`, t.prompt_text ? `🚀 Full Specialist Prompt Sent to Model (${escapeHtml(t.specialist_agent || 'specialist')})` : '🧭 Full Task Lead Planning Prompt Sent to Model', 'var(--peach)') : ''}
+            ${leadPromptTxt ? formatCollapsiblePromptViewerHtml(leadPromptTxt, `${tPrefix}_lead_prompt`, '🧭 Full Task Lead Planning Prompt Sent to Model', 'var(--amber)') : ''}
           </div>
         </details>
       ` : '';
@@ -8132,6 +8843,14 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           deliberation: t.deliberation || '',
           brief: t.brief || '',
           summary: t.summary || '',
+          step_log: Array.isArray(t.step_log) ? t.step_log : [],
+          curated_context: t.curated_context || '',
+          prompt_text: t.prompt_text || '',
+          self_inquiries: Array.isArray(t.self_inquiries) ? t.self_inquiries : [],
+          lead_deliberation: t.lead_deliberation || '',
+          lead_prompt_text: t.lead_prompt_text || '',
+          lead_curated_context: t.lead_curated_context || '',
+          lead_self_inquiries: Array.isArray(t.lead_self_inquiries) ? t.lead_self_inquiries : [],
           verification_passed: t.verification_passed ?? !String(t.summary || '').startsWith('ERROR from '),
           touched_files: Array.isArray(t.touched_files) ? t.touched_files : [],
           code_diffs: t.code_diffs || {},
@@ -8242,7 +8961,17 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         titleEl.textContent = `${data.title || data.item_id} (${data.item_id})`;
       }
       if (badgeEl) {
-        badgeEl.textContent = `${String(data.state || 'ready').toUpperCase()} • ${(data.attempts || []).length} Attempt(s)`;
+        const failCount = Number(data.failure_count || 0);
+        const specResets = Number(data.spec_resets || 0);
+        const retryNotes = [];
+        if (failCount > 0 || (data.failure && data.state === 'in_progress')) {
+          retryNotes.push(`Retry #${Math.max(1, failCount)}`);
+        }
+        if (specResets > 0) {
+          retryNotes.push(`${specResets} Spec Reset${specResets === 1 ? '' : 's'}`);
+        }
+        const retrySuffix = retryNotes.length > 0 ? ` • ${retryNotes.join(', ')}` : '';
+        badgeEl.textContent = `${String(data.state || 'ready').toUpperCase()} • ${(data.attempts || []).length} Attempt(s)${retrySuffix}`;
       }
 
       const attempts = Array.isArray(data.attempts) ? data.attempts : [];
@@ -8256,12 +8985,12 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             All Attempts (${attempts.length})
           </button>
           ${attempts.map(att => {
-            const k = String(att.revision_index);
+            const k = String(att.attempt_key || att.revision_index);
             const isSel = String(_activeChronologyAttemptFilter) === k;
             const cr = att.council_review;
-            const icon = cr ? (cr.approved ? '✅' : '🛠️') : '🔨';
+            const icon = att.is_failed_retry ? '❌' : (cr ? (cr.approved ? '✅' : '🛠️') : '🔨');
             return `
-              <button type="button" onclick="setChronologyAttemptFilter('${k}')" style="background: ${isSel ? 'rgba(41, 173, 255, 0.25)' : '#071024'}; border: 1px solid ${isSel ? 'var(--cyan)' : 'var(--navy)'}; color: var(--white); border-radius: 999px; padding: 4px 11px; font-size: 11px; font-weight: 700; cursor: pointer;">
+              <button type="button" onclick="setChronologyAttemptFilter('${escapeJsAttr(k)}')" style="background: ${isSel ? 'rgba(41, 173, 255, 0.25)' : '#071024'}; border: 1px solid ${isSel ? 'var(--cyan)' : 'var(--navy)'}; color: var(--white); border-radius: 999px; padding: 4px 11px; font-size: 11px; font-weight: 700; cursor: pointer;">
                 ${icon} Attempt #${att.attempt_number} (${(att.turns || []).length} turns)
               </button>
             `;
@@ -8298,20 +9027,21 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
 
       const visibleAttempts = _activeChronologyAttemptFilter === 'all'
         ? attempts
-        : attempts.filter(a => String(a.revision_index) === String(_activeChronologyAttemptFilter));
+        : attempts.filter(a => String(a.attempt_key || a.revision_index) === String(_activeChronologyAttemptFilter));
 
       const attemptsTimelineHtml = visibleAttempts.length === 0
         ? `<div class="blueprint-empty">No specialist turns recorded yet for this task.</div>`
         : visibleAttempts.map(att => {
             const turns = Array.isArray(att.turns) ? att.turns : [];
             const cr = att.council_review;
-            const turnsHtml = turns.map(t => {
+            const turnsHtml = turns.map((t, turnArrIdx) => {
               const b = getSpecialistBadgeStyle(t.specialist_agent);
               const passed = t.verification_passed !== false;
               const touched = Array.isArray(t.touched_files) ? t.touched_files : [];
               const codeDiffs = t.code_diffs || {};
               const diffKeys = Object.keys(codeDiffs);
               const proofs = Array.isArray(t.proof_urls) ? t.proof_urls : [];
+              const turnKeyPrefix = `${data.item_id}_att${att.attempt_number}_t${t.turn_index ?? turnArrIdx}`;
 
               const proofsStripHtml = proofs.length > 0 ? `
                 <div style="margin-top: 8px;">
@@ -8379,7 +9109,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
               ` : '';
 
               return `
-                <div style="position: relative; padding: 10px 12px; background: #060e22; border: 1px solid ${passed ? 'rgba(41, 173, 255, 0.28)' : 'rgba(255, 0, 77, 0.5)'}; border-left: 3px solid ${passed ? b.col : 'var(--neon-red)'}; border-radius: 6px;">
+                <div class="${turnArrIdx >= 2 ? 'chronology-deferred-turn' : ''}" style="position: relative; padding: 10px 12px; background: #060e22; border: 1px solid ${passed ? 'rgba(41, 173, 255, 0.28)' : 'rgba(255, 0, 77, 0.5)'}; border-left: 3px solid ${passed ? b.col : 'var(--neon-red)'}; border-radius: 6px;">
                   <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
                     <div style="display: flex; align-items: center; gap: 8px;">
                       <span style="font-family: monospace; font-size: 11px; font-weight: 800; color: ${b.col}; background: ${b.bg}; padding: 2px 8px; border-radius: 4px;">
@@ -8392,7 +9122,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
                     ${t.timestamp_utc ? `<span style="font-family: monospace; font-size: 10px; color: var(--slate);">${escapeHtml(t.timestamp_utc)}</span>` : ''}
                   </div>
                   ${t.brief ? `
-                    <details style="margin-top: 7px; background: rgba(255, 255, 255, 0.03); border: 1px solid var(--navy); border-radius: 4px; padding: 4px 8px;">
+                    <details data-details-key="${escapeHtml(turnKeyPrefix + '_brief')}" style="margin-top: 7px; background: rgba(255, 255, 255, 0.03); border: 1px solid var(--navy); border-radius: 4px; padding: 4px 8px;">
                       <summary style="cursor: pointer; font-size: 10.5px; color: var(--amber); font-weight: 700;">
                         📨 Task Lead Delegation Brief (${escapeHtml(t.brief.slice(0, 110))}${t.brief.length > 110 ? '…' : ''})
                       </summary>
@@ -8400,10 +9130,15 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
                     </details>
                   ` : ''}
                   ${t.summary ? `
-                    <div style="margin-top: 7px; font-size: 11px; color: ${passed ? 'var(--light-gray)' : 'var(--pink)'}; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere;">${escapeHtml(t.summary)}</div>
+                    <details data-details-key="${escapeHtml(turnKeyPrefix + '_summary')}" style="margin-top: 6px; background: rgba(255, 255, 255, 0.02); border: 1px solid var(--navy); border-radius: 4px; padding: 4px 8px;">
+                      <summary style="cursor: pointer; font-size: 10.5px; color: ${passed ? 'var(--light-gray)' : 'var(--pink)'};">
+                        <strong style="color: ${passed ? 'var(--green)' : 'var(--pink)'};">🧾 Turn Execution Outcome:</strong> ${escapeHtml(t.summary.replace(/\s+/g, ' ').slice(0, 130))}${t.summary.length > 130 ? '…' : ''}
+                      </summary>
+                      <div style="margin-top: 6px; font-size: 11px; color: ${passed ? 'var(--white)' : 'var(--pink)'}; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere;">${escapeHtml(t.summary)}</div>
+                    </details>
                   ` : ''}
                   ${formatTurnStepLogHtml(t.step_log, false)}
-                  ${formatTurnEpistemicDetailsHtml(t, contextPacks, selfInquiries)}
+                  ${formatTurnEpistemicDetailsHtml(t, contextPacks, selfInquiries, turnKeyPrefix)}
                   ${filesAndDiffsHtml}
                   ${proofsStripHtml}
                 </div>
@@ -8497,7 +9232,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
               <section style="background: #081229; border: 1px solid var(--navy); border-radius: 8px; padding: 12px 14px; display: flex; flex-direction: column; gap: 9px;">
                 <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; border-bottom: 1px solid var(--navy); padding-bottom: 8px;">
                   <div>
-                    <strong style="font-size: 13px; color: var(--cyan);">Attempt #${att.attempt_number} (Revision ${att.revision_index})</strong>
+                    <strong style="font-size: 13px; color: ${att.is_failed_retry ? 'var(--pink)' : 'var(--cyan)'};">Attempt #${att.attempt_number} (Revision ${att.revision_index}${att.is_failed_retry ? ' • Auto-Retried Worker Failure' : ''})</strong>
                     ${att.current_strategy ? `<div style="font-size: 11px; color: var(--light-gray); margin-top: 2px;">🧭 <strong>Task Lead Strategy:</strong> ${escapeHtml(att.current_strategy)}</div>` : ''}
                   </div>
                   <span style="font-family: monospace; font-size: 10.5px; color: var(--amber); background: rgba(255, 163, 0, 0.14); padding: 2px 8px; border-radius: 4px;">
@@ -8511,14 +9246,24 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             `;
           }).join('');
 
-      const failureBannerHtml = data.failure ? `
-        <details style="background: rgba(255, 0, 77, 0.1); border: 1px solid var(--neon-red); border-radius: 6px; padding: 8px 12px;">
+      const itemStateLower = String(data.state || '').toLowerCase();
+      const isTerminalFailureState = itemStateLower === 'failed' || itemStateLower === 'needs_decision';
+      const showFailureBanner = Boolean(data.failure) && itemStateLower !== 'approved' && itemStateLower !== 'cancelled';
+      const failureBannerHtml = showFailureBanner ? (isTerminalFailureState ? `
+        <details open style="background: rgba(255, 0, 77, 0.1); border: 1px solid var(--neon-red); border-radius: 6px; padding: 8px 12px;">
           <summary style="cursor: pointer; font-size: 11px; font-weight: 800; color: var(--neon-red);">
             ⚠️ Latest Runtime / Verification Exception Diagnostic Trace
           </summary>
           <pre tabindex="0" style="margin: 8px 0 0 0; padding: 8px; background: #030712; color: var(--pink); font-size: 10.5px; overflow-x: auto; border-radius: 4px;"><code>${escapeHtml(data.failure)}</code></pre>
         </details>
-      ` : '';
+      ` : `
+        <details style="background: rgba(255, 163, 0, 0.08); border: 1px solid var(--amber); border-radius: 6px; padding: 8px 12px;">
+          <summary style="cursor: pointer; font-size: 11px; font-weight: 800; color: var(--amber);">
+            🔄 Prior Worker Attempt Diagnostic (Auto-Retrying — Passed to Task Lead to Fix)
+          </summary>
+          <pre tabindex="0" style="margin: 8px 0 0 0; padding: 8px; background: #030712; color: var(--light-gray); font-size: 10.5px; overflow-x: auto; border-radius: 4px;"><code>${escapeHtml(data.failure)}</code></pre>
+        </details>
+      `) : '';
 
       setHtmlIfChanged(bodyEl, `
         ${formatStructuredSpecHtml(data.spec || '', data.proof_spec || '')}
@@ -8792,7 +9537,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             message: String(it.failure || ''),
           });
         });
-        let candidateErr = (_lastBuildError && !_isErrorDismissed(_lastBuildError) && !allBoardApproved) ? _lastBuildError : null;
+        const staleBoardItemErrAfterFullApproval = allBoardApproved && Boolean(_lastBuildError && _lastBuildError.item_id);
+        let candidateErr = (_lastBuildError && !_isErrorDismissed(_lastBuildError) && !staleBoardItemErrAfterFullApproval) ? _lastBuildError : null;
         if (candidateErr) {
           if (candidateErr.item_id) {
             const matchedItem = items.find(it => it.id === candidateErr.item_id);
@@ -9764,22 +10510,32 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           btnApprove.dataset.actionMode = 'greenlight';
           btnApprove.innerHTML = '✅ Greenlight &amp; Build';
           btnApprove.style.opacity = '1';
-        } else if (st === 'locked' || st === 'greenlit' || boardItems.length > 0) {
-          const allDone = boardItems.length > 0
-            ? boardItems.every(it => String(it.status || it.state || '').toLowerCase() === 'approved')
-            : (tracks.length > 0 && tracks.every(t => ['completed', 'satisfied'].includes((t.status || '').toLowerCase())));
+        } else if (st === 'locked' || st === 'greenlit' || st === 'in_production' || boardItems.length > 0) {
+          const explicitSlicesBanner = Array.isArray(bible.slice_roadmap) ? bible.slice_roadmap : [];
+          const hasUnfinishedSliceBanner = st !== 'locked'
+            && explicitSlicesBanner.length > 0
+            && explicitSlicesBanner.some(s => ['active', 'in_progress'].includes(String(s && s.status || '').toLowerCase()));
+          const allDone = !_lastBuildError && (
+            boardItems.length > 0
+              ? (boardItems.every(it => ['approved', 'cancelled'].includes(String(it.status || it.state || '').toLowerCase())) && !hasUnfinishedSliceBanner)
+              : (tracks.length > 0 && tracks.every(t => ['completed', 'satisfied'].includes((t.status || '').toLowerCase())))
+          );
           if (allDone && !running) {
             btnApprove.disabled = false;
             btnApprove.dataset.actionMode = 'next_slice';
             btnApprove.title = 'Reflect on the current slice and strategize + build the next slice (optionally enter feedback in the box to the left first)';
             btnApprove.innerHTML = '🚀 Iterate Next Slice';
             btnApprove.style.opacity = '1';
+          } else if (!running) {
+            btnApprove.disabled = false;
+            btnApprove.dataset.actionMode = 'resume';
+            btnApprove.title = 'Resume building the active slice from the persisted Living Game Bible and Production Board';
+            btnApprove.innerHTML = _isBuildPaused ? '▶ Resume Paused Build' : '▶ Resume Build';
+            btnApprove.style.opacity = '1';
           } else {
             btnApprove.disabled = true;
             btnApprove.dataset.actionMode = 'greenlight';
-            btnApprove.innerHTML = _isBuildPaused
-              ? '⏸️ Build Paused'
-              : (running ? '⚙️ Greenlit — Building Game...' : '⏸️ Greenlit — Ready to Resume');
+            btnApprove.innerHTML = '⚙️ Greenlit — Building Game...';
             btnApprove.style.opacity = '0.85';
           }
         } else {
@@ -10322,6 +11078,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         loadPalette(),
         loadDiff(),
       ]);
+      if (typeof syncPlaytestArchiveOnGameSwitch === 'function') {
+        syncPlaytestArchiveOnGameSwitch();
+      }
       updateHeaderBuildStatus();
       updateStudioPulseRibbon();
     }
@@ -10441,6 +11200,10 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         openNextSliceModal();
         return;
       }
+      if (approved && btnApprove && btnApprove.dataset.actionMode === 'resume') {
+        triggerResumeGameBuild(feedback);
+        return;
+      }
       if (approved && btnApprove) {
         btnApprove.disabled = true;
         btnApprove.innerHTML = '⏳ Greenlighting &amp; Starting Build...';
@@ -10473,17 +11236,148 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     let _activePlaytestSessionId = null;
     let _playtestSessionsCache = [];
     let _playtestTargetsCache = [];
+    let _playtestGamesCatalog = [];
+    let _playtestActiveCartridgeId = '';
+    let _playtestArchiveGameFilter = 'selected'; // 'selected' | 'all' | <candidate_id>
+    let _playtestArchiveSliceFilter = 'all';     // 'all' | '__general__' | <slice_id>
+    let _playtestArchiveSourceFilter = 'all';    // 'all' | 'council' | 'operator'
     let _playtestSelectedWishIds = new Set();
-    let _playtestViewMode = 'live'; // 'live' | 'video'
+    let _playtestViewMode = 'live'; // 'live' | 'video' | 'frames'
     let _playtestMarkers = [];
     let _playtestLastAutoPausedMarkerKey = null;
     let _playtestVideoLoadedKey = '';
+    let _playtestCurrentDetail = null;
+    let _playtestCurrentTurnIdx = 0;
+    let _playtestPlaybackSpeed = 1;
+    let _playtestFramesTimer = null;
 
     function formatPlaytestClock(sec) {
       const s = Math.max(0, Number(sec || 0));
       const mins = Math.floor(s / 60);
       const rem = (s - mins * 60).toFixed(1).padStart(4, '0');
       return `${String(mins).padStart(2, '0')}:${rem}`;
+    }
+
+    function formatPlaytestTimestampShort(isoUtc) {
+      if (!isoUtc) return '';
+      const d = new Date(isoUtc);
+      if (Number.isNaN(d.getTime())) return String(isoUtc);
+      return d.toLocaleString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+    }
+
+    function sessionMatchesCartridgeFilter(s, cartFilter) {
+      if (!s) return false;
+      if (cartFilter === 'all') return true;
+      const effCart = (cartFilter === 'selected')
+        ? (_selectedCartridgeId || _activeCandidateId || 'active')
+        : cartFilter;
+      if (!effCart || effCart === 'active') {
+        return Boolean(
+          s.matches_active_cartridge ||
+          (_playtestActiveCartridgeId && s.candidate_id === _playtestActiveCartridgeId) ||
+          (!s.candidate_id && s.checkpoint_id === 'active')
+        );
+      }
+      return Boolean(
+        s.candidate_id === effCart ||
+        (effCart === _playtestActiveCartridgeId && s.matches_active_cartridge)
+      );
+    }
+
+    function getPlaytestRunsForCartridge(cartFilter = 'selected') {
+      return _playtestSessionsCache.filter(s => sessionMatchesCartridgeFilter(s, cartFilter));
+    }
+
+    function getFilteredArchiveSessions() {
+      return _playtestSessionsCache.filter(s => {
+        if (!sessionMatchesCartridgeFilter(s, _playtestArchiveGameFilter)) return false;
+        if (_playtestArchiveSourceFilter === 'council' && s.initiated_by !== 'council') return false;
+        if (_playtestArchiveSourceFilter === 'operator' && s.initiated_by === 'council') return false;
+        if (_playtestArchiveSliceFilter === '__general__') return !s.slice_id;
+        if (_playtestArchiveSliceFilter !== 'all' && s.slice_id !== _playtestArchiveSliceFilter) return false;
+        return true;
+      });
+    }
+
+    function updateHeaderPlaytestRunBadge() {
+      const el = document.getElementById('header-playtest-run-count');
+      if (!el) return;
+      const selRuns = getPlaytestRunsForCartridge('selected');
+      if (selRuns.length > 0) {
+        el.textContent = `${selRuns.length} run${selRuns.length === 1 ? '' : 's'}`;
+        el.style.display = 'inline-block';
+      } else if (_playtestSessionsCache.length > 0) {
+        el.textContent = `${_playtestSessionsCache.length} total`;
+        el.style.display = 'inline-block';
+      } else {
+        el.style.display = 'none';
+      }
+    }
+
+    function stopPlaytestFramesPlayback() {
+      if (_playtestFramesTimer) {
+        clearInterval(_playtestFramesTimer);
+        _playtestFramesTimer = null;
+      }
+      updateReplayPlayPauseButton();
+    }
+
+    function startPlaytestFramesPlayback() {
+      stopPlaytestFramesPlayback();
+      const turns = Array.isArray(_playtestCurrentDetail?.turns) ? _playtestCurrentDetail.turns : [];
+      if (turns.length === 0) return;
+      if (_playtestCurrentTurnIdx >= turns.length - 1) {
+        renderPlaytestTurnAtIndex(0, { syncVideo: false, scrollTurnRow: true });
+      }
+      const intervalMs = Math.max(120, Math.round(900 / Math.max(0.25, _playtestPlaybackSpeed)));
+      _playtestFramesTimer = setInterval(() => {
+        const curTurns = Array.isArray(_playtestCurrentDetail?.turns) ? _playtestCurrentDetail.turns : [];
+        if (_playtestViewMode !== 'frames' || curTurns.length === 0) {
+          stopPlaytestFramesPlayback();
+          return;
+        }
+        if (_playtestCurrentTurnIdx >= curTurns.length - 1) {
+          stopPlaytestFramesPlayback();
+          return;
+        }
+        renderPlaytestTurnAtIndex(_playtestCurrentTurnIdx + 1, { syncVideo: false, scrollTurnRow: true });
+      }, intervalMs);
+      updateReplayPlayPauseButton();
+    }
+
+    function updateReplayPlayPauseButton() {
+      const btn = document.getElementById('btn-pt-replay-playpause');
+      if (!btn) return;
+      if (_playtestViewMode === 'video') {
+        const vidEl = document.getElementById('pt-replay-video');
+        const isPlaying = Boolean(vidEl && vidEl.src && !vidEl.paused && !vidEl.ended);
+        btn.textContent = isPlaying ? '⏸ Pause' : '▶ Play';
+      } else if (_playtestViewMode === 'frames') {
+        btn.textContent = _playtestFramesTimer ? '⏸ Pause' : '▶ Play Turns';
+      } else {
+        btn.textContent = '▶ Play';
+      }
+    }
+
+    function setPlaytestPlaybackSpeed(speed) {
+      const s = Number(speed || 1);
+      if (!Number.isFinite(s) || s <= 0) return;
+      _playtestPlaybackSpeed = s;
+      document.querySelectorAll('.pt-speed-btn').forEach(btn => {
+        btn.classList.toggle('active', Number(btn.getAttribute('data-pt-speed')) === s);
+      });
+      const vidEl = document.getElementById('pt-replay-video');
+      if (vidEl) {
+        try { vidEl.playbackRate = s; } catch (_) {}
+      }
+      if (_playtestFramesTimer) {
+        startPlaytestFramesPlayback();
+      }
     }
 
     function switchPlaytestObsSubtab(tabName) {
@@ -10500,15 +11394,40 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     }
 
     function switchPlaytestStageView(mode) {
-      _playtestViewMode = (mode === 'video') ? 'video' : 'live';
+      const nextMode = (mode === 'video' || mode === 'frames') ? mode : 'live';
+      if (_playtestViewMode === 'frames' && nextMode !== 'frames') {
+        stopPlaytestFramesPlayback();
+      }
+      if (_playtestViewMode === 'video' && nextMode !== 'video') {
+        const vidEl = document.getElementById('pt-replay-video');
+        if (vidEl && !vidEl.paused) {
+          try { vidEl.pause(); } catch (_) {}
+        }
+      }
+      _playtestViewMode = nextMode;
       const liveBtn = document.getElementById('btn-pt-view-live');
       const vidBtn = document.getElementById('btn-pt-view-video');
+      const framesBtn = document.getElementById('btn-pt-view-frames');
       const liveStage = document.getElementById('pt-live-stage');
       const vidStage = document.getElementById('pt-video-stage');
+      const framesStage = document.getElementById('pt-frames-stage');
+      const transportBar = document.getElementById('pt-replay-transport-bar');
       if (liveBtn) liveBtn.classList.toggle('active', _playtestViewMode === 'live');
       if (vidBtn) vidBtn.classList.toggle('active', _playtestViewMode === 'video');
+      if (framesBtn) framesBtn.classList.toggle('active', _playtestViewMode === 'frames');
       if (liveStage) liveStage.style.display = (_playtestViewMode === 'live') ? 'flex' : 'none';
       if (vidStage) vidStage.style.display = (_playtestViewMode === 'video') ? 'flex' : 'none';
+      if (framesStage) framesStage.style.display = (_playtestViewMode === 'frames') ? 'flex' : 'none';
+      const hasTurns = Array.isArray(_playtestCurrentDetail?.turns) && _playtestCurrentDetail.turns.length > 0;
+      if (transportBar) {
+        transportBar.style.display = ((_playtestViewMode === 'video' || _playtestViewMode === 'frames') && hasTurns)
+          ? 'flex'
+          : 'none';
+      }
+      if (_playtestViewMode === 'frames' && hasTurns) {
+        renderPlaytestTurnAtIndex(_playtestCurrentTurnIdx, { syncVideo: false, scrollTurnRow: false });
+      }
+      updateReplayPlayPauseButton();
     }
 
     function updateHeaderPlaytestWishBadge(pendingCount) {
@@ -10519,19 +11438,325 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       badge.style.display = n > 0 ? 'inline-block' : 'none';
     }
 
-    async function loadPlaytestSessions(preferredSessionId = null) {
+    function renderPlaytestArchiveBrowser() {
+      const gameSel = document.getElementById('pt-archive-game-select');
+      const slicePillsEl = document.getElementById('pt-archive-slice-pills');
+      const sourcePillsEl = document.getElementById('pt-archive-source-pills');
+      const cardsEl = document.getElementById('pt-session-history-cards');
+      const countBadgeEl = document.getElementById('pt-archive-count-badge');
+      const filterNoteEl = document.getElementById('pt-archive-active-filter-note');
+      const sessSel = document.getElementById('pt-session-select');
+
+      const selectedGameCount = getPlaytestRunsForCartridge('selected').length;
+      if (gameSel) {
+        const gameOpts = [
+          `<option value="selected">Selected Game (${selectedGameCount})</option>`,
+          `<option value="all">All Recorded Games (${_playtestSessionsCache.length})</option>`,
+        ];
+        const seenCandidates = new Set();
+        for (const g of _playtestGamesCatalog) {
+          const cid = String(g.candidate_id || '').trim();
+          if (!cid || seenCandidates.has(cid)) continue;
+          seenCandidates.add(cid);
+          const cCount = getPlaytestRunsForCartridge(cid).length;
+          if (cCount === 0 && !g.is_active && _playtestArchiveGameFilter !== cid) continue;
+          const prefix = g.is_active ? '⭐ ' : '';
+          gameOpts.push(`<option value="${escapeHtml(cid)}">${escapeHtml(prefix + (g.game_title || cid))} (${cCount})</option>`);
+        }
+        gameSel.innerHTML = gameOpts.join('');
+        if (!Array.from(gameSel.options).some(o => o.value === _playtestArchiveGameFilter)) {
+          _playtestArchiveGameFilter = 'selected';
+        }
+        gameSel.value = _playtestArchiveGameFilter;
+      }
+
+      const gameScopedAllSource = getPlaytestRunsForCartridge(_playtestArchiveGameFilter);
+      const councilCount = gameScopedAllSource.filter(s => s.initiated_by === 'council').length;
+      const manualCount = gameScopedAllSource.filter(s => s.initiated_by !== 'council').length;
+      if (sourcePillsEl) {
+        sourcePillsEl.querySelectorAll('[data-pt-source]').forEach(btn => {
+          const src = btn.getAttribute('data-pt-source');
+          btn.classList.toggle('active', src === _playtestArchiveSourceFilter);
+          if (src === 'all') btn.textContent = `All (${gameScopedAllSource.length})`;
+          else if (src === 'council') btn.textContent = `🏛️ Council Gates (${councilCount})`;
+          else if (src === 'operator') btn.textContent = `👤 Manual (${manualCount})`;
+        });
+      }
+
+      const gameAndSourceScoped = gameScopedAllSource.filter(s => {
+        if (_playtestArchiveSourceFilter === 'council') return s.initiated_by === 'council';
+        if (_playtestArchiveSourceFilter === 'operator') return s.initiated_by !== 'council';
+        return true;
+      });
+
+      // Build slice catalog for filter pills
+      const sliceMap = new Map();
+      const registerSlice = (sid, sIdx, sTitle) => {
+        if (!sid) return;
+        const existing = sliceMap.get(sid);
+        if (!existing) {
+          sliceMap.set(sid, {
+            slice_id: sid,
+            slice_index: (sIdx !== null && sIdx !== undefined) ? Number(sIdx) : null,
+            title: sTitle || sid,
+          });
+        } else {
+          if ((existing.slice_index === null || existing.slice_index === undefined) && sIdx !== null && sIdx !== undefined) {
+            existing.slice_index = Number(sIdx);
+          }
+          if ((!existing.title || existing.title === sid) && sTitle) {
+            existing.title = sTitle;
+          }
+        }
+      };
+
+      if (_playtestArchiveGameFilter !== 'all') {
+        const effCart = (_playtestArchiveGameFilter === 'selected')
+          ? (_selectedCartridgeId || _activeCandidateId || 'active')
+          : _playtestArchiveGameFilter;
+        const matchingCatalogGame = _playtestGamesCatalog.find(g =>
+          (effCart === 'active' && g.is_active) ||
+          g.candidate_id === effCart ||
+          (effCart === 'active' && _playtestActiveCartridgeId && g.candidate_id === _playtestActiveCartridgeId)
+        );
+        if (matchingCatalogGame && Array.isArray(matchingCatalogGame.slices)) {
+          matchingCatalogGame.slices.forEach(sl => registerSlice(sl.slice_id, sl.slice_index, sl.title));
+        } else if (_playtestArchiveGameFilter === 'selected' && cachedGameBible && Array.isArray(cachedGameBible.slice_roadmap)) {
+          cachedGameBible.slice_roadmap.forEach(sl => registerSlice(sl.slice_id, sl.slice_index, sl.title));
+        }
+      }
+      gameAndSourceScoped.forEach(s => {
+        if (s.slice_id) registerSlice(s.slice_id, s.slice_index, s.slice_title);
+      });
+
+      const sortedSlices = Array.from(sliceMap.values()).sort((a, b) => {
+        const ia = (a.slice_index !== null && a.slice_index !== undefined) ? a.slice_index : 999;
+        const ib = (b.slice_index !== null && b.slice_index !== undefined) ? b.slice_index : 999;
+        if (ia !== ib) return ia - ib;
+        return String(a.slice_id).localeCompare(String(b.slice_id));
+      });
+      const generalCount = gameAndSourceScoped.filter(s => !s.slice_id).length;
+
+      const validSliceFilters = new Set(['all', ...sortedSlices.map(sl => sl.slice_id)]);
+      if (generalCount > 0) validSliceFilters.add('__general__');
+      if (!validSliceFilters.has(_playtestArchiveSliceFilter)) {
+        _playtestArchiveSliceFilter = 'all';
+      }
+
+      if (slicePillsEl) {
+        const pills = [
+          `<button type="button" class="pt-slice-filter-pill ${_playtestArchiveSliceFilter === 'all' ? 'active' : ''}" data-pt-slice="all">All Slices (${gameAndSourceScoped.length})</button>`,
+        ];
+        sortedSlices.forEach(sl => {
+          const cnt = gameAndSourceScoped.filter(s => s.slice_id === sl.slice_id).length;
+          if (_playtestArchiveGameFilter === 'all' && cnt === 0) return;
+          const shortTitle = String(sl.title || sl.slice_id).replace(/^Slice\s*#?\d+\s*[:\-—]\s*/i, '');
+          const labelPrefix = (sl.slice_index !== null && sl.slice_index !== undefined)
+            ? `Slice #${sl.slice_index}: ${shortTitle}`
+            : shortTitle;
+          const activeCls = _playtestArchiveSliceFilter === sl.slice_id ? 'active' : '';
+          pills.push(`<button type="button" class="pt-slice-filter-pill ${activeCls}" data-pt-slice="${escapeHtml(sl.slice_id)}">${escapeHtml(labelPrefix)} (${cnt})</button>`);
+        });
+        if (generalCount > 0) {
+          const activeCls = _playtestArchiveSliceFilter === '__general__' ? 'active' : '';
+          pills.push(`<button type="button" class="pt-slice-filter-pill ${activeCls}" data-pt-slice="__general__">Active Build / Checkpoint (${generalCount})</button>`);
+        }
+        slicePillsEl.innerHTML = pills.join('');
+        slicePillsEl.querySelectorAll('[data-pt-slice]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            _playtestArchiveSliceFilter = btn.getAttribute('data-pt-slice') || 'all';
+            renderPlaytestArchiveBrowser();
+            const matching = getFilteredArchiveSessions();
+            if (matching.length > 0 && !matching.some(m => m.session_id === _activePlaytestSessionId)) {
+              selectAndWatchPlaytestSession(matching[0].session_id);
+            }
+          });
+        });
+      }
+
+      const filtered = getFilteredArchiveSessions();
+      if (countBadgeEl) {
+        countBadgeEl.textContent = filtered.length === _playtestSessionsCache.length
+          ? `${filtered.length} run${filtered.length === 1 ? '' : 's'}`
+          : `${filtered.length} / ${_playtestSessionsCache.length} runs`;
+      }
+      if (filterNoteEl) {
+        const activeCard = _playtestSessionsCache.find(s => s.session_id === _activePlaytestSessionId);
+        if (activeCard) {
+          const runNum = activeCard.game_run_number ? `Run #${activeCard.game_run_number}` : activeCard.session_id;
+          const slTxt = activeCard.slice_id
+            ? (activeCard.slice_index !== null && activeCard.slice_index !== undefined ? `Slice #${activeCard.slice_index}` : activeCard.slice_id)
+            : (activeCard.checkpoint_id || 'Active Build');
+          filterNoteEl.textContent = `Currently watching ${runNum} (${slTxt}) • Click any session card to switch`;
+        } else {
+          filterNoteEl.textContent = 'Click any recorded session card below to watch its replay video or step turn-by-turn';
+        }
+      }
+
+      if (sessSel) {
+        const dropdownList = filtered.length > 0 ? filtered : _playtestSessionsCache;
+        if (dropdownList.length === 0) {
+          sessSel.innerHTML = '<option value="">No playtest sessions yet</option>';
+        } else {
+          sessSel.innerHTML = dropdownList.map(s => {
+            const st = String(s.status || 'running').toUpperCase();
+            const who = s.initiated_by === 'council' ? '🏛️ Council' : '👤 Manual';
+            const runTag = s.game_run_number ? `Run #${s.game_run_number} • ` : '';
+            const slTag = s.slice_id
+              ? (s.slice_index !== null && s.slice_index !== undefined ? `Slice #${s.slice_index}` : s.slice_id)
+              : (s.checkpoint_id || 'active');
+            const label = `${runTag}[${who} • ${st}] ${s.game_title || s.checkpoint_id} — ${slTag} (${s.turn_count || 0}t)`;
+            const sel = s.session_id === _activePlaytestSessionId ? 'selected' : '';
+            return `<option value="${escapeHtml(s.session_id)}" ${sel}>${escapeHtml(label)}</option>`;
+          }).join('');
+        }
+      }
+
+      if (!cardsEl) return;
+      if (filtered.length === 0) {
+        if (_playtestSessionsCache.length > 0 && _playtestArchiveGameFilter === 'selected') {
+          cardsEl.innerHTML = `
+            <div style="grid-column: 1 / -1; font-size: 11px; color: var(--slate); padding: 8px 10px; background: #071022; border-radius: 6px; border: 1px dashed rgba(41,173,255,0.28); display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+              <span>No recorded playtest runs match the current game/slice filter yet (${_playtestSessionsCache.length} run${_playtestSessionsCache.length === 1 ? '' : 's'} saved across all games).</span>
+              <button type="button" class="btn-activate-checkpoint" onclick="document.getElementById('pt-archive-game-select').value='all'; document.getElementById('pt-archive-game-select').dispatchEvent(new Event('change'));" style="padding: 3px 9px; font-size: 10px;">
+                📚 Show All Games (${_playtestSessionsCache.length})
+              </button>
+            </div>
+          `;
+        } else {
+          cardsEl.innerHTML = '<div style="font-size: 11px; color: var(--slate); padding: 6px;">No playtest sessions recorded for this filter yet. Click <strong>▶ Run New Session</strong> above to record one.</div>';
+        }
+        return;
+      }
+
+      cardsEl.innerHTML = filtered.map(s => {
+        const isCurrent = s.session_id === _activePlaytestSessionId;
+        const st = String(s.status || 'completed').toLowerCase();
+        const isCouncil = s.initiated_by === 'council';
+        const runLabel = s.game_run_number ? `Run #${s.game_run_number}` : 'Run';
+        const passLabel = (s.slice_id && s.slice_run_number) ? ` • Pass #${s.slice_run_number}` : '';
+        const shortSliceTitle = s.slice_title
+          ? String(s.slice_title).replace(/^Slice\s*#?\d+\s*[:\-—]\s*/i, '')
+          : '';
+        const sliceHeading = s.slice_id
+          ? `🔪 ${s.slice_index !== null && s.slice_index !== undefined ? `Slice #${s.slice_index}` : s.slice_id}${shortSliceTitle ? `: ${shortSliceTitle}` : ''}`
+          : `📦 ${s.checkpoint_id || 'Active Build'}`;
+        const rating = (s.overall_fun_rating !== null && s.overall_fun_rating !== undefined)
+          ? Number(s.overall_fun_rating)
+          : null;
+        const ratingCol = rating !== null
+          ? (rating >= 7 ? 'var(--green)' : (rating >= 5 ? 'var(--yellow)' : 'var(--pink)'))
+          : 'var(--slate)';
+        const cr = (s.council_review && typeof s.council_review === 'object') ? s.council_review : null;
+        let councilChip = '';
+        if (cr && cr.verdict) {
+          const approved = cr.verdict === 'approve_slice';
+          const spawnedN = Array.isArray(cr.spawned_item_ids) ? cr.spawned_item_ids.length : 0;
+          councilChip = approved
+            ? `<span style="padding: 1px 6px; border-radius: 4px; background: rgba(0,228,54,0.18); border: 1px solid var(--green); color: var(--green); font-size: 9.5px; font-weight: 800;">✓ Approved</span>`
+            : `<span style="padding: 1px 6px; border-radius: 4px; background: rgba(255,163,0,0.18); border: 1px solid var(--amber); color: var(--yellow); font-size: 9.5px; font-weight: 800;">↻ Iterate${spawnedN ? ` (${spawnedN})` : ''}</span>`;
+        }
+        const durSec = Number(s.sim_ticks_total || 0) / 60;
+        const watchCue = st === 'running'
+          ? '🔴 Watch Live'
+          : (s.has_video ? '🎬 Watch Replay' : (s.turn_count > 0 ? '🕹️ Watch Turns' : '○ Empty'));
+        const statusChip = isCurrent
+          ? `<span style="color: var(--green); font-size: 9.5px; font-weight: 800; font-family: var(--font-mono);">● WATCHING</span>`
+          : `<span style="color: ${st === 'running' ? 'var(--green)' : (st === 'error' ? 'var(--pink)' : 'var(--slate)')}; font-size: 9.5px; font-family: var(--font-mono); font-weight: 700;">${escapeHtml(st.toUpperCase())}</span>`;
+
+        return `
+          <div class="pt-session-card ${isCurrent ? 'active' : ''}"
+               role="button" tabindex="0"
+               onclick="selectAndWatchPlaytestSession('${escapeJsAttr(s.session_id)}')"
+               onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();selectAndWatchPlaytestSession('${escapeJsAttr(s.session_id)}');}">
+            <div style="display: flex; justify-content: space-between; align-items: center; gap: 6px;">
+              <span style="font-family: var(--font-mono); font-size: 10.5px; font-weight: 800; color: var(--cyan);">${escapeHtml(runLabel + passLabel)}</span>
+              ${statusChip}
+            </div>
+            <div style="font-size: 11px; font-weight: 700; color: var(--white); line-height: 1.25;">${escapeHtml(sliceHeading)}</div>
+            ${_playtestArchiveGameFilter === 'all' ? `<div style="font-size: 10px; color: var(--cyan); opacity: 0.9;">🎮 ${escapeHtml(s.game_title || s.candidate_id || s.checkpoint_id || 'Untitled')}</div>` : ''}
+            <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 4px;">
+              <span style="padding: 1px 6px; border-radius: 4px; background: rgba(41,173,255,0.12); color: var(--light-gray); font-size: 9.5px; font-weight: 700;">${isCouncil ? '🏛️ Council Gate' : '👤 Manual'}</span>
+              ${rating !== null ? `<span style="padding: 1px 6px; border-radius: 4px; background: rgba(0,0,0,0.35); border: 1px solid ${ratingCol}; color: ${ratingCol}; font-family: var(--font-mono); font-size: 9.5px; font-weight: 800;">★ ${rating}/10</span>` : ''}
+              ${councilChip}
+              ${s.bugs_count > 0 ? `<span style="font-size: 9.5px; color: var(--pink); font-weight: 700;">🐛 ${s.bugs_count}</span>` : ''}
+              ${s.wishes_count > 0 ? `<span style="font-size: 9.5px; color: var(--yellow); font-weight: 700;">✨ ${s.wishes_count}</span>` : ''}
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center; gap: 6px; padding-top: 4px; border-top: 1px solid rgba(255,255,255,0.06); font-size: 9.5px; color: var(--slate);">
+              <span>${escapeHtml(formatPlaytestTimestampShort(s.created_at_utc))} • ${s.turn_count || 0}t (${formatPlaytestClock(durSec)})</span>
+              <span style="color: ${isCurrent ? 'var(--green)' : 'var(--cyan)'}; font-weight: 800;">${watchCue}</span>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function syncPlaytestArchiveOnGameSwitch() {
+      updateHeaderPlaytestRunBadge();
+      if (typeof renderSliceSelectorBar === 'function') renderSliceSelectorBar();
+      if (_playtestArchiveGameFilter === 'selected') {
+        _playtestArchiveSliceFilter = 'all';
+        renderPlaytestArchiveBrowser();
+        const filtered = getFilteredArchiveSessions();
+        const wsPlaytester = document.getElementById('workspace-playtester');
+        const isPlaytesterOpen = Boolean(wsPlaytester && wsPlaytester.style.display !== 'none');
+        if (filtered.length > 0 && !filtered.some(s => s.session_id === _activePlaytestSessionId)) {
+          _activePlaytestSessionId = filtered[0].session_id;
+          _playtestVideoLoadedKey = '';
+          if (isPlaytesterOpen) {
+            loadPlaytestSessionDetail(_activePlaytestSessionId);
+          }
+        }
+      }
+    }
+
+    async function selectAndWatchPlaytestSession(sessionId) {
+      if (!sessionId) return;
+      stopPlaytestFramesPlayback();
+      _activePlaytestSessionId = sessionId;
+      _playtestVideoLoadedKey = '';
+      renderPlaytestArchiveBrowser();
+      await loadPlaytestSessionDetail(sessionId);
+    }
+    window.selectAndWatchPlaytestSession = selectAndWatchPlaytestSession;
+
+    window.openPlaytestArchiveForSlice = async function(sliceId, cartridgeId) {
+      _playtestArchiveGameFilter = (cartridgeId && cartridgeId !== 'active') ? cartridgeId : 'selected';
+      _playtestArchiveSliceFilter = sliceId || 'all';
+      _playtestArchiveSourceFilter = 'all';
+      const drawer = document.getElementById('pt-session-archive-drawer');
+      if (drawer) drawer.open = true;
+      switchMainWorkspace('playtester', { skipAutoReload: true });
+      await loadPlaytestSessions(null, { selectFirstFiltered: true });
+    };
+
+    window.openPlaytestArchiveForGame = async function(cartridgeId) {
+      _playtestArchiveGameFilter = (cartridgeId && cartridgeId !== 'active') ? cartridgeId : 'selected';
+      _playtestArchiveSliceFilter = 'all';
+      _playtestArchiveSourceFilter = 'all';
+      const drawer = document.getElementById('pt-session-archive-drawer');
+      if (drawer) drawer.open = true;
+      switchMainWorkspace('playtester', { skipAutoReload: true });
+      await loadPlaytestSessions(null, { selectFirstFiltered: true });
+    };
+
+    async function loadPlaytestSessions(preferredSessionId = null, opts = {}) {
       try {
-        const res = await fetch('/api/playtest/sessions');
+        const res = await fetch('/api/playtest/sessions?limit=250');
         if (!res.ok) return;
         const data = await res.json();
         _playtestSessionsCache = Array.isArray(data.sessions) ? data.sessions : [];
         _playtestTargetsCache = Array.isArray(data.playable_targets) ? data.playable_targets : [];
+        _playtestGamesCatalog = Array.isArray(data.games_catalog) ? data.games_catalog : [];
+        _playtestActiveCartridgeId = String(data.active_cartridge_id || '');
         updateHeaderPlaytestWishBadge(data.pending_wishes_count || 0);
+        updateHeaderPlaytestRunBadge();
+        if (typeof renderSliceSelectorBar === 'function') renderSliceSelectorBar();
 
         const targetSel = document.getElementById('pt-target-select');
         if (targetSel) {
           const prevVal = targetSel.value;
-          const opts = _playtestTargetsCache.map((t, idx) => {
+          const targetOpts = _playtestTargetsCache.map((t, idx) => {
             const val = JSON.stringify({
               checkpoint_id: t.checkpoint_id || null,
               candidate_id: t.candidate_id || null,
@@ -10539,35 +11764,37 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             });
             return `<option value="${escapeHtml(val)}" ${idx === 0 && !prevVal ? 'selected' : ''}>${escapeHtml(t.label || t.checkpoint_id)}</option>`;
           });
-          targetSel.innerHTML = opts.length
-            ? opts.join('')
+          targetSel.innerHTML = targetOpts.length
+            ? targetOpts.join('')
             : '<option value="">No playable checkpoints or completed slices found</option>';
           if (prevVal && Array.from(targetSel.options).some(o => o.value === prevVal)) {
             targetSel.value = prevVal;
           }
         }
 
-        const sessSel = document.getElementById('pt-session-select');
-        if (preferredSessionId) {
+        if (preferredSessionId && _playtestSessionsCache.some(s => s.session_id === preferredSessionId)) {
           _activePlaytestSessionId = preferredSessionId;
-        } else if (!_activePlaytestSessionId && _playtestSessionsCache.length > 0) {
-          _activePlaytestSessionId = _playtestSessionsCache[0].session_id;
-        }
-        if (sessSel) {
-          if (_playtestSessionsCache.length === 0) {
-            sessSel.innerHTML = '<option value="">No playtest sessions yet</option>';
-          } else {
-            sessSel.innerHTML = _playtestSessionsCache.map(s => {
-              const st = String(s.status || 'running').toUpperCase();
-              const who = s.initiated_by === 'council' ? '🏛️ Council' : '👤 Manual';
-              const label = `[${who} • ${st}] ${s.game_title || s.checkpoint_id} (${s.turn_count || 0}t)`;
-              const sel = s.session_id === _activePlaytestSessionId ? 'selected' : '';
-              return `<option value="${escapeHtml(s.session_id)}" ${sel}>${escapeHtml(label)}</option>`;
-            }).join('');
+        } else if (opts.selectFirstFiltered) {
+          const matching = getFilteredArchiveSessions();
+          if (matching.length > 0) {
+            _activePlaytestSessionId = matching[0].session_id;
+          } else if (_playtestSessionsCache.length > 0) {
+            _activePlaytestSessionId = _playtestSessionsCache[0].session_id;
+          }
+        } else if (!_activePlaytestSessionId || !_playtestSessionsCache.some(s => s.session_id === _activePlaytestSessionId)) {
+          const matching = getFilteredArchiveSessions();
+          if (matching.length > 0) {
+            _activePlaytestSessionId = matching[0].session_id;
+          } else if (_playtestSessionsCache.length > 0) {
+            _activePlaytestSessionId = _playtestSessionsCache[0].session_id;
           }
         }
 
-        if (_activePlaytestSessionId) {
+        renderPlaytestArchiveBrowser();
+
+        const wsPlaytester = document.getElementById('workspace-playtester');
+        const isPlaytesterOpen = Boolean(wsPlaytester && wsPlaytester.style.display !== 'none');
+        if (_activePlaytestSessionId && (isPlaytesterOpen || preferredSessionId || opts.selectFirstFiltered)) {
           await loadPlaytestSessionDetail(_activePlaytestSessionId);
         }
       } catch (e) {
@@ -10587,6 +11814,175 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       }
     }
 
+    function renderPlaytestFrameReticle(tr) {
+      const svgEl = document.getElementById('pt-frame-reticle-svg');
+      if (!svgEl || !tr) return;
+      const ap = (tr.action_px && typeof tr.action_px === 'object') ? tr.action_px : {};
+      const sx = Math.round(ap.drag_from_x ?? tr.cursor_start_x ?? 640);
+      const sy = Math.round(ap.drag_from_y ?? tr.cursor_start_y ?? 360);
+      const ex = Math.round(ap.target_x ?? tr.cursor_end_x ?? 640);
+      const ey = Math.round(ap.target_y ?? tr.cursor_end_y ?? 360);
+      const btnAct = String(ap.mouse_button_action || 'none');
+      const holdKeys = Array.isArray(ap.hold_keys) ? ap.hold_keys : [];
+      const tapKeys = Array.isArray(ap.tap_keys) ? ap.tap_keys : [];
+      const durMs = Number(ap.duration_ms || 300);
+
+      let stroke = '#29adff';
+      let fill = 'rgba(41, 173, 255, 0.16)';
+      if (btnAct === 'left_click' || btnAct === 'double_click' || btnAct === 'hold_left') {
+        stroke = '#00e436';
+        fill = 'rgba(0, 228, 54, 0.24)';
+      } else if (btnAct === 'right_click') {
+        stroke = '#ff004d';
+        fill = 'rgba(255, 0, 77, 0.24)';
+      } else if (btnAct === 'drag_left') {
+        stroke = '#ffa300';
+        fill = 'rgba(255, 163, 0, 0.24)';
+      }
+
+      const dist = Math.hypot(ex - sx, ey - sy);
+      const isDrag = btnAct === 'drag_left';
+      const pathSvg = dist > 6 ? `
+        <circle cx="${sx}" cy="${sy}" r="5" fill="${stroke}" fill-opacity="0.7" />
+        <line x1="${sx}" y1="${sy}" x2="${ex}" y2="${ey}"
+              stroke="${stroke}" stroke-width="${isDrag ? '3.5' : '2'}"
+              ${isDrag ? '' : 'stroke-dasharray="7 5"'} stroke-opacity="0.88" />
+      ` : '';
+      const extraRing = (btnAct === 'double_click' || btnAct === 'hold_left' || isDrag)
+        ? `<circle cx="${ex}" cy="${ey}" r="26" fill="none" stroke="${stroke}" stroke-width="1.8" stroke-opacity="0.7" />`
+        : '';
+
+      const allKeys = [...tapKeys, ...holdKeys.map(k => `${k}(hold)`)];
+      const hudText = `T#${tr.turn_index} • ${btnAct.toUpperCase()} @ (${ex}, ${ey})${allKeys.length ? ` • Keys: ${allKeys.join('+')}` : ''} • ${durMs}ms`;
+      const tagX = Math.min(1080, Math.max(14, ex + 22));
+      const tagY = Math.min(700, Math.max(30, ey - 10));
+
+      svgEl.innerHTML = `
+        ${pathSvg}
+        ${extraRing}
+        <circle cx="${ex}" cy="${ey}" r="17" fill="${fill}" stroke="${stroke}" stroke-width="2.5" />
+        <line x1="${ex - 24}" y1="${ey}" x2="${ex - 9}" y2="${ey}" stroke="${stroke}" stroke-width="2" />
+        <line x1="${ex + 9}" y1="${ey}" x2="${ex + 24}" y2="${ey}" stroke="${stroke}" stroke-width="2" />
+        <line x1="${ex}" y1="${ey - 24}" x2="${ex}" y2="${ey - 9}" stroke="${stroke}" stroke-width="2" />
+        <line x1="${ex}" y1="${ey + 9}" x2="${ex}" y2="${ey + 24}" stroke="${stroke}" stroke-width="2" />
+        <circle cx="${ex}" cy="${ey}" r="3.5" fill="#ffffff" />
+        <g transform="translate(12, 12)">
+          <rect x="0" y="0" width="${Math.min(1250, Math.max(260, hudText.length * 7.6 + 22))}" height="26" rx="5" fill="rgba(3, 8, 20, 0.84)" stroke="${stroke}" stroke-width="1.2" />
+          <text x="10" y="17" fill="#ffffff" font-family="monospace" font-size="12.5" font-weight="700">${escapeHtml(hudText)}</text>
+        </g>
+        <text x="${tagX}" y="${tagY}" fill="${stroke}" font-family="monospace" font-size="12" font-weight="800" stroke="#03060e" stroke-width="3" paint-order="stroke">(${ex}, ${ey})</text>
+      `;
+    }
+
+    function renderPlaytestTurnAtIndex(idx, { syncVideo = false, scrollTurnRow = false } = {}) {
+      const detail = _playtestCurrentDetail;
+      const sess = detail?.session;
+      const turns = Array.isArray(detail?.turns) ? detail.turns : [];
+      if (!sess || turns.length === 0) return;
+
+      const clamped = Math.max(0, Math.min(turns.length - 1, Number(idx || 0)));
+      _playtestCurrentTurnIdx = clamped;
+      const tr = turns[clamped];
+      const lastTurnNum = turns[turns.length - 1]?.turn_index || turns.length;
+
+      const scrubber = document.getElementById('pt-turn-scrubber');
+      const scrubLabel = document.getElementById('pt-turn-scrubber-label');
+      const syncedBanner = document.getElementById('pt-synced-turn-banner');
+      if (scrubber) {
+        scrubber.min = '1';
+        scrubber.max = String(turns.length);
+        scrubber.value = String(clamped + 1);
+      }
+      if (scrubLabel) {
+        scrubLabel.textContent = `T#${tr.turn_index} / ${lastTurnNum} (${formatPlaytestClock(tr.video_timestamp_sec)})`;
+      }
+      if (syncedBanner) {
+        syncedBanner.innerHTML = `
+          <div style="display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-bottom: 2px;">
+            <strong style="color: var(--cyan); font-family: var(--font-mono);">Turn #${tr.turn_index} [${formatPlaytestClock(tr.video_timestamp_sec)}] — ${escapeHtml(tr.append_log_line || '')}</strong>
+            ${tr.mood_state ? `<span style="color: var(--yellow); font-weight: 800;">Mood: ${escapeHtml(tr.mood_state)}</span>` : ''}
+          </div>
+          ${tr.deliberation ? `<div style="color: var(--white);"><strong>Thought:</strong> ${escapeHtml(tr.deliberation)}</div>` : ''}
+        `;
+      }
+
+      const planEl = document.getElementById('pt-active-plan-text');
+      const cursorEl = document.getElementById('pt-cursor-readout');
+      const moodEl = document.getElementById('pt-mood-pill');
+      if (planEl && tr.current_plan) planEl.textContent = tr.current_plan;
+      if (cursorEl) {
+        cursorEl.textContent = `Cursor: (${Math.round(tr.cursor_end_x ?? 640)}, ${Math.round(tr.cursor_end_y ?? 360)})`;
+      }
+      if (moodEl && tr.mood_state) {
+        moodEl.textContent = `Mood: ${tr.mood_state}`;
+      }
+
+      // Highlight active turn row in Turn Tape
+      const turnsListEl = document.getElementById('pt-turns-list');
+      if (turnsListEl) {
+        turnsListEl.querySelectorAll('[data-pt-turn-idx]').forEach(row => {
+          const isMatch = Number(row.getAttribute('data-pt-turn-idx')) === clamped;
+          row.classList.toggle('pt-turn-row-active', isMatch);
+          if (isMatch && scrollTurnRow) {
+            try { row.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); } catch (_) {}
+          }
+        });
+      }
+
+      // Update Turn-by-Turn Frame & Reticle stage
+      const frameImg = document.getElementById('pt-frame-replay-img');
+      const reticleSvg = document.getElementById('pt-frame-reticle-svg');
+      const frameEmpty = document.getElementById('pt-frame-replay-empty');
+      const frameAudio = document.getElementById('pt-frame-turn-audio');
+      if (tr.screenshot_name && frameImg) {
+        frameImg.src = `/api/playtest/sessions/${encodeURIComponent(sess.session_id)}/media/${encodeURIComponent(tr.screenshot_name)}`;
+        frameImg.style.display = 'block';
+        if (frameEmpty) frameEmpty.style.display = 'none';
+        if (reticleSvg) {
+          reticleSvg.style.display = 'block';
+          renderPlaytestFrameReticle(tr);
+        }
+      } else {
+        if (frameImg) {
+          frameImg.removeAttribute('src');
+          frameImg.style.display = 'none';
+        }
+        if (reticleSvg) reticleSvg.style.display = 'none';
+        if (frameEmpty) frameEmpty.style.display = 'block';
+      }
+      if (frameAudio) {
+        if (tr.audio_clip_name) {
+          const aSrc = `/api/playtest/sessions/${encodeURIComponent(sess.session_id)}/media/${encodeURIComponent(tr.audio_clip_name)}`;
+          if (frameAudio.getAttribute('src') !== aSrc) {
+            frameAudio.src = aSrc;
+          }
+          frameAudio.style.display = 'block';
+        } else {
+          try { frameAudio.pause(); frameAudio.removeAttribute('src'); } catch (_) {}
+          frameAudio.style.display = 'none';
+        }
+      }
+
+      if (syncVideo && _playtestViewMode === 'video') {
+        const vidEl = document.getElementById('pt-replay-video');
+        if (vidEl && vidEl.src) {
+          try { vidEl.currentTime = Math.max(0, Number(tr.video_timestamp_sec || 0)); } catch (_) {}
+        }
+      }
+    }
+
+    window.jumpToPlaytestTurnIndex = function(turnIdx) {
+      const detail = _playtestCurrentDetail;
+      const sess = detail?.session;
+      const turns = Array.isArray(detail?.turns) ? detail.turns : [];
+      if (!sess || turns.length === 0) return;
+      stopPlaytestFramesPlayback();
+      if (_playtestViewMode === 'live') {
+        switchPlaytestStageView(sess.has_video ? 'video' : 'frames');
+      }
+      renderPlaytestTurnAtIndex(turnIdx, { syncVideo: _playtestViewMode === 'video', scrollTurnRow: true });
+    };
+
     function renderPlaytestSessionDetail(detail) {
       if (!detail || !detail.session) return;
       const sess = detail.session;
@@ -10594,6 +11990,10 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const wishes = Array.isArray(detail.wishes) ? detail.wishes : [];
       const compactions = Array.isArray(detail.compactions) ? detail.compactions : [];
       const tok = detail.token_summary || {};
+      const prevSessionId = _playtestCurrentDetail?.session?.session_id || null;
+      const prevStatus = String(_playtestCurrentDetail?.session?.status || '').toLowerCase();
+      const isSessionChanged = prevSessionId !== sess.session_id;
+      _playtestCurrentDetail = detail;
 
       // Status & Control buttons
       const status = String(sess.status || 'idle').toLowerCase();
@@ -10645,11 +12045,39 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         tokEl.textContent = `${sess.turn_count || 0} turns • ${tok.cache_hit_pct || 0}% cache • ${totalK}k tok`;
       }
 
-      // Blindfold Store Card Banner
+      // Run # badge + Slice provenance pill + Blindfold Store Card Banner
+      const runBadgeEl = document.getElementById('pt-session-run-badge');
+      const sliceProvEl = document.getElementById('pt-slice-provenance-pill');
       const titleEl = document.getElementById('pt-blind-title');
       const descEl = document.getElementById('pt-blind-desc');
       const moodEl = document.getElementById('pt-mood-pill');
       const planEl = document.getElementById('pt-active-plan-text');
+      if (runBadgeEl) {
+        if (sess.game_run_number) {
+          const passPart = (sess.slice_id && sess.slice_run_number) ? ` • Slice Pass #${sess.slice_run_number}` : '';
+          runBadgeEl.textContent = `Run #${sess.game_run_number}${passPart}`;
+          runBadgeEl.style.display = 'inline-block';
+        } else {
+          runBadgeEl.style.display = 'none';
+        }
+      }
+      if (sliceProvEl) {
+        if (sess.slice_id) {
+          const shortSl = sess.slice_title
+            ? String(sess.slice_title).replace(/^Slice\s*#?\d+\s*[:\-—]\s*/i, '')
+            : '';
+          const slLabel = (sess.slice_index !== null && sess.slice_index !== undefined)
+            ? `🔪 Slice #${sess.slice_index}${shortSl ? `: ${shortSl}` : ''}`
+            : `🔪 ${sess.slice_id}`;
+          sliceProvEl.textContent = slLabel;
+          sliceProvEl.style.display = 'inline-block';
+        } else if (sess.checkpoint_id) {
+          sliceProvEl.textContent = `📦 ${sess.checkpoint_id}`;
+          sliceProvEl.style.display = 'inline-block';
+        } else {
+          sliceProvEl.style.display = 'none';
+        }
+      }
       if (titleEl) titleEl.textContent = sess.game_title || sess.checkpoint_id || 'Untitled';
       if (descEl) descEl.textContent = sess.game_description ? `"${sess.game_description}"` : '(No store blurb — discovering purely from screen & audio)';
       if (moodEl) moodEl.textContent = `Mood: ${sess.current_mood || 'observing'}`;
@@ -10679,13 +12107,13 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           if (_playtestVideoLoadedKey !== vKey) {
             _playtestVideoLoadedKey = vKey;
             vidEl.src = `/api/playtest/sessions/${encodeURIComponent(sess.session_id)}/video?v=${encodeURIComponent(vKey)}`;
-            try { vidEl.load(); } catch (_) {}
+            try {
+              vidEl.load();
+              vidEl.playbackRate = _playtestPlaybackSpeed;
+            } catch (_) {}
           }
           vidEl.style.display = 'block';
           if (vidUnavail) vidUnavail.style.display = 'none';
-          if (status === 'completed' || status === 'stopped' || status === 'error') {
-            switchPlaytestStageView('video');
-          }
         } else {
           if (_playtestVideoLoadedKey) {
             _playtestVideoLoadedKey = '';
@@ -10693,9 +12121,42 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           }
           vidEl.style.display = 'none';
           if (vidUnavail) vidUnavail.style.display = 'block';
-          if (status === 'idle') {
-            switchPlaytestStageView('live');
-          }
+        }
+      }
+
+      // Smart stage mode selection (auto-select on session switch or when run finishes, without yanking user out of manual 'frames' view)
+      const justFinished = (prevStatus === 'running' || prevStatus === 'paused') &&
+        (status === 'completed' || status === 'stopped' || status === 'error');
+      if (isSessionChanged) {
+        _playtestLastAutoPausedMarkerKey = null;
+        stopPlaytestFramesPlayback();
+        _playtestCurrentTurnIdx = (status === 'running') ? Math.max(0, turns.length - 1) : 0;
+        if (status === 'running') {
+          switchPlaytestStageView('live');
+        } else if (sess.has_video) {
+          switchPlaytestStageView('video');
+        } else if (turns.length > 0) {
+          switchPlaytestStageView('frames');
+        } else {
+          switchPlaytestStageView('live');
+        }
+      } else if (justFinished && _playtestViewMode === 'live') {
+        _playtestCurrentTurnIdx = 0;
+        if (sess.has_video) {
+          switchPlaytestStageView('video');
+        } else if (turns.length > 0) {
+          switchPlaytestStageView('frames');
+        }
+      } else {
+        if (status === 'running') {
+          _playtestCurrentTurnIdx = Math.max(0, turns.length - 1);
+        } else if (_playtestCurrentTurnIdx >= turns.length) {
+          _playtestCurrentTurnIdx = Math.max(0, turns.length - 1);
+        }
+        if (status === 'idle' && turns.length === 0) {
+          switchPlaytestStageView('live');
+        } else {
+          switchPlaytestStageView(_playtestViewMode);
         }
       }
 
@@ -10749,6 +12210,16 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             detail: iu.impression || '',
           });
         });
+        const bugArr = Array.isArray(t.bug_reports) ? t.bug_reports : [];
+        bugArr.forEach((br, idx) => {
+          _playtestMarkers.push({
+            key: `bug_${t.turn_index}_${idx}`,
+            kind: 'bug',
+            sec: Number(t.video_timestamp_sec || 0),
+            label: `🐛 [${formatPlaytestClock(t.video_timestamp_sec)}] Bug: ${br.summary || br.bug_key || 'Glitch'}`,
+            detail: br.details || '',
+          });
+        });
       });
       wishes.forEach(w => {
         _playtestMarkers.push({
@@ -10764,13 +12235,16 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       const markersContainer = document.getElementById('pt-video-markers');
       if (markersContainer) {
         if (_playtestMarkers.length === 0) {
-          markersContainer.innerHTML = '<span style="font-size: 10.5px; color: var(--slate);">Markers appear here whenever the player\'s mood shifts, an impression updates, or a wish is filed.</span>';
+          markersContainer.innerHTML = '<span style="font-size: 10.5px; color: var(--slate);">Markers appear here whenever the player\'s mood shifts, an impression updates, a bug is spotted, or a wish is filed.</span>';
         } else {
           markersContainer.innerHTML = _playtestMarkers.map(m => {
             const isWish = m.kind === 'wish';
             const isImp = m.kind === 'impression';
-            const border = isWish ? 'var(--amber)' : (isImp ? 'var(--green)' : 'var(--cyan)');
-            const bg = isWish ? 'rgba(255, 163, 0, 0.16)' : (isImp ? 'rgba(0, 228, 54, 0.14)' : 'rgba(41, 173, 255, 0.14)');
+            const isBug = m.kind === 'bug';
+            const border = isBug ? 'var(--pink)' : (isWish ? 'var(--amber)' : (isImp ? 'var(--green)' : 'var(--cyan)'));
+            const bg = isBug
+              ? 'rgba(255, 0, 77, 0.16)'
+              : (isWish ? 'rgba(255, 163, 0, 0.16)' : (isImp ? 'rgba(0, 228, 54, 0.14)' : 'rgba(41, 173, 255, 0.14)'));
             return `<button type="button" onclick="seekPlaytestReplay(${m.sec})" title="${escapeHtml(m.detail)}" style="padding: 2px 7px; border-radius: 10px; border: 1px solid ${border}; background: ${bg}; color: var(--white); font-size: 10px; cursor: pointer;">${escapeHtml(m.label)}</button>`;
           }).join('');
         }
@@ -10792,6 +12266,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         const hasFullReport = Boolean(rep.overall_experience_summary);
         const imps = (sess.impressions && typeof sess.impressions === 'object') ? sess.impressions : {};
         const impEntries = Object.entries(imps);
+        const bugsObj = (sess.bugs_found && typeof sess.bugs_found === 'object') ? sess.bugs_found : {};
+        const bugEntries = Object.entries(bugsObj);
 
         let fullReportHtml = '';
         if (hasFullReport) {
@@ -10799,6 +12275,8 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           const ratingColor = rating >= 7 ? 'var(--green)' : (rating >= 5 ? 'var(--yellow)' : 'var(--pink)');
           const highlights = Array.isArray(rep.key_highlights) ? rep.key_highlights : [];
           const painPoints = Array.isArray(rep.key_pain_points) ? rep.key_pain_points : [];
+          const bugsObserved = Array.isArray(rep.bugs_and_glitches_observed) ? rep.bugs_and_glitches_observed : [];
+          const unansweredQs = Array.isArray(rep.unanswered_questions_and_mysteries) ? rep.unanswered_questions_and_mysteries : [];
           const reportPillars = [
             ['🎨 Graphics & Visuals', rep.graphics_and_visuals],
             ['🎮 Gameplay & Feel', rep.gameplay_and_feel],
@@ -10835,11 +12313,47 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
                   <ul style="margin: 3px 0 0 16px; padding: 0; color: var(--white);">${painPoints.map(p => `<li>${escapeHtml(String(p))}</li>`).join('')}</ul>
                 </div>
               ` : ''}
+              ${bugsObserved.length ? `
+                <div>
+                  <div style="font-size: 10px; font-weight: 800; color: var(--pink); text-transform: uppercase;">🐛 Bugs &amp; Glitches Observed</div>
+                  <ul style="margin: 3px 0 0 16px; padding: 0; color: var(--white);">${bugsObserved.map(b => `<li>${escapeHtml(String(b))}</li>`).join('')}</ul>
+                </div>
+              ` : ''}
+              ${unansweredQs.length ? `
+                <div>
+                  <div style="font-size: 10px; font-weight: 800; color: var(--cyan); text-transform: uppercase;">❓ Unanswered Questions &amp; Mysteries</div>
+                  <ul style="margin: 3px 0 0 16px; padding: 0; color: var(--white);">${unansweredQs.map(q => `<li>${escapeHtml(String(q))}</li>`).join('')}</ul>
+                </div>
+              ` : ''}
             </div>
           `;
         } else if (status === 'running' || status === 'paused') {
           fullReportHtml = `<div style="padding: 8px 10px; border-radius: 6px; background: #071022; border: 1px dashed rgba(41,173,255,0.3); color: var(--slate); font-size: 10.5px;">Full 6-pillar <strong>Session Experience Report</strong> will be synthesized automatically as soon as this session completes or is stopped.</div>`;
         }
+
+        const liveBugsHtml = bugEntries.length > 0
+          ? bugEntries.map(([bKey, bVal]) => {
+              const bObj = (bVal && typeof bVal === 'object') ? bVal : {};
+              const sev = String(bObj.severity || 'major').toUpperCase();
+              const sevColor = sev === 'BLOCKER' ? 'var(--pink)' : (sev === 'MAJOR' ? 'var(--amber)' : 'var(--yellow)');
+              const bScrUrl = bObj.screenshot_name
+                ? `/api/playtest/sessions/${encodeURIComponent(sess.session_id)}/media/${encodeURIComponent(bObj.screenshot_name)}`
+                : '';
+              return `
+                <details style="padding: 6px 8px; background: #0b0e1e; border-radius: 5px; border-left: 3px solid ${sevColor};">
+                  <summary style="cursor: pointer; font-size: 10.5px; color: var(--white); font-weight: 700;">
+                    <span style="color: ${sevColor}; font-family: var(--font-mono);">[${escapeHtml(sev)} • ${escapeHtml(String(bObj.category || 'bug'))}]</span>
+                    ${escapeHtml(String(bObj.summary || bKey))}
+                    ${bObj.turn_index ? `<span style="color: var(--slate); font-weight: 400;"> (T#${escapeHtml(String(bObj.turn_index))})</span>` : ''}
+                  </summary>
+                  <div style="margin-top: 5px; color: var(--light-gray); line-height: 1.35;">
+                    <div>${escapeHtml(String(bObj.details || ''))}</div>
+                    ${bScrUrl ? `<a href="${bScrUrl}" target="_blank" rel="noopener" style="display: inline-block; margin-top: 4px; color: var(--cyan); font-size: 10px;">🖼️ View Bug Screenshot</a>` : ''}
+                  </div>
+                </details>
+              `;
+            }).join('')
+          : '<div style="color: var(--slate);">No bugs or glitches spotted yet during play.</div>';
 
         const sparseImpHtml = impEntries.length > 0
           ? impEntries.map(([k, v]) => `
@@ -10850,12 +12364,49 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
             `).join('')
           : '<div style="color: var(--slate);">No sparse pillar impressions recorded yet — the player updates these only when forming or revising an impression.</div>';
 
+        const cr = (sess.council_review && typeof sess.council_review === 'object')
+          ? sess.council_review
+          : ((rep.council_review && typeof rep.council_review === 'object') ? rep.council_review : null);
+        let councilVerdictHtml = '';
+        if (cr && cr.verdict) {
+          const isApproved = cr.verdict === 'approve_slice';
+          const vColor = isApproved ? 'var(--green)' : 'var(--amber)';
+          const vBg = isApproved ? 'rgba(0, 228, 54, 0.12)' : 'rgba(255, 163, 0, 0.12)';
+          const vTitle = isApproved ? '✅ COUNCIL GATE VERDICT: SLICE APPROVED' : '🔄 COUNCIL GATE VERDICT: ITERATE CURRENT SLICE';
+          const passNum = Number(cr.pass_index || 0) + 1;
+          const spawned = Array.isArray(cr.spawned_item_ids) ? cr.spawned_item_ids : [];
+          councilVerdictHtml = `
+            <div style="padding: 9px 11px; border-radius: 7px; background: ${vBg}; border: 1px solid ${vColor}; display: flex; flex-direction: column; gap: 6px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+                <span style="font-size: 10.5px; font-weight: 800; color: ${vColor};">${vTitle}</span>
+                <span style="font-family: var(--font-mono); font-size: 10px; color: var(--white);">Gate Pass #${passNum}${cr.slice_id ? ` • ${escapeHtml(cr.slice_id)}` : ''}</span>
+              </div>
+              ${cr.player_experience_synthesis ? `<div style="color: var(--white); line-height: 1.38;">${escapeHtml(cr.player_experience_synthesis)}</div>` : ''}
+              ${spawned.length > 0 ? `<div style="font-size: 10px; color: var(--yellow);"><strong>Spawned Polish/Fix Tasks (${spawned.length}):</strong> <code>${escapeHtml(spawned.join(', '))}</code></div>` : ''}
+              ${cr.next_slice_carryover_notes ? `<div style="font-size: 10px; color: var(--cyan);"><strong>Carryover Notes:</strong> ${escapeHtml(cr.next_slice_carryover_notes)}</div>` : ''}
+              ${cr.deliberation ? `
+                <details style="margin-top: 2px;">
+                  <summary style="cursor: pointer; font-size: 10px; color: var(--light-gray); font-weight: 700;">View Council Deliberation</summary>
+                  <div style="margin-top: 4px; font-size: 10px; color: var(--light-gray); line-height: 1.35;">${escapeHtml(cr.deliberation)}</div>
+                </details>
+              ` : ''}
+            </div>
+          `;
+        }
+
         repContainer.innerHTML = `
           ${provBanner}
+          ${councilVerdictHtml}
           ${fullReportHtml}
           <div style="border-top: 1px solid var(--border-subtle); padding-top: 8px;">
+            <div style="font-size: 10px; font-weight: 800; color: var(--pink); text-transform: uppercase; margin-bottom: 5px;">
+              🐛 Bugs &amp; Glitches Spotted Along The Way (${bugEntries.length})
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 5px;">${liveBugsHtml}</div>
+          </div>
+          <div style="border-top: 1px solid var(--border-subtle); padding-top: 8px;">
             <div style="font-size: 10px; font-weight: 800; color: var(--green); text-transform: uppercase; margin-bottom: 5px;">
-              📝 Sparse Running Pillar Impressions (Non-Repetitive Live Notes)
+              📝 Sparse Running Pillar Impressions (Revised As Things Change)
             </div>
             <div style="display: flex; flex-direction: column; gap: 5px;">${sparseImpHtml}</div>
           </div>
@@ -10887,44 +12438,69 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
           const cursorReadout = document.getElementById('pt-cursor-readout');
           if (cursorReadout) cursorReadout.textContent = 'Cursor: (640, 360)';
           turnsListEl.innerHTML = status === 'idle'
-            ? '<div style="font-size: 11px; color: var(--slate);">Session data reset — click <strong>▶ Run Playtester</strong> to start.</div>'
+            ? '<div style="font-size: 11px; color: var(--slate);">Session data reset — click <strong>▶ Run New Session</strong> to start.</div>'
             : '<div style="font-size: 11px; color: var(--slate);">Waiting for Turn #1...</div>';
         } else {
-          const lastTurn = turns[turns.length - 1];
-          const cursorReadout = document.getElementById('pt-cursor-readout');
-          if (cursorReadout && lastTurn) {
-            cursorReadout.textContent = `Cursor: (${Math.round(lastTurn.cursor_end_x || 640)}, ${Math.round(lastTurn.cursor_end_y || 360)})`;
-          }
-          turnsListEl.innerHTML = turns.slice().reverse().map(tr => {
+          turnsListEl.innerHTML = turns.map((tr, origIdx) => ({ tr, origIdx })).reverse().map(({ tr, origIdx }, dispIdx) => {
+            const deferredCls = dispIdx >= 8 ? 'pt-turn-row-deferred' : '';
+            const activeCls = origIdx === _playtestCurrentTurnIdx ? 'pt-turn-row-active' : '';
             const audioHtml = tr.audio_clip_name ? `
-              <audio controls preload="none" src="/api/playtest/sessions/${encodeURIComponent(sess.session_id)}/media/${encodeURIComponent(tr.audio_clip_name)}" style="height: 24px; width: 100%; margin-top: 4px;"></audio>
+              <audio controls loading="lazy" preload="none" src="/api/playtest/sessions/${encodeURIComponent(sess.session_id)}/media/${encodeURIComponent(tr.audio_clip_name)}" style="height: 24px; width: 100%; margin-top: 4px;"></audio>
             ` : '';
             const scrUrl = tr.screenshot_name
               ? `/api/playtest/sessions/${encodeURIComponent(sess.session_id)}/media/${encodeURIComponent(tr.screenshot_name)}`
               : '';
             return `
-              <details style="background: #070e1f; border: 1px solid rgba(41,173,255,0.16); border-radius: 5px; padding: 6px 8px; font-size: 10.5px;">
-                <summary style="cursor: pointer; color: var(--light-gray); font-family: var(--font-mono); font-size: 10px;">
-                  <strong style="color: var(--cyan);">T#${tr.turn_index}</strong> [${formatPlaytestClock(tr.video_timestamp_sec)}] ${escapeHtml(tr.append_log_line || '')}
+              <details data-pt-turn-idx="${origIdx}" class="${deferredCls} ${activeCls}" style="background: #070e1f; border: 1px solid rgba(41,173,255,0.16); border-radius: 5px; padding: 6px 8px; font-size: 10.5px;">
+                <summary style="cursor: pointer; color: var(--light-gray); font-family: var(--font-mono); font-size: 10px; display: flex; justify-content: space-between; align-items: center; gap: 6px;">
+                  <span><strong style="color: var(--cyan);">T#${tr.turn_index}</strong> [${formatPlaytestClock(tr.video_timestamp_sec)}] ${escapeHtml(tr.append_log_line || '')}</span>
+                  <button type="button" onclick="event.preventDefault(); event.stopPropagation(); jumpToPlaytestTurnIndex(${origIdx});" style="padding: 1px 6px; border-radius: 4px; border: 1px solid rgba(41,173,255,0.45); background: rgba(41,173,255,0.14); color: var(--cyan); font-size: 9.5px; font-weight: 800; cursor: pointer; flex-shrink: 0;" title="Watch this turn in the replay stage">▶ Watch</button>
                 </summary>
                 <div style="margin-top: 6px; display: flex; flex-direction: column; gap: 5px; color: var(--light-gray);">
                   <div><strong style="color: var(--cyan);">Player Deliberation:</strong> ${escapeHtml(tr.deliberation || '')}</div>
                   <div><strong style="color: var(--green);">Active Plan:</strong> ${escapeHtml(tr.current_plan || '')}</div>
-                  ${scrUrl ? `<a href="${scrUrl}" target="_blank" rel="noopener" style="color: var(--cyan); font-size: 10px;">🖼️ View Turn #${tr.turn_index} Screenshot</a>` : ''}
+                  ${scrUrl ? `<a href="${scrUrl}" target="_blank" rel="noopener" style="color: var(--cyan); font-size: 10px;">🖼️ View Turn #${tr.turn_index} Raw Screenshot</a>` : ''}
                   ${audioHtml}
                 </div>
               </details>
             `;
           }).join('');
+          renderPlaytestTurnAtIndex(_playtestCurrentTurnIdx, { syncVideo: false, scrollTurnRow: false });
         }
       }
 
-      // Render Permanent Rulebook + Compacted Episodic Journal
+      // Render Permanent Notes, Questions, Rulebook + Compacted Episodic Journal
       const memEl = document.getElementById('pt-memory-container');
       if (memEl) {
         const rb = (sess.rulebook && typeof sess.rulebook === 'object') ? sess.rulebook : {};
         const rbEntries = Object.entries(rb);
+        const fnObj = (sess.field_notes && typeof sess.field_notes === 'object') ? sess.field_notes : {};
+        const fnEntries = Object.entries(fnObj);
+        const qObj = (sess.questions && typeof sess.questions === 'object') ? sess.questions : {};
+        const qEntries = Object.entries(qObj);
         const cj = (sess.compacted_journal && typeof sess.compacted_journal === 'object') ? sess.compacted_journal : {};
+
+        const qHtml = qEntries.length > 0
+          ? qEntries.map(([qKey, qVal]) => {
+              const qItem = (qVal && typeof qVal === 'object') ? qVal : {};
+              const isAns = qItem.status === 'answered';
+              const badgeColor = isAns ? 'var(--green)' : 'var(--yellow)';
+              const badgeTxt = isAns ? 'ANSWERED' : 'OPEN';
+              return `
+                <div style="padding: 5px 8px; background: #081226; border-radius: 5px; border-left: 3px solid ${badgeColor};">
+                  <div style="font-size: 10px; font-weight: 800; color: ${badgeColor};">
+                    [${badgeTxt}] ${escapeHtml(String(qItem.question || qKey))}
+                  </div>
+                  ${qItem.answer ? `<div style="margin-top: 2px; color: var(--white);">↳ ${escapeHtml(String(qItem.answer))}</div>` : ''}
+                </div>
+              `;
+            }).join('')
+          : '<div style="color: var(--slate);">No player questions logged yet.</div>';
+
+        const fnHtml = fnEntries.length > 0
+          ? fnEntries.map(([k, v]) => `<div style="padding: 4px 7px; background: #081226; border-radius: 4px;"><strong style="color: var(--cyan);">${escapeHtml(k)}:</strong> ${escapeHtml(String(v))}</div>`).join('')
+          : '<div style="color: var(--slate);">No screen/world field notes recorded yet.</div>';
+
         const rbHtml = rbEntries.length > 0
           ? rbEntries.map(([k, v]) => `<div style="padding: 4px 7px; background: #081226; border-radius: 4px;"><strong style="color: var(--green);">${escapeHtml(k)}:</strong> ${escapeHtml(String(v))}</div>`).join('')
           : '<div style="color: var(--slate);">No controls or rules confirmed yet.</div>';
@@ -10940,12 +12516,24 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         };
 
         memEl.innerHTML = `
-          <div>
-            <div style="font-size: 10px; font-weight: 800; color: var(--green); text-transform: uppercase; margin-bottom: 4px;">
-              🔒 Permanent How-To-Play Rulebook (Code-Merged — Never Summarized Away)
-            </div>
-            <div style="display: flex; flex-direction: column; gap: 4px;">${rbHtml}</div>
-          </div>
+          <details open style="background: #060e1f; border: 1px solid rgba(41,173,255,0.18); border-radius: 6px; padding: 7px 9px;">
+            <summary style="cursor: pointer; font-size: 10px; font-weight: 800; color: var(--yellow); text-transform: uppercase;">
+              ❓ Player Questions &amp; Hypotheses (${qEntries.length})
+            </summary>
+            <div style="display: flex; flex-direction: column; gap: 5px; margin-top: 6px;">${qHtml}</div>
+          </details>
+          <details open style="background: #060e1f; border: 1px solid rgba(41,173,255,0.18); border-radius: 6px; padding: 7px 9px;">
+            <summary style="cursor: pointer; font-size: 10px; font-weight: 800; color: var(--cyan); text-transform: uppercase;">
+              🗒️ Field Notes &amp; Screen Observations (${fnEntries.length})
+            </summary>
+            <div style="display: flex; flex-direction: column; gap: 4px; margin-top: 6px;">${fnHtml}</div>
+          </details>
+          <details open style="background: #060e1f; border: 1px solid rgba(0,228,54,0.18); border-radius: 6px; padding: 7px 9px;">
+            <summary style="cursor: pointer; font-size: 10px; font-weight: 800; color: var(--green); text-transform: uppercase;">
+              🔒 Permanent How-To-Play Rulebook (${rbEntries.length})
+            </summary>
+            <div style="display: flex; flex-direction: column; gap: 4px; margin-top: 6px;">${rbHtml}</div>
+          </details>
           <div style="border-top: 1px solid var(--border-subtle); padding-top: 8px;">
             <div style="font-size: 10px; font-weight: 800; color: var(--cyan); text-transform: uppercase; margin-bottom: 4px;">
               📚 Compacted Episodic Memory (${compactions.length} Compaction Pass${compactions.length === 1 ? '' : 'es'})
@@ -10962,6 +12550,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
 
       // Render Wish Inbox (1-Click Send + Batch Checkboxes)
       renderPlaytestWishInbox(sess, wishes);
+      if (isSessionChanged) {
+        renderPlaytestArchiveBrowser();
+      }
     }
 
     function renderPlaytestWishInbox(sess, wishes) {
@@ -11041,11 +12632,25 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
     }
 
     window.seekPlaytestReplay = function(sec) {
-      switchPlaytestStageView('video');
-      const vid = document.getElementById('pt-replay-video');
-      if (vid && vid.src) {
-        vid.currentTime = Math.max(0, Number(sec || 0));
-        vid.play().catch(() => {});
+      const targetSec = Math.max(0, Number(sec || 0));
+      const sess = _playtestCurrentDetail?.session;
+      const turns = Array.isArray(_playtestCurrentDetail?.turns) ? _playtestCurrentDetail.turns : [];
+      if (sess && sess.has_video) {
+        switchPlaytestStageView('video');
+        const vid = document.getElementById('pt-replay-video');
+        if (vid && vid.src) {
+          vid.currentTime = targetSec;
+          vid.play().catch(() => {});
+        }
+      } else if (turns.length > 0) {
+        switchPlaytestStageView('frames');
+        let bestIdx = 0;
+        for (let i = 0; i < turns.length; i++) {
+          if (Number(turns[i].video_timestamp_sec || 0) <= targetSec + 0.05) {
+            bestIdx = i;
+          }
+        }
+        renderPlaytestTurnAtIndex(bestIdx, { syncVideo: false, scrollTurnRow: true });
       }
     };
 
@@ -11211,7 +12816,9 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       if (
         evType === 'playtest_turn_completed' ||
         evType === 'playtest_impression_updated' ||
+        evType === 'playtest_bug_reported' ||
         evType === 'playtest_report_ready' ||
+        evType === 'playtest_council_report_dispatched' ||
         evType === 'playtest_session_status' ||
         evType === 'playtest_video_ready' ||
         evType === 'playtest_compacted'
@@ -11230,19 +12837,107 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       document.getElementById('btn-pt-pause')?.addEventListener('click', () => controlPlaytestSession('pause'));
       document.getElementById('btn-pt-resume')?.addEventListener('click', () => controlPlaytestSession('resume'));
       document.getElementById('btn-pt-stop')?.addEventListener('click', () => controlPlaytestSession('stop'));
-      document.getElementById('btn-pt-reset')?.addEventListener('click', () => controlPlaytestSession('reset'));
+      document.getElementById('btn-pt-reset')?.addEventListener('click', () => {
+        const curSess = _playtestCurrentDetail?.session;
+        const curTurns = Array.isArray(_playtestCurrentDetail?.turns) ? _playtestCurrentDetail.turns : [];
+        const curWishes = Array.isArray(_playtestCurrentDetail?.wishes) ? _playtestCurrentDetail.wishes : [];
+        const curStatus = String(curSess?.status || 'idle').toLowerCase();
+        if (curStatus !== 'running' && (curTurns.length > 0 || curWishes.length > 0)) {
+          const ok = window.confirm(
+            'Resetting this recorded session will permanently wipe its replay video, screenshots, and turn history.\n\n' +
+            'Tip: Click "▶ Run New Session" instead to start a fresh run while keeping this session in the archive.\n\n' +
+            'Wipe this session anyway?'
+          );
+          if (!ok) return;
+        }
+        controlPlaytestSession('reset');
+      });
 
       document.getElementById('pt-session-select')?.addEventListener('change', (e) => {
         const sid = e.target.value;
         if (sid) {
-          _activePlaytestSessionId = sid;
-          _playtestVideoLoadedKey = '';
-          loadPlaytestSessionDetail(sid);
+          selectAndWatchPlaytestSession(sid);
         }
+      });
+
+      document.getElementById('pt-archive-game-select')?.addEventListener('change', (e) => {
+        _playtestArchiveGameFilter = e.target.value || 'selected';
+        _playtestArchiveSliceFilter = 'all';
+        renderPlaytestArchiveBrowser();
+        const matching = getFilteredArchiveSessions();
+        if (matching.length > 0 && !matching.some(m => m.session_id === _activePlaytestSessionId)) {
+          selectAndWatchPlaytestSession(matching[0].session_id);
+        }
+      });
+
+      document.querySelectorAll('#pt-archive-source-pills [data-pt-source]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          _playtestArchiveSourceFilter = btn.getAttribute('data-pt-source') || 'all';
+          renderPlaytestArchiveBrowser();
+          const matching = getFilteredArchiveSessions();
+          if (matching.length > 0 && !matching.some(m => m.session_id === _activePlaytestSessionId)) {
+            selectAndWatchPlaytestSession(matching[0].session_id);
+          }
+        });
       });
 
       document.getElementById('btn-pt-view-live')?.addEventListener('click', () => switchPlaytestStageView('live'));
       document.getElementById('btn-pt-view-video')?.addEventListener('click', () => switchPlaytestStageView('video'));
+      document.getElementById('btn-pt-view-frames')?.addEventListener('click', () => switchPlaytestStageView('frames'));
+
+      // Unified Replay Transport Controls
+      document.getElementById('btn-pt-step-first')?.addEventListener('click', () => {
+        stopPlaytestFramesPlayback();
+        renderPlaytestTurnAtIndex(0, { syncVideo: _playtestViewMode === 'video', scrollTurnRow: true });
+      });
+      document.getElementById('btn-pt-step-prev')?.addEventListener('click', () => {
+        stopPlaytestFramesPlayback();
+        renderPlaytestTurnAtIndex(_playtestCurrentTurnIdx - 1, { syncVideo: _playtestViewMode === 'video', scrollTurnRow: true });
+      });
+      document.getElementById('btn-pt-step-next')?.addEventListener('click', () => {
+        stopPlaytestFramesPlayback();
+        renderPlaytestTurnAtIndex(_playtestCurrentTurnIdx + 1, { syncVideo: _playtestViewMode === 'video', scrollTurnRow: true });
+      });
+      document.getElementById('btn-pt-step-last')?.addEventListener('click', () => {
+        stopPlaytestFramesPlayback();
+        const turns = Array.isArray(_playtestCurrentDetail?.turns) ? _playtestCurrentDetail.turns : [];
+        if (turns.length > 0) {
+          renderPlaytestTurnAtIndex(turns.length - 1, { syncVideo: _playtestViewMode === 'video', scrollTurnRow: true });
+        }
+      });
+      document.getElementById('btn-pt-replay-playpause')?.addEventListener('click', () => {
+        const sess = _playtestCurrentDetail?.session;
+        const turns = Array.isArray(_playtestCurrentDetail?.turns) ? _playtestCurrentDetail.turns : [];
+        if (_playtestViewMode === 'video') {
+          const vidEl = document.getElementById('pt-replay-video');
+          if (vidEl && vidEl.src && sess?.has_video) {
+            if (vidEl.paused || vidEl.ended) {
+              vidEl.playbackRate = _playtestPlaybackSpeed;
+              vidEl.play().catch(() => {});
+            } else {
+              vidEl.pause();
+            }
+          } else if (turns.length > 0) {
+            switchPlaytestStageView('frames');
+            startPlaytestFramesPlayback();
+          }
+        } else if (_playtestViewMode === 'frames') {
+          if (_playtestFramesTimer) stopPlaytestFramesPlayback();
+          else startPlaytestFramesPlayback();
+        }
+      });
+
+      document.getElementById('pt-turn-scrubber')?.addEventListener('input', (e) => {
+        stopPlaytestFramesPlayback();
+        const targetIdx = Math.max(0, Number(e.target.value || 1) - 1);
+        renderPlaytestTurnAtIndex(targetIdx, { syncVideo: _playtestViewMode === 'video', scrollTurnRow: true });
+      });
+
+      document.querySelectorAll('.pt-speed-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          setPlaytestPlaybackSpeed(Number(btn.getAttribute('data-pt-speed') || 1));
+        });
+      });
 
       const obsTabs = Array.from(document.querySelectorAll('.pt-obs-tab'));
       obsTabs.forEach((btn, idx) => {
@@ -11284,13 +12979,35 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
         if (ids.length > 0) window.dispatchPlaytestWishes(ids);
       });
 
-      // Optional Auto-Pause on Feedback Markers during Replay Video playback
+      // Synchronize Turn Scrubber + Optional Auto-Pause on Feedback Markers during Replay Video playback
       const vidEl = document.getElementById('pt-replay-video');
       if (vidEl) {
+        vidEl.addEventListener('loadedmetadata', () => {
+          try { vidEl.playbackRate = _playtestPlaybackSpeed; } catch (_) {}
+        });
+        vidEl.addEventListener('play', updateReplayPlayPauseButton);
+        vidEl.addEventListener('pause', updateReplayPlayPauseButton);
+        vidEl.addEventListener('ended', updateReplayPlayPauseButton);
         vidEl.addEventListener('timeupdate', () => {
+          const cur = vidEl.currentTime;
+          if (_playtestViewMode === 'video') {
+            const turns = Array.isArray(_playtestCurrentDetail?.turns) ? _playtestCurrentDetail.turns : [];
+            if (turns.length > 0) {
+              let activeIdx = 0;
+              for (let i = 0; i < turns.length; i++) {
+                if (Number(turns[i].video_timestamp_sec || 0) <= cur + 0.05) {
+                  activeIdx = i;
+                } else {
+                  break;
+                }
+              }
+              if (activeIdx !== _playtestCurrentTurnIdx) {
+                renderPlaytestTurnAtIndex(activeIdx, { syncVideo: false, scrollTurnRow: false });
+              }
+            }
+          }
           const autoPauseEl = document.getElementById('pt-autopause-markers');
           if (!autoPauseEl || !autoPauseEl.checked || vidEl.paused) return;
-          const cur = vidEl.currentTime;
           for (const m of _playtestMarkers) {
             if (Math.abs(cur - m.sec) < 0.22 && _playtestLastAutoPausedMarkerKey !== m.key) {
               _playtestLastAutoPausedMarkerKey = m.key;
@@ -11439,6 +13156,7 @@ No candidate diff pending. Current cartridge code is synchronized with latest Ge
       loadStudioSettingsStatus();
       loadGameBible();
       fetchLiveProductionBoardFallback();
+      loadPlaytestSessions();
       loadArtifacts();
       loadPalette();
       loadDiff();

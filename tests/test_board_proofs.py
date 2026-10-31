@@ -542,3 +542,59 @@ def test_unread_module_guard_verified_disk_diff_and_council_test_script_visibili
     assert "preload('res://main.tscn').instantiate()" in review_txt
 
 
+def test_counterfactual_allows_round_trip_toggle_and_cancellation_trajectories(tmp_path):
+    """Verifies that `capture_filmstrip(..., verify_counterfactual=True)` accepts genuine round-trip
+    mechanics (`S0 -> S1 -> S0`, e.g., open & close UI, select & cancel, jump & land) where scripted
+    player inputs causally diverge from zero-input at an intermediate tick before returning to neutral,
+    while still rejecting dead/no-op input scripts where no captured tick diverges."""
+    import tempfile
+
+    probe = Path(tempfile.mkdtemp(prefix="godot_roundtrip_probe_"))
+    roundtrip_script = '''extends Node2D
+var mode_id: int = 0
+func _ready() -> void:
+	var bg = ColorRect.new()
+	bg.size = Vector2(1280, 720)
+	bg.color = Color(0.12, 0.16, 0.22)
+	add_child(bg)
+func _process(_d: float) -> void:
+	if Input.is_action_pressed("ui_accept"):
+		mode_id = 1
+	elif Input.is_action_pressed("ui_cancel"):
+		mode_id = 0
+func get_state_snapshot() -> Dictionary:
+	return {"mode_id": mode_id, "player_pos": [0.0, 0.0]}
+'''
+    try:
+        (probe / "project.godot").write_text(PROJECT)
+        (probe / "main.tscn").write_text(SCENE)
+        (probe / "main.gd").write_text(roundtrip_script)
+
+        # Round-trip: tick 2 (mode=0) -> press ui_accept -> tick 12 (mode=1) -> press ui_cancel -> tick 24 (mode=0)
+        out_ok = capture_filmstrip(
+            probe,
+            ticks=[2, 12, 24],
+            out_path=tmp_path / "roundtrip_ok.png",
+            input_script=[
+                {"from": 5, "to": 10, "actions": ["ui_accept"]},
+                {"from": 15, "to": 20, "actions": ["ui_cancel"]},
+            ],
+            verify_counterfactual=True,
+        )
+        assert out_ok.is_file()
+
+        # Dead/unwired action (`ui_left` is never read): trajectory [0, 0, 0] matches zero-input [0, 0, 0] -> rejected!
+        with pytest.raises(StudioAgentError) as ei:
+            capture_filmstrip(
+                probe,
+                ticks=[2, 12, 24],
+                out_path=tmp_path / "roundtrip_dead.png",
+                input_script=[{"from": 5, "to": 10, "actions": ["ui_left"]}],
+                verify_counterfactual=True,
+            )
+        assert "Counterfactual QA check failed" in str(ei.value)
+    finally:
+        shutil.rmtree(probe, ignore_errors=True)
+
+
+

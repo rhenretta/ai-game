@@ -1854,6 +1854,493 @@ def test_new_game_preempts_paused_old_candidate_build(tmp_path: Path):
     clear_candidate_build_aborted(cand_old)
 
 
+def test_drain_backlog_handles_concurrent_worker_failure_during_review_and_cancelled_dependents(tmp_path):
+    """Regression test:
+    1. When a background worker transitions an item (`task_b`) to `state='failed'` (`failure_count=1`) while
+       `_run_review_round` is synchronously reviewing `task_a` (with `task_c` blocked on `task_b` and
+       `scheduler.running_count() == 0`), `_drain_backlog` must NOT throw 'Backlog cannot drain: remaining items
+       are blocked with nothing in flight'—it must re-queue `task_b` and drain all items cleanly.
+    2. When the Council issues `CapDecision(action='cancel')` on a `needs_decision` item, `_drain_backlog`
+       unblocks any `blocked_by_cancelled()` downstream dependents instead of deadlocking.
+    3. `_format_worker_failure_excerpt` preserves the head of long `StudioAgentError` QA gate messages.
+    """
+    from engine.studio.models import CapDecision, GameBibleSpec, ReviewBatch, ReviewDecision, WorkItemProposal
+    from engine.studio.workers import _format_worker_failure_excerpt
+    from engine.studio.writers_room import CreativeWritersRoom
+
+    long_err = (
+        "Traceback (most recent call last):\n"
+        "  File \"workers.py\", line 3910, in run_task_lead\n"
+        "engine.studio.models.StudioAgentError: Task Lead for 'task_b' exhausted 6 turns with failing QA gate: "
+        "ERROR from qa_test_engineer: Counterfactual QA check failed: specific root-cause headline here. "
+        + ("frame_telemetry_padding " * 60)
+    )
+    excerpt = _format_worker_failure_excerpt(long_err, max_chars=400)
+    assert excerpt.startswith("engine.studio.models.StudioAgentError: Task Lead for 'task_b'")
+    assert "specific root-cause headline here" in excerpt
+
+    def _mk_prop(iid: str, deps: Optional[List[str]] = None, mods: Optional[List[str]] = None) -> WorkItemProposal:
+        return WorkItemProposal(
+            deliberation=f"Proposal for {iid}",
+            item_id=iid,
+            kind="mechanic_code",
+            title=f"Title {iid}",
+            spec=f"Spec for {iid}",
+            proof_spec="Filmstrip",
+            depends_on=list(deps or []),
+            target_modules=list(mods or []),
+        )
+
+    board = ProductionBoard(tmp_path / "backlog.json", default_max_revisions=1)
+    board.add_items(
+        [
+            _mk_prop("task_a", mods=["a.gd"]),
+            _mk_prop("task_b", mods=["b.gd"]),
+            _mk_prop("task_c", deps=["task_b"], mods=["c.gd"]),
+            _mk_prop("opt_prereq", mods=["opt.gd"]),
+            _mk_prop("dep_after_opt", deps=["opt_prereq"], mods=["dep.gd"]),
+        ],
+        "GameplaySystemsEngineer",
+    )
+
+    attempts: Dict[str, int] = {"task_b": 0, "opt_prereq": 0}
+    review_entered = threading.Event()
+    allow_review_finish = threading.Event()
+
+    def _mechanic_handler(item: WorkItem) -> WorkerResult:
+        if item.item_id == "task_b":
+            attempts["task_b"] += 1
+            if attempts["task_b"] == 1:
+                review_entered.wait(timeout=3.0)
+                raise StudioAgentError("Transient first-attempt QA failure on task_b")
+        return WorkerResult(notes=f"completed {item.item_id}")
+
+    scheduler = BoardScheduler(board, {"mechanic_code": _mechanic_handler}, max_workers=2, poll_interval=0.01)
+
+    class _ReviewMockClient:
+        pass
+
+    room = CreativeWritersRoom(
+        client=_ReviewMockClient(),
+        board=board,
+        scheduler=scheduler,
+        drain_poll_s=0.02,
+        drain_timeout_s=10.0,
+    )
+    room.max_assembly_passes = 0
+    room.max_blind_playtest_passes = 0
+
+    def _fake_review_as(role, awaiting, deciding, *args, **kwargs):
+        if any(i.item_id == "task_a" for i in awaiting) and attempts["task_b"] <= 1:
+            review_entered.set()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if board.get("task_b").state == "failed" and scheduler.running_count() == 0:
+                    break
+                time.sleep(0.01)
+            allow_review_finish.set()
+        rev_decs = []
+        for it in awaiting:
+            if it.item_id == "opt_prereq":
+                rev_decs.append(
+                    ReviewDecision(
+                        deliberation="Reject opt_prereq so it hits revision cap and escalates.",
+                        item_id=it.item_id,
+                        feedback="Unneeded optional module.",
+                        verdict="request_changes",
+                    )
+                )
+            else:
+                rev_decs.append(
+                    ReviewDecision(
+                        deliberation="Looks solid.",
+                        item_id=it.item_id,
+                        feedback="",
+                        verdict="approve",
+                    )
+                )
+        cap_decs = [
+            CapDecision(
+                deliberation="Cancel optional prerequisite; downstream item can proceed independently.",
+                item_id=it.item_id,
+                action="cancel",
+            )
+            for it in deciding
+        ]
+        return ReviewBatch(
+            deliberation="Review round completed.",
+            spoken_dialogue="Reviewed.",
+            review_decisions=rev_decs,
+            cap_decisions=cap_decs,
+        )
+
+    room._review_as = _fake_review_as  # type: ignore[method-assign]
+    bible = GameBibleSpec(
+        deliberation="Test bible",
+        game_title="Test Drain Resilience",
+        elevator_pitch="Resilience test",
+        core_genre="Simulation",
+        status="in_production",
+    )
+
+    try:
+        room._drain_backlog(bible, "Test DNA", tmp_path)
+    finally:
+        scheduler.stop()
+
+    assert board.is_drained()
+    assert attempts["task_b"] == 2
+    assert board.get("task_a").state == "approved"
+    assert board.get("task_b").state == "approved"
+    assert board.get("task_c").state == "approved"
+    assert board.get("opt_prereq").state == "cancelled"
+    assert board.get("dep_after_opt").state == "approved"
+
+
+def test_blind_playtest_mode_skips_scripted_qa_playthrough_wrapper(tmp_path):
+    """Verifies that when the end-of-slice Blind AI Playtester is enabled, `_run_slice_assembly_check`
+    runs fast static entrypoint reachability + zero-input boot sanity (`input_script=[]`), skips generating
+    any `tests/test_slice_playtest_*.gd` wrapper script or `SlicePlaytestRoundtableTurn` LLM calls, and
+    returns 0 so `_drain_backlog` hands straight off to `_run_end_of_slice_blind_playtest`."""
+    from types import SimpleNamespace
+    from engine.studio.models import GameBibleSpec, GameSliceSpec
+    from engine.studio.writers_room import CreativeWritersRoom
+
+    (tmp_path / "project.godot").write_text(
+        '[application]\nconfig/name="SanityTest"\nrun/main_scene="res://main.tscn"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "main.tscn").write_text(
+        '[gd_scene load_steps=2 format=3]\n'
+        '[ext_resource type="Script" path="res://main.gd" id="1"]\n'
+        '[node name="Main" type="Node2D"]\n'
+        'script = ExtResource("1")\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "main.gd").write_text("extends Node2D\nfunc get_state_snapshot() -> Dictionary:\n\treturn {'ok': true}\n", encoding="utf-8")
+
+    llm_calls: list[str] = []
+
+    def _forbid_llm(*_a, **_kw):
+        llm_calls.append("called")
+        raise AssertionError("Scripted QA playtest planner / roundtable LLM must not be called when Blind Playtester takes over")
+
+    live_like_client = SimpleNamespace(models=SimpleNamespace(generate_content=_forbid_llm))
+    board = ProductionBoard(tmp_path / "backlog.json")
+    events: list[tuple[str, dict]] = []
+    room = CreativeWritersRoom(
+        client=live_like_client,
+        board=board,
+        event_callback=lambda et, payload: events.append((et, payload)),
+    )
+    room.enable_end_of_slice_blind_playtest = True
+
+    bible = GameBibleSpec(
+        deliberation="d",
+        game_title="Sanity Game",
+        core_genre="Simulation",
+        slice_roadmap=[
+            GameSliceSpec(
+                deliberation="d",
+                slice_id="slice_0_core",
+                slice_index=0,
+                title="Slice 0",
+                slice_objective="Core loop",
+                player_acclimation_and_mechanics_focus="Controls",
+                status="active",
+            )
+        ],
+        active_slice_index=0,
+    )
+
+    spawned = room._run_slice_assembly_check(bible, "Player DNA", tmp_path, pass_index=0)
+    assert spawned == 0
+    assert llm_calls == []
+    assert not list((tmp_path / "tests").glob("test_slice_playtest_*.gd")) if (tmp_path / "tests").exists() else True
+    completed_ev = [p for et, p in events if et == "slice_assembly_check_completed"]
+    assert len(completed_ev) == 1
+    assert completed_ev[0]["is_slice_assembled"] is True
+    assert completed_ev[0]["mode"] == "static_boot_sanity"
+
+
+def test_task_lead_archives_prior_failed_trace_and_timeline_exposes_retries(tmp_path):
+    """Verifies that when a prior Task Lead attempt leaves `lead_trace_rev0.json` with `status='failed'`,
+    the auto-retried `run_task_lead` archives it as `lead_trace_rev0_failed1.json` instead of clobbering it,
+    and `/api/studio/board-item/{item_id}/timeline` returns both Attempt #1 (`is_failed_retry=True`) and
+    Attempt #2 (`is_failed_retry=False`)."""
+    import json
+    from starlette.testclient import TestClient
+    from engine.studio.models import SpecialistReport, TaskLeadDecision, WorkItemProposal
+    from engine.studio.workers import WorkerContext, run_task_lead
+    from engine.ui.server import create_app
+
+    cand_dir = tmp_path / "cartridges" / "candidate_genesis_retry"
+    work_dir = cand_dir / "artifacts" / "work_items" / "item_retry_demo"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (cand_dir / "game_bible.json").write_text(
+        json.dumps({"deliberation": "d", "game_title": "Retry Demo", "core_genre": "Puzzle"}),
+        encoding="utf-8",
+    )
+    proof_img = work_dir / "proof_ok.png"
+    from PIL import Image
+    Image.new("RGB", (32, 32), (10, 120, 80)).save(proof_img, "PNG")
+
+    board = ProductionBoard(cand_dir / "backlog.json")
+    board.add_items(
+        [
+            WorkItemProposal(
+                deliberation="d",
+                item_id="item_retry_demo",
+                kind="mechanic_code",
+                title="Retry Demo Task",
+                spec="Implement mechanic",
+                proof_spec="Verify mechanic",
+                target_modules=["mechanics.gd"],
+            )
+        ],
+        raised_by_role="GameplaySystemsEngineer",
+    )
+    item = board.claim_ready()[0]
+
+    # Seed Attempt #1's failed trace on disk
+    (work_dir / "lead_trace_rev0.json").write_text(
+        json.dumps(
+            {
+                "item_id": "item_retry_demo",
+                "revision": 0,
+                "status": "failed",
+                "current_strategy": "Attempt 1 strategy",
+                "turns": [
+                    SpecialistReport(
+                        specialist_agent="qa_test_engineer",
+                        turn_index=0,
+                        brief="Run QA",
+                        summary="ERROR from qa_test_engineer: Entrypoint Parity Gate failed",
+                        verification_passed=False,
+                    ).model_dump()
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Attempt #2 succeeds on turn 0 -> submits on turn 1
+    decisions = iter(
+        [
+            TaskLeadDecision(
+                deliberation="Fix mechanic",
+                current_strategy="Attempt 2 strategy",
+                proof_strategy="Capture clean proof",
+                specialist_agent="swe_engineer",
+                brief="Fix wiring",
+                target_paths=["mechanics.gd"],
+                action="delegate",
+            ),
+            TaskLeadDecision(
+                deliberation="Submit verified result",
+                current_strategy="Attempt 2 strategy",
+                proof_strategy="Capture clean proof",
+                submission_summary="Fixed and verified",
+                selected_proof_images=[str(proof_img)],
+                action="submit_to_council",
+            ),
+        ]
+    )
+
+    import engine.studio.workers as workers_mod
+    orig_decide = workers_mod.plan_task_lead_turn
+    orig_dispatch = workers_mod._dispatch_to_specialist
+    try:
+        workers_mod.plan_task_lead_turn = lambda *_a, **_kw: next(decisions)
+        workers_mod._dispatch_to_specialist = lambda *_a, **_kw: SpecialistReport(
+            specialist_agent="swe_engineer",
+            turn_index=0,
+            brief="Fix wiring",
+            summary="Implemented fix cleanly",
+            touched_files=["mechanics.gd"],
+            proof_images=[str(proof_img)],
+            verification_passed=True,
+        )
+        ctx = WorkerContext(cartridge_dir=cand_dir, client=object(), model_name="test-model", board=board)
+        res = run_task_lead(ctx, item, max_turns=3)
+    finally:
+        workers_mod.plan_task_lead_turn = orig_decide
+        workers_mod._dispatch_to_specialist = orig_dispatch
+
+    assert res.proof_images == [str(proof_img)]
+    assert (work_dir / "lead_trace_rev0_failed1.json").is_file()
+    assert (work_dir / "lead_trace_rev0.json").is_file()
+
+    app = create_app(cartridges_root=tmp_path / "cartridges", db_path=tmp_path / "telemetry.db")
+    with TestClient(app) as tc:
+        resp = tc.get("/api/studio/board-item/item_retry_demo/chronology?cartridge=candidate_genesis_retry")
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert len(payload["attempts"]) == 2
+        assert payload["attempts"][0]["attempt_number"] == 1
+        assert payload["attempts"][0]["is_failed_retry"] is True
+        assert payload["attempts"][0]["status"] == "failed"
+        assert "Entrypoint Parity Gate failed" in payload["attempts"][0]["turns"][0]["summary"]
+        assert payload["attempts"][1]["attempt_number"] == 2
+        assert payload["attempts"][1]["is_failed_retry"] is False
+        assert payload["attempts"][1]["status"] == "submitted"
+
+
+def test_paused_resumed_item_skips_council_reshaping_and_reports_resumed_turn_index(tmp_path: Path) -> None:
+    """When an item yields mid-execution (e.g., on Pause after Turn #1) back to state='ready', resuming must:
+    1) NOT treat it as an unstarted item for Council Task Shaping or `action='split'` decomposition, and
+    2) emit `resumed=True` and `resumed_turn_index=1` on `backlog_item_started`."""
+    from engine.studio import writers_room as wr_mod
+    from engine.studio.models import SpecialistReport, WorkItemProposal, WorkItemRefinement
+    import json
+
+    cand_dir = tmp_path / "cartridges" / "candidate_resume_shape"
+    cand_dir.mkdir(parents=True, exist_ok=True)
+    events: list[tuple[str, dict]] = []
+    board = ProductionBoard(
+        path=cand_dir / "backlog.json",
+        event_callback=lambda ev_type, payload: events.append((ev_type, payload)),
+    )
+    board.add_items(
+        [
+            WorkItemProposal(
+                deliberation="Spawned follow-up integration task.",
+                item_id="integration_followup_fix",
+                kind="integration",
+                title="Follow-up Integration Fix",
+                spec="Wire subsystem interaction cleanly.",
+                proof_spec="Filmstrip verifying end-to-end flow.",
+                target_modules=["main.gd"],
+            )
+        ],
+        raised_by_role="GameplaySystemsEngineer",
+    )
+
+    # Simulate Turn #1 completed and saved to lead_trace_rev0.json before operator paused the build
+    work_dir = cand_dir / "artifacts" / "work_items" / "integration_followup_fix"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    turn0 = SpecialistReport(
+        deliberation="SWE completed Turn #1.",
+        turn_index=0,
+        specialist_agent="swe_engineer",
+        brief="Implement fix in main.gd.",
+        summary="Verified modified main.gd.",
+        touched_files=["main.gd"],
+        verification_passed=True,
+    )
+    (work_dir / "lead_trace_rev0.json").write_text(
+        json.dumps(
+            {
+                "item_id": "integration_followup_fix",
+                "revision": 0,
+                "status": "yielded",
+                "turns": [turn0.model_dump()],
+                "collected_proofs": [],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    assert board.has_prior_execution_activity("integration_followup_fix") is True
+
+    # Splitting a task that already has completed worker turns must be rejected
+    split_issues = board.validate_refinements(
+        [
+            WorkItemRefinement(
+                deliberation="Attempt to split an already-started task.",
+                item_id="integration_followup_fix",
+                split_items=[
+                    WorkItemProposal(
+                        deliberation="Subtask A",
+                        item_id="sub_a",
+                        kind="mechanic_code",
+                        title="Sub A",
+                        spec="Spec A",
+                        proof_spec="Proof A",
+                        target_modules=["scenes/mechanics/a.gd"],
+                    )
+                ],
+                action="split",
+            )
+        ]
+    )
+    assert any("already started worker execution" in msg for msg in split_issues)
+
+    # CreativeWritersRoom must not select this item for pre-execution domain shaping
+    room = wr_mod.CreativeWritersRoom(client=None, board=board)
+    item_obj = board.get("integration_followup_fix")
+    assert room._has_started_execution(item_obj, candidate_dir=cand_dir) is True
+    assert room._items_needing_domain_direction("UXExperienceDesigner", candidate_dir=cand_dir) == []
+
+    # Claiming the item again emits resumed=True and resumed_turn_index=1 (Turn #2)
+    claimed = board.claim_ready(limit=1)
+    assert len(claimed) == 1
+    started_evs = [p for et, p in events if et == "backlog_item_started" and p.get("item_id") == "integration_followup_fix"]
+    assert len(started_evs) == 1
+    assert started_evs[0]["resumed"] is True
+    assert started_evs[0]["resumed_turn_index"] == 1
+
+
+def test_qa_specialist_rejects_self_recursive_test_script(tmp_path: Path) -> None:
+    """Rejects QA test scripts that call `load()` or `preload()` on their own `.gd`/`.tscn` path (preventing infinite `_ready()` recursion)."""
+    from types import SimpleNamespace
+    from engine.studio import workers as workers_mod
+    from engine.studio.models import FilmstripPlan, StudioAgentError, WorkItemProposal
+
+    cand_dir = tmp_path / "cartridge_recursive_qa"
+    cand_dir.mkdir(parents=True, exist_ok=True)
+    (cand_dir / "project.godot").write_text("[application]\nrun/main_scene=\"res://main.tscn\"\n", encoding="utf-8")
+    (cand_dir / "main.tscn").write_text("[gd_scene format=3]\n[node name=\"Main\" type=\"Node2D\"]\n", encoding="utf-8")
+
+    board = ProductionBoard()
+    [item] = board.add_items(
+        [
+            WorkItemProposal(
+                deliberation="Integration verification item.",
+                item_id="integration_demo_self_ref",
+                kind="integration",
+                title="Integration Demo",
+                spec="Verify integration.",
+                proof_spec="Capture filmstrip.",
+                target_modules=["main.gd"],
+            )
+        ],
+        raised_by_role="GameplaySystemsEngineer",
+    )
+
+    recursive_plan = FilmstripPlan(
+        deliberation="Authoring QA wrapper scene.",
+        target_scene="res://tests/test_integration_demo_self_ref.tscn",
+        test_scene_gd_content=(
+            "extends Node2D\n"
+            "func _ready() -> void:\n"
+            "\tvar overlay = Node2D.new()\n"
+            "\toverlay.set_script(load(\"res://tests/test_integration_demo_self_ref.gd\"))\n"
+            "\tadd_child(overlay)\n"
+        ),
+        capture_ticks=[1, 30, 60],
+        input_segments=[],
+    )
+
+    ctx = workers_mod.WorkerContext(
+        cartridge_dir=cand_dir,
+        client=SimpleNamespace(),
+        model_name="test-model",
+        board=board,
+    )
+    orig_plan_fn = workers_mod.plan_filmstrip
+    workers_mod.plan_filmstrip = lambda *_a, **_kw: recursive_plan
+    try:
+        with pytest.raises(StudioAgentError, match="Self-recursive QA test script rejected"):
+            workers_mod.run_qa_test_engineer_specialist(ctx, item, brief="Verify integration")
+    finally:
+        workers_mod.plan_filmstrip = orig_plan_fn
+
+
+
+
+
 
 
 

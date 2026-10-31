@@ -26,10 +26,14 @@ from engine.playtest.godot_bridge import TurnObservation
 from engine.playtest.models import (
     IMPRESSION_PILLAR_LABELS,
     BlindStoreCard,
+    PlaytestBugReport,
     PlaytestBudgetExceededError,
     PlaytestCompactedJournal,
     PlaytestExperienceReport,
+    PlaytestFieldNoteUpdate,
     PlaytestImpressionUpdate,
+    PlaytestMoodNote,
+    PlaytestQuestionUpdate,
     PlaytestRulebookUpdate,
     PlaytestSessionConfig,
     PlaytestTokenTracker,
@@ -41,13 +45,47 @@ from engine.studio.models import (
     StudioAgentConfigurationError,
     StudioAgentError,
     _sanitize_gemini_json_schema,
-    bounded_thinking_config,
     is_transient_gemini_error,
 )
 
 logger = logging.getLogger("BlindPlaytesterAgent")
 
 UNCHANGED_FRAME_MSE_THRESHOLD = 0.0005
+
+
+def _playtest_non_thinking_config(model_name: str) -> Any:
+    """Returns a non-thinking / minimal-latency ThinkingConfig tailored to `model_name`.
+    - `gemini-3.5-flash-lite` / `gemini-3.1-flash-lite`: uses `ThinkingLevel.MINIMAL` (zero thought tokens).
+    - `gemini-3.8-flash`: uses `thinking_budget=0` (`MINIMAL` enum is rejected on 3.8-flash).
+    All player reasoning is emitted directly in the Rationale-First `deliberation` JSON property (Rule 4).
+    """
+    try:
+        from google.genai import types
+        thinking_cls = getattr(types, "ThinkingConfig", None)
+        if thinking_cls is None:
+            return None
+        m_low = (model_name or "").strip().lower()
+        thinking_lvl = getattr(types, "ThinkingLevel", None)
+        if "flash-lite" in m_low and thinking_lvl is not None and hasattr(thinking_lvl, "MINIMAL"):
+            return thinking_cls(thinking_level=thinking_lvl.MINIMAL)
+        return thinking_cls(thinking_budget=0)
+    except Exception:
+        return None
+
+
+def _ensure_schema_fields_required(schema_dict: Dict[str, Any], fields: List[str]) -> Dict[str, Any]:
+    """Ensures `fields` present in `schema_dict['properties']` are listed in `schema_dict['required']`
+    for live Gemini structured generation while preserving Python model defaults for unit tests.
+    """
+    props = schema_dict.get("properties")
+    if not isinstance(props, dict):
+        return schema_dict
+    req = list(schema_dict.get("required") or [])
+    for f_name in fields:
+        if f_name in props and f_name not in req:
+            req.append(f_name)
+    schema_dict["required"] = req
+    return schema_dict
 
 
 def _read_dotenv_api_key(dotenv_path: Optional[Path] = None) -> str:
@@ -235,9 +273,8 @@ def build_blind_player_system_prompt(store_card: BlindStoreCard) -> str:
         f"Store Page Description: {desc_line}\n\n"
         "You have no manual, walkthrough, or knowledge of how the game was built—only what you see on the "
         "screen (including your white pointer arrow cursor and any in-game cursor or UI) and hear in the game audio. "
-        "Figure out how to play naturally, experiment with the world at a human pace, and form an honest, nuanced "
-        "impression of the whole player experience: graphics & visual clarity, gameplay & feel, sound & audio feedback, "
-        "intuitiveness & controls, goals & sense of accomplishment, and world/story atmosphere.\n\n"
+        "Figure out how to play naturally, experiment with the world at a human pace, notice when things change or feel "
+        "off, and form an honest, nuanced impression of the whole player experience.\n\n"
         "CONTROLLER INTERFACE:\n"
         "- Mouse (Normalized 0..1000 Coordinates): Both X and Y use standard normalized 0..1000 image coordinates "
         "where (0, 0) is top-left, (500, 500) is center, and (1000, 1000) is bottom-right. Set `mouse_x` (0..1000) "
@@ -248,21 +285,29 @@ def build_blind_player_system_prompt(store_card: BlindStoreCard) -> str:
         "set `drag_from_x` and `drag_from_y` (0..1000) to where the drag starts and `mouse_x`/`mouse_y` (0..1000) to where you drag it.\n"
         "- Keyboard: `hold_keys` holds keys across `duration_ms` (350..2000ms); `tap_keys` taps keys briefly.\n"
         "- Visual detail: Set `inspect_high_res_next=true` only when small text or UI details are hard to read.\n\n"
-        "KEEPING YOUR MENTAL NOTES:\n"
-        "- `rulebook_updates`: Whenever you confirm what an input or game element does (including confirming "
-        "a tested key does nothing), record it so your permanent Rulebook stays accurate.\n"
-        "- `current_plan`: Brief note of what you are actively doing across the next few steps.\n"
-        "- `turn_log_entry`: Single compact line noting what happened since your last input and what you are trying next.\n\n"
-        "SPARSE IMPRESSIONS, MOOD SHIFTS, WISHES & STOPPING (DO NOT REPEAT YOURSELF):\n"
-        "- `impression_updates`: Leave empty (`[]`) on most turns! As you play, sparsely build and refine your impression across "
+        "PLAYER FIELD NOTES, QUESTIONS & RULEBOOK:\n"
+        "- `field_note_updates`: Jot brief notes on what you are looking at (screen layout, objects, UI indicators) "
+        "when you notice something new or when an element's state visibly changes.\n"
+        "- `question_updates`: Naturally ask questions as you explore ('What am I looking at?', 'What does X do?', "
+        "'Why is Y like that?') with `status='open'`. Test your questions as you play, and update the same `question_key` "
+        "to `status='answered'` with `answer` ONLY on a subsequent turn once you observe real visual or audio confirmation.\n"
+        "- `rulebook_updates`: Your `motor_action` executes AFTER your turn decision—never assume an action worked on the "
+        "same turn you try it! Wait until the following turn to confirm whether counters, objects, or UI actually changed. "
+        "If clicking or pressing something 2-3 times produces no observable state change, record that it is non-interactive "
+        "or unresponsive and try a different approach rather than repeating the same input.\n"
+        "- `current_plan` & `turn_log_entry`: Track what you are actively doing next and a compact 1-line note on what just happened.\n\n"
+        "MOOD, EVOLVING IMPRESSIONS, BUGS, WISHES & STOPPING:\n"
+        "- `current_mood` & `mood_shift`: Keep `current_mood` steady across routine exploration and ordinary clicks—do NOT "
+        "flip back and forth on minor steps. Leave `mood_shift` null on almost all turns, populating it ONLY at genuine "
+        "emotional turning points (e.g., delight at a real breakthrough, surprise, mounting confusion, boredom, or frustration when stuck).\n"
+        "- `impression_updates`: Leave empty (`[]`) on most turns. Build and revise your impression across "
         "`graphics_and_visuals`, `gameplay_and_feel`, `sound_and_audio`, `intuitiveness_and_controls`, `goals_and_pacing`, "
-        "and `world_and_atmosphere`. Emit an update ONLY when you genuinely form a new impression or revise an earlier one—never "
-        "repeat or rephrase what is already recorded in your Running Impressions.\n"
-        "- `mood_shift`: Leave `null` on most turns. Emit a `mood_shift` ONLY when your mood or understanding "
-        "genuinely changes, explaining why in 1-2 short, direct sentences without repeating earlier notes.\n"
-        "- `submit_wish`: Leave `null` on most turns. File a concrete player wish whenever you hit real control/UX confusion, "
-        "missing visual/audio feedback, gameplay friction, or something you genuinely wish worked better—never file duplicate wishes.\n"
-        "- `end_playtest`: Populate when you complete the available objectives/content or conclude you cannot progress any further."
+        "and `world_and_atmosphere`. Early impressions are tentative—if anything changes as you keep playing, revise your "
+        "earlier note rather than letting a stale first impression stand, and never repeat unchanged notes.\n"
+        "- `bug_reports`: Keep an eye out for bugs, glitches, overlapping/raw UI, unresponsive controls, or things that behave "
+        "brokenly along the way, logging each distinct issue once without duplicating earlier bug entries.\n"
+        "- `submit_wish`: File a concrete player wish whenever you hit UX/design friction or wish something worked better—never duplicate wishes.\n"
+        "- `end_playtest`: Populate once you complete the available objectives/content or confirm after testing distinct ideas that you cannot progress any further."
     )
 
 
@@ -285,20 +330,38 @@ class BlindPlaytesterAgent:
         )
 
         self.system_prompt: str = build_blind_player_system_prompt(self.store_card)
-        self.turn_schema: Dict[str, Any] = _sanitize_gemini_json_schema(
-            copy.deepcopy(PlaytestTurnDecision.model_json_schema())
+        self.turn_schema: Dict[str, Any] = _ensure_schema_fields_required(
+            _sanitize_gemini_json_schema(copy.deepcopy(PlaytestTurnDecision.model_json_schema())),
+            [
+                "field_note_updates",
+                "question_updates",
+                "rulebook_updates",
+                "bug_reports",
+                "impression_updates",
+                "current_mood",
+            ],
         )
         self.compaction_schema: Dict[str, Any] = _sanitize_gemini_json_schema(
             copy.deepcopy(PlaytestCompactedJournal.model_json_schema())
         )
-        self.report_schema: Dict[str, Any] = _sanitize_gemini_json_schema(
-            copy.deepcopy(PlaytestExperienceReport.model_json_schema())
+        self.report_schema: Dict[str, Any] = _ensure_schema_fields_required(
+            _sanitize_gemini_json_schema(copy.deepcopy(PlaytestExperienceReport.model_json_schema())),
+            [
+                "key_highlights",
+                "key_pain_points",
+                "bugs_and_glitches_observed",
+                "unanswered_questions_and_mysteries",
+            ],
         )
 
-        # Permanent deterministic How-To-Play Rulebook & Pillar Impressions (NEVER summarized away)
+        # Permanent deterministic player notebook (NEVER summarized away across compactions)
         self.rulebook: Dict[str, str] = {}
+        self.field_notes: Dict[str, str] = {}
+        self.questions: Dict[str, Dict[str, Any]] = {}
+        self.bugs_found: Dict[str, Dict[str, Any]] = {}
         self.impressions: Dict[str, str] = {}
         self.filed_wish_summaries: List[str] = []
+        self.mood_history: List[Dict[str, Any]] = []
         # Episodic history summary (refreshed every compaction_interval_turns)
         self.compacted_journal: Optional[PlaytestCompactedJournal] = None
         self.compaction_count: int = 0
@@ -313,12 +376,18 @@ class BlindPlaytesterAgent:
         self.current_mood: str = "curious"
         self.inspect_high_res_next: bool = False
         self.prev_observation: Optional[TurnObservation] = None
+        self._last_click_spot: Optional[Tuple[float, float, str]] = None
+        self._same_spot_click_streak: int = 0
 
     def reset_memory(self) -> None:
-        """Clears all player memory, rulebook, impressions, and append-only turn tape for a clean Reset."""
+        """Clears all player memory, rulebook, notes, questions, bugs, impressions, and turn tape for a clean Reset."""
         self.rulebook.clear()
+        self.field_notes.clear()
+        self.questions.clear()
+        self.bugs_found.clear()
         self.impressions.clear()
         self.filed_wish_summaries.clear()
+        self.mood_history.clear()
         self.compacted_journal = None
         self.compaction_count = 0
         self.covered_up_to_turn = 0
@@ -328,9 +397,12 @@ class BlindPlaytesterAgent:
         self.current_mood = "curious"
         self.inspect_high_res_next = False
         self.prev_observation = None
+        self._last_click_spot = None
+        self._same_spot_click_streak = 0
 
     def _render_epoch_header_text(self) -> str:
-        """Renders `[Block 1A — Permanent Rulebook & Impressions] + [Block 1B — Compacted Episodic Journal]`.
+        """Renders `[Block 1A — Permanent Notebook (Rulebook, Notes, Questions, Bugs, Impressions)]`
+        + `[Block 1B — Compacted Episodic Journal]`.
         Frozen across all turns of the current epoch so byte-0 prefix caching stays 100% invariant.
         """
         lines: List[str] = ["=== PLAYER PERMANENT HOW-TO-PLAY RULEBOOK (CONFIRMED SO FAR) ==="]
@@ -341,7 +413,38 @@ class BlindPlaytesterAgent:
                 lines.append(f"- {k}: {v}")
 
         lines.append("")
-        lines.append("=== PLAYER RUNNING IMPRESSIONS (SPARSE — DO NOT REPEAT UNCHANGED NOTES) ===")
+        lines.append("=== PLAYER FIELD NOTES (WHAT YOU HAVE OBSERVED ON SCREEN) ===")
+        if not self.field_notes:
+            lines.append("- (No screen observations recorded yet.)")
+        else:
+            for topic, obs_note in self.field_notes.items():
+                lines.append(f"- {topic}: {obs_note}")
+
+        lines.append("")
+        lines.append("=== PLAYER QUESTIONS & DISCOVERED ANSWERS ===")
+        if not self.questions:
+            lines.append("- (No player questions logged yet.)")
+        else:
+            for q_key, q_entry in self.questions.items():
+                q_txt = q_entry.get("question", "")
+                if q_entry.get("status") == "answered" and q_entry.get("answer"):
+                    lines.append(f"- [ANSWERED] ({q_key}) {q_txt} -> {q_entry['answer']}")
+                else:
+                    lines.append(f"- [OPEN] ({q_key}) {q_txt}")
+
+        lines.append("")
+        lines.append("=== BUGS & GLITCHES SPOTTED SO FAR ===")
+        if not self.bugs_found:
+            lines.append("- (No bugs or glitches logged yet.)")
+        else:
+            for b_key, b_entry in self.bugs_found.items():
+                lines.append(
+                    f"- [{b_entry.get('severity', 'major').upper()} | {b_entry.get('category', 'bug')}] "
+                    f"({b_key}) {b_entry.get('summary', '')}: {b_entry.get('details', '')}"
+                )
+
+        lines.append("")
+        lines.append("=== PLAYER RUNNING IMPRESSIONS (REVISE IF THINGS CHANGE — DO NOT REPEAT UNCHANGED) ===")
         if not self.impressions:
             lines.append("- (No experience pillar impressions recorded yet.)")
         else:
@@ -398,7 +501,7 @@ class BlindPlaytesterAgent:
                 )
             )
 
-        # Determine visual delta against prior turn
+        # Determine visual & perceptual deltas against prior turn
         frame_mse = 1.0
         cursor_delta = 999.0
         if self.prev_observation is not None:
@@ -412,6 +515,13 @@ class BlindPlaytesterAgent:
             and frame_mse < UNCHANGED_FRAME_MSE_THRESHOLD
             and cursor_delta < 1.0
         )
+        cur_audio_silent = bool(obs.audio_is_silent or obs.wav_path is None)
+        audio_became_silent = (
+            self.config.enable_audio_perception
+            and self.prev_observation is not None
+            and not bool(self.prev_observation.audio_is_silent or self.prev_observation.wav_path is None)
+            and cur_audio_silent
+        )
 
         norm_cx = normalize_screen_x(obs.cursor_x)
         norm_cy = normalize_screen_y(obs.cursor_y)
@@ -424,6 +534,30 @@ class BlindPlaytesterAgent:
             f"Your Current Mood: {self.current_mood}",
             f"What You Were Actively Doing (Current Plan): {self.current_plan}",
         ]
+        if self.field_notes:
+            fn_brief = " | ".join(f"{k}: {v}" for k, v in list(self.field_notes.items())[-10:])
+            status_lines.append(f"Your Field Notes So Far: {fn_brief}")
+        if self.questions:
+            open_qs = [
+                f"[{k}] {q['question']}"
+                for k, q in self.questions.items()
+                if q.get("status") != "answered"
+            ]
+            ans_qs = [
+                f"[{k}] {q['question']} -> {q.get('answer', '')}"
+                for k, q in self.questions.items()
+                if q.get("status") == "answered"
+            ]
+            if open_qs:
+                status_lines.append(f"Open Questions You Are Trying To Answer: {' | '.join(open_qs[-8:])}")
+            if ans_qs:
+                status_lines.append(f"Questions Already Answered: {' | '.join(ans_qs[-6:])}")
+        if self.bugs_found:
+            bug_brief = "; ".join(
+                f"[{b.get('category')}/{b.get('severity')}] ({k}) {b.get('summary')}"
+                for k, b in list(self.bugs_found.items())[-10:]
+            )
+            status_lines.append(f"Bugs & Glitches Already Logged (do NOT duplicate): {bug_brief}")
         if self.impressions:
             imp_brief = " | ".join(f"{k}: {v}" for k, v in self.impressions.items())
             status_lines.append(f"Your Recorded Impressions So Far (only update if changed): {imp_brief}")
@@ -437,12 +571,14 @@ class BlindPlaytesterAgent:
             status_lines.append(
                 "Visual Delta Note: The screen is visually identical to your previous turn — your last input caused no visible screen change."
             )
-        if not self.config.enable_audio_perception:
-            status_lines.append("Audio Note: Audio perception disabled for this session.")
-        elif obs.audio_is_silent or obs.wav_path is None:
-            status_lines.append("Audio Note: Game audio was silent during this step.")
-        else:
-            status_lines.append(f"Audio Note: Game audio clip attached below (RMS={obs.audio_rms:.3f}).")
+        if self._same_spot_click_streak >= 3 and self._last_click_spot is not None:
+            status_lines.append(
+                f"Action Continuity Note: You have clicked nearly the same spot ({self._last_click_spot[0]:.0f}, {self._last_click_spot[1]:.0f}) "
+                f"{self._same_spot_click_streak} turns in a row. Check carefully whether counters, objects, or UI actually changed—"
+                "if nothing progressed, that spot may be decorative/unresponsive or require a different step."
+            )
+        if audio_became_silent:
+            status_lines.append("Perceptual Change Note: Game audio stopped and is now silent.")
 
         tail_parts.append(types.Part.from_text(text="\n".join(status_lines)))
 
@@ -520,7 +656,7 @@ class BlindPlaytesterAgent:
             response_mime_type="application/json",
             response_schema=self.turn_schema,
             temperature=0.55,
-            thinking_config=bounded_thinking_config(256),
+            thinking_config=_playtest_non_thinking_config(self.config.model_name),
         )
 
         resp = self._call_gemini_resilient(
@@ -536,19 +672,91 @@ class BlindPlaytesterAgent:
 
         decision = PlaytestTurnDecision.model_validate_json(raw_text)
 
-        # 1. Deterministically merge confirmed rulebook & sparse pillar impression updates (never lost across compactions)
+        # 1. Deterministically merge permanent player notebook updates (never lost across compactions)
+        self._apply_field_note_updates(decision.field_note_updates)
+        self._apply_question_updates(turn_index, decision.question_updates)
         self._apply_rulebook_updates(decision.rulebook_updates)
+        self._apply_bug_reports(turn_index, obs, decision.bug_reports)
         self._apply_impression_updates(decision.impression_updates)
         if decision.submit_wish is not None:
             w_headline = f"[{decision.submit_wish.category}] {' '.join(decision.submit_wish.summary.split())}"
             if w_headline not in self.filed_wish_summaries:
                 self.filed_wish_summaries.append(w_headline)
 
-        # 2. Update verbatim continuity fields
+        # 2. Update verbatim continuity fields & capture live mood transitions
         self.current_plan = decision.current_plan.strip()
         self.inspect_high_res_next = bool(decision.motor_action.inspect_high_res_next)
+
+        prev_mood_norm = self.current_mood.strip().lower()
+        cand_mood = ""
+        cand_note = ""
+        cand_delib = decision.deliberation
+        is_explicit_shift = False
         if decision.mood_shift is not None:
-            self.current_mood = decision.mood_shift.mood.strip()
+            cand_mood = " ".join(decision.mood_shift.mood.split())
+            cand_note = " ".join(decision.mood_shift.note.split())
+            cand_delib = decision.mood_shift.deliberation
+            is_explicit_shift = True
+        elif decision.current_mood and decision.current_mood.strip():
+            cand_mood = " ".join(decision.current_mood.split())
+            cand_note = " ".join(decision.turn_log_entry.split()) or f"Player mood shifted to {cand_mood}."
+
+        cand_norm = cand_mood.lower()
+        if not cand_norm or cand_norm == prev_mood_norm:
+            decision.mood_shift = None
+        else:
+            last_shift_turn = int(self.mood_history[-1]["turn_index"]) if self.mood_history else -999
+            turns_since_last_shift = turn_index - last_shift_turn
+            recent_mood_norms = {str(m["mood"]).strip().lower() for m in self.mood_history[-3:]}
+            if self.mood_history:
+                recent_mood_norms.add("curious")
+            has_high_salience_signal = bool(
+                decision.bug_reports or decision.submit_wish is not None or decision.end_playtest is not None
+            )
+            is_rapid_bounce_back = cand_norm in recent_mood_norms and turns_since_last_shift < 8
+            is_too_frequent = (
+                len(self.mood_history) >= 2
+                and turns_since_last_shift < 5
+                and not has_high_salience_signal
+            )
+            if is_rapid_bounce_back or is_too_frequent:
+                decision.mood_shift = None
+            else:
+                self.current_mood = cand_mood
+                final_note = cand_note or f"Player mood shifted to {cand_mood}."
+                if not is_explicit_shift:
+                    decision.mood_shift = PlaytestMoodNote(
+                        deliberation=cand_delib,
+                        mood=cand_mood,
+                        note=final_note,
+                    )
+                else:
+                    decision.mood_shift.mood = cand_mood
+                    decision.mood_shift.note = final_note
+                self.mood_history.append({
+                    "turn_index": turn_index,
+                    "sim_time_sec": obs.sim_time_sec,
+                    "mood": cand_mood,
+                    "note": final_note,
+                })
+
+        # Track consecutive clicks on the same screen spot so ephemeral tail can nudge against zombie click loops
+        act = decision.motor_action
+        if act.mouse_button_action in ("left_click", "right_click", "double_click"):
+            click_x = act.mouse_x if act.mouse_x is not None else normalize_screen_x(obs.cursor_x)
+            click_y = act.mouse_y if act.mouse_y is not None else normalize_screen_y(obs.cursor_y)
+            if (
+                self._last_click_spot is not None
+                and act.mouse_button_action == self._last_click_spot[2]
+                and ((click_x - self._last_click_spot[0]) ** 2 + (click_y - self._last_click_spot[1]) ** 2) ** 0.5 <= 22.0
+            ):
+                self._same_spot_click_streak += 1
+            else:
+                self._last_click_spot = (click_x, click_y, act.mouse_button_action)
+                self._same_spot_click_streak = 1
+        else:
+            self._last_click_spot = None
+            self._same_spot_click_streak = 0
 
         # 3. Format compact single-line append-only turn tape entry
         tape_line = self._format_append_tape_line(turn_index, obs, decision)
@@ -563,7 +771,8 @@ class BlindPlaytesterAgent:
 
     def compact_journal(self) -> Tuple[PlaytestCompactedJournal, int, Dict[str, int]]:
         """Compacts older turns in `epoch_turn_lines` into `PlaytestCompactedJournal` while:
-        1. Keeping `self.rulebook` 100% deterministic in `[Block 1A]` (never LLM-summarized), and
+        1. Keeping `self.rulebook`, `self.field_notes`, `self.questions`, `self.bugs_found`, and `self.impressions`
+           100% deterministic in `[Block 1A]` (never LLM-summarized), and
         2. Carrying the latest `compaction_overlap_turns` (default 5) raw lines verbatim into the
            new epoch's `[Block 2]` so immediate spatial/task momentum is never lost at the seam.
         """
@@ -600,12 +809,29 @@ class BlindPlaytesterAgent:
             if self.impressions
             else "(None recorded yet.)"
         )
+        questions_lines = (
+            "\n".join(
+                f"- [{q.get('status', 'open').upper()}] ({k}) {q.get('question', '')}"
+                + (f" -> {q.get('answer')}" if q.get("answer") else "")
+                for k, q in self.questions.items()
+            )
+            if self.questions
+            else "(None recorded yet.)"
+        )
+        bugs_lines = (
+            "\n".join(
+                f"- [{b.get('severity', 'major').upper()}] ({k}) {b.get('summary', '')}"
+                for k, b in self.bugs_found.items()
+            )
+            if self.bugs_found
+            else "(None recorded yet.)"
+        )
         folded_text = "\n".join(line for _, line in lines_to_compact)
 
         prompt = (
             f"You are consolidating your own player memory while playing '{self.store_card.game_title}'.\n"
-            "Your confirmed How-To-Play controls/rules AND your structured 6-pillar Running Impressions are ALREADY "
-            "stored separately (shown below for context—do NOT worry about duplicating every keybind or repeating pillar notes).\n"
+            "Your confirmed How-To-Play controls/rules, Field Notes, Questions, Bugs, and 6-pillar Running Impressions "
+            "are ALREADY stored separately (shown below for context—do NOT worry about duplicating every keybind or repeating pillar notes).\n"
             "Focus your compacted journal on:\n"
             "1. Chronological story, character, and exploration progress so far,\n"
             "2. Your spatial mental map of notable places, objects, doors, or NPCs,\n"
@@ -613,6 +839,8 @@ class BlindPlaytesterAgent:
             "4. Open mysteries or hypotheses you still want to test,\n"
             "5. Concise overall vibe takeaway so far.\n\n"
             f"PERMANENT RULEBOOK (STORED SEPARATELY):\n{rulebook_lines}\n\n"
+            f"PERMANENT QUESTIONS & ANSWERS (STORED SEPARATELY):\n{questions_lines}\n\n"
+            f"PERMANENT BUGS SPOTTED (STORED SEPARATELY):\n{bugs_lines}\n\n"
             f"PERMANENT PILLAR IMPRESSIONS (STORED SEPARATELY):\n{impressions_lines}\n\n"
             f"PRIOR COMPACTED JOURNAL:\n{prior_journal_json}\n\n"
             f"NEW COMPLETED TURNS TO FOLD INTO YOUR JOURNAL ( up through Turn #{up_to_turn} ):\n{folded_text}"
@@ -622,7 +850,7 @@ class BlindPlaytesterAgent:
             response_mime_type="application/json",
             response_schema=self.compaction_schema,
             temperature=0.3,
-            thinking_config=bounded_thinking_config(1024),
+            thinking_config=_playtest_non_thinking_config(self.config.model_name),
         )
         resp = self._call_gemini_resilient(
             model=self.config.model_name,
@@ -640,7 +868,7 @@ class BlindPlaytesterAgent:
         self.compaction_count += 1
         self.covered_up_to_turn = up_to_turn
 
-        # Start new prefix-cached epoch with updated [Block 1A Rulebook + Block 1B Journal] + 5-turn verbatim overlap
+        # Start new prefix-cached epoch with updated [Block 1A Notebook + Block 1B Journal] + 5-turn verbatim overlap
         self.epoch_header_text = self._render_epoch_header_text()
         self.epoch_turn_lines = carryover_lines
         return updated_journal, up_to_turn, tok_stats
@@ -652,6 +880,7 @@ class BlindPlaytesterAgent:
         end_outcome: Optional[str] = None,
         closing_thoughts: Optional[str] = None,
         final_screenshot_path: Optional[Path] = None,
+        final_audio_path: Optional[Path] = None,
         wishes_filed: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[PlaytestExperienceReport, Dict[str, int]]:
         """Synthesizes a complete, honest first-person `PlaytestExperienceReport` at the end of a stopped or
@@ -678,6 +907,38 @@ class BlindPlaytesterAgent:
             if self.rulebook
             else "- (No confirmed controls/rules recorded.)"
         )
+        field_notes_summary = (
+            "\n".join(f"- {k}: {v}" for k, v in self.field_notes.items())
+            if self.field_notes
+            else "- (No field notes recorded.)"
+        )
+        answered_q_lines = [
+            f"- {q.get('question', '')} -> {q.get('answer', '')}"
+            for q in self.questions.values()
+            if q.get("status") == "answered" and q.get("answer")
+        ]
+        open_q_lines = [
+            f"- {q.get('question', '')}"
+            for q in self.questions.values()
+            if q.get("status") != "answered"
+        ]
+        questions_summary = ""
+        if answered_q_lines:
+            questions_summary += "Answered During Play:\n" + "\n".join(answered_q_lines) + "\n"
+        if open_q_lines:
+            questions_summary += "Still Unanswered At End Of Session:\n" + "\n".join(open_q_lines) + "\n"
+        if not questions_summary:
+            questions_summary = "- (No explicit questions tracked.)\n"
+
+        bugs_summary = (
+            "\n".join(
+                f"- [{b.get('severity', 'major').upper()} | {b.get('category', 'bug')}] "
+                f"(Turn #{b.get('turn_index', '?')}) {b.get('summary', '')}: {b.get('details', '')}"
+                for b in self.bugs_found.values()
+            )
+            if self.bugs_found
+            else "- (No explicit bugs logged during play—mention any glitches or broken behaviors you noticed if applicable.)"
+        )
         impressions_summary = (
             "\n".join(
                 f"- {IMPRESSION_PILLAR_LABELS.get(k, k)} ({k}): {v}"
@@ -694,6 +955,14 @@ class BlindPlaytesterAgent:
             wishes_lines.append(f"{idx}. [{w_cat}] {w_sum} — {w_rat}")
         wishes_block = "\n".join(wishes_lines) if wishes_lines else "- (No formal wishes filed during the session.)"
 
+        if self.mood_history:
+            mood_arc = " -> ".join(
+                f"{m['mood']} (T#{m['turn_index']})" for m in self.mood_history[-12:]
+            )
+            mood_summary = f"curious (T#0) -> {mood_arc} | Current: {self.current_mood}"
+        else:
+            mood_summary = f"{self.current_mood} (no shifts recorded)"
+
         end_context_bits = [f"Session End Status: {end_status}"]
         if end_outcome:
             end_context_bits.append(f"Player End Outcome: {end_outcome}")
@@ -704,14 +973,22 @@ class BlindPlaytesterAgent:
             "=== END OF PLAYTEST SESSION — WRITE YOUR HONEST PLAYER EXPERIENCE REPORT ===\n"
             + "\n".join(end_context_bits)
             + "\n"
-            f"Final Player Mood: {self.current_mood}\n\n"
+            f"Player Mood Trajectory: {mood_summary}\n\n"
             f"Confirmed Controls & Rules You Discovered:\n{rulebook_summary}\n\n"
+            f"Your Field Notes & Screen Observations:\n{field_notes_summary}\n\n"
+            f"Your Questions & Hypotheses:\n{questions_summary}\n"
+            f"Bugs & Glitches Spotted Along The Way:\n{bugs_summary}\n\n"
             f"Your Sparse Running Pillar Impressions:\n{impressions_summary}\n\n"
             f"Wishes You Filed During Play:\n{wishes_block}\n\n"
             "Now write your complete, candid, first-person `PlaytestExperienceReport` covering your overall session "
             "experience, graphics & visual clarity, gameplay & feel, sound & audio feedback, intuitiveness & onboarding, "
-            "goals/pacing & sense of accomplishment, world & atmosphere, concrete highlights, concrete pain points, "
-            "and your honest 1-10 `overall_fun_rating` based purely on what you actually experienced on screen and in audio."
+            "goals/pacing & actual progression accomplished, world & atmosphere, concrete highlights, concrete pain points, "
+            "bugs & glitches observed, any unanswered questions/mysteries, and your honest 1-10 `overall_fun_rating`.\n"
+            "BE CANDID, NOT PROMOTIONAL: Cross-check the attached final screen against your earlier notes—report what "
+            "visibly and audibly progressed rather than what you hoped an action did. Explicitly call out if objectives "
+            "stayed stuck at 0, if repeated actions had no effect, if UI widgets overlapped or looked unfinished, if audio "
+            "was silent or cut out, or if mechanics played themselves without meaningful player decisions, and score "
+            "`overall_fun_rating` strictly by the rubric (never 7-10 when core progression stalled, audio was silent, or agency was missing)."
         )
 
         tail_parts: List[Any] = [types.Part.from_text(text=report_prompt)]
@@ -726,6 +1003,10 @@ class BlindPlaytesterAgent:
                         media_resolution=types.MediaResolution.MEDIA_RESOLUTION_MEDIUM,
                     )
                 )
+        if self.config.enable_audio_perception and final_audio_path is not None and final_audio_path.is_file():
+            wav_bytes = final_audio_path.read_bytes()
+            if wav_bytes:
+                tail_parts.append(types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"))
 
         contents.append(types.Content(role="user", parts=tail_parts))
 
@@ -734,7 +1015,7 @@ class BlindPlaytesterAgent:
             response_mime_type="application/json",
             response_schema=self.report_schema,
             temperature=0.35,
-            thinking_config=bounded_thinking_config(1024),
+            thinking_config=_playtest_non_thinking_config(self.config.model_name),
         )
         resp = self._call_gemini_resilient(
             model=self.config.model_name,
@@ -751,10 +1032,14 @@ class BlindPlaytesterAgent:
         return report, tok_stats
 
     def export_memory_snapshot(self) -> Dict[str, Any]:
-        """Serializes the permanent Rulebook, sparse Pillar Impressions, and Compacted Episodic Journal for SQLite & UI inspection."""
+        """Serializes the permanent player notebook and Compacted Episodic Journal for SQLite & UI inspection."""
         return {
             "rulebook": dict(self.rulebook),
+            "field_notes": dict(self.field_notes),
+            "questions": copy.deepcopy(self.questions),
+            "bugs_found": copy.deepcopy(self.bugs_found),
             "impressions": dict(self.impressions),
+            "mood_history": list(self.mood_history),
             "filed_wish_summaries": list(self.filed_wish_summaries),
             "current_plan": self.current_plan,
             "current_mood": self.current_mood,
@@ -766,6 +1051,59 @@ class BlindPlaytesterAgent:
             "active_epoch_turn_count": len(self.epoch_turn_lines),
             "epoch_header_preview": self.epoch_header_text,
         }
+
+    def _apply_field_note_updates(self, updates: List[PlaytestFieldNoteUpdate]) -> None:
+        for upd in updates:
+            topic = " ".join(upd.topic.split())
+            obs_txt = " ".join(upd.observation.split())
+            if topic and obs_txt:
+                self.field_notes[topic] = obs_txt
+
+    def _apply_question_updates(self, turn_index: int, updates: List[PlaytestQuestionUpdate]) -> None:
+        for upd in updates:
+            q_key = "_".join(upd.question_key.strip().lower().split())
+            q_txt = " ".join(upd.question.split())
+            ans_txt = " ".join(upd.answer.split()) if upd.answer else None
+            if not q_key or not q_txt:
+                continue
+            existing = self.questions.get(q_key)
+            asked_turn = existing.get("asked_turn", turn_index) if existing else turn_index
+            status = "answered" if (upd.status == "answered" or bool(ans_txt)) else "open"
+            self.questions[q_key] = {
+                "question_key": q_key,
+                "question": q_txt,
+                "status": status,
+                "answer": ans_txt if ans_txt else (existing.get("answer") if existing else None),
+                "asked_turn": asked_turn,
+                "answered_turn": turn_index if status == "answered" else (existing.get("answered_turn") if existing else None),
+            }
+
+    def _apply_bug_reports(self, turn_index: int, obs: TurnObservation, reports: List[PlaytestBugReport]) -> None:
+        for rep in reports:
+            b_key = "_".join(rep.bug_key.strip().lower().split())
+            summary = " ".join(rep.summary.split())
+            details = " ".join(rep.details.split())
+            if not b_key or not summary:
+                continue
+            if b_key in self.bugs_found:
+                # Allow updating severity/details if player learned more about the same bug, preserving initial turn & screenshot
+                prev = self.bugs_found[b_key]
+                prev["summary"] = summary
+                prev["details"] = details or prev.get("details", "")
+                prev["severity"] = rep.severity
+                prev["category"] = rep.category
+                continue
+            self.bugs_found[b_key] = {
+                "bug_key": b_key,
+                "category": rep.category,
+                "severity": rep.severity,
+                "summary": summary,
+                "details": details,
+                "turn_index": turn_index,
+                "sim_time_sec": obs.sim_time_sec,
+                "video_timestamp_sec": round(obs.tick / 60.0, 3),
+                "screenshot_path": str(obs.screenshot_path) if obs.screenshot_path else None,
+            }
 
     def _apply_rulebook_updates(self, updates: List[PlaytestRulebookUpdate]) -> None:
         for upd in updates:
@@ -811,12 +1149,33 @@ class BlindPlaytesterAgent:
         act_str = " ".join(act_bits)
 
         extras: List[str] = []
+        if decision.field_note_updates:
+            fn_str = "; ".join(
+                f"{' '.join(u.topic.split())}={' '.join(u.observation.split())}"
+                for u in decision.field_note_updates
+            )
+            extras.append(f"NOTE+[{fn_str}]")
+        if decision.question_updates:
+            q_parts: List[str] = []
+            for u in decision.question_updates:
+                qk = "_".join(u.question_key.strip().lower().split())
+                if u.status == "answered" and u.answer:
+                    q_parts.append(f"ANSWERED({qk})={' '.join(u.answer.split())}")
+                else:
+                    q_parts.append(f"OPEN({qk})={' '.join(u.question.split())}")
+            extras.append(f"QUESTION+[{'; '.join(q_parts)}]")
         if decision.rulebook_updates:
             rb_str = "; ".join(
                 f"{' '.join(u.key_or_topic.split())}={' '.join(u.behavior.split())}"
                 for u in decision.rulebook_updates
             )
             extras.append(f"RULEBOOK+[{rb_str}]")
+        if decision.bug_reports:
+            b_str = "; ".join(
+                f"{u.category}/{u.severity}:{' '.join(u.summary.split())}"
+                for u in decision.bug_reports
+            )
+            extras.append(f"BUG+[{b_str}]")
         if decision.impression_updates:
             imp_str = "; ".join(
                 f"{u.pillar}={' '.join(u.impression.split())}"

@@ -15,6 +15,7 @@ import struct
 import threading
 import wave
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
@@ -118,18 +119,18 @@ def record_turn_epistemic_context(
         return
     if role == "task_lead":
         if curated_context is not None:
-            state["lead_curated_context"] = curated_context[:35000]
+            state["lead_curated_context"] = curated_context
         if prompt_text is not None:
-            state["lead_prompt_text"] = prompt_text[:45000]
+            state["lead_prompt_text"] = prompt_text
         if self_inquiries is not None:
             state["lead_self_inquiries"] = list(self_inquiries)
         if deliberation is not None:
             state["lead_deliberation"] = deliberation
     else:
         if curated_context is not None:
-            state["curated_context"] = curated_context[:35000]
+            state["curated_context"] = curated_context
         if prompt_text is not None:
-            state["prompt_text"] = prompt_text[:45000]
+            state["prompt_text"] = prompt_text
         if self_inquiries is not None:
             state["self_inquiries"] = list(self_inquiries)
     persist_fn = state.get("_persist_fn")
@@ -260,6 +261,23 @@ def _is_live(client: Any) -> bool:
     return client is not None and getattr(type(client), "__module__", "").startswith("google.genai")
 
 
+def _format_worker_failure_excerpt(failure_text: str, max_chars: int = 1000) -> str:
+    """Extracts the authentic exception message from a formatted worker traceback starting at the exception headline,
+    avoiding blind tail-slicing that chops off the root error description when messages exceed `max_chars`."""
+    raw = str(failure_text or "").strip()
+    if not raw:
+        return ""
+    lines = raw.splitlines()
+    for idx in range(len(lines) - 1, -1, -1):
+        stripped = lines[idx].strip()
+        if not stripped or stripped.startswith("ACTION REQUIRED FOR TASK LEAD"):
+            continue
+        if "Error:" in stripped or "Exception:" in stripped:
+            joined = "\n".join(lines[idx:]).strip()
+            return joined[:max_chars]
+    return raw[:max_chars] if len(raw) <= max_chars else raw[-max_chars:]
+
+
 def plan_asset_requirement(
     ctx: WorkerContext,
     item: WorkItem,
@@ -294,7 +312,7 @@ def plan_asset_requirement(
     if fb:
         feedback_block = "COUNCIL FEEDBACK ON EARLIER REVISIONS (address ALL of it):\n" + "\n".join(f"  rev {n}: {t}" for n, t in fb) + "\n"
     if getattr(item, "failure", ""):
-        feedback_block += f"PREVIOUS WORKER EXECUTION ERROR TO FIX:\n{item.failure[-600:]}\n"
+        feedback_block += f"PREVIOUS WORKER EXECUTION ERROR TO FIX:\n{_format_worker_failure_excerpt(item.failure, 1000)}\n"
 
     curated_block = f"{rendering_block}\n--- GAME BIBLE ---\n{bible_text}\n"
     multimodal_parts: List[Any] = []
@@ -517,7 +535,7 @@ def plan_audio_requirements(
     if fb:
         feedback_block = "COUNCIL FEEDBACK ON EARLIER REVISIONS (address ALL of it):\n" + "\n".join(f"  rev {n}: {t}" for n, t in fb) + "\n"
     if getattr(item, "failure", ""):
-        feedback_block += f"PREVIOUS WORKER EXECUTION ERROR TO FIX:\n{item.failure[-600:]}\n"
+        feedback_block += f"PREVIOUS WORKER EXECUTION ERROR TO FIX:\n{_format_worker_failure_excerpt(item.failure, 1000)}\n"
 
     curated_block = f"--- GAME BIBLE ---\n{bible_text}\n"
     multimodal_parts: List[Any] = []
@@ -1513,7 +1531,7 @@ def _compute_turn_code_diffs(
             )
         )
         if diff_lines:
-            diffs[rel_path] = "".join(diff_lines)[:12000]
+            diffs[rel_path] = "".join(diff_lines)
     return diffs
 
 
@@ -1974,14 +1992,21 @@ def run_swe_engineer_specialist(
         clean_mod = clean_mod.lstrip("/")
         if "/" in clean_mod and Path(clean_mod).name in canonical_root_gd:
             clean_mod = Path(clean_mod).name
-        if clean_mod in excluded_mods:
+        if clean_mod in excluded_mods or clean_mod.startswith("tests/"):
             continue
         if clean_mod.endswith(CODE_MODULE_SUFFIXES) and clean_mod not in explicit_code_modules:
             explicit_code_modules.append(clean_mod)
     if not explicit_code_modules and item.target_modules:
         for own_m in item.target_modules:
-            if own_m not in excluded_mods and own_m.endswith(CODE_MODULE_SUFFIXES):
-                explicit_code_modules.append(own_m)
+            clean_own = str(own_m or "").strip().replace("\\", "/").removeprefix("res://").lstrip("/")
+            if (
+                clean_own
+                and not clean_own.startswith("tests/")
+                and clean_own not in excluded_mods
+                and clean_own.endswith(CODE_MODULE_SUFFIXES)
+                and clean_own not in explicit_code_modules
+            ):
+                explicit_code_modules.append(clean_own)
     if item.kind == "level_map" and not explicit_code_modules and is_real_genai_client(ctx.client):
         explicit_code_modules = ["scenes.gd"]
     has_existing_layout = (ctx.cartridge_dir / "level_layout.json").is_file()
@@ -2083,7 +2108,8 @@ def run_swe_engineer_specialist(
             description = (
                 f"{item.spec}\n\n"
                 f"TASK LEAD BRIEF FOR SWE ENGINEER:\n{brief}\n\n"
-                f"COUNCIL WILL JUDGE: {item.proof_spec}"
+                f"COUNCIL WILL JUDGE: {item.proof_spec}\n\n"
+                f"QA HARNESS BOUNDARY (MANDATORY): `qa_test_engineer` exclusively authors `res://tests/test_{_safe_id(item.item_id)}.tscn` + `.gd` and injects external player inputs (`input_segments`), while the engine's Counterfactual Zero-Input Gate (`input_script=[]`) and Entrypoint Parity Gate (`res://main.tscn`) verify that the exact same player inputs satisfy all state assertions natively inside `res://main.tscn` WITHOUT any `tests/test_*.gd` wrapper code! NEVER create or modify any file under `tests/` and NEVER script `sim_tick` timers—implement and wire all authentic signal/input/entity connections directly in your production Target Modules ({modules})."
                 f"{scope_boundary_note}"
                 f"{telemetry_note}"
             )
@@ -2500,6 +2526,21 @@ def run_qa_test_engineer_specialist(
                     rel_gd_path = f"{rel_scene_base}.gd"
                 abs_gd_path = ctx.cartridge_dir / rel_gd_path
                 abs_tscn_path = ctx.cartridge_dir / rel_tscn_path
+                self_refs = (
+                    f"res://{rel_gd_path}",
+                    f"res://{rel_tscn_path}",
+                )
+                for s_ref in self_refs:
+                    if re.search(
+                        rf"\b(?:preload|load)\s*\(\s*['\"]" + re.escape(s_ref) + rf"['\"]\s*\)",
+                        test_gd_code,
+                    ):
+                        raise StudioAgentError(
+                            f"Self-recursive QA test script rejected in res://{rel_gd_path}: script calls `load`/`preload` on its own "
+                            f"path `{s_ref}`, which causes infinite `_ready()` scene-instantiation recursion and freezes Godot. "
+                            "Define an inner `class DebugOverlay extends Node2D:` (or draw directly in the root test node's `_draw()`) "
+                            f"instead of loading `{s_ref}` inside itself."
+                        )
                 abs_gd_path.parent.mkdir(parents=True, exist_ok=True)
                 abs_gd_path.write_text(test_gd_code + "\n", encoding="utf-8")
                 tscn_content = (
@@ -2533,6 +2574,24 @@ def run_qa_test_engineer_specialist(
                 rel_scene = rel_scene.lstrip("/")
                 if (ctx.cartridge_dir / rel_scene).is_file():
                     cur_resolved_scene = f"res://{rel_scene}"
+                    if rel_scene.startswith("tests/") and rel_scene.endswith(".tscn"):
+                        disk_gd_rel = rel_scene[:-5] + ".gd"
+                        disk_gd_abs = ctx.cartridge_dir / disk_gd_rel
+                        if disk_gd_abs.is_file():
+                            disk_gd_text = disk_gd_abs.read_text(encoding="utf-8", errors="ignore")
+                            for s_ref in (f"res://{disk_gd_rel}", f"res://{rel_scene}"):
+                                if re.search(
+                                    rf"\b(?:preload|load)\s*\(\s*['\"]" + re.escape(s_ref) + rf"['\"]\s*\)",
+                                    disk_gd_text,
+                                ):
+                                    if disk_gd_rel not in qa_touched_files:
+                                        qa_touched_files.append(disk_gd_rel)
+                                    raise StudioAgentError(
+                                        f"Self-recursive QA test script rejected in res://{disk_gd_rel}: script calls `load`/`preload` on its own "
+                                        f"path `{s_ref}`, which causes infinite `_ready()` scene-instantiation recursion and freezes Godot. "
+                                        "Provide fresh `test_scene_gd_content` using an inner `class DebugOverlay extends Node2D:` "
+                                        f"instead of loading `{s_ref}` inside itself."
+                                    )
             record_turn_substep(
                 "rendering_scene",
                 f"Rendering scene {cur_resolved_scene or 'res://main.tscn'} across ticks {list(cur_plan.capture_ticks)}",
@@ -2575,7 +2634,11 @@ def run_qa_test_engineer_specialist(
                 "QA filmstrip state assertions failed" in err_str
                 or "Entrypoint Parity Gate failed" in err_str
             )
-            is_test_script_error = "Godot headless smoke check failed in res://tests/" in err_str
+            is_test_script_error = (
+                "Godot headless smoke check failed in res://tests/" in err_str
+                or "Godot simulation failed or timed out in res://tests/" in err_str
+                or "Self-recursive QA test script rejected" in err_str
+            )
             if is_real_genai_client(ctx.client) and ctx.filmstrip_fn is None and (is_assertion_fail or is_test_script_error):
                 t_prog_p1 = format_filmstrip_telemetry_progression(out_strip_path) if out_strip_path.is_file() else ""
                 logger.info(
@@ -2603,7 +2666,12 @@ def run_qa_test_engineer_specialist(
                 try:
                     strip, resolved_scene, script, setup_calls = _stage_and_run_plan(plan)
                 except StudioAgentError as qa_pass2_err:
-                    if "Godot headless smoke check failed in res://tests/" in str(qa_pass2_err):
+                    p2_err = str(qa_pass2_err)
+                    if (
+                        "Godot headless smoke check failed in res://tests/" in p2_err
+                        or "Godot simulation failed or timed out in res://tests/" in p2_err
+                        or "Self-recursive QA test script rejected" in p2_err
+                    ):
                         for tf in qa_touched_files:
                             if tf.startswith("tests/"):
                                 (ctx.cartridge_dir / tf).unlink(missing_ok=True)
@@ -2741,6 +2809,18 @@ def validate_task_lead_decision(
             )
         if not decision.brief.strip():
             issues.append("brief must be non-empty when action == 'delegate'.")
+        if decision.specialist_agent == "swe_engineer" and decision.target_paths:
+            bad_swe_test_paths = [
+                p for p in decision.target_paths
+                if str(p or "").strip().replace("\\", "/").removeprefix("res://").lstrip("/").startswith("tests/")
+            ]
+            if bad_swe_test_paths:
+                issues.append(
+                    f"swe_engineer cannot target QA test harness path(s) {bad_swe_test_paths} in `target_paths`. "
+                    "'swe_engineer' strictly implements production game modules (`main.gd`, `scenes/...`, `mechanics.gd`, "
+                    "`entities.gd`, `ui_hud.gd`) so live `res://main.tscn` passes the Entrypoint Parity Gate under real player "
+                    "inputs; 'qa_test_engineer' exclusively owns `res://tests/test_<item_id>.tscn` + `.gd` and `input_segments`."
+                )
     elif decision.action == "spawn_tasks":
         if not decision.spawned_tasks:
             issues.append("spawned_tasks must contain at least one WorkItemProposal when action == 'spawn_tasks'.")
@@ -2991,14 +3071,15 @@ def plan_task_lead_turn(
             + prior_trace_text
         )
     if getattr(item, "failure", ""):
+        err_excerpt = _format_worker_failure_excerpt(item.failure, 1200)
         if turn_history and any(not str(t.summary).startswith("FAILED") for t in turn_history):
             prior_revision_block += (
                 "\nPRIOR ATTEMPT ERROR (occurred BEFORE Turn 0 of this attempt; if a specialist in CURRENT REVISION TURN HISTORY "
                 "already updated the code to address this, proceed to the next verification/proof specialist such as qa_test_engineer):\n"
-                f"{item.failure[-800:]}\n"
+                f"{err_excerpt}\n"
             )
         else:
-            prior_revision_block += f"\nPREVIOUS WORKER EXECUTION ERROR TO FIX:\n{item.failure[-800:]}\n"
+            prior_revision_block += f"\nPREVIOUS WORKER EXECUTION ERROR TO FIX:\n{err_excerpt}\n"
 
     verified_modified_prod: List[str] = []
     for t_rep in turn_history:
@@ -3047,10 +3128,10 @@ def plan_task_lead_turn(
             "contextual `dialogue_barks`, and character sheets into `narrative_bible.json` / `narrative.json` and produces a script table proof sheet (`script_sheet_*.png`).\n"
         ),
         "swe_engineer": (
-            "  - 'swe_engineer': architects or modifies GDScript modules (.gd), world/level layouts, scenes, entities, or UI and verifies headless engine compilation/boot.\n"
+            "  - 'swe_engineer': architects or modifies PRODUCTION GDScript modules (`.gd` outside `tests/`—NEVER `tests/test_*.gd`), world/level layouts, scenes, entities, or UI so `res://main.tscn` works natively under real player inputs/signals, and verifies headless engine compilation/boot.\n"
         ),
         "qa_test_engineer": (
-            "  - 'qa_test_engineer': builds a bespoke Godot test scene (`res://tests/test_<item_id>.tscn` + `.gd`), strategizes any needed QA diagnostic overlays or telemetry (`overlays_and_telemetry_strategy`), executes the scripted test scenario (`input_segments`, `mouse_click_pos`, `state_assertions`, `capture_ticks`), captures a multi-frame gameplay filmstrip proof image, and authors a `council_test_scene_summary` so the Council knows exactly what the test scene and overlays show.\n"
+            "  - 'qa_test_engineer': EXCLUSIVELY owns and builds the Godot QA test scene (`res://tests/test_<item_id>.tscn` + `.gd`), strategizes read-only QA diagnostic overlays or telemetry (`overlays_and_telemetry_strategy`), executes external player inputs (`input_segments`, `mouse_world_pos`, `mouse_click_pos`, `state_assertions`, `capture_ticks`) verified against BOTH `res://tests/test_<item_id>.tscn` and live `res://main.tscn` (Counterfactual + Entrypoint Parity Gates), captures the filmstrip proof image, and authors `council_test_scene_summary`.\n"
         ),
     }
     from engine.studio.context_curator import ContextCuratorAgent, SelfInquiryQAPair, is_real_genai_client
@@ -3184,7 +3265,7 @@ def plan_task_lead_turn(
             f"   - Think empathetically from the perspective of a brand-new player booting this game for the first time with zero external instructions. Strategize how THIS game communicates: (a) what the player is doing and why (their role, purpose, and stakes), (b) how they interact with the world and how actions causally connect (`input -> entity response -> world consequence`), and (c) what visual/audio feedback occurs when an action succeeds OR when an action is attempted before its prerequisite is met.\n"
             f"   - UNSOLVED t=0 BASELINE (`test_unsolved_baseline_t0`) & QA TEST SCENE OWNERSHIP (`res://tests/test_<item_id>.tscn`) — NO DEBUG OVERLAYS IN PRODUCTION GAME (`res://main.tscn`):\n"
             f"     * `_ready()` at `t=0` in `main.gd` (`res://main.tscn`) is what the live human player boots into! `_ready()` MUST initialize the world in its unbuilt/unsolved starting state as defined by the Game Bible, and production game scenes (`main.gd`, `scenes.gd`, `ui_hud.gd`, etc.) must NEVER contain `func test_*()` staging helpers or debug overlays (`[DEBUG]`, telemetry readouts, wireframe boxes).\n"
-            f"     * Conversely, in QA test scenes (`res://tests/test_<item_id>.tscn`), rich diagnostic overlays ARE essential! When delegating to `'qa_test_engineer'`, instruct QA to author `res://tests/test_<item_id>.tscn` (`test_scene_gd_content`), strategize what test-only diagnostic overlays (e.g., force/velocity/heading vectors, bounding boxes, anchor markers, or telemetry readouts drawn by the test scene) and `get_state_snapshot()` metrics (`player_pos`, angular/linear rates, etc.) are needed to prove both visual quality and human-scale responsiveness over time, and write a clear `council_test_scene_summary` for the Council!\n"
+            f"     * Conversely, in QA test scenes (`res://tests/test_<item_id>.tscn`), rich diagnostic overlays ARE essential—and `res://tests/test_<item_id>.tscn` + `.gd` is EXCLUSIVELY owned by `'qa_test_engineer'`, NEVER `'swe_engineer'`! NEVER ask `'swe_engineer'` to create or edit `tests/test_*.gd`, and NEVER script `_physics_process` tick timers or direct spawn/place calls inside `tests/test_*.gd` (even if an older feedback note mentioned `tests/test_*.gd`, translate missing gameplay/signal wires into production-module fixes for `'swe_engineer'` so live `res://main.tscn` passes the Entrypoint Parity Gate!). When delegating to `'qa_test_engineer'`, instruct QA to author `res://tests/test_<item_id>.tscn` (`test_scene_gd_content` with read-only camera framing/diagnostic `_draw()` overlays and `get_state_snapshot()` readouts—zero mid-run game-state mutations), drive all actions externally via `input_segments`, and write a clear `council_test_scene_summary` for the Council!\n"
             f"   - REAL INTERACTIVE VERBS & CAMERA NAVIGATION: Every core player verb in `core_loop.player_verbs` and the active slice's `scope_boundaries` (including mouse click/drag placement or connection, interactive component tuning/socketing, hazard clearing, and `Camera2D` panning/scrolling when `world_bounds` exceeds the 1280x720 viewport) MUST be wired to real `_unhandled_input` / `_input` / UI handlers and exercised via `input_segments` (`mouse_world_pos`, `mouse_click_pos`, or actions) in QA filmstrips.\n"
             f"   - DIAGNOSING FAILED QA PLAYTESTS vs. BROKEN MECHANICS (ZERO SHORTCUTS — NEVER PRE-SOLVE THE GAME TO PASS QA):\n"
             f"     * First check `CARTRIDGE SYMBOLS & FILES` below for any `⚠️ BROKEN / MISSING SCRIPT OR SCENE REFERENCES ON DISK`. If a builder/spawner script calls `load('res://...')` on a `.gd` file that does not exist on disk (or wraps it in `ResourceLoader.exists(...) else null`), placement/spawning silently no-ops! Delegate to `'swe_engineer'` to create the missing script or replace the broken reference with real node instantiation.\n"
@@ -3403,22 +3484,33 @@ def run_task_lead(
     if trace_path.is_file():
         try:
             existing_trace = json.loads(trace_path.read_text(encoding="utf-8"))
-            if (
-                isinstance(existing_trace, dict)
-                and existing_trace.get("status", "in_progress")
-                in ("in_progress", "yielded", "waiting_for_spawned_tasks")
-                and not existing_trace.get("submission_summary")
-            ):
-                for raw_turn in existing_trace.get("turns", []):
-                    turn_history.append(SpecialistReport.model_validate(raw_turn))
-                for p in existing_trace.get("collected_proofs", []):
-                    if isinstance(p, str) and Path(p).is_file() and p not in collected_proofs:
-                        collected_proofs.append(p)
-                last_strategy = str(existing_trace.get("current_strategy") or "")
-                last_proof_strategy = str(existing_trace.get("proof_strategy") or "")
-                raw_pending = existing_trace.get("pending_decision")
-                if isinstance(raw_pending, dict):
-                    pending_decision = TaskLeadDecision.model_validate(raw_pending)
+            if isinstance(existing_trace, dict):
+                existing_status = str(existing_trace.get("status", "in_progress"))
+                if (
+                    existing_status in ("in_progress", "yielded", "waiting_for_spawned_tasks")
+                    and not existing_trace.get("submission_summary")
+                ):
+                    for raw_turn in existing_trace.get("turns", []):
+                        turn_history.append(SpecialistReport.model_validate(raw_turn))
+                    for p in existing_trace.get("collected_proofs", []):
+                        if isinstance(p, str) and Path(p).is_file() and p not in collected_proofs:
+                            collected_proofs.append(p)
+                    last_strategy = str(existing_trace.get("current_strategy") or "")
+                    last_proof_strategy = str(existing_trace.get("proof_strategy") or "")
+                    raw_pending = existing_trace.get("pending_decision")
+                    if isinstance(raw_pending, dict):
+                        pending_decision = TaskLeadDecision.model_validate(raw_pending)
+                elif existing_status == "failed" and existing_trace.get("turns"):
+                    # Archive prior failed retry trace so auto-retries never overwrite earlier turn chronology
+                    fail_idx = 1
+                    while (trace_path.parent / f"lead_trace_rev{len(item.revisions)}_failed{fail_idx}.json").is_file():
+                        fail_idx += 1
+                    archived_trace_path = trace_path.parent / f"lead_trace_rev{len(item.revisions)}_failed{fail_idx}.json"
+                    archived_payload = dict(existing_trace)
+                    archived_payload["archived_failed_index"] = fail_idx
+                    archived_payload["archived_at_utc"] = datetime.now(timezone.utc).isoformat()
+                    archived_trace_path.write_text(json.dumps(archived_payload, indent=2), encoding="utf-8")
+                    trace_path.unlink(missing_ok=True)
         except Exception:
             logger.debug("Could not hydrate existing lead trace at %s", trace_path, exc_info=True)
 
@@ -3480,7 +3572,6 @@ def run_task_lead(
             raise WorkerYielded("spawned_prerequisite_tasks")
 
     try:
-        from datetime import datetime, timezone
         turn_idx = len(turn_history)
         while turn_idx < effective_max_turns:
             _sync_live_board_state_or_yield(pending_decision)
@@ -3906,9 +3997,12 @@ def run_task_lead(
                 or "QA Diagnostic Production Defect Report" in str(getattr(qa_turns_hist[-1], "summary", ""))
             ):
                 _persist_trace(status="failed", pending=None)
+                qa_raw_summary = str(getattr(qa_turns_hist[-1], "summary", "")).strip()
+                if "\nACTION REQUIRED FOR TASK LEAD:" in qa_raw_summary:
+                    qa_raw_summary = qa_raw_summary.split("\nACTION REQUIRED FOR TASK LEAD:", 1)[0].strip()
                 raise StudioAgentError(
                     f"Task Lead for '{item.item_id}' exhausted {effective_max_turns} turns with failing QA gate: "
-                    f"{str(getattr(qa_turns_hist[-1], 'summary', ''))[-600:]}"
+                    f"{qa_raw_summary[:1200]}"
                 )
             if not collected_proofs:
                 _persist_trace(status="failed", pending=None)

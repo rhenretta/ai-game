@@ -3404,6 +3404,207 @@ def test_qa_test_scene_ownership_overlay_strategy_and_slim_harness(tmp_path: Pat
     assert any("Post-Capture Visual Audit failed" in iss for iss in gate_issues)
 
 
+def test_drained_board_resume_rearms_continuous_mode_sanitizes_schema_and_surfaces_ui_errors(tmp_path):
+    import asyncio
+    import os
+    from types import SimpleNamespace
+    from google.genai import types
+    from engine.studio.asset_library import CartridgeAssetLibrary
+    from engine.studio.models import (
+        GameBibleSpec,
+        GameRequirementsSpec,
+        GameSliceSpec,
+        GenesisWorldSpec,
+        RenderingStrategySpec,
+        ReviewDecision,
+        StudioOrchestratorConfig,
+        StudioSwarmPlan,
+        SubjectRenderTreatment,
+        WorkItemProposal,
+    )
+    from engine.studio.orchestrator import StudioOrchestrator, SwarmExecutionContext
+    from engine.studio.production_board import ProductionBoard, WorkerResult
+
+    # 1. Verify CartridgeAssetLibrary.derive_baseline_assets_from_bible builds a valid Gemini response_schema
+    # without prefixItems validation errors when live client is active
+    lib_dir = tmp_path / "lib_cand"
+    lib_dir.mkdir(parents=True)
+    (lib_dir / "rendering_strategy.json").write_text(
+        RenderingStrategySpec(
+            deliberation="d",
+            rendering_paradigm="hybrid_2d",
+            renderer="compatibility",
+            lighting_and_atmosphere="warm_sunlight",
+            effects_stack=["GPUParticles2D"],
+            treatments=[
+                SubjectRenderTreatment(
+                    deliberation="d",
+                    subject_id="hero_actor",
+                    technique="sprite_sheet",
+                    target_resolution=(128, 128),
+                )
+            ],
+        ).model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    captured_configs = []
+
+    class _LiveModels:
+        def generate_content(self, model, contents, config=None):
+            captured_configs.append(config)
+            return SimpleNamespace(text='{"deliberation": "d", "elements": []}')
+
+    class _LiveVisual:
+        text_model_name = "gemini-3.8-flash"
+
+        def __init__(self):
+            self.client = SimpleNamespace(models=_LiveModels())
+
+        def _is_live_genai_client(self):
+            return True
+
+    asset_lib = CartridgeAssetLibrary(cartridge_dir=lib_dir, visual_agent=_LiveVisual())
+    elems = asset_lib.derive_baseline_assets_from_bible(GameBibleSpec(deliberation="d", game_title="Test"))
+    assert elems == []
+    assert len(captured_configs) == 1
+    assert isinstance(captured_configs[0], types.GenerateContentConfig)
+
+    # 2. Verify fast-path resume on a completed/drained continuous board re-arms _continuous_active and production_board
+    cand_dir = tmp_path / "cand_resumed"
+    cand_dir.mkdir(parents=True)
+    (cand_dir / "artifacts" / "proofs").mkdir(parents=True)
+    (cand_dir / "artifacts" / "proofs" / "filmstrip_slice_assembly_check_pass0.png").write_bytes(b"png")
+    bible = GameBibleSpec(
+        deliberation="d",
+        game_title="Resumed Game",
+        status="locked",
+        active_slice_index=1,
+        slice_roadmap=[
+            GameSliceSpec(deliberation="d", slice_id="s0", slice_index=0, title="S0", status="completed", slice_objective="g0"),
+            GameSliceSpec(deliberation="d", slice_id="s1", slice_index=1, title="S1", status="completed", slice_objective="g1"),
+        ],
+    )
+    (cand_dir / "game_bible.json").write_text(bible.model_dump_json(indent=2), encoding="utf-8")
+    wspec = GenesisWorldSpec(
+        deliberation="d",
+        game_title="Resumed Game",
+        core_genre="simulation",
+        thematic_premise="premise",
+        world_lore="lore",
+        conflict_tone="cozy_exploratory",
+        conflict_narrative="narrative",
+        aesthetic_style="clean",
+        palette_mood="vibrant_fantasy",
+        gameplay_pacing="tactical_methodical",
+        pacing_score=0.0,
+        target_difficulty=1.0,
+    )
+    (cand_dir / "world_spec.json").write_text(wspec.model_dump_json(indent=2), encoding="utf-8")
+    (cand_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    rspec = GameRequirementsSpec(deliberation="d", game_title="Resumed Game", requirements=[])
+    (cand_dir / "requirements_spec.json").write_text(rspec.model_dump_json(indent=2), encoding="utf-8")
+
+    pb = ProductionBoard(cand_dir / "backlog.json")
+    added = pb.add_items(
+        [
+            WorkItemProposal(
+                deliberation="d",
+                item_id="mechanic_core",
+                title="Core Mechanic",
+                kind="mechanic_code",
+                spec="Build core.",
+                proof_spec="Prove core.",
+                target_modules=["scenes/mechanics/core.gd"],
+            )
+        ],
+        raised_by_role="GameplayDesigner",
+        slice_id="s0",
+    )
+    proof_file = cand_dir / "artifacts" / "proofs" / "filmstrip_slice_assembly_check_pass0.png"
+    claimed = pb.claim_ready()
+    pb.submit_result(claimed[0].item_id, WorkerResult(proof_images=[str(proof_file)], notes="done"))
+    pb.apply_review(ReviewDecision(deliberation="d", validation_criteria_for_my_role="ok", item_id=claimed[0].item_id, verdict="approve", feedback="ok"))
+
+    orch = make_orchestrator(continuous_production=True)
+    orch.enable_writers_room = True
+    orch._continuous_active = False
+    plan = StudioSwarmPlan(
+        deliberation="d",
+        plan_id="plan_resume",
+        game_title="Resumed Game",
+        genre_verdict="simulation",
+        target_episode=0,
+        specialist_agent_roles=["Director"],
+        dag_edges=[],
+    )
+    ctx = SwarmExecutionContext(run_id="plan_resume", staging_dir=cand_dir)
+    asyncio.run(orch._execute_specialist("Director", plan, ctx))
+    assert orch._continuous_active is True
+    assert orch.production_board is not None
+    assert len(ctx.raw_outputs["requirements_spec"].requirements) == 1
+    assert ctx.raw_outputs["requirements_spec"].requirements[0].status == "completed"
+
+    # 3. Verify _rmtree_force cleanly removes read-only / immutable files
+    locked_dir = tmp_path / "locked_ckpt" / "assets"
+    locked_dir.mkdir(parents=True)
+    locked_file = locked_dir / "locked.png"
+    locked_file.write_bytes(b"123")
+    os.chmod(locked_file, 0o444)
+    if hasattr(os, "chflags"):
+        import stat as _stat
+        try:
+            os.chflags(locked_file, _stat.UF_IMMUTABLE)
+        except OSError:
+            pass
+    StudioOrchestrator._rmtree_force(locked_dir)
+    assert not locked_dir.exists()
+
+    # 4. Verify UI error banner only suppresses board-item errors after full board approval, never non-item errors
+    ui_html = (Path(__file__).resolve().parent.parent / "engine" / "ui" / "static" / "index.html").read_text(encoding="utf-8")
+    assert "const staleBoardItemErrAfterFullApproval = allBoardApproved && Boolean(_lastBuildError && _lastBuildError.item_id);" in ui_html
+
+
+def test_turn_epistemic_context_untruncated_and_collapsible_prompt_sections():
+    """Verifies record_turn_epistemic_context preserves 100% of prompt_text, lead_prompt_text, and curated_context
+    beyond 45,000 chars without truncation, and index.html exposes collapsible section inspection.
+    """
+    from engine.studio import workers
+
+    long_lead_prompt = "SPEC: Build system\n" + ("A" * 62000) + "\nTAIL_SENTINEL_LEAD"
+    long_spec_prompt = "ARCHITECTURAL SPECIFICATION:\n" + ("B" * 78000) + "\nTAIL_SENTINEL_SPEC"
+    long_curated = "=== SEMANTICALLY CURATED STUDIO CONTEXT ===\n" + ("C" * 51000) + "\n=== END CURATED STUDIO CONTEXT ==="
+
+    prev_state = getattr(workers._ACTIVE_TURN_CTX, "state", None)
+    state_holder = {}
+    workers._ACTIVE_TURN_CTX.state = state_holder
+    try:
+        workers.record_turn_epistemic_context(
+            role="task_lead",
+            curated_context=long_curated,
+            prompt_text=long_lead_prompt,
+        )
+        workers.record_turn_epistemic_context(
+            role="swe_engineer",
+            curated_context=long_curated,
+            prompt_text=long_spec_prompt,
+        )
+    finally:
+        workers._ACTIVE_TURN_CTX.state = prev_state
+
+    assert state_holder["lead_prompt_text"] == long_lead_prompt
+    assert state_holder["lead_prompt_text"].endswith("TAIL_SENTINEL_LEAD")
+    assert state_holder["prompt_text"] == long_spec_prompt
+    assert state_holder["prompt_text"].endswith("TAIL_SENTINEL_SPEC")
+    assert state_holder["lead_curated_context"] == long_curated
+    assert state_holder["curated_context"] == long_curated
+
+    ui_html = (Path(__file__).resolve().parent.parent / "engine" / "ui" / "static" / "index.html").read_text(encoding="utf-8")
+    assert "function parsePromptIntoCollapsibleSections(" in ui_html
+    assert "function formatCollapsiblePromptViewerHtml(" in ui_html
+
+
+
+
 
 
 

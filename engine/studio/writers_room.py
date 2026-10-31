@@ -410,6 +410,25 @@ class CreativeWritersRoom:
                             )
                 except Exception as exc:
                     logger.debug("Failed peeking .pending_playtest_wishes.json: %s", exc)
+            rf = Path(candidate_dir) / ".pending_council_playtest_reports.json"
+            if rf.is_file() and not queued:
+                try:
+                    raw_r = json.loads(rf.read_text(encoding="utf-8"))
+                    if isinstance(raw_r, list) and raw_r:
+                        rep_summaries = []
+                        for env in raw_r:
+                            if not isinstance(env, dict):
+                                continue
+                            s_rep = env.get("session_report") or {}
+                            rep_summaries.append(
+                                f"Session {env.get('session_id', '?')} (slice={env.get('observed_on_slice_id', 'unspecified')}, "
+                                f"fun={s_rep.get('overall_fun_rating', '?')}/10, wishes={len(env.get('wishes') or [])}): "
+                                f"{s_rep.get('overall_experience_summary', '')}"
+                            )
+                        if rep_summaries:
+                            queued.append("[COUNCIL BLIND PLAYTEST REPORT & WISHES]: " + " | ".join(rep_summaries))
+                except Exception as exc:
+                    logger.debug("Failed peeking .pending_council_playtest_reports.json: %s", exc)
 
         # Also check if any ExecutiveProducer utterance is in transcript without a matching ConceptEvolutionEntry
         pivoted_texts = {
@@ -480,77 +499,171 @@ class CreativeWritersRoom:
         self,
         candidate_dir: Optional[Path] = None,
     ) -> Tuple[str, List[Any]]:
-        """Consumes approved Blind Playtester wish items from `<candidate_dir>/.pending_playtest_wishes.json`,
-        returning `(formatted_provenance_block, multimodal_screenshot_parts)` so Council specialists inspect
+        """Consumes approved Blind Playtester wish items from `<candidate_dir>/.pending_playtest_wishes.json`
+        AND any auto-delivered full Council playtest reports + wishes from
+        `<candidate_dir>/.pending_council_playtest_reports.json`, returning
+        `(formatted_provenance_block, multimodal_screenshot_parts)` so Council specialists inspect
         both the `observed_on_slice_id` provenance against current HEAD and the player's actual screenshots.
         """
         if candidate_dir is None:
             return "", []
         wf = Path(candidate_dir) / ".pending_playtest_wishes.json"
-        if not wf.is_file():
-            return "", []
-        try:
-            raw_items = json.loads(wf.read_text(encoding="utf-8"))
-            wf.unlink(missing_ok=True)
-        except Exception as exc:
-            logger.debug("Failed reading .pending_playtest_wishes.json: %s", exc)
-            return "", []
-        if not isinstance(raw_items, list) or not raw_items:
+        rf = Path(candidate_dir) / ".pending_council_playtest_reports.json"
+        raw_items: List[Any] = []
+        raw_reports: List[Any] = []
+        if wf.is_file():
+            try:
+                loaded_w = json.loads(wf.read_text(encoding="utf-8"))
+                wf.unlink(missing_ok=True)
+                if isinstance(loaded_w, list):
+                    raw_items = loaded_w
+            except Exception as exc:
+                logger.debug("Failed reading .pending_playtest_wishes.json: %s", exc)
+        if rf.is_file():
+            try:
+                loaded_r = json.loads(rf.read_text(encoding="utf-8"))
+                rf.unlink(missing_ok=True)
+                if isinstance(loaded_r, list):
+                    raw_reports = loaded_r
+            except Exception as exc:
+                logger.debug("Failed reading .pending_council_playtest_reports.json: %s", exc)
+
+        if not raw_items and not raw_reports:
             return "", []
 
         from google.genai import types
 
-        lines: List[str] = [
-            "=== APPROVED BLIND PLAYTESTER WISHES (OPAQUE-BOX PLAYER FEEDBACK) ===",
-            "PROVENANCE & HEAD RECONCILIATION RULE: Each wish below was filed by an autonomous Blind Playtester "
-            "(who knew ONLY the game's title and short store description) while playing a specific completed slice checkpoint.",
-            "Before adding tasks, check current HEAD code and recent ProductionBoard tasks to verify whether a later slice "
-            "already resolved the symptom; if not, update your domain's Game Bible strategy and raise/refine concrete "
-            "`backlog_additions` or `backlog_refinements` immediately:",
-        ]
+        blocks: List[str] = []
         parts: List[Any] = []
         seen_screens: set[str] = set()
 
-        for idx, item in enumerate(raw_items, 1):
-            if not isinstance(item, dict):
-                continue
-            cat = str(item.get("category") or "gameplay_feel")
-            summary = str(item.get("summary") or "").strip()
-            rationale = str(item.get("rationale") or "").strip()
-            obs_slice = str(item.get("observed_on_slice_id") or "unspecified_slice")
-            cp_id = str(item.get("checkpoint_id") or "unknown_checkpoint")
-            mood = str(item.get("mood_at_time") or "unspecified")
-            p_note = str(item.get("producer_note") or "").strip()
-            lines.append(
-                f"  {idx}. [{cat}] {summary}\n"
-                f"     - Observed on Slice: `{obs_slice}` (Checkpoint `{cp_id}`, Player Mood: `{mood}`)\n"
-                f"     - Player Experience Rationale: {rationale}"
-                + (f"\n     - Executive Producer Direction: {p_note}" if p_note else "")
-            )
-            scr_str = str(item.get("screenshot_path") or "").strip()
-            if scr_str and scr_str not in seen_screens and len(seen_screens) < 4:
-                scr_p = Path(scr_str)
-                if scr_p.is_file():
-                    try:
-                        img_bytes = scr_p.read_bytes()
-                        if img_bytes:
-                            seen_screens.add(scr_str)
-                            parts.append(
-                                types.Part.from_text(
-                                    text=f"Blind Playtester Screenshot for Wish #{idx} ('{summary}', observed on slice '{obs_slice}'):"
-                                )
-                            )
-                            parts.append(
-                                types.Part.from_bytes(
-                                    data=img_bytes,
-                                    mime_type="image/png",
-                                    media_resolution=types.MediaResolution.MEDIA_RESOLUTION_MEDIUM,
-                                )
-                            )
-                    except Exception as img_exc:
-                        logger.debug("Skipping unreadable playtest wish screenshot %s: %s", scr_p, img_exc)
+        def _attach_screen(label: str, raw_scr: Any) -> None:
+            scr_str = str(raw_scr or "").strip()
+            if not scr_str or scr_str in seen_screens or len(seen_screens) >= 4:
+                return
+            scr_p = Path(scr_str)
+            if not scr_p.is_file():
+                return
+            try:
+                img_bytes = scr_p.read_bytes()
+                if img_bytes:
+                    seen_screens.add(scr_str)
+                    parts.append(types.Part.from_text(text=label))
+                    parts.append(
+                        types.Part.from_bytes(
+                            data=img_bytes,
+                            mime_type="image/png",
+                            media_resolution=types.MediaResolution.MEDIA_RESOLUTION_MEDIUM,
+                        )
+                    )
+            except Exception as img_exc:
+                logger.debug("Skipping unreadable playtest screenshot %s: %s", scr_p, img_exc)
 
-        return "\n".join(lines), parts
+        for r_idx, env in enumerate(raw_reports, 1):
+            if not isinstance(env, dict):
+                continue
+            sid = str(env.get("session_id") or f"report_{r_idx}")
+            obs_slice = str(env.get("observed_on_slice_id") or "unspecified_slice")
+            cp_id = str(env.get("checkpoint_id") or "unknown_checkpoint")
+            rep = env.get("session_report") or {}
+            env_wishes = env.get("wishes") or []
+            env_bugs = env.get("bugs_found") or {}
+            env_questions = env.get("questions") or {}
+            env_notes = env.get("field_notes") or {}
+            env_rulebook = env.get("rulebook") or {}
+
+            r_lines: List[str] = [
+                f"=== COUNCIL-INITIATED BLIND PLAYTEST FULL REPORT & WISHES (`{sid}` | Slice `{obs_slice}` | Checkpoint `{cp_id}`) ===",
+                f"Overall Fun Rating: {rep.get('overall_fun_rating', '?')}/10 ({env.get('turn_count', '?')} turns, {env.get('sim_duration_sec', '?')}s)",
+                f"Overall Experience Summary: {rep.get('overall_experience_summary', '')}",
+                f"- Graphics & Visuals: {rep.get('graphics_and_visuals', '')}",
+                f"- Gameplay & Feel: {rep.get('gameplay_and_feel', '')}",
+                f"- Sound & Audio: {rep.get('sound_and_audio', '')}",
+                f"- Intuitiveness & Onboarding: {rep.get('intuitiveness_and_onboarding', '')}",
+                f"- Goals, Pacing & Accomplishment: {rep.get('goals_pacing_and_accomplishment', '')}",
+                f"- World & Atmosphere: {rep.get('world_and_atmosphere', '')}",
+                f"- Key Highlights: {json.dumps(rep.get('key_highlights') or [])}",
+                f"- Key Pain Points: {json.dumps(rep.get('key_pain_points') or [])}",
+                f"- Bugs & Glitches Observed: {json.dumps(rep.get('bugs_and_glitches_observed') or [])}",
+                f"- Unanswered Questions & Mysteries: {json.dumps(rep.get('unanswered_questions_and_mysteries') or [])}",
+            ]
+            if isinstance(env_bugs, dict) and env_bugs:
+                r_lines.append("Spotted Bugs & Glitches During Play:")
+                for bk, bv in env_bugs.items():
+                    if isinstance(bv, dict):
+                        r_lines.append(
+                            f"  * [{bv.get('severity', 'major').upper()} | {bv.get('category', 'bug')}] "
+                            f"({bk}) {bv.get('summary', '')}: {bv.get('details', '')}"
+                        )
+                        _attach_screen(
+                            f"Blind Playtester Bug Screenshot ('{bv.get('summary', bk)}', slice '{obs_slice}'):",
+                            bv.get("screenshot_path"),
+                        )
+            if isinstance(env_notes, dict) and env_notes:
+                r_lines.append("Player Field Notes:")
+                for nk, nv in env_notes.items():
+                    r_lines.append(f"  * {nk}: {nv}")
+            if isinstance(env_questions, dict) and env_questions:
+                r_lines.append("Player Questions (Asked & Answered Along The Way):")
+                for qk, qv in env_questions.items():
+                    if isinstance(qv, dict):
+                        st = str(qv.get("status") or "open").upper()
+                        ans = f" -> {qv['answer']}" if qv.get("answer") else ""
+                        r_lines.append(f"  * [{st}] ({qk}) {qv.get('question', '')}{ans}")
+            if isinstance(env_rulebook, dict) and env_rulebook:
+                r_lines.append("Confirmed Controls/Rules Figured Out:")
+                for rk, rv in env_rulebook.items():
+                    r_lines.append(f"  * {rk}: {rv}")
+            if isinstance(env_wishes, list) and env_wishes:
+                r_lines.append(f"Auto-Delivered Player Wishes ({len(env_wishes)}):")
+                for w_i, w_item in enumerate(env_wishes, 1):
+                    if isinstance(w_item, dict):
+                        r_lines.append(
+                            f"  {w_i}. [{w_item.get('category', 'gameplay_feel')}] {w_item.get('summary', '')} "
+                            f"(mood={w_item.get('mood_at_time', 'n/a')}): {w_item.get('rationale', '')}"
+                        )
+                        _attach_screen(
+                            f"Blind Playtester Wish Screenshot ('{w_item.get('summary', '')}', slice '{obs_slice}'):",
+                            w_item.get("screenshot_path"),
+                        )
+            _attach_screen(
+                f"Blind Playtester Final Session Screen ('{sid}', slice '{obs_slice}'):",
+                env.get("final_screenshot_path"),
+            )
+            blocks.append("\n".join(r_lines))
+
+        if raw_items:
+            lines: List[str] = [
+                "=== APPROVED BLIND PLAYTESTER WISHES (OPAQUE-BOX PLAYER FEEDBACK) ===",
+                "PROVENANCE & HEAD RECONCILIATION RULE: Each wish below was filed by an autonomous Blind Playtester "
+                "(who knew ONLY the game's title and short store description) while playing a specific completed slice checkpoint.",
+                "Before adding tasks, check current HEAD code and recent ProductionBoard tasks to verify whether a later slice "
+                "already resolved the symptom; if not, update your domain's Game Bible strategy and raise/refine concrete "
+                "`backlog_additions` or `backlog_refinements` immediately:",
+            ]
+            for idx, item in enumerate(raw_items, 1):
+                if not isinstance(item, dict):
+                    continue
+                cat = str(item.get("category") or "gameplay_feel")
+                summary = str(item.get("summary") or "").strip()
+                rationale = str(item.get("rationale") or "").strip()
+                obs_slice = str(item.get("observed_on_slice_id") or "unspecified_slice")
+                cp_id = str(item.get("checkpoint_id") or "unknown_checkpoint")
+                mood = str(item.get("mood_at_time") or "unspecified")
+                p_note = str(item.get("producer_note") or "").strip()
+                lines.append(
+                    f"  {idx}. [{cat}] {summary}\n"
+                    f"     - Observed on Slice: `{obs_slice}` (Checkpoint `{cp_id}`, Player Mood: `{mood}`)\n"
+                    f"     - Player Experience Rationale: {rationale}"
+                    + (f"\n     - Executive Producer Direction: {p_note}" if p_note else "")
+                )
+                _attach_screen(
+                    f"Blind Playtester Screenshot for Wish #{idx} ('{summary}', observed on slice '{obs_slice}'):",
+                    item.get("screenshot_path"),
+                )
+            blocks.append("\n".join(lines))
+
+        return "\n\n".join(blocks), parts
 
     def _emit_event(self, event_type: str, payload: Dict[str, Any]) -> None:
         """Emits a rationale-first telemetry event to Mission Control and TraceLogger."""
@@ -1512,6 +1625,7 @@ class CreativeWritersRoom:
             f"- For each item you raise, provide a unique `item_id`, `slice_id` matching the active slice, a precise `spec`, `depends_on`, `blocks_items`, "
             f"`target_modules` (leave `target_modules=[]` for standalone `visual_asset`, `animation`, and `audio_asset` items; for `mechanic_code`, `ui`, `level_map`, and `integration` items, prefer encapsulated per-feature GDScript module paths such as `scenes/mechanics/<feature_id>.gd`, `scenes/entities/<entity_id>.gd`, `scenes/ui/<widget_id>.gd`, or `scenes/world/<region_id>.gd` that register in the `'state_providers'` node group so multiple SWE workers can build features in parallel with disjoint per-file locks rather than bottlenecking on a single monolithic file), and a `proof_spec`. "
             f"Do not duplicate existing items. The finished work will be shown to the Council panel for approval.\n"
+            f"- SYSTEMIC CONTRACTS OVER HARDCODED COORDINATES: Define `spec` and `spec_addition_or_rewrite` (`enrich`) as generalizable, world-wide rules (querying authoritative world geometry/regions, node groups, and player-driven state across all valid locations)—never prescribe hardcoded `(x, y)` coordinate whitelists, bounding-box overrides, or fixed target coordinates for production mechanics (specific coordinates belong only as example test landmarks in `proof_spec`).\n"
             f"Buildable kinds right now: {self._supported_kinds() or 'all'}.\n"
         )
 
@@ -1786,7 +1900,7 @@ class CreativeWritersRoom:
                 "  2. State transitions across frames are not causally driven by player inputs (`[QA] tick ... in:[...]` or mouse clicks), or if an input action / setup call teleports or forces the world/onboarding step directly to a solved state by bypassing intermediate mechanics or prerequisites.\n"
                 "  3. A multi-screen world (`world_bounds` larger than the 1280x720 viewport) lacks working camera navigation/panning or leaves core player verbs and mid/long-term progression from the Game Bible unimplemented.\n"
                 "  4. A worker attempts to 'cheat' a failed playtest by inflating collision/catch radii into giant magnets, pre-spawning player-built routing/solution structures in `_ready()`, or moving the goal/receiver into the un-deflected/un-routed default trajectory of an emitter so the objective completes without genuine player construction.\n"
-                "ABSOLUTE BAN ON COUNCIL-ORDERED SHORTCUTS: When a QA playtest fails to route an entity/projectile to the goal, NEVER write `feedback` telling workers to move the goal/receiver into the un-interacted path or widen hitboxes to make the test pass! Instead, inspect the `[QA] tick ... in:[...]` inputs and `[QA] pos=...` telemetry to diagnose whether (a) the QA play script failed to perform the required multi-step player sequence (e.g., didn't press the tool-selection key, didn't rotate, or clicked invalid terrain so the placed structure count stayed 0), or (b) the game script failed to instantiate/interact when clicked at a valid coordinate—and direct your `feedback` at fixing that exact root cause.\n"
+                "ABSOLUTE BAN ON COUNCIL-ORDERED SHORTCUTS & WRAPPER-SCRIPT AUTOMATION: When a QA playtest fails to complete a gameplay chain or launch/route an entity to the goal, NEVER write `feedback` telling workers to move the goal/receiver into an un-interacted path, widen hitboxes, OR call spawn/placement/mutation functions inside `_physics_process()` / `_process()` of `tests/test_<item_id>.gd`! The engine enforces a Counterfactual Zero-Input Gate (`input_script=[]`) AND an Entrypoint Parity Gate (replaying the exact same `input_segments` directly against live `res://main.tscn` without `tests/test_*.gd`), so scripting gameplay actions inside `tests/test_*.gd` immediately fails verification. Instead, inspect `qa_test_script_source`, `[QA] tick ... in:[...]` inputs, and `[QA] pos=...` telemetry: if `tests/test_<item_id>.gd` is mutating game state or bypassing `main.tscn` inputs, `request_changes` to remove that wrapper cheating; otherwise diagnose whether (a) a signal/input/entity wire is missing in the production game scripts (`target_modules` / `res://main.tscn`), or (b) `qa_test_engineer`'s external `input_segments` (`mouse_world_pos`, `mouse_click_pos`, tool/tuning keys) missed a required player step—and direct your `feedback` at fixing that exact root cause. Likewise, treat any `(x, y)` coordinate in QA telemetry strictly as diagnostic evidence of where a world-wide rule broke—never instruct workers to whitelist a specific `(x, y)` coordinate/rectangle or hardcode aiming/spawning toward a fixed coordinate in production scripts; always require fixing the general spatial/gameplay contract across all valid world regions.\n"
                 "Use the external QA contact-sheet header/footer strips ('[QA] tick ... in:[...]', '[QA] pos=(...) ...') above and below each 16:9 frame "
                 "as ground-truth engine telemetry to verify coordinates, inputs, and state changes—never flag those external QA margin strips (or the external checkerboard, cyan border, and yellow baseline guide line in `plate_*.png` / `anim_sheet_*.png`) as defects.\n"
             )
@@ -1825,7 +1939,8 @@ class CreativeWritersRoom:
             "  * These external margin strips above/below the 16:9 border are QA contact-sheet headers/footers—never reject those external margin strips (or the external checkerboard/cyan border/yellow baseline in `plate_*.png`).\n"
             "  * DEBUG OVERLAY POLICY (REQUIRED IN TEST SCENES, BANNED IN FINAL PRODUCTION GAME): In isolated or staged QA test scenes (`res://tests/test_<item_id>.tscn`), rich visual debug overlays (velocity/force vectors, target markers, state readouts) ARE expected and necessary to prove physics and state changes—if a proof is ambiguous without a visual vector/marker overlay, use `request_changes` to ask QA for that overlay in `res://tests/test_<item_id>.tscn`. Conversely, the final production game (`res://main.tscn`, `main.gd`, `ui_hud.gd`) must NEVER render raw developer debug text (`[DEBUG]`, telemetry dumps) on the player's HUD!\n"
             "  * HUMAN-SCALE PLAYABILITY & SUBSYSTEM HARMONY: Check the rate of change across ticks (`60 ticks = 1.0s`). If a player holds a movement, steering, rotation, or interaction input for 60–180 ticks (1–3 seconds) and the entity barely turns or moves (e.g., 1 degree per second because a damping/stabilizer subsystem is fighting the player's input, or `[idle]` with zero inputs), you MUST `request_changes`!\n"
-            "  * CAUSAL-CHAIN ROOT-CAUSE DIAGNOSIS (NEVER ORDER GOALPOST SHIFTS OR SHORTCUTS): When a multi-step gameplay chain fails in a filmstrip, read the `[QA] tick N in:[...]` input bar and `[QA] pos=...` state snapshot bar across every frame to see WHICH link in the causal chain broke (e.g., did the QA script fail to press the tool-selection key or click an invalid water/void coordinate so the placed structure count stayed 0, OR did the game script fail to instantiate/deflect/route when clicked at a valid coordinate?). NEVER ask workers to move a goal/receiver into an un-deflected default trajectory or inflate a catch radius to make a failed playtest pass!\n"
+            "  * CAUSAL-CHAIN ROOT-CAUSE DIAGNOSIS (NEVER ORDER GOALPOST SHIFTS, SHORTCUTS, OR `_physics_process` WRAPPER CALLS): Every QA capture must pass the Counterfactual Zero-Input Gate (`input_script=[]` produces zero progress) AND the Entrypoint Parity Gate (the external `input_segments` satisfy the exact same state assertions inside live `res://main.tscn` without `tests/test_<item_id>.gd`). NEVER instruct workers in `feedback` to invoke spawn/placement/action methods from `_physics_process()` inside `tests/test_<item_id>.gd`, and NEVER ask workers to move a goal/receiver into an un-deflected default trajectory or inflate a catch radius! Instead, read `[QA] tick N in:[...]` and `[QA] pos=...` to see WHICH link in the causal chain broke: require fixing missing signal/input/entity connections in the production `.gd` modules (`target_modules` / `res://main.tscn`) and driving real player inputs externally via `qa_test_engineer`'s `input_segments` (`mouse_world_pos`, `mouse_click_pos`, action keys), keeping `tests/test_<item_id>.gd` strictly limited to scene instantiation, read-only camera/diagnostic `_draw()` overlays, and `get_state_snapshot()` readouts!\n"
+            "  * SYSTEMIC INVARIANTS OVER COORDINATE POINT-PATCHES: Treat any `(x, y)` coordinate, tick, or angle in `[QA]` telemetry strictly as a diagnostic sample showing WHERE a general game rule broke—NEVER as the boundary of the fix! Never write `feedback` (or `replacement_spec` / `spawned_prerequisite_tasks`) instructing production code to whitelist a specific `(x, y)` coordinate/bounding box or hardcode aiming/targeting toward a fixed coordinate; instead, diagnose the underlying systemic mismatch (e.g., UI/cursor validation disagreeing with authoritative world geometry across regions, or entity targeting/orientation not driven by player controls/state) so the mechanic works everywhere in the world.\n"
             "  * VISUAL & UI INTEGRITY: Inspect every frame from Frame 1 to the final frame. If active subjects drift off-screen, if world indicators are detached from their sprites, or if HUD panels/labels overlap or collide with each other, you MUST `request_changes`!\n\n"
         )
         on_disk_sprites_block = ""
@@ -2152,10 +2267,14 @@ class CreativeWritersRoom:
             applied += 1
         return applied
 
-    def _handle_failed_items(self) -> None:
+    def _handle_failed_items(self) -> bool:
         """Re-queues a failed item once (visible via events/logs); on a second failure in a live Council build,
         escalates the item to `needs_decision` so the Council can rewrite its spec or cancel/re-point dependents,
-        or raises the authentic error if spec rewrites are exhausted or in direct unit-test failure probes (Rule 5)."""
+        or raises the authentic error if spec rewrites are exhausted or in direct unit-test failure probes (Rule 5).
+        Returns True if any failed item was re-queued or escalated."""
+        if self.board is None:
+            return False
+        handled = False
         for it in self.board.items():
             if it.state != "failed":
                 continue
@@ -2168,10 +2287,44 @@ class CreativeWritersRoom:
                         it.failure,
                     )
                     self.board.escalate_failed_to_decision(it.item_id)
+                    handled = True
                     continue
                 raise StudioAgentError(f"Backlog item '{it.item_id}' failed {it.failure_count} times:\n{it.failure}")
             logger.warning("Re-queueing failed item %s (failure %d):\n%s", it.item_id, it.failure_count, it.failure)
             self.board.requeue_failed(it.item_id)
+            handled = True
+        if handled and self.scheduler is not None:
+            self.scheduler.start()
+        return handled
+
+    def _resolve_blocked_by_cancelled(self) -> bool:
+        """Unblocks items stranded solely because a Council decision explicitly cancelled one of their `depends_on`
+        items, pruning the cancelled dependency IDs and annotating the dependent's spec so the build never deadlocks."""
+        if self.board is None:
+            return False
+        stranded = self.board.blocked_by_cancelled()
+        if not stranded:
+            return False
+        all_by_id = {i.item_id: i for i in self.board.items()}
+        resolved = False
+        for it in stranded:
+            cancelled_deps = [d for d in it.depends_on if d in all_by_id and all_by_id[d].state == "cancelled"]
+            if not cancelled_deps:
+                continue
+            remaining_deps = [d for d in it.depends_on if d not in cancelled_deps]
+            reasons = "; ".join(
+                f"{d} ({all_by_id[d].decision_reason or 'cancelled by Council'})" for d in cancelled_deps
+            )
+            note = (
+                f"[Council Dependency Update]: Prerequisite item(s) {cancelled_deps} were cancelled ({reasons}); "
+                "implement this item cleanly without relying on cancelled prerequisites."
+            )
+            updated_spec = f"{it.spec.rstrip()}\n\n{note}" if note not in it.spec else it.spec
+            self.board.update_item(it.item_id, spec=updated_spec, depends_on=remaining_deps)
+            resolved = True
+        if resolved and self.scheduler is not None:
+            self.scheduler.start()
+        return resolved
 
     def _is_paused(self, candidate_dir: Optional[Path] = None) -> bool:
         if self.scheduler is not None and hasattr(self.scheduler, "is_paused") and self.scheduler.is_paused():
@@ -2379,7 +2532,37 @@ class CreativeWritersRoom:
         "AudioAtmosphereDesigner",
     )
 
-    def _items_needing_domain_direction(self, role_name: str) -> List[Any]:
+    def _has_started_execution(self, item: Any, candidate_dir: Optional[Path] = None) -> bool:
+        """Returns True if `item` has already completed worker turns, revisions, or retries (so Council
+        pre-execution Task Shaping must not re-shape or split it on pause/resume)."""
+        if getattr(item, "revisions", None) or getattr(item, "failure_count", 0) > 0 or getattr(item, "spec_resets", 0) > 0:
+            return True
+        if self.board is not None and hasattr(self.board, "has_prior_execution_activity"):
+            try:
+                if self.board.has_prior_execution_activity(item):
+                    return True
+            except Exception:
+                pass
+        c_dir = candidate_dir or getattr(self, "_active_candidate_dir", None)
+        if c_dir is not None:
+            raw_id = str(getattr(item, "item_id", ""))
+            safe_id = "".join(ch if (ch.isalnum() or ch in ("_", "-")) else "_" for ch in raw_id).strip("_") or "item"
+            rev_idx = len(getattr(item, "revisions", None) or [])
+            trace_path = Path(c_dir) / "artifacts" / "work_items" / safe_id / f"lead_trace_rev{rev_idx}.json"
+            if trace_path.is_file():
+                try:
+                    t_data = json.loads(trace_path.read_text(encoding="utf-8"))
+                    if isinstance(t_data, dict) and (t_data.get("turns") or t_data.get("pending_decision")):
+                        return True
+                except Exception:
+                    pass
+        return False
+
+    def _items_needing_domain_direction(
+        self,
+        role_name: str,
+        candidate_dir: Optional[Path] = None,
+    ) -> List[Any]:
         """Returns unstarted board items that were raised by a different specialist (or split/added in Stage 1)
         and have not yet received `[<role_name> Direction]` input."""
         if self.board is None:
@@ -2388,6 +2571,8 @@ class CreativeWritersRoom:
         needed: List[Any] = []
         for item in self.board.items():
             if item.state not in ("ready", "blocked"):
+                continue
+            if self._has_started_execution(item, candidate_dir=candidate_dir):
                 continue
             if item.raised_by_role == role_name:
                 continue
@@ -2401,6 +2586,7 @@ class CreativeWritersRoom:
         game_bible: GameBibleSpec,
         dna_summary: str,
         bible_snapshot: str,
+        candidate_dir: Optional[Path] = None,
     ) -> int:
         """Stage 2 of Council Task Shaping: Runs all 6 Council domain leads in parallel over the complete
         Production Board (including any tasks added or split during Stage 1) so every task receives
@@ -2412,7 +2598,7 @@ class CreativeWritersRoom:
             spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == role_name), None)
             if spec is None:
                 continue
-            targets = self._items_needing_domain_direction(role_name)
+            targets = self._items_needing_domain_direction(role_name, candidate_dir=candidate_dir)
             if targets:
                 role_targets.append((role_name, spec, targets))
         if not role_targets:
@@ -2452,6 +2638,7 @@ class CreativeWritersRoom:
                 f"INSTRUCTIONS:\n"
                 f"1. For EVERY task listed in `TASKS REQUIRING YOUR DOMAIN REVIEW` above, include one `WorkItemRefinement` entry in `backlog_refinements` with matching `item_id`:\n"
                 f"   - Set `action='enrich'` and populate `spec_addition_or_rewrite` (plus optional `proof_spec_update`, `add_depends_on`, or `add_target_modules`—using encapsulated per-feature `.gd` paths like `scenes/mechanics/<feature>.gd`, `scenes/entities/<entity>.gd`, or `scenes/ui/<widget>.gd` when assigning or refining code targets so parallel SWE workers can lock disjoint files) whenever your domain has direction, integration contracts, UX affordances, non-overlapping HUD layout rules, world/progression hooks, visual rig/silhouette specs, or reactive audio cues for that task.\n"
+                f"   - Specify generalizable, world-wide invariants (querying authoritative world geometry/regions, node groups, and player-driven controls/state across the entire map)—never prescribe hardcoded `(x, y)` coordinate whitelists, bounding-box overrides, or fixed aiming/spawn coordinates for production code (keep sample coordinates strictly in `proof_spec_update` if needed as QA test landmarks).\n"
                 f"   - Set `action='no_input'` ONLY if, after deliberating, your domain genuinely has zero requirements or touchpoints with that specific task.\n"
                 f"2. Leave `backlog_additions=[]` in Stage 2 (all companion tasks were already raised in Stage 1).\n"
                 f"Return `TaskShapingBatch` with `deliberation` FIRST."
@@ -2510,7 +2697,10 @@ class CreativeWritersRoom:
           contribute domain direction (`action='enrich'`)."""
         if self.board is None or not is_real_genai_client(self.client):
             return 0
-        unstarted = [i for i in self.board.items() if i.state in ("ready", "blocked")]
+        unstarted = [
+            i for i in self.board.items()
+            if i.state in ("ready", "blocked") and not self._has_started_execution(i, candidate_dir=candidate_dir)
+        ]
         if not unstarted:
             return 0
         bible_snapshot = self._format_bible_snapshot(game_bible)
@@ -2520,7 +2710,10 @@ class CreativeWritersRoom:
 
         # Stage 1: Decomposition ('split') & Missing Companion Task Discovery ('backlog_additions')
         for role_name in self._SHAPING_COUNCIL_ROLES:
-            unstarted_now = [i for i in self.board.items() if i.state in ("ready", "blocked")]
+            unstarted_now = [
+                i for i in self.board.items()
+                if i.state in ("ready", "blocked") and not self._has_started_execution(i, candidate_dir=candidate_dir)
+            ]
             if not unstarted_now:
                 break
             role_prefix = f"[{role_name} Direction]:"
@@ -2545,7 +2738,7 @@ class CreativeWritersRoom:
                 f"Before the full Council gives cross-domain direction in Stage 2, review the unstarted (`ready` or `blocked`) tasks on the Production Board:\n"
                 f"1. DECOMPOSE MONOLITHIC TASKS (`action='split'` in `backlog_refinements`): Should any task be split into smaller, focused tasks (for example, separating core simulation mechanics from interactive player placement/building tools, separating world/level progression from HUD telemetry, or splitting a multi-entity visual_asset bundle into 1-entity-per-item visual_asset tasks)? When you split a task, downstream dependents on the board automatically re-point to your split tasks.\n"
                 f"2. RAISE MISSING COMPANION TASKS (`backlog_additions`): Is a prerequisite asset, UI affordance, level region, or sub-mechanic task missing altogether? Propose it in `backlog_additions` (and use `blocks_items` or `add_depends_on` to link it).\n"
-                f"3. CONTRIBUTE INITIAL DOMAIN DIRECTION (`action='enrich'` in `backlog_refinements`): You may also enrich existing tasks with `spec_addition_or_rewrite` and `add_depends_on`.\n"
+                f"3. CONTRIBUTE INITIAL DOMAIN DIRECTION (`action='enrich'` in `backlog_refinements`): You may also enrich existing tasks with `spec_addition_or_rewrite` and `add_depends_on` (define generalizable, world-wide system/geometry contracts rather than hardcoded `(x, y)` coordinate whitelists or fixed target coordinates for production code).\n"
                 f"Buildable kinds right now: {self._supported_kinds() or 'all'}.\n"
                 f"Return `TaskShapingBatch` with `deliberation` FIRST."
             )
@@ -2634,11 +2827,23 @@ class CreativeWritersRoom:
             game_bible=game_bible,
             dna_summary=dna_summary,
             bible_snapshot=bible_snapshot,
+            candidate_dir=candidate_dir,
         )
 
         if candidate_dir is not None and total_changes > 0:
             self._persist_bible(game_bible, candidate_dir=candidate_dir)
         return total_changes
+
+    def _is_end_of_slice_blind_playtest_enabled(self) -> bool:
+        """Returns True when the interactive turn-by-turn Blind AI Playtester is enabled for slice completion."""
+        explicit_flag = getattr(self, "enable_end_of_slice_blind_playtest", None)
+        if explicit_flag is False:
+            return False
+        if explicit_flag is True:
+            return True
+        if os.environ.get("STUDIO_ENABLE_END_OF_SLICE_PLAYTEST", "1") == "0":
+            return False
+        return bool(is_real_genai_client(self.client))
 
     def _run_slice_assembly_check(
         self,
@@ -2647,13 +2852,9 @@ class CreativeWritersRoom:
         candidate_dir: Optional[Path],
         pass_index: int = 0,
     ) -> int:
-        """Convenes QA and the Council when all current Production Board tasks for the active slice are approved:
-        1. QA builds and executes an automated Slice Playtest Script (`res://tests/test_slice_playtest_<slice_id>_pass<pass_index>.tscn`)
-           that instantiates the live game entrypoint (`res://main.tscn`), forms the state where the game is at the current slice,
-           and scripts real player inputs (`input_segments`) playing through at least the first goal / core loop segment of the current slice.
-        2. The Council holds a multi-perspective Slice Playtest Roundtable conversation (`SlicePlaytestRoundtableTurn` + `SliceAssemblyDecision`)
-           inspecting the playtest filmstrip, telemetry, and entrypoint reachability to verify that the slice is assembled, playable at human scale,
-           free of production debug overlays, and fun—emitting the full filmstrip and conversation to the Writers' Room transcript and UI."""
+        """Runs entrypoint reachability & zero-input boot sanity before handing off directly to the Blind AI Playtester
+        (or runs the legacy scripted QA playthrough + Council roundtable when explicitly requested via
+        `enable_slice_assembly_check=True` or when the Blind AI Playtester is disabled)."""
         if (
             self.board is None
             or candidate_dir is None
@@ -2661,7 +2862,11 @@ class CreativeWritersRoom:
         ):
             return 0
         # Only run automatic slice assembly checks on live Gemini builds unless explicitly enabled in tests
-        if not is_real_genai_client(self.client) and not getattr(self, "enable_slice_assembly_check", False):
+        if (
+            not is_real_genai_client(self.client)
+            and not getattr(self, "enable_slice_assembly_check", False)
+            and not getattr(self, "enable_end_of_slice_blind_playtest", False)
+        ):
             return 0
 
         c_dir = Path(candidate_dir)
@@ -2670,21 +2875,20 @@ class CreativeWritersRoom:
         active_slice_title = active_slice_obj.title if active_slice_obj is not None else "Slice 1"
         active_slice_idx = active_slice_obj.slice_index if active_slice_obj is not None else 1
 
-        self._emit_activity(
-            agent_role="QATestEngineer",
-            status_text=(
-                f"QA is building & running an automated Slice Playtest Script for '{active_slice_title}' "
-                f"(Playtest & Assembly Check #{pass_index + 1})..."
-            ),
-            active_agents=["QATestEngineer", "CreativeDirector", "GameplaySystemsEngineer", "GameplayDesigner", "UXExperienceDesigner"],
-            phase="slice_assembly_check",
-        )
-
         from engine.studio.context_curator import (
             ContextCuratorAgent,
             compute_entrypoint_reachability,
         )
         from engine.studio.proofs import format_filmstrip_telemetry_progression
+
+        legacy_scripted_playtest_explicit = bool(
+            getattr(self, "enable_slice_assembly_check", False)
+            or getattr(self, "assembly_playtest_planner_fn", None) is not None
+            or getattr(self, "assembly_filmstrip_fn", None) is not None
+        )
+        blind_playtest_takes_over = (
+            self._is_end_of_slice_blind_playtest_enabled() and not legacy_scripted_playtest_explicit
+        )
 
         reach = compute_entrypoint_reachability(c_dir)
         parts: List[Any] = []
@@ -2695,7 +2899,83 @@ class CreativeWritersRoom:
         proof_out = c_dir / "artifacts" / "proofs" / f"filmstrip_slice_assembly_check_pass{pass_index}.png"
         rel_proof_path = f"artifacts/proofs/filmstrip_slice_assembly_check_pass{pass_index}.png"
 
-        if (
+        if blind_playtest_takes_over:
+            self._emit_activity(
+                agent_role="GameplaySystemsEngineer",
+                status_text=(
+                    f"Verifying entrypoint reachability & zero-input boot sanity for '{active_slice_title}' "
+                    f"before launching Blind AI Playtester..."
+                ),
+                active_agents=["GameplaySystemsEngineer"],
+                phase="slice_assembly_check",
+            )
+            main_scene_res = reach.get("main_scene") or "res://main.tscn"
+            boot_errs: List[str] = []
+            try:
+                from engine.sim.godot_verifier import GodotHeadlessSimulator
+
+                boot_sim = GodotHeadlessSimulator(
+                    c_dir,
+                    capture_viewport=False,
+                    capture_ticks=[1, 15],
+                    input_script=[],
+                    setup_script=None,
+                    max_ticks=15,
+                    telemetry_mode="null",
+                    target_scene=main_scene_res,
+                )
+                boot_state = boot_sim.run_until_complete()
+                boot_errs = [
+                    f"{d.file_path.name}:{d.line_number} - {d.error_message}"
+                    for d in (getattr(boot_sim, "runtime_diagnostics", None) or [])
+                    if getattr(d, "file_path", None) is not None and str(d.file_path).endswith(".gd")
+                ] + list(getattr(boot_sim, "script_errors", None) or [])
+                if getattr(boot_state, "is_crashed", False) and not boot_errs:
+                    boot_errs.append(f"Playable entrypoint '{main_scene_res}' exited abnormally during zero-input boot sanity check.")
+            except Exception as boot_exc:
+                boot_errs = [str(boot_exc)]
+
+            unreferenced_mods = list(reach.get("unreferenced_from_entrypoint") or [])
+            if not boot_errs and not unreferenced_mods:
+                self._emit_event(
+                    "slice_assembly_check_completed",
+                    {
+                        "deliberation": (
+                            f"Static entrypoint reachability ({len(reach.get('reachable_from_entrypoint') or [])} reachable modules, "
+                            f"0 unreferenced) and zero-input boot sanity passed on '{main_scene_res}'; handing off directly to Blind AI Playtester."
+                        ),
+                        "pass_index": pass_index,
+                        "is_slice_assembled": True,
+                        "mode": "static_boot_sanity",
+                        "playability_and_fun_evaluation": "Handed off to interactive Blind AI Playtester.",
+                        "unmounted_or_disconnected_systems": [],
+                        "spawned_item_ids": [],
+                    },
+                )
+                return 0
+
+            if boot_errs:
+                playtest_assertion_failure = (
+                    f"Entrypoint Parity Gate failed: zero-input boot sanity check on '{main_scene_res}' raised runtime GDScript error(s): "
+                    + " | ".join(str(e) for e in boot_errs[:5])
+                )
+            playtest_plan_summary = (
+                f"Static Entrypoint Reachability & Zero-Input Boot Sanity Check on `{main_scene_res}` "
+                f"(unreferenced_modules={unreferenced_mods}; boot_errors={len(boot_errs)}). "
+                "Interactive gameplay evaluation is delegated to the Blind AI Playtester once entrypoint wiring and boot health are clean."
+            )
+        else:
+            self._emit_activity(
+                agent_role="QATestEngineer",
+                status_text=(
+                    f"QA is building & running an automated Slice Playtest Script for '{active_slice_title}' "
+                    f"(Playtest & Assembly Check #{pass_index + 1})..."
+                ),
+                active_agents=["QATestEngineer", "CreativeDirector", "GameplaySystemsEngineer", "GameplayDesigner", "UXExperienceDesigner"],
+                phase="slice_assembly_check",
+            )
+
+        if not blind_playtest_takes_over and (
             is_real_genai_client(self.client)
             or getattr(self, "assembly_filmstrip_fn", None) is not None
             or getattr(self, "assembly_playtest_planner_fn", None) is not None
@@ -2794,6 +3074,7 @@ class CreativeWritersRoom:
                                 cartridge_dir=c_dir,
                                 ticks=[15, 60, 120, 180],
                                 out_path=proof_out,
+                                input_script=[],
                                 target_scene=reach.get("main_scene") or "res://main.tscn",
                             )
                         else:
@@ -2839,6 +3120,7 @@ class CreativeWritersRoom:
                                     cartridge_dir=c_dir,
                                     ticks=[15, 60, 120, 180],
                                     out_path=proof_out,
+                                    input_script=[],
                                     target_scene=reach.get("main_scene") or "res://main.tscn",
                                 )
                 if proof_out.is_file():
@@ -2957,7 +3239,9 @@ class CreativeWritersRoom:
         )
 
         roundtable_transcript_lines: List[str] = []
-        if is_real_genai_client(self.client) or getattr(self, "enable_slice_playtest_discussion", False):
+        if not blind_playtest_takes_over and (
+            is_real_genai_client(self.client) or getattr(self, "enable_slice_playtest_discussion", False)
+        ):
             playtest_panel_roles = ["GameplayDesigner", "UXExperienceDesigner", "VisualArtDirector"]
             self._emit_activity(
                 agent_role="CouncilReviewPanel",
@@ -3056,6 +3340,7 @@ class CreativeWritersRoom:
             "5. If everything needed for the active slice is assembled, responsive, playable through the first goal, and coherent in `run/main_scene` (and no playtest assertion failed), set `backlog_additions=[]` and `is_slice_assembled=True`.\n"
             "6. If any system is unmounted, if the playtest revealed sluggish/conflicting controls or assertion failures, or if `run/main_scene` has a visual/HUD/debug-overlay/onboarding defect, "
             "propose focused `integration` (or `mechanic_code`/`ui`) task(s) in `backlog_additions` BEFORE setting `is_slice_assembled=False`:\n"
+            "   - Diagnose and specify systemic, world-wide root causes in `spec` (fixing authoritative world/UI/mechanic rules across all valid regions and player states)—treat any failed playtest `(x, y)` coordinate strictly as diagnostic evidence or a `proof_spec` test landmark, never as a coordinate whitelist or fixed target to hardcode in production scripts.\n"
             "   - When writing `proof_spec` for a fix task, require a QA test scene (`res://tests/test_<item_id>.tscn`) with appropriate test-only diagnostic overlays and real `input_segments` proving the fix over ~120-240 ticks.\n"
             f"Buildable kinds right now: {self._supported_kinds() or 'all'}.\n"
             "Return `SliceAssemblyDecision` with `deliberation` FIRST and `is_slice_assembled` strictly last."
@@ -3207,14 +3492,8 @@ class CreativeWritersRoom:
         """
         if self.board is None or candidate_dir is None:
             return 0
-        explicit_flag = getattr(self, "enable_end_of_slice_blind_playtest", None)
-        if explicit_flag is False:
+        if not self._is_end_of_slice_blind_playtest_enabled():
             return 0
-        if explicit_flag is None:
-            if os.environ.get("STUDIO_ENABLE_END_OF_SLICE_PLAYTEST", "1") == "0":
-                return 0
-            if not is_real_genai_client(self.client):
-                return 0
 
         c_dir = Path(candidate_dir).resolve()
         if not (c_dir / "project.godot").is_file():
@@ -3280,10 +3559,13 @@ class CreativeWritersRoom:
         report = sess.get("session_report") or {}
         impressions = sess.get("impressions") or {}
         rulebook = sess.get("rulebook") or {}
+        field_notes = sess.get("field_notes") or {}
+        questions = sess.get("questions") or {}
+        bugs_found = sess.get("bugs_found") or {}
         wishes = detail.get("wishes") or []
         turns = detail.get("turns") or []
 
-        # Copy up to 4 representative session/wish screenshots into candidate proofs for UI & multimodal Council review
+        # Copy up to 5 representative session/bug/wish screenshots into candidate proofs for UI & multimodal Council review
         proof_dir = c_dir / "artifacts" / "proofs"
         proof_dir.mkdir(parents=True, exist_ok=True)
         candidate_shot_sources: List[Tuple[str, Path]] = []
@@ -3299,17 +3581,35 @@ class CreativeWritersRoom:
 
         if turns:
             _push_shot(f"Opening Screen (Turn #{turns[0].get('turn_index', 1)})", turns[0].get("screenshot_path"))
+        if isinstance(bugs_found, dict):
+            for b_item in list(bugs_found.values())[:2]:
+                if isinstance(b_item, dict):
+                    _push_shot(
+                        f"Spotted Bug [{b_item.get('severity', 'major')}/{b_item.get('category', 'bug')}] '{b_item.get('summary', '')}'",
+                        b_item.get("screenshot_path"),
+                    )
         for w in wishes[:2]:
             _push_shot(
                 f"Player Wish [{w.get('category', 'feedback')}] '{w.get('summary', '')}'",
                 w.get("screenshot_path"),
             )
+        final_reserved = 1 if len(turns) >= 2 else 0
+        mid_slots = max(0, (5 - final_reserved) - len(candidate_shot_sources))
+        if mid_slots > 0 and len(turns) > 2:
+            for k in range(1, mid_slots + 1):
+                mid_idx = int(round(k * (len(turns) - 1) / float(mid_slots + 1)))
+                if 0 < mid_idx < len(turns) - 1:
+                    mid_turn = turns[mid_idx]
+                    _push_shot(
+                        f"Mid-Session Progress (Turn #{mid_turn.get('turn_index', mid_idx + 1)})",
+                        mid_turn.get("screenshot_path"),
+                    )
         if len(turns) >= 2:
             _push_shot(f"Final Session Screen (Turn #{turns[-1].get('turn_index', len(turns))})", turns[-1].get("screenshot_path"))
 
         rel_proof_paths: List[str] = []
         multimodal_parts: List[Any] = []
-        for idx, (shot_label, src_path) in enumerate(candidate_shot_sources[:4], start=1):
+        for idx, (shot_label, src_path) in enumerate(candidate_shot_sources[:5], start=1):
             dest_name = f"blind_playtest_{active_slice_id}_p{pass_index}_shot{idx}.png"
             dest_path = proof_dir / dest_name
             try:
@@ -3326,9 +3626,14 @@ class CreativeWritersRoom:
         fun_rating = report.get("overall_fun_rating", "?")
         overall_summary = str(report.get("overall_experience_summary") or sess.get("end_summary") or "Session completed.")
         wishes_bullet_lines = [
-            f"- [{w.get('category', 'general')}] {w.get('summary', '')}: {w.get('rationale', '')}"
+            f"- [{w.get('category', 'general')}] {w.get('summary', '')} (Turn #{w.get('turn_index', '?')}, mood={w.get('mood_at_time', 'n/a')}): {w.get('rationale', '')}"
             for w in wishes
         ]
+        rep_highlights = report.get("key_highlights") or []
+        rep_pain_points = report.get("key_pain_points") or []
+        rep_bugs_observed = report.get("bugs_and_glitches_observed") or []
+        rep_unanswered_qs = report.get("unanswered_questions_and_mysteries") or []
+
         player_dialogue_lines = [
             f"[End-of-Slice Blind Playtest Report — Fun Rating: {fun_rating}/10 | {sess.get('turn_count', len(turns))} turns | status={sess.get('status')}]",
             overall_summary,
@@ -3339,9 +3644,28 @@ class CreativeWritersRoom:
             f"• Goals & Pacing: {report.get('goals_pacing_and_accomplishment', '(not reported)')}",
             f"• World & Atmosphere: {report.get('world_and_atmosphere', '(not reported)')}",
         ]
+        if rep_highlights:
+            player_dialogue_lines.append("Key Highlights:")
+            player_dialogue_lines.extend(f"- {h}" for h in rep_highlights)
+        if rep_pain_points:
+            player_dialogue_lines.append("Key Pain Points:")
+            player_dialogue_lines.extend(f"- {p}" for p in rep_pain_points)
+        if rep_bugs_observed:
+            player_dialogue_lines.append("Bugs & Glitches Observed:")
+            player_dialogue_lines.extend(f"- {b}" for b in rep_bugs_observed)
+        elif isinstance(bugs_found, dict) and bugs_found:
+            player_dialogue_lines.append("Bugs & Glitches Spotted Along The Way:")
+            for bk, bv in bugs_found.items():
+                if isinstance(bv, dict):
+                    player_dialogue_lines.append(
+                        f"- [{bv.get('severity', 'major').upper()}/{bv.get('category', 'bug')}] {bv.get('summary', bk)}: {bv.get('details', '')}"
+                    )
+        if rep_unanswered_qs:
+            player_dialogue_lines.append("Unanswered Player Questions:")
+            player_dialogue_lines.extend(f"- {q}" for q in rep_unanswered_qs)
         if wishes_bullet_lines:
             player_dialogue_lines.append(f"Auto-Delivered Player Wishes ({len(wishes_bullet_lines)}):")
-            player_dialogue_lines.extend(wishes_bullet_lines[:8])
+            player_dialogue_lines.extend(wishes_bullet_lines)
 
         pt_idx = len(game_bible.writers_room_transcript)
         pt_utt = WritersRoomUtterance(
@@ -3413,6 +3737,32 @@ class CreativeWritersRoom:
             if rulebook
             else "  (The Blind Playtester could not confirm any controls/rules!)"
         )
+        field_notes_lines = (
+            "\n".join(f"  - {k}: {v}" for k, v in field_notes.items())
+            if isinstance(field_notes, dict) and field_notes
+            else "  (No separate field notes logged.)"
+        )
+        if isinstance(questions, dict) and questions:
+            q_lines_list: List[str] = []
+            for qk, qv in questions.items():
+                if isinstance(qv, dict):
+                    st = str(qv.get("status") or "open").upper()
+                    ans = f" -> {qv['answer']}" if qv.get("answer") else ""
+                    q_lines_list.append(f"  - [{st}] ({qk}) {qv.get('question', '')}{ans}")
+            questions_lines = "\n".join(q_lines_list) if q_lines_list else "  (No player questions logged.)"
+        else:
+            questions_lines = "  (No player questions logged.)"
+        if isinstance(bugs_found, dict) and bugs_found:
+            b_lines_list: List[str] = []
+            for bk, bv in bugs_found.items():
+                if isinstance(bv, dict):
+                    b_lines_list.append(
+                        f"  - [{bv.get('severity', 'major').upper()} | {bv.get('category', 'bug')}] "
+                        f"(Turn #{bv.get('turn_index', '?')}, `{bk}`) {bv.get('summary', '')}: {bv.get('details', '')}"
+                    )
+            bugs_found_lines = "\n".join(b_lines_list) if b_lines_list else "  (No live bugs logged during play.)"
+        else:
+            bugs_found_lines = "  (No live bugs logged during play.)"
         impressions_lines = (
             "\n".join(f"  - {k}: {v}" for k, v in impressions.items())
             if impressions
@@ -3425,6 +3775,17 @@ class CreativeWritersRoom:
             )
             if wishes
             else "  (No explicit player wishes were filed during this session.)"
+        )
+        tape_entries: List[str] = []
+        for t_row in turns:
+            if isinstance(t_row, dict):
+                line_txt = str(t_row.get("append_log_line") or "").strip()
+                if line_txt:
+                    tape_entries.append(f"  {line_txt}")
+        action_tape_block = (
+            "\n".join(tape_entries)
+            if tape_entries
+            else "  (No per-turn action tape recorded.)"
         )
         approved_board_lines = [
             f"  - [{it.item_id}] ({it.kind}) '{it.title}' | target_modules={it.target_modules}"
@@ -3448,7 +3809,13 @@ class CreativeWritersRoom:
             f"Goals, Pacing & Accomplishment: {report.get('goals_pacing_and_accomplishment', '')}\n"
             f"World & Atmosphere: {report.get('world_and_atmosphere', '')}\n"
             f"Key Highlights: {json.dumps(report.get('key_highlights') or [])}\n"
-            f"Key Pain Points: {json.dumps(report.get('key_pain_points') or [])}\n\n"
+            f"Key Pain Points: {json.dumps(report.get('key_pain_points') or [])}\n"
+            f"Bugs & Glitches Observed: {json.dumps(report.get('bugs_and_glitches_observed') or [])}\n"
+            f"Unanswered Questions & Mysteries: {json.dumps(report.get('unanswered_questions_and_mysteries') or [])}\n\n"
+            f"=== BLIND PLAYER CHRONOLOGICAL ACTION TAPE ({len(tape_entries)} turns) ===\n{action_tape_block}\n\n"
+            f"=== BUGS & GLITCHES SPOTTED ALONG THE WAY ===\n{bugs_found_lines}\n\n"
+            f"=== PLAYER FIELD NOTES (SCREEN & WORLD OBSERVATIONS) ===\n{field_notes_lines}\n\n"
+            f"=== PLAYER QUESTIONS & DISCOVERED ANSWERS ===\n{questions_lines}\n\n"
             f"=== CONTROLS & RULES THE BLIND PLAYER ACTUALLY FIGURED OUT ===\n{rulebook_lines}\n\n"
             f"=== SPARSE RUNNING IMPRESSIONS DURING PLAY ===\n{impressions_lines}\n\n"
             f"=== AUTO-DELIVERED BLIND PLAYER WISHES ({len(wishes)} items) ===\n{wishes_block}\n\n"
@@ -3493,19 +3860,24 @@ class CreativeWritersRoom:
                     f"Experience Report and auto-delivered wishes for '{active_slice_title}' (`{active_slice_id}`).\n"
                     f"{mandate}\n"
                     "INSTRUCTIONS:\n"
-                    "1. Remember: the Blind Playtester played our game completely cold with ZERO internal instructions—only the title, "
-                    "a 1-sentence elevator pitch, screenshots, and game audio. Whatever confused them, felt unresponsive, lacked visual/audio "
-                    "feedback, or blocked progress is authentic first-time player reality.\n"
-                    "2. Diagnose from your discipline's perspective (`domain_reaction_to_blind_player`): what genuinely worked versus "
-                    "what caused friction, confusion, silence, or lack of fun?\n"
+                    "1. Remember: the Blind Playtester is a fast non-thinking player model playing cold with ZERO internal instructions. "
+                    "Do NOT take a high `overall_fun_rating` or optimistic report prose at face value! Independently audit the attached "
+                    "screenshots, `BLIND PLAYER CHRONOLOGICAL ACTION TAPE`, and curated source code.\n"
+                    "2. Specifically verify (`domain_reaction_to_blind_player`):\n"
+                    "   - Did visible objectives/counters actually progress through genuine player decisions, or did the player get stuck in "
+                    "repetitive no-op clicks, hallucinate that decorative UI was interactive, or leave core slice loops unexercised?\n"
+                    "   - Did any mechanics 'play themselves' via hardcoded target coordinates, timer-driven inventory shortcuts, or fake "
+                    "progression credits instead of real player agency?\n"
+                    "   - Are there overlapping/duplicate HUD widgets, raw unstyled panels, or silent/dropped audio?\n"
                     "3. Distinguish carefully between:\n"
-                    "   - CURRENT-SLICE FIXES (`priority_fixes_or_refinements`): onboarding/control clarity gaps where the player didn't know "
-                    "how to play, unresponsive/awkward mouse or keyboard feel, unreadable UI/visuals, missing essential audio/visual feedback "
-                    "on core slice actions, or progression blockers within this slice's intended scope.\n"
+                    "   - CURRENT-SLICE FIXES (`priority_fixes_or_refinements`): onboarding/control clarity gaps, repetitive no-op traps, "
+                    "auto-playing/hardcoded shortcuts bypassing player agency, overlapping/raw UI, missing essential audio/visual feedback, "
+                    "or stalled progression within this slice's intended scope.\n"
                     "   - NEXT-SLICE EXPANSION WISHES: larger new mechanics, deeper content tiers, or broader world features that belong in "
                     "upcoming slices rather than holding up approval of this slice.\n"
                     "4. Converse naturally with your fellow Council members in `spoken_dialogue`, and set `recommends_slice_approval=True` "
-                    "if this slice is intuitive, cohesive, and fun enough to approve now, or `False` if targeted current-slice iteration is needed first.\n"
+                    "ONLY if the screenshots, action tape, and code confirm genuine player-driven agency, clear UI/audio feedback, and real fun, "
+                    "or `False` if targeted current-slice iteration is needed first (even when `overall_fun_rating` was high).\n"
                     "Provide `deliberation` FIRST and `recommends_slice_approval` strictly LAST."
                 )
                 turn_dec = self._structured_with_validation(
@@ -3562,17 +3934,19 @@ class CreativeWritersRoom:
             f"You are the Creative Director chairing the Council's End-of-Slice Blind Playtest Verdict for "
             f"'{active_slice_title}' (`{active_slice_id}`, Pass #{pass_index + 1}).\n"
             "INSTRUCTIONS:\n"
-            "1. Synthesize the Blind Playtester's 6-pillar Experience Report, `overall_fun_rating`, discovered controls rulebook, "
-            "auto-delivered player wishes, screenshots, and the Council Roundtable Discussion above.\n"
+            "1. Independently audit the Blind Playtester's screenshots, `BLIND PLAYER CHRONOLOGICAL ACTION TAPE`, curated source code, "
+            "6-pillar Experience Report, `overall_fun_rating`, discovered controls rulebook, wishes, and Council Roundtable Discussion. "
+            "Never rubber-stamp an inflated `overall_fun_rating` if the screenshots, action tape, or code reveal repetitive no-op loops, "
+            "stalled objectives, overlapping/raw UI, silent audio, or hardcoded/auto-playing shortcuts that bypass real player agency.\n"
             "2. Decide between two clear moves:\n"
-            "   - `iterate_current_slice`: Choose this if the Blind Playtester hit real onboarding/intuitiveness confusion "
-            "(couldn't tell how to play or what controls/clicks do), progression blockers, broken/unresponsive interactions, "
-            "poor visual/UI readability, or missing core audio/visual feedback within this slice's scope. Populate focused, "
-            "high-impact `backlog_additions` (`mechanic_code`, `ui`, `integration`, `sfx`, etc.) targeting real production modules "
-            "(with concrete `proof_spec` verification).\n"
-            "   - `approve_slice`: Choose this when the current slice plays intuitively, cohesively, and rewardingly for its intended "
-            "scope, and any remaining player wishes or ideas are broader expansions best carried into `next_slice_carryover_notes` "
-            "(with `backlog_additions=[]`).\n"
+            "   - `iterate_current_slice`: Choose this if the Blind Playtester hit real onboarding/intuitiveness confusion, repeated "
+            "ineffective actions, stalled progression, auto-playing/shortcutted mechanics lacking player agency, overlapping/unstyled UI, "
+            "or missing core audio/visual feedback within this slice's scope. Populate focused, high-impact `backlog_additions` "
+            "(`mechanic_code`, `ui`, `integration`, `sfx`, etc.) targeting real production modules with systemic, world-wide fixes "
+            "(never single-coordinate point patches) and concrete `proof_spec` verification.\n"
+            "   - `approve_slice`: Choose this ONLY when the screenshots, action tape, and code confirm that the current slice plays "
+            "intuitively, cohesively, and rewardingly through genuine player decisions, and any remaining wishes are broader expansions "
+            "best carried into `next_slice_carryover_notes` (with `backlog_additions=[]`).\n"
             f"Buildable kinds right now: {self._supported_kinds() or 'all'}.\n"
             "Provide `deliberation` FIRST and `verdict` (`approve_slice` or `iterate_current_slice`) strictly LAST."
         )
@@ -3613,7 +3987,8 @@ class CreativeWritersRoom:
                 slice_id=active_slice_id,
             )
 
-        # Persist end-of-slice Blind Playtest artifact so next-slice reflection inherits player report + carryover notes
+        # Persist end-of-slice Blind Playtest artifact so next-slice reflection inherits player report + carryover notes,
+        # AND preserve immutable per-pass + per-session records so every historical run and verdict remains watchable.
         artifacts_dir = c_dir / "artifacts"
         artifacts_dir.mkdir(parents=True, exist_ok=True)
         saved_report_payload = {
@@ -3625,16 +4000,38 @@ class CreativeWritersRoom:
             "session_report": report,
             "impressions": impressions,
             "rulebook": rulebook,
+            "field_notes": field_notes,
+            "questions": questions,
+            "bugs_found": bugs_found,
             "wishes": wishes,
             "council_verdict": verdict.verdict,
             "player_experience_synthesis": verdict.player_experience_synthesis,
             "next_slice_carryover_notes": list(verdict.next_slice_carryover_notes or []),
             "spawned_item_ids": [it.item_id for it in added],
         }
+        report_json_str = json.dumps(saved_report_payload, indent=2)
         (artifacts_dir / f"blind_playtest_report_{active_slice_id}.json").write_text(
-            json.dumps(saved_report_payload, indent=2),
+            report_json_str,
             encoding="utf-8",
         )
+        (artifacts_dir / f"blind_playtest_report_{active_slice_id}_pass{pass_index}.json").write_text(
+            report_json_str,
+            encoding="utf-8",
+        )
+        if session_id and hasattr(mgr, "record_council_verdict"):
+            try:
+                mgr.record_council_verdict(
+                    session_id,
+                    slice_id=active_slice_id,
+                    slice_title=active_slice_title,
+                    pass_index=pass_index,
+                    verdict=verdict.verdict,
+                    player_experience_synthesis=verdict.player_experience_synthesis,
+                    spawned_item_ids=[it.item_id for it in added],
+                    next_slice_carryover_notes=list(verdict.next_slice_carryover_notes or []),
+                )
+            except Exception as rec_exc:
+                logger.warning("Could not persist Council Blind Playtest verdict onto session %s: %s", session_id, rec_exc)
 
         self._emit_event(
             "council_blind_playtest_deliberation_completed",
@@ -3719,10 +4116,13 @@ class CreativeWritersRoom:
             self._execute_steering_pivot_turns(game_bible, dna_summary, candidate_dir, steered_before_shaping)
         has_active_flight = any(
             i.state in ("in_progress", "waiting_for_lock", "awaiting_review", "changes_requested")
+            or (i.state in ("ready", "blocked") and self._has_started_execution(i, candidate_dir=candidate_dir))
             for i in self.board.items()
         )
         has_unshaped_unstarted = any(
-            i.state in ("ready", "blocked") and not i.revisions and not (i.shaping_notes or [])
+            i.state in ("ready", "blocked")
+            and not self._has_started_execution(i, candidate_dir=candidate_dir)
+            and not (i.shaping_notes or [])
             for i in self.board.items()
         )
         if not has_active_flight and has_unshaped_unstarted:
@@ -3734,12 +4134,13 @@ class CreativeWritersRoom:
             self.scheduler.start()
         deadline = time.monotonic() + self.drain_timeout_s
 
-        def _board_progress_sig() -> Tuple[int, int, int]:
+        def _board_progress_sig() -> Tuple[int, int, int, int]:
             all_items = self.board.items()
             return (
                 len(all_items),
                 sum(len(i.revisions) for i in all_items),
                 sum(1 for i in all_items if i.state in ("approved", "cancelled")),
+                sum(i.failure_count + i.spec_resets for i in all_items),
             )
 
         last_progress_sig = _board_progress_sig()
@@ -3760,8 +4161,14 @@ class CreativeWritersRoom:
                     assembly_passes = 0
                     if self.scheduler is not None:
                         self.scheduler.start()
-            self._handle_failed_items()
+            handled_failed = self._handle_failed_items()
+            unblocked_cancelled = self._resolve_blocked_by_cancelled()
             applied = self._run_review_round(game_bible, dna_summary, candidate_dir)
+            # Re-run failure & cancelled-dependent resolution immediately after `_run_review_round`,
+            # because background workers can fail an item while a multi-second Council review is in flight,
+            # or a Council `CapDecision(action="cancel")` in `_run_review_round` can leave dependents stranded.
+            handled_failed = self._handle_failed_items() or handled_failed
+            unblocked_cancelled = self._resolve_blocked_by_cancelled() or unblocked_cancelled
             if self.board.is_drained():
                 if assembly_passes < max_assembly_passes:
                     added_assembly = self._run_slice_assembly_check(
@@ -3812,14 +4219,29 @@ class CreativeWritersRoom:
                             logger.warning("Slice checkpoint callback raised error: %s", cb_exc)
                 return
             cur_progress_sig = _board_progress_sig()
-            if applied > 0 or steered or cur_progress_sig != last_progress_sig:
+            if applied > 0 or steered or handled_failed or unblocked_cancelled or cur_progress_sig != last_progress_sig:
                 last_progress_sig = cur_progress_sig
                 deadline = max(deadline, time.monotonic() + self.drain_timeout_s)
+            board_items_now = self.board.items()
+            if any(i.state == "failed" for i in board_items_now):
+                # A background worker transitioned an item to `failed` asynchronously; loop immediately so
+                # `_handle_failed_items()` requeues, escalates to `needs_decision`, or raises its authentic error.
+                continue
             active = [
-                i for i in self.board.items()
+                i for i in board_items_now
                 if i.state in ("ready", "in_progress", "waiting_for_lock", "changes_requested", "awaiting_review", "needs_decision")
             ]
             if not active and self.scheduler is not None and self.scheduler.running_count() == 0:
+                # Re-snapshot atomically after `running_count() == 0` in case the last worker just finished/failed
+                # between `board_items_now` and `running_count()`.
+                recheck_items = self.board.items()
+                if any(
+                    i.state in ("failed", "ready", "in_progress", "waiting_for_lock", "changes_requested", "awaiting_review", "needs_decision")
+                    for i in recheck_items
+                ):
+                    continue
+                if self._resolve_blocked_by_cancelled():
+                    continue
                 raise StudioAgentError(
                     "Backlog cannot drain: remaining items are blocked with nothing in flight.\n" + self.board.snapshot_text()
                 )
@@ -4805,9 +5227,12 @@ class CreativeWritersRoom:
                 b_rep = b_data.get("session_report") or {}
                 b_carry = b_data.get("next_slice_carryover_notes") or []
                 b_wishes = b_data.get("wishes") or []
+                b_bugs_obs = b_rep.get("bugs_and_glitches_observed") or []
+                b_pain_pts = b_rep.get("key_pain_points") or []
+                b_unans_qs = b_rep.get("unanswered_questions_and_mysteries") or []
                 wish_lines = [
                     f"  - [{w.get('category', 'general')}] {w.get('summary', '')}: {w.get('rationale', '')}"
-                    for w in b_wishes[:8]
+                    for w in b_wishes
                 ]
                 carry_lines = [f"  - {n}" for n in b_carry]
                 blind_report_block = (
@@ -4820,7 +5245,10 @@ class CreativeWritersRoom:
                     f"Intuitiveness & Onboarding: {b_rep.get('intuitiveness_and_onboarding', '')}\n"
                     f"Goals & Pacing: {b_rep.get('goals_pacing_and_accomplishment', '')}\n"
                     f"World & Atmosphere: {b_rep.get('world_and_atmosphere', '')}\n"
-                    f"Council Synthesis: {b_data.get('player_experience_synthesis', '')}\n"
+                    + (f"Key Pain Points: {json.dumps(b_pain_pts)}\n" if b_pain_pts else "")
+                    + (f"Bugs & Glitches Observed: {json.dumps(b_bugs_obs)}\n" if b_bugs_obs else "")
+                    + (f"Unanswered Player Questions: {json.dumps(b_unans_qs)}\n" if b_unans_qs else "")
+                    + f"Council Synthesis: {b_data.get('player_experience_synthesis', '')}\n"
                     + ("Carryover Takeaways for Next Slice:\n" + "\n".join(carry_lines) + "\n" if carry_lines else "")
                     + ("Player Wishes Recorded:\n" + "\n".join(wish_lines) + "\n" if wish_lines else "")
                     + "\n"

@@ -53,6 +53,7 @@ _EXCLUDED_CHECKPOINT_NAMES = {
     "production_board.json",
     ".pending_steering.json",
     ".pending_playtest_wishes.json",
+    ".pending_council_playtest_reports.json",
 }
 
 

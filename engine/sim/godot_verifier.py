@@ -470,6 +470,7 @@ class GodotHeadlessSimulator:
         input_script: Optional[List[Dict[str, Any]]] = None,
         setup_script: Optional[List[Dict[str, Any]]] = None,
         target_scene: str = "",
+        timeout_seconds: Optional[float] = None,
         **kwargs: Any,
     ):
         self.cartridge_path = Path(cartridge_path).resolve()
@@ -480,6 +481,7 @@ class GodotHeadlessSimulator:
         self.input_script = input_script
         self.setup_script = setup_script
         self.target_scene = str(target_scene or "").strip()
+        self.timeout_seconds = float(timeout_seconds) if timeout_seconds is not None else None
         self.viewport_captured = False
         self.step_count = 0
         self.elapsed_time = 0.0
@@ -597,6 +599,14 @@ class GodotHeadlessSimulator:
             ] + extra_args
 
         logger.info("Executing Godot playtest harness: %s", " ".join(cmd))
+        import os as _os
+        import signal as _signal
+
+        timeout_s = (
+            self.timeout_seconds
+            if self.timeout_seconds is not None and self.timeout_seconds > 0
+            else max(45.0, min(180.0, 30.0 + float(limit) * 0.15))
+        )
         proc = subprocess.Popen(
             cmd,
             cwd=str(self.cartridge_path),
@@ -604,10 +614,37 @@ class GodotHeadlessSimulator:
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            start_new_session=True,
         )
 
         stdout_lines: List[str] = []
         stderr_lines: List[str] = []
+        timed_out_flag: List[bool] = [False]
+
+        def _kill_proc_tree() -> None:
+            try:
+                if proc.poll() is None:
+                    _os.killpg(_os.getpgid(proc.pid), _signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        def _on_watchdog_timeout() -> None:
+            if proc.poll() is None:
+                timed_out_flag[0] = True
+                logger.warning(
+                    "Godot simulation timed out after %.1fs (max_ticks=%d, scene=%s); terminating process.",
+                    timeout_s,
+                    limit,
+                    self.target_scene or "res://main.tscn",
+                )
+                _kill_proc_tree()
+
+        watchdog = threading.Timer(timeout_s, _on_watchdog_timeout)
+        watchdog.daemon = True
+        watchdog.start()
 
         def _read_stderr():
             if proc.stderr:
@@ -617,90 +654,93 @@ class GodotHeadlessSimulator:
         err_thread = threading.Thread(target=_read_stderr, daemon=True)
         err_thread.start()
 
-        if proc.stdout:
-            for line in proc.stdout:
-                stdout_lines.append(line)
-                stripped = line.strip()
+        try:
+            if proc.stdout:
+                for line in proc.stdout:
+                    stdout_lines.append(line)
+                    stripped = line.strip()
 
-                # Telemetry intercept
-                if stripped.startswith("[TELEMETRY_EVENT] ") or stripped.startswith("[TELEMETRY] "):
-                    prefix_len = len("[TELEMETRY_EVENT] ") if stripped.startswith("[TELEMETRY_EVENT] ") else len("[TELEMETRY] ")
-                    raw_json = stripped[prefix_len:]
-                    try:
-                        ev = json.loads(raw_json)
-                        pname = ev.get("probe_name") or ev.get("name", "custom_probe")
-                        pcat = ev.get("category", "general")
-                        pdata = ev.get("payload") or ev.get("data", {})
-                        if self.telemetry_recorder:
-                            self.telemetry_recorder.emit_custom_probe(
-                                probe_name=pname,
-                                category=pcat,
-                                data=pdata,
-                            )
-                    except Exception as err:
-                        logger.debug("Failed parsing telemetry event: %s", err)
+                    # Telemetry intercept
+                    if stripped.startswith("[TELEMETRY_EVENT] ") or stripped.startswith("[TELEMETRY] "):
+                        prefix_len = len("[TELEMETRY_EVENT] ") if stripped.startswith("[TELEMETRY_EVENT] ") else len("[TELEMETRY] ")
+                        raw_json = stripped[prefix_len:]
+                        try:
+                            ev = json.loads(raw_json)
+                            pname = ev.get("probe_name") or ev.get("name", "custom_probe")
+                            pcat = ev.get("category", "general")
+                            pdata = ev.get("payload") or ev.get("data", {})
+                            if self.telemetry_recorder:
+                                self.telemetry_recorder.emit_custom_probe(
+                                    probe_name=pname,
+                                    category=pcat,
+                                    data=pdata,
+                                )
+                        except Exception as err:
+                            logger.debug("Failed parsing telemetry event: %s", err)
 
-                elif stripped.startswith("[STATE_SNAPSHOT] "):
-                    raw_json = stripped[len("[STATE_SNAPSHOT] "):]
-                    try:
-                        snap = json.loads(raw_json)
-                        self.final_snapshot = snap
-                        pos = snap.get("player_pos", [0.0, 0.0])
-                        vel = snap.get("player_vel", [0.0, 0.0])
-                        self.player_pos = (float(pos[0]), float(pos[1]))
-                        self.player_vel = (float(vel[0]), float(vel[1]))
-                        self.player_health = float(snap.get("player_health", 100.0))
-                    except Exception as err:
-                        logger.debug("Failed parsing state snapshot: %s", err)
+                    elif stripped.startswith("[STATE_SNAPSHOT] "):
+                        raw_json = stripped[len("[STATE_SNAPSHOT] "):]
+                        try:
+                            snap = json.loads(raw_json)
+                            self.final_snapshot = snap
+                            pos = snap.get("player_pos", [0.0, 0.0])
+                            vel = snap.get("player_vel", [0.0, 0.0])
+                            self.player_pos = (float(pos[0]), float(pos[1]))
+                            self.player_vel = (float(vel[0]), float(vel[1]))
+                            self.player_health = float(snap.get("player_health", 100.0))
+                        except Exception as err:
+                            logger.debug("Failed parsing state snapshot: %s", err)
 
-                elif stripped.startswith("[QA_TICK_SNAPSHOT] "):
-                    raw_json = stripped[len("[QA_TICK_SNAPSHOT] "):]
-                    try:
-                        tsnap = json.loads(raw_json)
-                        t_num = int(tsnap.get("tick", 0))
-                        if t_num > 0:
-                            self.tick_snapshots[t_num] = tsnap
-                    except Exception as err:
-                        logger.debug("Failed parsing QA tick snapshot: %s", err)
+                    elif stripped.startswith("[QA_TICK_SNAPSHOT] "):
+                        raw_json = stripped[len("[QA_TICK_SNAPSHOT] "):]
+                        try:
+                            tsnap = json.loads(raw_json)
+                            t_num = int(tsnap.get("tick", 0))
+                            if t_num > 0:
+                                self.tick_snapshots[t_num] = tsnap
+                        except Exception as err:
+                            logger.debug("Failed parsing QA tick snapshot: %s", err)
 
-                elif stripped.startswith("[QA_SETUP_CALL] "):
-                    raw_json = stripped[len("[QA_SETUP_CALL] "):]
-                    try:
-                        self.qa_setup_calls.append(json.loads(raw_json))
-                    except Exception as err:
-                        logger.debug("Failed parsing QA setup call: %s", err)
+                    elif stripped.startswith("[QA_SETUP_CALL] "):
+                        raw_json = stripped[len("[QA_SETUP_CALL] "):]
+                        try:
+                            self.qa_setup_calls.append(json.loads(raw_json))
+                        except Exception as err:
+                            logger.debug("Failed parsing QA setup call: %s", err)
 
-                elif stripped.startswith("[SCENE_AUDIT] "):
-                    raw_json = stripped[len("[SCENE_AUDIT] "):]
-                    try:
-                        self.scene_audit = json.loads(raw_json)
-                    except Exception as err:
-                        logger.debug("Failed parsing scene audit: %s", err)
+                    elif stripped.startswith("[SCENE_AUDIT] "):
+                        raw_json = stripped[len("[SCENE_AUDIT] "):]
+                        try:
+                            self.scene_audit = json.loads(raw_json)
+                        except Exception as err:
+                            logger.debug("Failed parsing scene audit: %s", err)
 
-                elif stripped.startswith("[PERF_METRICS] "):
-                    raw_json = stripped[len("[PERF_METRICS] "):]
-                    try:
-                        metrics = json.loads(raw_json)
-                        self.avg_frame_time_ms = float(metrics.get("avg_frame_time_ms", 0.0))
-                        self.max_frame_time_ms = float(metrics.get("max_frame_time_ms", 0.0))
-                        self.frame_budget_passed = bool(metrics.get("frame_budget_passed", True))
-                        self.ticks_executed = int(metrics.get("ticks_executed", 0))
-                    except Exception as err:
-                        logger.debug("Failed parsing perf metrics: %s", err)
+                    elif stripped.startswith("[PERF_METRICS] "):
+                        raw_json = stripped[len("[PERF_METRICS] "):]
+                        try:
+                            metrics = json.loads(raw_json)
+                            self.avg_frame_time_ms = float(metrics.get("avg_frame_time_ms", 0.0))
+                            self.max_frame_time_ms = float(metrics.get("max_frame_time_ms", 0.0))
+                            self.frame_budget_passed = bool(metrics.get("frame_budget_passed", True))
+                            self.ticks_executed = int(metrics.get("ticks_executed", 0))
+                        except Exception as err:
+                            logger.debug("Failed parsing perf metrics: %s", err)
 
-                elif stripped.startswith("[PROGRESSION] "):
-                    raw_json = stripped[len("[PROGRESSION] "):]
-                    try:
-                        prog = json.loads(raw_json)
-                        self.pos_delta = float(prog.get("pos_delta", 0.0))
-                        self.progression_verified = bool(prog.get("progression_verified", True))
-                    except Exception as err:
-                        logger.debug("Failed parsing progression: %s", err)
+                    elif stripped.startswith("[PROGRESSION] "):
+                        raw_json = stripped[len("[PROGRESSION] "):]
+                        try:
+                            prog = json.loads(raw_json)
+                            self.pos_delta = float(prog.get("pos_delta", 0.0))
+                            self.progression_verified = bool(prog.get("progression_verified", True))
+                        except Exception as err:
+                            logger.debug("Failed parsing progression: %s", err)
+        finally:
+            watchdog.cancel()
 
         try:
-            returncode = proc.wait(timeout=30.0)
+            returncode = proc.wait(timeout=10.0)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            _kill_proc_tree()
             returncode = proc.wait()
 
         err_thread.join(timeout=1.0)
@@ -711,13 +751,18 @@ class GodotHeadlessSimulator:
         self.step_count = self.ticks_executed or limit
         self.elapsed_time = self.step_count * (1.0 / 60.0)
         self.is_completed = True
-        self.outcome = "COMPLETED" if returncode == 0 else "CRASHED"
+        self.outcome = "COMPLETED" if (returncode == 0 and not timed_out_flag[0]) else "CRASHED"
         self.viewport_captured = bool(
             use_viewport
             and (self.cartridge_path / "assets" / "playtest_captures" / "playtest_t0.png").is_file()
         )
         self.close()
 
+        if timed_out_flag[0]:
+            raise RuntimeError(
+                f"Godot simulation timed out after {timeout_s:.1f}s on '{self.target_scene or 'res://main.tscn'}' "
+                f"(ticks_executed={self.ticks_executed}/{limit}; possible infinite loop or recursive _ready() scene instantiation): {stderr_full}"
+            )
         if returncode != 0:
             raise RuntimeError(f"Godot headless simulation failed with code {returncode}: {stderr_full}")
 

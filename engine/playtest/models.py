@@ -12,7 +12,7 @@ from pydantic import Field, field_validator
 from engine.studio.models import BaseEpistemicModel, StudioAgentError
 
 
-DEFAULT_PLAYTEST_MODEL = "gemini-3.8-flash"
+DEFAULT_PLAYTEST_MODEL = "gemini-3.5-flash-lite"
 PLAYTEST_VIEWPORT_W = 1280
 PLAYTEST_VIEWPORT_H = 720
 NORM_COORD_SCALE = 1000.0
@@ -208,7 +208,74 @@ class PlaytestRulebookUpdate(BaseEpistemicModel):
     behavior: str = Field(
         ...,
         min_length=1,
-        description="Concise 1-sentence observed behavior (including 'does nothing' when an input was tested and had no effect).",
+        description="Concise 1-sentence behavior confirmed ONLY after observing the result on a subsequent turn (never assume an input worked on the same turn you trigger it; record 'does nothing / non-interactive' if repeated tries produce no state change).",
+    )
+
+
+class PlaytestFieldNoteUpdate(BaseEpistemicModel):
+    """Structured screen/world observation merged deterministically into the player's Field Notes."""
+    topic: str = Field(
+        ...,
+        min_length=1,
+        description="Short label for what you are looking at or noting (e.g. 'Top-Left Counter', 'Center Structure', 'Bottom Toolbar', 'Cursor Icon').",
+    )
+    observation: str = Field(
+        ...,
+        min_length=1,
+        description="Concise 1-2 sentence note describing what you see on screen, what state it shows, or how elements appear connected.",
+    )
+
+
+class PlaytestQuestionUpdate(BaseEpistemicModel):
+    """Live player question ('what am I looking at?', 'what does X do?', 'why is Y like that?') tracked until answered."""
+    question_key: str = Field(
+        ...,
+        min_length=1,
+        description="Short stable snake_case key identifying this question so you can later update the exact same key to 'answered' once you figure it out.",
+    )
+    question: str = Field(
+        ...,
+        min_length=1,
+        description="Natural first-person player question about what you are looking at, what an element/control does, or why something behaved that way.",
+    )
+    answer: Optional[str] = Field(
+        default=None,
+        description="Leave null while still investigating; populate with your concise discovered answer ONLY once a subsequent turn visibly or audibly confirms it.",
+    )
+    status: Literal["open", "answered"] = Field(
+        default="open",
+        description="Set 'open' when posing or refining an unanswered question; set 'answered' ONLY after a subsequent turn confirms the answer. Strictly last.",
+    )
+
+
+class PlaytestBugReport(BaseEpistemicModel):
+    """Concrete bug or glitch spotted by the blind player during live gameplay."""
+    bug_key: str = Field(
+        ...,
+        min_length=1,
+        description="Short snake_case identifier for deduplicating this specific bug or glitch across the session.",
+    )
+    category: Literal[
+        "visual_glitch",
+        "audio_glitch",
+        "input_ui_bug",
+        "gameplay_bug",
+        "progression_blocker",
+        "performance_issue",
+    ] = Field(..., description="Category of bug or glitch observed.")
+    summary: str = Field(
+        ...,
+        min_length=1,
+        description="Crisp 1-line headline summarizing the bug or glitch.",
+    )
+    details: str = Field(
+        ...,
+        min_length=1,
+        description="1-3 concise sentences describing what happened versus what you expected as a player.",
+    )
+    severity: Literal["minor", "major", "blocker"] = Field(
+        default="major",
+        description="Impact on the player experience ('minor'=small cosmetic/polish issue, 'major'=noticeable bug or broken behavior, 'blocker'=prevents further progress). Strictly last.",
     )
 
 
@@ -221,21 +288,21 @@ class PlaytestImpressionUpdate(BaseEpistemicModel):
     impression: str = Field(
         ...,
         min_length=1,
-        description="Concise 1-2 sentence updated player impression for this pillar. Only emit when forming a new impression or revising an earlier one—never repeat unchanged observations.",
+        description="Concise 1-2 sentence updated player impression for this pillar. Emit when forming a new impression or revising an earlier one as things change over time—never repeat unchanged notes.",
     )
 
 
 class PlaytestMoodNote(BaseEpistemicModel):
-    """Concise player mood-shift entry emitted only when mood or understanding genuinely changes."""
+    """Sparse player mood-shift entry emitted ONLY on genuine emotional turning points."""
     mood: str = Field(
         ...,
         min_length=1,
-        description="Natural 1-2 word mood label (e.g. intrigued, frustrated, amused, bored, satisfied, confused).",
+        description="Natural 1-3 word mood label (e.g. intrigued, frustrated, amused, bored, satisfied, confused).",
     )
     note: str = Field(
         ...,
         min_length=1,
-        description="1-2 concise sentences explaining why your mood shifted. Do not write long paragraphs.",
+        description="1-2 concise sentences explaining what genuinely changed how you feel. Do not emit for routine clicks or unchanged moods.",
     )
 
 
@@ -280,41 +347,57 @@ class PlaytestTurnDecision(BaseEpistemicModel):
     current_plan: str = Field(
         ...,
         min_length=1,
-        description="1-2 concise sentences on what you are actively doing across the next few steps (carried verbatim across compactions).",
+        description="1-2 concise sentences on what you are actively doing or testing across the next few steps (carried verbatim across compactions).",
     )
     turn_log_entry: str = Field(
         ...,
         min_length=1,
         description="Compact 1-line note of what changed since your last input and what you are trying now.",
     )
+    field_note_updates: List[PlaytestFieldNoteUpdate] = Field(
+        default_factory=list,
+        description="Jot or revise concise notes on what you are looking at (screen layout, objects, UI elements, states). Leave [] when nothing new is noticed.",
+    )
+    question_updates: List[PlaytestQuestionUpdate] = Field(
+        default_factory=list,
+        description="Ask genuine player questions ('What am I looking at?', 'What does X do?', 'Why is Y like that?') with status='open', and update an existing question_key to status='answered' with answer as soon as your experiments figure it out.",
+    )
     rulebook_updates: List[PlaytestRulebookUpdate] = Field(
         default_factory=list,
         description="Update your permanent Rulebook whenever you confirm what a control or game element does (or doesn't do).",
     )
+    bug_reports: List[PlaytestBugReport] = Field(
+        default_factory=list,
+        description="Log any bugs, glitches, or things that feel broken as you spot them along the way. Leave [] on most turns and do not duplicate already-logged bugs.",
+    )
     impression_updates: List[PlaytestImpressionUpdate] = Field(
         default_factory=list,
-        description="Leave empty ([]) on most turns. Update sparsely ONLY when you genuinely form a new impression or revise an earlier impression on graphics, gameplay, sound, intuitiveness, goals/pacing, or world/atmosphere—never repeat what is already recorded.",
+        description="Leave empty ([]) on most turns. Update when you form a new impression or revise an earlier one because things changed as you kept playing—never repeat unchanged notes.",
+    )
+    current_mood: str = Field(
+        default="",
+        description="Your current 1-3 word emotional state as a player (keep the exact same word as Your Current Mood unless how you genuinely feel has meaningfully changed—do NOT flip back and forth on routine clicks or steps).",
+    )
+    mood_shift: Optional[PlaytestMoodNote] = Field(
+        default=None,
+        description="Leave null on almost all turns. Populate ONLY when your emotional state genuinely shifts at a real turning point (e.g. delight at a breakthrough, surprise, mounting confusion, boredom, or frustration when stuck)—never for routine clicks, minor confirmations, or unchanged moods.",
     )
     motor_action: PlaytestMotorAction = Field(
         ...,
         description="Mouse and/or keyboard input burst to execute now.",
     )
-    mood_shift: Optional[PlaytestMoodNote] = Field(
-        default=None,
-        description="Leave null unless your mood or understanding genuinely shifted on this turn.",
-    )
     submit_wish: Optional[PlaytestWishDraft] = Field(
         default=None,
-        description="Leave null unless you want to file an explicit wish report for the studio.",
+        description="Leave null unless you want to file an explicit player wish or UX/design improvement for the studio.",
     )
     end_playtest: Optional[PlaytestEndDecision] = Field(
         default=None,
-        description="Leave null unless you reached the end of the game or determined you cannot progress any further.",
+        description="Leave null while still actively progressing or testing fresh ideas; populate once you complete the available objectives or confirm you cannot progress any further.",
     )
 
 
 class PlaytestCompactedJournal(BaseEpistemicModel):
-    """Compacted episodic memory (how-to-play Rulebook is stored separately and never summarized away)."""
+    """Compacted episodic memory (how-to-play Rulebook, Field Notes, Questions, and Bugs are stored separately and never summarized away)."""
     episodic_story_and_world_chronicle: List[str] = Field(
         default_factory=list,
         description="Concise chronological bullets of areas explored, story/character moments, and milestones achieved.",
@@ -342,7 +425,7 @@ class PlaytestExperienceReport(BaseEpistemicModel):
     overall_experience_summary: str = Field(
         ...,
         min_length=1,
-        description="First-person narrative overview of your playtest session: what you tried, how far you progressed, why the session ended, and whether you genuinely had fun.",
+        description="First-person narrative overview of your playtest session: what you tried, how far you actually progressed, why the session ended, and whether you genuinely had fun.",
     )
     graphics_and_visuals: str = Field(
         ...,
@@ -357,7 +440,7 @@ class PlaytestExperienceReport(BaseEpistemicModel):
     sound_and_audio: str = Field(
         ...,
         min_length=1,
-        description="Honest player impression of sound effects, ambience/music, audio feedback cues, or notable silence where sound was expected.",
+        description="Honest player impression of sound effects, ambience/music, and audio feedback across the session.",
     )
     intuitiveness_and_onboarding: str = Field(
         ...,
@@ -367,7 +450,7 @@ class PlaytestExperienceReport(BaseEpistemicModel):
     goals_pacing_and_accomplishment: str = Field(
         ...,
         min_length=1,
-        description="Honest player impression of short- and long-term objective clarity, pacing, and sense of progress or accomplishment.",
+        description="Honest player impression of short- and long-term objective clarity, pacing, actual progression achieved, and sense of accomplishment.",
     )
     world_and_atmosphere: str = Field(
         ...,
@@ -382,9 +465,26 @@ class PlaytestExperienceReport(BaseEpistemicModel):
         default_factory=list,
         description="Concrete confusions, UX/control snags, missing feedback, balance issues, or progression blockers encountered.",
     )
+    bugs_and_glitches_observed: List[str] = Field(
+        default_factory=list,
+        description="Concrete bugs, glitches, or broken behaviors noticed during play.",
+    )
+    unanswered_questions_and_mysteries: List[str] = Field(
+        default_factory=list,
+        description="Player questions ('what am I looking at?', 'what does X do?', 'why is Y like that?') that remained unanswered when the session ended.",
+    )
     overall_fun_rating: int = Field(
         ...,
-        description="Overall 1-to-10 player fun & experience rating for this session (1=unplayable/broken, 5=mixed/functional, 8+=genuinely engaging and fun). Strictly last.",
+        description=(
+            "Honest, non-inflated 1-to-10 player fun & experience rating grounded in verified screen/audio evidence, "
+            "actual objective progression, and real player agency "
+            "(1-2=crashes, blank, or completely unresponsive; "
+            "2-3=boots and renders visuals/UI, but core gameplay loop or primary objectives stay stuck/unresponsive or trap you in repetitive no-op actions; "
+            "4=partially playable, but undermined by stalled objectives, broken/overlapping UI, or auto-playing shortcuts lacking real player agency; "
+            "5-6=core gameplay loop works end-to-end with real player-driven progression, though held back by silent/missing audio, rough UI clutter, or shallow pacing; "
+            "7-8=cohesive, intuitive, responsive, player-driven loop with working audio/visual feedback and genuine fun; "
+            "9-10=standout, polished, bug-free, deeply engaging experience—never award 7-10 if objectives stalled, actions looped without effect, audio was silent, or the game played itself). Strictly last."
+        ),
     )
 
     @field_validator("overall_fun_rating", mode="before")

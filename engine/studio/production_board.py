@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 import traceback
@@ -83,6 +84,83 @@ def _normalize_text(text: str) -> str:
     return " ".join((text or "").lower().split())
 
 
+def compute_work_item_attempt_count(
+    cart_dir: Optional[Path],
+    item_or_dict: Any,
+    state_override: Optional[str] = None,
+) -> int:
+    """Computes the exact 1-based execution attempt count for a work item, matching the Timeline
+    modal (`api_production_board_item_detail`): counts all archived failed worker retries
+    (`lead_trace_rev*_failed*.json`), all revision traces/records (`lead_trace_rev*.json` | `revisions`),
+    and the currently executing attempt when `state` is `in_progress` or `waiting_for_lock`.
+    """
+    if isinstance(item_or_dict, dict):
+        item_id = str(item_or_dict.get("item_id") or item_or_dict.get("id") or "")
+        st = str(state_override or item_or_dict.get("state") or "ready").lower()
+        revs = item_or_dict.get("revisions") if isinstance(item_or_dict.get("revisions"), list) else []
+        failure_count = int(item_or_dict.get("failure_count") or 0)
+        persisted_attempt_count = int(item_or_dict.get("attempt_count") or 0)
+    else:
+        item_id = str(getattr(item_or_dict, "item_id", "") or "")
+        st = str(state_override or getattr(item_or_dict, "state", "ready") or "ready").lower()
+        revs = list(getattr(item_or_dict, "revisions", None) or [])
+        failure_count = int(getattr(item_or_dict, "failure_count", 0) or 0)
+        persisted_attempt_count = int(getattr(item_or_dict, "attempt_count", 0) or 0)
+
+    rev_indices: Set[int] = set()
+    for idx, rv in enumerate(revs):
+        if isinstance(rv, dict):
+            rev_indices.add(int(rv.get("revision_index", idx)))
+        else:
+            rev_indices.add(int(getattr(rv, "revision_index", idx)))
+
+    failed_trace_count = 0
+    trace_rev_statuses: Dict[int, str] = {}
+    found_any_trace_file = False
+    if cart_dir is not None and item_id:
+        safe_item_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", item_id).strip("_") or "item"
+        work_item_dir = Path(cart_dir) / "artifacts" / "work_items" / safe_item_id
+        if not work_item_dir.is_dir():
+            alt_dir = Path(cart_dir) / "artifacts" / "work_items" / item_id
+            if alt_dir.is_dir():
+                work_item_dir = alt_dir
+        if work_item_dir.is_dir():
+            for lt_file in work_item_dir.glob("lead_trace_rev*.json"):
+                if re.search(r"lead_trace_rev\d+_failed\d+\.json$", lt_file.name):
+                    found_any_trace_file = True
+                    failed_trace_count += 1
+                    continue
+                m_rev = re.search(r"lead_trace_rev(\d+)\.json$", lt_file.name)
+                if m_rev:
+                    found_any_trace_file = True
+                    r_idx = int(m_rev.group(1))
+                    rev_indices.add(r_idx)
+                    if r_idx == len(revs) and st in ("in_progress", "waiting_for_lock"):
+                        try:
+                            lt_obj = json.loads(lt_file.read_text(encoding="utf-8"))
+                            if isinstance(lt_obj, dict):
+                                trace_rev_statuses[r_idx] = str(lt_obj.get("status") or "").lower()
+                        except Exception:
+                            pass
+
+    cur_rev_idx = len(revs)
+    extra_unarchived_fail = 0
+    if st in ("in_progress", "waiting_for_lock"):
+        # If an unarchived failed trace for cur_rev_idx is still on disk before run_task_lead renames it,
+        # count both that prior failed attempt and the newly started in-progress attempt.
+        if trace_rev_statuses.get(cur_rev_idx) == "failed":
+            extra_unarchived_fail = 1
+        rev_indices.add(cur_rev_idx)
+
+    if found_any_trace_file:
+        return failed_trace_count + extra_unarchived_fail + len(rev_indices)
+
+    base = failure_count + len(rev_indices)
+    if st in ("ready", "blocked") and not rev_indices and failure_count == 0 and persisted_attempt_count == 0:
+        return 0
+    return max(persisted_attempt_count, base)
+
+
 class ProductionBoard:
     """Thread-safe, persisted backlog with dependency tracking and a review/revision state machine."""
 
@@ -114,12 +192,26 @@ class ProductionBoard:
             self._items[item_id].waiting_on_locks = []
 
     # ------------------------------------------------------------------ persistence
+    def _sync_attempt_counts_locked(self) -> bool:
+        cart_dir = self.path.parent if self.path is not None else None
+        changed = False
+        for it in self._items.values():
+            new_cnt = compute_work_item_attempt_count(cart_dir, it)
+            if it.attempt_count != new_cnt:
+                it.attempt_count = new_cnt
+                changed = True
+        return changed
+
     def _load(self) -> None:
         data = json.loads(self.path.read_text(encoding="utf-8"))
         self._design_revision = int(data.get("design_revision", 0))
         dirty = False
         for raw in data.get("items", []):
             item = WorkItem.model_validate(raw)
+            prod_mods = [m for m in item.target_modules if not str(m).startswith("tests/")]
+            if len(prod_mods) != len(item.target_modules) and prod_mods:
+                item.target_modules = prod_mods
+                dirty = True
             if item.state in ("in_progress", "failed"):  # worker died with the process or build was resumed: re-queue
                 item.state = "changes_requested" if item.revisions and item.revisions[-1].feedback else "ready"
                 item.failure_count = 0
@@ -131,10 +223,13 @@ class ProductionBoard:
                     self._yielded_file_locks[item.item_id] = file_locks
             self._items[item.item_id] = item
         self._refresh()
+        if self._sync_attempt_counts_locked():
+            dirty = True
         if dirty:
             self._persist()
 
     def _persist(self) -> None:
+        self._sync_attempt_counts_locked()
         if self.path is None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -154,6 +249,7 @@ class ProductionBoard:
             "item_id": item.item_id,
             "kind": item.kind,
             "state": item.state,
+            "attempt_count": item.attempt_count,
             **extra,
         }
         try:
@@ -279,6 +375,17 @@ class ProductionBoard:
                     extra += f" spawned_by={i.spawned_by_item_id}"
                 if i.state in ("needs_decision", "cancelled") and i.decision_reason:
                     extra += f" REASON={i.decision_reason}"
+                elif i.state == "failed" and i.failure:
+                    err_lines = [
+                        ln.strip()
+                        for ln in i.failure.strip().splitlines()
+                        if ln.strip() and not ln.strip().startswith("ACTION REQUIRED FOR TASK LEAD")
+                    ]
+                    err_head = next(
+                        (ln for ln in reversed(err_lines) if "Error:" in ln or "Exception:" in ln),
+                        err_lines[-1] if err_lines else "worker error",
+                    )
+                    extra += f" FAILURE={err_head[:240]}"
                 if i.accepted_compromise:
                     extra += " [accepted compromise]"
                 if getattr(i, "shaping_notes", None):
@@ -566,6 +673,39 @@ class ProductionBoard:
             stack.extend(self._items[n].depends_on)
         return ""
 
+    def _resumed_turn_count_locked(self, item: WorkItem) -> int:
+        if self.path is None:
+            return 0
+        safe_id = "".join(ch if (ch.isalnum() or ch in ("_", "-")) else "_" for ch in str(item.item_id)).strip("_") or "item"
+        trace_path = self.path.parent / "artifacts" / "work_items" / safe_id / f"lead_trace_rev{len(item.revisions)}.json"
+        if not trace_path.is_file():
+            return 0
+        try:
+            data = json.loads(trace_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and str(data.get("status", "in_progress")) in (
+                "in_progress",
+                "yielded",
+                "waiting_for_spawned_tasks",
+            ):
+                turns = data.get("turns")
+                if isinstance(turns, list):
+                    return len(turns)
+        except Exception:
+            pass
+        return 0
+
+    def _has_execution_history_locked(self, item: WorkItem) -> bool:
+        if item.revisions or item.failure_count > 0 or item.spec_resets > 0:
+            return True
+        return self._resumed_turn_count_locked(item) > 0
+
+    def has_prior_execution_activity(self, item_or_id: Any) -> bool:
+        with self._lock:
+            item = self._items.get(item_or_id) if isinstance(item_or_id, str) else item_or_id
+            if item is None:
+                return False
+            return self._has_execution_history_locked(item)
+
     def validate_refinements(
         self,
         refinements: List[WorkItemRefinement],
@@ -616,6 +756,12 @@ class ProductionBoard:
                 if r.action == "no_input":
                     continue
                 if r.action == "split":
+                    if r.item_id in self._items and self._has_execution_history_locked(self._items[r.item_id]):
+                        issues.append(
+                            f"Item '{r.item_id}' has already started worker execution (completed turns or prior attempts exist) "
+                            "and cannot be split (`action='split'`). Use `action='enrich'` or `action='no_input'` instead."
+                        )
+                        continue
                     if r.item_id in seen_splits:
                         issues.append(f"Duplicate split refinement for item '{r.item_id}' in the same turn.")
                         continue
@@ -820,7 +966,15 @@ class ProductionBoard:
             item = self._require(item_id)
             if item.state != "failed":
                 raise BoardValidationError(f"Item '{item_id}' is {item.state}, not failed.")
-            short_err = (item.failure.strip().splitlines()[-1] if item.failure.strip() else "worker error")[:240]
+            err_lines = [
+                ln.strip()
+                for ln in item.failure.strip().splitlines()
+                if ln.strip() and not ln.strip().startswith("ACTION REQUIRED FOR TASK LEAD")
+            ]
+            short_err = next(
+                (ln for ln in reversed(err_lines) if "Error:" in ln or "Exception:" in ln),
+                err_lines[-1] if err_lines else "worker error",
+            )[:240]
             reason = f"worker failed {item.failure_count} times ({short_err})"
             item.state = "needs_decision"
             item.decision_reason = reason
@@ -903,11 +1057,23 @@ class ProductionBoard:
                     mods = _cand_mods(item)
                     if mods & busy:
                         continue
+                    was_yielded = item.item_id in self._yielded_on_code_lock
                     self._discard_yielded(item.item_id)
                     item.state = "in_progress"
+                    item.attempt_count = compute_work_item_attempt_count(
+                        self.path.parent if self.path is not None else None,
+                        item,
+                    )
                     busy.update(mods)
                     claimed.append(item.model_copy(deep=True))
-                    self._emit("backlog_item_started", item, revision=len(item.revisions))
+                    prior_turns = self._resumed_turn_count_locked(item)
+                    self._emit(
+                        "backlog_item_started",
+                        item,
+                        revision=len(item.revisions),
+                        resumed=bool(was_yielded or prior_turns > 0),
+                        resumed_turn_index=prior_turns,
+                    )
                 if claimed:
                     self._persist()
                 return claimed
@@ -964,13 +1130,19 @@ class ProductionBoard:
                     code_claimed_in_call += 1
 
                 chosen.state = "in_progress"
+                chosen.attempt_count = compute_work_item_attempt_count(
+                    self.path.parent if self.path is not None else None,
+                    chosen,
+                )
                 busy.update(chosen_mods)
                 claimed.append(chosen.model_copy(deep=True))
+                prior_turns = self._resumed_turn_count_locked(chosen)
                 self._emit(
                     "backlog_item_started",
                     chosen,
                     revision=len(chosen.revisions),
-                    resumed=was_yielded,
+                    resumed=bool(was_yielded or prior_turns > 0),
+                    resumed_turn_index=prior_turns,
                 )
 
             if claimed:
@@ -978,7 +1150,7 @@ class ProductionBoard:
             return claimed
 
     def expand_item_target_modules(self, item_id: str, extra_modules: List[str]) -> List[str]:
-        """Atomically appends newly discovered target module paths to `item.target_modules` (deduplicated, skipping `excluded_modules`)."""
+        """Atomically appends newly discovered target module paths to `item.target_modules` (deduplicated, skipping `excluded_modules` and `tests/*`)."""
         with self._lock:
             item = self._require(item_id)
             excluded = set(getattr(item, "excluded_modules", None) or [])
@@ -990,6 +1162,8 @@ class ProductionBoard:
                 elif mod.startswith("res:/"):
                     mod = mod[len("res:/"):]
                 mod = mod.lstrip("/")
+                if mod.startswith("tests/"):
+                    continue
                 if mod and mod not in excluded and mod not in item.target_modules:
                     item.target_modules.append(mod)
                     changed = True

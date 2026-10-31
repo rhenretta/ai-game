@@ -167,7 +167,7 @@ class TestGateACodeSelfHealing:
         )
 
         class MockModels:
-            def generate_content(self, model, contents):
+            def generate_content(self, model, contents, **kwargs):
                 class MockResponse:
                     text = (
                         '"""mechanics.py"""\n'

@@ -887,7 +887,7 @@ class LeadGameplaySWEAgent:
                 f"   - Every solid surface, obstacle, boundary wall, or interactive zone rendered visually MUST have matching `StaticBody2D`, `CollisionPolygon2D`, `CollisionShape2D`, or `Area2D` geometry aligned 1:1 with its visual representation so entities never clip through solid boundaries or float over empty space.\n"
                 f"9. ABSOLUTE BAN ON PRE-SOLVED t=0 LEVELS, PRE-WIRED DIORAMAS, SHALLOW TUTORIAL STUBS, SELF-PLAYING `sim_tick` / `playtest_timer` DEMO LOOPS, FAKE DISCONNECTED SIMULATIONS & TEST-GAMING SHORTCUTS:\n"
                 f"   - DELIVER THE LARGER POINT OF THE GAME (NOT A TINY TUTORIAL SLICE): Onboarding is ONLY the opening 60 seconds of play; never reduce the game to a linear 4-step tutorial checklist or a single 1-click lock-and-key connection! Implement the full playable system described in `CORE LOOP` (`moment_to_moment_loop`, `minute_to_minute_loop`, `session_loop`, and `player_agency_and_optimization_depth`) and `GOAL HIERARCHY` (short-, mid-, and long-term goals) so the player has a genuine toolkit/sandbox to build, experiment, optimize, or strategize across multiple stages with no single pre-scripted solution.\n"
-                f"   - UNSOLVED t=0 BASELINE (`test_unsolved_baseline_t0`) & ZERO `func test_*()` POLLUTION IN `main.gd`: `_ready()` at `t = 0` in `main.gd` (`res://main.tscn`) is the live starting state for the human player! NEVER pre-solve, pre-connect, pre-place completed player structures, or pre-complete the game objective inside `_ready()` (`is_completed` MUST be `false` and player-built connections/systems MUST start unbuilt/unsolved at `t=0`) just to make a downstream mechanic visible at tick 0 in a QA capture, and NEVER add `func test_*()` scenario-staging helper functions to `main.gd`! Isolated QA scenario staging belongs strictly in `res://tests/test_<item_id>.gd` + `res://tests/test_<item_id>.tscn` authored by `qa_test_engineer` (or driven via `input_segments`).\n"
+                f"   - UNSOLVED t=0 BASELINE (`test_unsolved_baseline_t0`), ZERO `func test_*()` POLLUTION IN `main.gd` & STRICT `tests/*` BOUNDARY: `_ready()` at `t = 0` in `main.gd` (`res://main.tscn`) is the live starting state for the human player! NEVER pre-solve, pre-connect, pre-place completed player structures, or pre-complete the game objective inside `_ready()` (`is_completed` MUST be `false` and player-built connections/systems MUST start unbuilt/unsolved at `t=0`) just to make a downstream mechanic visible at tick 0 in a QA capture, NEVER add `func test_*()` scenario-staging helper functions to `main.gd`, and NEVER output files or patches under `tests/test_*.gd` unless `tests/` is explicitly listed in `Target Modules`! QA test harnesses (`res://tests/test_<item_id>.gd` + `.tscn`) and external `input_segments` are authored exclusively by `qa_test_engineer`, and the engine's Entrypoint Parity Gate replays the exact same player inputs directly against `res://main.tscn`—so all gameplay wires, signals, and `get_state_snapshot()` metrics MUST work natively in your production `Target Modules`!\n"
                 f"   - GAMEPLAY CRAFTSMANSHIP & ANTI-CHEAT MANDATE (ZERO SHORTCUTS TO PASS QA ASSERTIONS):\n"
                 f"     * NO HITBOX / RADIUS INFLATION: Collision shapes, trigger zones, and catch/interaction radii MUST match the physical visual bounds of their sprite/structure (typically 24–48px). NEVER inflate a catch/trigger radius (e.g., to 100–200px+) or vertical tolerance to turn a precision mechanic into an unmissable giant magnet just to make a QA state assertion pass!\n"
                 f"     * NO GOALPOST SHIFTING INTO UN-INTERACTED PATHS: NEVER place, move, or pre-spawn a target/receiver/goal into the default un-deflected/un-routed trajectory of an emitter/spawner so that the objective completes without player construction or routing. The engine's Counterfactual QA Check runs the exact same simulation with `input_script = []` (zero player inputs) and automatically fails any build where post-baseline progress assertions pass without player intervention—even if a prior revision note or feedback comment mistakenly suggested moving the goal into the default trajectory!\n"
@@ -1015,6 +1015,7 @@ class LeadGameplaySWEAgent:
                         or "diagnostic_test_scene_request" in bundle_dict
                     ):
                         cand_bundle = TrackCodeSynthesisPayload(**bundle_dict)
+                        self._validate_no_qa_test_harness_edits(cand_bundle, track)
                         if self._is_live_genai_client():
                             self._validate_no_large_file_clobber(
                                 cand_bundle,
@@ -1145,6 +1146,50 @@ class LeadGameplaySWEAgent:
         )
 
     synthesize_requirement_track = implement_requirement_track
+
+    def _validate_no_qa_test_harness_edits(
+        self,
+        bundle: TrackCodeSynthesisPayload,
+        track: RequirementTrack,
+    ) -> None:
+        """Enforces the SWE vs. QA boundary during requirement-track synthesis: unless `track.target_modules`
+        explicitly targets a `tests/*` file, `swe_engineer` must never write `tests/test_*.gd` wrappers.
+        If both production edits and stray `tests/*` edits are present, prunes the stray `tests/*` entries;
+        if ONLY `tests/*` files/patches were emitted, raises `CodeVerificationError` so SWE implements the
+        actual behavior in its production `track.target_modules` instead.
+        """
+        if not isinstance(bundle, TrackCodeSynthesisPayload):
+            return
+        norm_targets = [
+            str(m or "").strip().replace("\\", "/").removeprefix("res://").lstrip("/")
+            for m in (track.target_modules or [])
+        ]
+        if any(m.startswith("tests/") for m in norm_targets):
+            return
+
+        def _norm_fn(raw_fn: Any) -> str:
+            return str(raw_fn or "").strip().replace("\\", "/").removeprefix("res://").lstrip("/")
+
+        bad_files = [_norm_fn(getattr(f, "filename", "")) for f in (bundle.files or []) if _norm_fn(getattr(f, "filename", "")).startswith("tests/")]
+        bad_patches = [_norm_fn(getattr(p, "filename", "")) for p in (bundle.patches or []) if _norm_fn(getattr(p, "filename", "")).startswith("tests/")]
+        if not bad_files and not bad_patches:
+            return
+
+        kept_files = [f for f in (bundle.files or []) if not _norm_fn(getattr(f, "filename", "")).startswith("tests/")]
+        kept_patches = [p for p in (bundle.patches or []) if not _norm_fn(getattr(p, "filename", "")).startswith("tests/")]
+        if kept_files or kept_patches:
+            bundle.files = kept_files
+            bundle.patches = kept_patches
+            return
+
+        attempted_tests = sorted(set(bad_files + bad_patches))
+        raise CodeVerificationError(
+            f"Rejected `swe_engineer` edits targeting QA test harness file(s) {attempted_tests}: "
+            "`swe_engineer` must NEVER create or modify `tests/test_*.gd` (which is authored exclusively by "
+            "`qa_test_engineer` and verified against live `res://main.tscn` by the Counterfactual Zero-Input Gate "
+            "and Entrypoint Parity Gate). Implement and wire the authentic player-input / signal / entity logic "
+            f"directly inside your production Target Modules {norm_targets or ['main.gd']}!"
+        )
 
     def _validate_no_large_file_clobber(
         self,
@@ -1716,7 +1761,12 @@ class LeadGameplaySWEAgent:
         if (
             is_godot_cartridge
             and self._is_live_genai_client()
-            and failure_type not in (GateFailureType.SYNTAX_AST_ERROR, GateFailureType.UNHANDLED_EXCEPTION)
+            and failure_type not in (
+                GateFailureType.SYNTAX_AST_ERROR,
+                GateFailureType.UNHANDLED_EXCEPTION,
+                GateFailureType.ASSET_INTEGRITY_VIOLATION,
+                GateFailureType.TELEMETRY_EMISSION_FAILURE,
+            )
         ):
             req_spec = None
             req_spec_path = c_dir / "requirements_spec.json"
@@ -3937,11 +3987,12 @@ class LeadGameplaySWEAgent:
         results: Dict[str, Path] = {}
 
         # Step 0: Render and validate every asset plate (3x3 tile grids, alpha cutouts) & animation strip in the catalog
+        # Skip full-catalog re-rendering when assets were already fabricated and Council-approved on the Production Board.
         try:
             from engine.studio.asset_library import AssetLibraryManager
             lib_mgr = AssetLibraryManager(cartridge_dir=c_dir, client=self.client)
             lib_mgr.export_godot_studio_helper()
-            if self._is_live_genai_client():
+            if self._is_live_genai_client() and not (c_dir / "backlog.json").is_file():
                 lib_mgr.verify_all_catalog_assets_and_animations(auto_remediate=True)
         except Exception as exc:
             logger.warning("Catalog asset & animation verification warning: %s", exc)

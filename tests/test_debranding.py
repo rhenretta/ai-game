@@ -23,6 +23,12 @@ class TestProjectDebranding:
         """Collects all source, config, cartridge, and test files to inspect."""
         targets = ["engine", "cartridges", "tests", "config.py", "run_game.py", "verify_engine.py"]
         excluded_dirs = {".git", ".venv", ".pytest_cache", "__pycache__", ".agents", "teamwork"}
+        binary_suffixes = {
+            ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".ico",
+            ".mp4", ".mov", ".webm", ".wav", ".mp3", ".ogg", ".flac",
+            ".ttf", ".otf", ".woff", ".woff2", ".db", ".sqlite", ".sqlite3",
+            ".pyc", ".pyo", ".so", ".dylib", ".ctex", ".scn", ".res",
+        }
 
         files: List[Path] = []
         for target_name in targets:
@@ -35,6 +41,8 @@ class TestProjectDebranding:
                 for item in target_path.rglob("*"):
                     if item.is_file():
                         if any(excluded in item.parts for excluded in excluded_dirs):
+                            continue
+                        if item.suffix.lower() in binary_suffixes:
                             continue
                         files.append(item)
         return files

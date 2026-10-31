@@ -4356,6 +4356,12 @@ def create_app(
                 it_copy["lock_holders"] = lock_holders
                 if yielded_turn_info is not None:
                     it_copy["yielded_turn_info"] = yielded_turn_info
+                from engine.studio.production_board import compute_work_item_attempt_count
+                it_copy["attempt_count"] = compute_work_item_attempt_count(
+                    cart_dir,
+                    it_copy,
+                    state_override=st,
+                )
                 counts[st] = counts.get(st, 0) + 1
                 enriched_revs = []
                 latest_proof_urls: List[str] = []
@@ -5193,6 +5199,7 @@ def create_app(
         context_packs: List[Dict[str, Any]] = []
         self_inquiries: List[Dict[str, Any]] = []
         lead_traces_by_rev: Dict[int, Dict[str, Any]] = {}
+        failed_traces_by_rev: Dict[int, List[Tuple[int, Dict[str, Any]]]] = {}
         all_touched_files: List[str] = [
             str(m).replace("res://", "").lstrip("/")
             for m in (board_item.get("target_modules") or [])
@@ -5234,6 +5241,17 @@ def create_app(
                     continue
 
             for lt_file in sorted(work_item_dir.glob("lead_trace_rev*.json")):
+                m_fail = re.search(r"lead_trace_rev(\d+)_failed(\d+)\.json$", lt_file.name)
+                if m_fail:
+                    rev_idx_f = int(m_fail.group(1))
+                    fail_idx_f = int(m_fail.group(2))
+                    try:
+                        lt_fail_data = json.loads(lt_file.read_text(encoding="utf-8"))
+                        if isinstance(lt_fail_data, dict):
+                            failed_traces_by_rev.setdefault(rev_idx_f, []).append((fail_idx_f, lt_fail_data))
+                    except Exception:
+                        continue
+                    continue
                 m_rev = re.search(r"lead_trace_rev(\d+)\.json$", lt_file.name)
                 if not m_rev:
                     continue
@@ -5252,14 +5270,10 @@ def create_app(
                 r_i = int(rv.get("revision_index", idx))
                 revs_by_idx[r_i] = rv
 
-        all_rev_indices = sorted(set(lead_traces_by_rev.keys()) | set(revs_by_idx.keys()))
-        attempts: List[Dict[str, Any]] = []
-        for rev_idx in all_rev_indices:
-            lt = lead_traces_by_rev.get(rev_idx) or {}
-            rv = revs_by_idx.get(rev_idx) or {}
-            raw_turns = lt.get("turns") if isinstance(lt.get("turns"), list) else []
-            enriched_turns: List[Dict[str, Any]] = []
-            for t_i, t in enumerate(raw_turns):
+        def _enrich_turns_from_trace(lt_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
+            raw_turns_local = lt_obj.get("turns") if isinstance(lt_obj.get("turns"), list) else []
+            out_turns: List[Dict[str, Any]] = []
+            for t_i, t in enumerate(raw_turns_local):
                 if not isinstance(t, dict):
                     continue
                 t_files = [
@@ -5306,7 +5320,7 @@ def create_app(
                             }
                         )
                     raw_step_log = fallback_steps
-                enriched_turns.append(
+                out_turns.append(
                     {
                         "turn_index": t.get("turn_index", t_i),
                         "specialist_agent": t.get("specialist_agent") or "worker",
@@ -5337,6 +5351,37 @@ def create_app(
                         "timestamp_utc": t.get("timestamp_utc") or "",
                     }
                 )
+            return out_turns
+
+        all_rev_indices = sorted(
+            set(lead_traces_by_rev.keys()) | set(revs_by_idx.keys()) | set(failed_traces_by_rev.keys())
+        )
+        attempts: List[Dict[str, Any]] = []
+        seq_attempt_num = 0
+        for rev_idx in all_rev_indices:
+            for fail_idx, lt_fail in sorted(failed_traces_by_rev.get(rev_idx, []), key=lambda x: x[0]):
+                seq_attempt_num += 1
+                attempts.append(
+                    {
+                        "attempt_key": f"rev{rev_idx}_fail{fail_idx}",
+                        "revision_index": rev_idx,
+                        "attempt_number": seq_attempt_num,
+                        "is_failed_retry": True,
+                        "status": "failed",
+                        "current_strategy": lt_fail.get("current_strategy") or "",
+                        "submission_summary": "",
+                        "turns": _enrich_turns_from_trace(lt_fail),
+                        "council_review": None,
+                        "pending_decision": None,
+                        "active_turn": None,
+                    }
+                )
+
+            if rev_idx not in lead_traces_by_rev and rev_idx not in revs_by_idx:
+                continue
+            lt = lead_traces_by_rev.get(rev_idx) or {}
+            rv = revs_by_idx.get(rev_idx) or {}
+            enriched_turns = _enrich_turns_from_trace(lt)
 
             rv_proofs = [str(p) for p in (rv.get("proof_paths") or lt.get("collected_proofs") or []) if p]
             council_review = None
@@ -5361,10 +5406,13 @@ def create_app(
                     ],
                 }
 
+            seq_attempt_num += 1
             attempts.append(
                 {
+                    "attempt_key": f"rev{rev_idx}",
                     "revision_index": rev_idx,
-                    "attempt_number": rev_idx + 1,
+                    "attempt_number": seq_attempt_num,
+                    "is_failed_retry": False,
                     "status": lt.get("status") or ("reviewed" if rv else "in_progress"),
                     "current_strategy": lt.get("current_strategy") or "",
                     "submission_summary": lt.get("submission_summary") or "",
@@ -5418,6 +5466,8 @@ def create_app(
                 "target_modules": board_item.get("target_modules") or [],
                 "depends_on": board_item.get("depends_on") or [],
                 "failure": board_item.get("failure") or "",
+                "failure_count": int(board_item.get("failure_count") or 0),
+                "spec_resets": int(board_item.get("spec_resets") or 0),
                 "context_packs": context_packs,
                 "self_inquiries": self_inquiries,
                 "attempts": attempts,
@@ -5921,6 +5971,42 @@ def create_app(
                             orch._board_scheduler.resume()
                     except Exception:
                         pass
+                if not paused_flag and "PYTEST_CURRENT_TEST" not in os.environ:
+                    post_unpause_proc = _inspect_live_build_process()
+                    if not post_unpause_proc["is_process_alive"] and target_cartridges and target_cartridges.is_dir():
+                        resumable_cands = sorted(
+                            [
+                                d
+                                for d in target_cartridges.iterdir()
+                                if d.is_dir() and d.name.startswith("candidate_") and (d / "game_bible.json").is_file()
+                            ],
+                            key=lambda d: d.stat().st_mtime,
+                            reverse=True,
+                        )
+                        if resumable_cands:
+                            cand_to_resume = resumable_cands[0].name
+                            from engine.studio.daemon import StudioDaemon, StudioDaemonConfig
+
+                            def _run_bg_unpause_resume() -> None:
+                                try:
+                                    cfg = StudioDaemonConfig(
+                                        steam_profile="default",
+                                        cartridges_root=target_cartridges,
+                                        active_cartridge_dir=target_active,
+                                        db_path=target_db,
+                                        resume_current=True,
+                                        resume_candidate_id=cand_to_resume,
+                                    )
+                                    daemon_inst = StudioDaemon(config_obj=cfg, event_bus=target_bus)
+                                    daemon_inst.run_genesis_cycle()
+                                except Exception as bg_exc:
+                                    logger.error("Background unpause resume failed: %s", bg_exc)
+
+                            threading.Thread(
+                                target=_run_bg_unpause_resume,
+                                name=f"GenesisTrigger_unpause_{uuid.uuid4().hex[:8]}",
+                                daemon=True,
+                            ).start()
 
         proc_info = _inspect_live_build_process()
         pause_val = proc_info["pause_for_greenlight"]
@@ -6150,23 +6236,33 @@ def create_app(
         """GET /api/playtest/sessions: Lists Blind Playtester sessions, playable slice/checkpoint targets, and pending wishes."""
         mgr = _get_playtest_manager()
         cp_filter = request.query_params.get("checkpoint_id") or None
-        cand_filter = request.query_params.get("candidate_id") or None
-        db = mgr._db()
-        sessions = db.list_playtest_sessions(checkpoint_id=cp_filter, candidate_id=cand_filter, limit=60)
-        for s in sessions:
-            has_vid = bool(s.get("video_path") and Path(str(s["video_path"])).is_file())
-            if not has_vid and s.get("status") in ("stopped", "completed", "error"):
-                recovered = mgr._recover_unmuxed_session_video(s, db)
-                has_vid = bool(recovered and Path(recovered).is_file())
-            s["has_video"] = has_vid
-            s["latest_frame_name"] = Path(str(s["latest_frame_path"])).name if s.get("latest_frame_path") else None
-        pending_wishes = db.list_playtest_wishes(status="pending", limit=100)
+        cand_filter = (
+            request.query_params.get("candidate_id")
+            or request.query_params.get("cartridge")
+            or None
+        )
+        slice_filter = request.query_params.get("slice_id") or None
+        raw_limit = request.query_params.get("limit")
+        try:
+            limit_val = max(1, min(500, int(raw_limit))) if raw_limit else 200
+        except ValueError:
+            limit_val = 200
+
+        enriched = mgr.list_enriched_sessions(
+            checkpoint_id=cp_filter,
+            candidate_id=cand_filter,
+            slice_id=slice_filter,
+            limit=limit_val,
+        )
+        sessions = enriched["sessions"]
         targets = mgr.list_playable_targets()
         return JSONResponse({
             "deliberation": f"Listed {len(sessions)} Blind Playtester sessions and {len(targets)} playable slice/checkpoint targets.",
             "sessions": sessions,
             "playable_targets": targets,
-            "pending_wishes_count": len(pending_wishes),
+            "games_catalog": enriched["games_catalog"],
+            "active_cartridge_id": enriched["active_cartridge_id"],
+            "pending_wishes_count": enriched["pending_wishes_count"],
         })
 
     async def playtest_session_start_handler(request):

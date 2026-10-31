@@ -502,9 +502,9 @@ class TestGateEMultimodalAssetIntegrity:
         assert rep_tiny.passed is False
         assert any("below minimum 8px" in err for err in rep_tiny.errors)
 
-        # Above max dimension (2050x16 > 2048px)
+        # Above max dimension (8200x16 > 8192px)
         huge_png = tmp_path / "huge.png"
-        img_huge = Image.new("RGB", (2050, 16), color=STYLE_BIBLE_16_PALETTE[0])
+        img_huge = Image.new("RGB", (8200, 16), color=STYLE_BIBLE_16_PALETTE[0])
         img_huge.save(huge_png, format="PNG")
 
         rep_huge = validator.validate_visual_asset(huge_png)

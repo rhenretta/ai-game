@@ -8,6 +8,7 @@ streaming live observability events over `SwarmEventBus`.
 """
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timezone
 import json
 import logging
@@ -84,6 +85,7 @@ class _RunningSessionHandle:
         config: PlaytestSessionConfig,
         session_dir: Path,
         initiated_by: str = "operator",
+        inline_council_caller: bool = False,
     ) -> None:
         self.session_id = session_id
         self.checkpoint_dir = checkpoint_dir
@@ -91,6 +93,7 @@ class _RunningSessionHandle:
         self.config = config
         self.session_dir = session_dir
         self.initiated_by = initiated_by if initiated_by in ("operator", "council") else "operator"
+        self.inline_council_caller = bool(inline_council_caller)
         self.pause_gate = threading.Event()
         self.pause_gate.set()  # Unpaused initially
         self.stop_event = threading.Event()
@@ -136,7 +139,26 @@ class PlaytestSessionManager:
         """
         try:
             db = self._db()
-            for row in db.list_playtest_sessions(limit=50):
+            existing_ids = {str(r.get("session_id") or "") for r in db.list_playtest_sessions(limit=500)}
+            if self.sessions_root.is_dir():
+                for child_dir in sorted(self.sessions_root.iterdir()):
+                    if not child_dir.is_dir():
+                        continue
+                    arch_file = child_dir / "session_archive.json"
+                    if child_dir.name not in existing_ids and arch_file.is_file():
+                        try:
+                            arch = json.loads(arch_file.read_text(encoding="utf-8"))
+                            sess_rec = arch.get("session")
+                            if isinstance(sess_rec, dict) and sess_rec.get("session_id"):
+                                db.upsert_playtest_session(sess_rec)
+                                for tr_rec in arch.get("turns") or []:
+                                    if isinstance(tr_rec, dict) and tr_rec.get("turn_index") is not None:
+                                        db.insert_playtest_turn(tr_rec)
+                                existing_ids.add(str(sess_rec["session_id"]))
+                        except Exception as restore_exc:
+                            logger.debug("Skipping archive restore for %s: %s", child_dir.name, restore_exc)
+
+            for row in db.list_playtest_sessions(limit=200):
                 sid = str(row.get("session_id") or "")
                 if not sid:
                     continue
@@ -345,6 +367,67 @@ class PlaytestSessionManager:
         except Exception as exc:
             logger.debug("Playtest event publish skipped (%s): %s", event_type, exc)
 
+    def _infer_target_provenance_ids(
+        self,
+        target_dir: Path,
+        candidate_id: Optional[str] = None,
+        slice_id: Optional[str] = None,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Resolves `(candidate_id, slice_id)` provenance IDs from `manifest.json` / `game_bible.json`
+        when omitted by the caller (e.g., running on `active`), without exposing any internal rules
+        or prompts to the blind player agent.
+        """
+        cand_out = candidate_id
+        slice_out = slice_id
+        if cand_out and slice_out:
+            return cand_out, slice_out
+
+        manifest_file = target_dir / "manifest.json"
+        if manifest_file.is_file():
+            try:
+                mf = json.loads(manifest_file.read_text(encoding="utf-8"))
+                if isinstance(mf, dict):
+                    if not cand_out:
+                        cand_out = mf.get("candidate_id") or mf.get("source_candidate_id") or None
+                    if not slice_out:
+                        slice_out = mf.get("slice_id") or mf.get("completed_slice_id") or None
+            except Exception:
+                pass
+
+        gb_file = target_dir / "game_bible.json"
+        if gb_file.is_file():
+            try:
+                gb = json.loads(gb_file.read_text(encoding="utf-8"))
+                if isinstance(gb, dict):
+                    if not cand_out and gb.get("cartridge_id"):
+                        cand_out = str(gb["cartridge_id"])
+                    if not slice_out:
+                        slices = [s for s in (gb.get("slice_roadmap") or gb.get("slices") or []) if isinstance(s, dict)]
+                        if slices:
+                            act_idx = gb.get("active_slice_index")
+                            chosen: Optional[Dict[str, Any]] = None
+                            for s in slices:
+                                if str(s.get("status") or "").lower() == "active":
+                                    chosen = s
+                                    break
+                            if chosen is None and isinstance(act_idx, int) and 0 <= act_idx < len(slices):
+                                if str(gb.get("status") or "").lower() == "in_production":
+                                    chosen = slices[act_idx]
+                            if chosen is None:
+                                completed_slices = [
+                                    s for s in slices if str(s.get("status") or "").lower() == "completed"
+                                ]
+                                if completed_slices:
+                                    chosen = completed_slices[-1]
+                            if chosen is not None and chosen.get("slice_id"):
+                                slice_out = str(chosen["slice_id"])
+            except Exception:
+                pass
+
+        if not cand_out and target_dir.name.startswith("candidate_"):
+            cand_out = target_dir.name
+        return (str(cand_out) if cand_out else None), (str(slice_out) if slice_out else None)
+
     def resolve_playtest_target(
         self,
         *,
@@ -366,16 +449,21 @@ class PlaytestSessionManager:
             if checkpoint_id == "active":
                 act = (self.cartridges_root / "active").resolve()
                 if (act / "project.godot").is_file():
-                    return act, "active", candidate_id, slice_id
+                    inf_cand, inf_slice = self._infer_target_provenance_ids(act, candidate_id, slice_id)
+                    return act, "active", inf_cand, inf_slice
                 raise StudioAgentError(f"Active cartridge directory '{act}' has no playable Godot project.godot.")
             cp_candidate = (checkpoints_dir / checkpoint_id).resolve()
             cp_candidate.relative_to(self.cartridges_root)
             if cp_candidate.is_dir() and (cp_candidate / "project.godot").is_file():
-                return cp_candidate, checkpoint_id, candidate_id, slice_id
+                inf_cand, inf_slice = self._infer_target_provenance_ids(cp_candidate, candidate_id, slice_id)
+                return cp_candidate, checkpoint_id, inf_cand, inf_slice
             direct_cand = (self.cartridges_root / checkpoint_id).resolve()
             direct_cand.relative_to(self.cartridges_root)
             if direct_cand.is_dir() and (direct_cand / "project.godot").is_file():
-                return direct_cand, checkpoint_id, candidate_id or checkpoint_id, slice_id
+                inf_cand, inf_slice = self._infer_target_provenance_ids(
+                    direct_cand, candidate_id or checkpoint_id, slice_id
+                )
+                return direct_cand, checkpoint_id, inf_cand, inf_slice
             raise StudioAgentError(f"Checkpoint '{checkpoint_id}' not found or missing project.godot.")
 
         # 2. Resolve from completed slice_id (and optional candidate_id)
@@ -443,14 +531,19 @@ class PlaytestSessionManager:
                         return cp_d, cp_d.name, candidate_id, slice_id
             if matching_cps:
                 best_cp = matching_cps[0][1]
-                return best_cp, best_cp.name, candidate_id, slice_id
+                inf_cand, inf_slice = self._infer_target_provenance_ids(best_cp, candidate_id, slice_id)
+                return best_cp, best_cp.name, inf_cand, inf_slice
             if resolved_cand_dir is not None and (resolved_cand_dir / "project.godot").is_file():
-                return resolved_cand_dir, resolved_cand_dir.name, candidate_id or resolved_cand_dir.name, slice_id
+                inf_cand, inf_slice = self._infer_target_provenance_ids(
+                    resolved_cand_dir, candidate_id or resolved_cand_dir.name, slice_id
+                )
+                return resolved_cand_dir, resolved_cand_dir.name, inf_cand, inf_slice
 
         # 3. Default to active cartridge or newest checkpoint
         act_dir = (self.cartridges_root / "active").resolve()
         if act_dir.is_dir() and (act_dir / "project.godot").is_file():
-            return act_dir, "active", candidate_id, slice_id
+            inf_cand, inf_slice = self._infer_target_provenance_ids(act_dir, candidate_id, slice_id)
+            return act_dir, "active", inf_cand, inf_slice
         if checkpoints_dir.is_dir():
             valid_cps = sorted(
                 [p for p in checkpoints_dir.iterdir() if p.is_dir() and (p / "project.godot").is_file()],
@@ -458,7 +551,8 @@ class PlaytestSessionManager:
                 reverse=True,
             )
             if valid_cps:
-                return valid_cps[0], valid_cps[0].name, candidate_id, slice_id
+                inf_cand, inf_slice = self._infer_target_provenance_ids(valid_cps[0], candidate_id, slice_id)
+                return valid_cps[0], valid_cps[0].name, inf_cand, inf_slice
 
         raise StudioAgentError("No playable Godot checkpoint or active slice found to playtest.")
 
@@ -470,7 +564,10 @@ class PlaytestSessionManager:
         act_dir = self.cartridges_root / "active"
         if act_dir.is_dir() and (act_dir / "project.godot").is_file():
             try:
-                card = extract_blind_store_card(act_dir, checkpoint_id="active")
+                inf_cand, inf_slice = self._infer_target_provenance_ids(act_dir, None, None)
+                card = extract_blind_store_card(
+                    act_dir, checkpoint_id="active", candidate_id=inf_cand, slice_id=inf_slice
+                )
                 targets.append({
                     "target_type": "active",
                     "checkpoint_id": "active",
@@ -555,6 +652,14 @@ class PlaytestSessionManager:
         """Safely deletes captured media, staged runtime, and Godot user:// state for `session_id`."""
         if not session_id or ".." in session_id or "/" in session_id or "\\" in session_id or "\0" in session_id:
             return
+        if self.cartridges_root.is_dir():
+            for cand_d in [self.cartridges_root / "active", *self.cartridges_root.glob("candidate_*")]:
+                arch_f = cand_d / "artifacts" / "playtest_sessions" / f"{session_id}.json"
+                if arch_f.is_file():
+                    try:
+                        arch_f.unlink(missing_ok=True)
+                    except OSError:
+                        pass
         s_dir = (self.sessions_root / session_id).resolve()
         try:
             s_dir.relative_to(self.sessions_root)
@@ -576,7 +681,12 @@ class PlaytestSessionManager:
                 except OSError:
                     pass
 
-    def start_session(self, req: PlaytestSessionStartRequest) -> Dict[str, Any]:
+    def start_session(
+        self,
+        req: PlaytestSessionStartRequest,
+        *,
+        inline_council_caller: bool = False,
+    ) -> Dict[str, Any]:
         """Stops any currently active playtester session and starts a fresh opaque-box session."""
         # Stop any currently active/paused handle so only one background Godot runner runs at a time
         self._stop_all_active_handles()
@@ -640,6 +750,9 @@ class PlaytestSessionManager:
             "sim_duration_sec": 0.0,
             "compaction_count": 0,
             "rulebook": {},
+            "field_notes": {},
+            "questions": {},
+            "bugs_found": {},
             "impressions": {},
             "session_report": {},
             "compacted_journal": {},
@@ -659,6 +772,7 @@ class PlaytestSessionManager:
             config=cfg,
             session_dir=session_dir,
             initiated_by=initiated_by,
+            inline_council_caller=inline_council_caller,
         )
         worker = threading.Thread(
             target=self._run_session_worker,
@@ -722,7 +836,7 @@ class PlaytestSessionManager:
             compaction_interval_turns=compaction_interval_turns,
             enable_audio_perception=enable_audio_perception,
         )
-        started = self.start_session(req)
+        started = self.start_session(req, inline_council_caller=True)
         session_id = str(started["session_id"])
 
         with self._lock:
@@ -877,6 +991,393 @@ class PlaytestSessionManager:
 
         raise StudioAgentError(f"Unsupported session control action: '{action}'")
 
+    def _collect_archive_catalog(self) -> Dict[str, Any]:
+        """Scans cartridges on disk to map game titles, slice roadmaps (`slice_index`, `slice_title`),
+        `active_cartridge_id`, and any historical Council Blind Playtest verdicts saved under `artifacts/`.
+        """
+        active_cartridge_id: Optional[str] = None
+        active_game_title: Optional[str] = None
+        games_by_cand: Dict[str, Dict[str, Any]] = {}
+        title_to_cand: Dict[str, str] = {}
+        slices_lookup: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        council_verdicts_by_session: Dict[str, Dict[str, Any]] = {}
+
+        if not self.cartridges_root.is_dir():
+            return {
+                "active_cartridge_id": None,
+                "active_game_title": None,
+                "games_by_cand": {},
+                "title_to_cand": {},
+                "slices_lookup": {},
+                "council_verdicts_by_session": {},
+            }
+
+        act_dir = self.cartridges_root / "active"
+        if act_dir.is_dir():
+            active_cartridge_id, _ = self._infer_target_provenance_ids(act_dir, None, None)
+
+        scan_dirs: List[Path] = []
+        if act_dir.is_dir():
+            scan_dirs.append(act_dir)
+        scan_dirs.extend(
+            sorted(
+                [p for p in self.cartridges_root.glob("candidate_*") if p.is_dir()],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        )
+
+        for d in scan_dirs:
+            inf_cand, _ = self._infer_target_provenance_ids(d, None, None)
+            cand_key = inf_cand or d.name
+            gb_file = d / "game_bible.json"
+            if gb_file.is_file():
+                try:
+                    gb = json.loads(gb_file.read_text(encoding="utf-8"))
+                    if isinstance(gb, dict):
+                        g_title = str(gb.get("game_title") or gb.get("title") or cand_key)
+                        if d.name == "active" and not active_game_title:
+                            active_game_title = g_title
+                        if g_title and cand_key != "active":
+                            title_to_cand.setdefault(g_title, cand_key)
+                        slice_list: List[Dict[str, Any]] = []
+                        for idx, s in enumerate(gb.get("slice_roadmap") or gb.get("slices") or []):
+                            if not isinstance(s, dict):
+                                continue
+                            sid = str(s.get("slice_id") or "")
+                            if not sid:
+                                continue
+                            s_idx = int(s.get("slice_index", idx) if s.get("slice_index") is not None else idx)
+                            s_title = str(s.get("title") or sid)
+                            s_status = str(s.get("status") or "planned")
+                            s_meta = {
+                                "slice_id": sid,
+                                "slice_index": s_idx,
+                                "slice_title": s_title,
+                                "status": s_status,
+                            }
+                            slice_list.append(s_meta)
+                            slices_lookup.setdefault((cand_key, sid), s_meta)
+                            slices_lookup.setdefault(("*", sid), s_meta)
+                        if cand_key not in games_by_cand:
+                            games_by_cand[cand_key] = {
+                                "candidate_id": cand_key,
+                                "game_title": g_title,
+                                "is_active": bool(active_cartridge_id and cand_key == active_cartridge_id) or d.name == "active",
+                                "slices": slice_list,
+                            }
+                except Exception:
+                    pass
+
+            art_dir = d / "artifacts"
+            if art_dir.is_dir():
+                for rep_f in sorted(art_dir.glob("blind_playtest_report*.json")):
+                    try:
+                        rep_data = json.loads(rep_f.read_text(encoding="utf-8"))
+                        if isinstance(rep_data, dict) and rep_data.get("session_id") and rep_data.get("council_verdict"):
+                            sid_key = str(rep_data["session_id"])
+                            council_verdicts_by_session.setdefault(
+                                sid_key,
+                                {
+                                    "slice_id": rep_data.get("slice_id"),
+                                    "slice_title": rep_data.get("slice_title") or "",
+                                    "pass_index": int(rep_data.get("pass_index", 0) or 0),
+                                    "verdict": str(rep_data.get("council_verdict") or ""),
+                                    "player_experience_synthesis": str(rep_data.get("player_experience_synthesis") or ""),
+                                    "spawned_item_ids": list(rep_data.get("spawned_item_ids") or []),
+                                    "next_slice_carryover_notes": list(rep_data.get("next_slice_carryover_notes") or []),
+                                },
+                            )
+                    except Exception:
+                        continue
+
+        return {
+            "active_cartridge_id": active_cartridge_id,
+            "active_game_title": active_game_title,
+            "games_by_cand": games_by_cand,
+            "title_to_cand": title_to_cand,
+            "slices_lookup": slices_lookup,
+            "council_verdicts_by_session": council_verdicts_by_session,
+        }
+
+    @staticmethod
+    def _compute_session_run_numbers(
+        all_sessions: List[Dict[str, Any]],
+        title_to_cand: Optional[Dict[str, str]] = None,
+    ) -> Tuple[Dict[str, int], Dict[str, int]]:
+        """Computes chronological 1-based `game_run_number` and `slice_run_number` across `all_sessions`."""
+        t_map = title_to_cand or {}
+        chrono = sorted(
+            all_sessions,
+            key=lambda r: (str(r.get("started_at_utc") or ""), str(r.get("session_id") or "")),
+        )
+        game_counters: Dict[str, int] = {}
+        slice_counters: Dict[Tuple[str, str], int] = {}
+        game_run_by_sid: Dict[str, int] = {}
+        slice_run_by_sid: Dict[str, int] = {}
+
+        for row in chrono:
+            sid = str(row.get("session_id") or "")
+            if not sid:
+                continue
+            raw_cand = str(row.get("candidate_id") or "")
+            raw_title = str(row.get("game_title") or "")
+            eff_cand = raw_cand or t_map.get(raw_title, "")
+            g_key = eff_cand or raw_title or str(row.get("checkpoint_id") or "default")
+            game_counters[g_key] = game_counters.get(g_key, 0) + 1
+            game_run_by_sid[sid] = game_counters[g_key]
+
+            sl_id = str(row.get("slice_id") or "")
+            if sl_id:
+                sl_key = (g_key, sl_id)
+                slice_counters[sl_key] = slice_counters.get(sl_key, 0) + 1
+                slice_run_by_sid[sid] = slice_counters[sl_key]
+
+        return game_run_by_sid, slice_run_by_sid
+
+    def _enrich_session_summary_row(
+        self,
+        sess: Dict[str, Any],
+        *,
+        db: TelemetryDB,
+        catalog: Dict[str, Any],
+        game_run_by_sid: Dict[str, int],
+        slice_run_by_sid: Dict[str, int],
+        wishes_total_by_sid: Dict[str, int],
+        wishes_pending_by_sid: Dict[str, int],
+    ) -> Dict[str, Any]:
+        sid = str(sess.get("session_id") or "")
+        active_cid = catalog.get("active_cartridge_id")
+        active_title = catalog.get("active_game_title")
+        title_to_cand = catalog.get("title_to_cand") or {}
+        slices_lookup = catalog.get("slices_lookup") or {}
+        verdict_map = catalog.get("council_verdicts_by_session") or {}
+
+        has_vid = bool(sess.get("video_path") and Path(str(sess["video_path"])).is_file())
+        if not has_vid and sess.get("status") in ("stopped", "completed", "error"):
+            recovered = self._recover_unmuxed_session_video(sess, db)
+            has_vid = bool(recovered and Path(recovered).is_file())
+        sess["has_video"] = has_vid
+        sess["latest_frame_name"] = (
+            Path(str(sess["latest_frame_path"])).name if sess.get("latest_frame_path") else None
+        )
+
+        raw_cand_id = str(sess.get("candidate_id") or "")
+        raw_title = str(sess.get("game_title") or "")
+        cand_id = raw_cand_id or title_to_cand.get(raw_title, "")
+        if cand_id and not raw_cand_id:
+            sess["candidate_id"] = cand_id
+        slice_id = str(sess.get("slice_id") or "")
+        sl_meta = (
+            slices_lookup.get((cand_id, slice_id))
+            or slices_lookup.get(("*", slice_id))
+            if slice_id
+            else None
+        )
+        rep = sess.get("session_report") if isinstance(sess.get("session_report"), dict) else {}
+        council_rev = rep.get("council_review") if isinstance(rep.get("council_review"), dict) else verdict_map.get(sid)
+
+        sess["slice_index"] = sl_meta.get("slice_index") if sl_meta else None
+        sess["slice_title"] = (
+            (council_rev.get("slice_title") if isinstance(council_rev, dict) and council_rev.get("slice_title") else None)
+            or (sl_meta.get("slice_title") if sl_meta else None)
+        )
+        sess["game_run_number"] = game_run_by_sid.get(sid, 1)
+        sess["slice_run_number"] = slice_run_by_sid.get(sid)
+        sess["overall_fun_rating"] = rep.get("overall_fun_rating")
+        sess["overall_experience_summary"] = str(
+            rep.get("overall_experience_summary") or sess.get("end_summary") or ""
+        )
+        bugs_obj = sess.get("bugs_found")
+        sess["bugs_count"] = len(bugs_obj) if isinstance(bugs_obj, dict) else 0
+        sess["wishes_count"] = int(wishes_total_by_sid.get(sid, 0))
+        sess["pending_wishes_count"] = int(wishes_pending_by_sid.get(sid, 0))
+        sess["council_review"] = council_rev
+        sess["matches_active_cartridge"] = bool(
+            (active_cid and cand_id == active_cid)
+            or (
+                not cand_id
+                and sess.get("checkpoint_id") == "active"
+                and (not active_title or raw_title == active_title)
+            )
+        )
+        return sess
+
+    def list_enriched_sessions(
+        self,
+        *,
+        checkpoint_id: Optional[str] = None,
+        candidate_id: Optional[str] = None,
+        slice_id: Optional[str] = None,
+        limit: int = 200,
+    ) -> Dict[str, Any]:
+        """Lists playtest sessions enriched with chronological run numbers, slice metadata,
+        fun ratings, Council verdicts, and a `games_catalog` index for UI filtering.
+        """
+        db = self._db()
+        fetch_cap = max(200, int(limit))
+        all_sessions = db.list_playtest_sessions(limit=fetch_cap)
+        all_wishes = db.list_playtest_wishes(limit=1000)
+
+        wishes_total_by_sid: Dict[str, int] = {}
+        wishes_pending_by_sid: Dict[str, int] = {}
+        total_pending_wishes = 0
+        for w in all_wishes:
+            wsid = str(w.get("session_id") or "")
+            if wsid:
+                wishes_total_by_sid[wsid] = wishes_total_by_sid.get(wsid, 0) + 1
+            if w.get("status") == "pending":
+                total_pending_wishes += 1
+                if wsid:
+                    wishes_pending_w_cnt = wishes_pending_by_sid.get(wsid, 0) + 1
+                    wishes_pending_by_sid[wsid] = wishes_pending_w_cnt
+
+        catalog = self._collect_archive_catalog()
+        game_run_by_sid, slice_run_by_sid = self._compute_session_run_numbers(
+            all_sessions,
+            title_to_cand=catalog.get("title_to_cand"),
+        )
+
+        enriched: List[Dict[str, Any]] = []
+        for s in all_sessions:
+            self._enrich_session_summary_row(
+                s,
+                db=db,
+                catalog=catalog,
+                game_run_by_sid=game_run_by_sid,
+                slice_run_by_sid=slice_run_by_sid,
+                wishes_total_by_sid=wishes_total_by_sid,
+                wishes_pending_by_sid=wishes_pending_by_sid,
+            )
+            if checkpoint_id and s.get("checkpoint_id") != checkpoint_id:
+                continue
+            if candidate_id:
+                if candidate_id == "active":
+                    if not s.get("matches_active_cartridge"):
+                        continue
+                elif s.get("candidate_id") != candidate_id:
+                    continue
+            if slice_id and s.get("slice_id") != slice_id:
+                continue
+            enriched.append(s)
+
+        # Also ensure any game represented in historical sessions appears in `games_catalog`
+        games_by_cand = dict(catalog.get("games_by_cand") or {})
+        active_cid = catalog.get("active_cartridge_id")
+        for s in all_sessions:
+            cid = str(s.get("candidate_id") or "")
+            if cid and cid not in games_by_cand:
+                games_by_cand[cid] = {
+                    "candidate_id": cid,
+                    "game_title": str(s.get("game_title") or cid),
+                    "is_active": bool(active_cid and cid == active_cid),
+                    "slices": [],
+                }
+
+        return {
+            "sessions": enriched[: max(1, int(limit))],
+            "games_catalog": list(games_by_cand.values()),
+            "active_cartridge_id": active_cid,
+            "pending_wishes_count": total_pending_wishes,
+        }
+
+    def record_council_verdict(
+        self,
+        session_id: str,
+        *,
+        slice_id: str,
+        slice_title: str = "",
+        pass_index: int = 0,
+        verdict: str,
+        player_experience_synthesis: str = "",
+        spawned_item_ids: Optional[List[str]] = None,
+        next_slice_carryover_notes: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Persists the Council's End-of-Slice Blind Playtest verdict onto the session record
+        in SQLite AND writes immutable session archive snapshots on disk.
+        """
+        if not session_id:
+            return None
+        db = self._db()
+        existing = db.get_playtest_session(session_id)
+        if existing is None:
+            return None
+
+        rep = dict(existing.get("session_report") or {}) if isinstance(existing.get("session_report"), dict) else {}
+        council_review = {
+            "slice_id": slice_id,
+            "slice_title": slice_title,
+            "pass_index": int(pass_index),
+            "verdict": str(verdict),
+            "player_experience_synthesis": str(player_experience_synthesis or ""),
+            "spawned_item_ids": list(spawned_item_ids or []),
+            "next_slice_carryover_notes": list(next_slice_carryover_notes or []),
+            "recorded_at_utc": _utc_now(),
+        }
+        rep["council_review"] = council_review
+        existing["session_report"] = rep
+        if slice_id and not existing.get("slice_id"):
+            existing["slice_id"] = slice_id
+        existing["updated_at_utc"] = _utc_now()
+        db.upsert_playtest_session(existing)
+        self._write_session_archive_snapshot(session_id)
+        self._emit_event(
+            "playtest_council_verdict_recorded",
+            f"Recorded Council Blind Playtest verdict '{verdict}' on session {session_id} ({slice_id}, pass #{pass_index + 1}).",
+            {
+                "session_id": session_id,
+                "slice_id": slice_id,
+                "pass_index": int(pass_index),
+                "verdict": str(verdict),
+                "spawned_item_ids": list(spawned_item_ids or []),
+            },
+        )
+        return existing
+
+    def _write_session_archive_snapshot(self, session_id: str) -> None:
+        """Writes an immutable JSON snapshot of the completed/updated playtest session into
+        `<sessions_root>/<session_id>/session_archive.json` and `<cartridge>/artifacts/playtest_sessions/<session_id>.json`.
+        """
+        if not session_id or ".." in session_id or "/" in session_id or "\\" in session_id or "\0" in session_id:
+            return
+        try:
+            detail = self.get_session_detail(session_id)
+            if detail is None:
+                return
+            s_dir = (self.sessions_root / session_id).resolve()
+            s_dir.relative_to(self.sessions_root)
+            if s_dir.is_dir():
+                arch_path = s_dir / "session_archive.json"
+                tmp_path = s_dir / "session_archive.json.tmp"
+                tmp_path.write_text(json.dumps(detail, indent=2, default=str), encoding="utf-8")
+                tmp_path.replace(arch_path)
+
+            sess = detail.get("session") or {}
+            cand_id = str(sess.get("candidate_id") or "")
+            target_dirs: List[Path] = []
+            if cand_id and ".." not in cand_id and "/" not in cand_id and "\\" not in cand_id:
+                cand_p = (self.cartridges_root / cand_id).resolve()
+                try:
+                    cand_p.relative_to(self.cartridges_root)
+                    if cand_p.is_dir():
+                        target_dirs.append(cand_p)
+                except ValueError:
+                    pass
+            if sess.get("matches_active_cartridge"):
+                act_p = (self.cartridges_root / "active").resolve()
+                if act_p.is_dir() and act_p not in target_dirs:
+                    target_dirs.append(act_p)
+
+            for c_dir in target_dirs:
+                pt_art_dir = c_dir / "artifacts" / "playtest_sessions"
+                pt_art_dir.mkdir(parents=True, exist_ok=True)
+                out_f = pt_art_dir / f"{session_id}.json"
+                tmp_f = pt_art_dir / f"{session_id}.json.tmp"
+                tmp_f.write_text(json.dumps(detail, indent=2, default=str), encoding="utf-8")
+                tmp_f.replace(out_f)
+        except Exception as exc:
+            logger.debug("Playtest archive snapshot write skipped for %s: %s", session_id, exc)
+
     def get_session_detail(self, session_id: str) -> Optional[Dict[str, Any]]:
         db = self._db()
         sess = db.get_playtest_session(session_id)
@@ -904,16 +1405,74 @@ class PlaytestSessionManager:
         if live_handle is None and sess.get("status") in ("stopped", "completed", "error"):
             self._recover_unmuxed_session_video(sess, db)
 
-        # Convert filesystem paths into session-relative media filenames for clean UI URLs
-        sess["has_video"] = bool(sess.get("video_path") and Path(str(sess["video_path"])).is_file())
-        sess["latest_frame_name"] = (
-            Path(str(sess["latest_frame_path"])).name if sess.get("latest_frame_path") else None
+        all_sessions = db.list_playtest_sessions(limit=300)
+        catalog = self._collect_archive_catalog()
+        game_run_by_sid, slice_run_by_sid = self._compute_session_run_numbers(
+            all_sessions,
+            title_to_cand=catalog.get("title_to_cand"),
         )
+        pending_w_cnt = sum(1 for w in wishes if w.get("status") == "pending")
+        self._enrich_session_summary_row(
+            sess,
+            db=db,
+            catalog=catalog,
+            game_run_by_sid=game_run_by_sid,
+            slice_run_by_sid=slice_run_by_sid,
+            wishes_total_by_sid={session_id: len(wishes)},
+            wishes_pending_by_sid={session_id: pending_w_cnt},
+        )
+
         for tr in turns:
             tr["screenshot_name"] = Path(str(tr["screenshot_path"])).name if tr.get("screenshot_path") else None
             tr["audio_clip_name"] = Path(str(tr["audio_clip_path"])).name if tr.get("audio_clip_path") else None
+            act_raw = tr.get("action") if isinstance(tr.get("action"), dict) else {}
+            mx_norm = act_raw.get("mouse_x")
+            my_norm = act_raw.get("mouse_y")
+            dfx_norm = act_raw.get("drag_from_x")
+            dfy_norm = act_raw.get("drag_from_y")
+            target_px_x = (
+                round(denormalize_screen_x(float(mx_norm)), 1)
+                if mx_norm is not None
+                else round(float(tr.get("cursor_end_x", 640.0) or 640.0), 1)
+            )
+            target_px_y = (
+                round(denormalize_screen_y(float(my_norm)), 1)
+                if my_norm is not None
+                else round(float(tr.get("cursor_end_y", 360.0) or 360.0), 1)
+            )
+            drag_px_x = (
+                round(denormalize_screen_x(float(dfx_norm)), 1)
+                if dfx_norm is not None
+                else round(float(tr.get("cursor_start_x", 640.0) or 640.0), 1)
+            )
+            drag_px_y = (
+                round(denormalize_screen_y(float(dfy_norm)), 1)
+                if dfy_norm is not None
+                else round(float(tr.get("cursor_start_y", 360.0) or 360.0), 1)
+            )
+            btn_act = str(act_raw.get("mouse_button_action") or "none")
+            hold_k = list(act_raw.get("hold_keys") or [])
+            tap_k = list(act_raw.get("tap_keys") or [])
+            dur_ms = int(act_raw.get("duration_ms", 0) or 0)
+            tr["action_px"] = {
+                "target_x": target_px_x,
+                "target_y": target_px_y,
+                "drag_from_x": drag_px_x,
+                "drag_from_y": drag_px_y,
+                "has_explicit_mouse": bool(mx_norm is not None or my_norm is not None or btn_act != "none"),
+                "mouse_button_action": btn_act,
+                "hold_keys": hold_k,
+                "tap_keys": tap_k,
+                "duration_ms": dur_ms,
+            }
         for w in wishes:
             w["screenshot_name"] = Path(str(w["screenshot_path"])).name if w.get("screenshot_path") else None
+        if isinstance(sess.get("bugs_found"), dict):
+            for b_val in sess["bugs_found"].values():
+                if isinstance(b_val, dict):
+                    b_val["screenshot_name"] = (
+                        Path(str(b_val["screenshot_path"])).name if b_val.get("screenshot_path") else None
+                    )
 
         return {
             "deliberation": f"Loaded observability snapshot for Blind Playtester session {session_id}.",
@@ -953,6 +1512,186 @@ class PlaytestSessionManager:
             raise FileNotFoundError(f"Playtest media file not found: {filename}")
         return target
 
+    def _resolve_target_candidate_dir(self, candidate_id: Optional[str]) -> Optional[Path]:
+        cand_dir: Optional[Path] = None
+        if candidate_id:
+            try:
+                p = (self.cartridges_root / str(candidate_id)).resolve()
+                p.relative_to(self.cartridges_root)
+                if p.is_dir():
+                    cand_dir = p
+            except ValueError:
+                cand_dir = None
+
+        if cand_dir is None and self.cartridges_root.is_dir():
+            cands = sorted(
+                [p for p in self.cartridges_root.glob("candidate_*") if p.is_dir()],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if cands:
+                cand_dir = cands[0]
+            elif (self.cartridges_root / "active").is_dir():
+                cand_dir = (self.cartridges_root / "active").resolve()
+        return cand_dir
+
+    def _deliver_council_report_and_wishes_to_candidate(
+        self,
+        *,
+        handle: _RunningSessionHandle,
+        turn_count: int,
+        sim_ticks: int,
+        final_status: str,
+        end_outcome: Optional[str],
+        session_report_dict: Dict[str, Any],
+        session_wishes: List[Dict[str, Any]],
+        last_obs_screenshot_path: Optional[Path],
+        sent_iso: str,
+    ) -> None:
+        """Delivers the full final PlaytestExperienceReport + all wishes + spotted bugs + questions + field notes
+        to the target candidate's Council queue whenever a Council-initiated playtest finishes asynchronously.
+        """
+        store_card = handle.store_card
+        cand_dir = self._resolve_target_candidate_dir(store_card.candidate_id)
+        if cand_dir is None and handle.checkpoint_dir.is_dir():
+            try:
+                handle.checkpoint_dir.resolve().relative_to(self.cartridges_root)
+                cand_dir = handle.checkpoint_dir.resolve()
+            except ValueError:
+                cand_dir = None
+        if cand_dir is None:
+            logger.warning(
+                "Could not resolve target candidate directory to auto-deliver Council playtest report for %s.",
+                handle.session_id,
+            )
+            return
+
+        agent = handle.agent
+        bugs_found = copy.deepcopy(agent.bugs_found) if agent is not None else {}
+        questions = copy.deepcopy(agent.questions) if agent is not None else {}
+        field_notes = dict(agent.field_notes) if agent is not None else {}
+        rulebook = dict(agent.rulebook) if agent is not None else {}
+        impressions = dict(agent.impressions) if agent is not None else {}
+
+        wish_payload_items: List[Dict[str, Any]] = []
+        for w in session_wishes:
+            wish_payload_items.append({
+                "wish_id": str(w.get("wish_id") or ""),
+                "session_id": handle.session_id,
+                "turn_index": w.get("turn_index"),
+                "checkpoint_id": w.get("checkpoint_id") or store_card.checkpoint_id,
+                "observed_on_slice_id": w.get("observed_on_slice_id") or store_card.slice_id or "unspecified_slice",
+                "category": w.get("category"),
+                "summary": w.get("summary"),
+                "rationale": w.get("rationale"),
+                "mood_at_time": w.get("mood_at_time"),
+                "screenshot_path": w.get("screenshot_path"),
+                "video_timestamp_sec": w.get("video_timestamp_sec"),
+                "producer_note": "Auto-delivered from Council Blind Playtest",
+                "sent_at_utc": sent_iso,
+            })
+
+        report_envelope = {
+            "session_id": handle.session_id,
+            "candidate_id": cand_dir.name,
+            "checkpoint_id": store_card.checkpoint_id,
+            "observed_on_slice_id": store_card.slice_id or "unspecified_slice",
+            "status": final_status,
+            "end_outcome": end_outcome,
+            "turn_count": turn_count,
+            "sim_duration_sec": round(sim_ticks / 60.0, 2),
+            "session_report": session_report_dict,
+            "wishes": wish_payload_items,
+            "bugs_found": bugs_found,
+            "questions": questions,
+            "field_notes": field_notes,
+            "rulebook": rulebook,
+            "impressions": impressions,
+            "final_screenshot_path": str(last_obs_screenshot_path) if last_obs_screenshot_path else None,
+            "sent_at_utc": sent_iso,
+        }
+
+        reports_queue_path = cand_dir / ".pending_council_playtest_reports.json"
+        existing_reports: List[Dict[str, Any]] = []
+        if reports_queue_path.is_file():
+            try:
+                loaded_r = json.loads(reports_queue_path.read_text(encoding="utf-8"))
+                if isinstance(loaded_r, list):
+                    existing_reports = loaded_r
+            except Exception:
+                existing_reports = []
+        existing_reports.append(report_envelope)
+        reports_queue_path.write_text(json.dumps(existing_reports, indent=2), encoding="utf-8")
+
+        fun_rating = session_report_dict.get("overall_fun_rating", "?")
+        overall_sum = str(session_report_dict.get("overall_experience_summary") or "")
+        steering_lines = [
+            f"[COUNCIL BLIND PLAYTEST FULL REPORT & WISHES — Session `{handle.session_id}` | "
+            f"Slice `{store_card.slice_id or 'unspecified'}` | Fun Rating: {fun_rating}/10 | {turn_count} turns]",
+            f"Overall Experience Summary: {overall_sum}",
+            f"- Graphics & Visuals: {session_report_dict.get('graphics_and_visuals', '')}",
+            f"- Gameplay & Feel: {session_report_dict.get('gameplay_and_feel', '')}",
+            f"- Sound & Audio: {session_report_dict.get('sound_and_audio', '')}",
+            f"- Intuitiveness & Onboarding: {session_report_dict.get('intuitiveness_and_onboarding', '')}",
+            f"- Goals, Pacing & Accomplishment: {session_report_dict.get('goals_pacing_and_accomplishment', '')}",
+            f"- World & Atmosphere: {session_report_dict.get('world_and_atmosphere', '')}",
+        ]
+        if session_report_dict.get("key_pain_points"):
+            steering_lines.append("Key Pain Points: " + "; ".join(str(x) for x in session_report_dict["key_pain_points"]))
+        if session_report_dict.get("bugs_and_glitches_observed"):
+            steering_lines.append(
+                "Bugs & Glitches Observed: " + "; ".join(str(x) for x in session_report_dict["bugs_and_glitches_observed"])
+            )
+        if session_report_dict.get("unanswered_questions_and_mysteries"):
+            steering_lines.append(
+                "Unanswered Player Questions: "
+                + "; ".join(str(x) for x in session_report_dict["unanswered_questions_and_mysteries"])
+            )
+        if wish_payload_items:
+            steering_lines.append(f"Auto-Delivered Player Wishes ({len(wish_payload_items)}):")
+            for idx, item in enumerate(wish_payload_items, 1):
+                steering_lines.append(
+                    f"  {idx}. [{item['category']}] {item['summary']} "
+                    f"(mood='{item.get('mood_at_time') or 'n/a'}'): {item['rationale']}"
+                )
+        formatted_msg = "\n".join(steering_lines)
+
+        steering_path = cand_dir / ".pending_steering.json"
+        s_list: List[str] = []
+        if steering_path.is_file():
+            try:
+                raw_s = json.loads(steering_path.read_text(encoding="utf-8"))
+                if isinstance(raw_s, list):
+                    s_list = [str(x) for x in raw_s]
+                elif isinstance(raw_s, dict) and raw_s.get("message"):
+                    s_list = [str(raw_s["message"])]
+            except Exception:
+                s_list = []
+        s_list.append(formatted_msg)
+        steering_path.write_text(json.dumps(s_list, indent=2), encoding="utf-8")
+
+        if self.event_bus is not None:
+            orch = getattr(self.event_bus, "_active_orchestrator", None)
+            if orch is not None:
+                wr = getattr(orch, "writers_room", None)
+                if wr is not None and hasattr(wr, "queue_live_steering"):
+                    try:
+                        wr.queue_live_steering(formatted_msg, candidate_dir=cand_dir)
+                    except Exception:
+                        pass
+
+        self._emit_event(
+            "playtest_council_report_dispatched",
+            f"Delivered full Council Blind Playtest report + {len(wish_payload_items)} wish(es) from {handle.session_id} to {cand_dir.name}.",
+            {
+                "session_id": handle.session_id,
+                "candidate_id": cand_dir.name,
+                "overall_fun_rating": fun_rating,
+                "wishes_count": len(wish_payload_items),
+                "bugs_count": len(bugs_found),
+            },
+        )
+
     def dispatch_wishes_to_council(
         self,
         wish_ids: List[str],
@@ -968,23 +1707,7 @@ class PlaytestSessionManager:
 
         # Resolve target candidate directory
         cand_id = next((str(w.get("candidate_id") or "") for w in wishes if w.get("candidate_id")), "")
-        cand_dir: Optional[Path] = None
-        if cand_id:
-            p = (self.cartridges_root / cand_id).resolve()
-            p.relative_to(self.cartridges_root)
-            if p.is_dir():
-                cand_dir = p
-
-        if cand_dir is None and self.cartridges_root.is_dir():
-            cands = sorted(
-                [p for p in self.cartridges_root.glob("candidate_*") if p.is_dir()],
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-            if cands:
-                cand_dir = cands[0]
-            elif (self.cartridges_root / "active").is_dir():
-                cand_dir = (self.cartridges_root / "active").resolve()
+        cand_dir = self._resolve_target_candidate_dir(cand_id)
 
         if cand_dir is None:
             raise StudioAgentError("Cannot dispatch wishes to Council: no target candidate directory found.")
@@ -1107,6 +1830,7 @@ class PlaytestSessionManager:
         error_msg: Optional[str] = None
         latest_frame_path: Optional[str] = None
         last_obs_screenshot_path: Optional[Path] = None
+        last_obs_wav_path: Optional[Path] = None
         session_report_dict: Optional[Dict[str, Any]] = None
 
         def _on_live_frame(frame_pkt: Dict[str, Any]) -> None:
@@ -1154,6 +1878,7 @@ class PlaytestSessionManager:
             obs: TurnObservation = bridge.start()
             latest_frame_path = str(obs.preview_path)
             last_obs_screenshot_path = obs.screenshot_path
+            last_obs_wav_path = obs.wav_path if (obs.wav_path and not obs.audio_is_silent) else None
 
             # Initial boot settle sidebar segment (ticks 0 .. obs.tick)
             boot_sidebar = render_turn_sidebar_png(
@@ -1257,6 +1982,28 @@ class PlaytestSessionManager:
                         },
                     )
 
+                # Record bug or glitch spotted by the blind player
+                if decision.bug_reports:
+                    for b_rep in decision.bug_reports:
+                        sticky_feedback_items.append({
+                            "kind": "bug",
+                            "turn_label": f"T#{turn_index}",
+                            "badge": f"BUG ({b_rep.severity.upper()} • {b_rep.category})",
+                            "text": f"{b_rep.summary}: {b_rep.details}",
+                        })
+                    self._emit_event(
+                        "playtest_bug_reported",
+                        decision.bug_reports[0].deliberation,
+                        {
+                            "session_id": session_id,
+                            "turn_index": turn_index,
+                            "video_timestamp_sec": vid_ts_sec,
+                            "bug_reports": [b.model_dump() for b in decision.bug_reports],
+                            "bugs_found": copy.deepcopy(agent.bugs_found),
+                            "screenshot_name": Path(obs_screenshot_path).name,
+                        },
+                    )
+
                 # Record wish item if player explicitly triggered submit_wish
                 if decision.submit_wish is not None:
                     w_draft = decision.submit_wish
@@ -1315,7 +2062,10 @@ class PlaytestSessionManager:
                         "current_plan": decision.current_plan,
                         "deliberation": decision.deliberation,
                         "action": decision.motor_action.model_dump(),
+                        "field_note_updates": [u.model_dump() for u in decision.field_note_updates],
+                        "question_updates": [u.model_dump() for u in decision.question_updates],
                         "rulebook_updates": [u.model_dump() for u in decision.rulebook_updates],
+                        "bug_reports": [u.model_dump() for u in decision.bug_reports],
                         "impression_updates": [u.model_dump() for u in decision.impression_updates],
                         "append_log_line": tape_line,
                         "mood_state": mood_label,
@@ -1337,6 +2087,9 @@ class PlaytestSessionManager:
                             "append_log_line": tape_line,
                             "current_mood": agent.current_mood,
                             "current_plan": agent.current_plan,
+                            "field_notes": dict(agent.field_notes),
+                            "questions": copy.deepcopy(agent.questions),
+                            "bugs_found": copy.deepcopy(agent.bugs_found),
                             "impressions": dict(agent.impressions),
                             "end_outcome": end_outcome,
                         },
@@ -1351,6 +2104,9 @@ class PlaytestSessionManager:
                 next_obs = bridge.step_action(decision.motor_action)
                 latest_frame_path = str(next_obs.preview_path)
                 last_obs_screenshot_path = next_obs.screenshot_path
+                last_obs_wav_path = (
+                    next_obs.wav_path if (next_obs.wav_path and not next_obs.audio_is_silent) else None
+                )
 
                 # Render sticky HUD sidebar card spanning [tick_start .. next_obs.tick]
                 sidebar_png = render_turn_sidebar_png(
@@ -1386,7 +2142,10 @@ class PlaytestSessionManager:
                     "current_plan": decision.current_plan,
                     "deliberation": decision.deliberation,
                     "action": decision.motor_action.model_dump(),
+                    "field_note_updates": [u.model_dump() for u in decision.field_note_updates],
+                    "question_updates": [u.model_dump() for u in decision.question_updates],
                     "rulebook_updates": [u.model_dump() for u in decision.rulebook_updates],
+                    "bug_reports": [u.model_dump() for u in decision.bug_reports],
                     "impression_updates": [u.model_dump() for u in decision.impression_updates],
                     "append_log_line": tape_line,
                     "mood_state": mood_label,
@@ -1443,6 +2202,9 @@ class PlaytestSessionManager:
                         "append_log_line": tape_line,
                         "current_mood": agent.current_mood,
                         "current_plan": agent.current_plan,
+                        "field_notes": dict(agent.field_notes),
+                        "questions": copy.deepcopy(agent.questions),
+                        "bugs_found": copy.deepcopy(agent.bugs_found),
                         "impressions": dict(agent.impressions),
                         "frame_name": Path(latest_frame_path).name,
                         "token_snapshot": tracker.snapshot(),
@@ -1513,13 +2275,14 @@ class PlaytestSessionManager:
                         end_outcome=end_outcome,
                         closing_thoughts=end_summary,
                         final_screenshot_path=last_obs_screenshot_path,
+                        final_audio_path=last_obs_wav_path,
                         wishes_filed=session_wishes,
                     )
                     session_report_dict = report_model.model_dump()
                     if not end_summary:
                         end_summary = report_model.overall_experience_summary
 
-                    # Strict delivery boundary: Council-initiated runs auto-deliver all wishes + report;
+                    # Strict delivery boundary: Council-initiated runs auto-deliver all wishes + full report;
                     # manual operator runs NEVER auto-deliver wishes (they stay status='pending').
                     if handle.initiated_by == "council":
                         auto_sent_ids: List[str] = []
@@ -1532,6 +2295,9 @@ class PlaytestSessionManager:
                                     producer_note="Auto-delivered from Council end-of-slice Blind Playtest",
                                     sent_at_utc=ended_iso,
                                 )
+                                w_row["status"] = "sent_to_council"
+                                w_row["producer_note"] = "Auto-delivered from Council end-of-slice Blind Playtest"
+                                w_row["sent_at_utc"] = ended_iso
                                 auto_sent_ids.append(wid)
                         if auto_sent_ids:
                             self._emit_event(
@@ -1547,6 +2313,19 @@ class PlaytestSessionManager:
                                     "count": len(auto_sent_ids),
                                     "initiated_by": "council",
                                 },
+                            )
+                        if not handle.inline_council_caller:
+                            ticks_now = handle.bridge.last_tick if handle.bridge is not None else 0
+                            self._deliver_council_report_and_wishes_to_candidate(
+                                handle=handle,
+                                turn_count=turn_index,
+                                sim_ticks=ticks_now,
+                                final_status=final_status,
+                                end_outcome=end_outcome,
+                                session_report_dict=session_report_dict,
+                                session_wishes=session_wishes,
+                                last_obs_screenshot_path=last_obs_screenshot_path,
+                                sent_iso=ended_iso,
                             )
 
                     self._emit_event(
@@ -1584,6 +2363,9 @@ class PlaytestSessionManager:
                     or f"Blind Playtester session {session_id} ended with status={final_status}."
                 ),
             )
+            with self._lock:
+                self._handles.pop(session_id, None)
+            self._write_session_archive_snapshot(session_id)
             self._emit_event(
                 "playtest_session_status",
                 f"Blind Playtester session {session_id} finished ({final_status}).",
@@ -1598,8 +2380,6 @@ class PlaytestSessionManager:
                     "has_report": bool(session_report_dict),
                 },
             )
-            with self._lock:
-                self._handles.pop(session_id, None)
 
     def _try_mux_interim_or_final_video(
         self,
@@ -1652,6 +2432,13 @@ class PlaytestSessionManager:
         agent = handle.agent
         tok = agent.token_tracker.snapshot() if agent is not None else {}
         existing = db.get_playtest_session(handle.session_id) or {}
+        existing_rep = existing.get("session_report") if isinstance(existing.get("session_report"), dict) else {}
+        if session_report is not None:
+            merged_report = dict(session_report)
+            if "council_review" in existing_rep and "council_review" not in merged_report:
+                merged_report["council_review"] = existing_rep["council_review"]
+        else:
+            merged_report = existing_rep
         rec = {
             "session_id": handle.session_id,
             "checkpoint_id": handle.store_card.checkpoint_id,
@@ -1668,11 +2455,12 @@ class PlaytestSessionManager:
             "sim_ticks_total": sim_ticks,
             "sim_duration_sec": round(sim_ticks / 60.0, 2),
             "compaction_count": agent.compaction_count if agent is not None else 0,
-            "rulebook": dict(agent.rulebook) if agent is not None else {},
+            "rulebook": dict(agent.rulebook) if agent is not None else (existing.get("rulebook") or {}),
+            "field_notes": dict(agent.field_notes) if agent is not None else (existing.get("field_notes") or {}),
+            "questions": copy.deepcopy(agent.questions) if agent is not None else (existing.get("questions") or {}),
+            "bugs_found": copy.deepcopy(agent.bugs_found) if agent is not None else (existing.get("bugs_found") or {}),
             "impressions": dict(agent.impressions) if agent is not None else (existing.get("impressions") or {}),
-            "session_report": (
-                session_report if session_report is not None else (existing.get("session_report") or {})
-            ),
+            "session_report": merged_report,
             "compacted_journal": (
                 agent.compacted_journal.model_dump()
                 if (agent is not None and agent.compacted_journal is not None)

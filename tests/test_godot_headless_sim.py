@@ -145,3 +145,41 @@ SCRIPT ERROR: Parse Error: Identifier "KinematicBody2D" not declared in the curr
         assert d1.file_path == tmp_path / "entities.gd"
         assert d1.line_number == 22
         assert "KinematicBody2D" in d1.error_message
+
+    def test_headless_sim_watchdog_terminates_infinite_loop(self, tmp_path: Path):
+        """Verifies wall-clock watchdog terminates a hung/infinite-loop GDScript scene instead of blocking forever."""
+        import time
+
+        cart_dir = tmp_path / "hung_sim_cartridge"
+        payload = TrackCodeSynthesisPayload(
+            deliberation="Hermetic Godot 4 cartridge with deliberate infinite loop in _ready() to test watchdog timeout.",
+            manifest_data={"title": "Hung Sim Cartridge", "genre": "Action", "version": "1.0.0"},
+            files=[
+                ModuleFileSpec(
+                    deliberation="Root script that spins indefinitely during scene initialization.",
+                    filename="main.gd",
+                    content="""extends Node2D
+
+func _ready() -> void:
+\tvar acc: int = 0
+\twhile true:
+\t\tacc = (acc + 1) % 1000000
+""",
+                ),
+            ],
+        )
+        payload.assemble_cartridge_directory(cart_dir)
+
+        sim = GodotHeadlessSimulator(
+            cartridge_path=cart_dir,
+            telemetry_mode="null",
+            max_ticks=20,
+            timeout_seconds=1.5,
+        )
+        t0 = time.monotonic()
+        with pytest.raises(RuntimeError, match="Godot simulation timed out after 1.5s"):
+            sim.run_until_complete()
+        elapsed = time.monotonic() - t0
+        assert elapsed < 10.0
+        assert sim.outcome == "CRASHED"
+

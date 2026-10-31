@@ -3566,6 +3566,10 @@ class WorkItem(BaseEpistemicModel):
     accepted_compromise: str = Field(default="", description="Set when the council accepted the item as-is after the cap/stall.")
     failure: str = Field(default="", description="Full error text of the last worker failure.")
     failure_count: int = Field(default=0, description="Number of worker failures so far.")
+    attempt_count: int = Field(
+        default=0,
+        description="Cumulative 1-based execution attempt count across all revisions, active runs, and auto-retried worker failures.",
+    )
     priority: int = Field(default=0)
     decision_reason: str = Field(default="", description="Why the item is in needs_decision.")
     shaping_notes: List[str] = Field(

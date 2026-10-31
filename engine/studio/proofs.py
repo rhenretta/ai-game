@@ -328,7 +328,12 @@ def capture_filmstrip(
         setup_script=setup_script, max_ticks=max(ticks), telemetry_mode="in_memory",
         target_scene=target_scene,
     )
-    sim.run_until_complete()
+    try:
+        sim.run_until_complete()
+    except RuntimeError as sim_err:
+        raise StudioAgentError(
+            f"Godot simulation failed or timed out in {target_scene or 'res://main.tscn'}: {sim_err}"
+        ) from sim_err
     script_errs = [
         f"{d.file_path.name}:{d.line_number} - {d.error_message}"
         for d in (getattr(sim, "runtime_diagnostics", None) or [])
@@ -474,7 +479,12 @@ def capture_filmstrip(
             setup_script=setup_script, max_ticks=max(ticks), telemetry_mode="null",
             target_scene=target_scene,
         )
-        ctrl_sim.run_until_complete()
+        try:
+            ctrl_sim.run_until_complete()
+        except RuntimeError as sim_err:
+            raise StudioAgentError(
+                f"Godot zero-input control simulation failed or timed out in {target_scene or 'res://main.tscn'}: {sim_err}"
+            ) from sim_err
         ctrl_snaps = dict(getattr(ctrl_sim, "tick_snapshots", {}) or {})
         sorted_t = sorted(set(ticks))
         t_first, t_last = sorted_t[0], sorted_t[-1]
@@ -490,15 +500,23 @@ def capture_filmstrip(
             c0 = _norm_snap(ctrl_snaps[t_first])
             c_end = _norm_snap(ctrl_snaps[t_last])
             a_end = _norm_snap(tick_snaps[t_last])
-            # If the zero-input control run ended in the exact same state as the scripted run:
-            # - either a self-playing demo timer ran (`c0 != c_end`), OR
+            common_ticks = [t for t in sorted_t if t in ctrl_snaps and t in tick_snaps]
+            ctrl_traj = [_norm_snap(ctrl_snaps[t]) for t in common_ticks]
+            act_traj = [_norm_snap(tick_snaps[t]) for t in common_ticks]
+            # If the zero-input control run produced the exact same state trajectory across ALL captured ticks
+            # as the scripted run (diverging neither at any intermediate tick nor at the final tick):
+            # - either a self-playing demo timer ran (`any(s != c0 for s in ctrl_traj)`), OR
             # - `setup_script` did all the state mutation and `input_script` was a dead no-op!
-            if input_script and c_end == a_end:
+            # Comparing the full `common_ticks` trajectory preserves legitimate round-trip mechanics
+            # (`S0 -> S1 -> S0`, e.g., open & close UI, jump & land, select & cancel) where scripted player
+            # inputs causally diverge from zero-input at intermediate tick(s) before returning to neutral.
+            if input_script and ctrl_traj == act_traj:
                 raise StudioAgentError(
-                    f"Counterfactual QA check failed: running with zero player inputs (input_script=[]) produced the exact same end state "
-                    f"at tick {t_last} ({c_end}) as the scripted run! Either player inputs in the game script are dead/unwired, or a self-playing timer/setup call bypassed real player agency."
+                    f"Counterfactual QA check failed: running with zero player inputs (input_script=[]) produced the exact same state "
+                    f"across all captured ticks {common_ticks} (end state at tick {t_last}: {c_end}) as the scripted run! "
+                    f"Either player inputs in the game script are dead/unwired, or a self-playing timer/setup call bypassed real player agency."
                 )
-            if not input_script and c0 != c_end and c_end == a_end:
+            if not input_script and any(s != c0 for s in ctrl_traj) and ctrl_traj == act_traj:
                 raise StudioAgentError(
                     f"Counterfactual QA check failed: running with zero inputs (input_script=[]) produced the exact same state transition "
                     f"from tick {t_first} to tick {t_last} ({c_end}) as the scripted run. Remove self-playing sim_tick demo timers from main.gd/scenes.gd."
@@ -548,7 +566,12 @@ def capture_filmstrip(
                     telemetry_mode="null",
                     target_scene=main_scene_res,
                 )
-                main_sim.run_until_complete()
+                try:
+                    main_sim.run_until_complete()
+                except RuntimeError as sim_err:
+                    raise StudioAgentError(
+                        f"Entrypoint Parity Gate failed: live playable entrypoint '{main_scene_res}' crashed or timed out: {sim_err}"
+                    ) from sim_err
                 main_errs = [
                     f"{d.file_path.name}:{d.line_number} - {d.error_message}"
                     for d in (getattr(main_sim, "runtime_diagnostics", None) or [])

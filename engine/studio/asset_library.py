@@ -509,9 +509,10 @@ static func create_tiled_surface(
         """Decomposes the Writers' Room 16:9 concept scene into discrete, isolated, buildable 2D world elements
         via a structured LLM JSON contract (Rule 2 & Rule 4) grounded in the concept art and Game Bible.
         """
-        from pydantic import BaseModel, Field
+        from pydantic import Field
+        from engine.studio.models import BaseEpistemicModel
 
-        class DecomposedElementItemSpec(BaseModel):
+        class DecomposedElementItemSpec(BaseEpistemicModel):
             deliberation: str = Field(description="Reasoning for isolating this modular world element, actor, or surface.")
             asset_id: str = Field(description="Snake_case identifier for this asset.")
             asset_type: str = Field(description="Asset category suited to this subject (e.g. 'backdrop', 'tile', 'prop', 'sprite_sheet', 'articulated_rig', 'diegetic_ui').")
@@ -523,7 +524,7 @@ static func create_tiled_surface(
             animation_states: List[AnimationStateSpec] = Field(default_factory=list, description="When fabrication_mode is 'sprite_sheet', the custom animation states tailored to this subject's verbs.")
             articulated_parts: List[ArticulatedPartSpec] = Field(default_factory=list, description="When fabrication_mode is 'articulated_parts', the independently movable parts.")
 
-        class DecomposedConceptManifestSpec(BaseModel):
+        class DecomposedConceptManifestSpec(BaseEpistemicModel):
             deliberation: str = Field(description="Architectural decomposition plan breaking the 16:9 concept scene into modular tiles, props, and animated elements.")
             elements: List[DecomposedElementItemSpec] = Field(default_factory=list)
 

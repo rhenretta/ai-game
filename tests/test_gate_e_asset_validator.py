@@ -339,3 +339,156 @@ class TestFullCartridgeGateE:
         assert res.passed is True
         assert res.failure_type == GateFailureType.NONE
         assert list(res.to_dict().keys())[0] == "deliberation"
+
+    def test_high_res_sprite_sheet_and_board_managed_narrative_validation(self, tmp_path: Path):
+        """Verifies high-res sprite sheets (up to 8192px) pass Gate B, dict-keyed character IDs are preserved,
+        and Continuous Production Board cartridges only fail on uncommissioned narrative assets if referenced in code.
+        """
+        v = AssetValidator(enforce_palette=False)
+        cart_dir = tmp_path / "candidate_board_cart"
+        (cart_dir / "assets" / "sprites").mkdir(parents=True, exist_ok=True)
+        (cart_dir / "backlog.json").write_text(
+            json.dumps({"items": [{"id": "task_1", "state": "approved"}]}),
+            encoding="utf-8",
+        )
+        (cart_dir / "game_bible.json").write_text(
+            json.dumps({"slice_roadmap": [{"slice_id": "s0", "status": "completed"}]}),
+            encoding="utf-8",
+        )
+        (cart_dir / "main.gd").write_text("extends Node2D\nfunc _ready() -> void:\n\tpass\n", encoding="utf-8")
+
+        # 4096x512 multi-frame sprite sheet passes default max_dimension=8192
+        sheet_path = cart_dir / "assets" / "sprites" / "wide_anim_sheet.png"
+        Image.new("RGBA", (4096, 512), (20, 40, 80, 255)).save(sheet_path, format="PNG")
+        sheet_rep = v.validate_visual_asset(sheet_path)
+        assert sheet_rep.passed is True
+
+        # >8192px is still rejected
+        huge_path = tmp_path / "too_wide.png"
+        Image.new("RGBA", (8200, 16), (20, 40, 80, 255)).save(huge_path, format="PNG")
+        assert v.validate_visual_asset(huge_path).passed is False
+
+        # Unreferenced lore character/bark in narrative.json does not fail a board-managed cartridge
+        narrative_data = {
+            "deliberation": "Exported GameBible lore.",
+            "world_title": "Test World",
+            "characters": {
+                "npc_mentor": {
+                    "name": "Mentor",
+                    "portrait": "assets/portraits/npc_mentor_portrait.png",
+                }
+            },
+            "dialogue_barks": [
+                {"bark_id": "bark_lore", "voice_clip": "assets/audio/bark_lore.wav"}
+            ],
+        }
+        (cart_dir / "narrative.json").write_text(json.dumps(narrative_data), encoding="utf-8")
+        assert v.validate_cartridge_assets(cart_dir).passed is True
+
+        # If cartridge .gd actually references the missing portrait, Gate B fails fast with the real character key
+        (cart_dir / "main.gd").write_text(
+            'extends Node2D\nconst P = "res://assets/portraits/npc_mentor_portrait.png"\n',
+            encoding="utf-8",
+        )
+        res_missing_ref = v.validate_cartridge_assets(cart_dir)
+        assert res_missing_ref.passed is False
+        assert "npc_mentor" in res_missing_ref.details
+        assert "unknown" not in res_missing_ref.details
+
+    def test_swe_repair_and_gate_f_respect_production_board_cartridges(self, tmp_path: Path):
+        """Verifies ASSET_INTEGRITY_VIOLATION never triggers repair_godot_cartridge_holistic and
+        Gate F recognizes completed Continuous Production Board cartridges.
+        """
+        from types import SimpleNamespace
+        from engine.studio.swe import LeadGameplaySWEAgent
+        from engine.supervisor.models import RejectionDiagnosticTrace, RemedyType
+        from engine.supervisor.supervisor import BuildSupervisor
+
+        cart_dir = tmp_path / "candidate_godot_board"
+        cart_dir.mkdir(parents=True, exist_ok=True)
+        (cart_dir / "project.godot").write_text('[application]\nconfig/name="BoardGame"\n', encoding="utf-8")
+        (cart_dir / "backlog.json").write_text(
+            json.dumps({"items": [{"id": "item_1", "state": "approved"}]}),
+            encoding="utf-8",
+        )
+        (cart_dir / "game_bible.json").write_text(
+            json.dumps(
+                {
+                    "slice_roadmap": [
+                        {"slice_id": "slice_0", "status": "completed"},
+                        {"slice_id": "slice_1", "status": "completed"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        (cart_dir / "requirements_spec.json").write_text(
+            json.dumps(
+                {
+                    "deliberation": "Spec",
+                    "spec_id": "spec_1",
+                    "game_title": "BoardGame",
+                    "genre_paradigm": "simulation",
+                    "high_concept_summary": "Summary",
+                    "requirements": [
+                        {
+                            "deliberation": "Req",
+                            "id": "r1",
+                            "title": "Req 1",
+                            "description": "Desc",
+                            "responsible_agents": ["LeadGameplaySWEAgent"],
+                            "target_modules": ["main.gd"],
+                            "status": "completed",
+                            "acceptance_criteria": [],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        # 1. ASSET_INTEGRITY_VIOLATION must never invoke repair_godot_cartridge_holistic
+        swe = LeadGameplaySWEAgent(client=SimpleNamespace())
+        swe._is_live_genai_client = lambda: True
+        holistic_calls = []
+        swe.repair_godot_cartridge_holistic = lambda *a, **kw: holistic_calls.append(1) or {}
+
+        trace = RejectionDiagnosticTrace(
+            deliberation="Asset integrity violation.",
+            candidate_id="candidate_godot_board",
+            episode_number=1,
+            attempt_number=1,
+            failure_gate="Gate B: Multimodal Asset Verification",
+            failure_type=GateFailureType.ASSET_INTEGRITY_VIOLATION,
+            failure_reason="Missing audio clip",
+            remedy_type=RemedyType.REGENERATE_ASSET,
+            recommended_remedy="Regenerate asset",
+        )
+        swe.repair_cartridge_code(cart_dir, trace)
+        assert holistic_calls == []
+
+        # 2. Gate F passes cleanly when all slices & board items are completed/approved
+        sup = BuildSupervisor(
+            cartridges_root=tmp_path,
+            active_cartridge_dir=tmp_path / "active",
+        )
+        gate_f, trace_f = sup.verify_gate_f_challenger(cart_dir)
+        assert gate_f.passed is True
+        assert trace_f is None
+        assert gate_f.diagnostic_data["completed_slices"] == 2
+        assert gate_f.diagnostic_data["approved_board_items"] == 1
+
+        # 3. If a slice is still planned (incomplete), _completed_production_board_summary returns None
+        (cart_dir / "game_bible.json").write_text(
+            json.dumps(
+                {
+                    "slice_roadmap": [
+                        {"slice_id": "slice_0", "status": "completed"},
+                        {"slice_id": "slice_1", "status": "planned"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert sup._completed_production_board_summary(cart_dir) is None
+
