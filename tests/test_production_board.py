@@ -709,6 +709,16 @@ def test_persistence_roundtrip_resets_failed_items_on_resume(tmp_path):
     assert reloaded.failure_count == 0
     assert "Error 2" in reloaded.failure
 
+    # When an item already has Council requested changes, requeue_failed preserves `changes_requested` (not `ready`)
+    b_resumed.claim_ready()
+    b_resumed.submit_result("dep_item", WorkerResult())
+    b_resumed.apply_review(review("dep_item", "request_changes", feedback="Refine alignment."))
+    assert b_resumed.get("dep_item").state == "changes_requested"
+    b_resumed.claim_ready()
+    b_resumed.fail_item("dep_item", "Transient revision failure")
+    b_resumed.requeue_failed("dep_item")
+    assert b_resumed.get("dep_item").state == "changes_requested"
+
 
 def test_final_turn_qa_assertion_failure_preserves_verified_swe_code_and_rendered_filmstrip(tmp_path):
     """When swe_engineer passes verification on Turn 0 and qa_test_engineer renders the filmstrip on the final turn
@@ -959,8 +969,11 @@ def test_audio_proof_wav_never_wrapped_as_image_part(tmp_path):
 
     ctx = WorkerContext(cartridge_dir=tmp_path, client=None)
     parts = _build_task_lead_multimodal_parts(ctx, [str(waveform_png), str(wav_file)])
-    assert len(parts) == 2
+    assert len(parts) == 4
     assert "waveform_audio_cockpit_rev0.png" in parts[0]
+    assert parts[1].inline_data.mime_type == "image/png"
+    assert "cockpit_kinesthetic_sfx.wav" in parts[2]
+    assert parts[3].inline_data.mime_type == "audio/wav"
 
     item = WorkItem(
         deliberation="d",
@@ -979,8 +992,11 @@ def test_audio_proof_wav_never_wrapped_as_image_part(tmp_path):
     )
     room = CreativeWritersRoom(client=None)
     review_parts = room._proof_parts(item, tmp_path)
-    assert len(review_parts) == 2
+    assert len(review_parts) == 4
     assert "waveform_audio_cockpit_rev0.png" in review_parts[0]
+    assert review_parts[1].inline_data.mime_type == "image/png"
+    assert "cockpit_kinesthetic_sfx.wav" in review_parts[2]
+    assert review_parts[3].inline_data.mime_type == "audio/wav"
 
     board = ProductionBoard()
     board._items[item.item_id] = item

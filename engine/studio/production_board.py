@@ -995,7 +995,10 @@ class ProductionBoard:
             item = self._require(item_id)
             if item.state != "failed":
                 raise BoardValidationError(f"Item '{item_id}' is {item.state}, not failed.")
-            item.state = "ready" if self._deps_satisfied(item) else "blocked"
+            if self._deps_satisfied(item):
+                item.state = "changes_requested" if item.revisions and item.revisions[-1].feedback else "ready"
+            else:
+                item.state = "blocked"
             self._persist()
             return item.model_copy(deep=True)
 

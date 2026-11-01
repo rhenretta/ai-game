@@ -1084,6 +1084,9 @@ static func create_tiled_surface(
                         f"or generate_sfx for sfx/ambient_loop)."
                     )
             if dest_path.is_file():
+                from engine.studio.audio import validate_wav_file
+                _ok_wav, _wav_err, wav_dur = validate_wav_file(dest_path)
+                self._supersede_same_path_entries(req.asset_id, req.target_path)
                 self.catalog.entries[req.asset_id] = AssetLibraryEntry(
                     deliberation=req.deliberation,
                     asset_id=req.asset_id,
@@ -1094,6 +1097,7 @@ static func create_tiled_surface(
                     file_path=req.target_path,
                     target_display_size=(0, 0),
                     texture_pixel_size=(0, 0),
+                    duration_seconds=round(float(wav_dur), 3) if wav_dur > 0 else 0.0,
                     sha256_hash=self._compute_sha256(dest_path),
                 )
                 return dest_path

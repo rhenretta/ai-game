@@ -371,6 +371,26 @@ class PlaytestEndDecision(BaseEpistemicModel):
     )
 
 
+class PlaytestAudioEvaluationRequest(BaseEpistemicModel):
+    """Optional on-demand request from the Blind Playtester to have recent gameplay video+audio perceptually evaluated."""
+    lookback_seconds: float = Field(
+        default=8.0,
+        description="Duration of recent gameplay video+audio (in seconds, 2.0 to 20.0) to listen to and inspect.",
+    )
+    question: str = Field(
+        ...,
+        min_length=1,
+        description="Natural first-person player question about recent gameplay sound, timing, atmosphere, or whether actions and audio match.",
+    )
+
+    @field_validator("lookback_seconds", mode="before")
+    @classmethod
+    def _clamp_lookback_seconds(cls, v: Any) -> float:
+        if v is None or v == "":
+            return 8.0
+        return max(2.0, min(20.0, float(v)))
+
+
 class PlaytestTurnDecision(BaseEpistemicModel):
     """Complete structured output for a single Blind Playtester turn.
     Evaluates concrete prior-turn observations (`turn_log_entry`, `field_note_updates`, `question_updates`,
@@ -418,6 +438,14 @@ class PlaytestTurnDecision(BaseEpistemicModel):
     motor_action: PlaytestMotorAction = Field(
         ...,
         description="Mouse and/or keyboard input burst to execute now (runs AFTER this turn decision).",
+    )
+    request_audio_evaluation: Optional[PlaytestAudioEvaluationRequest] = Field(
+        default=None,
+        description=(
+            "Leave null on most turns. Populate whenever you want a focused perceptual ear on the last few seconds "
+            "of synchronized gameplay video+audio (e.g., checking whether sounds match on-screen actions, how the "
+            "soundscape feels, or inspecting an audio cut-out or glitch)."
+        ),
     )
     submit_wish: Optional[PlaytestWishDraft] = Field(
         default=None,
@@ -630,10 +658,46 @@ class PlaytestTokenTracker:
 
     def record_response(self, response: Any) -> Dict[str, int]:
         usage = getattr(response, "usage_metadata", None) or getattr(response, "usage", None)
-        p_tok = int(getattr(usage, "prompt_token_count", 0) or getattr(usage, "input_tokens", 0) or 0) if usage else 0
-        c_tok = int(getattr(usage, "cached_content_token_count", 0) or getattr(usage, "cached_tokens", 0) or 0) if usage else 0
-        o_tok = int(getattr(usage, "candidates_token_count", 0) or getattr(usage, "output_tokens", 0) or 0) if usage else 0
-        t_tok = int(getattr(usage, "thoughts_token_count", 0) or 0) if usage else 0
+        p_tok = (
+            int(
+                getattr(usage, "prompt_token_count", 0)
+                or getattr(usage, "total_input_tokens", 0)
+                or getattr(usage, "input_tokens", 0)
+                or 0
+            )
+            if usage
+            else 0
+        )
+        c_tok = (
+            int(
+                getattr(usage, "cached_content_token_count", 0)
+                or getattr(usage, "total_cached_tokens", 0)
+                or getattr(usage, "cached_tokens", 0)
+                or 0
+            )
+            if usage
+            else 0
+        )
+        o_tok = (
+            int(
+                getattr(usage, "candidates_token_count", 0)
+                or getattr(usage, "total_output_tokens", 0)
+                or getattr(usage, "output_tokens", 0)
+                or 0
+            )
+            if usage
+            else 0
+        )
+        t_tok = (
+            int(
+                getattr(usage, "thoughts_token_count", 0)
+                or getattr(usage, "total_thought_tokens", 0)
+                or getattr(usage, "thought_tokens", 0)
+                or 0
+            )
+            if usage
+            else 0
+        )
         with self._lock:
             self.total_calls += 1
             self.prompt_tokens += p_tok

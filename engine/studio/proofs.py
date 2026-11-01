@@ -309,17 +309,21 @@ def capture_filmstrip(
     state_assertions: Optional[List[Any]] = None,
     target_scene: str = "",
     verify_entrypoint_parity: bool = False,
+    audiovisual_mp4_out_path: Optional[Path] = None,
 ) -> Path:
     """Runs the real game, captures the viewport at `ticks` (driven by `input_script` and `setup_script` if given),
-    and composes a labelled QA proof strip with external input & state telemetry."""
+    and composes a labelled QA proof strip with external input & state telemetry (plus optional `.mp4` video+audio clip)."""
     from engine.sim.godot_verifier import GodotHeadlessSimulator
 
     cartridge_dir = Path(cartridge_dir)
     out_path = Path(out_path)
+    av_mp4_path = Path(audiovisual_mp4_out_path) if audiovisual_mp4_out_path is not None else None
     if not ticks:
         raise StudioAgentError("capture_filmstrip requires at least one tick")
     if out_path.is_file():
         out_path.unlink()
+    if av_mp4_path is not None and av_mp4_path.is_file():
+        av_mp4_path.unlink()
     cap_dir = cartridge_dir / "assets" / "playtest_captures"
     for stale in cap_dir.glob("filmstrip_*.png"):
         stale.unlink()
@@ -327,6 +331,7 @@ def capture_filmstrip(
         cartridge_dir, capture_viewport=True, capture_ticks=ticks, input_script=input_script,
         setup_script=setup_script, max_ticks=max(ticks), telemetry_mode="in_memory",
         target_scene=target_scene,
+        capture_audiovisual_mp4=av_mp4_path,
     )
     try:
         sim.run_until_complete()

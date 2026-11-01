@@ -6,7 +6,7 @@ import type { LiveStudioActivity } from '../../domain/liveActivity';
 import { WorkItemCard } from './WorkItemCard';
 import { TaskChronologyDrawer } from './TaskChronologyDrawer';
 import {
-  isWorkingBoardState,
+  isWorkingBoardItem,
   sortBoardItemsByPriority,
 } from '../../domain/boardCards';
 import type { LightboxMedia } from '../../components/MediaLightbox';
@@ -58,14 +58,22 @@ export function ProductionBoardView({
 
     for (const it of items) {
       if (it.kind) kinds.add(it.kind);
-      if (isWorkingBoardState(it.state)) {
+      // "Working" is the overall umbrella status for any started, not-yet-approved task
+      // (including in_progress, waiting_for_lock, awaiting_review, changes_requested/Revising, etc.)
+      if (isWorkingBoardItem(it)) {
         activeNow += 1;
-        if (it.state === 'awaiting_review') review += 1;
-      } else if (it.state === 'changes_requested') revising += 1;
-      else if (it.state === 'ready') ready += 1;
-      else if (it.state === 'blocked') blocked += 1;
-      else if (it.state === 'approved') approved += 1;
-      else if (it.state === 'failed' || it.state === 'needs_decision') {
+      }
+      if (it.state === 'awaiting_review') {
+        review += 1;
+      } else if (it.state === 'changes_requested') {
+        revising += 1;
+      } else if (it.state === 'ready') {
+        ready += 1;
+      } else if (it.state === 'blocked') {
+        blocked += 1;
+      } else if (it.state === 'approved') {
+        approved += 1;
+      } else if (it.state === 'failed' || it.state === 'needs_decision') {
         // While the Studio build is actively running, failed/needs_decision items are being
         // autonomously re-queued or re-shaped by the Council; only flag Needs Attention if halted.
         if (isBuildRunning) revising += 1;
@@ -89,7 +97,7 @@ export function ProductionBoardView({
   const filteredItems = useMemo(() => {
     const q = query.trim().toLowerCase();
     const matched = items.filter((it) => {
-      if (statusFilter === 'active_now' && !isWorkingBoardState(it.state)) return false;
+      if (statusFilter === 'active_now' && !isWorkingBoardItem(it)) return false;
       if (statusFilter === 'awaiting_review' && it.state !== 'awaiting_review') return false;
       if (statusFilter === 'changes_requested') {
         const isSelfCorrecting =

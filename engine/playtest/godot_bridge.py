@@ -357,6 +357,77 @@ def mux_broadcast_replay_mp4(
     return output_mp4_path
 
 
+def extract_recent_gameplay_clip_mp4(
+    *,
+    raw_game_mkv: Path,
+    session_pcm_path: Path,
+    end_tick: int,
+    lookback_seconds: float,
+    output_mp4_path: Path,
+) -> Path:
+    """Slices the most recent `lookback_seconds` (clamped 2.0..20.0s) from the pure 1280x720
+    `raw_game_mkv` stream (NO HUD sidebar — preserving strict opaque-box isolation) paired with
+    its synchronized 16kHz mono PCM audio window into a compact 640x360 H.264/AAC `.mp4` clip.
+    """
+    if not raw_game_mkv.is_file() or raw_game_mkv.stat().st_size == 0:
+        raise PlaytestRunnerError(
+            f"Cannot extract recent gameplay clip: missing or empty game video stream '{raw_game_mkv}' (Rule 5)."
+        )
+
+    lookback_sec = max(2.0, min(20.0, float(lookback_seconds)))
+    end_sec = max(1.0 / 60.0, float(max(1, int(end_tick))) / 60.0)
+    start_sec = max(0.0, end_sec - lookback_sec)
+    clip_dur = max(1.0 / 60.0, end_sec - start_sec)
+
+    output_mp4_path.parent.mkdir(parents=True, exist_ok=True)
+    start_sample = max(0, int(round(start_sec * TARGET_AUDIO_HZ)))
+    end_sample = max(start_sample + 160, int(round(end_sec * TARGET_AUDIO_HZ)))
+    needed_samples = end_sample - start_sample
+
+    raw_pcm = session_pcm_path.read_bytes() if session_pcm_path.is_file() else b""
+    slice_pcm = raw_pcm[start_sample * 2 : end_sample * 2]
+    actual_samples = len(slice_pcm) // 2
+    if actual_samples < needed_samples:
+        slice_pcm = slice_pcm + (b"\x00\x00" * (needed_samples - actual_samples))
+
+    slice_wav_path = output_mp4_path.with_name(f".tmp_audio_{output_mp4_path.stem}.wav")
+    tmp_mp4 = output_mp4_path.with_name(f".tmp_{output_mp4_path.name}")
+    write_pcm16_to_wav(slice_pcm, slice_wav_path, sample_rate=TARGET_AUDIO_HZ)
+    try:
+        ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+        cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-fflags", "+genpts",
+            "-i", str(raw_game_mkv),
+            "-i", str(slice_wav_path),
+            "-filter_complex",
+            f"[0:v]trim=start={start_sec:.3f}:end={end_sec:.3f},setpts=PTS-STARTPTS,scale=640:360,fps=15,format=yuv420p[vout]",
+            "-map", "[vout]",
+            "-map", "1:a:0",
+            "-t", f"{clip_dur:.3f}",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "24",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-shortest",
+            "-movflags", "+faststart",
+            str(tmp_mp4),
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if res.returncode != 0 or not tmp_mp4.is_file() or tmp_mp4.stat().st_size == 0:
+            tmp_mp4.unlink(missing_ok=True)
+            raise PlaytestRunnerError(
+                f"ffmpeg recent gameplay clip extraction failed (exit {res.returncode}):\n{(res.stderr or '')[-1200:]}"
+            )
+        tmp_mp4.replace(output_mp4_path)
+        return output_mp4_path
+    finally:
+        slice_wav_path.unlink(missing_ok=True)
+
+
 class GodotPlaytestBridge:
     """Host controller managing a live, pauseable, silent background Godot 4.3 playtest process."""
 

@@ -147,6 +147,18 @@ describe('UI components', () => {
         raised_by_role: 'Audio Director',
         attempt_count: 1,
       },
+      {
+        deliberation: 'Queued item deliberation.',
+        item_id: 'task_gamma',
+        title: 'Build queued telemetry aggregator',
+        kind: 'mechanic_code',
+        spec: 'Aggregate tick counters.',
+        proof_spec: 'Deterministic summary',
+        target_modules: ['scripts/aggregator.gd'],
+        depends_on: [],
+        state: 'ready',
+        attempt_count: 1,
+      },
     ];
 
     renderWithQueryClient(
@@ -160,11 +172,22 @@ describe('UI components', () => {
 
     expect(screen.getByText('Implement deterministic grid solver')).toBeInTheDocument();
     expect(screen.getByText('Synthesize ambient wind loop')).toBeInTheDocument();
+    expect(screen.getByText('Build queued telemetry aggregator')).toBeInTheDocument();
 
-    // Filter to Working only
-    fireEvent.click(screen.getByRole('button', { name: /Working/i }));
+    // Filter to Working only: excludes `approved` AND excludes `ready` (even when attempt_count > 0)
+    const workingBtn = screen.getByRole('button', { name: /Working/i });
+    expect(workingBtn).toHaveTextContent('1');
+    fireEvent.click(workingBtn);
     expect(screen.queryByText('Implement deterministic grid solver')).not.toBeInTheDocument();
+    expect(screen.queryByText('Build queued telemetry aggregator')).not.toBeInTheDocument();
     expect(screen.getByText('Synthesize ambient wind loop')).toBeInTheDocument();
+
+    // Filter to Queued (`ready`): shows only the ready item
+    const queuedBtn = screen.getByRole('button', { name: /Queued/i });
+    expect(queuedBtn).toHaveTextContent('1');
+    fireEvent.click(queuedBtn);
+    expect(screen.getByText('Build queued telemetry aggregator')).toBeInTheDocument();
+    expect(screen.queryByText('Synthesize ambient wind loop')).not.toBeInTheDocument();
 
     // Switch back to All and open TaskChronologyDrawer for task_alpha
     fireEvent.click(screen.getByRole('button', { name: /^All/i }));
@@ -1180,7 +1203,7 @@ describe('UI components', () => {
     expect(workspaceMainBlock).not.toContain('overflow: clip');
   });
 
-  it('keeps awaiting_review tasks visible and counted under the Working filter on ProductionBoardView', () => {
+  it('includes Revising, In Review, and all started-unapproved tasks under the Working umbrella filter on ProductionBoardView', () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(() =>
       Promise.resolve(
         new Response(
@@ -1225,6 +1248,29 @@ describe('UI components', () => {
         attempt_count: 1,
       },
       {
+        deliberation: 'Revising after Council feedback rationale.',
+        item_id: 'task_revising',
+        title: 'Refine Collision Broadphase',
+        kind: 'mechanic_code',
+        spec: 'Tighten AABB bounds.',
+        target_modules: ['scenes/systems/broadphase.gd'],
+        depends_on: [],
+        state: 'changes_requested',
+        attempt_count: 1,
+      },
+      {
+        deliberation: 'Started task awaiting spawned prerequisite.',
+        item_id: 'task_started_blocked',
+        title: 'Integrate Telemetry HUD',
+        kind: 'ui',
+        spec: 'Bind HUD counters.',
+        target_modules: ['scenes/ui/hud.gd'],
+        depends_on: ['task_prereq'],
+        state: 'blocked',
+        attempt_count: 1,
+        revisions: [{ revision_index: 0, verdict: 'request_changes', feedback: 'Await prereq.' }],
+      },
+      {
         deliberation: 'Queued task rationale.',
         item_id: 'task_queued',
         title: 'Compose Ambient Cue',
@@ -1233,6 +1279,17 @@ describe('UI components', () => {
         target_modules: ['assets/audio/cue.wav'],
         depends_on: [],
         state: 'ready',
+      },
+      {
+        deliberation: 'Completed task rationale.',
+        item_id: 'task_done',
+        title: 'Bootstrap Entrypoint Scene',
+        kind: 'integration',
+        spec: 'Initialize root scene.',
+        target_modules: ['scenes/main.tscn'],
+        depends_on: [],
+        state: 'approved',
+        attempt_count: 1,
       },
     ];
 
@@ -1247,13 +1304,23 @@ describe('UI components', () => {
     );
 
     const filterBar = screen.getByRole('group', { name: 'Filter Production Board by Status' });
-    const workingPill = within(filterBar).getByRole('button', { name: /Working\s*2/i });
+    // Working counts all 4 started-and-not-yet-approved tasks (in_progress + awaiting_review + changes_requested + started-blocked)
+    const workingPill = within(filterBar).getByRole('button', { name: /Working\s*4/i });
+    const revisingPill = within(filterBar).getByRole('button', { name: /Revising\s*1/i });
     fireEvent.click(workingPill);
 
     expect(screen.getByText('Build Kinematic Solver')).toBeInTheDocument();
     expect(screen.getByText('Verify Shader Pipeline')).toBeInTheDocument();
+    expect(screen.getByText('Refine Collision Broadphase')).toBeInTheDocument();
+    expect(screen.getByText('Integrate Telemetry HUD')).toBeInTheDocument();
     expect(screen.getByText('Specialist Council Reviewing Submission')).toBeInTheDocument();
     expect(screen.queryByText('Compose Ambient Cue')).not.toBeInTheDocument();
+    expect(screen.queryByText('Bootstrap Entrypoint Scene')).not.toBeInTheDocument();
+
+    // Clicking the focused Revising sub-filter narrows specifically to the revising item
+    fireEvent.click(revisingPill);
+    expect(screen.getByText('Refine Collision Broadphase')).toBeInTheDocument();
+    expect(screen.queryByText('Build Kinematic Solver')).not.toBeInTheDocument();
   });
 
   it('updates Live Screen image src cache-buster in real time as playtest_frame_update events arrive', async () => {

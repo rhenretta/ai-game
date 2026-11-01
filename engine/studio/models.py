@@ -484,6 +484,32 @@ class AudioSynthesisResult(BaseEpistemicModel):
     sha256_hash: str = Field(...)
 
 
+class AudioEvaluationReport(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Open-ended perceptual evaluation of audio cues (.wav, etc.) and/or synchronized gameplay clips (.mp4).
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Step-by-step acoustic and/or audiovisual deliberation analyzing timbre, timing, sync with visual events, mix balance, and context before concluding.",
+    )
+    rich_acoustic_description: str = Field(
+        ...,
+        description="Detailed natural-language description of what the audio or gameplay clip actually sounds like to a human listener (textures, layers, prosody, mood, and timestamped moments).",
+    )
+    contextual_observations: List[str] = Field(
+        default_factory=list,
+        description="Concrete observations connecting what is heard to the caller's context, visual gameplay events, or creative direction.",
+    )
+    notable_concerns: List[str] = Field(
+        default_factory=list,
+        description="Audible defects, mismatches, sync lag, harsh synthesis artifacts, loop clicks, silence, or mix clashes observed (empty list if none).",
+    )
+    answer_to_inquiry: str = Field(
+        ...,
+        description="Direct, comprehensive answer to the caller's evaluation prompt, including any scores, comparisons, or actionable suggestions requested.",
+    )
+
+
 class TelemetryProbeDesignSpec(BaseEpistemicModel):
     deliberation: str = Field(
         ...,
@@ -1282,6 +1308,14 @@ class AssetLibraryEntry(BaseEpistemicModel):
     )
     pivot_normalized: Tuple[float, float] = Field(default=(0.5, 0.5))
     concept_reference_used: Optional[str] = Field(default=None)
+    perceptual_description: str = Field(
+        default="",
+        description="Optional natural-language perceptual description of an audio asset's actual sound, texture, and timing from AudioEvaluatorAgent.",
+    )
+    duration_seconds: float = Field(
+        default=0.0,
+        description="Duration in seconds for audio or video assets (0.0 for static/sprite assets).",
+    )
     sha256_hash: str = Field(default="")
     created_at_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -3299,6 +3333,10 @@ class FilmstripPlan(BaseEpistemicModel):
         description="Observable state assertions verified by the QA harness across the captured ticks.",
     )
     frame_expectations: List[str] = Field(default_factory=list, description="Optional internal notes on what each captured tick tests.")
+    record_audiovisual_clip: bool = Field(
+        default=False,
+        description="Set True when the QA brief calls for capturing a synchronized gameplay .mp4 video+audio clip alongside the frame contact sheet.",
+    )
 
 
 class WorkItemProposal(BaseEpistemicModel):
@@ -4177,15 +4215,15 @@ class TaskLeadDecision(BaseEpistemicModel):
     )
     specialist_agent: str = Field(
         default="",
-        description="REQUIRED non-empty specialist identifier whenever this turn delegates work ('visual_artist', 'audio_designer', 'script_writer', 'swe_engineer', or 'qa_test_engineer'). Because this field appears BEFORE `action` in the JSON schema, you MUST populate `specialist_agent` here whenever you will set `action` to 'delegate'!",
+        description="REQUIRED non-empty specialist identifier whenever this turn delegates work ('visual_artist', 'audio_designer', 'audio_evaluator', 'script_writer', 'swe_engineer', or 'qa_test_engineer'). Because this field appears BEFORE `action` in the JSON schema, you MUST populate `specialist_agent` here whenever you will set `action` to 'delegate'!",
     )
     brief: str = Field(
         default="",
-        description="REQUIRED non-empty natural-language instructions (<= 180 words) for `specialist_agent` whenever this turn delegates work. Name the target files, symbols, and behavioral/visual requirements concisely—NEVER write raw GDScript code blocks inside `brief` (since `swe_engineer` reads the staging files directly)! Because `brief` appears BEFORE `action` in the JSON schema, you MUST write the specialist brief here whenever you will set `action` to 'delegate'!",
+        description="REQUIRED non-empty natural-language instructions (<= 180 words) for `specialist_agent` whenever this turn delegates work. Name the target files, symbols, and behavioral/visual/acoustic requirements concisely—NEVER write raw GDScript code blocks inside `brief` (since `swe_engineer` reads the staging files directly)! Because `brief` appears BEFORE `action` in the JSON schema, you MUST write the specialist brief here whenever you will set `action` to 'delegate'!",
     )
     target_paths: List[str] = Field(
         default_factory=list,
-        description="Optional file paths or GDScript modules the specialist should create, modify, or inspect.",
+        description="Optional file paths or GDScript modules the specialist should create, modify, or inspect (e.g. .gd files, .png sprites, .wav cues, or .mp4 gameplay clips).",
     )
     submission_summary: str = Field(
         default="",
@@ -4193,7 +4231,7 @@ class TaskLeadDecision(BaseEpistemicModel):
     )
     selected_proof_paths: List[str] = Field(
         default_factory=list,
-        description="When action == 'submit_to_council', paths of the proof images generated during this session to submit to the Council.",
+        description="When action == 'submit_to_council', paths of the proof artifacts (.png, .wav, and/or .mp4) generated during this session to submit to the Council.",
     )
     spawned_tasks: List[WorkItemProposal] = Field(
         default_factory=list,
@@ -4747,6 +4785,7 @@ class TokenUsageTracker:
             self.total_tokens: int = 0
             self.by_label: Dict[str, Dict[str, int]] = {}
             self.consecutive_swe_pev_calls: int = 0
+            self._recorded_response_ids: List[int] = []
 
     def reset_swe_pev_streak(self) -> None:
         with self._lock:
@@ -4817,22 +4856,58 @@ class TokenUsageTracker:
             raise StudioPausedError(err_msg)
 
     def record_response(self, response: Any, label: str = "generate_content") -> Optional[Dict[str, int]]:
-        if getattr(response, "_studio_usage_recorded", False):
+        if response is None or getattr(response, "_studio_usage_recorded", False):
             return None
+        resp_id = id(response)
+        with self._lock:
+            if resp_id in self._recorded_response_ids:
+                return None
+            self._recorded_response_ids.append(resp_id)
+            if len(self._recorded_response_ids) > 256:
+                del self._recorded_response_ids[:-256]
         try:
             setattr(response, "_studio_usage_recorded", True)
         except Exception:
             pass
         usage = getattr(response, "usage_metadata", None)
-        prompt_tok = int(getattr(usage, "prompt_token_count", 0) or 0) if usage is not None else 0
-        cached_tok = int(getattr(usage, "cached_content_token_count", 0) or 0) if usage is not None else 0
-        output_tok = int(getattr(usage, "candidates_token_count", 0) or 0) if usage is not None else 0
-        thought_tok = int(getattr(usage, "thoughts_token_count", 0) or 0) if usage is not None else 0
-        total_tok = (
-            int(getattr(usage, "total_token_count", 0) or (prompt_tok + output_tok + thought_tok))
-            if usage is not None
-            else 0
-        )
+        interaction_usage = getattr(response, "usage", None) if usage is None else None
+        if usage is not None:
+            prompt_tok = int(getattr(usage, "prompt_token_count", 0) or 0)
+            cached_tok = int(getattr(usage, "cached_content_token_count", 0) or 0)
+            output_tok = int(getattr(usage, "candidates_token_count", 0) or 0)
+            thought_tok = int(getattr(usage, "thoughts_token_count", 0) or 0)
+            total_tok = int(getattr(usage, "total_token_count", 0) or (prompt_tok + output_tok + thought_tok))
+        elif interaction_usage is not None:
+            prompt_tok = int(
+                getattr(interaction_usage, "total_input_tokens", None)
+                or getattr(interaction_usage, "input_tokens", 0)
+                or 0
+            )
+            cached_tok = int(
+                getattr(interaction_usage, "total_cached_tokens", None)
+                or getattr(interaction_usage, "cached_tokens", 0)
+                or 0
+            )
+            output_tok = int(
+                getattr(interaction_usage, "total_output_tokens", None)
+                or getattr(interaction_usage, "output_tokens", 0)
+                or 0
+            )
+            thought_tok = int(
+                getattr(interaction_usage, "total_thought_tokens", None)
+                or getattr(interaction_usage, "thought_tokens", 0)
+                or 0
+            )
+            total_tok = int(
+                getattr(interaction_usage, "total_tokens", 0)
+                or (prompt_tok + output_tok + thought_tok)
+            )
+        else:
+            prompt_tok = 0
+            cached_tok = 0
+            output_tok = 0
+            thought_tok = 0
+            total_tok = 0
 
         family = (label or "generate_content").split("[", 1)[0].strip() or "generate_content"
         with self._lock:
@@ -5202,6 +5277,59 @@ def inject_gemini_dataset_config(
     return out_kwargs
 
 
+def inject_gemini_interactions_config(
+    kwargs: Dict[str, Any],
+    *,
+    label: str = "interactions.create",
+    candidate_dir: Optional[Union[Path, str]] = None,
+    dataset_name: Optional[str] = None,
+    store_logs: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Non-destructively injects top-level `labels` and `store=True` into `client.interactions.create` kwargs
+    so Interactions API requests receive identical AI Studio Dataset tagging as `generate_content`."""
+    import os as _os
+
+    out_kwargs = dict(kwargs)
+    if "request" in out_kwargs and out_kwargs["request"] is not None:
+        return out_kwargs
+
+    skip_dataset_meta = bool(getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "skip_dataset_store", False))
+    if skip_dataset_meta:
+        return out_kwargs
+
+    auto_labels = build_gemini_request_labels(
+        label=label,
+        candidate_dir=candidate_dir,
+        dataset_name=dataset_name,
+    )
+    if auto_labels:
+        existing_labels = dict(out_kwargs.get("labels") or {})
+        out_kwargs["labels"] = {**auto_labels, **existing_labels}
+
+    env_store = _os.environ.get("GEMINI_STORE_LOGS", "").strip().lower()
+    if store_logs is not None:
+        should_store = bool(store_logs)
+    elif env_store in ("0", "false", "no", "off"):
+        should_store = False
+    elif env_store in ("1", "true", "yes", "on"):
+        should_store = True
+    else:
+        should_store = bool(get_active_gemini_dataset_context().get("store_logs", True))
+
+    model_str = str(out_kwargs.get("model") or "").lower()
+    modalities = [str(m).upper() for m in (out_kwargs.get("response_modalities") or [])]
+    is_media_synthesis = (
+        "image" in model_str
+        or "tts" in model_str
+        or "IMAGE" in modalities
+        or "AUDIO" in modalities
+        or "VIDEO" in modalities
+    )
+    if should_store and not is_media_synthesis and "store" not in out_kwargs:
+        out_kwargs["store"] = True
+    return out_kwargs
+
+
 def install_studio_gemini_guardrails(
     client: Any,
     candidate_dir: Optional[Path] = None,
@@ -5209,8 +5337,9 @@ def install_studio_gemini_guardrails(
     store_logs: Optional[bool] = None,
 ) -> Any:
     """Installs transport-level pause enforcement, circuit-breaker checks, AI Studio dataset label injection,
-    and token tracking directly onto `client.models.generate_content`, `embed_content`, and `generate_images`
-    so even direct SDK calls cannot bypass studio pause, dataset tagging, or token accounting."""
+    and token tracking directly onto `client.models.generate_content`, `embed_content`, `generate_images`,
+    and `client.interactions.create` so even direct SDK calls cannot bypass studio pause, dataset tagging,
+    or token accounting."""
     if candidate_dir is not None or dataset_name is not None or store_logs is not None:
         set_active_gemini_dataset_context(
             dataset_name=dataset_name,
@@ -5220,80 +5349,137 @@ def install_studio_gemini_guardrails(
     if client is None or not is_real_genai_client(client):
         return client
     models_obj = getattr(client, "models", None)
-    if models_obj is None or getattr(models_obj, "_studio_guardrails_installed", False):
-        return client
+    if models_obj is not None and not getattr(models_obj, "_studio_guardrails_installed", False):
+        for method_name in ("generate_content", "embed_content", "generate_images"):
+            orig_fn = getattr(models_obj, method_name, None)
+            if not callable(orig_fn):
+                continue
 
-    for method_name in ("generate_content", "embed_content", "generate_images"):
-        orig_fn = getattr(models_obj, method_name, None)
-        if not callable(orig_fn):
-            continue
+            def _make_guarded(fn: Any, m_name: str) -> Any:
+                def _guarded(*args: Any, **kwargs: Any) -> Any:
+                    import random as _random
+                    import time as _time
 
-        def _make_guarded(fn: Any, m_name: str) -> Any:
-            def _guarded(*args: Any, **kwargs: Any) -> Any:
-                import random as _random
-                import time as _time
+                    ctx_label = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "label", None)
+                    ctx_c_dir = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "candidate_dir", None) or candidate_dir
+                    in_retry_wrapper = bool(getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "in_retry_wrapper", False))
+                    lbl = ctx_label or f"genai.models.{m_name}"
+                    wait_if_studio_paused(candidate_dir=ctx_c_dir, label=lbl)
+                    TOKEN_USAGE_TRACKER.check_circuit_breaker(label=lbl, candidate_dir=ctx_c_dir)
+                    call_kwargs = (
+                        inject_gemini_dataset_config(
+                            kwargs,
+                            label=lbl,
+                            candidate_dir=ctx_c_dir,
+                            dataset_name=dataset_name,
+                            store_logs=store_logs,
+                        )
+                        if m_name == "generate_content"
+                        else kwargs
+                    )
+                    max_direct_retries = 0 if in_retry_wrapper else 3
+                    for attempt in range(max_direct_retries + 1):
+                        try:
+                            if attempt > 0:
+                                call_kwargs = (
+                                    inject_gemini_dataset_config(
+                                        kwargs,
+                                        label=lbl,
+                                        candidate_dir=ctx_c_dir,
+                                        dataset_name=dataset_name,
+                                        store_logs=store_logs,
+                                    )
+                                    if m_name == "generate_content"
+                                    else kwargs
+                                )
+                            res = fn(*args, **call_kwargs)
+                            _check_gateway_abort(ctx_c_dir, label=lbl)
+                            break
+                        except StudioPausedError:
+                            raise
+                        except Exception as exc:
+                            if attempt < max_direct_retries and is_transient_gemini_error(exc):
+                                if "400" in str(exc) or "INVALID_ARGUMENT" in str(exc).upper():
+                                    _THREAD_LOCAL_GEMINI_CALL_CTX.skip_dataset_store = True
+                                delay = 1.5 * (2 ** attempt) + _random.uniform(0.0, 0.35)
+                                _time.sleep(delay)
+                                wait_if_studio_paused(candidate_dir=ctx_c_dir, label=lbl)
+                                continue
+                            raise
+                    stats = TOKEN_USAGE_TRACKER.record_response(res, label=lbl)
+                    if stats is not None:
+                        _emit_gateway_llm_activity(lbl, stats)
+                    return res
+                return _guarded
 
-                ctx_label = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "label", None)
-                ctx_c_dir = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "candidate_dir", None) or candidate_dir
-                in_retry_wrapper = bool(getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "in_retry_wrapper", False))
-                lbl = ctx_label or f"genai.models.{m_name}"
-                wait_if_studio_paused(candidate_dir=ctx_c_dir, label=lbl)
-                TOKEN_USAGE_TRACKER.check_circuit_breaker(label=lbl, candidate_dir=ctx_c_dir)
-                call_kwargs = (
-                    inject_gemini_dataset_config(
+            try:
+                setattr(models_obj, method_name, _make_guarded(orig_fn, method_name))
+            except Exception:
+                pass
+
+        try:
+            setattr(models_obj, "_studio_guardrails_installed", True)
+        except Exception:
+            pass
+
+    interactions_obj = getattr(client, "interactions", None)
+    if interactions_obj is not None and not getattr(interactions_obj, "_studio_guardrails_installed", False):
+        orig_create = getattr(interactions_obj, "create", None)
+        if callable(orig_create):
+            def _make_guarded_interactions(fn: Any) -> Any:
+                def _guarded_interactions(*args: Any, **kwargs: Any) -> Any:
+                    import random as _random
+                    import time as _time
+
+                    ctx_label = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "label", None)
+                    ctx_c_dir = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "candidate_dir", None) or candidate_dir
+                    in_retry_wrapper = bool(getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "in_retry_wrapper", False))
+                    lbl = ctx_label or "genai.interactions.create"
+                    wait_if_studio_paused(candidate_dir=ctx_c_dir, label=lbl)
+                    TOKEN_USAGE_TRACKER.check_circuit_breaker(label=lbl, candidate_dir=ctx_c_dir)
+                    call_kwargs = inject_gemini_interactions_config(
                         kwargs,
                         label=lbl,
                         candidate_dir=ctx_c_dir,
                         dataset_name=dataset_name,
                         store_logs=store_logs,
                     )
-                    if m_name == "generate_content"
-                    else kwargs
-                )
-                max_direct_retries = 0 if in_retry_wrapper else 3
-                for attempt in range(max_direct_retries + 1):
-                    try:
-                        if attempt > 0:
-                            call_kwargs = (
-                                inject_gemini_dataset_config(
+                    max_direct_retries = 0 if in_retry_wrapper else 3
+                    for attempt in range(max_direct_retries + 1):
+                        try:
+                            if attempt > 0:
+                                call_kwargs = inject_gemini_interactions_config(
                                     kwargs,
                                     label=lbl,
                                     candidate_dir=ctx_c_dir,
                                     dataset_name=dataset_name,
                                     store_logs=store_logs,
                                 )
-                                if m_name == "generate_content"
-                                else kwargs
-                            )
-                        res = fn(*args, **call_kwargs)
-                        _check_gateway_abort(ctx_c_dir, label=lbl)
-                        break
-                    except StudioPausedError:
-                        raise
-                    except Exception as exc:
-                        if attempt < max_direct_retries and is_transient_gemini_error(exc):
-                            if "400" in str(exc) or "INVALID_ARGUMENT" in str(exc).upper():
-                                _THREAD_LOCAL_GEMINI_CALL_CTX.skip_dataset_store = True
-                            delay = 1.5 * (2 ** attempt) + _random.uniform(0.0, 0.35)
-                            _time.sleep(delay)
-                            wait_if_studio_paused(candidate_dir=ctx_c_dir, label=lbl)
-                            continue
-                        raise
-                stats = TOKEN_USAGE_TRACKER.record_response(res, label=lbl)
-                if stats is not None:
-                    _emit_gateway_llm_activity(lbl, stats)
-                return res
-            return _guarded
+                            res = fn(*args, **call_kwargs)
+                            _check_gateway_abort(ctx_c_dir, label=lbl)
+                            break
+                        except StudioPausedError:
+                            raise
+                        except Exception as exc:
+                            if attempt < max_direct_retries and is_transient_gemini_error(exc):
+                                if "400" in str(exc) or "INVALID_ARGUMENT" in str(exc).upper():
+                                    _THREAD_LOCAL_GEMINI_CALL_CTX.skip_dataset_store = True
+                                delay = 1.5 * (2 ** attempt) + _random.uniform(0.0, 0.35)
+                                _time.sleep(delay)
+                                wait_if_studio_paused(candidate_dir=ctx_c_dir, label=lbl)
+                                continue
+                            raise
+                    stats = TOKEN_USAGE_TRACKER.record_response(res, label=lbl)
+                    if stats is not None:
+                        _emit_gateway_llm_activity(lbl, stats)
+                    return res
+                return _guarded_interactions
 
-        try:
-            setattr(models_obj, method_name, _make_guarded(orig_fn, method_name))
-        except Exception:
-            pass
-
-    try:
-        setattr(models_obj, "_studio_guardrails_installed", True)
-    except Exception:
-        pass
+            try:
+                setattr(interactions_obj, "create", _make_guarded_interactions(orig_create))
+                setattr(interactions_obj, "_studio_guardrails_installed", True)
+            except Exception:
+                pass
     return client
 
 

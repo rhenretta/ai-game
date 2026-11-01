@@ -89,7 +89,8 @@ export function WorkItemCard({
   const isActivelyExecuting =
     item.state === 'in_progress' ||
     item.state === 'waiting_for_lock' ||
-    item.state === 'awaiting_review';
+    item.state === 'awaiting_review' ||
+    item.state === 'changes_requested';
 
   // Hydrate live disk trace & mid-flight turn proofs for active items (at most 2-3 workers at once)
   // and reuse any cached chronology already fetched for completed items.

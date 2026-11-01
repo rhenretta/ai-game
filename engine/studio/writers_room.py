@@ -1854,6 +1854,7 @@ class CreativeWritersRoom:
         return types.Part.from_bytes(data=p.read_bytes(), mime_type=mime)
 
     def _proof_parts(self, item: Any, candidate_dir: Optional[Path]) -> List[Any]:
+        from engine.studio.audio_evaluator import AUDIO_MIME_BY_SUFFIX, INLINE_MEDIA_MAX_BYTES, VIDEO_MIME_BY_SUFFIX
         from google.genai import types
 
         if not item.revisions:
@@ -1861,6 +1862,8 @@ class CreativeWritersRoom:
         latest = item.revisions[-1]
         parts: List[Any] = []
         resolved_paths: List[Path] = []
+        audio_paths: List[Path] = []
+        video_paths: List[Path] = []
         for rel in latest.proof_paths:
             path = Path(rel)
             if not path.is_absolute() and candidate_dir is not None:
@@ -1868,9 +1871,14 @@ class CreativeWritersRoom:
             if not path.is_file():
                 raise StudioAgentError(f"Proof image for item '{item.item_id}' is missing on disk: {path}")
             suffix = path.suffix.lower()
-            if suffix not in (".png", ".jpg", ".jpeg", ".webp"):
-                continue
-            resolved_paths.append(path)
+            if suffix in (".png", ".jpg", ".jpeg", ".webp"):
+                resolved_paths.append(path)
+            elif suffix in AUDIO_MIME_BY_SUFFIX and 0 < path.stat().st_size <= INLINE_MEDIA_MAX_BYTES:
+                if path not in audio_paths:
+                    audio_paths.append(path)
+            elif suffix in VIDEO_MIME_BY_SUFFIX and 0 < path.stat().st_size <= INLINE_MEDIA_MAX_BYTES:
+                if path not in video_paths:
+                    video_paths.append(path)
         if len(resolved_paths) > 1:
             strips = [p for p in resolved_paths if "filmstrip" in p.name.lower()]
             others = [p for p in resolved_paths if "filmstrip" not in p.name.lower()]
@@ -1915,6 +1923,18 @@ class CreativeWritersRoom:
                 parts.append(types.Part.from_bytes(data=path.read_bytes(), mime_type=mime, media_resolution=media_res))
             else:
                 parts.append(types.Part.from_bytes(data=path.read_bytes(), mime_type=mime))
+        for ap in audio_paths[-2:]:
+            a_mime = AUDIO_MIME_BY_SUFFIX[ap.suffix.lower()]
+            parts.append(
+                f"PROOF AUDIO for item '{item.item_id}' (revision {latest.revision_index + 1}, file {ap.name}):"
+            )
+            parts.append(types.Part.from_bytes(data=ap.read_bytes(), mime_type=a_mime))
+        for vp in video_paths[-1:]:
+            v_mime = VIDEO_MIME_BY_SUFFIX[vp.suffix.lower()]
+            parts.append(
+                f"PROOF AUDIOVISUAL CLIP for item '{item.item_id}' (revision {latest.revision_index + 1}, file {vp.name}):"
+            )
+            parts.append(types.Part.from_bytes(data=vp.read_bytes(), mime_type=v_mime))
         if not latest.proof_paths:
             parts.append(f"NOTE: item '{item.item_id}' returned NO proof images.")
         return parts

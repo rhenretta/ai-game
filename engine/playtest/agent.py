@@ -336,7 +336,12 @@ def build_blind_player_system_prompt(store_card: BlindStoreCard) -> str:
         "- Keyboard: `hold_keys` holds keys across `duration_ms` (350..2000ms); `tap_keys` taps keys briefly.\n"
         "- Visual detail: Set `inspect_high_res_next=true` early (e.g., on Turn 1 so Turn 2 renders in full detail) and "
         "whenever inspecting new UI panels, icons, sprite edges, or small text—do NOT praise graphics or UI as 'clean', "
-        "'polished', or 'legible' before checking them at HIGH resolution.\n\n"
+        "'polished', or 'legible' before checking them at HIGH resolution.\n"
+        "- Focused audio / soundscape check: Leave `request_audio_evaluation` null on most turns; whenever you want a focused "
+        "perceptual ear on the last few seconds of synchronized gameplay video+audio (for instance, to check whether sounds "
+        "match on-screen events, judge how the soundscape fits the game's mood, or inspect an audio anomaly), populate "
+        "`request_audio_evaluation` with `lookback_seconds` (2..20s) and your `question`, and the acoustic observations will "
+        "arrive on your next turn.\n\n"
         "VISUAL & UI CRAFT HONESTY (LOOK WITH CRITICAL HUMAN EYES):\n"
         "- Never grade visuals or UI on a curve. Before describing `graphics_and_visuals` or UI overlays positively, actively "
         "scan the screen for universal rendering and layout defects:\n"
@@ -469,6 +474,7 @@ class BlindPlaytesterAgent:
         self._same_spot_click_streak: int = 0
         self._last_key_signature: Optional[Tuple[Tuple[str, ...], Tuple[str, ...]]] = None
         self._repeated_key_streak: int = 0
+        self._pending_audio_eval_notes: List[str] = []
 
     def reset_memory(self) -> None:
         """Clears all player memory, rulebook, notes, questions, bugs, impressions, and turn tape for a clean Reset."""
@@ -496,6 +502,32 @@ class BlindPlaytesterAgent:
         self._same_spot_click_streak = 0
         self._last_key_signature = None
         self._repeated_key_streak = 0
+        self._pending_audio_eval_notes.clear()
+
+    def queue_audio_evaluation_result(
+        self,
+        *,
+        turn_index: int,
+        question: str,
+        lookback_seconds: float,
+        report: Any,
+    ) -> str:
+        """Queues a perceptual audio evaluation note from `AudioEvaluatorAgent` so it appears in the next
+        turn's observation status and in the append-only turn tape without leaking internal Studio context.
+        """
+        raw_ctx_obs = getattr(report, "contextual_observations", None) or []
+        ctx_obs_str = "; ".join(raw_ctx_obs) if isinstance(raw_ctx_obs, list) else str(raw_ctx_obs)
+        concerns = "; ".join(getattr(report, "notable_concerns", None) or [])
+        concerns_clause = f" Concerns: {concerns}." if concerns else ""
+        formatted = (
+            f"[Lookback {lookback_seconds:.1f}s | Q: {question}] "
+            f"Heard: {getattr(report, 'rich_acoustic_description', '')} | "
+            f"Gameplay/Soundscape Fit: {ctx_obs_str} | "
+            f"Answer: {getattr(report, 'answer_to_inquiry', '')}{concerns_clause}"
+        ).strip()
+        self._pending_audio_eval_notes.append(formatted)
+        self.epoch_turn_lines.append((turn_index, f"  [Audio Check after T#{turn_index}] {formatted}"))
+        return formatted
 
     def _render_epoch_header_text(self) -> str:
         """Renders `[Block 1A — Permanent Notebook (Rulebook, Notes, Questions, Bugs, Impressions)]`
@@ -721,6 +753,10 @@ class BlindPlaytesterAgent:
             )
         if audio_became_silent:
             status_lines.append("Perceptual Change Note: Game audio stopped and is now silent.")
+        if self._pending_audio_eval_notes:
+            for a_note in self._pending_audio_eval_notes:
+                status_lines.append(f"Focused Audio Evaluation Result (from your prior turn request): {a_note}")
+            self._pending_audio_eval_notes.clear()
 
         tail_parts.append(types.Part.from_text(text="\n".join(status_lines)))
 

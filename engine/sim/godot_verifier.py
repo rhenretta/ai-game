@@ -450,6 +450,97 @@ def verify_godot_cartridge_syntax(
     return is_valid, diagnostics
 
 
+def mux_raw_rgb_and_pcm_to_mp4(
+    *,
+    raw_rgb_path: Path,
+    pcm_path: Path,
+    out_mp4_path: Path,
+    width: int = 640,
+    height: int = 360,
+    fps: int = 15,
+    sample_rate: int = 16000,
+    min_duration_sec: float = 0.0,
+) -> Path:
+    """Muxes raw RGB24 video frames and signed 16-bit mono PCM audio into a container-portable H.264/AAC `.mp4`."""
+    try:
+        import imageio_ffmpeg
+    except Exception as exc:
+        raise RuntimeError(
+            f"imageio-ffmpeg is required to mux synchronized audiovisual MP4 clips (Rule 6): {exc}"
+        ) from exc
+
+    if not raw_rgb_path.is_file() or raw_rgb_path.stat().st_size < (width * height * 3):
+        raise RuntimeError(
+            f"Audiovisual capture produced no RGB video frames at {raw_rgb_path}."
+        )
+
+    frame_bytes = width * height * 3
+    num_frames = raw_rgb_path.stat().st_size // frame_bytes
+    video_dur_sec = max(min_duration_sec, float(num_frames) / float(max(1, fps)))
+    min_pcm_bytes = int(round(video_dur_sec * float(sample_rate))) * 2
+    existing_pcm = pcm_path.read_bytes() if pcm_path.is_file() else b""
+    if len(existing_pcm) < min_pcm_bytes:
+        padded_pcm = existing_pcm + (b"\x00" * (min_pcm_bytes - len(existing_pcm)))
+        pcm_path.write_bytes(padded_pcm)
+
+    out_mp4 = Path(out_mp4_path)
+    out_mp4.parent.mkdir(parents=True, exist_ok=True)
+    tmp_mp4 = out_mp4.with_name(f".tmp_{out_mp4.stem}.mp4")
+    if tmp_mp4.is_file():
+        tmp_mp4.unlink()
+
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    mux_cmd = [
+        ffmpeg_exe,
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(fps),
+        "-i",
+        str(raw_rgb_path),
+        "-f",
+        "s16le",
+        "-ar",
+        str(sample_rate),
+        "-ac",
+        "1",
+        "-i",
+        str(pcm_path),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "24",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "96k",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        str(tmp_mp4),
+    ]
+    res = subprocess.run(mux_cmd, capture_output=True, text=True, check=False)
+    if res.returncode != 0 or not tmp_mp4.is_file() or tmp_mp4.stat().st_size <= 0:
+        if tmp_mp4.is_file():
+            tmp_mp4.unlink()
+        raise RuntimeError(
+            f"ffmpeg failed muxing audiovisual gameplay MP4 '{out_mp4.name}' (rc={res.returncode}): {res.stderr.strip()}"
+        )
+    tmp_mp4.replace(out_mp4)
+    return out_mp4
+
+
 class GodotHeadlessSimulator:
     """Headless simulation runner for Godot 4 cartridges.
     Matches interface of HeadlessSimulator for seamless polymorphism.
@@ -471,12 +562,16 @@ class GodotHeadlessSimulator:
         setup_script: Optional[List[Dict[str, Any]]] = None,
         target_scene: str = "",
         timeout_seconds: Optional[float] = None,
+        capture_audiovisual_mp4: Optional[Union[Path, str]] = None,
         **kwargs: Any,
     ):
         self.cartridge_path = Path(cartridge_path).resolve()
         self.telemetry_mode = telemetry_mode
         self.max_ticks = max_frames or ticks or max_ticks
-        self.capture_viewport = capture_viewport
+        self.capture_viewport = capture_viewport or (capture_audiovisual_mp4 is not None)
+        self.capture_audiovisual_mp4: Optional[Path] = (
+            Path(capture_audiovisual_mp4) if capture_audiovisual_mp4 is not None else None
+        )
         self.capture_ticks = sorted(set(int(t) for t in (capture_ticks or [])))
         self.input_script = input_script
         self.setup_script = setup_script
@@ -562,6 +657,15 @@ class GodotHeadlessSimulator:
         has_display = (sys_name == "Darwin") or bool(os.environ.get("DISPLAY")) or bool(os.environ.get("WAYLAND_DISPLAY"))
         xvfb_bin = shutil.which("xvfb-run") if (sys_name == "Linux" and not has_display) else None
 
+        want_av_mp4 = self.capture_audiovisual_mp4 is not None
+        if want_av_mp4:
+            use_viewport = True
+            if not (has_display or xvfb_bin):
+                raise RuntimeError(
+                    "Audiovisual MP4 capture requires a display (macOS, DISPLAY/WAYLAND_DISPLAY, or xvfb-run); refusing to fabricate clip."
+                )
+
+        av_work_dir: Optional[Path] = None
         if use_viewport:
             cap_dir = self.cartridge_path / "assets" / "playtest_captures"
             for stale_name in ("playtest_t0.png", "playtest_tend.png", "playtest_collision_overlay.png"):
@@ -573,20 +677,39 @@ class GodotHeadlessSimulator:
                         pass
             if "--capture-viewport" not in extra_args:
                 extra_args.append("--capture-viewport")
+            if want_av_mp4:
+                av_work_dir = cap_dir / "_av_capture"
+                if av_work_dir.exists():
+                    shutil.rmtree(av_work_dir, ignore_errors=True)
+                av_work_dir.mkdir(parents=True, exist_ok=True)
+                extra_args += ["--record-audiovisual", str(av_work_dir)]
 
         if use_viewport and (has_display or xvfb_bin):
             render_bin = ensure_godot_background_render_binary()
             cmd: List[str] = []
             if xvfb_bin:
                 cmd.extend([xvfb_bin, "-a"])
-            cmd.extend([
-                str(render_bin),
-                "--audio-driver", "Dummy",
-                "--fixed-fps", "60",
-                "--path", str(self.cartridge_path),
-                "-s", str(HARNESS_SCRIPT_PATH),
-                "--max-ticks", str(limit),
-            ] + extra_args)
+            cmd.append(str(render_bin))
+            if want_av_mp4 and av_work_dir is not None:
+                if sys_name == "Darwin":
+                    cmd.extend(["-ApplePersistenceIgnoreState", "YES"])
+                silent_clock_avi = av_work_dir / "_silent_clock.avi"
+                cmd.extend([
+                    "--rendering-method", "gl_compatibility",
+                    "--write-movie", str(silent_clock_avi),
+                    "--fixed-fps", "60",
+                    "--path", str(self.cartridge_path),
+                    "-s", str(HARNESS_SCRIPT_PATH),
+                    "--max-ticks", str(limit),
+                ] + extra_args)
+            else:
+                cmd.extend([
+                    "--audio-driver", "Dummy",
+                    "--fixed-fps", "60",
+                    "--path", str(self.cartridge_path),
+                    "-s", str(HARNESS_SCRIPT_PATH),
+                    "--max-ticks", str(limit),
+                ] + extra_args)
         else:
             godot_bin = ensure_godot_binary()
             cmd = [
@@ -761,12 +884,31 @@ class GodotHeadlessSimulator:
         self.close()
 
         if timed_out_flag[0]:
+            if av_work_dir is not None:
+                shutil.rmtree(av_work_dir, ignore_errors=True)
             raise RuntimeError(
                 f"Godot simulation timed out after {timeout_s:.1f}s on '{self.target_scene or 'res://main.tscn'}' "
                 f"(ticks_executed={self.ticks_executed}/{limit}; possible infinite loop or recursive _ready() scene instantiation): {stderr_full}"
             )
         if returncode != 0:
+            if av_work_dir is not None:
+                shutil.rmtree(av_work_dir, ignore_errors=True)
             raise RuntimeError(f"Godot headless simulation failed with code {returncode}: {stderr_full}")
+
+        if want_av_mp4 and self.capture_audiovisual_mp4 is not None and av_work_dir is not None:
+            try:
+                mux_raw_rgb_and_pcm_to_mp4(
+                    raw_rgb_path=av_work_dir / "_harness_video_rgb24.raw",
+                    pcm_path=av_work_dir / "_harness_audio.pcm",
+                    out_mp4_path=self.capture_audiovisual_mp4,
+                    width=640,
+                    height=360,
+                    fps=15,
+                    sample_rate=16000,
+                    min_duration_sec=max(0.1, float(self.step_count) / 60.0),
+                )
+            finally:
+                shutil.rmtree(av_work_dir, ignore_errors=True)
 
         return self.get_state()
 

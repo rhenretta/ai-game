@@ -5,7 +5,7 @@ import type {
   WorkspaceId,
 } from '../api/types';
 import type { LiveItemStep } from '../realtime/useSwarmSocket';
-import { isWorkingBoardState } from './boardCards';
+import { isActivelyExecutingBoardState } from './boardCards';
 import { getRoleMetadata } from './roles';
 
 export type StudioPipelinePhase =
@@ -251,7 +251,7 @@ export function deriveLiveStudioActivity(params: {
   const boardItems = (bible?.production_board?.items ?? []).filter((i) => i.state !== 'cancelled');
   const totalBoard = boardItems.length;
   const approvedBoard = boardItems.filter((i) => i.state === 'approved').length;
-  const workingBoardItems = boardItems.filter((i) => isWorkingBoardState(i.state));
+  const workingBoardItems = boardItems.filter((i) => isActivelyExecutingBoardState(i.state));
   const awaitingReviewItems = boardItems.filter((i) => i.state === 'awaiting_review');
   const allBoardApproved = totalBoard > 0 && approvedBoard === totalBoard;
 

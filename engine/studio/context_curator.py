@@ -32,12 +32,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from engine.studio.models import (
     StudioAgentError,
     bounded_thinking_config,
     call_gemini_with_transient_retry,
+    is_real_genai_client,
 )
 
 logger = logging.getLogger("ContextCurator")
@@ -70,7 +71,7 @@ class ContextChunk(BaseModel):
     content: str = Field(..., description="Full text payload of the chunk.")
     associated_image_path: str = Field(
         default="",
-        description="Optional cartridge-relative or absolute image path (e.g. concept art mockup, sprite plate, or proof strip).",
+        description="Optional cartridge-relative or absolute media path (e.g. concept art mockup, sprite plate, .wav cue, or .mp4 proof clip).",
     )
 
 
@@ -79,7 +80,7 @@ class ContextCuratorDecision(BaseModel):
 
     deliberation: str = Field(
         ...,
-        description="Step-by-step deliberation evaluating what council discussions, rendering treatments, assets, code symbols, and reference images the target agent role specifically needs to fulfill this request without context bloat.",
+        description="Step-by-step deliberation evaluating what council discussions, rendering treatments, assets, code symbols, and reference media (.png/.wav/.mp4) the target agent role specifically needs to fulfill this request without context bloat.",
     )
     search_queries_used: List[str] = Field(
         default_factory=list,
@@ -99,18 +100,34 @@ class ContextCuratorDecision(BaseModel):
     )
     selected_image_paths: List[str] = Field(
         default_factory=list,
-        description="Exact image paths from `AVAILABLE MULTIMODAL IMAGES` (such as the 16:9 Concept Art Mockup, fabricated sprite/rig plates, or proof filmstrips) to attach multimodally for this agent.",
+        description="Exact image/media paths from `AVAILABLE MULTIMODAL MEDIA` (such as the 16:9 Concept Art Mockup, sprite/rig plates, proof filmstrips, .wav cues, or .mp4 clips) to attach multimodally for this agent.",
     )
+    selected_media_paths: List[str] = Field(
+        default_factory=list,
+        description="Exact multimodal paths (.png/.jpg/.webp images, .wav audio cues, or .mp4 gameplay clips) from `AVAILABLE MULTIMODAL MEDIA` to attach when seeing or hearing them genuinely helps `target_agent_role`.",
+    )
+
+    @model_validator(mode="after")
+    def _sync_media_and_image_paths(self) -> "ContextCuratorDecision":
+        merged: List[str] = []
+        for raw_p in list(self.selected_media_paths or []) + list(self.selected_image_paths or []):
+            s = str(raw_p or "").strip()
+            if s and s not in merged:
+                merged.append(s)
+        self.selected_media_paths = list(merged)
+        self.selected_image_paths = list(merged)
+        return self
 
 
 @dataclass
 class CuratedContextPack:
-    """The assembled text prompt block and multimodal image Parts produced by `ContextCuratorAgent`."""
+    """The assembled text prompt block and multimodal Parts produced by `ContextCuratorAgent`."""
 
     prompt_block: str
     multimodal_parts: List[Any] = field(default_factory=list)
     decision: Optional[ContextCuratorDecision] = None
     retrieved_chunks: List[ContextChunk] = field(default_factory=list)
+    selected_media_paths: List[str] = field(default_factory=list)
 
 
 class SelfInquiryQAPair(BaseModel):
@@ -631,27 +648,65 @@ class CartridgeSemanticIndex:
 
             if actual_disk_px is not None:
                 clean_entry["actual_disk_pixel_size"] = actual_disk_px
-            fmode_val = aval.get("fabrication_mode", aval.get("asset_type", "asset"))
-            hf_val = int(aval.get("hframes") or 1)
-            vf_val = int(aval.get("vframes") or 1)
-            tex_sz_val = actual_disk_px or aval.get("texture_pixel_size") or aval.get("target_display_size") or []
+            fmode_val = str(aval.get("fabrication_mode", aval.get("asset_type", "asset")) or "asset")
+            atype_val = str(aval.get("asset_type", "") or "")
+            is_audio_entry = (
+                fmode_val in ("audio_bark", "sfx", "ambient_loop")
+                or atype_val in ("audio_bark", "sfx", "ambient_loop")
+                or (
+                    asset_disk_path is not None
+                    and asset_disk_path.suffix.lower() in (".wav", ".mp3", ".ogg", ".flac", ".aac", ".opus")
+                )
+            )
+            if is_audio_entry:
+                dur_val = float(aval.get("duration_seconds") or 0.0)
+                if dur_val <= 0.0 and asset_disk_path is not None and asset_disk_path.is_file() and asset_disk_path.suffix.lower() == ".wav":
+                    try:
+                        from engine.studio.audio import validate_wav_file
+                        _ok_w, _err_w, computed_dur = validate_wav_file(asset_disk_path)
+                        if _ok_w and computed_dur > 0:
+                            dur_val = round(float(computed_dur), 3)
+                            clean_entry["duration_seconds"] = dur_val
+                    except Exception:
+                        pass
+                perc_desc = str(aval.get("perceptual_description") or "").strip()
+                media_path_str = (
+                    str(asset_disk_path)
+                    if (asset_disk_path is not None and asset_disk_path.is_file())
+                    else img_path
+                )
+                sound_tag = f", sound={perc_desc[:120]!r}" if perc_desc else ""
+                chunk_title = (
+                    f"Fabricated Audio Asset [{aid}] (mode={fmode_val}, path={rel_file}, "
+                    f"duration={dur_val:.2f}s{sound_tag})"
+                )
+            else:
+                media_path_str = img_path
+                hf_val = int(aval.get("hframes") or 1)
+                vf_val = int(aval.get("vframes") or 1)
+                tex_sz_val = actual_disk_px or aval.get("texture_pixel_size") or aval.get("target_display_size") or []
+                chunk_title = (
+                    f"Fabricated Asset [{aid}] (mode={fmode_val}, path={rel_file}, "
+                    f"tex_size={tex_sz_val}, hframes={hf_val}, vframes={vf_val})"
+                )
             _add(
                 ContextChunk(
                     chunk_id=f"asset:catalog:{aid}",
                     category="asset",
-                    title=(
-                        f"Fabricated Asset [{aid}] (mode={fmode_val}, path={rel_file}, "
-                        f"tex_size={tex_sz_val}, hframes={hf_val}, vframes={vf_val})"
-                    ),
+                    title=chunk_title,
                     content=json.dumps(clean_entry, ensure_ascii=False, indent=2),
-                    associated_image_path=img_path,
+                    associated_image_path=media_path_str,
                 )
             )
 
         # Also index any mockup PNGs on disk if not already indexed from `visual_mockups`
         mockups_dir = self.cartridge_dir / "assets" / "mockups"
         if mockups_dir.is_dir():
-            existing_mockup_imgs = {Path(c.associated_image_path).resolve() for c in chunks if c.associated_image_path}
+            existing_mockup_imgs = {
+                Path(c.associated_image_path).resolve()
+                for c in chunks
+                if c.associated_image_path and Path(c.associated_image_path).suffix.lower() == ".png"
+            }
             for mp in sorted(mockups_dir.glob("*.png")):
                 if mp.resolve() not in existing_mockup_imgs:
                     _add(
@@ -1240,23 +1295,97 @@ class ContextCuratorAgent:
             return "council_reviewer"
         return re.sub(r"[^a-z0-9_]+", "_", role_clean).strip("_") or "agent"
 
+    _CURATOR_MEDIA_MIMES: Dict[str, str] = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".wav": "audio/wav",
+        ".mp3": "audio/mp3",
+        ".ogg": "audio/ogg",
+        ".flac": "audio/flac",
+        ".mp4": "video/mp4",
+        ".webm": "video/webm",
+    }
+    _CURATOR_INLINE_MAX_BYTES: int = 18 * 1024 * 1024
+
     @staticmethod
     def _should_attach_concept_mockup(target_agent_role: str, item_kind: str) -> bool:
-        """Determines whether the 16:9 Concept Art Mockup image should be attached multimodally.
-        Visual fabrication, level/UI/integration layout, and visual/creative Council reviews need the
-        mockup pixels for aesthetic/spatial consistency; backend mechanic code, QA test scripting,
-        audio, and narrative tasks receive the structured style/palette text without paying image tokens."""
-        role_low = (target_agent_role or "").strip().lower()
+        """Fallback helper for non-Curator callers checking whether a task kind has a visual/spatial mockup."""
         kind_low = (item_kind or "").strip().lower()
-        if "qa" in role_low or "test" in role_low or "audio" in role_low or "voice" in role_low or "script" in role_low:
-            return False
-        if "visual" in role_low or "art" in role_low:
-            return True
-        if role_low.startswith("council_reviewer"):
-            if "visualartdirector" in role_low or "creativedirector" in role_low:
-                return True
-            return kind_low in ("visual_asset", "animation", "level_map", "ui", "integration")
         return kind_low in ("visual_asset", "animation", "level_map", "ui", "integration", "")
+
+    @classmethod
+    def _select_curated_media_paths(
+        cls,
+        target_agent_role: str,
+        item_kind: str,
+        curator_selected_paths: Sequence[str],
+        extra_image_paths: Optional[Sequence[str]],
+        cartridge_dir: Path,
+        max_selected_images: int = 3,
+    ) -> List[str]:
+        """Resolves and caps LLM-selected multimodal media attachments (.png/.jpg/.webp images,
+        .wav/.mp3/.ogg/.flac audio cues, and .mp4/.webm gameplay clips) without hardcoded role blocks."""
+        role_low = (target_agent_role or "").strip().lower()
+        is_swe = "swe" in role_low or ("engineer" in role_low and "audio" not in role_low and "qa" not in role_low)
+        cap = max(1, int(max_selected_images or 3))
+
+        def _resolve_valid(raw_p: str) -> Optional[Path]:
+            if not raw_p:
+                return None
+            p = Path(raw_p) if Path(raw_p).is_absolute() else (cartridge_dir / raw_p)
+            if p.is_file() and p.suffix.lower() in cls._CURATOR_MEDIA_MIMES:
+                try:
+                    if p.stat().st_size > 0:
+                        return p
+                except Exception:
+                    return None
+            return None
+
+        final_paths: List[str] = []
+        seen_resolved: set[Path] = set()
+        total_bytes = 0
+
+        for raw_p in list(curator_selected_paths or []):
+            p = _resolve_valid(raw_p)
+            if p is None:
+                continue
+            rp = p.resolve()
+            if rp in seen_resolved:
+                continue
+            n_low = p.name.lower()
+            # Never feed QA sprite alpha-checkerboard diagnostic plates as SWE code-generation textures
+            if is_swe and n_low.startswith(("plate_", "anim_sheet_", "anim_rig_")):
+                continue
+            f_bytes = p.stat().st_size
+            if total_bytes + f_bytes > cls._CURATOR_INLINE_MAX_BYTES:
+                continue
+            seen_resolved.add(rp)
+            total_bytes += f_bytes
+            final_paths.append(str(p))
+            if len(final_paths) >= cap:
+                break
+
+        # If the caller explicitly provided captured proof artifacts (`extra_image_paths`) and budget remains,
+        # attach at most one latest non-pass1 proof strip when none was already included
+        if len(final_paths) < cap and extra_image_paths:
+            proof_strips = [
+                p for raw_e in extra_image_paths
+                if (p := _resolve_valid(raw_e)) is not None
+                and "filmstrip" in p.name.lower()
+                and "_pass1." not in p.name.lower()
+            ]
+            if proof_strips:
+                cand_strip = proof_strips[-1]
+                rp_s = cand_strip.resolve()
+                s_bytes = cand_strip.stat().st_size
+                if rp_s not in seen_resolved and total_bytes + s_bytes <= cls._CURATOR_INLINE_MAX_BYTES:
+                    seen_resolved.add(rp_s)
+                    total_bytes += s_bytes
+                    final_paths.append(str(cand_strip))
+
+        return final_paths[:cap]
 
     @classmethod
     def _select_role_tailored_image_paths(
@@ -1266,80 +1395,59 @@ class ContextCuratorAgent:
         curator_selected_paths: Sequence[str],
         extra_image_paths: Optional[Sequence[str]],
         cartridge_dir: Path,
-        max_selected_images: int = 2,
+        max_selected_images: int = 3,
     ) -> List[str]:
-        """Filters and caps multimodal image attachments by target agent role and task kind so agents only
-        receive images they actually need (at most 1 Concept Art Mockup when visual/spatial + 1 latest proof)."""
-        role_low = (target_agent_role or "").strip().lower()
-        if "qa" in role_low or "test" in role_low or "audio" in role_low or "voice" in role_low or "script" in role_low:
-            return []
+        return cls._select_curated_media_paths(
+            target_agent_role=target_agent_role,
+            item_kind=item_kind,
+            curator_selected_paths=curator_selected_paths,
+            extra_image_paths=extra_image_paths,
+            cartridge_dir=cartridge_dir,
+            max_selected_images=max_selected_images,
+        )
 
-        want_mockup = cls._should_attach_concept_mockup(target_agent_role, item_kind)
-        is_swe = "swe" in role_low or "engineer" in role_low
+    @classmethod
+    def _build_multimodal_parts_from_paths(
+        cls,
+        media_paths: Sequence[str],
+        available_descriptions: Optional[Dict[str, str]] = None,
+    ) -> List[Any]:
+        from google.genai import types
 
-        def _resolve_valid(raw_p: str) -> Optional[Path]:
-            if not raw_p:
-                return None
-            p = Path(raw_p) if Path(raw_p).is_absolute() else (cartridge_dir / raw_p)
-            if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
-                return p
-            return None
-
-        mockup_candidates: List[str] = []
-        proof_filmstrips: List[str] = []
-        inspection_plates: List[str] = []
-        other_images: List[str] = []
-
-        all_raw = list(curator_selected_paths or []) + list(extra_image_paths or [])
-        seen_names: set[str] = set()
-        for raw_p in all_raw:
-            p = _resolve_valid(raw_p)
-            if p is None:
+        parts: List[Any] = []
+        total_bytes = 0
+        desc_map = available_descriptions or {}
+        for m_str in media_paths:
+            p = Path(m_str)
+            ext = p.suffix.lower()
+            mime = cls._CURATOR_MEDIA_MIMES.get(ext)
+            if mime is None or not p.is_file():
                 continue
-            p_str = str(p)
+            try:
+                f_size = p.stat().st_size
+            except Exception:
+                continue
+            if f_size <= 0 or total_bytes + f_size > cls._CURATOR_INLINE_MAX_BYTES:
+                continue
+            total_bytes += f_size
+            desc = desc_map.get(m_str) or ""
+            desc_suffix = f" — {desc}" if desc else ""
             n_low = p.name.lower()
-            is_mockup = (
-                "mockup" in n_low
-                or "mockups" in [part.lower() for part in p.parts]
-                or n_low.endswith("_gameplay.png")
-            )
-            if is_mockup:
-                if p.name not in seen_names:
-                    mockup_candidates.append(p_str)
-                    seen_names.add(p.name)
-            elif "filmstrip" in n_low:
-                proof_filmstrips.append(p_str)
-            elif n_low.startswith(("plate_", "anim_sheet_", "anim_rig_", "waveform_", "script_sheet_")):
-                inspection_plates.append(p_str)
+            if mime.startswith("image/"):
+                qa_overlay_note = ""
+                if n_low.startswith("plate_"):
+                    qa_overlay_note = " [QA ALPHA INSPECTION PLATE: dark/light checkerboard grids and cyan bounding box are external QA overlays, NOT inside the sprite PNG]"
+                elif n_low.startswith("anim_sheet_") or n_low.startswith("anim_rig_"):
+                    qa_overlay_note = " [QA ANIMATION CONTACT SHEET: dark checkerboard grid, cyan cell borders, and horizontal yellow/gold baseline ruler lines at the bottom of frames are external QA alignment guides, NOT inside the sprite sheet PNG]"
+                elif "filmstrip" in n_low:
+                    qa_overlay_note = " [QA CONTACT SHEET: top/bottom '[QA] tick ...' / '[QA] pos=...' strips are external QA margins, NOT inside the 16:9 viewport]"
+                parts.append(f"CURATED REFERENCE / PROOF IMAGE ({p.name}{desc_suffix}){qa_overlay_note}:")
+            elif mime.startswith("audio/"):
+                parts.append(f"CURATED REFERENCE / PROOF AUDIO ({p.name}{desc_suffix}):")
             else:
-                if p.name not in seen_names:
-                    other_images.append(p_str)
-                    seen_names.add(p.name)
-
-        # Prefer final filmstrips over intermediate `*_pass1.png` captures
-        non_pass1_strips = [s for s in proof_filmstrips if "_pass1." not in Path(s).name.lower()]
-        latest_strip = (non_pass1_strips[-1] if non_pass1_strips else (proof_filmstrips[-1] if proof_filmstrips else ""))
-        latest_plate = inspection_plates[-1] if inspection_plates else ""
-
-        final_paths: List[str] = []
-        if want_mockup and mockup_candidates:
-            final_paths.append(mockup_candidates[0])
-
-        if is_swe:
-            # SWE engineer gets at most the single latest proof filmstrip (never QA sprite checkerboard plates)
-            if latest_strip and latest_strip not in final_paths:
-                final_paths.append(latest_strip)
-        else:
-            # Task Lead, Visual Artist, or Council Reviewer gets the single latest proof filmstrip or asset plate
-            if latest_strip and latest_strip not in final_paths:
-                final_paths.append(latest_strip)
-            elif latest_plate and latest_plate not in final_paths:
-                final_paths.append(latest_plate)
-            elif other_images and len(final_paths) < max_selected_images:
-                if other_images[-1] not in final_paths:
-                    final_paths.append(other_images[-1])
-
-        return final_paths[: max(1, min(max_selected_images, 2))]
+                parts.append(f"CURATED REFERENCE / PROOF GAMEPLAY VIDEO+AUDIO CLIP ({p.name}{desc_suffix}):")
+            parts.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime))
+        return parts
 
     def _build_role_queries(
         self,
@@ -1359,6 +1467,7 @@ class ContextCuratorAgent:
         elif "audio" in role_lower or "voice" in role_lower:
             role_query = (
                 f"Audio direction guide, character voice profiles, reactive voice barks, sound effects, "
+                f"perceptual audio descriptions in asset_library.json, GDScript AudioStreamPlayer and res://assets/audio/*.wav bindings, "
                 f"and AudioAtmosphereDesigner council discussions for: {task_request[:500]}"
             )
         elif "swe" in role_lower or "engineer" in role_lower:
@@ -1400,14 +1509,14 @@ class ContextCuratorAgent:
         item_kind: str = "",
         extra_image_paths: Optional[List[str]] = None,
         max_selected_chunks: int = 10,
-        max_selected_images: int = 2,
+        max_selected_images: int = 3,
         reuse_revision_cache: bool = True,
     ) -> CuratedContextPack:
         """Semantically searches the cartridge corpus and runs the LLM Context Generator decision to assemble
         a tailored `CuratedContextPack` (`prompt_block` + `multimodal_parts`).
         Reuses the curated pack within the same `(item_id, revision)` so multi-turn Task Lead loops,
         SWE synthesis, QA filmstrip planning, and Council review panelists share a stable byte-identical prefix
-        while receiving role-appropriate multimodal image attachments."""
+        while receiving role-appropriate multimodal media attachments."""
         if not is_real_genai_client(self.client):
             raise StudioAgentError(
                 f"ContextCuratorAgent.curate_context requires an active google.genai Client for '{item_id}' (Rule 5)."
@@ -1463,30 +1572,21 @@ class ContextCuratorAgent:
                         chosen_chunks = [
                             by_cid[cid] for cid in (cached.get("selected_chunk_ids") or []) if cid in by_cid
                         ]
-                        chosen_image_paths = self._select_role_tailored_image_paths(
+                        cached_media_raw = (
+                            cached.get("selected_media_paths")
+                            or cached.get("selected_image_paths")
+                            or decision.selected_media_paths
+                            or []
+                        )
+                        chosen_media_paths = self._select_curated_media_paths(
                             target_agent_role=target_agent_role,
                             item_kind=item_kind,
-                            curator_selected_paths=cached.get("selected_image_paths") or [],
+                            curator_selected_paths=cached_media_raw,
                             extra_image_paths=extra_image_paths,
                             cartridge_dir=self.cartridge_dir,
                             max_selected_images=max_selected_images,
                         )
-                        multimodal_parts: List[Any] = []
-                        for img_str in chosen_image_paths:
-                            p = Path(img_str)
-                            if not p.is_file() or p.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
-                                continue
-                            mime = "image/jpeg" if p.suffix.lower() in (".jpg", ".jpeg") else ("image/webp" if p.suffix.lower() == ".webp" else "image/png")
-                            n_low = p.name.lower()
-                            qa_overlay_note = ""
-                            if n_low.startswith("plate_"):
-                                qa_overlay_note = " [QA ALPHA INSPECTION PLATE: dark/light checkerboard grids and cyan bounding box are external QA overlays, NOT inside the sprite PNG]"
-                            elif n_low.startswith("anim_sheet_") or n_low.startswith("anim_rig_"):
-                                qa_overlay_note = " [QA ANIMATION CONTACT SHEET: dark checkerboard grid, cyan cell borders, and horizontal yellow/gold baseline ruler lines at the bottom of frames are external QA alignment guides, NOT inside the sprite sheet PNG]"
-                            elif "filmstrip" in n_low:
-                                qa_overlay_note = " [QA CONTACT SHEET: top/bottom '[QA] tick ...' / '[QA] pos=...' strips are external QA margins, NOT inside the 16:9 viewport]"
-                            multimodal_parts.append(f"CURATED REFERENCE / PROOF IMAGE ({p.name}){qa_overlay_note}:")
-                            multimodal_parts.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime))
+                        multimodal_parts = self._build_multimodal_parts_from_paths(chosen_media_paths)
                         if trace_dir is not None and safe_role != cache_role:
                             role_file = trace_dir / f"context_pack_{safe_role}.json"
                             if not role_file.is_file():
@@ -1499,6 +1599,7 @@ class ContextCuratorAgent:
                             multimodal_parts=multimodal_parts,
                             decision=decision,
                             retrieved_chunks=chosen_chunks,
+                            selected_media_paths=chosen_media_paths,
                         )
                 except Exception:
                     pass
@@ -1552,18 +1653,22 @@ class ContextCuratorAgent:
                     ranked_pairs.insert(0, (m_ch, prior_score))
                     candidate_chunks.insert(0, m_ch)
                     chunks_by_id[m_ch.chunk_id] = m_ch
-            effective_extra_images: List[str] = [
+            effective_extra_media: List[str] = [
                 str(ep)
                 for ep in (extra_image_paths or [])
-                if ep and Path(ep).is_file() and Path(ep).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+                if ep and Path(ep).is_file() and Path(ep).suffix.lower() in self._CURATOR_MEDIA_MIMES
             ]
             if trace_dir is not None and trace_dir.is_dir():
                 strip_candidates = [
                     p for p in sorted(trace_dir.glob("*filmstrip*.png")) if "_pass1." not in p.name.lower()
                 ] or sorted(trace_dir.glob("*filmstrip*.png"))
                 for strip_p in strip_candidates[-1:]:
-                    if str(strip_p) not in effective_extra_images:
-                        effective_extra_images.append(str(strip_p))
+                    if str(strip_p) not in effective_extra_media:
+                        effective_extra_media.append(str(strip_p))
+                clip_candidates = sorted(trace_dir.glob("*gameplay_clip*.mp4"))
+                for clip_p in clip_candidates[-1:]:
+                    if clip_p.stat().st_size <= self._CURATOR_INLINE_MAX_BYTES and str(clip_p) not in effective_extra_media:
+                        effective_extra_media.append(str(clip_p))
             if item_id:
                 for pinned_cid in (f"board:trace:{item_id}", f"board:item:{item_id}"):
                     for ch in all_chunks:
@@ -1575,10 +1680,10 @@ class ContextCuratorAgent:
                             if (
                                 ch.associated_image_path
                                 and Path(ch.associated_image_path).is_file()
-                                and Path(ch.associated_image_path).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+                                and Path(ch.associated_image_path).suffix.lower() in self._CURATOR_MEDIA_MIMES
                             ):
-                                if ch.associated_image_path not in effective_extra_images:
-                                    effective_extra_images.insert(0, ch.associated_image_path)
+                                if ch.associated_image_path not in effective_extra_media:
+                                    effective_extra_media.insert(0, ch.associated_image_path)
                             break
 
             # Traverse 1 hop of the code reference graph (direct imports & imported_by) from target modules
@@ -1635,37 +1740,39 @@ class ContextCuratorAgent:
                     if "[GRAPH-LINKED:" not in existing_ch.title:
                         existing_ch.title = f"{existing_ch.title} [GRAPH-LINKED: {rel_reason}]"
 
-            # Collect available multimodal images from candidate chunks + any explicit `extra_image_paths`
-            available_images: Dict[str, str] = {}
+            # Collect available multimodal media (.png/.jpg/.webp images, .wav cues, .mp4 gameplay clips)
+            available_media: Dict[str, str] = {}
             for c in candidate_chunks:
                 if (
                     c.associated_image_path
                     and Path(c.associated_image_path).is_file()
-                    and Path(c.associated_image_path).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+                    and Path(c.associated_image_path).suffix.lower() in self._CURATOR_MEDIA_MIMES
                 ):
-                    available_images[c.associated_image_path] = f"From {c.chunk_id} ({c.title})"
-            for ep in effective_extra_images:
-                if ep and Path(ep).is_file() and Path(ep).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
-                    available_images[str(ep)] = f"Captured proof / prior revision image ({Path(ep).name})"
+                    available_media[c.associated_image_path] = f"From {c.chunk_id} ({c.title})"
+            for ep in effective_extra_media:
+                if ep and Path(ep).is_file() and Path(ep).suffix.lower() in self._CURATOR_MEDIA_MIMES:
+                    available_media[str(ep)] = f"Captured proof / reference media ({Path(ep).name})"
 
             candidate_lines: List[str] = []
             for c, sim in ranked_pairs[:22]:
-                img_tag = f" | image={c.associated_image_path}" if c.associated_image_path else ""
+                media_tag = f" | media={c.associated_image_path}" if c.associated_image_path else ""
                 candidate_lines.append(
-                    f"--- CHUNK id='{c.chunk_id}' category='{c.category}' similarity={sim:.3f}{img_tag} ---\n"
+                    f"--- CHUNK id='{c.chunk_id}' category='{c.category}' similarity={sim:.3f}{media_tag} ---\n"
                     f"Title: {c.title}\n"
                     f"{c.content[:650]}\n"
                 )
 
-            images_block = (
-                "\n".join(f"  - path='{p}': {desc}" for p, desc in available_images.items())
-                if available_images
+            media_block = (
+                "\n".join(f"  - path='{p}': {desc}" for p, desc in available_media.items())
+                if available_media
                 else "  (none on disk yet)"
             )
-            mockup_guidance = (
-                "Select the 16:9 Concept Art Mockup image path ONLY when the task involves visual asset fabrication, "
-                "level layout (`level_map`), HUD/UI composition (`ui`), or full-scene integration (`integration`); "
-                "omit the Concept Art Mockup on backend mechanic code, QA test scripting, audio, or narrative tasks."
+            multimodal_guidance = (
+                "Attach visual mockups, proof filmstrips, audio cues (.wav), or gameplay clips (.mp4) ONLY when "
+                f"`{target_agent_role}`'s specific task genuinely benefits from seeing or hearing them (for example: "
+                "attaching the 16:9 Concept Art Mockup for visual/spatial/mood alignment, attaching reference `.wav` "
+                "cues or `.mp4` clips for perceptual audio/gameplay evaluation, or attaching the latest proof strip/clip "
+                "when inspecting or fixing a capture). Leave empty when text specs and code suffice."
             )
 
             prompt = (
@@ -1673,23 +1780,23 @@ class ContextCuratorAgent:
                 f"Your job is to inspect the semantically retrieved candidate chunk digests (spanning long-term game & agent memories "
                 f"`memory:*`, on-disk assets, Writers' Room council conversations, Game Bible & Rendering Strategy treatments, "
                 f"Production Board items, build execution traces `board:trace:*`, and GDScript code modules) and decide the exact "
-                f"high-signal context and multimodal images to inject for the target agent.\n\n"
+                f"high-signal context and multimodal media to inject for the target agent.\n\n"
                 f"TARGET AGENT ROLE: {target_agent_role} (canonical memory bank: '{norm_target_role}')\n"
                 f"WORK ITEM: id='{item_id}' kind='{item_kind}'\n"
                 f"TASK REQUEST / BRIEF:\n{task_request[:1800]}\n\n"
-                f"AVAILABLE MULTIMODAL IMAGES ON DISK (select up to {max_selected_images} relevant paths in `selected_image_paths`):\n"
-                f"{images_block}\n\n"
+                f"AVAILABLE MULTIMODAL MEDIA ON DISK (select up to {max_selected_images} relevant paths in `selected_media_paths` / `selected_image_paths`):\n"
+                f"{media_block}\n\n"
                 f"SEMANTICALLY RETRIEVED CANDIDATE CHUNK DIGESTS (select up to {max_selected_chunks} relevant `chunk_id`s in `selected_chunk_ids`; full chunk contents will be expanded automatically):\n"
                 + "\n".join(candidate_lines)
                 + "\nINSTRUCTIONS:\n"
-                f"1. Select ONLY the chunks (`selected_chunk_ids`, up to {max_selected_chunks}) that `{target_agent_role}` genuinely needs to execute or review `{item_id}` with high visual, mechanical, and architectural fidelity:\n"
+                f"1. Select ONLY the chunks (`selected_chunk_ids`, up to {max_selected_chunks}) that `{target_agent_role}` genuinely needs to execute or review `{item_id}` with high visual, acoustic, mechanical, and architectural fidelity:\n"
                 f"   - Inspect `memory:...` chunks (`game_memory` category—especially memories in `'council'`, `'{norm_target_role}'`, or listing `{norm_target_role}` in `Applicable Roles`) and ALWAYS select any long-term strategic goals, architectural decisions, or operational/verification lessons learned that apply to what `{target_agent_role}` is doing!\n"
                 f"   - Include `board:item:{item_id}` and `board:trace:{item_id}` when `{target_agent_role}` needs the task spec, prior revision diffs, or captured frame telemetry.\n"
                 f"   - Include only directly relevant Council utterances (`council:utterance:...`) or `design:...` treatments that govern this specific feature.\n"
-                f"   - Include relevant `asset:catalog:...` chunks when `{target_agent_role}` needs to know which sprites/rigs/props exist on disk.\n"
+                f"   - Include relevant `asset:catalog:...` chunks when `{target_agent_role}` needs to know which sprites, rigs, props, or audio cues exist on disk.\n"
                 f"   - Inspect `code:module:...` chunks (especially `[GRAPH-LINKED: ...]` modules directly imported by or importing the task's target files) and select only the modules that interact with this task.\n"
-                f"2. SMART MULTIMODAL IMAGE SELECTION (`selected_image_paths`, max {max_selected_images}): {mockup_guidance} Attach at most ONE latest captured proof filmstrip if inspecting or fixing a prior capture. Never attach sprite alpha-inspection plates (`plate_*.png`) for code or QA roles.\n"
-                f"3. STRICT EPISTEMIC NEUTRALITY IN `role_tailored_synthesis`: Your purpose is strictly to gather and organize context so `{target_agent_role}` can solve the problem—NOT to solve the problem, prescribe fixes, or judge proofs yourself! In `role_tailored_synthesis`, provide ONLY a concise factual inventory of the selected chunks, cross-file dependency links (`imports` / `imported_by`), and attached artifacts/telemetry. NEVER claim that a proof image or telemetry 'confirms', 'proves', or 'satisfies' a requirement, and NEVER tell `{target_agent_role}` what code to write or what verdict to reach.\n"
+                f"2. SMART MULTIMODAL MEDIA SELECTION (`selected_media_paths`, max {max_selected_images}): {multimodal_guidance} Never attach sprite alpha-inspection plates (`plate_*.png`) as SWE code-generation textures.\n"
+                f"3. STRICT EPISTEMIC NEUTRALITY IN `role_tailored_synthesis`: Your purpose is strictly to gather and organize context so `{target_agent_role}` can solve the problem—NOT to solve the problem, prescribe fixes, or judge proofs yourself! In `role_tailored_synthesis`, provide ONLY a concise factual inventory of the selected chunks, cross-file dependency links (`imports` / `imported_by`), and attached artifacts/telemetry. NEVER claim that a proof image, audio cue, or telemetry 'confirms', 'proves', or 'satisfies' a requirement, and NEVER tell `{target_agent_role}` what code to write or what verdict to reach.\n"
                 f"Provide `deliberation` FIRST."
             )
 
@@ -1724,33 +1831,20 @@ class ContextCuratorAgent:
             if not chosen_chunks and candidate_chunks:
                 chosen_chunks = candidate_chunks[: min(6, max_selected_chunks)]
 
-            # Resolve role-tailored multimodal image parts (capping and filtering by role & task kind)
-            chosen_image_paths = self._select_role_tailored_image_paths(
+            # Resolve LLM-selected multimodal media parts (.png/.jpg/.webp, .wav, .mp4)
+            chosen_media_paths = self._select_curated_media_paths(
                 target_agent_role=target_agent_role,
                 item_kind=item_kind,
-                curator_selected_paths=decision.selected_image_paths,
-                extra_image_paths=effective_extra_images,
+                curator_selected_paths=decision.selected_media_paths,
+                extra_image_paths=effective_extra_media,
                 cartridge_dir=self.cartridge_dir,
                 max_selected_images=max_selected_images,
             )
 
-            multimodal_parts = []
-            for img_str in chosen_image_paths:
-                p = Path(img_str)
-                if not p.is_file() or p.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
-                    continue
-                mime = "image/jpeg" if p.suffix.lower() in (".jpg", ".jpeg") else ("image/webp" if p.suffix.lower() == ".webp" else "image/png")
-                desc = available_images.get(img_str) or f"Attached image ({p.name})"
-                n_low = p.name.lower()
-                qa_overlay_note = ""
-                if n_low.startswith("plate_"):
-                    qa_overlay_note = " [QA ALPHA INSPECTION PLATE: dark/light checkerboard grids and cyan bounding box are external QA overlays, NOT inside the sprite PNG]"
-                elif n_low.startswith("anim_sheet_") or n_low.startswith("anim_rig_"):
-                    qa_overlay_note = " [QA ANIMATION CONTACT SHEET: dark checkerboard grid, cyan cell borders, and horizontal yellow/gold baseline ruler lines at the bottom of frames are external QA alignment guides, NOT inside the sprite sheet PNG]"
-                elif "filmstrip" in n_low:
-                    qa_overlay_note = " [QA CONTACT SHEET: top/bottom '[QA] tick ...' / '[QA] pos=...' strips are external QA margins, NOT inside the 16:9 viewport]"
-                multimodal_parts.append(f"CURATED REFERENCE / PROOF IMAGE ({p.name} — {desc}){qa_overlay_note}:")
-                multimodal_parts.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime))
+            multimodal_parts = self._build_multimodal_parts_from_paths(
+                chosen_media_paths,
+                available_descriptions=available_media,
+            )
 
             expanded_chosen_chunks: List[ContextChunk] = []
             for c in chosen_chunks:
@@ -1793,7 +1887,8 @@ class ContextCuratorAgent:
                     "total_indexed_chunks": len(all_chunks),
                     "candidate_chunk_ids": [c.chunk_id for c in candidate_chunks],
                     "selected_chunk_ids": [c.chunk_id for c in chosen_chunks],
-                    "selected_image_paths": chosen_image_paths,
+                    "selected_image_paths": chosen_media_paths,
+                    "selected_media_paths": chosen_media_paths,
                     "prompt_block": prompt_block,
                     "decision": decision.model_dump(),
                 }
@@ -1818,7 +1913,8 @@ class ContextCuratorAgent:
                             "target_agent_role": target_agent_role,
                             "role_tailored_synthesis": decision.role_tailored_synthesis,
                             "selected_chunk_ids": [c.chunk_id for c in chosen_chunks],
-                            "selected_image_paths": [Path(p).name for p in chosen_image_paths],
+                            "selected_image_paths": [Path(p).name for p in chosen_media_paths],
+                            "selected_media_paths": [Path(p).name for p in chosen_media_paths],
                             "total_indexed_chunks": len(all_chunks),
                         },
                     )
@@ -1830,6 +1926,7 @@ class ContextCuratorAgent:
                 multimodal_parts=multimodal_parts,
                 decision=decision,
                 retrieved_chunks=chosen_chunks,
+                selected_media_paths=chosen_media_paths,
             )
 
     def _expand_chunk_for_question(self, chunk: ContextChunk) -> ContextChunk:

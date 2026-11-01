@@ -605,7 +605,7 @@ export function formatElapsedDuration(elapsedSeconds: number): string {
   return `${mins}m ${String(secs).padStart(2, '0')}s`;
 }
 
-export function isWorkingBoardState(state: string): boolean {
+export function isActivelyExecutingBoardState(state: string): boolean {
   return (
     state === 'in_progress' ||
     state === 'waiting_for_lock' ||
@@ -613,12 +613,47 @@ export function isWorkingBoardState(state: string): boolean {
   );
 }
 
+export function isWorkingBoardState(state: string): boolean {
+  return (
+    state === 'in_progress' ||
+    state === 'waiting_for_lock' ||
+    state === 'awaiting_review' ||
+    state === 'changes_requested' ||
+    state === 'needs_decision' ||
+    state === 'failed'
+  );
+}
+
+/**
+ * Overall "Working" umbrella predicate: includes every non-cancelled task that has
+ * been picked up and has not yet been approved (`in_progress`, `waiting_for_lock`,
+ * `awaiting_review`, `changes_requested` / Revising, `failed` / `needs_decision`, plus
+ * any reviewed task temporarily `blocked` on a Council-spawned prerequisite).
+ * `ready` (Queued) items have not been picked up and must never appear in Working.
+ */
+export function isWorkingBoardItem(item: ProductionBoardItem): boolean {
+  if (
+    item.state === 'ready' ||
+    item.state === 'approved' ||
+    item.state === 'cancelled'
+  ) {
+    return false;
+  }
+  if (isWorkingBoardState(item.state)) {
+    return true;
+  }
+  if (item.state === 'blocked') {
+    return Array.isArray(item.revisions) && item.revisions.length > 0;
+  }
+  return false;
+}
+
 export function sortBoardItemsByPriority(
   items: ProductionBoardItem[],
   isBuildRunning: boolean,
 ): ProductionBoardItem[] {
-  const getRank = (state: string): number => {
-    switch (state) {
+  const getRank = (item: ProductionBoardItem): number => {
+    switch (item.state) {
       case 'in_progress':
         return 1;
       case 'waiting_for_lock':
@@ -633,7 +668,7 @@ export function sortBoardItemsByPriority(
       case 'ready':
         return 6;
       case 'blocked':
-        return 7;
+        return isWorkingBoardItem(item) ? 5.6 : 7;
       case 'approved':
         return 8;
       default:
@@ -642,7 +677,7 @@ export function sortBoardItemsByPriority(
   };
 
   return [...items].sort((a, b) => {
-    const rankDiff = getRank(a.state) - getRank(b.state);
+    const rankDiff = getRank(a) - getRank(b);
     if (rankDiff !== 0) return rankDiff;
     const prioA = typeof a.priority === 'number' ? a.priority : 100;
     const prioB = typeof b.priority === 'number' ? b.priority : 100;

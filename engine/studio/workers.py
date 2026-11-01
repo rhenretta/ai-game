@@ -219,6 +219,7 @@ class WorkerContext:
     client: Any = None
     visual_agent: Any = None
     voice_agent: Any = None
+    audio_evaluator: Any = None
     swe_agent: Any = None
     model_name: str = "gemini-3.8-flash"
     library_factory: Optional[Callable[..., Any]] = None
@@ -1568,6 +1569,7 @@ def plan_filmstrip(
             f"       4. STEP-BY-STEP `state_assertions`: Populate `state_assertions` for EACH link in the causal chain across ticks (e.g., tool slot selected -> structure placed count incremented `> baseline` -> intermediate interaction/ricochet count `> 0` -> final objective/delivery count `> baseline`), rather than only asserting on the final score at the last tick! That way, if any step fails in Pass 1, the telemetry pinpoints the exact link that needs adjustment.\n"
             f"   - REACTIVE TIMING TIP: When a secondary player input depends on dynamic physics or movement reaching a threshold, "
             f"populate `when_snapshot_key`, `when_operator` ('<=', '>=', '==', '!='), `when_value`, and `hold_ticks` on that `InputSegment`.\n"
+            f"   - AUDIOVISUAL CLIP RECORDING (`record_audiovisual_clip`): Leave `record_audiovisual_clip = False` by default; set `record_audiovisual_clip = True` when the Task Lead QA brief or proof strategy asks to capture a synchronized `.mp4` gameplay video+audio clip alongside the contact sheet so live in-game sound playback, synchronization, or mix balance can be perceptually evaluated.\n"
             f"   - LONG-TERM MEMORY SELECTIVITY: Leave `memory_updates` empty (`[]`) on routine QA runs! Never log single-task test steps or pass/fail status; record ONLY non-obvious harness constraints or verification invariants that future tasks/slices would otherwise trip over.\n"
             f"   - Use no input only if the item kind is a purely static layout preview. Provide `deliberation` FIRST.{retry}"
         )
@@ -1841,31 +1843,48 @@ def code_item_handler(ctx: WorkerContext) -> Callable[[WorkItem], WorkerResult]:
 # Iterative Task Lead Agent & Autonomous Domain Specialists
 # ---------------------------------------------------------------------------
 
-ALL_SPECIALIST_AGENTS = ("visual_artist", "audio_designer", "script_writer", "swe_engineer", "qa_test_engineer")
+ALL_SPECIALIST_AGENTS = (
+    "visual_artist",
+    "audio_designer",
+    "audio_evaluator",
+    "script_writer",
+    "swe_engineer",
+    "qa_test_engineer",
+)
 
 
 def available_specialists(ctx: WorkerContext, item: Optional[WorkItem] = None) -> List[str]:
     """Returns the autonomous domain specialists configured and available in `ctx` for `item`.
 
     Standalone asset fabrication tasks (`visual_asset`, `animation`, `audio_asset`) are scoped to their
-    asset fabrication specialists so they produce isolated asset files and inspection/waveform plates
+    asset fabrication/evaluation specialists so they produce isolated asset files and inspection/waveform plates
     without rewriting shared `.gd` gameplay scenes or hijacking `main.tscn` into a static showcase.
-    Gameplay, level, UI, and integration tasks have full access to all specialists (`visual_artist`,
-    `audio_designer`, `script_writer`, `swe_engineer`, `qa_test_engineer`).
+    Gameplay, level, UI, and integration tasks have full access to all configured specialists (`visual_artist`,
+    `audio_designer`, `audio_evaluator`, `script_writer`, `swe_engineer`, `qa_test_engineer`).
     """
     has_visual = ctx.library_factory is not None or ctx.visual_agent is not None or _is_live(ctx.client)
     has_audio = ctx.voice_agent is not None
+    has_audio_evaluator = ctx.audio_evaluator is not None or callable(
+        getattr(getattr(ctx.client, "interactions", None), "create", None)
+    )
     if item is not None and not item.revisions:
         if item.kind in ("visual_asset", "animation"):
             return ["visual_artist"] if has_visual else []
         if item.kind == "audio_asset":
-            return ["audio_designer"] if has_audio else []
+            aud_specs: List[str] = []
+            if has_audio:
+                aud_specs.append("audio_designer")
+            if has_audio_evaluator:
+                aud_specs.append("audio_evaluator")
+            return aud_specs
 
     specs: List[str] = []
     if has_visual:
         specs.append("visual_artist")
     if has_audio:
         specs.append("audio_designer")
+    if has_audio_evaluator:
+        specs.append("audio_evaluator")
     if _is_live(ctx.client):
         specs.append("script_writer")
     if ctx.swe_agent is not None and (
@@ -1975,6 +1994,147 @@ def run_audio_designer_specialist(
         summary=res.notes,
         touched_files=touched_wavs,
         proof_images=list(res.proof_images),
+    )
+
+
+def run_audio_evaluator_specialist(
+    ctx: WorkerContext,
+    item: WorkItem,
+    brief: str,
+    target_paths: Optional[List[str]] = None,
+    turn_index: int = 0,
+    collected_proofs: Optional[Sequence[str]] = None,
+    turn_history: Optional[Sequence[SpecialistReport]] = None,
+) -> SpecialistReport:
+    """Autonomous Perceptual Audio & Audiovisual Evaluator specialist: listens directly to synthesized `.wav`
+    cues and/or synchronized `.mp4` gameplay clips with Gemini native multimodal understanding, enriches
+    `perceptual_description` in the cartridge asset catalog when evaluating `.wav` assets, and returns an
+    open-ended perceptual report to the Task Lead."""
+    from engine.studio.audio_evaluator import (
+        AUDIO_MIME_BY_SUFFIX,
+        VIDEO_MIME_BY_SUFFIX,
+        AudioEvaluatorAgent,
+        classify_media_path,
+    )
+
+    def _resolve_candidate(raw_p: str) -> Optional[Path]:
+        s = str(raw_p or "").strip()
+        if not s:
+            return None
+        if s.startswith("res://"):
+            s = s[len("res://"):]
+        elif s.startswith("res:/"):
+            s = s[len("res:/"):]
+        p = Path(s)
+        if not p.is_absolute():
+            p = (Path(ctx.cartridge_dir) / s.lstrip("/")).resolve()
+        if p.is_file():
+            try:
+                classify_media_path(p)
+                return p
+            except StudioAgentError:
+                return None
+        return None
+
+    resolved_media: List[Path] = []
+    for tp in (target_paths or []):
+        cand = _resolve_candidate(tp)
+        if cand is not None and cand not in resolved_media:
+            resolved_media.append(cand)
+
+    has_audio_or_video = any(
+        p.suffix.lower() in AUDIO_MIME_BY_SUFFIX or p.suffix.lower() in VIDEO_MIME_BY_SUFFIX
+        for p in resolved_media
+    )
+    if not has_audio_or_video:
+        fallback_candidates: List[str] = []
+        for cp in reversed(list(collected_proofs or [])):
+            fallback_candidates.append(cp)
+        for rep in reversed(list(turn_history or [])):
+            for p_img in reversed(list(getattr(rep, "proof_images", None) or [])):
+                fallback_candidates.append(p_img)
+            for tf in reversed(list(getattr(rep, "touched_files", None) or [])):
+                fallback_candidates.append(tf)
+        item_dir = _item_dir(ctx, item)
+        safe_id = _safe_id(item.item_id)
+        clip_cand = item_dir / f"gameplay_clip_{safe_id}_rev{len(item.revisions)}.mp4"
+        if clip_cand.is_file():
+            fallback_candidates.append(str(clip_cand))
+        manifest_file = item_dir / f"synthesized_wavs_rev{len(item.revisions)}.json"
+        if manifest_file.is_file():
+            try:
+                for mp in reversed(json.loads(manifest_file.read_text(encoding="utf-8"))):
+                    fallback_candidates.append(str(mp))
+            except Exception:
+                pass
+        if item.revisions:
+            for prev_p in reversed(list(item.revisions[-1].proof_paths or [])):
+                fallback_candidates.append(prev_p)
+
+        for fc in fallback_candidates:
+            cand = _resolve_candidate(fc)
+            if cand is None or cand in resolved_media:
+                continue
+            sfx = cand.suffix.lower()
+            if sfx in AUDIO_MIME_BY_SUFFIX or sfx in VIDEO_MIME_BY_SUFFIX:
+                resolved_media.append(cand)
+                if len([x for x in resolved_media if x.suffix.lower() in AUDIO_MIME_BY_SUFFIX or x.suffix.lower() in VIDEO_MIME_BY_SUFFIX]) >= 3:
+                    break
+
+    has_audio_or_video = any(
+        p.suffix.lower() in AUDIO_MIME_BY_SUFFIX or p.suffix.lower() in VIDEO_MIME_BY_SUFFIX
+        for p in resolved_media
+    )
+    if not has_audio_or_video:
+        raise StudioAgentError(
+            f"Audio Evaluator specialist for item '{item.item_id}' found no existing audio (.wav/.mp3/.ogg/.flac) "
+            f"or audiovisual (.mp4/.webm) files to evaluate (target_paths={target_paths!r}). "
+            "Synthesize an audio asset with 'audio_designer', capture a synchronized gameplay clip via 'qa_test_engineer' "
+            "(with `record_audiovisual_clip=True`), or pass explicit existing media paths in `target_paths`."
+        )
+
+    record_turn_substep(
+        "evaluating_audio",
+        f"Listening to {[p.name for p in resolved_media]} via AudioEvaluatorAgent",
+        details={"media_files": [p.name for p in resolved_media]},
+        specialist_agent="audio_evaluator",
+    )
+    evaluator = ctx.audio_evaluator or AudioEvaluatorAgent(
+        client=ctx.client,
+        model_name=ctx.model_name,
+        event_callback=ctx.event_callback,
+    )
+    eval_report = evaluator.evaluate(
+        inquiry_prompt=brief,
+        media_paths=resolved_media,
+        curate_studio_context=True,
+        cartridge_dir=ctx.cartridge_dir,
+        item_id=item.item_id,
+        item_kind=item.kind,
+        board=ctx.board,
+        enrich_catalog=True,
+    )
+    eval_out_path = _item_dir(ctx, item) / f"audio_eval_turn{turn_index}_rev{len(item.revisions)}.json"
+    eval_out_path.parent.mkdir(parents=True, exist_ok=True)
+    eval_out_path.write_text(eval_report.model_dump_json(indent=2), encoding="utf-8")
+
+    ctx_obs_txt = "; ".join(eval_report.contextual_observations) if eval_report.contextual_observations else "none"
+    concerns_txt = "; ".join(eval_report.notable_concerns) if eval_report.notable_concerns else "none"
+    summary = (
+        f"Evaluated {[p.name for p in resolved_media]}. "
+        f"Rich Acoustic Description: {eval_report.rich_acoustic_description} | "
+        f"Contextual Observations: [{ctx_obs_txt}] | "
+        f"Notable Concerns: [{concerns_txt}] | "
+        f"Answer to Inquiry: {eval_report.answer_to_inquiry}"
+    )
+    return SpecialistReport(
+        deliberation=eval_report.deliberation,
+        turn_index=turn_index,
+        specialist_agent="audio_evaluator",
+        brief=brief,
+        summary=summary,
+        touched_files=[],
+        proof_images=[str(p) for p in resolved_media],
     )
 
 
@@ -2727,6 +2887,7 @@ def run_qa_test_engineer_specialist(
         strip_prefix = "level_filmstrip" if item.kind == "level_map" else "filmstrip"
         safe_id = _safe_id(item.item_id)
         out_strip_path = _item_dir(ctx, item) / f"{strip_prefix}_{safe_id}_rev{len(item.revisions)}.png"
+        out_clip_path = _item_dir(ctx, item) / f"gameplay_clip_{safe_id}_rev{len(item.revisions)}.mp4"
         qa_touched_files: List[str] = []
 
         def _stage_and_run_plan(cur_plan: FilmstripPlan) -> Tuple[Path, str, List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -2847,6 +3008,8 @@ def run_qa_test_engineer_specialist(
                     ("[SWE DIAGNOSTIC TEST SCENE REQUEST", "[COUNCIL DIAGNOSTIC TEST SCENE REQUEST")
                 )
             )
+            want_av_clip = bool(getattr(cur_plan, "record_audiovisual_clip", False))
+            target_av_clip = out_clip_path if want_av_clip else None
             with commit_gate_cm:
                 if ctx.filmstrip_fn is None:
                     cur_strip = capture_filmstrip(
@@ -2859,14 +3022,26 @@ def run_qa_test_engineer_specialist(
                         state_assertions=list(getattr(cur_plan, "state_assertions", None) or []),
                         target_scene=cur_resolved_scene,
                         verify_entrypoint_parity=(item.kind == "integration" and not is_diagnostic_probe),
+                        audiovisual_mp4_out_path=target_av_clip,
                     )
                 else:
-                    cur_strip = ctx.filmstrip_fn(
-                        ctx.cartridge_dir,
-                        ticks=list(cur_plan.capture_ticks),
-                        out_path=out_strip_path,
-                        input_script=cur_script,
-                    )
+                    import inspect
+
+                    fn_kwargs: Dict[str, Any] = {
+                        "ticks": list(cur_plan.capture_ticks),
+                        "out_path": out_strip_path,
+                        "input_script": cur_script,
+                    }
+                    if target_av_clip is not None:
+                        try:
+                            sig = inspect.signature(ctx.filmstrip_fn)
+                            if "audiovisual_mp4_out_path" in sig.parameters or any(
+                                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                            ):
+                                fn_kwargs["audiovisual_mp4_out_path"] = target_av_clip
+                        except (TypeError, ValueError):
+                            pass
+                    cur_strip = ctx.filmstrip_fn(ctx.cartridge_dir, **fn_kwargs)
             return cur_strip, cur_resolved_scene, cur_script, cur_setup_calls
 
         plan = plan_filmstrip(ctx, qa_item)
@@ -3024,6 +3199,10 @@ def run_qa_test_engineer_specialist(
         qa_briefing += f" QA Test Scene Summary for Council: {council_summary}"
     if overlays_strat:
         qa_briefing += f" QA Overlays & Telemetry Strategy: {overlays_strat}"
+    qa_proof_list: List[str] = [str(strip)]
+    if getattr(plan, "record_audiovisual_clip", False) and out_clip_path.is_file():
+        qa_proof_list.append(str(out_clip_path))
+        extra_qa += f" Recorded synchronized audiovisual clip: {out_clip_path.name}."
     summary = (
         f"Filmstrip ticks {plan.capture_ticks}.{qa_briefing}{extra_qa}{audit_block}"
     )
@@ -3034,7 +3213,7 @@ def run_qa_test_engineer_specialist(
         brief=brief,
         summary=summary,
         touched_files=qa_touched_files,
-        proof_images=[str(strip)],
+        proof_images=qa_proof_list,
         verification_passed=qa_passed,
     )
 
@@ -3207,6 +3386,33 @@ def _build_task_lead_multimodal_parts(
             if lead_media_res is not None
             else types.Part.from_bytes(data=p.read_bytes(), mime_type=mime)
         )
+
+    from engine.studio.audio_evaluator import AUDIO_MIME_BY_SUFFIX, INLINE_MEDIA_MAX_BYTES, VIDEO_MIME_BY_SUFFIX
+
+    audio_proofs = [
+        Path(p_str)
+        for p_str in collected_proofs
+        if Path(p_str).is_file()
+        and Path(p_str).suffix.lower() in AUDIO_MIME_BY_SUFFIX
+        and 0 < Path(p_str).stat().st_size <= INLINE_MEDIA_MAX_BYTES
+    ]
+    for ap in audio_proofs[-2:]:
+        a_mime = AUDIO_MIME_BY_SUFFIX[ap.suffix.lower()]
+        parts.append(f"CAPTURED PROOF AUDIO ({ap.name}):")
+        parts.append(types.Part.from_bytes(data=ap.read_bytes(), mime_type=a_mime))
+
+    video_proofs = [
+        Path(p_str)
+        for p_str in collected_proofs
+        if Path(p_str).is_file()
+        and Path(p_str).suffix.lower() in VIDEO_MIME_BY_SUFFIX
+        and 0 < Path(p_str).stat().st_size <= INLINE_MEDIA_MAX_BYTES
+    ]
+    for vp in video_proofs[-1:]:
+        v_mime = VIDEO_MIME_BY_SUFFIX[vp.suffix.lower()]
+        parts.append(f"CAPTURED PROOF VIDEO ({vp.name}):")
+        parts.append(types.Part.from_bytes(data=vp.read_bytes(), mime_type=v_mime))
+
     return parts
 
 
@@ -3338,7 +3544,7 @@ def plan_task_lead_turn(
 
     verified_modified_prod: List[str] = []
     for t_rep in turn_history:
-        if getattr(t_rep, "specialist_agent", "") == "qa_test_engineer":
+        if getattr(t_rep, "specialist_agent", "") in ("qa_test_engineer", "audio_evaluator"):
             continue
         for tf in (getattr(t_rep, "touched_files", None) or []):
             norm_tf = CartridgeFileLockTable.normalize_path(str(tf))
@@ -3378,6 +3584,9 @@ def plan_task_lead_turn(
         "audio_designer": (
             "  - 'audio_designer': synthesizes voice barks, SFX, or ambient loops and renders a waveform proof image (`waveform_*.png`).\n"
         ),
+        "audio_evaluator": (
+            "  - 'audio_evaluator': Perceptual Audio & Audiovisual Evaluator — listens directly to synthesized `.wav` files and/or synchronized `.mp4` gameplay clips using Gemini native multimodal perception, answers any open-ended `brief` question you ask about acoustic texture, timbral/world fit, voice delivery, event-to-sound synchronization, or mix balance, and records `perceptual_description` in the asset catalog.\n"
+        ),
         "script_writer": (
             "  - 'script_writer': Lead Scriptwriter & Narrative Dramatist — crafts scene scripts (`cutscenes`), branching `dialogue_trees`, "
             "contextual `dialogue_barks`, and character sheets into `narrative_bible.json` / `narrative.json` and produces a script table proof sheet (`script_sheet_*.png`).\n"
@@ -3386,7 +3595,7 @@ def plan_task_lead_turn(
             "  - 'swe_engineer': architects or modifies PRODUCTION GDScript modules (`.gd` outside `tests/`—NEVER `tests/test_*.gd`), world/level layouts, scenes, entities, or UI so `res://main.tscn` works natively under real player inputs/signals, and verifies headless engine compilation/boot.\n"
         ),
         "qa_test_engineer": (
-            "  - 'qa_test_engineer': EXCLUSIVELY owns and builds the Godot QA test scene (`res://tests/test_<item_id>.tscn` + `.gd`), strategizes read-only QA diagnostic overlays or telemetry (`overlays_and_telemetry_strategy`), executes external player inputs (`input_segments`, `mouse_world_pos`, `mouse_click_pos`, `state_assertions`, `capture_ticks`) verified against BOTH `res://tests/test_<item_id>.tscn` and live `res://main.tscn` (Counterfactual + Entrypoint Parity Gates), captures the filmstrip proof image, and authors `council_test_scene_summary`.\n"
+            "  - 'qa_test_engineer': EXCLUSIVELY owns and builds the Godot QA test scene (`res://tests/test_<item_id>.tscn` + `.gd`), strategizes read-only QA diagnostic overlays or telemetry (`overlays_and_telemetry_strategy`), executes external player inputs (`input_segments`, `mouse_world_pos`, `mouse_click_pos`, `state_assertions`, `capture_ticks`) verified against BOTH `res://tests/test_<item_id>.tscn` and live `res://main.tscn` (Counterfactual + Entrypoint Parity Gates), captures the filmstrip proof image (plus an optional synchronized `gameplay_clip_*.mp4` when your brief asks to verify live in-game audio), and authors `council_test_scene_summary`.\n"
         ),
     }
     from engine.studio.context_curator import ContextCuratorAgent, SelfInquiryQAPair, is_real_genai_client
@@ -3394,23 +3603,30 @@ def plan_task_lead_turn(
     available_spec_lines = "".join(spec_descriptions[s] for s in specialists if s in spec_descriptions)
     curated_lead_block = ""
     multimodal_parts: List[Any] = []
+    lead_supported_exts = (".png", ".jpg", ".jpeg", ".webp", ".wav", ".mp3", ".ogg", ".flac", ".mp4", ".webm")
     prior_rev_proofs: List[str] = []
     if item.revisions:
         for p in (item.revisions[-1].proof_paths or []):
-            if p and Path(p).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp") and p not in prior_rev_proofs:
+            if p and Path(p).suffix.lower() in lead_supported_exts and p not in prior_rev_proofs:
                 prior_rev_proofs.append(p)
     turn_proof_imgs: List[str] = []
     for t_rep in turn_history:
         for p_img in (getattr(t_rep, "proof_images", None) or []):
             if p_img and p_img not in turn_proof_imgs:
                 turn_proof_imgs.append(p_img)
-    current_turn_proofs = [
+    all_turn_media = [
         p
         for p in dict.fromkeys(list(collected_proofs) + turn_proof_imgs)
-        if p and Path(p).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+        if p and Path(p).suffix.lower() in lead_supported_exts
     ]
-    raw_lead_images = current_turn_proofs[-1:] if current_turn_proofs else prior_rev_proofs[-1:]
-    lead_image_paths = list(raw_lead_images)
+    current_turn_imgs = [p for p in all_turn_media if Path(p).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")]
+    current_turn_av = [p for p in all_turn_media if Path(p).suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp")]
+    raw_lead_images = (
+        (current_turn_imgs[-1:] + current_turn_av[-2:])
+        if all_turn_media
+        else prior_rev_proofs[-2:]
+    )
+    lead_image_paths = list(dict.fromkeys(raw_lead_images))
     active_curator: Optional[ContextCuratorAgent] = None
     already_included_cids: List[str] = []
     if is_real_genai_client(ctx.client):
@@ -3440,13 +3656,13 @@ def plan_task_lead_turn(
         if collected_proofs and pack.multimodal_parts:
             existing_labels = [p for p in multimodal_parts if isinstance(p, str)]
             extra_proof_parts = _build_task_lead_multimodal_parts(
-                ctx, list(collected_proofs)[-1:], item_kind=item.kind
+                ctx, list(collected_proofs)[-3:], item_kind=item.kind
             )
             for idx_p in range(0, len(extra_proof_parts), 2):
                 lbl = extra_proof_parts[idx_p]
                 if (
                     isinstance(lbl, str)
-                    and lbl.startswith("CAPTURED PROOF IMAGE")
+                    and lbl.startswith(("CAPTURED PROOF IMAGE", "CAPTURED PROOF AUDIO", "CAPTURED PROOF VIDEO"))
                     and idx_p + 1 < len(extra_proof_parts)
                 ):
                     m_fname = re.search(r"\(([^)—\]]+)", lbl)
@@ -3724,12 +3940,35 @@ def _dispatch_to_specialist(
     decision: TaskLeadDecision,
     turn_index: int,
     _lock_already_held: bool = False,
+    collected_proofs: Optional[Sequence[str]] = None,
+    turn_history: Optional[Sequence[SpecialistReport]] = None,
 ) -> SpecialistReport:
     spec_name = decision.specialist_agent
     if spec_name == "visual_artist":
         return run_visual_artist_specialist(ctx, item, decision.brief, decision.target_paths, turn_index=turn_index)
     if spec_name == "audio_designer":
         return run_audio_designer_specialist(ctx, item, decision.brief, decision.target_paths, turn_index=turn_index)
+    if spec_name == "audio_evaluator":
+        live_st = getattr(_ACTIVE_TURN_CTX, "state", None)
+        eff_proofs = (
+            collected_proofs
+            if collected_proofs is not None
+            else (live_st.get("_collected_proofs_ref") if isinstance(live_st, dict) else None)
+        )
+        eff_turns = (
+            turn_history
+            if turn_history is not None
+            else (live_st.get("_turn_history_ref") if isinstance(live_st, dict) else None)
+        )
+        return run_audio_evaluator_specialist(
+            ctx,
+            item,
+            decision.brief,
+            decision.target_paths,
+            turn_index=turn_index,
+            collected_proofs=eff_proofs,
+            turn_history=eff_turns,
+        )
     if spec_name == "script_writer":
         return run_script_writer_specialist(ctx, item, decision.brief, decision.target_paths, turn_index=turn_index)
     if spec_name == "swe_engineer":
@@ -4139,6 +4378,8 @@ def run_task_lead(
                 )
             if isinstance(getattr(_ACTIVE_TURN_CTX, "state", None), dict):
                 _ACTIVE_TURN_CTX.state["_task_baseline_snap_ref"] = task_baseline_snap
+                _ACTIVE_TURN_CTX.state["_collected_proofs_ref"] = list(collected_proofs)
+                _ACTIVE_TURN_CTX.state["_turn_history_ref"] = list(turn_history)
             try:
                 report = _dispatch_to_specialist(
                     ctx,
@@ -4350,7 +4591,7 @@ def run_task_lead(
 
     final_mod_prod: List[str] = []
     for t_rep in turn_history:
-        if getattr(t_rep, "specialist_agent", "") == "qa_test_engineer":
+        if getattr(t_rep, "specialist_agent", "") in ("qa_test_engineer", "audio_evaluator"):
             continue
         for tf in (getattr(t_rep, "touched_files", None) or []):
             norm_tf = CartridgeFileLockTable.normalize_path(str(tf))

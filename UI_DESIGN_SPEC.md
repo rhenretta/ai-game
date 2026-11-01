@@ -1,7 +1,7 @@
 # Studio Observability UI Design Specification (Requirement R5)
 **Document Version:** 2.0.0  
 **Status:** IMPLEMENTED  
-**Target Milestone:** M_UI → M17  
+**Target Milestone:** M_UI → M18  
 **Module Scope:** `studio-web/`, `engine/ui/server.py`, `engine/ui/models.py`  
 **Reference Requirements:** R1, R2, R3, R5  
 
@@ -430,7 +430,7 @@ During long-running autonomous game genesis builds, players and developers need 
 ## 11. Decoupled Blind Playtester Studio, Session History Archive & Replay Theatre
 
 ### 11.1 Overview, Zero-Leak Player Isolation & Skeptical Council Audit
-Mission Control includes a dedicated **🧪 Blind Playtester** workspace powered by `engine/playtest/` (`BlindPlaytesterAgent`, `GodotPlaytestBridge`, `PlaytestSessionManager`). Unlike internal QA smoke/filmstrip harnesses, the Blind Playtester experiences verified checkpoints strictly as a cold external human player—receiving **only** a Steam-style `BlindStoreCard` (`game_title` + short pitch), live 1280×720 viewport screenshots (with `0..1000` normalized screen-coordinate smooth cursor pointing and desktop pointer arrow parity), and captured in-game audio clips, with zero access to `.gd` source code, `GameBibleSpec`, `backlog.json`, or internal state dictionaries.
+Mission Control includes a dedicated **🧪 Blind Playtester** workspace powered by `engine/playtest/` (`BlindPlaytesterAgent`, `GodotPlaytestBridge`, `PlaytestSessionManager`). Unlike internal QA smoke/filmstrip harnesses, the Blind Playtester experiences verified checkpoints strictly as a cold external human player—receiving **only** a Steam-style `BlindStoreCard` (`game_title` + short pitch), live 1280×720 viewport screenshots (with `0..1000` normalized screen-coordinate smooth cursor pointing and desktop pointer arrow parity), and captured in-game audio clips (plus optional on-demand `2..20s` rolling gameplay `.mp4` soundscape evaluations via `PlaytestAudioEvaluationRequest` and `AudioEvaluatorAgent` with `curate_studio_context=False`), with zero access to `.gd` source code, `GameBibleSpec`, `backlog.json`, or internal state dictionaries.
 
 Sessions distinguish provenance via `initiated_by` (`"operator"` vs `"council"`), rendered in the session header and archive cards as **`[👤 Manual]`** or **`[🏛️ Council]`**:
 - **Manual Operator Runs (`initiated_by="operator"`)**: Persist sparse 6-pillar impressions, player field notes, open/answered questions, live bug reports, the end-of-session `PlaytestExperienceReport`, and the `1600×720` side-by-side broadcast MP4 (`replay.mp4`) for Mission Control inspection while keeping generated `PlaytestWishDraft` items in `status="pending"` until the operator explicitly forwards selected wishes (`POST /api/playtest/wishes/send-to-council`) or dispatches the **Full Playtest Experience Report** (`POST /api/playtest/sessions/{session_id}/send-report-to-council`).
@@ -507,6 +507,11 @@ Mission Control (`studio-web/src/`) unifies studio operations across 7 workspace
 ### 13.3 Live Post-Board Phase Observability & Tracked QA Self-Repair (`LiveActivityBanner.tsx`, `liveActivity.ts`)
 - `/api/studio/status` exposes `board_activity`, `writers_room_activity`, and `agent_activity` so `LiveActivityBanner.tsx` continuously displays the exact phase and specialist currently executing—even after all initial `ProductionBoard` items reach `approved` (covering **Slice Assembly Check**, **End-of-Slice Blind Playtest**, **5-Gate QA Slice Verification**, **Slice Reflection & Strategy**, and **Final Sign-Off Council**).
 - When `_run_slice_qa_gate_check` detects any Gate A–E defect, `build_qa_gate_work_item_proposal` raises a visible `qa_gate_pass*` work item directly onto `ProductionBoard` so self-repair runs transparently on the board with full `TaskChronologyDrawer`, `TurnDetailCard`, `PromptInspector`, and Council Proof Review observability.
+
+### 13.4 Production Board Working Lifecycle & Live Proof Showcase (`ProductionBoardView.tsx`, `WorkItemCard.tsx`, `boardCards.ts`, `liveActivity.ts`)
+- **Strict `Working` vs `Queued` Lifecycle Separation**: `isWorkingBoardItem` (`boardCards.ts`) groups only tasks that have been picked up and are not yet approved (`in_progress`, `waiting_for_lock`, `awaiting_review`, `changes_requested`, `failed`, `needs_decision`, and Council-reviewed `blocked` tasks waiting on newly spawned prerequisites). Unstarted `ready` items—even if they hold interrupted prior-attempt counters before Council submission—remain strictly under **`Queued`** (`ready`), while `ProductionBoard.requeue_failed` preserves `changes_requested` whenever Council revision feedback already exists.
+- **Scoped Live Step Counts & Cache-Busted Mid-Flight Proof Showcases**: `deriveLiveStudioActivity` (`liveActivity.ts`) filters live step entries strictly to active working board item IDs, while `WorkItemCard.tsx` fetches live chronology across `in_progress`, `waiting_for_lock`, and `changes_requested` and resolves card previews via `resolveCardProofShowcase`—skipping deleted/unlinked QA retry filmstrips and appending `&v=` cache-busting tokens so newly captured revision proofs render immediately.
+
 
 
 

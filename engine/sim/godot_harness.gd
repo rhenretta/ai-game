@@ -31,9 +31,18 @@ var setup_script: Array = []
 var _active_scripted_actions: Array[String] = []
 var _harness_cursor_pos: Vector2 = Vector2(640.0, 360.0)
 var _hovered_pickables: Dictionary = {}
+const AV_TARGET_AUDIO_HZ: int = 16000
+const AV_VIDEO_W: int = 640
+const AV_VIDEO_H: int = 360
 var script_error: String = ""
 var scripted_mode: bool = false
 var target_scene_override: String = ""
+var record_audiovisual_dir: String = ""
+var _av_audio_capture: AudioEffectCapture = null
+var _av_audio_mix_rate: float = 48000.0
+var _av_audio_resample_pos: float = 0.0
+var _av_rgb_file: FileAccess = null
+var _av_pcm_file: FileAccess = null
 
 func _init() -> void:
 	var args = OS.get_cmdline_args()
@@ -55,6 +64,8 @@ func _init() -> void:
 			_load_setup_script(String(args[i + 1]))
 		elif args[i] == "--scene" and i + 1 < args.size():
 			target_scene_override = String(args[i + 1]).strip_edges()
+		elif args[i] == "--record-audiovisual" and i + 1 < args.size():
+			record_audiovisual_dir = String(args[i + 1]).strip_edges()
 
 func _load_input_script(path: String) -> void:
 	var f = FileAccess.open(path, FileAccess.READ)
@@ -105,6 +116,16 @@ func _initialize() -> void:
 	render_viewport.physics_object_picking = false
 	render_viewport.gui_embed_subwindows = true
 	root.add_child(render_viewport)
+	if record_audiovisual_dir != "":
+		DirAccess.make_dir_recursive_absolute(record_audiovisual_dir)
+		_av_audio_mix_rate = float(AudioServer.get_mix_rate())
+		if _av_audio_mix_rate <= 0.0:
+			_av_audio_mix_rate = 48000.0
+		_av_audio_capture = AudioEffectCapture.new()
+		_av_audio_capture.buffer_length = 20.0
+		AudioServer.add_bus_effect(0, _av_audio_capture)
+		_av_rgb_file = FileAccess.open(record_audiovisual_dir.path_join("_harness_video_rgb24.raw"), FileAccess.WRITE)
+		_av_pcm_file = FileAccess.open(record_audiovisual_dir.path_join("_harness_audio.pcm"), FileAccess.WRITE)
 	var main_path = ProjectSettings.get_setting("application/run/main_scene", "res://main.tscn")
 	if target_scene_override != "":
 		var cand_scene = target_scene_override
@@ -196,6 +217,12 @@ func _process(_delta: float) -> bool:
 			max_player_y_reached = py
 
 	var did_capture_this_tick: bool = false
+	if record_audiovisual_dir != "":
+		_drain_av_audio_chunk()
+		if (current_tick - 1) % 4 == 0:
+			_append_av_video_frame()
+			did_capture_this_tick = true
+
 	if capture_ticks.has(current_tick):
 		_try_capture_viewport("res://assets/playtest_captures/filmstrip_%04d.png" % current_tick)
 		print("[QA_TICK_SNAPSHOT] " + JSON.stringify(live_snap))
@@ -1323,7 +1350,56 @@ func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
 	for child in node.get_children():
 		_walk_scene_audit(child, current_in_ui, report)
 
+func _drain_av_audio_chunk() -> void:
+	if _av_audio_capture == null or _av_pcm_file == null:
+		return
+	var avail: int = _av_audio_capture.get_frames_available()
+	if avail <= 0:
+		return
+	var raw_frames: PackedVector2Array = _av_audio_capture.get_buffer(avail)
+	var step_ratio: float = _av_audio_mix_rate / float(AV_TARGET_AUDIO_HZ)
+	var out_bytes := PackedByteArray()
+	var pos: float = _av_audio_resample_pos
+	var n_in: int = raw_frames.size()
+	while int(pos) < n_in:
+		var frame: Vector2 = raw_frames[int(pos)]
+		var mono: float = clampf((frame.x + frame.y) * 0.5, -1.0, 1.0)
+		var s16: int = clampi(int(round(mono * 32767.0)), -32768, 32767)
+		out_bytes.append(s16 & 0xFF)
+		out_bytes.append((s16 >> 8) & 0xFF)
+		pos += step_ratio
+	_av_audio_resample_pos = pos - float(n_in)
+	if _av_audio_resample_pos < 0.0:
+		_av_audio_resample_pos = 0.0
+	if out_bytes.size() > 0:
+		_av_pcm_file.store_buffer(out_bytes)
+
+func _append_av_video_frame() -> void:
+	if _av_rgb_file == null or DisplayServer.get_name() == "headless":
+		return
+	RenderingServer.force_draw(true)
+	var vp_tex = render_viewport.get_texture() if render_viewport != null else root.get_texture()
+	if vp_tex == null:
+		return
+	var img: Image = vp_tex.get_image()
+	if img == null or img.is_empty():
+		return
+	if img.is_compressed():
+		img.decompress()
+	if img.get_width() != AV_VIDEO_W or img.get_height() != AV_VIDEO_H:
+		img.resize(AV_VIDEO_W, AV_VIDEO_H, Image.INTERPOLATE_BILINEAR)
+	img.convert(Image.FORMAT_RGB8)
+	_av_rgb_file.store_buffer(img.get_data())
+
 func _emit_summary_and_exit() -> void:
+	if record_audiovisual_dir != "":
+		_drain_av_audio_chunk()
+		if _av_rgb_file != null:
+			_av_rgb_file.close()
+			_av_rgb_file = null
+		if _av_pcm_file != null:
+			_av_pcm_file.close()
+			_av_pcm_file = null
 	var samples: Array[int] = frame_times_usec if frame_times_usec.size() > 0 else fallback_frame_times_usec
 	var total_usec = 0.0
 	var max_usec = 0.0

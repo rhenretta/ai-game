@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   extractLatestRevisionSummary,
+  isActivelyExecutingBoardState,
+  isWorkingBoardItem,
   isWorkingBoardState,
   mergeLiveTurnState,
   resolveCardProofShowcase,
@@ -397,12 +399,42 @@ describe('boardCards domain helpers', () => {
     expect(preservedRevShowcase.sourceLabel).toBe('Rev #1 · Turn #6 · qa_test_engineer');
   });
 
-  it('treats in_progress, waiting_for_lock, and awaiting_review as active working states', () => {
+  it('treats Working as the overall umbrella for any task that has started and is not yet approved', () => {
     expect(isWorkingBoardState('in_progress')).toBe(true);
     expect(isWorkingBoardState('waiting_for_lock')).toBe(true);
     expect(isWorkingBoardState('awaiting_review')).toBe(true);
+    expect(isWorkingBoardState('changes_requested')).toBe(true);
+    expect(isWorkingBoardState('needs_decision')).toBe(true);
+    expect(isWorkingBoardState('failed')).toBe(true);
     expect(isWorkingBoardState('ready')).toBe(false);
     expect(isWorkingBoardState('blocked')).toBe(false);
     expect(isWorkingBoardState('approved')).toBe(false);
+
+    expect(isActivelyExecutingBoardState('in_progress')).toBe(true);
+    expect(isActivelyExecutingBoardState('changes_requested')).toBe(false);
+
+    // `ready` (Queued) items are NEVER in Working, even if an interrupted trace set attempt_count
+    expect(isWorkingBoardItem(makeItem({ state: 'ready' }))).toBe(false);
+    expect(isWorkingBoardItem(makeItem({ state: 'ready', attempt_count: 1, failure_count: 1 }))).toBe(
+      false,
+    );
+    // Unreviewed `blocked` items are NOT in Working (even if attempt_count > 0)
+    expect(isWorkingBoardItem(makeItem({ state: 'blocked' }))).toBe(false);
+    expect(isWorkingBoardItem(makeItem({ state: 'blocked', attempt_count: 1 }))).toBe(false);
+    // Revising (`changes_requested`) IS working
+    expect(isWorkingBoardItem(makeItem({ state: 'changes_requested', attempt_count: 1 }))).toBe(true);
+    // Reviewed item temporarily blocked on a Council-spawned prerequisite IS working until approved
+    expect(
+      isWorkingBoardItem(
+        makeItem({
+          state: 'blocked',
+          attempt_count: 1,
+          revisions: [{ revision_index: 0, verdict: 'request_changes', feedback: 'Spawned dep.' }],
+        }),
+      ),
+    ).toBe(true);
+    // Approved or cancelled items are NOT working
+    expect(isWorkingBoardItem(makeItem({ state: 'approved', attempt_count: 2 }))).toBe(false);
+    expect(isWorkingBoardItem(makeItem({ state: 'cancelled', attempt_count: 1 }))).toBe(false);
   });
 });

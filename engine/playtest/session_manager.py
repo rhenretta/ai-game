@@ -25,6 +25,7 @@ from engine.playtest.godot_bridge import (
     GodotPlaytestBridge,
     SidebarSegment,
     TurnObservation,
+    extract_recent_gameplay_clip_mp4,
     mux_broadcast_replay_mp4,
     render_turn_sidebar_png,
 )
@@ -2471,6 +2472,80 @@ class PlaytestSessionManager:
                 last_obs_wav_path = (
                     next_obs.wav_path if (next_obs.wav_path and not next_obs.audio_is_silent) else None
                 )
+
+                # Fulfill optional on-demand Blind Playtester audio evaluation (strict opaque-box isolation)
+                if decision.request_audio_evaluation is not None and not handle.stop_event.is_set():
+                    from engine.studio.audio_evaluator import AudioEvaluatorAgent
+
+                    audio_req = decision.request_audio_evaluation
+                    raw_mkv_cand = Path(getattr(bridge, "raw_game_mkv", media_dir / "raw_game_stream.mkv"))
+                    sess_pcm_cand = Path(getattr(bridge, "session_pcm_path", media_dir / "session_audio.pcm"))
+                    eval_media: List[Path] = []
+                    if raw_mkv_cand.is_file() and raw_mkv_cand.stat().st_size > 0:
+                        clip_out = extract_recent_gameplay_clip_mp4(
+                            raw_game_mkv=raw_mkv_cand,
+                            session_pcm_path=sess_pcm_cand,
+                            end_tick=next_obs.tick,
+                            lookback_seconds=audio_req.lookback_seconds,
+                            output_mp4_path=media_dir / f"audio_eval_turn_{turn_index:04d}.mp4",
+                        )
+                        eval_media.append(clip_out)
+                    elif next_obs.wav_path is not None and Path(next_obs.wav_path).is_file():
+                        eval_media.append(Path(next_obs.wav_path))
+                        if next_obs.screenshot_path is not None and Path(next_obs.screenshot_path).is_file():
+                            eval_media.append(Path(next_obs.screenshot_path))
+                    elif obs.wav_path is not None and Path(obs.wav_path).is_file():
+                        eval_media.append(Path(obs.wav_path))
+                        if obs.screenshot_path is not None and Path(obs.screenshot_path).is_file():
+                            eval_media.append(Path(obs.screenshot_path))
+                    else:
+                        raise PlaytestRunnerError(
+                            "Cannot fulfill request_audio_evaluation: neither raw gameplay video stream "
+                            "nor turn audio WAV exists on disk (Rule 5)."
+                        )
+
+                    opaque_ctx = (
+                        f"Game Title: {store_card.game_title}\n"
+                        f"Public Store Description: {store_card.game_description or '(No store description provided.)'}"
+                    )
+                    playtest_audio_eval = AudioEvaluatorAgent(
+                        client=agent.client,
+                        model_name=cfg.model_name,
+                    )
+                    audio_eval_report = playtest_audio_eval.evaluate(
+                        inquiry_prompt=audio_req.question,
+                        media_paths=eval_media,
+                        curate_studio_context=False,
+                        opaque_context_text=opaque_ctx,
+                        enrich_catalog=False,
+                        token_tracker=tracker,
+                    )
+                    queued_note = agent.queue_audio_evaluation_result(
+                        turn_index=turn_index,
+                        question=audio_req.question,
+                        lookback_seconds=audio_req.lookback_seconds,
+                        report=audio_eval_report,
+                    )
+                    sticky_feedback_items.append({
+                        "kind": "audio_eval",
+                        "turn_label": f"T#{turn_index}",
+                        "badge": f"AUDIO CHECK ({audio_req.lookback_seconds:.0f}s)",
+                        "text": audio_eval_report.answer_to_inquiry.strip(),
+                    })
+                    self._emit_event(
+                        "playtest_audio_evaluated",
+                        audio_eval_report.deliberation,
+                        {
+                            "session_id": session_id,
+                            "turn_index": turn_index,
+                            "video_timestamp_sec": round(next_obs.tick / 60.0, 3),
+                            "lookback_seconds": audio_req.lookback_seconds,
+                            "question": audio_req.question,
+                            "clip_name": eval_media[0].name,
+                            "queued_note": queued_note,
+                            "report": audio_eval_report.model_dump(),
+                        },
+                    )
 
                 # Render sticky HUD sidebar card spanning [tick_start .. next_obs.tick]
                 sidebar_png = render_turn_sidebar_png(
