@@ -2338,6 +2338,304 @@ def test_qa_specialist_rejects_self_recursive_test_script(tmp_path: Path) -> Non
         workers_mod.plan_filmstrip = orig_plan_fn
 
 
+def test_snapshot_text_preserves_active_items_after_many_approved_slices_and_surfaces_valid_ids():
+    from engine.studio.models import WorkItemProposal, WorkItemRefinement
+
+    board = ProductionBoard()
+    approved_batch = [
+        WorkItemProposal(
+            deliberation="Historical slice work item.",
+            item_id=f"slice_hist_item_{idx:02d}",
+            kind="mechanic_code",
+            title=f"Historical Slice Item {idx}",
+            spec="Historical spec content.",
+            proof_spec="Historical proof.",
+            target_modules=[
+                f"scenes/mechanics/system_{idx}_a.gd",
+                f"scenes/entities/entity_{idx}_b.gd",
+                f"scenes/ui/panel_{idx}_c.gd",
+            ],
+        )
+        for idx in range(55)
+    ]
+    board.add_items(approved_batch, "GameplayDesigner", slice_id="slice_0_foundation")
+    while True:
+        claimed = board.claim_ready(limit=20)
+        if not claimed:
+            break
+        for c in claimed:
+            board.submit_result(c.item_id, WorkerResult(notes="done"))
+            board.apply_review(review(c.item_id, "approve"))
+
+    next_slice_batch = [
+        WorkItemProposal(
+            deliberation="Active slice work item.",
+            item_id=f"slice_next_active_{idx:02d}",
+            kind="mechanic_code",
+            title=f"Next Slice Active Item {idx}",
+            spec="Active slice implementation spec.",
+            proof_spec="Active slice proof.",
+            target_modules=[f"scenes/mechanics/next_{idx}.gd"],
+        )
+        for idx in range(12)
+    ]
+    board.add_items(next_slice_batch, "CreativeDirector", slice_id="slice_1_expansion")
+
+    snap = board.snapshot_text()
+    for idx in range(12):
+        assert f"[slice_next_active_{idx:02d}]" in snap
+    assert "- APPROVED ITEMS (55):" in snap
+
+    prop_issues = board.validate_proposals(
+        [
+            WorkItemProposal(
+                deliberation="Companion visual item.",
+                item_id="companion_asset_pack",
+                kind="visual_asset",
+                title="Companion Asset Pack",
+                spec="Sprites.",
+                proof_spec="Plate.",
+                blocks_items=["nonexistent_slug_id"],
+            )
+        ]
+    )
+    assert any(
+        "blocks_items references unknown item 'nonexistent_slug_id'" in msg
+        and "slice_next_active_00" in msg
+        for msg in prop_issues
+    )
+
+    ref_issues = board.validate_refinements(
+        [
+            WorkItemRefinement(
+                deliberation="Attempted enrichment with wrong slug.",
+                item_id="nonexistent_slug_id",
+                action="enrich",
+                spec_addition_or_rewrite="Extra detail.",
+            )
+        ]
+    )
+    assert any(
+        "Cannot refine unknown item 'nonexistent_slug_id'" in msg
+        and "slice_next_active_00" in msg
+        for msg in ref_issues
+    )
+
+
+def test_resuming_drained_board_with_unfinished_slice_runs_blind_playtest_instead_of_next_slice(tmp_path: Path):
+    """Verifies that if all ProductionBoard items are approved and Slice Assembly already passed
+    (`slice_assembly:verified`), but the active slice still has `status='active'` (`bible.status='in_production'`)
+    because the end-of-slice Council Blind Playtest was interrupted, `run_writers_room` resumes directly into
+    `_run_end_of_slice_blind_playtest` for the unfinished slice instead of skipping it and expanding the next slice."""
+    from PIL import Image
+    from engine.studio.models import (
+        CoreLoopSpec,
+        EngagementPlan,
+        ExperienceStoryboardBeat,
+        GameBibleSpec,
+        GameSliceSpec,
+        GenesisWorldSpec,
+        GoalHierarchy,
+        GoalSpec,
+        LevelArchetypeSpec,
+        LevelGenerationStrategy,
+        OnboardingPlan,
+        OnboardingStep,
+        ReviewDecision,
+        WritersRoomUtterance,
+    )
+    from engine.studio.writers_room import CreativeWritersRoom
+
+    proof_img = tmp_path / "proof0.png"
+    Image.new("RGB", (64, 36), (30, 60, 90)).save(proof_img, "PNG")
+
+    board = ProductionBoard(tmp_path / "backlog.json")
+    board.add_items(
+        [P("slice1_item", kind="mechanic_code", modules=("main.gd",))],
+        "GameplaySystemsEngineer",
+        slice_id="slice_1_active_gate",
+    )
+    board.claim_ready()
+    board.submit_result("slice1_item", WorkerResult(proof_images=[str(proof_img)], notes="done"))
+    board.apply_review(ReviewDecision(deliberation="ok", item_id="slice1_item", verdict="approve"))
+    assert board.is_drained()
+
+    sched = BoardScheduler(board, {}, max_workers=1)
+    room = CreativeWritersRoom(
+        client=object(),
+        board=board,
+        scheduler=sched,
+        drain_poll_s=0.01,
+        drain_timeout_s=5.0,
+        max_parallel_calls=1,
+    )
+    room.max_assembly_passes = 2
+    room.max_blind_playtest_passes = 1
+
+    assembly_calls: list[int] = []
+    playtest_calls: list[tuple[str, int]] = []
+    expansion_calls: list[str] = []
+
+    def _spy_assembly(game_bible, dna_summary, candidate_dir, pass_index=0):
+        assembly_calls.append(pass_index)
+        return 0
+
+    def _spy_blind_playtest(game_bible, dna_summary, candidate_dir, pass_index=0):
+        active_s = game_bible.get_active_slice()
+        playtest_calls.append((active_s.slice_id if active_s else "", pass_index))
+        return 0
+
+    def _spy_expansion(*args, **kwargs):
+        expansion_calls.append("expanded")
+
+    room._run_slice_assembly_check = _spy_assembly
+    room._run_end_of_slice_blind_playtest = _spy_blind_playtest
+    room.run_slice_expansion = _spy_expansion
+
+    existing_bible = GameBibleSpec(
+        deliberation="d",
+        status="in_production",
+        game_title="Synthetic Shift",
+        core_genre="Simulation",
+        elevator_pitch="Operate a kinetic relay station.",
+        core_fantasy="Master high-throughput signal routing.",
+        first_60_seconds_hook="Route the opening pulse through node A.",
+        diegetic_ui_philosophy="Peripheral console readouts.",
+        visual_style_guide="Clean 2D schematics.",
+        audio_direction_guide="Crisp relay clicks.",
+        gameplay_pillars=["Signal routing", "Load balancing"],
+        level_generation_strategy=LevelGenerationStrategy(
+            deliberation="d",
+            generation_approach="Procedural sector grid",
+            world_structure="Connected relay sectors",
+            level_archetypes=[
+                LevelArchetypeSpec(
+                    deliberation="a1",
+                    archetype_id="sector_alpha",
+                    purpose="Core hub",
+                    visual_identity="Slate grid",
+                    signature_challenge="Steady throughput",
+                )
+            ],
+            generation_rules=["Spawn hub in sector 0"],
+            difficulty_and_pacing_curve="Scales with active relays.",
+        ),
+        core_loop=CoreLoopSpec(
+            deliberation="d",
+            player_verbs=["Place", "Link", "Tune"],
+            player_agency_and_optimization_depth="Trade latency against bandwidth.",
+            moment_to_moment_loop="Connect relay -> observe pulse.",
+            minute_to_minute_loop="Stabilize sector load.",
+            session_loop="Complete multi-sector network.",
+        ),
+        onboarding_plan=OnboardingPlan(
+            deliberation="d",
+            world_introduction="Central relay hub view.",
+            purpose_and_stakes_framing="Power the beacon before overload.",
+            causal_chain_and_feedback_strategy="Line glow reflects load.",
+            steps=[
+                OnboardingStep(deliberation="s0", step_index=0, concept_introduced="Place", diegetic_method="Ghost"),
+                OnboardingStep(deliberation="s1", step_index=1, concept_introduced="Link", diegetic_method="Trace"),
+                OnboardingStep(deliberation="s2", step_index=2, concept_introduced="Tune", diegetic_method="Dial"),
+            ],
+        ),
+        goal_hierarchy=GoalHierarchy(
+            deliberation="d",
+            goals=[
+                GoalSpec(deliberation="g1", goal_id="g_short", horizon="short_term", description="Link 1 node", reward="Power"),
+                GoalSpec(deliberation="g2", goal_id="g_mid", horizon="mid_term", description="Stabilize hub", reward="Tier 2"),
+                GoalSpec(deliberation="g3", goal_id="g_long", horizon="long_term", description="Full grid", reward="Mastery"),
+            ],
+            progression_structure="Sector milestones.",
+        ),
+        engagement_plan=EngagementPlan(
+            deliberation="d",
+            entertainment_pillars=["Tactile routing", "Throughput puzzles"],
+            variety_injectors=["Surge events"],
+            pacing_and_intensity_curve="Steady escalation.",
+        ),
+        experience_storyboard=[
+            ExperienceStoryboardBeat(
+                deliberation="b1",
+                beat_index=0,
+                phase_title="Boot",
+                player_emotional_state="Curiosity",
+                sensory_and_camera_staging="Hub overview",
+                diegetic_teaching_moment="Pulse indicator",
+                narrative_integration="Station online",
+            ),
+        ],
+        slice_roadmap=[
+            GameSliceSpec(
+                deliberation="d",
+                slice_id="slice_0_boot",
+                slice_index=0,
+                title="Slice 0",
+                slice_objective="Initial boot",
+                player_acclimation_and_mechanics_focus="Basic link",
+                status="completed",
+            ),
+            GameSliceSpec(
+                deliberation="d",
+                slice_id="slice_1_active_gate",
+                slice_index=1,
+                title="Slice 1",
+                slice_objective="Throughput expansion",
+                player_acclimation_and_mechanics_focus="Load balancing",
+                status="active",
+            ),
+        ],
+        active_slice_index=1,
+        writers_room_transcript=[
+            WritersRoomUtterance(
+                deliberation="d",
+                turn_index=0,
+                speaker_role="CreativeDirector",
+                speaker_display_name="Creative Director",
+                spoken_dialogue="Locked Living Game Bible for production",
+                bible_updates_summary=["Locked Living Game Bible for production"],
+            ),
+            WritersRoomUtterance(
+                deliberation="Assembly verified.",
+                turn_index=1,
+                speaker_role="GameplaySystemsEngineer",
+                speaker_display_name="Lead Gameplay & Godot Systems Engineer",
+                spoken_dialogue="Slice assembly verified cleanly.",
+                bible_updates_summary=["slice_assembly:verified"],
+            ),
+        ],
+        world_spec=GenesisWorldSpec(
+            deliberation="d",
+            game_title="Synthetic Shift",
+            core_genre="Simulation",
+            thematic_premise="Kinetic relay operation.",
+            aesthetic_style="Clean 2D",
+            palette_mood="vibrant_fantasy",
+            world_lore="Signal grid.",
+            conflict_tone="tactical_methodical",
+            conflict_narrative="Prevent grid overload.",
+            gameplay_pacing="methodical",
+            pacing_score=0.5,
+            target_difficulty=0.5,
+            mechanics_guidelines=["Balance throughput."],
+        ),
+    )
+
+    try:
+        res_bible = room.run_writers_room(existing_bible=existing_bible, candidate_dir=tmp_path)
+    finally:
+        sched.stop()
+
+    assert assembly_calls == []
+    assert playtest_calls == [("slice_1_active_gate", 0)]
+    assert expansion_calls == []
+    assert len(res_bible.slice_roadmap) == 2
+    assert res_bible.slice_roadmap[1].status == "completed"
+    assert res_bible.status == "locked"
+
+
+
+
 
 
 

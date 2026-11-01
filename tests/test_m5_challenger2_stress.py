@@ -705,7 +705,11 @@ class TestEpistemicModelOrderingAndDebranding:
             PROJECT_ROOT / "run_studio.py",
             PROJECT_ROOT / "engine" / "ui" / "models.py",
             PROJECT_ROOT / "engine" / "ui" / "server.py",
-            PROJECT_ROOT / "engine" / "ui" / "static" / "index.html",
+            PROJECT_ROOT / "studio-web" / "index.html",
+            *[
+                p for p in sorted((PROJECT_ROOT / "studio-web" / "src").rglob("*"))
+                if p.is_file() and p.suffix in {".ts", ".tsx", ".css"}
+            ],
         ]
 
         forbidden = "".join(chr(c) for c in (106, 111, 97, 110))

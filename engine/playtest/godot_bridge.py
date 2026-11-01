@@ -387,12 +387,16 @@ class GodotPlaytestBridge:
         self._ctrl_conn: Optional[socket.socket] = None
         self._godot_proc: Optional[subprocess.Popen] = None
         self._ffmpeg_proc: Optional[subprocess.Popen] = None
+        self._stdout_lines: List[str] = []
         self._stderr_lines: List[str] = []
+        self._ffmpeg_stderr_lines: List[str] = []
+        self._stdout_thread: Optional[threading.Thread] = None
         self._stderr_thread: Optional[threading.Thread] = None
+        self._ffmpeg_stderr_thread: Optional[threading.Thread] = None
         self._closed = False
         self.last_tick: int = 0
 
-    def start(self, boot_timeout_sec: float = 25.0) -> TurnObservation:
+    def start(self, boot_timeout_sec: float = 45.0) -> TurnObservation:
         """Stages the isolated runtime, boots Godot + live H.264 stream capture, and returns Turn 0 observation."""
         if not RUNNER_SCRIPT_PATH.is_file():
             raise PlaytestRunnerError(f"Playtest GDScript runner missing at {RUNNER_SCRIPT_PATH}")
@@ -435,6 +439,7 @@ class GodotPlaytestBridge:
             ff_cmd = [
                 ffmpeg_bin,
                 "-y",
+                "-loglevel", "warning",
                 "-f", "rawvideo",
                 "-pix_fmt", "rgb24",
                 "-s", "1280x720",
@@ -452,7 +457,15 @@ class GodotPlaytestBridge:
                 ff_cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
             )
+            self._ffmpeg_stderr_thread = threading.Thread(
+                target=self._drain_ffmpeg_stderr_worker,
+                name="FfmpegPlaytestStderr",
+                daemon=True,
+            )
+            self._ffmpeg_stderr_thread.start()
             time.sleep(0.12)
 
         # 3. Launch silent background Godot 4.3 process
@@ -499,6 +512,12 @@ class GodotPlaytestBridge:
             text=True,
             bufsize=1,
         )
+        self._stdout_thread = threading.Thread(
+            target=self._drain_stdout_worker,
+            name="GodotPlaytestStdout",
+            daemon=True,
+        )
+        self._stdout_thread.start()
         self._stderr_thread = threading.Thread(
             target=self._drain_stderr_worker,
             name="GodotPlaytestStderr",
@@ -519,13 +538,21 @@ class GodotPlaytestBridge:
             return self._wait_for_observation(timeout_sec=boot_timeout_sec)
         except Exception as exc:
             stderr_tail = "\n".join(self._stderr_lines[-30:])
+            ff_tail = "\n".join(self._ffmpeg_stderr_lines[-15:])
+            diag_parts = []
+            if stderr_tail:
+                diag_parts.append(f"Godot stderr:\n{stderr_tail}")
+            if ff_tail:
+                diag_parts.append(f"ffmpeg stderr:\n{ff_tail}")
+            diag_block = "\n".join(diag_parts)
             self.close()
             if isinstance(exc, PlaytestRunnerError):
-                if stderr_tail and stderr_tail not in str(exc):
-                    raise PlaytestRunnerError(f"{exc}\nGodot stderr:\n{stderr_tail}") from exc
+                if diag_block and diag_block not in str(exc):
+                    raise PlaytestRunnerError(f"{exc}\n{diag_block}") from exc
                 raise
             raise PlaytestRunnerError(
-                f"Failed booting Godot Blind Playtester runner: {exc}\nGodot stderr:\n{stderr_tail}"
+                f"Failed booting Godot Blind Playtester runner: {exc}"
+                + (f"\n{diag_block}" if diag_block else "")
             ) from exc
 
     def step_action(self, action: PlaytestMotorAction, timeout_sec: float = 30.0) -> TurnObservation:
@@ -604,6 +631,20 @@ class GodotPlaytestBridge:
         if silent_clock_avi.exists():
             silent_clock_avi.unlink(missing_ok=True)
 
+    def _drain_stdout_worker(self) -> None:
+        proc = self._godot_proc
+        if proc is None or proc.stdout is None:
+            return
+        try:
+            for line in proc.stdout:
+                clean = line.rstrip("\r\n")
+                if clean:
+                    self._stdout_lines.append(clean)
+                    if len(self._stdout_lines) > 100:
+                        self._stdout_lines = self._stdout_lines[-100:]
+        except Exception:
+            pass
+
     def _drain_stderr_worker(self) -> None:
         proc = self._godot_proc
         if proc is None or proc.stderr is None:
@@ -615,6 +656,20 @@ class GodotPlaytestBridge:
                     self._stderr_lines.append(clean)
                     if len(self._stderr_lines) > 200:
                         self._stderr_lines = self._stderr_lines[-200:]
+        except Exception:
+            pass
+
+    def _drain_ffmpeg_stderr_worker(self) -> None:
+        proc = self._ffmpeg_proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            for line in proc.stderr:
+                clean = line.rstrip("\r\n")
+                if clean:
+                    self._ffmpeg_stderr_lines.append(clean)
+                    if len(self._ffmpeg_stderr_lines) > 100:
+                        self._ffmpeg_stderr_lines = self._ffmpeg_stderr_lines[-100:]
         except Exception:
             pass
 

@@ -995,23 +995,45 @@ class StudioOrchestrator:
                             (staging_dir / "artifacts" / "proofs").glob("filmstrip_slice_assembly_check_pass*.png")
                         ) if (staging_dir / "artifacts" / "proofs").is_dir() else False
                         needs_next_slice_iteration = False
-                        if self._is_live_genai_client() and (staging_dir / "game_bible.json").is_file():
+                        if (staging_dir / "game_bible.json").is_file():
                             try:
                                 gb_check = GameBibleSpec.model_validate_json(
                                     (staging_dir / "game_bible.json").read_text(encoding="utf-8")
                                 )
-                                target_s = (
-                                    int(self.writers_room.target_slices)
-                                    if getattr(self.writers_room, "target_slices", None) is not None
-                                    else max(2, int(os.environ.get("STUDIO_TARGET_SLICES", "2")))
+                                has_unfinished_slice = bool(
+                                    str(getattr(gb_check, "status", "") or "").lower() != "locked"
+                                    and gb_check.slice_roadmap
+                                    and any(
+                                        str(getattr(s, "status", "") or "").lower() in ("active", "in_progress")
+                                        for s in gb_check.slice_roadmap
+                                    )
                                 )
-                                completed_s = sum(
-                                    1 for s in (gb_check.slice_roadmap or []) if getattr(s, "status", "") == "completed"
-                                )
-                                if len(gb_check.slice_roadmap or []) < target_s or completed_s < target_s:
+                                if has_unfinished_slice:
                                     needs_next_slice_iteration = True
+                                elif self._is_live_genai_client():
+                                    target_s = (
+                                        int(self.writers_room.target_slices)
+                                        if getattr(self.writers_room, "target_slices", None) is not None
+                                        else max(2, int(os.environ.get("STUDIO_TARGET_SLICES", "2")))
+                                    )
+                                    completed_s = sum(
+                                        1 for s in (gb_check.slice_roadmap or []) if getattr(s, "status", "") == "completed"
+                                    )
+                                    ver_file = staging_dir / "verification_report.json"
+                                    bible_file = staging_dir / "game_bible.json"
+                                    slice_already_promoted = bool(
+                                        ver_file.is_file()
+                                        and ver_file.stat().st_mtime >= bible_file.stat().st_mtime - 2.0
+                                    )
+                                    if (
+                                        len(gb_check.slice_roadmap or []) < target_s
+                                        or completed_s < target_s
+                                        or (getattr(self, "_resume_current_requested", False) and slice_already_promoted)
+                                    ):
+                                        needs_next_slice_iteration = True
                             except Exception:
-                                needs_next_slice_iteration = True
+                                if self._is_live_genai_client():
+                                    needs_next_slice_iteration = True
                         has_resume_feedback = bool(
                             getattr(self, "_creative_prompt", None)
                             or getattr(self.writers_room, "_pending_steering", None)
@@ -2438,6 +2460,7 @@ class StudioOrchestrator:
         for json_name in [
             "manifest.json",
             "game_bible.json",
+            "game_memory.json",
             "world_spec.json",
             "requirements_spec.json",
             "narrative_bible.json",
@@ -3013,6 +3036,96 @@ class StudioOrchestrator:
             episode_number=plan.target_episode,
             max_retries=self.config.max_retries,
         )
+
+        # When a Continuous Production Board cartridge fails final QA verification (e.g. on a resumed build
+        # or post-slice integration), escalate remediation onto the Production Board rather than mutating off-board!
+        use_wr_escalation = (
+            self.enable_writers_room
+            if self.enable_writers_room is not None
+            else self._is_live_genai_client()
+        )
+        max_board_qa_escalations = max(1, min(2, int(getattr(self.config, "max_retries", 2) or 2)))
+        qa_esc_idx = 0
+        while (
+            not bool(getattr(report, "promoted_to_active", False))
+            and getattr(report, "rejection_trace", None) is not None
+            and use_wr_escalation
+            and self._continuous_production_enabled()
+            and (staging_dir / "backlog.json").is_file()
+            and qa_esc_idx < max_board_qa_escalations
+        ):
+            from engine.supervisor.supervisor import build_qa_gate_work_item_proposal
+
+            trace_esc = report.rejection_trace
+            pb_esc = self._build_production_board(staging_dir)
+            gb_esc: Optional[GameBibleSpec] = self.active_game_bible
+            if gb_esc is None and (staging_dir / "game_bible.json").is_file():
+                try:
+                    gb_esc = GameBibleSpec.model_validate_json((staging_dir / "game_bible.json").read_text(encoding="utf-8"))
+                except Exception:
+                    gb_esc = None
+            last_slice_id = ""
+            if gb_esc is not None and gb_esc.slice_roadmap:
+                active_or_last = gb_esc.get_active_slice() or gb_esc.slice_roadmap[-1]
+                last_slice_id = getattr(active_or_last, "slice_id", "") or ""
+            qa_prop = build_qa_gate_work_item_proposal(
+                candidate_dir=staging_dir,
+                trace=trace_esc,
+                pass_index=100 + qa_esc_idx,
+                slice_id=last_slice_id,
+                existing_item_ids={it.item_id for it in pb_esc.items()},
+            )
+            added_esc = pb_esc.add_items(
+                [qa_prop],
+                raised_by_role="QATestEngineer",
+                slice_id=last_slice_id,
+            )
+            if not added_esc:
+                break
+            if gb_esc is not None:
+                from engine.studio.models import WritersRoomUtterance
+
+                t_idx = len(gb_esc.writers_room_transcript)
+                esc_utt = WritersRoomUtterance(
+                    deliberation=qa_prop.deliberation,
+                    utterance_id=f"utt_{t_idx:02d}_QATestEngineer_final_qa_esc_{qa_esc_idx}",
+                    turn_index=t_idx,
+                    speaker_role="QATestEngineer",
+                    speaker_display_name="QA & Build Supervisor",
+                    spoken_dialogue=(
+                        f"[Final 5-Gate QA Escalation #{qa_esc_idx + 1}] {trace_esc.failure_gate} flagged: "
+                        f"{trace_esc.failure_reason} Created Production Board task `{qa_prop.item_id}` ({qa_prop.title}) "
+                        f"for Task Lead execution and Specialist Council sign-off before promotion."
+                    ),
+                    addressed_to=["GameplaySystemsEngineer", "CreativeDirector"],
+                    bible_updates_summary=[f"backlog:+{it.item_id}" for it in added_esc],
+                )
+                gb_esc.writers_room_transcript.append(esc_utt)
+                self.writers_room._persist_bible(gb_esc, candidate_dir=staging_dir)
+
+            qa_esc_idx += 1
+            if StudioBuildState.SYNTHESIZING in self.ALLOWED_TRANSITIONS.get(self.state, set()):
+                self.transition_to(
+                    StudioBuildState.SYNTHESIZING,
+                    f"Escalating {trace_esc.failure_gate} remediation task '{qa_prop.item_id}' onto Production Board...",
+                )
+            dna_esc = context.raw_outputs.get("dna")
+            gb_esc = self.run_writers_room_session(
+                dna=dna_esc,
+                staging_dir=staging_dir,
+                target_episode=plan.target_episode,
+                existing_bible=gb_esc,
+            )
+            if StudioBuildState.VERIFYING in self.ALLOWED_TRANSITIONS.get(self.state, set()):
+                self.transition_to(
+                    StudioBuildState.VERIFYING,
+                    f"Re-verifying candidate cartridge '{staging_dir.name}' across 5 Quality Gates after board remediation...",
+                )
+            report = supervisor.evaluate_and_heal(
+                candidate_or_spec=staging_dir,
+                episode_number=plan.target_episode,
+                max_retries=1,
+            )
 
         delib_sup = getattr(report, "deliberation", None)
         if not isinstance(delib_sup, str) or not delib_sup.strip():

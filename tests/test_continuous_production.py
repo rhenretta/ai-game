@@ -3559,9 +3559,11 @@ def test_drained_board_resume_rearms_continuous_mode_sanitizes_schema_and_surfac
     StudioOrchestrator._rmtree_force(locked_dir)
     assert not locked_dir.exists()
 
-    # 4. Verify UI error banner only suppresses board-item errors after full board approval, never non-item errors
-    ui_html = (Path(__file__).resolve().parent.parent / "engine" / "ui" / "static" / "index.html").read_text(encoding="utf-8")
-    assert "const staleBoardItemErrAfterFullApproval = allBoardApproved && Boolean(_lastBuildError && _lastBuildError.item_id);" in ui_html
+    # 4. Verify React UI error domain module only suppresses board-item errors after full board approval, never non-item errors
+    errors_ts = (Path(__file__).resolve().parent.parent / "studio-web" / "src" / "domain" / "errors.ts").read_text(encoding="utf-8")
+    assert "export function shouldSurfaceBuildError(" in errors_ts
+    assert "lastError.item_id" in errors_ts
+    assert "activeItems.every((it) => it.state === 'approved')" in errors_ts
 
 
 def test_turn_epistemic_context_untruncated_and_collapsible_prompt_sections():
@@ -3598,9 +3600,326 @@ def test_turn_epistemic_context_untruncated_and_collapsible_prompt_sections():
     assert state_holder["lead_curated_context"] == long_curated
     assert state_holder["curated_context"] == long_curated
 
-    ui_html = (Path(__file__).resolve().parent.parent / "engine" / "ui" / "static" / "index.html").read_text(encoding="utf-8")
-    assert "function parsePromptIntoCollapsibleSections(" in ui_html
-    assert "function formatCollapsiblePromptViewerHtml(" in ui_html
+    prompt_parser_ts = (Path(__file__).resolve().parent.parent / "studio-web" / "src" / "domain" / "promptParser.ts").read_text(encoding="utf-8")
+    prompt_inspector_tsx = (Path(__file__).resolve().parent.parent / "studio-web" / "src" / "components" / "PromptInspector.tsx").read_text(encoding="utf-8")
+    assert "export function parsePromptIntoSections(" in prompt_parser_ts
+    assert "parsePromptIntoSections" in prompt_inspector_tsx
+
+
+def test_qa_gate_self_repair_spawns_board_tasks_and_blocks_off_board_mutation(tmp_path: Path):
+    """Verifies that:
+    1. BuildSupervisor.evaluate_and_heal NEVER invokes off-board swe_agent.repair_cartridge_code when backlog.json exists.
+    2. CreativeWritersRoom._drain_backlog runs 5-Gate QA verification (_run_slice_qa_gate_check), spawns a tracked
+       WorkItem on ProductionBoard when a gate fails, executes + Council-approves it, re-verifies clean, and then completes the slice.
+    3. verify_gate_d_frame_budget reports truthful steady-state vs spike diagnostics.
+    """
+    from types import SimpleNamespace
+    from engine.studio.models import (
+        GameBibleSpec,
+        GameSliceSpec,
+        ReviewBatch,
+        ReviewDecision,
+        WorkItemProposal,
+    )
+    from engine.studio.production_board import BoardScheduler, ProductionBoard, WorkerResult
+    from engine.studio.writers_room import CreativeWritersRoom
+    from engine.supervisor.models import GateFailureType, QualityGateResult, RejectionDiagnosticTrace, RemedyType
+    from engine.supervisor.supervisor import BuildSupervisor
+
+    cand_dir = tmp_path / "candidate_board_qa"
+    cand_dir.mkdir(parents=True)
+    (cand_dir / "project.godot").write_text("[application]\nconfig/name=\"Synthetic\"\nrun/main_scene=\"res://main.tscn\"\n", encoding="utf-8")
+    (cand_dir / "main.tscn").write_text("[gd_scene load_steps=2 format=3]\n[ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n[node name=\"Main\" type=\"Node2D\"]\nscript = ExtResource(\"1\")\n", encoding="utf-8")
+    (cand_dir / "main.gd").write_text("extends Node2D\nfunc _ready() -> void:\n\tpass\n", encoding="utf-8")
+
+    board = ProductionBoard(cand_dir / "backlog.json")
+    seed_item = board.add_items(
+        [
+            WorkItemProposal(
+                deliberation="Seed initial core mechanic task.",
+                item_id="core_loop_seed",
+                kind="mechanic_code",
+                title="Core Loop Seed",
+                spec="Build deterministic tick state.",
+                proof_spec="Show tick progression.",
+                target_modules=["main.gd"],
+                slice_id="slice_0",
+            )
+        ],
+        raised_by_role="GameplaySystemsEngineer",
+        slice_id="slice_0",
+    )[0]
+    claimed_seed = board.claim_ready()
+    board.submit_result(claimed_seed[0].item_id, WorkerResult(proof_images=[], notes="Implemented core loop"))
+    board.apply_review(
+        ReviewDecision(
+            deliberation="Seed item approved.",
+            validation_criteria_for_my_role="Core loop deterministic.",
+            item_id=seed_item.item_id,
+            verdict="approve",
+            feedback="Approved.",
+        )
+    )
+
+    # 1. BuildSupervisor must NOT call swe_agent.repair_cartridge_code off-board when backlog.json exists
+    off_board_calls = []
+
+    class SpySWE:
+        def repair_cartridge_code(self, *args, **kwargs):
+            off_board_calls.append((args, kwargs))
+            return {}
+
+    sup = BuildSupervisor(
+        cartridges_root=tmp_path,
+        active_cartridge_dir=tmp_path / "active",
+        swe_agent=SpySWE(),
+        max_retries=3,
+    )
+    sup.evaluate_candidate_cartridge = lambda **kw: (
+        {
+            "gate_d": QualityGateResult(
+                deliberation="Spike failure.",
+                gate_name="Gate D: Frame Budget",
+                passed=False,
+                failure_type=GateFailureType.FRAME_BUDGET_EXCEEDED,
+                details="Steady-state average 7.48ms <= 16.60ms, but frame spike exceeded budget.",
+            )
+        },
+        RejectionDiagnosticTrace(
+            deliberation="Gate D rejected build.",
+            candidate_id=cand_dir.name,
+            episode_number=0,
+            attempt_number=1,
+            failure_gate="Gate D: Frame Budget",
+            failure_type=GateFailureType.FRAME_BUDGET_EXCEEDED,
+            failure_reason="Steady-state average 7.48ms <= 16.60ms, but frame spike exceeded budget.",
+            remedy_type=RemedyType.OPTIMIZE_FRAME_LOOP,
+            recommended_remedy="Eliminate spike allocation in main.gd.",
+        ),
+    )
+    eval_report = sup.evaluate_and_heal(cand_dir, max_retries=3)
+    assert eval_report.promoted_to_active is False
+    assert eval_report.attempt_count == 1
+    assert off_board_calls == [], "Board-managed cartridge must never mutate files off-board via swe_agent.repair_cartridge_code!"
+
+    # 2. Gate D diagnostic accuracy check
+    real_sup = BuildSupervisor()
+    healthy_res = real_sup.verify_gate_d_frame_budget(
+        SimpleNamespace(avg_frame_time_ms=7.48, p95_frame_time_ms=9.2, max_frame_time_ms=14.1, frame_budget_passed=True)
+    )
+    assert healthy_res.passed is True
+    spike_res = real_sup.verify_gate_d_frame_budget(
+        SimpleNamespace(avg_frame_time_ms=7.48, p95_frame_time_ms=34.0, max_frame_time_ms=82.0, frame_budget_passed=False)
+    )
+    assert spike_res.passed is False
+    assert "7.48ms > 16.60ms" not in spike_res.details
+    assert "7.48ms <= 16.60ms" in spike_res.details
+
+    # 3. Drain loop spawns ProductionBoard task on QA gate failure, runs worker + Council review, and re-verifies clean
+    executed_ids = []
+
+    def _worker(item):
+        executed_ids.append(item.item_id)
+        proof_p = cand_dir / "artifacts" / "proofs" / f"{item.item_id}.png"
+        proof_p.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (32, 32), (10, 20, 30)).save(proof_p)
+        return WorkerResult(
+            proof_images=[str(proof_p)],
+            notes=f"Resolved QA gate task {item.item_id}",
+        )
+
+    scheduler = BoardScheduler(board, {"mechanic_code": _worker, "integration": _worker}, max_workers=1)
+    events = []
+    room = CreativeWritersRoom(
+        client=object(),
+        board=board,
+        scheduler=scheduler,
+        event_callback=lambda et, pl: events.append((et, pl)),
+    )
+    room.max_assembly_passes = 0
+    room.max_blind_playtest_passes = 0
+    room.max_qa_gate_passes = 2
+
+    qa_calls = []
+
+    def _fake_qa_eval(c_path: Path, pass_idx: int):
+        qa_calls.append(pass_idx)
+        if len(qa_calls) == 1:
+            return (
+                {},
+                RejectionDiagnosticTrace(
+                    deliberation="Gate C runtime exception detected on pass 0.",
+                    candidate_id=c_path.name,
+                    episode_number=0,
+                    attempt_number=1,
+                    failure_gate="Gate C: Headless Execution & Progression",
+                    failure_type=GateFailureType.UNHANDLED_EXCEPTION,
+                    failure_reason="Invalid get index 'velocity' in res://main.gd:12",
+                    file_path="main.gd",
+                    line_number=12,
+                    remedy_type=RemedyType.REPAIR_CODE_EXCEPTION,
+                    recommended_remedy="Guard node property lookup in main.gd.",
+                ),
+            )
+        return ({}, None)
+
+    room.qa_gate_evaluator_fn = _fake_qa_eval
+    room._review_as = lambda role, awaiting, needing, *a, **kw: ReviewBatch(
+        deliberation="Council panel approves QA remediation proof.",
+        spoken_dialogue="QA gate remediation verified cleanly.",
+        review_decisions=[
+            ReviewDecision(
+                deliberation="QA gate fix verified cleanly.",
+                validation_criteria_for_my_role="Runtime error eliminated and gameplay intact.",
+                item_id=it.item_id,
+                verdict="approve",
+                feedback="Approved.",
+            )
+            for it in awaiting
+        ],
+        cap_decisions=[],
+    )
+
+    bible = GameBibleSpec(
+        deliberation="Synthetic test bible.",
+        cartridge_id=cand_dir.name,
+        target_episode=0,
+        status="in_production",
+        game_title="Synthetic Vector Sandbox",
+        core_genre="simulation",
+        slice_roadmap=[
+            GameSliceSpec(
+                deliberation="Slice 0 spec.",
+                slice_id="slice_0",
+                slice_index=0,
+                title="Slice 0",
+                slice_objective="Playable core loop.",
+                player_acclimation_and_mechanics_focus="Controls.",
+                status="active",
+            )
+        ],
+        active_slice_index=0,
+    )
+
+    try:
+        room._drain_backlog(bible, "Synthetic DNA", cand_dir)
+    finally:
+        scheduler.stop()
+
+    assert len(qa_calls) == 2
+    assert len(executed_ids) == 1
+    spawned_id = executed_ids[0]
+    assert spawned_id.startswith("qa_gate_c_")
+    spawned_item = next(it for it in board.items() if it.item_id == spawned_id)
+    assert spawned_item.state == "approved"
+    assert "main.gd" in spawned_item.target_modules
+    assert bible.slice_roadmap[0].status == "completed"
+    assert any(u.speaker_role == "QATestEngineer" and spawned_id in u.spoken_dialogue for u in bible.writers_room_transcript)
+    assert [pl["passed"] for et, pl in events if et == "slice_qa_gate_check_completed"] == [False, True]
+
+
+def test_swe_symbol_index_excludes_item_tests_and_orders_static_prefix_first(tmp_path: Path):
+    """Verifies _build_cartridge_symbol_index excludes historical per-item tests/test_*.gd files (keeping
+    tests/test_authored_beats.gd) and debug_and_patch_pev_cycle places the shared static prefix at token 0
+    across Phase 1 and Phase 2 hops for Gemini implicit prefix cache hits.
+    """
+    from types import SimpleNamespace
+    from engine.studio.models import CodeSliceRequest, DebugResearchPlan, SurgicalCodePatch, SurgicalPatchPayload
+    from engine.studio.swe import LeadGameplaySWEAgent
+
+    (tmp_path / "project.godot").write_text("[application]\nrun/main_scene=\"res://main.tscn\"\n", encoding="utf-8")
+    (tmp_path / "main.gd").write_text(
+        "extends Node2D\nvar counter: int = 0\nfunc _process(delta: float) -> void:\n\tcounter += 1\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_authored_beats.gd").write_text("extends SceneTree\nfunc _initialize() -> void:\n\tquit(0)\n", encoding="utf-8")
+    for idx in range(12):
+        (tests_dir / f"test_mechanic_item_{idx:02d}.gd").write_text(
+            f"extends SceneTree\nfunc _initialize() -> void:\n\tvar x_{idx} = {idx}\n\tquit(0)\n",
+            encoding="utf-8",
+        )
+
+    captured_prompts = []
+
+    class FakeModels:
+        def generate_content(self, model, contents, config):
+            prompt_str = contents[0] if isinstance(contents, list) else str(contents)
+            captured_prompts.append(prompt_str)
+            schema = getattr(config, "response_schema", None)
+            if schema is DebugResearchPlan:
+                payload = DebugResearchPlan(
+                    deliberation="Inspect main.gd _process.",
+                    root_cause_hypothesis="Increment step needs clamping.",
+                    slice_requests=[
+                        CodeSliceRequest(
+                            deliberation="Read main.gd lines 1..4",
+                            filename="main.gd",
+                            start_line=1,
+                            end_line=4,
+                        )
+                    ],
+                )
+                return SimpleNamespace(text=payload.model_dump_json(), usage_metadata=None)
+            # Hop 1 requests an extra slice; Hop 2 emits patch
+            if len(captured_prompts) == 2:
+                payload = SurgicalPatchPayload(
+                    deliberation="Need one more slice before patching.",
+                    patches=[],
+                    additional_slice_requests=[
+                        CodeSliceRequest(
+                            deliberation="Confirm top of main.gd",
+                            filename="main.gd",
+                            start_line=1,
+                            end_line=4,
+                        )
+                    ],
+                )
+                return SimpleNamespace(text=payload.model_dump_json(), usage_metadata=None)
+            payload = SurgicalPatchPayload(
+                deliberation="Apply surgical increment fix.",
+                patches=[
+                    SurgicalCodePatch(
+                        deliberation="Clamp counter in _process.",
+                        filename="main.gd",
+                        start_line=4,
+                        end_line=4,
+                        replacement_code="\tcounter = min(counter + 1, 1000)",
+                    )
+                ],
+                additional_slice_requests=[],
+            )
+            return SimpleNamespace(text=payload.model_dump_json(), usage_metadata=None)
+
+    swe = LeadGameplaySWEAgent(client=SimpleNamespace(models=FakeModels()))
+    sym_idx = swe._build_cartridge_symbol_index(tmp_path)
+    assert "main.gd" in sym_idx
+    assert "tests/test_authored_beats.gd" in sym_idx
+    assert "test_mechanic_item_00.gd" not in sym_idx
+
+    swe._is_live_genai_client = lambda: True
+    import engine.sim.godot_verifier as gv
+    orig_verify = gv.verify_godot_cartridge_syntax
+    gv.verify_godot_cartridge_syntax = lambda *a, **kw: (True, [])
+    try:
+        patched = swe.debug_and_patch_pev_cycle(
+            c_dir=tmp_path,
+            defect_summary="Counter grows unbounded in main.gd.",
+            max_pev_cycles=1,
+        )
+    finally:
+        gv.verify_godot_cartridge_syntax = orig_verify
+
+    assert "main.gd" in patched
+    assert len(captured_prompts) == 3  # Phase 1 + Phase 2 Hop 1 + Phase 2 Hop 2
+    common_prefix_anchor = "--- DEFECT TO RESOLVE ---\nCounter grows unbounded in main.gd."
+    idx0 = captured_prompts[0].index(common_prefix_anchor) + len(common_prefix_anchor)
+    # Token 0 through DEFECT TO RESOLVE must be 100% byte-identical across all 3 LLM calls!
+    assert captured_prompts[0][:idx0] == captured_prompts[1][:idx0] == captured_prompts[2][:idx0]
+    assert captured_prompts[0].startswith("You are the Lead Gameplay SWE Agent performing surgical Godot 4 (.gd) debugging")
+    assert "--- CARTRIDGE SYMBOL & REFERENCE INDEX ---" in captured_prompts[0][:idx0]
+
 
 
 

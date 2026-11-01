@@ -1,134 +1,81 @@
 """tests/test_ui_static_index.py
-Test specifications for Feature 29 & 30: Mission Control Single Page Application.
-Verifies zero-build frontend, 7 mandatory DOM IDs, 9 agent SVG layout,
-5-state lifecycle CSS, and real-time streaming contracts.
+Test specifications for the Mission Control React Frontend (`studio-web/`) and API root contract,
+and retirement of the legacy monolithic `engine/ui/static/index.html` UI.
 """
+import inspect
 from pathlib import Path
 import pytest
-from engine.ui.server import STATIC_DIR
+from starlette.testclient import TestClient
 
-INDEX_PATH = STATIC_DIR / "index.html"
-
-MANDATORY_DOM_IDS = [
-    "agent-dag-canvas",
-    "deliberation-stream",
-    "tool-invocations-list",
-    "btn-trigger-genesis",
-    "telemetry-heatmap",
-    "voice-preview-player",
-    "code-diff-container",
-]
-
-AUTHORITATIVE_9_AGENTS = [
-    "StudioOrchestrator",
-    "SteamAndTelemetryAnalystAgent",
-    "CreativeDirectorWorldbuilderAgent",
-    "NarrativeCharacterWriterAgent",
-    "VoiceActingAudioProducerAgent",
-    "VisualArtSpriteDesignerAgent",
-    "LeadGameplaySWEAgent",
-    "TelemetryArchitectAgent",
-    "QAPlaytesterBuildSupervisor",
-]
-
-LIFECYCLE_STATES = ["idle", "analyzing", "synthesizing", "verifying", "promoted"]
+import config
+from engine.sim.godot_verifier import GodotHeadlessSimulator
+import engine.ui.server as ui_server
+from engine.ui.server import STUDIO_WEB_DIR, create_app
 
 
-class TestMissionControlSinglePageApp:
-    """Verifies Feature 29 & 30 Mission Control HTML/CSS/JS contracts."""
+class TestStudioWebFrontendArchitecture:
+    """Verifies legacy static HTML UI removal, studio-web React SPA structure, and root serving contracts."""
 
-    def test_static_index_file_exists_and_well_formed(self):
-        """F29.1: index.html exists, is HTML5 well-formed, and contains required title."""
-        assert INDEX_PATH.exists(), f"Missing static file at {INDEX_PATH}"
-        content = INDEX_PATH.read_text(encoding="utf-8")
-        assert content.strip().startswith("<!DOCTYPE html>")
-        assert "<title>Mission Control</title>" in content
-        assert "Autonomous Game Studio — Mission Control" in content
+    def test_legacy_static_html_retired(self):
+        """Ensures engine/ui/static and engine/ui/static/index.html are permanently removed."""
+        legacy_static_dir = config.PROJECT_ROOT / "engine" / "ui" / "static"
+        assert not legacy_static_dir.exists(), f"Legacy static UI directory must not exist: {legacy_static_dir}"
 
-    def test_all_seven_mandatory_dom_ids_present(self):
-        """F29.1: Enforces that all 7 required DOM elements exist with exact IDs."""
-        content = INDEX_PATH.read_text(encoding="utf-8")
-        for dom_id in MANDATORY_DOM_IDS:
-            assert f'id="{dom_id}"' in content, f"Mandatory DOM element missing: '{dom_id}'"
+    def test_studio_web_entrypoint_and_workspaces_exist(self):
+        """Verifies studio-web index.html and core React workspace views exist."""
+        index_html = STUDIO_WEB_DIR / "index.html"
+        assert index_html.is_file(), f"Missing studio-web index.html at {index_html}"
+        html_text = index_html.read_text(encoding="utf-8")
+        assert html_text.strip().lower().startswith("<!doctype html>")
+        assert "<title>Autonomous Game Studio — Mission Control</title>" in html_text
+        assert '<div id="root"></div>' in html_text
+        assert 'src="/src/main.tsx"' in html_text
 
-    def test_nine_agent_nodes_present_in_svg_dag(self):
-        """F29.2: Verifies all 9 studio agent personas are represented in SVG DAG."""
-        content = INDEX_PATH.read_text(encoding="utf-8")
-        for agent in AUTHORITATIVE_9_AGENTS:
-            assert f'id="node-{agent}"' in content or f'data-agent="{agent}"' in content, (
-                f"Agent persona '{agent}' missing from SVG DAG in index.html"
-            )
+        required_views = [
+            STUDIO_WEB_DIR / "src" / "App.tsx",
+            STUDIO_WEB_DIR / "src" / "features" / "board" / "ProductionBoardView.tsx",
+            STUDIO_WEB_DIR / "src" / "features" / "writers-room" / "WritersRoomView.tsx",
+            STUDIO_WEB_DIR / "src" / "features" / "bible" / "GameBibleView.tsx",
+            STUDIO_WEB_DIR / "src" / "features" / "memory" / "GameMemoryView.tsx",
+            STUDIO_WEB_DIR / "src" / "features" / "assets" / "AssetsAndCodeView.tsx",
+            STUDIO_WEB_DIR / "src" / "features" / "playtest" / "PlaytestLabView.tsx",
+            STUDIO_WEB_DIR / "src" / "features" / "dna" / "PlayerDnaView.tsx",
+            STUDIO_WEB_DIR / "src" / "realtime" / "useSwarmSocket.ts",
+        ]
+        for view_path in required_views:
+            assert view_path.is_file(), f"Expected React view missing: {view_path}"
 
-    def test_svg_dag_canvas_dimensions_and_viewbox(self):
-        """F29.2: Verifies SVG canvas has width=800 and height=400 as required by tests."""
-        content = INDEX_PATH.read_text(encoding="utf-8")
-        assert 'id="agent-dag-canvas"' in content
-        assert 'width="800"' in content
-        assert 'height="400"' in content
-        assert 'viewBox="0 0 800 400"' in content
+    def test_root_endpoint_dev_json_and_production_dist_serving(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Verifies GET / returns Rationale-First JSON when unbuilt and serves dist/index.html when compiled."""
+        empty_dist = tmp_path / "dist_missing"
+        monkeypatch.setattr(ui_server, "STUDIO_WEB_DIST_DIR", empty_dist)
+        client = TestClient(create_app(db_path=tmp_path / "t.db", cartridges_root=tmp_path / "carts"))
+        res_dev = client.get("/")
+        assert res_dev.status_code == 200
+        body = res_dev.json()
+        assert list(body.keys())[0] == "deliberation"
+        assert body["status"] == "ok"
+        assert "ui_url" in body
 
-    def test_five_lifecycle_states_css_styling_present(self):
-        """F29.2: Verifies CSS rules exist for all 5 lifecycle states."""
-        content = INDEX_PATH.read_text(encoding="utf-8")
-        for state in LIFECYCLE_STATES:
-            assert f"state-{state}" in content, f"Missing CSS class for state-{state}"
-        assert "@keyframes" in content, "Missing animation keyframes for status pulses"
+        built_dist = tmp_path / "dist_built"
+        (built_dist / "assets").mkdir(parents=True, exist_ok=True)
+        (built_dist / "index.html").write_text("<!doctype html><title>Autonomous Game Studio — Mission Control</title>", encoding="utf-8")
+        (built_dist / "assets" / "app.js").write_text("console.log('ready');", encoding="utf-8")
+        monkeypatch.setattr(ui_server, "STUDIO_WEB_DIST_DIR", built_dist)
 
-    def test_deliberation_terminal_styling_and_epistemic_prominence(self):
-        """F29.3: Verifies terminal-log class and Rule 4 deliberation formatting."""
-        content = INDEX_PATH.read_text(encoding="utf-8")
-        assert 'class="terminal-log"' in content or 'terminal-log' in content
-        assert "deliberation" in content.lower()
-        assert 'id="stream-search"' in content
-        assert 'id="agent-filter"' in content
+        client_prod = TestClient(create_app(db_path=tmp_path / "t2.db", cartridges_root=tmp_path / "carts2"))
+        res_prod = client_prod.get("/")
+        assert res_prod.status_code == 200
+        assert "text/html" in res_prod.headers["content-type"]
+        assert "Autonomous Game Studio — Mission Control" in res_prod.text
 
-    def test_tool_invocations_container_and_cards(self):
-        """F29.3: Verifies tool invocation cards show inputs, outputs, errors, and PEV status."""
-        content = INDEX_PATH.read_text(encoding="utf-8")
-        assert 'id="tool-invocations-list"' in content
-        assert "pev" in content.lower()
+        res_asset = client_prod.get("/assets/app.js")
+        assert res_asset.status_code == 200
+        assert "ready" in res_asset.text
 
-    def test_websocket_auto_reconnect_and_resilience_logic(self):
-        """F29.4: Verifies WebSocket reconnection backoff and endpoint fallback in JS."""
-        content = INDEX_PATH.read_text(encoding="utf-8")
-        assert "/ws/swarm" in content
-        assert "/ws/stream" in content
-        assert "reconnect" in content.lower() or "retry" in content.lower()
-        assert "studio-status-badge" in content
-
-    def test_palette_and_diff_containers_present(self):
-        """F30: Verifies 16-color Style Bible palette container and live code diff viewer."""
-        content = INDEX_PATH.read_text(encoding="utf-8")
-        assert 'id="palette-grid"' in content
-        assert 'id="code-diff-container"' in content
-        assert 'id="voice-preview-player"' in content
-
-    def test_zero_npm_external_build_dependencies(self):
-        """F29.1: Verifies zero npm, webpack, or external build dependencies are referenced."""
-        content = INDEX_PATH.read_text(encoding="utf-8")
-        assert "node_modules" not in content
-        assert "webpack" not in content
-        assert "<script src=" not in content, "External scripts are forbidden; frontend must be zero-build"
-
-    def test_debranding_invariance(self):
-        """Repository-wide invariant: 0 occurrences of forbidden branding tokens (case-insensitive)."""
-        content = INDEX_PATH.read_text(encoding="utf-8")
-        forbidden = "".join(chr(c) for c in (106, 111, 97, 110))
-        assert forbidden not in content.lower(), "Found legacy debranding token in index.html"
-
-    def test_three_game_agnostic_studio_panels_present(self):
-        """M2: Verifies that the 3 game-agnostic data-driven studio panels exist in index.html."""
-        content = INDEX_PATH.read_text(encoding="utf-8")
-        assert "Steam Player DNA & Game Blueprint" in content
-        assert "Dynamic Agent-Designed Telemetry & Hypotheses" in content
-        assert "Multimodal Voice Clip Preview" in content
-        assert 'id="dna-playtime"' in content
-        assert 'id="game-blueprint-content"' in content
-        assert 'id="probes-catalog-container"' in content
-
-    def test_zero_forbidden_hardcoded_game_tokens(self):
-        """M2: Rigorously enforces 0 occurrences of all 7 forbidden hardcoded game tokens in index.html."""
-        content = INDEX_PATH.read_text(encoding="utf-8")
+    def test_debranding_and_zero_forbidden_game_tokens_across_studio_web(self):
+        """Enforces zero occurrences of legacy branding or hardcoded prototype game tokens across studio-web/src."""
+        forbidden_brand = "".join(chr(c) for c in (106, 111, 97, 110))
         forbidden_patterns = [
             "Spatial Occupancy Telemetry Heatmap",
             "640x360",
@@ -138,69 +85,20 @@ class TestMissionControlSinglePageApp:
             "hero_start.wav",
             "cartridges/seed",
         ]
-        for pattern in forbidden_patterns:
-            assert pattern not in content, f"Forbidden hardcoded game token '{pattern}' found in index.html"
+        src_files = [STUDIO_WEB_DIR / "index.html", *sorted((STUDIO_WEB_DIR / "src").rglob("*"))]
+        checked = 0
+        for fpath in src_files:
+            if not fpath.is_file() or fpath.suffix not in {".html", ".ts", ".tsx", ".css"}:
+                continue
+            checked += 1
+            content = fpath.read_text(encoding="utf-8")
+            assert forbidden_brand not in content.lower(), f"Found legacy debranding token in {fpath}"
+            for pattern in forbidden_patterns:
+                assert pattern not in content, f"Forbidden hardcoded game token '{pattern}' found in {fpath}"
+        assert checked >= 20
 
-    def test_clean_empty_state_game_blueprint_present(self):
-        """M2: Verifies clean empty state for Game Blueprint before Genesis build."""
-        content = INDEX_PATH.read_text(encoding="utf-8")
-        assert "No Active Game Built Yet — Commission Genesis Build" in content
-
-    def test_empathetic_live_pulse_ribbon_and_production_board_subtab(self):
-        """Verifies Always-Visible Live Studio Pulse Ribbon and Live Production Board & Proofs subtab."""
-        content = INDEX_PATH.read_text(encoding="utf-8")
-        assert 'id="studio-live-pulse-bar"' in content
-        assert 'id="studio-board-progress"' in content
-        assert 'data-bible-tab="board"' in content
-        assert 'id="bible-subview-board"' in content
-        assert 'id="production-board-cards-container"' in content
-        assert "fetchLiveProductionBoardFallback" in content
-        assert "renderProductionBoardPanel" in content
-        assert "updateStudioPulseRibbon" in content
-
-    def test_game_switcher_pause_resume_and_built_renders_showcase(self):
-        """Verifies Game Switcher dropdown, Pause/Resume controls, and Built Assets/Renders/Code showcase."""
-        content = INDEX_PATH.read_text(encoding="utf-8")
-        assert 'id="studio-game-switcher"' in content
-        assert 'id="btn-activate-selected-game"' in content
-        assert 'id="btn-resume-genesis"' in content
-        assert 'data-bible-tab="renders"' in content
-        assert 'id="bible-subview-renders"' in content
-        assert 'id="built-renders-showcase-container"' in content
-        assert "renderBuiltRendersShowcase" in content
-        assert "switchSelectedGame" in content
-        assert "pauseActiveGameBuild" in content
-        assert "normalizeBoardItem" in content
-
-    def test_live_turn_step_log_context_prompt_error_banner_and_lightbox_click_safety(self):
-        """Verifies live turn execution drill-down, step-by-step log, per-turn context/prompt/self-inquiry Q&A,
-        prominent build error banner, expandable non-overflowing turn summaries, and safe lightbox click handling."""
-        content = INDEX_PATH.read_text(encoding="utf-8")
-        assert 'id="studio-build-error-banner"' in content
-        assert "backlog_item_substep" in content
-        assert "formatTurnStepLogHtml" in content
-        assert "formatTurnEpistemicDetailsHtml" in content
-        assert "scheduleChronologyLiveRefresh" in content
-        assert "[Expand full turn]" in content
-        assert "target.querySelector?.('img')" not in content
-
-    def test_polling_scroll_preservation_and_headless_godot_renders(self):
-        """Verifies UI polling preserves scroll positions / <details> state and Godot automated renders run with --headless."""
-        import inspect
-        from engine.sim.godot_verifier import GodotHeadlessSimulator
-
-        content = INDEX_PATH.read_text(encoding="utf-8")
-        assert "updateLiveElapsedCountersInDom" in content
-        assert "live-elapsed-counter" in content
-        assert "setHtmlIfChanged(bodyEl," in content
-        assert '[style*="overflow"]' in content
-
+    def test_headless_godot_renders_contract(self):
+        """Verifies Godot automated renders execute strictly with --headless and --capture-viewport."""
         sim_src = inspect.getsource(GodotHeadlessSimulator.run_until_complete)
         assert '"--headless"' in sim_src
         assert '"--capture-viewport"' in sim_src
-        assert "--position" not in sim_src
-
-
-
-
-

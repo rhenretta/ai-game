@@ -922,6 +922,283 @@ def test_mood_dedup_anti_ping_pong_and_same_spot_click_continuity_note(tmp_path:
     assert "MOOD[frustrated:" in tape5
 
 
+def test_hold_left_and_drag_streak_triggers_continuity_note_and_high_res_upgrade(tmp_path: Path):
+    """Regression guard: repeated `hold_left` (and `drag_left`) actions on the same coordinate
+    must increment `_same_spot_click_streak`, surface `Action Continuity Note`, automatically
+    upgrade the attached screenshot to `HIGH` resolution so small HUD counters are read crisply,
+    and escalate at streak >= 5 so the playtester never loops 30+ turns on a stalled counter.
+    """
+    card = BlindStoreCard(
+        deliberation="Test repeated hold_left streak tracking.",
+        checkpoint_id="cp_hold_loop",
+        game_title="Synthetic Workshop",
+        game_description="Test interactive objects.",
+    )
+
+    queued = []
+    for idx in range(1, 7):
+        payload = _turn_payload(idx, plan="Hold left mouse button on central object and verify counter")
+        payload["motor_action"]["mouse_x"] = 500.0
+        payload["motor_action"]["mouse_y"] = 480.0
+        payload["motor_action"]["mouse_button_action"] = "hold_left"
+        payload["motor_action"]["hold_keys"] = []
+        payload["motor_action"]["tap_keys"] = []
+        payload["motor_action"]["duration_ms"] = 1500
+        payload["motor_action"]["inspect_high_res_next"] = False
+        queued.append({"payload": payload})
+
+    fake_client = _QueuedFakeGeminiClient(queued)
+    agent = BlindPlaytesterAgent(store_card=card, client=fake_client)
+    obs = [_make_obs(tmp_path, i, marker_x=15 * i, cursor_xy=(640.0, 345.6)) for i in range(1, 7)]
+
+    _, _, s1 = agent.decide_turn(1, obs[0])
+    assert agent._same_spot_click_streak == 1
+    assert s1["image_resolution"] == "MEDIUM"
+
+    _, _, s2 = agent.decide_turn(2, obs[1])
+    assert agent._same_spot_click_streak == 2
+    assert s2["image_resolution"] == "MEDIUM"
+
+    _, _, s3 = agent.decide_turn(3, obs[2])
+    assert agent._same_spot_click_streak == 3
+    assert s3["image_resolution"] == "MEDIUM"
+
+    # Turn 4 sees streak == 3 from Turns 1..3 -> emits Action Continuity Note AND upgrades to HIGH res!
+    _, _, s4 = agent.decide_turn(4, obs[3])
+    t4_tail = fake_client.calls[3]["contents"][-1].parts[0].text
+    assert "Action Continuity Note: You have repeated 'hold_left' on nearly the same spot (500, 480) 3 turns in a row." in t4_tail
+    assert s4["image_resolution"] == "HIGH"
+    assert agent._same_spot_click_streak == 4
+
+    _, _, s5 = agent.decide_turn(5, obs[4])
+    assert s5["image_resolution"] == "HIGH"
+    assert agent._same_spot_click_streak == 5
+
+    # Turn 6 sees streak == 5 -> escalates with explicit STOP REPEATING directive!
+    _, _, s6 = agent.decide_turn(6, obs[5])
+    t6_tail = fake_client.calls[5]["contents"][-1].parts[0].text
+    assert "STOP REPEATING 'hold_left' AT (500, 480)" in t6_tail
+    assert s6["image_resolution"] == "HIGH"
+
+
+def test_evidence_first_turn_schema_order_and_rulebook_question_retraction(tmp_path: Path):
+    """Verifies that:
+    1. `PlaytestTurnDecision` orders prior-turn observational fields (`turn_log_entry`,
+       `field_note_updates`, `question_updates`, `rulebook_updates`, `bug_reports`) BEFORE
+       `current_plan` and `motor_action` so unexecuted future plans cannot contaminate confirmed rules.
+    2. `Your Confirmed Rulebook So Far` is shown in every turn's ephemeral status block.
+    3. Mistaken Rulebook entries can be retracted (`action='retract'`) and prematurely answered
+       questions can be reopened (`status='open'`, `answer=None`, clearing the stale answer).
+    """
+    turn_fields = list(PlaytestTurnDecision.model_fields.keys())
+    assert turn_fields[0] == "deliberation"
+    assert turn_fields.index("question_updates") < turn_fields.index("current_plan")
+    assert turn_fields.index("rulebook_updates") < turn_fields.index("current_plan")
+    assert turn_fields.index("current_plan") < turn_fields.index("motor_action")
+    assert list(PlaytestRulebookUpdate.model_fields.keys())[-1] == "action"
+
+    card = BlindStoreCard(
+        deliberation="Test rulebook retraction and question reopening.",
+        checkpoint_id="cp_retract",
+        game_title="Synthetic Control Room",
+        game_description="Test switches and gauges.",
+    )
+
+    t1 = _turn_payload(
+        1,
+        plan="Hold left button on central node",
+        rulebook_updates=[
+            {
+                "deliberation": "Prematurely recorded rule.",
+                "key_or_topic": "Hold Left Button",
+                "observed_change_from_prior_turn": "Assumed gauge moved.",
+                "behavior": "Increments primary counter.",
+                "action": "confirm",
+            }
+        ],
+    )
+    t1["question_updates"] = [
+        {
+            "deliberation": "Marked answered too early.",
+            "question_key": "node_hold_effect",
+            "question": "Does holding left click increment the primary counter?",
+            "observed_change_from_prior_turn": "Thought gauge ticked.",
+            "answer": "Yes, holding increments the counter.",
+            "status": "answered",
+        }
+    ]
+
+    t2 = _turn_payload(
+        2,
+        plan="Try pressing Tab instead since counter stayed 0/10",
+        rulebook_updates=[
+            {
+                "deliberation": "Counter stayed at 0/10 on Turn 2 high-res check; retracting mistaken rule.",
+                "key_or_topic": "hold left button",
+                "observed_change_from_prior_turn": "Counter remained 0/10 across previous and current screen.",
+                "behavior": "Did not increment counter.",
+                "action": "retract",
+            }
+        ],
+    )
+    t2["question_updates"] = [
+        {
+            "deliberation": "Reopening question because counter is still 0/10.",
+            "question_key": "node_hold_effect",
+            "question": "Does holding left click increment the primary counter?",
+            "observed_change_from_prior_turn": "Counter remained 0/10.",
+            "answer": None,
+            "status": "open",
+        }
+    ]
+
+    fake_client = _QueuedFakeGeminiClient([{"payload": t1}, {"payload": t2}])
+    agent = BlindPlaytesterAgent(store_card=card, client=fake_client)
+    obs1 = _make_obs(tmp_path, 1, marker_x=25)
+    obs2 = _make_obs(tmp_path, 2, marker_x=50)
+
+    agent.decide_turn(1, obs1)
+    assert "Hold Left Button" in agent.rulebook
+    assert agent.questions["node_hold_effect"]["status"] == "answered"
+
+    _, tape2, _ = agent.decide_turn(2, obs2)
+    # Turn 2 ephemeral tail showed the live Rulebook so the player could spot and retract it
+    t2_tail = fake_client.calls[1]["contents"][-1].parts[0].text
+    assert "Your Confirmed Rulebook So Far" in t2_tail
+    assert "Hold Left Button: Increments primary counter." in t2_tail
+
+    # Mistaken rule was retracted and question reopened with stale answer cleared
+    assert "Hold Left Button" not in agent.rulebook
+    assert "RULEBOOK+[RETRACTED(hold left button)]" in tape2
+    assert agent.questions["node_hold_effect"]["status"] == "open"
+    assert agent.questions["node_hold_effect"]["answer"] is None
+    assert agent.questions["node_hold_effect"]["answered_turn"] is None
+
+
+def test_visual_craft_audit_high_res_verification_and_report_model(tmp_path: Path):
+    from engine.playtest.models import DEFAULT_PLAYTEST_REPORT_MODEL
+
+    # 1. Rationale-First ordering: visual_and_ui_defects_observed precedes graphics_and_visuals & overall_fun_rating
+    rep_fields = list(PlaytestExperienceReport.model_fields.keys())
+    assert rep_fields[0] == "deliberation"
+    assert rep_fields.index("visual_and_ui_defects_observed") < rep_fields.index("graphics_and_visuals")
+    assert rep_fields[-1] == "overall_fun_rating"
+
+    card = BlindStoreCard(
+        deliberation="Test anti-sycophancy visual audit across turns and end-of-session report.",
+        checkpoint_id="cp_visual_audit",
+        game_title="Clockwork Relay",
+        game_description="A gleaming, ultra-polished hand-crafted world of pristine beauty.",
+    )
+    sys_prompt = build_blind_player_system_prompt(card)
+    assert "promotional box copy" in sys_prompt
+    assert "sprite-sheet/atlas frames" in sys_prompt
+    assert "spilling outside" in sys_prompt
+
+    # Turn 1: Player records premature graphics_and_visuals praise at MEDIUM resolution (without inspect_high_res_next)
+    t1 = _turn_payload(1, inspect_high_res_next=False, plan="Look closely at HUD and sprites")
+    t1["impression_updates"] = [
+        {
+            "deliberation": "Quick glance at opening thumbnail.",
+            "pillar": "graphics_and_visuals",
+            "impression": "Bright palette at first glance.",
+        }
+    ]
+
+    # Turn 2: Agent auto-upgrades to HIGH resolution + injects Visual Acuity Note -> player spots defects & revises!
+    t2 = _turn_payload(2, inspect_high_res_next=False, plan="Open side panel")
+    t2["impression_updates"] = [
+        {
+            "deliberation": "At HIGH resolution, sprite edges bleed adjacent frames and top-left text overflows box.",
+            "pillar": "graphics_and_visuals",
+            "impression": "Rough presentation: sprite-sheet neighbor slivers bleed into props and HUD text overflows.",
+        }
+    ]
+    t2["bug_reports"] = [
+        {
+            "deliberation": "Sprite atlas slicing cuts into neighboring frame.",
+            "bug_key": "sprite_atlas_bleed",
+            "category": "visual_glitch",
+            "summary": "Sprites show stray bleeding edge slivers from adjacent atlas frames",
+            "details": "Foreground props display cut-off edges and stray floating slivers from neighboring frames.",
+            "severity": "major",
+        }
+    ]
+
+    t3 = _turn_payload(3, inspect_high_res_next=False, plan="Wrap up check")
+
+    report_payload = {
+        "deliberation": "Auditing HIGH-res screenshots before writing graphics_and_visuals.",
+        "overall_experience_summary": "Playable controls, but visual presentation has obvious sprite-slicing and UI overflow bugs.",
+        "visual_and_ui_defects_observed": [
+            "Foreground sprites show cut-off edges and stray slivers bleeding from neighboring atlas frames",
+            "Top-left counter label spills outside its panel border",
+        ],
+        "graphics_and_visuals": "Rough and unfinished: sprite-sheet slicing bleed and overflowing HUD labels undermine readability.",
+        "gameplay_and_feel": "Basic click response works.",
+        "sound_and_audio": "Silent throughout the session.",
+        "intuitiveness_and_onboarding": "Controls are discoverable despite cramped labels.",
+        "goals_pacing_and_accomplishment": "Completed initial interaction check.",
+        "world_and_atmosphere": "Inconsistent mix of detailed raster sprites and flat untextured polygons.",
+        "key_highlights": ["Responsive cursor targeting"],
+        "key_pain_points": ["Sprite-sheet bleed slivers and overflowing HUD text"],
+        "bugs_and_glitches_observed": ["Sprites show stray bleeding edge slivers from adjacent atlas frames"],
+        "unanswered_questions_and_mysteries": [],
+        "overall_fun_rating": 4,
+    }
+
+    fake_client = _QueuedFakeGeminiClient(
+        [
+            {"payload": t1},
+            {"payload": t2},
+            {"payload": t3},
+            {"payload": report_payload},
+        ]
+    )
+    agent = BlindPlaytesterAgent(store_card=card, client=fake_client)
+    assert "visual_and_ui_defects_observed" in agent.report_schema.get("required", [])
+    assert agent.config.report_model_name == DEFAULT_PLAYTEST_REPORT_MODEL == "gemini-3.8-flash"
+
+    obs1 = _make_obs(tmp_path, 1, bg_rgb=(20, 30, 50), marker_x=30, audio_is_silent=True)
+    obs2 = _make_obs(tmp_path, 2, bg_rgb=(180, 140, 40), marker_x=220, audio_is_silent=True)
+    obs3 = _make_obs(tmp_path, 3, bg_rgb=(50, 120, 90), marker_x=400, audio_is_silent=True)
+
+    _, _, stats1 = agent.decide_turn(1, obs1)
+    assert stats1["image_resolution"] == "MEDIUM"
+
+    # Turn 2 MUST auto-upgrade to HIGH resolution because graphics_and_visuals was recorded prior to any HIGH frame
+    _, _, stats2 = agent.decide_turn(2, obs2)
+    assert stats2["image_resolution"] == "HIGH"
+    t2_tail_text = fake_client.calls[1]["contents"][-1].parts[0].text
+    assert "Visual Acuity Note:" in t2_tail_text
+    assert "Rough presentation" in agent.impressions["graphics_and_visuals"]
+
+    # Turn 3 returns to standard MEDIUM since HIGH verification already occurred
+    _, _, stats3 = agent.decide_turn(3, obs3)
+    assert stats3["image_resolution"] == "MEDIUM"
+
+    rep, _ = agent.generate_experience_report(
+        end_status="completed",
+        end_outcome="finished_exploring",
+        final_screenshot_path=obs3.screenshot_path,
+    )
+    assert len(rep.visual_and_ui_defects_observed) == 2
+    assert "sprite-sheet slicing bleed" in rep.graphics_and_visuals
+
+    rep_call = fake_client.calls[3]
+    assert rep_call["model"] == "gemini-3.8-flash"
+    assert rep_call["config"].thinking_config.thinking_budget == 2048
+    rep_img_parts = [
+        p for p in rep_call["contents"][-1].parts if p.inline_data and p.inline_data.mime_type == "image/png"
+    ]
+    # Opening (obs1) + distinct mid-session (obs2) + final (obs3) attached at HIGH resolution
+    assert len(rep_img_parts) == 3
+    for img_part in rep_img_parts:
+        assert img_part.media_resolution.level.value == "MEDIA_RESOLUTION_HIGH"
+
+
+
+
 
 
 

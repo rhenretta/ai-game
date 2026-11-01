@@ -166,9 +166,16 @@ class BuildSupervisor:
         if isinstance(candidate_or_spec, (Path, str)):
             candidate_dir = Path(candidate_or_spec).resolve()
             candidate_id = candidate_dir.name
-            logger.info("Supervisor evaluating candidate directory %s", candidate_dir)
+            is_board_managed = (candidate_dir / "backlog.json").is_file()
+            branch_retries = 1 if is_board_managed else retries
+            logger.info(
+                "Supervisor evaluating candidate directory %s (board_managed=%s, max_attempts=%d)",
+                candidate_dir,
+                is_board_managed,
+                branch_retries,
+            )
 
-            for attempt in range(1, retries + 1):
+            for attempt in range(1, branch_retries + 1):
                 gate_results, trace = self.evaluate_candidate_cartridge(
                     candidate_dir=candidate_dir,
                     episode_number=episode_number,
@@ -245,9 +252,16 @@ class BuildSupervisor:
                     elif hasattr(self.event_bus, "publish_event"):
                         self.event_bus.publish_event(qa_event)
 
-                if attempt >= retries:
+                if attempt >= branch_retries:
                     report = BuildEvaluationReport(
-                        deliberation=f"Candidate cartridge {candidate_id} rejected at {trace.failure_gate} ({fail_type_str}) after {retries} attempts: {trace.failure_reason} — Challenger Rationale: {trace.deliberation}",
+                        deliberation=(
+                            f"Candidate cartridge {candidate_id} rejected at {trace.failure_gate} ({fail_type_str}) "
+                            + (
+                                f"(board-managed cartridge: returning diagnostic trace for Production Board task escalation): {trace.failure_reason} — Challenger Rationale: {trace.deliberation}"
+                                if is_board_managed
+                                else f"after {branch_retries} attempts: {trace.failure_reason} — Challenger Rationale: {trace.deliberation}"
+                            )
+                        ),
                         candidate_id=candidate_id,
                         episode_number=episode_number,
                         status=SupervisorGateVerdict.FAILED_MAX_RETRIES,
@@ -257,7 +271,7 @@ class BuildSupervisor:
                         gate_results=gate_results,
                         rejection_trace=trace,
                         attempt_count=attempt,
-                        max_retries=retries,
+                        max_retries=branch_retries,
                         repair_history=repair_history,
                     )
                     if self.event_bus is not None and hasattr(self.event_bus, "publish_agent_task_record"):
@@ -480,6 +494,7 @@ class BuildSupervisor:
         episode_number: int = 1,
         attempt_number: int = 1,
         requirements_spec: Optional[Any] = None,
+        include_challenger_gate: bool = True,
     ) -> Tuple[Dict[str, QualityGateResult], Optional[RejectionDiagnosticTrace]]:
         """Evaluates an assembled candidate cartridge directory against all 5 Quality Gates."""
         candidate_dir = Path(candidate_dir).resolve()
@@ -630,6 +645,9 @@ class BuildSupervisor:
                 recommended_remedy="Ensure custom probes declared in telemetry_manifest.json are actively emitted during scene update.",
             )
             return gate_results, trace
+
+        if not include_challenger_gate:
+            return gate_results, None
 
         # ---------------------------------------------------------------------
         # 6. Gate F: Independent Challenger Gate & Acceptance Criteria Audit
@@ -1340,27 +1358,50 @@ class BuildSupervisor:
                 details="Simulation instance was not provided.",
             )
 
-        avg_ms = getattr(sim, "avg_frame_time_ms", 0.0)
-        max_ms = getattr(sim, "max_frame_time_ms", 0.0)
-        passed = getattr(sim, "frame_budget_passed", True)
+        avg_ms = float(getattr(sim, "avg_frame_time_ms", 0.0) or 0.0)
+        p95_ms = float(getattr(sim, "p95_frame_time_ms", 0.0) or 0.0)
+        max_ms = float(getattr(sim, "max_frame_time_ms", 0.0) or 0.0)
+        passed = bool(getattr(sim, "frame_budget_passed", True))
+        diag_payload = {
+            "avg_frame_time_ms": avg_ms,
+            "p95_frame_time_ms": p95_ms,
+            "max_frame_time_ms": max_ms,
+            "target_ms": target_ms,
+        }
 
-        if not passed or avg_ms > target_ms:
+        if avg_ms > target_ms:
             return QualityGateResult(
                 deliberation=f"Frame budget exceeded: average tick duration {avg_ms:.2f}ms exceeds target {target_ms:.2f}ms (60 FPS).",
                 gate_name="Gate D: Frame Budget",
                 passed=False,
                 failure_type=GateFailureType.FRAME_BUDGET_EXCEEDED,
-                details=f"Average frame {avg_ms:.2f}ms > {target_ms:.2f}ms. Peak frame spike: {max_ms:.2f}ms.",
-                diagnostic_data={"avg_frame_time_ms": avg_ms, "max_frame_time_ms": max_ms, "target_ms": target_ms},
+                details=f"Average frame {avg_ms:.2f}ms > {target_ms:.2f}ms (P95: {p95_ms:.2f}ms, peak frame spike: {max_ms:.2f}ms).",
+                diagnostic_data=diag_payload,
+            )
+
+        if not passed:
+            return QualityGateResult(
+                deliberation=(
+                    f"Frame spike budget exceeded: steady-state average {avg_ms:.2f}ms is within {target_ms:.2f}ms (60 FPS), "
+                    f"but P95 ({p95_ms:.2f}ms) or peak frame spike ({max_ms:.2f}ms) exceeded steady-state smoothness limits."
+                ),
+                gate_name="Gate D: Frame Budget",
+                passed=False,
+                failure_type=GateFailureType.FRAME_BUDGET_EXCEEDED,
+                details=(
+                    f"Steady-state average {avg_ms:.2f}ms <= {target_ms:.2f}ms, "
+                    f"but frame spike exceeded budget (P95: {p95_ms:.2f}ms, peak frame spike: {max_ms:.2f}ms)."
+                ),
+                diagnostic_data=diag_payload,
             )
 
         return QualityGateResult(
-            deliberation=f"Frame budget verified: avg {avg_ms:.2f}ms < {target_ms:.2f}ms (peak spike {max_ms:.2f}ms).",
+            deliberation=f"Frame budget verified: avg {avg_ms:.2f}ms < {target_ms:.2f}ms (P95 {p95_ms:.2f}ms, peak spike {max_ms:.2f}ms).",
             gate_name="Gate D: Frame Budget",
             passed=True,
             failure_type=GateFailureType.NONE,
-            details=f"Performance within budget: avg {avg_ms:.2f}ms, peak {max_ms:.2f}ms.",
-            diagnostic_data={"avg_frame_time_ms": avg_ms, "max_frame_time_ms": max_ms, "target_ms": target_ms},
+            details=f"Performance within budget: avg {avg_ms:.2f}ms, P95 {p95_ms:.2f}ms, peak {max_ms:.2f}ms.",
+            diagnostic_data=diag_payload,
         )
 
     def verify_gate_e_custom_telemetry(self, candidate_dir: Path, sim: Any) -> QualityGateResult:
@@ -2055,3 +2096,158 @@ class BuildSupervisor:
                 curr_y += sy
 
         return blockers
+
+
+def build_qa_gate_work_item_proposal(
+    candidate_dir: Path,
+    trace: RejectionDiagnosticTrace,
+    pass_index: int = 0,
+    slice_id: str = "",
+    existing_item_ids: Optional[Set[str]] = None,
+    supported_kinds: Optional[Set[str]] = None,
+) -> Any:
+    """Translates a BuildSupervisor `RejectionDiagnosticTrace` into a tracked, Rationale-First
+    `WorkItemProposal` for the Continuous Production Board so QA gate self-repair executes
+    through Task Lead + ContextCurator + Council Review instead of mutating files off-board.
+    """
+    import re as _re
+    from engine.studio.models import WorkItemProposal
+
+    c_dir = Path(candidate_dir).resolve()
+    fail_gate = str(getattr(trace, "failure_gate", "Quality Gate") or "Quality Gate").strip()
+    fail_type = getattr(trace, "failure_type", GateFailureType.NONE)
+    fail_type_str = fail_type.value if hasattr(fail_type, "value") else str(fail_type)
+    fail_reason = str(getattr(trace, "failure_reason", "") or "Quality gate verification failed.").strip()
+    rec_remedy = str(
+        getattr(trace, "recommended_remedy", "")
+        or getattr(trace, "remedy_directive", "")
+        or "Resolve the reported quality gate defect cleanly in the playable cartridge."
+    ).strip()
+
+    mechanic_failure_types = {
+        GateFailureType.SYNTAX_AST_ERROR,
+        GateFailureType.UNHANDLED_EXCEPTION,
+        GateFailureType.PROGRESSION_FAILURE,
+        GateFailureType.FRAME_BUDGET_EXCEEDED,
+    }
+    kind = "mechanic_code" if fail_type in mechanic_failure_types else "integration"
+    if supported_kinds:
+        if kind not in supported_kinds:
+            if "integration" in supported_kinds:
+                kind = "integration"
+            elif "mechanic_code" in supported_kinds:
+                kind = "mechanic_code"
+            else:
+                kind = sorted(supported_kinds)[0]
+
+    target_modules: List[str] = []
+
+    def _add_candidate_module(raw_mod: Optional[str]) -> None:
+        if not raw_mod:
+            return
+        cleaned = str(raw_mod).strip().replace("\\", "/")
+        if cleaned.startswith("res://"):
+            cleaned = cleaned[len("res://"):]
+        elif cleaned.startswith("res:/"):
+            cleaned = cleaned[len("res:/"):]
+        cleaned = cleaned.lstrip("/")
+        try:
+            p_cand = Path(cleaned)
+            if p_cand.is_absolute():
+                cleaned = p_cand.resolve().relative_to(c_dir).as_posix()
+        except Exception:
+            cleaned = Path(cleaned).name
+        if (
+            cleaned
+            and not cleaned.startswith("tests/")
+            and not cleaned.startswith("src/studio_rig_and_collider")
+            and (c_dir / cleaned).is_file()
+            and cleaned not in target_modules
+        ):
+            target_modules.append(cleaned)
+
+    _add_candidate_module(getattr(trace, "file_path", None))
+    diag_blob = "\n".join(
+        str(part or "")
+        for part in (
+            fail_reason,
+            getattr(trace, "runtime_traceback", ""),
+            " ".join(str(v) for v in (getattr(trace, "asset_violations", None) or [])),
+        )
+    )
+    for m_mod in _re.findall(r"(?:res://)?([A-Za-z0-9_./-]+\.(?:gd|tscn|json))", diag_blob):
+        _add_candidate_module(m_mod)
+
+    if not target_modules:
+        try:
+            from engine.studio.context_curator import compute_entrypoint_reachability
+
+            reach = compute_entrypoint_reachability(c_dir)
+            for mod_rel in list(reach.get("reachable_from_entrypoint") or [])[:4]:
+                _add_candidate_module(mod_rel)
+        except Exception:
+            pass
+    if not target_modules:
+        for default_mod in ("main.gd", "scenes.gd", "mechanics.gd"):
+            if (c_dir / default_mod).is_file():
+                target_modules.append(default_mod)
+    if not target_modules:
+        target_modules = ["main.gd"]
+
+    gate_slug = _re.sub(r"[^a-z0-9]+", "_", fail_gate.lower().split(":")[0]).strip("_") or "qa_gate"
+    type_slug = _re.sub(r"[^a-z0-9]+", "_", fail_type_str.lower()).strip("_")[:28] or "remediation"
+    slice_slug = _re.sub(r"[^a-z0-9]+", "_", (slice_id or "slice").lower()).strip("_")[:24] or "slice"
+    base_id = f"qa_{gate_slug}_{type_slug}_{slice_slug}_p{pass_index}"
+    item_id = base_id
+    taken = existing_item_ids or set()
+    suffix = 2
+    while item_id in taken:
+        item_id = f"{base_id}_{suffix}"
+        suffix += 1
+
+    extra_lines: List[str] = []
+    if getattr(trace, "file_path", None):
+        ln_sfx = f":{trace.line_number}" if getattr(trace, "line_number", None) else ""
+        extra_lines.append(f"- Diagnostic File Location: `{trace.file_path}{ln_sfx}`")
+    if getattr(trace, "runtime_traceback", None):
+        tb_trim = str(trace.runtime_traceback).strip()[:900]
+        if tb_trim:
+            extra_lines.append(f"- Runtime Traceback / Stderr:\n{tb_trim}")
+    if getattr(trace, "asset_violations", None):
+        extra_lines.append(f"- Asset Violations: {list(trace.asset_violations)[:6]}")
+    if getattr(trace, "unfulfilled_requirements", None):
+        extra_lines.append(f"- Unfulfilled Requirements: {list(trace.unfulfilled_requirements)[:6]}")
+
+    extra_context = ("\n" + "\n".join(extra_lines)) if extra_lines else ""
+    spec_text = (
+        f"Resolve the {fail_gate} ({fail_type_str}) verification failure in the playable cartridge (`res://main.tscn`) "
+        f"without regressing existing slice mechanics, visual framing, or controls:\n"
+        f"- Failure Diagnostic: {fail_reason}\n"
+        f"- Recommended Engineering Remedy: {rec_remedy}"
+        f"{extra_context}\n"
+        f"Acceptance Criteria:\n"
+        f"1. Fix the root cause in production cartridge modules ({', '.join(target_modules[:4])})—never mask errors or touch `tests/test_*` in place of production fixes.\n"
+        f"2. Verify that `res://main.tscn` boots cleanly, maintains 60 FPS steady-state frame budget (< 16.6ms avg), and preserves active gameplay progression."
+    )
+    proof_spec = (
+        f"Capture an authentic gameplay filmstrip on `res://main.tscn` demonstrating clean boot, responsive active gameplay "
+        f"progression, and full resolution of the {fail_gate} ({fail_type_str}) diagnostic with zero runtime script errors."
+    )
+
+    return WorkItemProposal(
+        deliberation=(
+            f"{fail_gate} ({fail_type_str}) rejected candidate cartridge '{c_dir.name}' ({fail_reason[:240]}). "
+            f"Creating tracked Production Board task '{item_id}' targeting {target_modules[:4]} so the Task Lead, "
+            f"domain specialists, and Specialist Council diagnose, fix, and visually verify the resolution on-board."
+        ),
+        item_id=item_id,
+        kind=kind,
+        title=f"QA {fail_gate.split(':')[0].strip()} Remediation: {fail_type_str.replace('_', ' ').title()}",
+        spec=spec_text,
+        proof_spec=proof_spec,
+        depends_on=[],
+        blocks_items=[],
+        target_modules=target_modules[:6],
+        slice_id=slice_id,
+    )
+

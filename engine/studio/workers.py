@@ -316,6 +316,11 @@ def plan_asset_requirement(
 
     curated_block = f"{rendering_block}\n--- GAME BIBLE ---\n{bible_text}\n"
     multimodal_parts: List[Any] = []
+    target_role = "audio_designer" if item.kind == "audio_asset" else "visual_artist"
+    from engine.studio.game_memory import GameMemoryStore, format_memory_query_results
+
+    mem_store = GameMemoryStore(ctx.cartridge_dir, event_callback=ctx.event_callback, client=ctx.client)
+    has_embed_client = callable(getattr(getattr(ctx.client, "models", None), "embed_content", None))
     if is_real_genai_client(ctx.client):
         curator = ContextCuratorAgent(
             cartridge_dir=ctx.cartridge_dir,
@@ -324,7 +329,6 @@ def plan_asset_requirement(
             board=ctx.board,
             event_callback=ctx.event_callback,
         )
-        target_role = "audio_designer" if item.kind == "audio_asset" else "visual_artist"
         pack = curator.curate_context(
             target_agent_role=target_role,
             task_request=f"{item.title}\nSPEC: {item.spec}\nPROOF: {item.proof_spec}\n{feedback_block}",
@@ -333,10 +337,20 @@ def plan_asset_requirement(
         )
         curated_block = f"{pack.prompt_block}\n{rendering_block}\n"
         multimodal_parts = list(pack.multimodal_parts)
+    elif (ctx.cartridge_dir / "game_memory.json").is_file():
+        role_mem = mem_store.format_role_memory_briefing(target_role)
+        if role_mem:
+            curated_block = f"{role_mem}\n{curated_block}"
 
     issues: List[str] = []
-    for attempt in range(1, attempts + 1):
+    mem_query_blocks: List[str] = []
+    asked_mem_queries: set[str] = set()
+    mem_queries_used = 0
+    max_mem_queries = 2 if has_embed_client else 0
+    attempt = 1
+    while attempt <= attempts:
         retry = "YOUR PREVIOUS ANSWER FAILED VALIDATION; FIX:\n- " + "\n- ".join(issues) + "\n\n" if issues else ""
+        mem_q_block = ("\n" + "\n".join(mem_query_blocks)) if mem_query_blocks else ""
         prompt = (
             f"{retry}You are the Visual/Audio Production Lead turning a council requirement into a precise `AssetRequirement`.\n"
             f"COUNCIL REQUIREMENT [{item.item_id}] ({item.kind}): {item.title}\nSPEC: {item.spec}\nPROOF THE COUNCIL WILL JUDGE: {item.proof_spec}\n"
@@ -350,7 +364,7 @@ def plan_asset_requirement(
             f"- MULTI-CELL GRID / STATE SHEET / ATLAS COMPOSITION (`grid_cols`, `grid_rows`, `cell_prompts`): Whenever the Task Lead brief or task spec requests a multi-cell grid, sheet, or atlas of distinct visual states, icons, stages, or variants (e.g., a 2x2 or NxM sheet where each cell depicts a distinct state, graphic, or component rather than biomechanical deformation of one walking figure), set `grid_cols` and `grid_rows` to the exact grid dimensions (e.g. `grid_cols=2, grid_rows=2`) and populate `cell_prompts` with exactly `grid_cols * grid_rows` focused visual descriptions in row-major order (top-left to bottom-right), where EACH string in `cell_prompts` describes the single isolated graphic/state that belongs inside that specific cell!\n"
             f"- When `grid_cols == 1` and `grid_rows == 1` (single isolated asset), `visual_prompt_or_text` MUST describe ONLY ONE single isolated object/prop in its canonical intact state — NEVER a multi-state variation grid.\n"
             f"- When `fabrication_mode == 'audio_bark'`, `visual_prompt_or_text` is sent directly to the neural TTS engine to synthesize ONE single spoken voice line into `target_path` (strictly bounded to [0.1s, 30.0s], max 45 words / 280 characters of direct spoken dialogue). NEVER concatenate multiple barks, speaker labels ('Kaelen barks:', 'Overseer Vhen:'), or parenthetical stage directions into `visual_prompt_or_text`! Write ONLY the exact spoken words of a single representative bark (1–2 sentences, <= 45 words).\n"
-            f"Provide `deliberation` FIRST.\n\n{curated_block}\n{retry}"
+            f"Provide `deliberation` FIRST.\n\n{curated_block}{mem_q_block}\n{retry}"
         )
         contents_arg: Any = ([prompt] + multimodal_parts) if multimodal_parts else prompt
         record_turn_epistemic_context(
@@ -373,6 +387,35 @@ def plan_asset_requirement(
         if not resp.text:
             raise StudioAgentError(f"Asset planning for '{item.item_id}' returned an empty response")
         req = AssetRequirement.model_validate_json(resp.text)
+        if req.memory_updates:
+            mem_store.apply_mutations(
+                author_role=target_role,
+                proposals=req.memory_updates,
+                item_id=item.item_id,
+            )
+            req.memory_updates = []
+        mem_q = (req.memory_query or "").strip()
+        mem_q_key = f"{(req.memory_query_bank or '').strip().lower()}::{mem_q.lower()}"
+        if (
+            mem_q
+            and not (req.visual_prompt_or_text or "").strip()
+            and has_embed_client
+            and mem_queries_used < max_mem_queries
+            and mem_q_key not in asked_mem_queries
+        ):
+            asked_mem_queries.add(mem_q_key)
+            mem_queries_used += 1
+            hits = mem_store.query_memories(
+                caller_role=target_role,
+                query_text=mem_q,
+                bank_filter=req.memory_query_bank,
+                client=ctx.client,
+            )
+            mem_query_blocks.append(format_memory_query_results(mem_q, req.memory_query_bank, hits))
+            issues = []
+            continue
+        req.memory_query = ""
+        req.memory_query_bank = ""
         req.asset_id = item.item_id
         issues = []
         if req.fabrication_mode not in allowed_modes:
@@ -423,6 +466,7 @@ def plan_asset_requirement(
             prior_req.write_text(req.model_dump_json(indent=2), encoding="utf-8")
             return req
         logger.info("Asset plan attempt %d/%d for %s invalid: %s", attempt, attempts, item.item_id, issues)
+        attempt += 1
     raise StudioAgentError(f"Asset planning for '{item.item_id}' still invalid after {attempts} attempts: {issues}")
 
 
@@ -539,6 +583,10 @@ def plan_audio_requirements(
 
     curated_block = f"--- GAME BIBLE ---\n{bible_text}\n"
     multimodal_parts: List[Any] = []
+    from engine.studio.game_memory import GameMemoryStore, format_memory_query_results
+
+    mem_store = GameMemoryStore(ctx.cartridge_dir, event_callback=ctx.event_callback, client=ctx.client)
+    has_embed_client = callable(getattr(getattr(ctx.client, "models", None), "embed_content", None))
     if is_real_genai_client(ctx.client):
         curator = ContextCuratorAgent(
             cartridge_dir=ctx.cartridge_dir,
@@ -555,10 +603,20 @@ def plan_audio_requirements(
         )
         curated_block = f"{pack.prompt_block}\n"
         multimodal_parts = list(pack.multimodal_parts)
+    elif (ctx.cartridge_dir / "game_memory.json").is_file():
+        role_mem = mem_store.format_role_memory_briefing("audio_designer")
+        if role_mem:
+            curated_block = f"{role_mem}\n{curated_block}"
 
     issues: List[str] = []
-    for attempt in range(1, attempts + 1):
+    mem_query_blocks: List[str] = []
+    asked_mem_queries: set[str] = set()
+    mem_queries_used = 0
+    max_mem_queries = 2 if has_embed_client else 0
+    attempt = 1
+    while attempt <= attempts:
         retry = "YOUR PREVIOUS ANSWER FAILED VALIDATION; FIX:\n- " + "\n- ".join(issues) + "\n\n" if issues else ""
+        mem_q_block = ("\n" + "\n".join(mem_query_blocks)) if mem_query_blocks else ""
         prompt = (
             f"{retry}You are the Audio Production Lead turning a council audio requirement (and any Task Lead brief) into an `AudioAssetPlanBatch`.\n"
             f"COUNCIL REQUIREMENT [{item.item_id}] ({item.kind}): {item.title}\nSPEC: {item.spec}\nPROOF THE COUNCIL WILL JUDGE: {item.proof_spec}\n"
@@ -573,7 +631,7 @@ def plan_audio_requirements(
             f"  * `asset_id` should be `{item.item_id}` when `len(assets) == 1`, or the unique stem of `target_path` when `len(assets) > 1`.\n"
             f"  * `visual_prompt_or_text` must describe ONLY that specific cue's acoustic texture, frequency band, envelope, or spoken dialogue.\n"
             f"  * When `fabrication_mode == 'audio_bark'`, `visual_prompt_or_text` is sent directly to the neural TTS engine to synthesize ONE single spoken voice line into `target_path` (strictly bounded to [0.1s, 30.0s], max 45 words / 280 characters of direct spoken dialogue). NEVER concatenate multiple barks, speaker labels ('Kaelen barks:', 'Overseer Vhen:'), or parenthetical stage directions into `visual_prompt_or_text`!\n"
-            f"Provide `deliberation` FIRST.\n\n{curated_block}\n{retry}"
+            f"Provide `deliberation` FIRST.\n\n{curated_block}{mem_q_block}\n{retry}"
         )
         contents_arg: Any = ([prompt] + multimodal_parts) if multimodal_parts else prompt
         record_turn_epistemic_context(
@@ -596,8 +654,38 @@ def plan_audio_requirements(
         if not resp.text:
             raise StudioAgentError(f"Audio asset planning for '{item.item_id}' returned an empty response")
         raw_obj = json.loads(resp.text)
-        if isinstance(raw_obj, dict) and isinstance(raw_obj.get("assets"), list):
+        if isinstance(raw_obj, dict) and (
+            isinstance(raw_obj.get("assets"), list)
+            or "memory_query" in raw_obj
+            or "memory_updates" in raw_obj
+        ):
             batch = AudioAssetPlanBatch.model_validate_json(resp.text)
+            if batch.memory_updates:
+                mem_store.apply_mutations(
+                    author_role="audio_designer",
+                    proposals=batch.memory_updates,
+                    item_id=item.item_id,
+                )
+            mem_q = (batch.memory_query or "").strip()
+            mem_q_key = f"{(batch.memory_query_bank or '').strip().lower()}::{mem_q.lower()}"
+            if (
+                mem_q
+                and not batch.assets
+                and has_embed_client
+                and mem_queries_used < max_mem_queries
+                and mem_q_key not in asked_mem_queries
+            ):
+                asked_mem_queries.add(mem_q_key)
+                mem_queries_used += 1
+                hits = mem_store.query_memories(
+                    caller_role="audio_designer",
+                    query_text=mem_q,
+                    bank_filter=batch.memory_query_bank,
+                    client=ctx.client,
+                )
+                mem_query_blocks.append(format_memory_query_results(mem_q, batch.memory_query_bank, hits))
+                issues = []
+                continue
             reqs = list(batch.assets)
         else:
             reqs = [AssetRequirement.model_validate_json(resp.text)]
@@ -679,6 +767,7 @@ def plan_audio_requirements(
                 )
             return reqs
         logger.info("Audio asset plan attempt %d/%d for %s invalid: %s", attempt, attempts, item.item_id, issues)
+        attempt += 1
     raise StudioAgentError(f"Audio asset planning for '{item.item_id}' still invalid after {attempts} attempts: {issues}")
 
 
@@ -1338,6 +1427,10 @@ def plan_filmstrip(
     qa_context = _summarize_cartridge_for_qa(ctx.cartridge_dir)
     context_block = f"\nCARTRIDGE SYMBOLS & ASSETS AVAILABLE FOR QA STAGING:\n{qa_context}\n" if qa_context else ""
     multimodal_parts: List[Any] = []
+    from engine.studio.game_memory import GameMemoryStore, format_memory_query_results
+
+    mem_store = GameMemoryStore(ctx.cartridge_dir, event_callback=ctx.event_callback, client=ctx.client)
+    has_embed_client = callable(getattr(getattr(ctx.client, "models", None), "embed_content", None))
     if is_real_genai_client(ctx.client):
         curator = ContextCuratorAgent(
             cartridge_dir=ctx.cartridge_dir,
@@ -1354,6 +1447,10 @@ def plan_filmstrip(
         )
         context_block = f"{context_block}\n{pack.prompt_block}"
         multimodal_parts = list(pack.multimodal_parts)
+    elif (ctx.cartridge_dir / "game_memory.json").is_file():
+        role_mem = mem_store.format_role_memory_briefing("qa_test_engineer")
+        if role_mem:
+            context_block = f"{context_block}\n{role_mem}"
     if prior_strip_path is not None and Path(prior_strip_path).is_file():
         try:
             multimodal_parts.append(f"PASS 1 CAPTURED FILMSTRIP THAT FAILED STATE ASSERTIONS ({Path(prior_strip_path).name}):")
@@ -1370,12 +1467,18 @@ def plan_filmstrip(
         else ""
     )
     issues: List[str] = []
-    for attempt in range(1, attempts + 1):
+    mem_query_blocks: List[str] = []
+    asked_mem_queries: set[str] = set()
+    mem_queries_used = 0
+    max_mem_queries = 2 if has_embed_client else 0
+    attempt = 1
+    while attempt <= attempts:
         retry = "\n\nYOUR PREVIOUS PLAN FAILED VALIDATION; FIX:\n- " + "\n- ".join(issues) if issues else ""
+        mem_q_block = ("\n" + "\n".join(mem_query_blocks)) if mem_query_blocks else ""
         prompt = (
             f"You are the QA Test Engineer designing and building a Godot 4.3 test scene and scripted playthrough that PROVES a built item to the design council.\n"
             f"ITEM [{item.item_id}] ({item.kind}): {item.title}\nSPEC: {item.spec}\nTHE COUNCIL WANTS TO SEE: {item.proof_spec}\n"
-            f"Available input actions: {actions}.{context_block}{prior_feedback_block}\n"
+            f"Available input actions: {actions}.{context_block}{mem_q_block}{prior_feedback_block}\n"
             f"1. BUILD YOUR QA TEST SCENE (`target_scene` + `test_scene_gd_content`) OR REPORT A PRODUCTION DEFECT (`production_defect_report`):\n"
             f"   - Set `target_scene = 'res://tests/test_{_safe_id(item.item_id)}.tscn'` and write the complete GDScript 2.0 (`extends Node2D`) test scene in `test_scene_gd_content`.\n"
             f"   - For isolated subsystem/mechanic/UI tasks, `test_scene_gd_content` can instantiate the specific feature script(s) or entities under test.\n"
@@ -1406,6 +1509,7 @@ def plan_filmstrip(
             f"       4. STEP-BY-STEP `state_assertions`: Populate `state_assertions` for EACH link in the causal chain across ticks (e.g., tool slot selected -> structure placed count incremented `> baseline` -> intermediate interaction/ricochet count `> 0` -> final objective/delivery count `> baseline`), rather than only asserting on the final score at the last tick! That way, if any step fails in Pass 1, the telemetry pinpoints the exact link that needs adjustment.\n"
             f"   - REACTIVE TIMING TIP: When a secondary player input depends on dynamic physics or movement reaching a threshold, "
             f"populate `when_snapshot_key`, `when_operator` ('<=', '>=', '==', '!='), `when_value`, and `hold_ticks` on that `InputSegment`.\n"
+            f"   - LONG-TERM MEMORY SELECTIVITY: Leave `memory_updates` empty (`[]`) on routine QA runs! Never log single-task test steps or pass/fail status; record ONLY non-obvious harness constraints or verification invariants that future tasks/slices would otherwise trip over.\n"
             f"   - Use no input only if the item kind is a purely static layout preview. Provide `deliberation` FIRST.{retry}"
         )
         contents_arg: Any = ([prompt] + multimodal_parts) if multimodal_parts else prompt
@@ -1429,6 +1533,39 @@ def plan_filmstrip(
         if not resp.text:
             raise StudioAgentError(f"Filmstrip planning for '{item.item_id}' returned an empty response")
         plan = FilmstripPlan.model_validate_json(resp.text)
+        if plan.memory_updates:
+            mem_store.apply_mutations(
+                author_role="qa_test_engineer",
+                proposals=plan.memory_updates,
+                item_id=item.item_id,
+            )
+        mem_q = (plan.memory_query or "").strip()
+        mem_q_key = f"{(plan.memory_query_bank or '').strip().lower()}::{mem_q.lower()}"
+        if (
+            mem_q
+            and not (plan.memory_query_answer or "").strip()
+            and not plan.production_defect_report.strip()
+            and has_embed_client
+            and mem_queries_used < max_mem_queries
+            and mem_q_key not in asked_mem_queries
+        ):
+            asked_mem_queries.add(mem_q_key)
+            mem_queries_used += 1
+            record_turn_substep(
+                "memory_query",
+                f"QA querying long-term memory: {mem_q}",
+                details={"query": mem_q, "bank": plan.memory_query_bank or "all"},
+                specialist_agent="qa_test_engineer",
+            )
+            hits = mem_store.query_memories(
+                caller_role="qa_test_engineer",
+                query_text=mem_q,
+                bank_filter=plan.memory_query_bank,
+                client=ctx.client,
+            )
+            mem_query_blocks.append(format_memory_query_results(mem_q, plan.memory_query_bank, hits))
+            issues = []
+            continue
         issues = validate_filmstrip_plan(
             plan,
             actions,
@@ -1436,6 +1573,7 @@ def plan_filmstrip(
         )
         if not issues:
             return plan
+        attempt += 1
     raise StudioAgentError(f"Filmstrip plan for '{item.item_id}' still invalid after {attempts} attempts: {issues}")
 
 
@@ -1804,6 +1942,10 @@ def run_script_writer_specialist(
         else "{}"
     )
     curated_context_block = f"GAME BIBLE CONTEXT:\n{bible_text}\n"
+    from engine.studio.game_memory import GameMemoryStore, format_memory_query_results
+
+    mem_store = GameMemoryStore(ctx.cartridge_dir, event_callback=ctx.event_callback, client=ctx.client)
+    has_embed_client = callable(getattr(getattr(ctx.client, "models", None), "embed_content", None))
     if is_real_genai_client(ctx.client):
         curator = ContextCuratorAgent(
             cartridge_dir=ctx.cartridge_dir,
@@ -1819,30 +1961,73 @@ def run_script_writer_specialist(
             item_kind=item.kind,
         )
         curated_context_block = f"{pack.prompt_block}\nGAME BIBLE CONTEXT:\n{bible_text}\n"
-    prompt = (
-        f"You are the Lead Scriptwriter & Narrative Dramatist executing a brief for TASK [{item.item_id}] ({item.kind}): {item.title}\n"
-        f"TASK SPEC: {item.spec}\n"
-        f"TASK LEAD BRIEF FOR SCRIPTWRITER:\n{brief}\n\n"
-        f"{curated_context_block}"
-        f"Craft the requested scene scripts (`added_or_updated_cutscenes`), branching dialogue (`added_or_updated_dialogue_trees`), "
-        f"contextual gameplay barks (`added_or_updated_barks`), or character sheets (`added_or_updated_characters`) suited to THIS game. "
-        f"Provide `deliberation` FIRST."
-    )
-    resp = call_gemini_with_transient_retry(
-        lambda: ctx.client.models.generate_content(
-            model=ctx.model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=ScriptWritingDeliverable,
-                thinking_config=bounded_thinking_config(1536),
+    elif (ctx.cartridge_dir / "game_memory.json").is_file():
+        role_mem = mem_store.format_role_memory_briefing("script_writer")
+        if role_mem:
+            curated_context_block = f"{role_mem}\n{curated_context_block}"
+
+    mem_query_blocks: List[str] = []
+    asked_mem_queries: set[str] = set()
+    max_mem_queries = 2 if has_embed_client else 0
+    deliverable: Optional[ScriptWritingDeliverable] = None
+    for mem_turn in range(max_mem_queries + 1):
+        mem_q_section = ("\n" + "\n".join(mem_query_blocks)) if mem_query_blocks else ""
+        prompt = (
+            f"You are the Lead Scriptwriter & Narrative Dramatist executing a brief for TASK [{item.item_id}] ({item.kind}): {item.title}\n"
+            f"TASK SPEC: {item.spec}\n"
+            f"TASK LEAD BRIEF FOR SCRIPTWRITER:\n{brief}\n\n"
+            f"{curated_context_block}{mem_q_section}"
+            f"Craft the requested scene scripts (`added_or_updated_cutscenes`), branching dialogue (`added_or_updated_dialogue_trees`), "
+            f"contextual gameplay barks (`added_or_updated_barks`), or character sheets (`added_or_updated_characters`) suited to THIS game. "
+            f"Provide `deliberation` FIRST."
+        )
+        resp = call_gemini_with_transient_retry(
+            lambda: ctx.client.models.generate_content(
+                model=ctx.model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=ScriptWritingDeliverable,
+                    thinking_config=bounded_thinking_config(1536),
+                ),
             ),
-        ),
-        label=f"run_script_writer_specialist[{item.item_id}:t{turn_index}]",
-    )
-    if not resp.text:
-        raise StudioAgentError(f"Scriptwriter specialist returned an empty response for '{item.item_id}'")
-    deliverable = ScriptWritingDeliverable.model_validate_json(resp.text)
+            label=f"run_script_writer_specialist[{item.item_id}:t{turn_index}]",
+        )
+        if not resp.text:
+            raise StudioAgentError(f"Scriptwriter specialist returned an empty response for '{item.item_id}'")
+        deliverable = ScriptWritingDeliverable.model_validate_json(resp.text)
+        if deliverable.memory_updates:
+            mem_store.apply_mutations(
+                author_role="script_writer",
+                proposals=deliverable.memory_updates,
+                item_id=item.item_id,
+            )
+        mem_q = (deliverable.memory_query or "").strip()
+        mem_q_key = f"{(deliverable.memory_query_bank or '').strip().lower()}::{mem_q.lower()}"
+        has_deliverable_content = bool(
+            deliverable.added_or_updated_characters
+            or deliverable.added_or_updated_cutscenes
+            or deliverable.added_or_updated_dialogue_trees
+            or deliverable.added_or_updated_barks
+        )
+        if (
+            mem_q
+            and not has_deliverable_content
+            and has_embed_client
+            and mem_turn < max_mem_queries
+            and mem_q_key not in asked_mem_queries
+        ):
+            asked_mem_queries.add(mem_q_key)
+            hits = mem_store.query_memories(
+                caller_role="script_writer",
+                query_text=mem_q,
+                bank_filter=deliverable.memory_query_bank,
+                client=ctx.client,
+            )
+            mem_query_blocks.append(format_memory_query_results(mem_q, deliverable.memory_query_bank, hits))
+            continue
+        break
+    assert deliverable is not None
 
     touched: List[str] = []
     with _CATALOG_LOCK:
@@ -2728,18 +2913,24 @@ def run_qa_test_engineer_specialist(
                 f"1. Inspect EVERY single frame of the attached `filmstrip_*.png` image from Frame 1 to the final frame.\n"
                 f"2. Strategize from first principles what a live player and the Design Council need to see verified for this specific task:\n"
                 f"   - Does the rendered viewport clearly frame the active subjects across all frames without losing them off-screen?\n"
-                f"   - Are UI/HUD panels, labels, and world/test overlays legible and free of text collisions, overlaps, or unintended production debug clutter?\n"
+                f"   - Are UI/HUD panels, labels, and world/test overlays legible and free of text collisions, panel-border overflows, overlaps, squished icons, cut-off/bleeding sprite-sheet slicing, or unintended production debug clutter?\n"
                 f"   - Are world-space indicators/vectors aligned with the actual visual sprites they represent?\n"
                 f"   - Across `CAPTURED TICKS` (60 ticks ~ 1 second), do the player inputs produce a responsive, human-playable rate of motion/change rather than a static image or a nearly imperceptible crawl?\n"
-                f"3. In `observed_frames_summary`, describe objectively what is ACTUALLY visible inside the 16:9 viewport of each frame.\n"
-                f"4. In `post_capture_test_scene_summary`, write a factual post-capture briefing for the Council explaining what the test scene staged, what inputs/overlays ran, and what the rendered frames show.\n"
-                f"5. If any frame fails visual framing, has overlapping/illegible UI, lacks test-scene diagnostic proof, or fails to show responsive progression, list each issue in `unaddressed_defects` and set `qa_passed = False`!\n"
+                f"3. In `observed_frames_summary`, describe objectively and unsentimentally what is ACTUALLY visible inside the 16:9 viewport of each frame (zero cheerleading or flattery).\n"
+                f"4. In `post_capture_test_scene_summary`, write a candid, factual post-capture briefing for the Council explaining what the test scene staged, what inputs/overlays ran, and what the rendered frames show.\n"
+                f"5. If any frame fails visual framing, has overlapping/overflowing UI or cut-off sprite slicing, lacks test-scene diagnostic proof, or fails to show responsive progression for THIS task's `SPEC`/`PROOF SPEC`, list each issue in `unaddressed_defects` and set `qa_passed = False`; once THIS task's `SPEC` and `PROOF SPEC` are genuinely proven without visual/causal glitches, set `qa_passed = True` without inventing out-of-scope wishlist demands!\n"
                 f"Provide `deliberation` FIRST and `qa_passed` LAST."
+            )
+            qa_media_res = getattr(getattr(types, "MediaResolution", None), "MEDIA_RESOLUTION_HIGH", None)
+            strip_part = (
+                types.Part.from_bytes(data=Path(strip).read_bytes(), mime_type="image/png", media_resolution=qa_media_res)
+                if qa_media_res is not None
+                else types.Part.from_bytes(data=Path(strip).read_bytes(), mime_type="image/png")
             )
             audit_contents: Any = [
                 audit_prompt,
                 f"CAPTURED FILMSTRIP TO AUDIT ({Path(strip).name}):",
-                types.Part.from_bytes(data=Path(strip).read_bytes(), mime_type="image/png"),
+                strip_part,
             ]
             audit_resp = call_gemini_with_transient_retry(
                 lambda: ctx.client.models.generate_content(
@@ -2951,7 +3142,12 @@ def _build_task_lead_multimodal_parts(
         parts.append(
             f"CAPTURED PROOF IMAGE ({p.name}){qa_note} — inspect this image carefully before choosing submit_to_council:"
         )
-        parts.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime))
+        lead_media_res = getattr(getattr(types, "MediaResolution", None), "MEDIA_RESOLUTION_HIGH", None)
+        parts.append(
+            types.Part.from_bytes(data=p.read_bytes(), mime_type=mime, media_resolution=lead_media_res)
+            if lead_media_res is not None
+            else types.Part.from_bytes(data=p.read_bytes(), mime_type=mime)
+        )
     return parts
 
 
@@ -3202,6 +3398,15 @@ def plan_task_lead_turn(
                         multimodal_parts.append(extra_proof_parts[idx_p + 1])
                         existing_labels.append(lbl)
 
+    from engine.studio.game_memory import GameMemoryStore, format_memory_query_results
+
+    mem_store = GameMemoryStore(ctx.cartridge_dir, event_callback=ctx.event_callback, client=ctx.client)
+    has_embed_client = callable(getattr(getattr(ctx.client, "models", None), "embed_content", None))
+    if active_curator is None and (ctx.cartridge_dir / "game_memory.json").is_file():
+        lead_mem = mem_store.format_role_memory_briefing("task_lead")
+        if lead_mem:
+            curated_lead_block = f"{lead_mem}\n{curated_lead_block}" if curated_lead_block else lead_mem
+
     issues: List[str] = []
     resolved_inquiries: List[SelfInquiryQAPair] = (
         active_curator.load_self_inquiry_memory(item.item_id, "task_lead")
@@ -3212,6 +3417,10 @@ def plan_task_lead_turn(
     asked_questions: set[str] = {p.question.strip().lower() for p in resolved_inquiries if p.question}
     inquiry_budget_used = 0
     max_inquiry_turns = 2 if active_curator is not None else 0
+    mem_query_blocks: List[str] = []
+    asked_mem_queries: set[str] = set()
+    mem_query_budget_used = 0
+    max_mem_query_turns = 2 if has_embed_client else 0
 
     attempt = 1
     while attempt <= attempts:
@@ -3239,6 +3448,10 @@ def plan_task_lead_turn(
             f"AVAILABLE AUTONOMOUS SPECIALISTS: {specialists}\n"
             f"{available_spec_lines}"
             f"INSTRUCTIONS:\n"
+            f"0. SKEPTICAL VERIFICATION, EXECUTIVE PRODUCER RESPECT & PRAGMATIC TASK COMPLETION:\n"
+            f"   - Treat specialist turn summaries (`swe_engineer`, `visual_artist`, `qa_test_engineer`) as UNVERIFIED CLAIMS—never praise or trust a specialist's prose ('implemented cleanly!') until you verify it directly in the rendered proof pixels, telemetry progression, and `VERIFIED PRODUCTION DISK DIFF SO FAR`.\n"
+            f"   - Treat any Executive Producer steering or Council direction in `SPEC` / `COUNCIL DIRECTION` with full respect and cater directly to it without excuses or silent scope downgrading (Rule 5).\n"
+            f"   - Keep scope bounded to THIS task: deliver `SPEC` and `PROOF THE COUNCIL WILL JUDGE` cleanly and fix any glaring visual/UI/causal glitches in your modules, then call the task ready (`submit_to_council`) rather than trying to rewrite unrelated systems or boil the ocean in one go.\n"
             f"1. Formulate your bespoke `current_strategy` and `proof_strategy` for creating everything necessary for this task and generating the final proof (and pivoting if the Council requested changes):\n"
             f"   - Creation Strategy (`current_strategy`): Plan every artifact, asset, multi-cell sheet/grid, rig, script, or GDScript module required by `SPEC`, and decide which specialist(s) in {specialists} to delegate to in sequence.\n"
             f"   - Proof Generation Strategy (`proof_strategy`): Plan how the final visual proof artifact(s) (`selected_proof_paths`) will be generated and verified to directly satisfy `PROOF THE COUNCIL WILL JUDGE` (`{item.proof_spec}`).\n"
@@ -3248,6 +3461,7 @@ def plan_task_lead_turn(
             f"     * Check for subsystem conflicts and human-scale feel: when multiple components act on the same entity (e.g., player input controllers alongside damping/stabilization/constraint scripts), ensure they do not fight or cancel out active player commands, and verify that holding a player input over 1–2 seconds (60–120 ticks) produces a responsive, human-playable rate of motion/turn/action.\n"
             f"     * If a prior task on the board or an earlier turn/revision already modified a script/property and the visual issue still occurs in the rendered viewport, treat the prior hypothesis as FALSIFIED/INCOMPLETE and inspect all other interacting nodes, camera targets, or scripts in the scene!\n"
             f"   - SELF-INQUIRY TOOL (`self_question` -> ContextCuratorAgent research -> `self_question_answer`): If you need to inspect a specific module's code, signals, or design spec that is not in your current context before writing your specialist `brief`, you may output a specific question in `self_question` (leaving `brief` empty). `ContextCuratorAgent` will fetch the relevant chunks on the next turn so YOU can answer your own question in `self_question_answer` and then delegate accurately.\n"
+            f"   - LONG-TERM MEMORY (`memory_query` / `memory_updates`): If you want to look up cross-slice strategic goals, prior architectural decisions, or operational lessons learned in the game or agent memory banks before delegating, populate `memory_query` (and optional `memory_query_bank`, leaving `brief` empty). Whenever you uncover a durable lesson learned or cross-task invariant during execution, record it in `memory_updates` (`target_bank='self'` or `'council'`).\n"
             f"   - ON-DEMAND RUNTIME DIAGNOSTIC TEST SCENES ('I NEED MORE DEBUG INFO'): If a prior proof, Council `changes_requested` feedback, or bug report shows a runtime issue whose root cause is NOT already obvious from the existing filmstrip and code, do NOT guess blindly! Delegate to `'qa_test_engineer'` FIRST with a diagnostic brief asking QA to build/update `res://tests/test_<item_id>.tscn` with specific visual debug overlays and `get_state_snapshot()` telemetry keys to isolate the exact cause, then inspect the resulting diagnostic filmstrip on the next turn before briefing `'swe_engineer'`.\n"
             f"2. JUST-IN-TIME ASSET & SUB-TASK DISCOVERY (`action = 'spawn_tasks'` or `'delegate'` to `'visual_artist'`): Assets and animations are NOT built heavily upfront. As you plan or implement this task, reason out what specific assets, surface textures, animations, sounds, or sub-tasks are needed for THIS task in THIS slice.\n"
             f"   - HYBRID PROCEDURAL + GENERATED VISUAL CRAFT (THE BEST OF BOTH WORLDS):\n"
@@ -3283,6 +3497,7 @@ def plan_task_lead_turn(
             f"5. Choose `action = 'delegate'` to send an open-ended natural-language `brief` to one of {specialists}, `action = 'spawn_tasks'` to create newly discovered tasks on the board, OR `action = 'submit_to_council'` ONLY after all required assets/code are built AND at least one proof image in `COLLECTED PROOF IMAGES SO FAR` visually proves the requirement.\n"
             f"   - CONCISE DELIBERATION & BRIEF (NO RAW CODE IN BRIEF): Keep `deliberation` (<= 120 words) and `brief` (<= 180 words) focused and concise. NEVER write raw GDScript code blocks or paste whole functions inside `brief`—`swe_engineer` already reads the staging files directly! State the target file paths, class/function names, and behavioral/visual acceptance criteria.\n"
             f"   - CRITICAL SCHEMA FIELD ORDER WARNING: In `TaskLeadDecision`, `specialist_agent` and `brief` appear BEFORE `action` in the JSON schema! Decide your turn action inside `deliberation` and `current_strategy` first: whenever you are delegating to a specialist (`action = 'delegate'`), you MUST populate `specialist_agent` (one of {specialists}) and a non-empty `brief` BEFORE emitting `action = 'delegate'`! Never leave `specialist_agent` or `brief` empty when delegating.\n"
+            f"   - LONG-TERM MEMORY SELECTIVITY: Leave `memory_updates` empty (`[]`) on ~95% of turns! Never log task progress, delegation steps, or facts already in the Game Bible/codebase; record ONLY when a costly cross-task failure mode, operational invariant, or deferred multi-slice goal would otherwise be lost.\n"
             f"Provide `deliberation` FIRST and `action` LAST.\n"
             f"{slice_context_block}"
             f"{curated_lead_block}"
@@ -3291,7 +3506,8 @@ def plan_task_lead_turn(
             f"{board_snapshot_block}"
             f"CARTRIDGE SYMBOLS & FILES:\n{qa_context or '(empty)'}{cat_block}"
             f"{verified_diff_block}"
-            f"COLLECTED PROOF IMAGES SO FAR: {collected_proofs}\n"
+            + (("\n" + "\n".join(mem_query_blocks)) if mem_query_blocks else "")
+            + f"COLLECTED PROOF IMAGES SO FAR: {collected_proofs}\n"
             f"{turns_block}"
             f"{retry}"
         )
@@ -3335,6 +3551,12 @@ def plan_task_lead_turn(
             role="task_lead",
             deliberation=decision.deliberation,
         )
+        if decision.memory_updates:
+            mem_store.apply_mutations(
+                author_role="task_lead",
+                proposals=decision.memory_updates,
+                item_id=item.item_id,
+            )
 
         # 1. If the Task Lead answered a pending self_question on this turn, record Q->A in persistent memory
         if pending_question_pack is not None and active_curator is not None:
@@ -3389,6 +3611,35 @@ def plan_task_lead_turn(
             for cid in pending_question_pack.selected_chunk_ids:
                 if cid not in already_included_cids:
                     already_included_cids.append(cid)
+            issues = []
+            continue
+
+        # 2b. If the Task Lead issued a direct `memory_query` instead of delegating/submitting, query GameMemoryStore
+        new_mem_q = (decision.memory_query or "").strip()
+        mem_q_key = f"{(decision.memory_query_bank or '').strip().lower()}::{new_mem_q.lower()}"
+        if (
+            new_mem_q
+            and not decision.brief.strip()
+            and has_embed_client
+            and mem_query_budget_used < max_mem_query_turns
+            and mem_q_key not in asked_mem_queries
+        ):
+            asked_mem_queries.add(mem_q_key)
+            mem_query_budget_used += 1
+            logger.info("Task Lead memory query on '%s' (turn %d): %s", item.item_id, mem_query_budget_used, new_mem_q)
+            record_turn_substep(
+                "memory_query",
+                f"Task Lead querying long-term memory: {new_mem_q}",
+                details={"query": new_mem_q, "bank": decision.memory_query_bank or "all"},
+                specialist_agent="task_lead",
+            )
+            hits = mem_store.query_memories(
+                caller_role="task_lead",
+                query_text=new_mem_q,
+                bank_filter=decision.memory_query_bank,
+                client=ctx.client,
+            )
+            mem_query_blocks.append(format_memory_query_results(new_mem_q, decision.memory_query_bank, hits))
             issues = []
             continue
 

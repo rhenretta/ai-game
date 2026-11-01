@@ -23,7 +23,7 @@ import uuid
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
-from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -71,7 +71,8 @@ logger = logging.getLogger("StudioObservabilityServer")
 
 import sys
 
-STATIC_DIR = Path(__file__).resolve().parent / "static"
+STUDIO_WEB_DIR = config.PROJECT_ROOT / "studio-web"
+STUDIO_WEB_DIST_DIR = STUDIO_WEB_DIR / "dist"
 _PROD_EVENTS_LOG = (config.PROJECT_ROOT / "data" / "studio_events.jsonl").resolve()
 
 
@@ -398,11 +399,18 @@ class SwarmEventBus:
             return
         try:
             current_size = self._log_path.stat().st_size
-            if current_size < getattr(self, "_last_log_offset", 0):
+            last_offset = getattr(self, "_last_log_offset", 0)
+            if current_size < last_offset:
+                last_offset = 0
                 self._last_log_offset = 0
 
+            max_initial_tail_bytes = 2 * 1024 * 1024
             with open(self._log_path, "r", encoding="utf-8", errors="replace") as fh:
-                fh.seek(getattr(self, "_last_log_offset", 0))
+                if last_offset == 0 and current_size > max_initial_tail_bytes:
+                    fh.seek(current_size - max_initial_tail_bytes)
+                    fh.readline()  # Advance past partial JSONL line boundary
+                else:
+                    fh.seek(last_offset)
                 for line in fh:
                     line = line.strip()
                     if line:
@@ -421,14 +429,43 @@ class SwarmEventBus:
         self._last_log_offset = 0
         self._sync_from_disk()
 
-    def _append_event_record(self, event_data: Dict[str, Any]) -> None:
+    def _append_event_record(self, event_data: Dict[str, Any]) -> Dict[str, Any]:
         with self._thread_lock:
             eid = event_data.get("event_id") or f"ev_{uuid.uuid4().hex[:12]}"
             ts = str(event_data.get("timestamp_utc") or datetime.now(timezone.utc).isoformat())
             event_data["event_id"] = eid
             event_data["timestamp_utc"] = ts
-            self._recent_events.append(event_data)
             self._index_event(event_data)
+
+            etype = str(event_data.get("event_type", "EVENT"))
+            agent = str(event_data.get("agent_name", "StudioSwarm"))
+            delib = str(event_data.get("deliberation", ""))
+            full_payload = event_data.get("payload", {})
+            feed_payload = full_payload
+            event_for_feed = event_data
+            if (
+                etype in (SwarmEventType.GAME_BIBLE_UPDATED.value, "GAME_BIBLE_UPDATED", "game_bible_updated")
+                and isinstance(full_payload, dict)
+                and any(
+                    heavy_k in full_payload
+                    for heavy_k in (
+                        "writers_room_transcript",
+                        "experience_storyboard",
+                        "concept_evolution",
+                        "visual_mockups",
+                        "world_spec",
+                        "narrative_bible",
+                    )
+                )
+            ):
+                from engine.telemetry.db import compact_game_bible_event_payload
+                feed_payload = compact_game_bible_event_payload(full_payload, delib)
+                event_for_feed = {
+                    **event_data,
+                    "payload": feed_payload,
+                }
+
+            self._recent_events.append(event_for_feed)
 
             # Relational SQLite WAL persistence (Milestone 7 Godot 4 Transition)
             if self._db_path:
@@ -453,11 +490,6 @@ class SwarmEventBus:
                                 deliberation=f"Live studio build session {bid}.",
                             )
 
-                    etype = str(event_data.get("event_type", "EVENT"))
-                    agent = str(event_data.get("agent_name", "StudioSwarm"))
-                    delib = str(event_data.get("deliberation", ""))
-                    payload = event_data.get("payload", {})
-
                     db.record_studio_event(
                         event_id=eid,
                         build_id=bid,
@@ -465,31 +497,31 @@ class SwarmEventBus:
                         agent_name=agent,
                         timestamp_utc=ts,
                         deliberation=delib,
-                        payload=payload,
+                        payload=feed_payload,
                     )
 
                     if etype in (SwarmEventType.AGENT_TASK_RECORD.value, "AGENT_TASK_RECORD", "TASK_EXECUTION_RECORD"):
-                        t_data = dict(payload) if isinstance(payload, dict) and payload else dict(event_data)
+                        t_data = dict(full_payload) if isinstance(full_payload, dict) and full_payload else dict(event_data)
                         db.record_studio_task(t_data, build_id=bid)
                     elif etype in (SwarmEventType.REQUIREMENTS_SPEC_GENERATED.value, "REQUIREMENTS_SPEC_GENERATED"):
-                        spec = payload.get("spec") if isinstance(payload, dict) else payload
+                        spec = full_payload.get("spec") if isinstance(full_payload, dict) else full_payload
                         if spec:
                             db.record_studio_requirements(build_id=bid, spec=spec)
                     elif etype in (SwarmEventType.REQUIREMENT_STATUS_UPDATE.value, "REQUIREMENT_STATUS_UPDATE"):
-                        if isinstance(payload, dict):
-                            rid = payload.get("requirement_id")
-                            st = payload.get("status")
+                        if isinstance(full_payload, dict):
+                            rid = full_payload.get("requirement_id")
+                            st = full_payload.get("status")
                             if rid and st:
                                 db.update_studio_requirement_status(build_id=bid, requirement_id=rid, status=st)
                     elif etype in (SwarmEventType.CARTRIDGE_PROMOTED.value, "CARTRIDGE_PROMOTED"):
                         db.update_studio_build(build_id=bid, status="PROMOTED")
                     elif etype in (SwarmEventType.GAME_BIBLE_UPDATED.value, "GAME_BIBLE_UPDATED", "game_bible_updated"):
-                        if isinstance(payload, dict) and payload:
+                        if isinstance(full_payload, dict) and full_payload:
                             db.upsert_game_bible(
-                                bible_id=str(payload.get("bible_id") or f"bible_{bid}"),
-                                cartridge_id=str(payload.get("cartridge_id") or bid),
-                                status=str(payload.get("status") or "brainstorming").upper(),
-                                bible_dict=payload,
+                                bible_id=str(full_payload.get("bible_id") or f"bible_{bid}"),
+                                cartridge_id=str(full_payload.get("cartridge_id") or bid),
+                                status=str(full_payload.get("status") or "brainstorming").upper(),
+                                bible_dict=full_payload,
                                 build_id=bid,
                             )
                 except Exception as exc:
@@ -503,14 +535,17 @@ class SwarmEventBus:
                 try:
                     self._log_path.parent.mkdir(parents=True, exist_ok=True)
                     with self._log_path.open("a", encoding="utf-8") as fh:
-                        fh.write(json.dumps(event_data) + "\n")
+                        fh.write(json.dumps(event_for_feed) + "\n")
                     self._last_log_offset = self._log_path.stat().st_size
                 except Exception:
                     pass
+            return event_for_feed
 
     def _get_lock(self) -> asyncio.Lock:
-        if self._lock is None:
+        cur_loop = asyncio.get_running_loop()
+        if self._lock is None or getattr(self, "_lock_loop", None) is not cur_loop:
             self._lock = asyncio.Lock()
+            self._lock_loop = cur_loop
         return self._lock
 
     def set_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -533,31 +568,32 @@ class SwarmEventBus:
         limit: Optional[int] = None,
         build_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        effective_limit = (
+            limit
+            if (limit is not None and limit > 0)
+            else (self._recent_events.maxlen or 300)
+        )
         with self._thread_lock:
             if self._db_path and self._db_path.exists():
                 try:
                     from engine.telemetry.db import TelemetryDB
                     db = TelemetryDB(self._db_path)
                     target_bid = build_id or self.get_active_build_id()
-                    db_events = db.get_studio_events(build_id=target_bid, limit=limit)
+                    db_events = db.get_studio_events(build_id=target_bid, limit=effective_limit)
                     if not db_events and target_bid and not str(target_bid).startswith("build_"):
-                        db_events = db.get_studio_events(build_id=f"build_{target_bid}", limit=limit)
+                        db_events = db.get_studio_events(build_id=f"build_{target_bid}", limit=effective_limit)
                     if not db_events and build_id is None:
-                        db_events = db.get_studio_events(build_id=None, limit=limit)
+                        db_events = db.get_studio_events(build_id=None, limit=effective_limit)
                     if db_events:
                         return db_events
                 except Exception as e:
                     logger.debug("Failed querying studio_events from DB: %s", e)
                 events = [ev for ev in self._recent_events if isinstance(ev, dict)]
-                if limit is not None and limit > 0:
-                    return events[-limit:]
-                return events
+                return events[-effective_limit:]
 
             self._sync_from_disk()
             events = [ev for ev in self._recent_events if isinstance(ev, dict)]
-            if limit is not None and limit > 0:
-                return events[-limit:]
-            return events
+            return events[-effective_limit:]
 
     async def broadcast(self, event_data: Dict[str, Any]) -> None:
         """Broadcasts an event dict to all connected WebSocket subscribers, purging dead sockets."""
@@ -577,7 +613,7 @@ class SwarmEventBus:
 
     def publish_threadsafe(self, event_data: Dict[str, Any]) -> None:
         """Thread-safe entrypoint for background worker threads to broadcast into the asyncio loop."""
-        self._append_event_record(event_data)
+        broadcast_event = self._append_event_record(event_data)
 
         if self._loop is not None and self._loop.is_closed():
             self._loop = None
@@ -590,7 +626,7 @@ class SwarmEventBus:
                 loop = None
 
         if loop and loop.is_running():
-            eid = event_data.get("event_id")
+            eid = broadcast_event.get("event_id")
             if eid:
                 if not hasattr(self, "_broadcasted_event_ids"):
                     self._broadcasted_event_ids = set()
@@ -603,9 +639,9 @@ class SwarmEventBus:
                     pass
 
                 if current_loop is loop:
-                    asyncio.create_task(self.broadcast(event_data))
+                    asyncio.create_task(self.broadcast(broadcast_event))
                 else:
-                    asyncio.run_coroutine_threadsafe(self.broadcast(event_data), loop)
+                    asyncio.run_coroutine_threadsafe(self.broadcast(broadcast_event), loop)
             except Exception as exc:
                 logger.warning("Failed to schedule broadcast into loop: %s", exc)
 
@@ -1886,11 +1922,20 @@ def create_app(
     start_time = time.time()
 
     async def index_handler(request):
-        """Serves the Mission Control single page app index.html."""
-        index_file = STATIC_DIR / "index.html"
-        if not index_file.exists():
-            return JSONResponse({"error": "Static index.html not found"}, status_code=404)
-        return FileResponse(str(index_file), media_type="text/html")
+        """Serves compiled studio-web React SPA when built, or redirects/describes the Vite UI in dev mode."""
+        dist_index = STUDIO_WEB_DIST_DIR / "index.html"
+        if dist_index.is_file():
+            return FileResponse(str(dist_index), media_type="text/html")
+        ui_origin = os.environ.get("STUDIO_WEB_ORIGIN", "http://127.0.0.1:5173/")
+        accept_hdr = (request.headers.get("accept") or "").lower()
+        if "text/html" in accept_hdr and not _is_pytest_active():
+            return RedirectResponse(url=ui_origin, status_code=307)
+        return JSONResponse({
+            "deliberation": "Mission Control API online; UI is served by the studio-web React application.",
+            "status": "ok",
+            "service": "studio_observability",
+            "ui_url": ui_origin,
+        })
 
     async def health_handler(request):
         """F28.2: Health check endpoint returning ok status."""
@@ -3065,6 +3110,23 @@ def create_app(
                         daemon_inst.run_genesis_cycle()
                     except Exception as bg_exc:
                         logger.error("Background Genesis trigger failed: %s", bg_exc)
+                    finally:
+                        setattr(threading.current_thread(), "_genesis_finished", True)
+                        proc_ev = {
+                            "deliberation": f"Background Genesis build thread for job {job_id} exited; notifying Mission Control subscribers to refresh process status.",
+                            "event_id": f"ev_proc_{uuid.uuid4().hex[:8]}",
+                            "event_type": "studio_process_updated",
+                            "agent_name": "StudioDaemon",
+                            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                            "payload": {"job_id": job_id, "status": "exited"},
+                        }
+                        for bus_inst in ({target_bus, swarm_bus} if swarm_bus is not None else {target_bus}):
+                            loop_ref = getattr(bus_inst, "_loop", None)
+                            if loop_ref is not None and loop_ref.is_running():
+                                try:
+                                    asyncio.run_coroutine_threadsafe(bus_inst.broadcast(proc_ev), loop_ref)
+                                except Exception:
+                                    pass
 
                 threading.Thread(
                     target=_run_bg_genesis,
@@ -3089,8 +3151,13 @@ def create_app(
         )
         return JSONResponse(resp.model_dump())
 
+    _ws_shutdown_state: Dict[str, Any] = {"event": None, "loop": None, "shutting_down": False}
+
     async def ws_swarm_handler(websocket: WebSocket):
         """F28.3 & R4: WebSocket streaming live deliberation tokens and tool invocations."""
+        if _ws_shutdown_state.get("shutting_down"):
+            await websocket.close(code=1012)
+            return
         await websocket.accept()
         loop = asyncio.get_running_loop()
         target_bus.set_event_loop(loop)
@@ -3124,24 +3191,28 @@ def create_app(
             except Exception:
                 last_rowid = 0
 
+        def _fetch_tail_rows(after_rowid: int) -> List[Dict[str, Any]]:
+            tdb = TelemetryDB(target_db)
+            conn = tdb.get_reader_connection()
+            try:
+                cur = conn.execute(
+                    "SELECT rowid, event_id, build_id, event_type, agent_name, timestamp_utc, deliberation, payload_json "
+                    "FROM studio_events WHERE rowid > ? ORDER BY rowid ASC LIMIT 100;",
+                    (after_rowid,),
+                )
+                return [dict(r) for r in cur.fetchall()]
+            finally:
+                conn.close()
+
         async def _tail_db_events() -> None:
             nonlocal last_rowid
+            from engine.telemetry.db import compact_game_bible_event_payload
             while True:
                 await asyncio.sleep(0.6)
                 if not target_db or not target_db.exists():
                     continue
                 try:
-                    tdb = TelemetryDB(target_db)
-                    conn = tdb.get_reader_connection()
-                    try:
-                        cur = conn.execute(
-                            "SELECT rowid, event_id, build_id, event_type, agent_name, timestamp_utc, deliberation, payload_json "
-                            "FROM studio_events WHERE rowid > ? ORDER BY rowid ASC LIMIT 100;",
-                            (last_rowid,),
-                        )
-                        new_rows = [dict(r) for r in cur.fetchall()]
-                    finally:
-                        conn.close()
+                    new_rows = await asyncio.to_thread(_fetch_tail_rows, last_rowid)
 
                     for r in new_rows:
                         rid = int(r.get("rowid") or 0)
@@ -3163,11 +3234,28 @@ def create_app(
                                 payload_obj = json.loads(p_raw)
                             except Exception:
                                 payload_obj = {}
+                        ev_type_str = r.get("event_type") or "AGENT_STREAM"
+                        if (
+                            ev_type_str in ("game_bible_updated", "GAME_BIBLE_UPDATED")
+                            and isinstance(payload_obj, dict)
+                            and any(
+                                heavy_k in payload_obj
+                                for heavy_k in (
+                                    "writers_room_transcript",
+                                    "experience_storyboard",
+                                    "concept_evolution",
+                                    "visual_mockups",
+                                    "world_spec",
+                                    "narrative_bible",
+                                )
+                            )
+                        ):
+                            payload_obj = compact_game_bible_event_payload(payload_obj, r.get("deliberation"))
                         ev_out = {
+                            "deliberation": r.get("deliberation") or "",
                             "event_id": eid,
                             "build_id": r.get("build_id"),
-                            "deliberation": r.get("deliberation") or "",
-                            "event_type": r.get("event_type") or "AGENT_STREAM",
+                            "event_type": ev_type_str,
                             "agent_name": r.get("agent_name") or "StudioOrchestrator",
                             "timestamp_utc": r.get("timestamp_utc") or datetime.now(timezone.utc).isoformat(),
                             "payload": payload_obj,
@@ -3180,8 +3268,34 @@ def create_app(
 
         tail_task = asyncio.create_task(_tail_db_events())
         try:
-            while True:
-                msg = await websocket.receive_text()
+            while not _ws_shutdown_state.get("shutting_down"):
+                shut_ev = (
+                    _ws_shutdown_state.get("event")
+                    if _ws_shutdown_state.get("loop") is loop
+                    else None
+                )
+                if shut_ev is not None:
+                    recv_task = asyncio.create_task(websocket.receive_text())
+                    wait_shut = asyncio.create_task(shut_ev.wait())
+                    done, pending = await asyncio.wait(
+                        {recv_task, wait_shut},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for p_task in pending:
+                        p_task.cancel()
+                        try:
+                            await p_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    if wait_shut in done or _ws_shutdown_state.get("shutting_down"):
+                        try:
+                            await websocket.close(code=1012)
+                        except Exception:
+                            pass
+                        break
+                    msg = recv_task.result()
+                else:
+                    msg = await websocket.receive_text()
                 # Echo / heartbeat keepalive
                 await websocket.send_json({
                     "deliberation": f"Received client probe: {msg[:64]}",
@@ -3815,11 +3929,16 @@ def create_app(
         payload = await asyncio.to_thread(_compute_steam_dna_payload, player_id, profile_tag, force_rescan)
         return JSONResponse(payload)
 
-    async def events_history_handler(request):
-        """GET /api/events/history: Returns buffered swarm events and hydrates deliberations/tool cards from active cartridge."""
-        bid = request.query_params.get("build_id")
+    def _compute_events_history_payload(
+        bid: Optional[str],
+        cartridge_q: Optional[str],
+        limit: int,
+    ) -> Dict[str, Any]:
+        raw_recent = target_bus.get_recent_events(limit=limit, build_id=bid or cartridge_q)
+        if not raw_recent and bid is None and cartridge_q:
+            raw_recent = target_bus.get_recent_events(limit=limit, build_id=None)
         recent = [
-            ev for ev in target_bus.get_recent_events(build_id=bid)
+            ev for ev in raw_recent
             if isinstance(ev, dict)
             and ev.get("event_type") != "BACKGROUND_THREAD_EVENT"
             and ev.get("agent_name") != "WorkerThread"
@@ -4113,12 +4232,24 @@ def create_app(
                 if ag and st:
                     lifecycle_states[ag] = st
 
-        return JSONResponse({
+        return {
             "deliberation": f"Retrieved {len(combined_events)} historical studio swarm events.",
             "events": combined_events,
             "agent_lifecycle_states": lifecycle_states,
             "process_status": _inspect_live_build_process(),
-        })
+        }
+
+    async def events_history_handler(request):
+        """GET /api/events/history: Returns buffered swarm events and hydrates deliberations/tool cards from active cartridge."""
+        bid = request.query_params.get("build_id")
+        cartridge_q = request.query_params.get("cartridge")
+        try:
+            limit = int(request.query_params.get("limit", 200))
+            limit = max(1, min(limit, 1000))
+        except (ValueError, TypeError):
+            limit = 200
+        payload = await asyncio.to_thread(_compute_events_history_payload, bid, cartridge_q, limit)
+        return JSONResponse(payload)
 
     async def agents_history_handler(request):
         """GET /api/agents/history: Chronological task history with deliberation and handoffs."""
@@ -5681,7 +5812,7 @@ def create_app(
                     continue
                 tname = str(th.name or "")
                 if (
-                    tname.startswith("GenesisTrigger_")
+                    (tname.startswith("GenesisTrigger_") and not getattr(th, "_genesis_finished", False))
                     or tname == "board-scheduler"
                     or (lock_held and tname.startswith("board-worker"))
                 ):
@@ -5803,7 +5934,7 @@ def create_app(
             "STUDIO_RESUMED",
         }
         try:
-            recent_ev = target_bus.get_recent_events(limit=500)
+            recent_ev = target_bus.get_recent_events(limit=120)
             if recent_ev and isinstance(recent_ev[-1], dict):
                 last_event_ts = recent_ev[-1].get("timestamp_utc")
             seen_newer_progress = False
@@ -5855,7 +5986,7 @@ def create_app(
                     if last_error is None:
                         recent_rows = conn.execute(
                             "SELECT event_type, agent_name, timestamp_utc, payload_json FROM studio_events "
-                            "ORDER BY id DESC LIMIT 50;"
+                            "ORDER BY rowid DESC LIMIT 50;"
                         ).fetchall()
                         seen_newer_progress = False
                         progressed_items_db: Set[str] = set()
@@ -6001,6 +6132,23 @@ def create_app(
                                     daemon_inst.run_genesis_cycle()
                                 except Exception as bg_exc:
                                     logger.error("Background unpause resume failed: %s", bg_exc)
+                                finally:
+                                    setattr(threading.current_thread(), "_genesis_finished", True)
+                                    proc_ev = {
+                                        "deliberation": "Background unpause-resume build thread exited; notifying Mission Control subscribers to refresh process status.",
+                                        "event_id": f"ev_proc_{uuid.uuid4().hex[:8]}",
+                                        "event_type": "studio_process_updated",
+                                        "agent_name": "StudioDaemon",
+                                        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                                        "payload": {"candidate_id": cand_to_resume, "status": "exited"},
+                                    }
+                                    for bus_inst in ({target_bus, swarm_bus} if swarm_bus is not None else {target_bus}):
+                                        loop_ref = getattr(bus_inst, "_loop", None)
+                                        if loop_ref is not None and loop_ref.is_running():
+                                            try:
+                                                asyncio.run_coroutine_threadsafe(bus_inst.broadcast(proc_ev), loop_ref)
+                                            except Exception:
+                                                pass
 
                             threading.Thread(
                                 target=_run_bg_unpause_resume,
@@ -6011,6 +6159,22 @@ def create_app(
         proc_info = _inspect_live_build_process()
         pause_val = proc_info["pause_for_greenlight"]
         paused_val = proc_info["is_paused"]
+        if request.method == "POST":
+            settings_ev = {
+                "deliberation": f"Broadcast studio settings update: paused={paused_val}, process_state={proc_info['process_state']}.",
+                "event_id": f"ev_cfg_{uuid.uuid4().hex[:8]}",
+                "event_type": "studio_settings_updated",
+                "agent_name": "ExecutiveProducer",
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "payload": {
+                    "pause_for_greenlight": pause_val,
+                    "paused": paused_val,
+                    "process_state": proc_info["process_state"],
+                },
+            }
+            await target_bus.broadcast(settings_ev)
+            if swarm_bus is not None and swarm_bus is not target_bus:
+                await swarm_bus.broadcast(settings_ev)
         return JSONResponse({
             "deliberation": f"Studio orchestration configuration: pause_for_greenlight={pause_val}, paused={paused_val}, process_state={proc_info['process_state']}.",
             "pause_for_greenlight": pause_val,
@@ -6352,6 +6516,10 @@ def create_app(
         except StudioAgentError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 
+        no_store_headers = {
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        }
         low = filename.lower()
         if low.endswith(".png"):
             mtype = "image/png"
@@ -6359,15 +6527,15 @@ def create_app(
             mtype = "image/jpeg"
         elif low.endswith(".wav"):
             resp = _serve_file_with_range_support(media_path, "audio/wav", request)
-            resp.headers["Cache-Control"] = "no-cache"
+            resp.headers.update(no_store_headers)
             return resp
         elif low.endswith(".mp4"):
             resp = _serve_file_with_range_support(media_path, "video/mp4", request)
-            resp.headers["Cache-Control"] = "no-cache"
+            resp.headers.update(no_store_headers)
             return resp
         else:
             mtype = "application/octet-stream"
-        return FileResponse(str(media_path), media_type=mtype, headers={"Cache-Control": "no-cache"})
+        return FileResponse(str(media_path), media_type=mtype, headers=no_store_headers)
 
     async def playtest_wishes_list_handler(request):
         """GET /api/playtest/wishes: Lists player-submitted wish items across sessions."""
@@ -6516,6 +6684,494 @@ def create_app(
             "wishes": updated_wishes,
         })
 
+    async def playtest_session_send_report_handler(request):
+        """POST /api/playtest/sessions/{session_id}/send-report-to-council: Dispatches the full Blind Playtest
+        session report (Experience Report, spotted bugs, player questions, field notes, rulebook, screenshots,
+        and optionally pending player wishes) immediately to the Specialist Council, auto-waking `SteeringResume`
+        if no Genesis build is currently running.
+        """
+        from engine.playtest.models import PlaytestReportDispatchRequest
+        from engine.studio.models import StudioAgentError
+
+        session_id = request.path_params.get("session_id", "")
+        try:
+            raw_bytes = await request.body()
+            raw_body = json.loads(raw_bytes.decode("utf-8")) if raw_bytes and raw_bytes.strip() else {}
+            if not isinstance(raw_body, dict):
+                raise ValueError("Request body must be a JSON object.")
+            req = PlaytestReportDispatchRequest(**raw_body)
+        except Exception as exc:
+            return JSONResponse(
+                {"deliberation": f"Invalid report dispatch request: {exc}", "error": str(exc)},
+                status_code=400,
+            )
+
+        mgr = _get_playtest_manager()
+        try:
+            dispatch_res = mgr.dispatch_session_report_to_council(
+                session_id,
+                include_pending_wishes=req.include_pending_wishes,
+                producer_note=req.producer_note,
+            )
+        except StudioAgentError as exc:
+            err_str = str(exc)
+            status_code = 404 if "not found" in err_str.lower() and "directory" not in err_str.lower() else 400
+            return JSONResponse({"deliberation": err_str, "error": err_str}, status_code=status_code)
+
+        cand_dir: Path = dispatch_res["cand_dir"]
+        spoken_msg: str = dispatch_res["spoken_msg"]
+        rel_proof_paths: List[str] = list(dispatch_res.get("proof_image_paths") or [])
+        updated_session: Dict[str, Any] = dispatch_res["session"]
+        updated_wishes: List[Dict[str, Any]] = dispatch_res["wishes"]
+        now_iso = str(dispatch_res.get("sent_at_utc") or datetime.now(timezone.utc).isoformat())
+
+        # Notify any live orchestrator / Writers' Room in memory immediately
+        orch = getattr(target_bus, "_active_orchestrator", None) or getattr(swarm_bus, "_active_orchestrator", None)
+        if orch is not None:
+            wr = getattr(orch, "writers_room", None)
+            if wr is not None and hasattr(wr, "queue_live_steering"):
+                try:
+                    wr.queue_live_steering(spoken_msg, candidate_dir=cand_dir)
+                except Exception:
+                    pass
+
+        # Append immediate visible utterance onto game_bible.json so Writers' Room UI renders it + player screenshots right away
+        gb_file = cand_dir / "game_bible.json"
+        if gb_file.is_file():
+            try:
+                gb_data = json.loads(gb_file.read_text(encoding="utf-8"))
+                if isinstance(gb_data, dict):
+                    tx = gb_data.setdefault("writers_room_transcript", [])
+                    utt = {
+                        "deliberation": req.deliberation,
+                        "utterance_id": f"utt_ptrep_{uuid.uuid4().hex[:8]}",
+                        "turn_index": len(tx),
+                        "speaker_role": "ExecutiveProducer",
+                        "speaker_display_name": "Executive Producer (Manual Playtest Report)",
+                        "spoken_dialogue": spoken_msg,
+                        "message": spoken_msg,
+                        "addressed_to": [
+                            "CreativeDirector",
+                            "GameplayDesigner",
+                            "UXExperienceDesigner",
+                            "LevelAndProgressionDesigner",
+                            "VisualArtDirector",
+                            "GameplaySystemsEngineer",
+                        ],
+                        "referenced_roles": [
+                            "GameplayDesigner",
+                            "UXExperienceDesigner",
+                            "GameplaySystemsEngineer",
+                        ],
+                        "bible_updates_summary": [
+                            f"Dispatched full Blind Playtest report ({session_id})",
+                        ],
+                        "proof_image_paths": rel_proof_paths,
+                        "artifact_emitted": (
+                            {
+                                "type": "playtest_report",
+                                "session_id": session_id,
+                                "path": rel_proof_paths[0],
+                                "caption": f"Manual Blind Playtest Report — {session_id}",
+                            }
+                            if rel_proof_paths
+                            else None
+                        ),
+                        "timestamp_utc": now_iso,
+                    }
+                    tx.append(utt)
+                    gb_data["updated_at_utc"] = now_iso
+                    gb_file.write_text(json.dumps(gb_data, indent=2), encoding="utf-8")
+                    target_bus.publish_game_bible_update(gb_data)
+                    target_bus.publish_threadsafe({
+                        "deliberation": req.deliberation,
+                        "event_type": SwarmEventType.WRITERS_ROOM_UTTERANCE.value,
+                        "agent_name": "ExecutiveProducer",
+                        "timestamp_utc": now_iso,
+                        "payload": utt,
+                    })
+            except Exception as gb_exc:
+                logger.debug("Could not append playtest report utterance to game_bible.json: %s", gb_exc)
+
+        # Auto-wake StudioDaemon in resume mode if Studio build lock is currently idle
+        auto_resumed_job_id: Optional[str] = None
+        if "PYTEST_CURRENT_TEST" not in os.environ:
+            try:
+                from engine.studio.daemon import StudioDaemon, StudioDaemonConfig, _genesis_build_lock
+                if not _genesis_build_lock.locked():
+                    auto_resumed_job_id = f"ptrep_{uuid.uuid4().hex[:8]}"
+                    cand_name = cand_dir.name
+                    target_bus._build_paused = False
+                    if target_bus is not swarm_bus:
+                        swarm_bus._build_paused = False
+                    try:
+                        pause_sentinel = target_cartridges / ".studio_paused.json"
+                        if pause_sentinel.is_file():
+                            pause_sentinel.unlink()
+                    except Exception:
+                        pass
+
+                    def _run_bg_report_resume() -> None:
+                        try:
+                            cfg = StudioDaemonConfig(
+                                steam_profile="default",
+                                cartridges_root=target_cartridges,
+                                active_cartridge_dir=target_active,
+                                db_path=target_db,
+                                resume_current=True,
+                                resume_candidate_id=cand_name,
+                            )
+                            daemon_inst = StudioDaemon(config_obj=cfg, event_bus=target_bus)
+                            daemon_inst.run_genesis_cycle()
+                        except Exception as bg_exc:
+                            logger.error("Background playtest report resume failed: %s", bg_exc)
+
+                    threading.Thread(
+                        target=_run_bg_report_resume,
+                        name=f"SteeringResume_{auto_resumed_job_id}",
+                        daemon=True,
+                    ).start()
+            except Exception as wake_exc:
+                logger.warning("Failed to auto-wake Studio on playtest report dispatch: %s", wake_exc)
+
+        return JSONResponse({
+            "deliberation": f"Dispatched full Blind Playtester report '{session_id}' to Council on '{cand_dir.name}'.",
+            "status": "council_resumed" if auto_resumed_job_id else "queued_for_active_council",
+            "candidate_id": cand_dir.name,
+            "auto_resumed_job_id": auto_resumed_job_id,
+            "session": updated_session,
+            "wishes": updated_wishes,
+            "proof_image_paths": rel_proof_paths,
+        })
+
+    def _resolve_memory_cartridge_dir(
+        sanitized_cart: Optional[Path],
+        build_id: Optional[str] = None,
+    ) -> Optional[Path]:
+        if sanitized_cart is not None:
+            return sanitized_cart
+
+        bid = str(build_id or target_bus.get_active_build_id() or "").strip()
+        if bid and target_cartridges.exists():
+            cand_token = bid[len("build_"):] if bid.startswith("build_") else bid
+            if cand_token and cand_token != "active":
+                cand_from_bid = target_cartridges / cand_token
+                if cand_from_bid.is_dir():
+                    return cand_from_bid
+
+        candidates: List[Path] = []
+        if target_cartridges.exists():
+            try:
+                candidates = sorted(
+                    [d for d in target_cartridges.glob("candidate_*") if d.is_dir()],
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+            except OSError:
+                candidates = []
+
+        # Prefer whichever cartridge directory has the freshest game_memory.json
+        mem_dirs: List[Path] = []
+        if target_active.is_dir() and (target_active / "game_memory.json").is_file():
+            mem_dirs.append(target_active)
+        for cdir in candidates:
+            if (cdir / "game_memory.json").is_file():
+                mem_dirs.append(cdir)
+        if mem_dirs:
+            mem_dirs.sort(
+                key=lambda p: (p / "game_memory.json").stat().st_mtime,
+                reverse=True,
+            )
+            return mem_dirs[0]
+
+        if candidates:
+            if target_active.is_dir() and (target_active / "game_bible.json").is_file():
+                try:
+                    if (candidates[0] / "game_bible.json").is_file() and (
+                        (candidates[0] / "game_bible.json").stat().st_mtime
+                        >= (target_active / "game_bible.json").stat().st_mtime
+                    ):
+                        return candidates[0]
+                    return target_active
+                except OSError:
+                    return candidates[0]
+            return candidates[0]
+
+        if target_active.exists():
+            return target_active
+        return None
+
+    def _build_memory_response_payload(
+        store: Any,
+        entries: List[Any],
+        deliberation: str,
+    ) -> Dict[str, Any]:
+        from engine.studio.models import CANONICAL_MEMORY_BANKS
+
+        ledger = store.load_ledger()
+        bank_counts = store.bank_summary_counts(status_filter="active")
+        total_bank_counts = store.bank_summary_counts(status_filter="all")
+        active_count = sum(1 for e in ledger.entries if e.status == "active")
+        sorted_entries = sorted(
+            entries,
+            key=lambda e: (0 if e.status == "active" else 1, e.updated_at_utc),
+            reverse=False,
+        )
+        # Active first, newest updated_at_utc first within each group
+        sorted_entries = sorted(
+            entries,
+            key=lambda e: e.updated_at_utc,
+            reverse=True,
+        )
+        sorted_entries.sort(key=lambda e: 0 if e.status == "active" else 1)
+        return {
+            "deliberation": deliberation,
+            "cartridge_id": ledger.cartridge_id or store.cartridge_dir.name,
+            "game_title": ledger.game_title,
+            "updated_at_utc": ledger.updated_at_utc,
+            "total_count": len(ledger.entries),
+            "active_count": active_count,
+            "bank_counts": bank_counts,
+            "total_bank_counts": total_bank_counts,
+            "banks": list(CANONICAL_MEMORY_BANKS),
+            "entries": [e.model_dump() for e in sorted_entries],
+        }
+
+    async def studio_memories_handler(request):
+        """GET/POST /api/studio/memories: Reads or mutates the per-game multi-bank long-term memory ledger."""
+        from engine.studio.game_memory import GameMemoryStore
+        from engine.studio.models import CANONICAL_MEMORY_BANKS, MemoryMutationProposal, StudioAgentError
+
+        tdb = TelemetryDB(target_db) if (target_db and target_db.parent.exists()) else None
+
+        def _publish_ws_memory_event(event_type: str, payload: Dict[str, Any]) -> None:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            delib_txt = str(payload.get("deliberation") or f"Long-term game memory event: {event_type}")
+            target_bus.publish_threadsafe(
+                {
+                    "deliberation": delib_txt,
+                    "event_type": event_type,
+                    "agent_name": str(payload.get("author_role") or payload.get("caller_role") or "GameMemoryStore"),
+                    "timestamp_utc": now_iso,
+                    "payload": payload,
+                }
+            )
+
+        if request.method == "GET":
+            cart_override = request.query_params.get("cartridge")
+            sanitized_cart, err_resp = _sanitize_cartridge_override(cart_override)
+            if err_resp is not None:
+                return err_resp
+            bid = request.query_params.get("build_id")
+            cart_dir = _resolve_memory_cartridge_dir(sanitized_cart, build_id=bid)
+            if cart_dir is None:
+                return JSONResponse(
+                    {
+                        "deliberation": "No active or candidate cartridge directory exists yet; returning empty memory ledger.",
+                        "cartridge_id": "",
+                        "game_title": "",
+                        "updated_at_utc": "",
+                        "total_count": 0,
+                        "active_count": 0,
+                        "bank_counts": {b: 0 for b in CANONICAL_MEMORY_BANKS},
+                        "total_bank_counts": {b: 0 for b in CANONICAL_MEMORY_BANKS},
+                        "banks": list(CANONICAL_MEMORY_BANKS),
+                        "entries": [],
+                    }
+                )
+
+            bank_q = (request.query_params.get("bank") or "").strip()
+            kind_q = (request.query_params.get("kind") or "").strip()
+            status_q = (request.query_params.get("status") or "").strip()
+            sem_q = (request.query_params.get("q") or "").strip()
+
+            store = GameMemoryStore(cart_dir, db=tdb, event_callback=_publish_ws_memory_event)
+            if sem_q:
+                api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+                if not api_key:
+                    return JSONResponse(
+                        {
+                            "deliberation": "Rejected semantic memory query because GEMINI_API_KEY is not configured for vector embedding retrieval (Rule 5).",
+                            "error": "Semantic vector memory query requires GEMINI_API_KEY for gemini-embedding-001.",
+                        },
+                        status_code=503,
+                    )
+                try:
+                    from google import genai
+
+                    embed_client = genai.Client(api_key=api_key)
+                    scored = store.query_memories(
+                        caller_role="council",
+                        query_text=sem_q,
+                        bank_filter=bank_q,
+                        kind_filter=kind_q,
+                        status_filter=status_q or "all",
+                        top_k=25,
+                        client=embed_client,
+                    )
+                except StudioAgentError as mem_err:
+                    return JSONResponse(
+                        {
+                            "deliberation": f"Semantic memory query failed fast: {mem_err}",
+                            "error": str(mem_err),
+                        },
+                        status_code=503,
+                    )
+                payload = _build_memory_response_payload(
+                    store,
+                    [e for e, _ in scored],
+                    deliberation=f"Retrieved {len(scored)} semantically ranked long-term memory entries for '{cart_dir.name}'.",
+                )
+                # Preserve exact semantic ranking order when q is supplied
+                payload["entries"] = [e.model_dump() for e, _ in scored]
+                return JSONResponse(payload)
+
+            entries = store.list_entries(
+                bank_filter=bank_q,
+                kind_filter=kind_q,
+                status_filter=status_q,
+            )
+            return JSONResponse(
+                _build_memory_response_payload(
+                    store,
+                    entries,
+                    deliberation=f"Loaded {len(entries)} long-term memory entries across '{cart_dir.name}'.",
+                )
+            )
+
+        # POST /api/studio/memories
+        try:
+            body = await request.json()
+        except Exception as exc:
+            return JSONResponse(
+                {
+                    "deliberation": f"Invalid JSON payload on POST /api/studio/memories: {exc}",
+                    "error": f"Invalid JSON body: {exc}",
+                },
+                status_code=400,
+            )
+        if not isinstance(body, dict):
+            return JSONResponse(
+                {
+                    "deliberation": "Rejected non-object JSON payload on POST /api/studio/memories.",
+                    "error": "Request body must be a JSON object.",
+                },
+                status_code=400,
+            )
+
+        cart_override = body.get("cartridge") or request.query_params.get("cartridge")
+        sanitized_cart, err_resp = _sanitize_cartridge_override(str(cart_override) if cart_override else None)
+        if err_resp is not None:
+            return err_resp
+
+        cart_dir = _resolve_memory_cartridge_dir(sanitized_cart, build_id=request.query_params.get("build_id"))
+        if cart_dir is None:
+            return JSONResponse(
+                {
+                    "deliberation": "Cannot record or mutate game memory because no active or candidate cartridge exists.",
+                    "error": "No active or candidate cartridge found.",
+                },
+                status_code=404,
+            )
+
+        deliberation_val = str(body.get("deliberation") or "").strip()
+        if not deliberation_val:
+            return JSONResponse(
+                {
+                    "deliberation": "Rejected memory mutation missing required Rationale-First `deliberation` field.",
+                    "error": "`deliberation` is required and must be non-empty.",
+                },
+                status_code=400,
+            )
+
+        op_val = str(body.get("operation") or "record").strip().lower()
+        if op_val not in ("record", "update", "fulfill", "supersede", "archive"):
+            return JSONResponse(
+                {
+                    "deliberation": f"Rejected unsupported memory operation '{op_val}'.",
+                    "error": f"Unsupported operation '{op_val}'. Expected record, update, fulfill, supersede, or archive.",
+                },
+                status_code=400,
+            )
+
+        proposal_kwargs: Dict[str, Any] = {
+            "deliberation": deliberation_val,
+            "operation": op_val,
+            "target_memory_id": str(body.get("target_memory_id") or "").strip(),
+            "target_bank": str(body.get("target_bank") or "council").strip(),
+            "title": str(body.get("title") or "").strip(),
+            "content": str(body.get("content") or "").strip(),
+            "applicable_roles": [
+                str(r).strip() for r in (body.get("applicable_roles") or []) if str(r).strip()
+            ] if isinstance(body.get("applicable_roles"), list) else [],
+            "resolution_note": str(body.get("resolution_note") or "").strip(),
+        }
+        if "kind" in body and body.get("kind"):
+            kind_val = str(body.get("kind")).strip()
+            if kind_val not in ("strategic_goal", "architectural_decision", "lesson_learned", "domain_note"):
+                return JSONResponse(
+                    {
+                        "deliberation": f"Rejected invalid memory kind '{kind_val}'.",
+                        "error": f"Invalid kind '{kind_val}'.",
+                    },
+                    status_code=400,
+                )
+            proposal_kwargs["kind"] = kind_val
+
+        if op_val == "record" and not proposal_kwargs["title"] and not proposal_kwargs["content"]:
+            return JSONResponse(
+                {
+                    "deliberation": "Rejected `record` memory mutation with empty title and content.",
+                    "error": "`title` or `content` is required when recording a memory.",
+                },
+                status_code=400,
+            )
+        if op_val in ("fulfill", "archive", "supersede") and not proposal_kwargs["target_memory_id"]:
+            return JSONResponse(
+                {
+                    "deliberation": f"Rejected `{op_val}` memory mutation missing `target_memory_id`.",
+                    "error": f"`target_memory_id` is required when operation is '{op_val}'.",
+                },
+                status_code=400,
+            )
+
+        try:
+            proposal = MemoryMutationProposal(**proposal_kwargs)
+        except Exception as val_exc:
+            return JSONResponse(
+                {
+                    "deliberation": f"Schema validation failed on POST /api/studio/memories: {val_exc}",
+                    "error": str(val_exc),
+                },
+                status_code=400,
+            )
+
+        author_role = str(body.get("author_role") or "CreativeDirector").strip()
+        store = GameMemoryStore(cart_dir, db=tdb, event_callback=_publish_ws_memory_event)
+        touched = store.apply_mutations(
+            author_role=author_role,
+            proposals=[proposal],
+            slice_id=str(body.get("slice_id") or "").strip(),
+            item_id=str(body.get("item_id") or "").strip(),
+        )
+        if not touched:
+            return JSONResponse(
+                {
+                    "deliberation": f"Target memory '{proposal.target_memory_id}' was not found in '{cart_dir.name}'.",
+                    "error": f"Memory '{proposal.target_memory_id}' not found.",
+                },
+                status_code=404,
+            )
+
+        all_entries = store.list_entries()
+        resp_payload = _build_memory_response_payload(
+            store,
+            all_entries,
+            deliberation=f"Applied '{op_val}' mutation to {len(touched)} memory entry(s) in '{cart_dir.name}'.",
+        )
+        resp_payload["mutated_entries"] = [e.model_dump() for e in touched]
+        return JSONResponse(resp_payload)
+
     routes = [
         Route("/", endpoint=index_handler, methods=["GET"]),
         Route("/health", endpoint=health_handler, methods=["GET"]),
@@ -6523,6 +7179,8 @@ def create_app(
         Route("/api/studio/status", endpoint=studio_status_handler, methods=["GET"]),
         Route("/api/studio/game-bible", endpoint=game_bible_handler, methods=["GET"]),
         Route("/api/game-bible", endpoint=game_bible_handler, methods=["GET"]),
+        Route("/api/studio/memories", endpoint=studio_memories_handler, methods=["GET", "POST"]),
+        Route("/api/memories", endpoint=studio_memories_handler, methods=["GET", "POST"]),
         Route("/api/studio/board-item/{item_id}/chronology", endpoint=board_item_chronology_handler, methods=["GET"]),
         Route("/api/studio/greenlight", endpoint=studio_greenlight_handler, methods=["POST"]),
         Route("/api/studio/settings", endpoint=studio_settings_handler, methods=["GET", "POST"]),
@@ -6542,6 +7200,7 @@ def create_app(
         Route("/api/playtest/sessions/start", endpoint=playtest_session_start_handler, methods=["POST"]),
         Route("/api/playtest/sessions/{session_id}", endpoint=playtest_session_detail_handler, methods=["GET"]),
         Route("/api/playtest/sessions/{session_id}/control", endpoint=playtest_session_control_handler, methods=["POST"]),
+        Route("/api/playtest/sessions/{session_id}/send-report-to-council", endpoint=playtest_session_send_report_handler, methods=["POST"]),
         Route("/api/playtest/sessions/{session_id}/video", endpoint=playtest_session_video_handler, methods=["GET"]),
         Route("/api/playtest/sessions/{session_id}/media/{filename}", endpoint=playtest_session_media_handler, methods=["GET"]),
         Route("/api/playtest/wishes", endpoint=playtest_wishes_list_handler, methods=["GET"]),
@@ -6567,8 +7226,9 @@ def create_app(
         WebSocketRoute("/ws/stream", endpoint=ws_swarm_handler),  # Compatibility alias
     ]
 
-    if STATIC_DIR.exists():
-        routes.append(Mount("/static", app=StaticFiles(directory=str(STATIC_DIR)), name="static"))
+    dist_assets_dir = STUDIO_WEB_DIST_DIR / "assets"
+    if dist_assets_dir.is_dir():
+        routes.append(Mount("/assets", app=StaticFiles(directory=str(dist_assets_dir)), name="studio_web_assets"))
 
     middleware = [
         Middleware(
@@ -6583,7 +7243,41 @@ def create_app(
 
     @contextlib.asynccontextmanager
     async def _lifespan(_app: Starlette):
+        import signal as _sig_mod
+
         daemon_inst = None
+        running_loop = asyncio.get_running_loop()
+        shut_event = asyncio.Event()
+        _ws_shutdown_state["event"] = shut_event
+        _ws_shutdown_state["loop"] = running_loop
+        _ws_shutdown_state["shutting_down"] = False
+        saved_sig_handlers: Dict[int, Any] = {}
+        if threading.current_thread() is threading.main_thread() and "PYTEST_CURRENT_TEST" not in os.environ:
+            for s_num in (_sig_mod.SIGTERM, _sig_mod.SIGINT):
+                try:
+                    prev_h = _sig_mod.getsignal(s_num)
+                    saved_sig_handlers[s_num] = prev_h
+                    srv_obj = getattr(prev_h, "__self__", None)
+                    srv_cfg = getattr(srv_obj, "config", None)
+                    if srv_cfg is not None and getattr(srv_cfg, "timeout_graceful_shutdown", None) is None:
+                        srv_cfg.timeout_graceful_shutdown = 2
+
+                    def _make_chained(orig_h: Any):
+                        def _chained(signum: int, frame: Any) -> None:
+                            _ws_shutdown_state["shutting_down"] = True
+                            try:
+                                if not running_loop.is_closed():
+                                    running_loop.call_soon_threadsafe(shut_event.set)
+                            except Exception:
+                                pass
+                            if callable(orig_h):
+                                orig_h(signum, frame)
+
+                        return _chained
+
+                    _sig_mod.signal(s_num, _make_chained(prev_h))
+                except Exception:
+                    pass
         if os.environ.get("STUDIO_RELOAD_WORKER_DAEMON") == "1" and "PYTEST_CURRENT_TEST" not in os.environ:
             try:
                 from engine.studio.daemon import StudioDaemon, StudioDaemonConfig
@@ -6610,6 +7304,13 @@ def create_app(
         try:
             yield
         finally:
+            _ws_shutdown_state["shutting_down"] = True
+            shut_event.set()
+            for s_num, orig_h in saved_sig_handlers.items():
+                try:
+                    _sig_mod.signal(s_num, orig_h)
+                except Exception:
+                    pass
             if _playtest_mgr_holder[0] is not None:
                 try:
                     _playtest_mgr_holder[0].shutdown()

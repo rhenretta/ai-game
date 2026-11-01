@@ -164,8 +164,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     print("=" * 64)
-    print("Autonomous Game Studio — Mission Control Web Observability")
-    print(f"Binding address: http://{args.host}:{args.port}")
+    print("Autonomous Game Studio — Mission Control API & Daemon")
+    print(f"API server:       http://{args.host}:{args.port}")
+    print(f"React UI (Vite):  {os.environ.get('STUDIO_WEB_ORIGIN', 'http://127.0.0.1:5173')}")
     print(f"Deliberation bus: ws://{args.host}:{args.port}/ws/swarm")
     if not args.no_daemon:
         print(f"Background daemon: ACTIVE (poll_interval={args.interval}s)")
@@ -193,6 +194,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "port": args.port,
         "reload": args.reload,
         "log_level": args.log_level,
+        "timeout_graceful_shutdown": 2,
     }
     if args.reload:
         uvicorn_kwargs["reload_dirs"] = [str(config.PROJECT_ROOT / "engine")]

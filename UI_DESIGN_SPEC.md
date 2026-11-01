@@ -1,8 +1,8 @@
 # Studio Observability UI Design Specification (Requirement R5)
-**Document Version:** 1.0.0  
-**Status:** APPROVED FOR IMPLEMENTATION  
-**Target Milestone:** M_UI  
-**Module Scope:** `engine/ui/static/index.html`, `engine/ui/server.py`, `engine/ui/models.py`  
+**Document Version:** 2.0.0  
+**Status:** IMPLEMENTED  
+**Target Milestone:** M_UI → M17  
+**Module Scope:** `studio-web/`, `engine/ui/server.py`, `engine/ui/models.py`  
 **Reference Requirements:** R1, R2, R3, R5  
 
 ---
@@ -10,22 +10,22 @@
 ## 1. Architectural & Epistemic Principles
 
 ### 1.1 Mandate & Objective
-This specification defines the user interface, interaction architecture, data models, and persistence layer for the **Studio Observability UI** (`engine/ui/`). The system provides complete, real-time epistemic observability over the autonomous 9-agent studio swarm as it conceives, specifies, builds, and verifies complete games from player Steam DNA.
+This specification defines the user interface, interaction architecture, data models, and persistence layer for the **Studio Observability UI** (`studio-web/` and `engine/ui/`). The system provides complete, real-time epistemic observability over the autonomous multi-agent studio swarm as it conceives, specifies, builds, playtests, and verifies complete games from player Steam DNA.
 
 The UI guarantees full transparency into:
 1. Every task and requirement track executed by any agent or subagent.
 2. The full pre-decision epistemic reasoning (`deliberation`) motivating each step.
 3. The cryptographically sealed handoff documentation (`ArtifactMetadataEnvelope`) including inputs, outputs, SHA-256 digests, and verification verdicts.
-4. The live, iterative progress of the agent-authored `GameRequirementsSpec` backlog.
-5. Persistent session state surviving full browser refreshes.
+4. The live, iterative progress of the agent-authored `GameRequirementsSpec` and `ProductionBoard` backlogs (including tracked `qa_gate_pass*` 5-Gate QA self-repair items).
+5. Persistent session state surviving full browser refreshes and immediate state reconciliation across Uvicorn server reloads.
 
 ### 1.2 Core Architectural Invariants
 1. **Rationale-First Epistemic Ordering (Rule 4)**:
    - In all UI cards, modal inspectors, and drawer panels, the epistemic reasoning (`deliberation`) block is placed **strictly first** at visual index 0 before any status pills, numerical metrics, hashes, or synthesized assets.
 2. **Zero Silent Fallbacks & Error Concealment (Rule 5)**:
    - When a quality gate, Challenger gate, or code compilation fails, the UI surfaces authentic, unmasked diagnostic traces (`RejectionDiagnosticTrace`), complete tracebacks, and defect coordinates. Fallbacks to mock data or placeholder assets are strictly prohibited.
-3. **Zero Build Dependency / Production Container Invariance (Rule 6)**:
-   - The frontend is authored in pure vanilla ES6 and CSS3, requiring no Node.js compilation, webpack bundling, or external CDN dependencies. It runs identically in local development and headless Linux container environments.
+3. **Production Container Invariance & SPA Routing Parity (Rule 6)**:
+   - Originally prototyped in vanilla ES6 (`engine/ui/static/index.html` in Milestone `M_UI`), Mission Control is now consolidated exclusively into the modular React 19 + TypeScript + TanStack Query single-page application in `studio-web/` (validated via `npm run typecheck` and `npm test` / `vitest run`). `engine/ui/server.py` serves compiled static bundles directly from `studio-web/dist/` in headless Linux containers and redirects HTML browser visits to `STUDIO_WEB_ORIGIN` (`http://127.0.0.1:5173/`) during local Vite development.
 
 ### 1.3 Design System & CSS Token Registry
 The UI adheres to the dark cybernetic aesthetic grounded in the 16-color Style Bible palette:
@@ -433,26 +433,27 @@ During long-running autonomous game genesis builds, players and developers need 
 Mission Control includes a dedicated **🧪 Blind Playtester** workspace powered by `engine/playtest/` (`BlindPlaytesterAgent`, `GodotPlaytestBridge`, `PlaytestSessionManager`). Unlike internal QA smoke/filmstrip harnesses, the Blind Playtester experiences verified checkpoints strictly as a cold external human player—receiving **only** a Steam-style `BlindStoreCard` (`game_title` + short pitch), live 1280×720 viewport screenshots (with `0..1000` normalized screen-coordinate smooth cursor pointing and desktop pointer arrow parity), and captured in-game audio clips, with zero access to `.gd` source code, `GameBibleSpec`, `backlog.json`, or internal state dictionaries.
 
 Sessions distinguish provenance via `initiated_by` (`"operator"` vs `"council"`), rendered in the session header and archive cards as **`[👤 Manual]`** or **`[🏛️ Council]`**:
-- **Manual Operator Runs (`initiated_by="operator"`)**: Persist sparse 6-pillar impressions, player field notes, open/answered questions, live bug reports, the end-of-session `PlaytestExperienceReport`, and the `1600×720` side-by-side broadcast MP4 (`replay.mp4`) for Mission Control inspection while keeping generated `PlaytestWishDraft` items in `status="pending"` until the operator explicitly curates and forwards selected wishes to the Council.
+- **Manual Operator Runs (`initiated_by="operator"`)**: Persist sparse 6-pillar impressions, player field notes, open/answered questions, live bug reports, the end-of-session `PlaytestExperienceReport`, and the `1600×720` side-by-side broadcast MP4 (`replay.mp4`) for Mission Control inspection while keeping generated `PlaytestWishDraft` items in `status="pending"` until the operator explicitly forwards selected wishes (`POST /api/playtest/wishes/send-to-council`) or dispatches the **Full Playtest Experience Report** (`POST /api/playtest/sessions/{session_id}/send-report-to-council`).
 - **Automated End-of-Slice Council Runs (`initiated_by="council"`)**: Invoked automatically by `CreativeWritersRoom._run_end_of_slice_blind_playtest` after `_run_slice_assembly_check` passes; marks all generated wishes `status="sent_to_council"` and delivers the `PlaytestExperienceReport`, 6-pillar impressions, field notes, questions, bug reports, rulebook, chronological player action tape, and up to 5 evenly-spaced session screenshots (`first -> quarter -> mid -> three-quarter -> final`) to the Council for a skeptical anti-auto-play / anti-noop-loop audit (`BlindPlaytestCouncilVerdict`: `iterate_current_slice` vs `approve_slice`). Every pass writes an immutable `artifacts/blind_playtest_report_<slice_id>_pass<k>.json` snapshot and stamps `council_review` onto the archived playtest session (`record_council_verdict`).
 
-### 11.2 Session History Archive, 3-Mode Replay Stage & Observability Sub-Views (`engine/ui/static/index.html`)
-1. **Per-Game & Per-Slice Session History Archive (`#pt-session-archive-drawer`, `#studio-slice-selector-bar`)**:
-   - Every playtest session is indexed per cartridge and slice (`list_enriched_sessions` with `game_run_number` `Run #1..N`, `slice_run_number` `Pass #1..M`, and full `games_catalog`) and snapshotted into `<cartridge>/artifacts/playtest_sessions/<session_id>.json` + `session_archive.json` (with automatic SQLite recovery if the database is reset).
-   - **🗂️ Recorded Sessions Drawer**: Toggleable browser filterable by **Game Cartridge**, **Slice (`Slice 0..N`)**, and **Source (`All`, `🏛️ Council`, `👤 Manual`)**, rendering watchable session cards with `Run #N`, `Pass #M`, `★ X/10` fun score, turn/bug/wish badges, Council Gate verdict pill (`✅ APPROVED` / `🔄 ITERATE`), and **🎬 Watch MP4** / **🕹️ Watch Turns** buttons.
-   - **1-Click Slice Bar Shortcuts**: Each slice pill in `#studio-slice-selector-bar` displays recorded run counts and latest fun rating (`🎬 N Run(s) • ★X/10`) plus a contextual **`🎬 Watch Runs`** action button that opens the Blind Playtester pre-filtered to that game and slice.
-2. **3-Mode Replay Stage & Unified Transport Bar (`#pt-frames-stage`, `#pt-replay-transport-bar`)**:
-   - **🔴 Live Player Screen**: Real-time `1280×720` viewport stream for active sessions.
-   - **🎬 Broadcast Replay MP4 (`1600×720`)**: Synchronized side-by-side HUD + audio MP4 player (`replay.mp4`) whose `timeupdate` progress dynamically highlights the active turn in the feed and scrubber.
-   - **🕹️ Turn-by-Turn Frames & Clicks (`1280×720`)**: Interactive frame-by-frame player rendering each turn's raw screenshot (`screenshot_url`), synchronized per-turn audio clip (`audio_url`), and a precision `1280×720` SVG reticle overlay (`#pt-frame-reticle-svg` driven by denormalized `action_px`) visualizing clicks (`CLICK` / `DBL-CLICK`), cursor trajectories, drag vectors, and key holds—allowing full visual inspection of any run even if `replay.mp4` is unavailable.
-   - **Unified Transport Controls**: `⏮ T#1`, `◀ Prev`, `▶ Play / ⏸ Pause` auto-stepper, `Next ▶`, `⏭ End`, interactive range `#pt-turn-scrubber`, `0.5× / 1× / 1.5× / 2× / 4×` speed selector, and click-any-turn-card-to-seek (`selectPlaytestReplayTurn`).
-3. **Accessible 4-Tab Observability Panel (`role="tablist"`, `role="tab"`, `role="tabpanel"`)**:
-   - Supports roving `tabindex` (`0` / `-1`) and `ArrowLeft` / `ArrowRight` / `Home` / `End` keyboard navigation across four views:
-     - **💬 Mood & Turn Feed**: Chronological rationale-first turn cards with sparse genuine-shift mood pills, `[RULEBOOK+]`, `[IMPRESSION+]`, `[NOTE+]`, `[Q&A]`, and `[BUG]` badges; clicking any turn seeks the replay stage directly to `Turn #k`.
-     - **📋 Impressions & Report**: Council Gate Verdict banner (`council_review`), live 6-pillar player impression cards (`graphics_and_visuals`, `gameplay_and_feel`, `sound_and_audio`, `intuitiveness_and_controls`, `goals_and_pacing`, `world_and_atmosphere`), synthesized `PlaytestExperienceReport` scorecard (`overall_fun_rating` `1..10`, standout highlights, friction points, recommendations), and structured Bug Reports (`bugs_found` / `bug_reports`).
-     - **🧠 Notes, Questions & Rulebook**: Persistent Player Field Notes (`field_notes_json`), Open/Answered Questions & Hypotheses (`questions_json`), and Empirically Discovered Rulebook (`rulebook_json`).
-     - **✨ Wishes → Council**: Filterable `PlaytestWishDraft` cards with batch selection, dismiss controls, and explicit **Send Selected to Council** dispatch.
-4. **Lifecycle & Protected Historical Reset Controls**:
+### 11.2 Playtest Lab UX, DVR Replay-to-Live Stage & Structured Player Notebook (`studio-web/src/features/playtest/PlaytestLabView.tsx`, `studio-web/src/domain/playtestNotebook.ts`)
+1. **Per-Game & Per-Slice Session Archive Strip**:
+   - Every playtest session is indexed per cartridge and slice (`list_enriched_sessions` with `game_run_number`, `slice_run_number`, `report_sent_to_council_at_utc`, and `games_catalog`) and snapshotted into `<cartridge>/artifacts/playtest_sessions/<session_id>.json` + `session_archive.json` (with automatic SQLite recovery if the database is reset).
+   - Filter pills filter runs by **Selected Game vs All Games**, **Slice (`All Slices`, `Slice #N`, `Active / General`)**, and **Source (`All Runs`, `Council Gates`, `Manual`)**, rendering horizontal session cards with provenance badges, turn counts, fun ratings (`★X/10`), and `Sent to Council` indicators.
+   - **Slice Subbar Shortcuts (`SliceSubbar.tsx`)**: Each slice pill surfaces recorded playtest counts/ratings and deep-links into the Playtest Lab filtered to that slice.
+2. **Current Playtester Focus Banner (`aria-label="Current playtester focus"`)**:
+   - Front-and-center status strip showing what the playtester is actively testing right now (`current_plan` hypothesis headline, formatted motor action badges, clean 1-sentence turn summary, and live vs scrubbed `Turn #k` context), plus a 1-click **`Review & Send Report`** jump button when a manual run has an experience report ready for Council dispatch.
+3. **DVR "Replay Up to Live" Viewport & Transport Bar**:
+   - **Live Screen**: Real-time `1280×720` viewport stream (`followingLive = true`).
+   - **Turn-by-Turn Replay (`1280×720`)**: Frame-by-frame player rendering each turn's raw screenshot (`screenshot_url`) and precision `1280×720` SVG reticle overlay (`action_px`) visualizing clicks (`CLICK` / `DBL-CLICK`), cursor trajectories, drag vectors, and key actions.
+   - **DVR Scrubber & Auto-Playback**: Interactive `<input type="range" aria-label="Turn replay scrubber">`, `⏮`, `◀ Prev`, `Next ▶`, `Replay 1→Live` / `Play → Live` / `⏸ Pause` auto-player (`0.5×`, `1×`, `2×`), and **`Jump to Live`** button. Scrubbing backward detaches `followingLive` so incoming live turns never yank the operator out of historical inspection; once auto-playback catches up to the latest live turn on an active session, it transitions seamlessly back to `Live Screen`.
+   - **Broadcast Video MP4 (`1600×720`)**: Synchronized side-by-side HUD + audio MP4 player (`replay.mp4`).
+4. **4-Tab Right-Hand Observability Panel**:
+   - **Activity Log (`Latest First` / `Oldest First`)**: Concise chronological/reverse-chronological action cards showing turn number, tick, mood shift badge, motor action summary, and 1-sentence intent/observation, while tucking full epistemic `deliberation`, raw prompt tape, rulebook deltas, and bug/question updates inside native `<details>` disclosures (`Full turn output & deliberation`). Clicking any card seeks the replay stage to that turn.
+   - **Experience Report & Full Council Dispatch**: Renders the Council Gate Verdict banner (`council_review`), 6-pillar player impression cards, `PlaytestExperienceReport` scorecard (`overall_fun_rating` `1..10`, highlights, friction points, player recommendations), and—for manual runs—a semantic `<form>` (**`Dispatch Full Playtest Report to Council`**) with optional Executive Producer direction, a checkbox to bundle pending session wishes (`include_pending_wishes`), `Sent ✓` timestamp state, and one-click re-send support.
+   - **Rulebook & Notes (`playtestNotebook.ts`)**: Organizes player memory into five distinct sections: **Bugs & Glitches Spotted** (severity badges + repro context), **Inferred Player Rulebook** (humanized control/mechanic labels with duplicate control Q&A suppressed), **Open Questions & Mysteries**, **Answered Questions** (collapsed `<details>` cards pairing the clean player question with `✓` empirical answer while hiding internal `what_does_*` `snake_case` keys), and **Screen Field Notes**.
+   - **Wishes → Council**: Individual `PlaytestWishDraft` triage cards with priority/category pills, dismiss controls, and **Send Selected to Council** batch forwarding.
+5. **Lifecycle & Protected Historical Reset Controls**:
    - **Start / Pause / Resume / Stop**: Starting a new run preserves all prior runs in the session archive; stopping finalizes `PlaytestExperienceReport`, updates `session_archive.json`, and muxes (or recovers via `_recover_unmuxed_session_video`) `replay.mp4`.
    - **Protected Reset (`action="reset"`)**: Resetting an actively `running` or `paused` session discards in-flight artifacts and restarts from Turn 0; resetting a recorded historical (`completed` / `stopped` / `failed`) session requires explicit confirmation (`confirm_delete=True`) before deleting that run from SQLite and `session_archive.json`.
 
@@ -463,10 +464,51 @@ Sessions distinguish provenance via `initiated_by` (`"operator"` vs `"council"`)
    - `playtest_compactions`: Periodic long-horizon memory compactions (`PlaytestCompactedJournal`) preserving recent raw turns while carrying `rulebook_json`, `impressions_json`, `field_notes_json`, `questions_json`, and `bugs_found_json` forward without breaking byte-0 prefix caching.
    - `playtest_wishes`: Structured player-perspective feedback items (`PlaytestWishDraft`) with `status` (`pending`, `sent_to_council`, `dismissed`).
 2. **REST API Endpoints**:
-   - `GET /api/playtest/sessions` & `POST /api/playtest/sessions/start`: Return enriched session history (`sessions` with `game_run_number`, `slice_run_number`, `has_video`, `has_turn_frames`, `council_review`, and `games_catalog`, optional `?candidate_id=...&slice_id=...` filters) or launch a new blind playtest against any verified checkpoint.
+   - `GET /api/playtest/sessions` & `POST /api/playtest/sessions/start`: Return enriched session history (`sessions` with `game_run_number`, `slice_run_number`, `has_video`, `has_turn_frames`, `council_review`, `report_sent_to_council_at_utc`, and `games_catalog`, optional `?candidate_id=...&slice_id=...` filters) or launch a new blind playtest against any verified checkpoint.
    - `GET /api/playtest/sessions/{session_id}` & `POST /api/playtest/sessions/{session_id}/control`: Inspect full enriched turn timeline (`action_px`, `screenshot_url`, `audio_url`), notes/questions/bugs, rulebook, impressions, experience report, and `council_review`, or `pause`, `resume`, `stop`, or `reset` (`confirm_delete` guarded for historical runs).
    - `GET /api/playtest/sessions/{session_id}/video` & `GET /api/playtest/sessions/{session_id}/media/{filename}`: Stream the composited `1600×720` MP4 session broadcast (recovering unmuxed frames on demand if interrupted) and per-turn viewport/audio captures.
-   - `GET /api/playtest/wishes`, `POST /api/playtest/wishes/send-to-council`, & `POST /api/playtest/wishes/{wish_id}/dismiss`: Triage authentic player wishes directly into live Writers' Room steering so the Council discusses and schedules improvements in the active slice.
+   - `GET /api/playtest/wishes`, `POST /api/playtest/wishes/send-to-council`, & `POST /api/playtest/wishes/{wish_id}/dismiss`: Triage individual player wishes into Writers' Room steering.
+   - `POST /api/playtest/sessions/{session_id}/send-report-to-council`: Dispatches a manual session's full `PlaytestExperienceReport`, 6-pillar impressions, bugs, open/answered questions, field notes, rulebook, optional pending wishes, optional Producer note, and up to 5 evenly-spaced player proof screenshots (`artifacts/proofs/manual_playtest_*.png`) into `.pending_steering.json` and the Writers' Room transcript, stamping `report_sent_to_council_at_utc` and waking `StudioDaemon(resume_current=True)` if idle.
+
+---
+
+## 12. Per-Game Multi-Bank Long-Term Memory Workspace (`studio-web/src/features/memory/GameMemoryView.tsx`, `engine/ui/server.py`)
+
+### 12.1 Overview & Multi-Bank Ownership
+The Mission Control **Memory** workspace provides live inspection and Executive Producer lifecycle control over each game's persistent cross-slice memory ledger (`<cartridge_dir>/game_memory.json`, mirrored to `studio_game_memories` in SQLite WAL).
+
+Memories are organized into 17 canonical banks (`CANONICAL_MEMORY_BANKS`):
+- **Shared Game Bank**: `council` (game-wide deferred strategic goals, cross-cutting architectural invariants, and studio-wide lessons).
+- **Council Specialist Banks (10)**: `CreativeDirector`, `GameplayDesigner`, `LevelAndProgressionDesigner`, `GameplaySystemsEngineer`, `StoryWorldArchitect`, `ScriptwriterAgent`, `CharacterDesigner`, `VisualArtDirector`, `UXExperienceDesigner`, `AudioAtmosphereDesigner`.
+- **Production Specialist Banks (6)**: `task_lead`, `swe_engineer`, `qa_test_engineer`, `visual_artist`, `audio_designer`, `script_writer`.
+
+### 12.2 UI Architecture & Accessibility (`GameMemoryView.tsx`)
+1. **Multi-Bank Navigation Sidebar (`.memory-bank-sidebar`)**: Displays live active/total badge counts across `All Banks`, `Council Shared`, Council Specialists, and Production Specialists using `aria-pressed` toggle buttons.
+2. **Lifecycle & Category Toolbar (`.memory-filter-bar`)**: Filters entries by status (`active`, `fulfilled`, `superseded`, `archived`, `all`) and category (`strategic_goal`, `architectural_decision`, `lesson_learned`, `domain_note`).
+3. **Container-Responsive Semantic Memory Cards (`article.memory-card`)**:
+   - Uses `<article className="memory-card">` (`container-type: inline-size`) with direct `<header className="memory-card-header">`, `<div className="memory-card-content">`, and `<footer className="memory-card-footer">` child regions, expandable `DeliberationDisclosure` rationale, provenance metadata (`slice_id`, `item_id`, `author_role`), and `Mark Fulfilled` / `Archive` / `Restore Active` lifecycle controls.
+4. **Deferred Post-Interaction Composer (`.memory-composer-form`)**:
+   - Allows the Executive Producer to seed durable memories into any bank with optional proactive curation `applicable_roles` checkboxes, hints positioned above controls (`aria-describedby`), and post-interaction validation (`:is(:user-invalid, .user-invalid-fallback)` + `aria-invalid` synchronization) that defers error states until blur or submit.
+
+### 12.3 REST & WebSocket Synchronization (`engine/ui/server.py`, `useSwarmSocket.ts`)
+1. `GET /api/studio/memories`: Supports `?cartridge=...&bank=...&kind=...&status=...` plus optional semantic search `?q=...` powered by `gemini-embedding-001` (failing fast with HTTP `503` when `GEMINI_API_KEY` is unconfigured rather than falling back to substring matching).
+2. `POST /api/studio/memories`: Applies Rationale-First (`deliberation` first) `MemoryMutationProposal` operations (`record`, `update`, `fulfill`, `supersede`, `archive`), persisting to `game_memory.json` and `studio_game_memories` and broadcasting `game_memory_updated` over `/ws/swarm` to invalidate `['game-memories']` queries in real time.
+
+---
+
+## 13. Modular React Mission Control Shell, Reconnect Reconciliation & Post-Board Phase Observability (`studio-web/`)
+
+### 13.1 Workspace Shell & Navigation (`App.tsx`, `TopCommandBar.tsx`, `SliceSubbar.tsx`)
+Mission Control (`studio-web/src/`) unifies studio operations across 7 workspace tabs (**Production Board**, **Writers' Room**, **Game Bible**, **Game Memory**, **Assets & Code**, **Playtest Lab**, and **Player DNA**) beneath a global command header (`TopCommandBar.tsx`), per-slice progress subbar (`SliceSubbar.tsx`), and live studio phase strip (`LiveActivityBanner.tsx`).
+
+### 13.2 Immediate WebSocket Reconnect Reconciliation (`useSwarmSocket.ts`)
+- Whenever `/ws/swarm` disconnects (e.g., during a Uvicorn `--reload` restart or daemon stop) and subsequently reconnects, `useSwarmSocket.ts` fires `onReconnect` to immediately invalidate and refetch `['status']`, `['studio-status']`, `['production-board']`, and `['writers-room']` without waiting for background polling intervals—ensuring the header immediately transitions from `Building` to `Stopped` and surfaces the **`Resume`** action button without requiring a manual browser refresh.
+
+### 13.3 Live Post-Board Phase Observability & Tracked QA Self-Repair (`LiveActivityBanner.tsx`, `liveActivity.ts`)
+- `/api/studio/status` exposes `board_activity`, `writers_room_activity`, and `agent_activity` so `LiveActivityBanner.tsx` continuously displays the exact phase and specialist currently executing—even after all initial `ProductionBoard` items reach `approved` (covering **Slice Assembly Check**, **End-of-Slice Blind Playtest**, **5-Gate QA Slice Verification**, **Slice Reflection & Strategy**, and **Final Sign-Off Council**).
+- When `_run_slice_qa_gate_check` detects any Gate A–E defect, `build_qa_gate_work_item_proposal` raises a visible `qa_gate_pass*` work item directly onto `ProductionBoard` so self-repair runs transparently on the board with full `TaskChronologyDrawer`, `TurnDetailCard`, `PromptInspector`, and Council Proof Review observability.
+
+
 
 
 

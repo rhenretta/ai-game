@@ -9,10 +9,11 @@ import threading
 from typing import Any, Dict, List, Literal, Optional
 from pydantic import Field, field_validator
 
-from engine.studio.models import BaseEpistemicModel, StudioAgentError
+from engine.studio.models import BaseEpistemicModel, DEFAULT_STUDIO_MODEL, StudioAgentError
 
 
 DEFAULT_PLAYTEST_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_PLAYTEST_REPORT_MODEL = DEFAULT_STUDIO_MODEL
 PLAYTEST_VIEWPORT_W = 1280
 PLAYTEST_VIEWPORT_H = 720
 NORM_COORD_SCALE = 1000.0
@@ -67,6 +68,10 @@ class PlaytestSessionConfig(BaseEpistemicModel):
         description="MANDATORY FIRST PROPERTY: Epistemic justification for session parameters.",
     )
     model_name: str = Field(default=DEFAULT_PLAYTEST_MODEL, description="Multimodal Gemini model for player turns.")
+    report_model_name: str = Field(
+        default=DEFAULT_PLAYTEST_REPORT_MODEL,
+        description="Higher-acuity multimodal Gemini model used once at session end to audit HIGH-resolution screenshots and synthesize PlaytestExperienceReport.",
+    )
     reaction_ticks: int = Field(
         default=15,
         ge=1,
@@ -150,7 +155,7 @@ class PlaytestMotorAction(BaseEpistemicModel):
     )
     inspect_high_res_next: bool = Field(
         default=False,
-        description="Set True only when small on-screen text or UI details are hard to read at standard resolution.",
+        description="Set True early (e.g. Turn 1 -> Turn 2) before praising visual/UI cleanliness and whenever closely inspecting UI panels, icons, sprite edges, or small on-screen text.",
     )
 
     @field_validator("mouse_x", "mouse_y", "drag_from_x", "drag_from_y", mode="before")
@@ -205,10 +210,18 @@ class PlaytestRulebookUpdate(BaseEpistemicModel):
         min_length=1,
         description="Concise input key or mechanic name (e.g. 'WASD', 'Key E', 'Left Click', 'Energy Meter').",
     )
+    observed_change_from_prior_turn: str = Field(
+        default="",
+        description="Concrete visual or audio delta ALREADY observed between the previous turn's screen/audio and the current screen/audio (never describe a predicted outcome of the motor_action you are about to execute).",
+    )
     behavior: str = Field(
         ...,
         min_length=1,
         description="Concise 1-sentence behavior confirmed ONLY after observing the result on a subsequent turn (never assume an input worked on the same turn you trigger it; record 'does nothing / non-interactive' if repeated tries produce no state change).",
+    )
+    action: Literal["confirm", "retract"] = Field(
+        default="confirm",
+        description="Set 'confirm' to record or update a verified rule; set 'retract' to remove an earlier Rulebook entry if subsequent turns show counters/objects did not actually change. Strictly last.",
     )
 
 
@@ -238,13 +251,17 @@ class PlaytestQuestionUpdate(BaseEpistemicModel):
         min_length=1,
         description="Natural first-person player question about what you are looking at, what an element/control does, or why something behaved that way.",
     )
+    observed_change_from_prior_turn: Optional[str] = Field(
+        default=None,
+        description="Leave null while status='open'. Before setting status='answered', cite the concrete visual or audio delta ALREADY visible between the previous turn screen and current screen—never answer a question on the same turn you are still testing it.",
+    )
     answer: Optional[str] = Field(
         default=None,
-        description="Leave null while still investigating; populate with your concise discovered answer ONLY once a subsequent turn visibly or audibly confirms it.",
+        description="Leave null while still investigating (or when reopening a mistaken answer); populate with your concise discovered answer ONLY once a subsequent turn visibly or audibly confirms it.",
     )
     status: Literal["open", "answered"] = Field(
         default="open",
-        description="Set 'open' when posing or refining an unanswered question; set 'answered' ONLY after a subsequent turn confirms the answer. Strictly last.",
+        description="Set 'open' when posing, refining, or reopening an unconfirmed question; set 'answered' ONLY after comparing previous vs current screen/audio proves the answer already happened. Strictly last.",
     )
 
 
@@ -271,7 +288,13 @@ class PlaytestBugReport(BaseEpistemicModel):
     details: str = Field(
         ...,
         min_length=1,
-        description="1-3 concise sentences describing what happened versus what you expected as a player.",
+        description=(
+            "1-3 concise sentences describing what happened or looked broken versus what a player expects "
+            "(for visual_glitch / input_ui_bug, cite concrete screen flaws such as cut-off sprites or stray bleeding "
+            "edge slivers from neighboring atlas frames, squished/distorted UI icons, text overflowing panel borders "
+            "or chopped off mid-word, overlapping HUD elements, harsh unblended rectangular texture boxes inside shapes, "
+            "or crude untextured placeholder polygons clashing with detailed sprites)."
+        ),
     )
     severity: Literal["minor", "major", "blocker"] = Field(
         default="major",
@@ -288,7 +311,13 @@ class PlaytestImpressionUpdate(BaseEpistemicModel):
     impression: str = Field(
         ...,
         min_length=1,
-        description="Concise 1-2 sentence updated player impression for this pillar. Emit when forming a new impression or revising an earlier one as things change over time—never repeat unchanged notes.",
+        description=(
+            "Concise 1-2 sentence candid player impression grounded strictly in what is visibly/audibly rendered—"
+            "never echo Store Page Description marketing copy, and never call graphics_and_visuals or UI 'clean', "
+            "'polished', or 'legible' if sprites have cut-off/bleeding edges, icons are squished, text overflows or "
+            "clips panel borders, textures show harsh rectangular seams, or raw flat polygons clash with detailed art. "
+            "Revise earlier impressions whenever HIGH-resolution inspection or new screens reveal flaws."
+        ),
     )
 
 
@@ -343,32 +372,31 @@ class PlaytestEndDecision(BaseEpistemicModel):
 
 
 class PlaytestTurnDecision(BaseEpistemicModel):
-    """Complete structured output for a single Blind Playtester turn."""
-    current_plan: str = Field(
-        ...,
-        min_length=1,
-        description="1-2 concise sentences on what you are actively doing or testing across the next few steps (carried verbatim across compactions).",
-    )
+    """Complete structured output for a single Blind Playtester turn.
+    Evaluates concrete prior-turn observations (`turn_log_entry`, `field_note_updates`, `question_updates`,
+    `rulebook_updates`, `bug_reports`) BEFORE formulating `current_plan` and `motor_action`, preventing
+    autoregressive bleed from unexecuted future plans into confirmed facts (Rule 4).
+    """
     turn_log_entry: str = Field(
         ...,
         min_length=1,
-        description="Compact 1-line note of what changed since your last input and what you are trying now.",
+        description="Compact 1-line factual note of what visibly or audibly changed between the previous turn screen and current screen (say 'no counter/state change observed' when values stayed identical).",
     )
     field_note_updates: List[PlaytestFieldNoteUpdate] = Field(
         default_factory=list,
-        description="Jot or revise concise notes on what you are looking at (screen layout, objects, UI elements, states). Leave [] when nothing new is noticed.",
+        description="Jot or revise concise notes on what you are currently looking at (screen layout, exact HUD numbers, objects, UI states). Leave [] when nothing new is noticed.",
     )
     question_updates: List[PlaytestQuestionUpdate] = Field(
         default_factory=list,
-        description="Ask genuine player questions ('What am I looking at?', 'What does X do?', 'Why is Y like that?') with status='open', and update an existing question_key to status='answered' with answer as soon as your experiments figure it out.",
+        description="Ask genuine player questions with status='open', update an existing question_key to status='answered' ONLY when the current screen/audio proves the outcome of a PRIOR turn's input (never for the motor_action you are about to run now), or set status='open' with answer=null to reopen an earlier answer that proved mistaken.",
     )
     rulebook_updates: List[PlaytestRulebookUpdate] = Field(
         default_factory=list,
-        description="Update your permanent Rulebook whenever you confirm what a control or game element does (or doesn't do).",
+        description="Update your permanent Rulebook ONLY after comparing the previous screen vs current screen confirms what a PRIOR turn's input actually did (or didn't do). Use action='retract' to remove any earlier Rulebook entry that subsequent turns disproved.",
     )
     bug_reports: List[PlaytestBugReport] = Field(
         default_factory=list,
-        description="Log any bugs, glitches, or things that feel broken as you spot them along the way. Leave [] on most turns and do not duplicate already-logged bugs.",
+        description="Log any bugs, glitches, unresponsive prompted controls, or things that feel broken as you spot them along the way. Leave [] on most turns and do not duplicate already-logged bugs.",
     )
     impression_updates: List[PlaytestImpressionUpdate] = Field(
         default_factory=list,
@@ -382,9 +410,14 @@ class PlaytestTurnDecision(BaseEpistemicModel):
         default=None,
         description="Leave null on almost all turns. Populate ONLY when your emotional state genuinely shifts at a real turning point (e.g. delight at a breakthrough, surprise, mounting confusion, boredom, or frustration when stuck)—never for routine clicks, minor confirmations, or unchanged moods.",
     )
+    current_plan: str = Field(
+        ...,
+        min_length=1,
+        description="1-2 concise sentences on what you are actively doing or testing across the next few steps (carried verbatim across compactions).",
+    )
     motor_action: PlaytestMotorAction = Field(
         ...,
-        description="Mouse and/or keyboard input burst to execute now.",
+        description="Mouse and/or keyboard input burst to execute now (runs AFTER this turn decision).",
     )
     submit_wish: Optional[PlaytestWishDraft] = Field(
         default=None,
@@ -427,10 +460,25 @@ class PlaytestExperienceReport(BaseEpistemicModel):
         min_length=1,
         description="First-person narrative overview of your playtest session: what you tried, how far you actually progressed, why the session ended, and whether you genuinely had fun.",
     )
+    visual_and_ui_defects_observed: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Concrete visual, sprite, texture, or UI layout defects visible in the attached HIGH-resolution session screenshots "
+            "(e.g. cut-off sprites or stray floating edge slivers bleeding from adjacent sprite-sheet frames, squished/stretched "
+            "or microscopic icons in UI slots, text spilling outside panel borders or truncated mid-word, overlapping HUD panels, "
+            "harsh unblended rectangular texture boxes pasted inside irregular polygons, or crude flat untextured placeholder "
+            "shapes clashing with detailed raster art). Audit the screenshots carefully BEFORE writing graphics_and_visuals; "
+            "leave [] ONLY when rendering, sprites, textures, and UI layout are genuinely free of visible defects."
+        ),
+    )
     graphics_and_visuals: str = Field(
         ...,
         min_length=1,
-        description="Honest player impression of visual art direction, spatial readability, UI/HUD clarity, and visual feedback.",
+        description=(
+            "Candid, unvarnished player impression of visual craft, sprite/texture cleanliness, art cohesion, spatial readability, "
+            "and UI/HUD layout legibility grounded directly in visual_and_ui_defects_observed—never parrot store-blurb marketing "
+            "prose or describe graphics/UI as 'clean', 'polished', or 'highly legible' when visual_and_ui_defects_observed is non-empty."
+        ),
     )
     gameplay_and_feel: str = Field(
         ...,
@@ -480,10 +528,10 @@ class PlaytestExperienceReport(BaseEpistemicModel):
             "actual objective progression, and real player agency "
             "(1-2=crashes, blank, or completely unresponsive; "
             "2-3=boots and renders visuals/UI, but core gameplay loop or primary objectives stay stuck/unresponsive or trap you in repetitive no-op actions; "
-            "4=partially playable, but undermined by stalled objectives, broken/overlapping UI, or auto-playing shortcuts lacking real player agency; "
-            "5-6=core gameplay loop works end-to-end with real player-driven progression, though held back by silent/missing audio, rough UI clutter, or shallow pacing; "
-            "7-8=cohesive, intuitive, responsive, player-driven loop with working audio/visual feedback and genuine fun; "
-            "9-10=standout, polished, bug-free, deeply engaging experience—never award 7-10 if objectives stalled, actions looped without effect, audio was silent, or the game played itself). Strictly last."
+            "4=partially playable, but undermined by stalled objectives, broken/overlapping/overflowing UI, noticeable sprite-slicing or texture-seam glitches, or auto-playing shortcuts lacking real player agency; "
+            "5-6=core gameplay loop works end-to-end with real player-driven progression, though held back by silent/missing audio, rough UI/visual craft defects, or shallow pacing; "
+            "7-8=cohesive, intuitive, responsive, player-driven loop with clean glitch-free visuals/UI, working audio/visual feedback, and genuine fun; "
+            "9-10=standout, polished, bug-free, deeply engaging experience—never award 7-10 if objectives stalled, actions looped without effect, audio was silent, visual/UI rendering had glaring defects, or the game played itself). Strictly last."
         ),
     )
 
@@ -541,6 +589,22 @@ class PlaytestWishDispatchRequest(BaseEpistemicModel):
     producer_note: Optional[str] = Field(
         default=None,
         description="Optional Executive Producer direction accompanying the player wish(es).",
+    )
+
+
+class PlaytestReportDispatchRequest(BaseEpistemicModel):
+    """API request payload to dispatch a finished Blind Playtester session's full report to the Council."""
+    deliberation: str = Field(
+        default="Executive Producer dispatched full Blind Playtester session report for immediate Council ingestion.",
+        description="MANDATORY FIRST PROPERTY: Epistemic justification.",
+    )
+    include_pending_wishes: bool = Field(
+        default=True,
+        description="Whether to also approve and include any pending player wishes from this session in the Council dispatch.",
+    )
+    producer_note: Optional[str] = Field(
+        default=None,
+        description="Optional Executive Producer direction accompanying the full playtest session report.",
     )
 
 

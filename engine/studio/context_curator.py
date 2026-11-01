@@ -44,7 +44,14 @@ logger = logging.getLogger("ContextCurator")
 
 _INDEX_LOCK = threading.Lock()
 
-ChunkCategory = Literal["asset", "council_utterance", "design_spec", "board_item", "code_module"]
+ChunkCategory = Literal[
+    "asset",
+    "council_utterance",
+    "design_spec",
+    "board_item",
+    "code_module",
+    "game_memory",
+]
 
 
 class ContextChunk(BaseModel):
@@ -57,7 +64,7 @@ class ContextChunk(BaseModel):
     chunk_id: str = Field(..., description="Unique stable identifier for this chunk within the cartridge.")
     category: ChunkCategory = Field(
         ...,
-        description="Semantic category: 'asset', 'council_utterance', 'design_spec', 'board_item', or 'code_module'.",
+        description="Semantic category: 'asset', 'council_utterance', 'design_spec', 'board_item', 'code_module', or 'game_memory'.",
     )
     title: str = Field(..., description="Short human-readable title summarizing the chunk.")
     content: str = Field(..., description="Full text payload of the chunk.")
@@ -797,6 +804,47 @@ class CartridgeSemanticIndex:
                 )
             )
 
+        # 7. Long-Term Per-Game & Per-Agent Memory Ledger (`game_memory.json`)
+        mem_path = self.cartridge_dir / "game_memory.json"
+        if mem_path.is_file():
+            try:
+                from engine.studio.game_memory import GameMemoryStore
+
+                ledger = GameMemoryStore(self.cartridge_dir).load_ledger()
+                for entry in ledger.entries:
+                    if entry.status != "active":
+                        continue
+                    roles_line = (
+                        f"Applicable Roles: {', '.join(entry.applicable_roles)}\n"
+                        if entry.applicable_roles
+                        else ""
+                    )
+                    prov_line = (
+                        f"Provenance: author={entry.author_role}"
+                        + (f", slice={entry.slice_id}" if entry.slice_id else "")
+                        + (f", item={entry.item_id}" if entry.item_id else "")
+                        + "\n"
+                    )
+                    _add(
+                        ContextChunk(
+                            deliberation=entry.deliberation,
+                            chunk_id=f"memory:{entry.memory_bank}:{entry.memory_id}",
+                            category="game_memory",
+                            title=f"Long-Term Memory [{entry.memory_bank} | {entry.kind}] — {entry.title}",
+                            content=(
+                                f"Memory ID: {entry.memory_id}\n"
+                                f"Memory Bank: {entry.memory_bank}\n"
+                                f"Kind: {entry.kind}\n"
+                                f"{prov_line}"
+                                f"{roles_line}"
+                                f"Guidance: {entry.content}\n"
+                                f"Rationale: {entry.deliberation}"
+                            ),
+                        )
+                    )
+            except Exception:
+                logger.debug("Could not index game_memory.json chunks in %s", self.cartridge_dir, exc_info=True)
+
         return chunks
 
     def build_code_reference_graph(self) -> Dict[str, Dict[str, Any]]:
@@ -1086,9 +1134,9 @@ class CartridgeSemanticIndex:
                 selected_ids.add(chunk.chunk_id)
                 break
 
-        # Guarantee top `per_category_min` chunks from each category so the LLM Curator can see assets,
-        # council conversations, design/rendering specs, board items, and code symbols
-        for cat in ("asset", "council_utterance", "design_spec", "board_item", "code_module"):
+        # Guarantee top `per_category_min` chunks from each category so the LLM Curator can see long-term memories,
+        # assets, council conversations, design/rendering specs, board items, and code symbols
+        for cat in ("game_memory", "asset", "council_utterance", "design_spec", "board_item", "code_module"):
             cat_count = 0
             for chunk, sim in scored:
                 if chunk.category != cat or chunk.chunk_id in selected_ids:
@@ -1309,7 +1357,16 @@ class ContextCuratorAgent:
                 f"Council discussions, 16:9 concept art mockup, visual/gameplay design intent, bound assets, "
                 f"and acceptance criteria for ({target_agent_role}): {task_request[:500]}"
             )
-        return [base_query, role_query]
+        queries = [base_query, role_query]
+        if (self.cartridge_dir / "game_memory.json").is_file():
+            from engine.studio.game_memory import normalize_agent_role
+
+            norm_role = normalize_agent_role(target_agent_role)
+            queries.append(
+                f"Long-term game memory for bank '{norm_role}' and 'council' — strategic goals, architectural decisions, "
+                f"and operational lessons learned relevant to ({norm_role}): {task_request[:420]}"
+            )
+        return queries
 
     def curate_context(
         self,
@@ -1332,13 +1389,23 @@ class ContextCuratorAgent:
                 f"ContextCuratorAgent.curate_context requires an active google.genai Client for '{item_id}' (Rule 5)."
             )
         from google.genai import types
+        from engine.studio.game_memory import normalize_agent_role
 
         safe_item = re.sub(r"[^a-z0-9_]+", "_", item_id.lower()).strip("_") if item_id else ""
         safe_role = re.sub(r"[^a-z0-9_]+", "_", target_agent_role.lower()).strip("_") or "agent"
         cache_role = self._normalized_cache_role(target_agent_role)
+        norm_target_role = normalize_agent_role(target_agent_role)
         current_rev = self._current_item_revision(item_id)
         trace_dir = (self.cartridge_dir / "artifacts" / "work_items" / safe_item) if safe_item else None
         cache_file = (trace_dir / f"context_pack_{cache_role}.json") if trace_dir is not None else None
+
+        mem_file = self.cartridge_dir / "game_memory.json"
+        mem_sig = ""
+        if mem_file.is_file():
+            try:
+                mem_sig = _sha256_text(mem_file.read_text(encoding="utf-8"))[:12]
+            except Exception:
+                mem_sig = ""
 
         intra_rev_sig = f"rev={current_rev}"
 
@@ -1358,6 +1425,7 @@ class ContextCuratorAgent:
                     if (
                         isinstance(cached, dict)
                         and cached.get("revision") == current_rev
+                        and str(cached.get("memory_sig") or "") == mem_sig
                         and cached.get("prompt_block")
                         and isinstance(cached.get("decision"), dict)
                     ):
@@ -1427,15 +1495,39 @@ class ContextCuratorAgent:
                     pass
 
             all_chunks = self.semantic_index.extract_corpus_chunks(board=self.board, game_bible=self.game_bible)
+
+            def _is_role_eligible_memory_chunk(ch: ContextChunk) -> bool:
+                if ch.category != "game_memory":
+                    return True
+                if norm_target_role == "council":
+                    return True
+                is_own_bank = ch.chunk_id.startswith(f"memory:{norm_target_role}:")
+                is_council_bank = ch.chunk_id.startswith("memory:council:")
+                is_applicable = "Applicable Roles: " in ch.content and norm_target_role in ch.content
+                return is_own_bank or is_council_bank or is_applicable
+
+            searchable_chunks = [ch for ch in all_chunks if _is_role_eligible_memory_chunk(ch)]
             queries = self._build_role_queries(
                 target_agent_role=target_agent_role,
                 task_request=task_request,
                 item_id=item_id,
                 item_kind=item_kind,
             )
-            ranked_pairs = self.semantic_index.semantic_search(queries=queries, chunks=all_chunks, top_k=16)
+            ranked_pairs = self.semantic_index.semantic_search(queries=queries, chunks=searchable_chunks, top_k=16)
             candidate_chunks = [c for c, _ in ranked_pairs]
             chunks_by_id: Dict[str, ContextChunk] = {c.chunk_id: c for c in candidate_chunks}
+
+            # Ensure role-relevant long-term memories (target agent's own bank, 'council' bank, or matching applicable_roles)
+            # are surfaced in the candidate pool so ContextCuratorDecision can inject them when relevant
+            role_memory_candidates: List[ContextChunk] = [
+                ch for ch in searchable_chunks if ch.category == "game_memory"
+            ]
+            for m_ch in role_memory_candidates[:6]:
+                if m_ch.chunk_id not in chunks_by_id:
+                    prior_score = 0.94 if m_ch.chunk_id.startswith(f"memory:{norm_target_role}:") else 0.90
+                    ranked_pairs.insert(0, (m_ch, prior_score))
+                    candidate_chunks.insert(0, m_ch)
+                    chunks_by_id[m_ch.chunk_id] = m_ch
             effective_extra_images: List[str] = [
                 str(ep)
                 for ep in (extra_image_paths or [])
@@ -1554,10 +1646,11 @@ class ContextCuratorAgent:
 
             prompt = (
                 f"You are the Studio Context Generator & Curator Agent.\n"
-                f"Your job is to inspect the semantically retrieved candidate chunk digests (spanning on-disk assets, Writers' Room council "
-                f"conversations, Game Bible & Rendering Strategy treatments, Production Board items, build execution traces `board:trace:*`, "
-                f"and GDScript code modules) and decide the exact high-signal context and multimodal images to inject for the target agent.\n\n"
-                f"TARGET AGENT ROLE: {target_agent_role}\n"
+                f"Your job is to inspect the semantically retrieved candidate chunk digests (spanning long-term game & agent memories "
+                f"`memory:*`, on-disk assets, Writers' Room council conversations, Game Bible & Rendering Strategy treatments, "
+                f"Production Board items, build execution traces `board:trace:*`, and GDScript code modules) and decide the exact "
+                f"high-signal context and multimodal images to inject for the target agent.\n\n"
+                f"TARGET AGENT ROLE: {target_agent_role} (canonical memory bank: '{norm_target_role}')\n"
                 f"WORK ITEM: id='{item_id}' kind='{item_kind}'\n"
                 f"TASK REQUEST / BRIEF:\n{task_request[:1800]}\n\n"
                 f"AVAILABLE MULTIMODAL IMAGES ON DISK (select up to {max_selected_images} relevant paths in `selected_image_paths`):\n"
@@ -1566,6 +1659,7 @@ class ContextCuratorAgent:
                 + "\n".join(candidate_lines)
                 + "\nINSTRUCTIONS:\n"
                 f"1. Select ONLY the chunks (`selected_chunk_ids`, up to {max_selected_chunks}) that `{target_agent_role}` genuinely needs to execute or review `{item_id}` with high visual, mechanical, and architectural fidelity:\n"
+                f"   - Inspect `memory:...` chunks (`game_memory` category—especially memories in `'council'`, `'{norm_target_role}'`, or listing `{norm_target_role}` in `Applicable Roles`) and ALWAYS select any long-term strategic goals, architectural decisions, or operational/verification lessons learned that apply to what `{target_agent_role}` is doing!\n"
                 f"   - Include `board:item:{item_id}` and `board:trace:{item_id}` when `{target_agent_role}` needs the task spec, prior revision diffs, or captured frame telemetry.\n"
                 f"   - Include only directly relevant Council utterances (`council:utterance:...`) or `design:...` treatments that govern this specific feature.\n"
                 f"   - Include relevant `asset:catalog:...` chunks when `{target_agent_role}` needs to know which sprites/rigs/props exist on disk.\n"
@@ -1668,6 +1762,7 @@ class ContextCuratorAgent:
                 payload_to_save = {
                     "item_id": item_id,
                     "revision": current_rev,
+                    "memory_sig": mem_sig,
                     "intra_rev_sig": intra_rev_sig,
                     "target_agent_role": target_agent_role,
                     "normalized_role": cache_role,

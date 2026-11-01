@@ -1809,52 +1809,49 @@ def test_f28_cors_and_security_headers():
 # ============================================================================
 
 def test_f29_static_index_html_served():
-    """F29.1: Static file route serves index.html single page app."""
-    from engine.ui.server import app
+    """F29.1: Root route returns 200 OK and studio-web React entrypoint exists."""
+    from engine.ui.server import STUDIO_WEB_DIR, app
     from starlette.testclient import TestClient
 
     client = TestClient(app)
     res = client.get("/")
     assert res.status_code == 200
-    assert "text/html" in res.headers["content-type"]
-    assert "Mission Control" in res.text
+    index_file = STUDIO_WEB_DIR / "index.html"
+    assert index_file.is_file()
+    assert "Mission Control" in index_file.read_text(encoding="utf-8")
 
 
 def test_f29_svg_agent_dag_element():
-    """F29.2: Single page app template contains SVG container for live agent DAG."""
-    from engine.ui.server import STATIC_DIR
-    index_file = STATIC_DIR / "index.html"
-    assert index_file.exists()
-    content = index_file.read_text(encoding="utf-8")
-    assert 'id="agent-dag-canvas"' in content
-    assert 'width="800"' in content
-    assert 'height="400"' in content
+    """F29.2: React studio-web LivePulseModal renders live agent status and swarm telemetry."""
+    from engine.ui.server import STUDIO_WEB_DIR
+    pulse_file = STUDIO_WEB_DIR / "src" / "features" / "shell" / "LivePulseModal.tsx"
+    assert pulse_file.is_file()
+    assert "LivePulseModal" in pulse_file.read_text(encoding="utf-8")
 
 
 def test_f29_live_deliberation_stream_container():
-    """F29.3: Single page app contains container for streaming deliberation tokens."""
-    from engine.ui.server import STATIC_DIR
-    index_file = STATIC_DIR / "index.html"
-    content = index_file.read_text(encoding="utf-8")
-    assert 'id="deliberation-stream"' in content
-    assert 'class="terminal-log"' in content
+    """F29.3: React studio-web streams live swarm events over WebSocket (/ws/swarm)."""
+    from engine.ui.server import STUDIO_WEB_DIR
+    ws_file = STUDIO_WEB_DIR / "src" / "realtime" / "useSwarmSocket.ts"
+    assert ws_file.is_file()
+    assert "/ws/swarm" in ws_file.read_text(encoding="utf-8")
 
 
 def test_f29_tool_invocation_monitor_container():
-    """F29.4: Single page app contains container for active tool call events."""
-    from engine.ui.server import STATIC_DIR
-    index_file = STATIC_DIR / "index.html"
-    content = index_file.read_text(encoding="utf-8")
-    assert 'id="tool-invocations-list"' in content
+    """F29.4: React studio-web provides turn chronology and epistemic prompt inspection."""
+    from engine.ui.server import STUDIO_WEB_DIR
+    drawer_file = STUDIO_WEB_DIR / "src" / "features" / "board" / "TaskChronologyDrawer.tsx"
+    assert drawer_file.is_file()
 
 
 def test_f29_genesis_build_trigger_button():
-    """F29.5: Single page app defines Genesis Build trigger button."""
-    from engine.ui.server import STATIC_DIR
-    index_file = STATIC_DIR / "index.html"
-    content = index_file.read_text(encoding="utf-8")
-    assert 'id="btn-trigger-genesis"' in content
-    assert "Genesis Build" in content
+    """F29.5: React studio-web defines New Game / Genesis commission modal and TopCommandBar trigger."""
+    from engine.ui.server import STUDIO_WEB_DIR
+    modal_file = STUDIO_WEB_DIR / "src" / "features" / "shell" / "NewGameModal.tsx"
+    topbar_file = STUDIO_WEB_DIR / "src" / "features" / "shell" / "TopCommandBar.tsx"
+    assert modal_file.is_file()
+    assert topbar_file.is_file()
+    assert "New Game" in topbar_file.read_text(encoding="utf-8")
 
 
 # ============================================================================
@@ -1862,29 +1859,25 @@ def test_f29_genesis_build_trigger_button():
 # ============================================================================
 
 def test_f30_heatmap_canvas_element():
-    """F30.1: Template defines HTML5 Canvas element for 2D spatial occupancy heatmap."""
-    from engine.ui.server import STATIC_DIR
-    index_file = STATIC_DIR / "index.html"
-    content = index_file.read_text(encoding="utf-8")
-    assert 'id="telemetry-heatmap"' in content
-    assert 'width="640"' in content
-    assert 'height="360"' in content
+    """F30.1: React studio-web provides PlaytestLabView and PlayerDnaView telemetry visualizations."""
+    from engine.ui.server import STUDIO_WEB_DIR
+    assert (STUDIO_WEB_DIR / "src" / "features" / "playtest" / "PlaytestLabView.tsx").is_file()
+    assert (STUDIO_WEB_DIR / "src" / "features" / "dna" / "PlayerDnaView.tsx").is_file()
 
 
 def test_f30_audio_player_element():
-    """F30.2: Template defines audio playback element for voice clip previews."""
-    from engine.ui.server import STATIC_DIR
-    index_file = STATIC_DIR / "index.html"
-    content = index_file.read_text(encoding="utf-8")
-    assert 'id="voice-preview-player"' in content
+    """F30.2: React AssetsAndCodeView provides audio playback for synthesized clips."""
+    from engine.ui.server import STUDIO_WEB_DIR
+    assets_view = STUDIO_WEB_DIR / "src" / "features" / "assets" / "AssetsAndCodeView.tsx"
+    assert assets_view.is_file()
+    assert "<audio" in assets_view.read_text(encoding="utf-8")
 
 
 def test_f30_code_diff_viewer_element():
-    """F30.3: Template defines side-by-side diff viewer for synthesized code changes."""
-    from engine.ui.server import STATIC_DIR
-    index_file = STATIC_DIR / "index.html"
-    content = index_file.read_text(encoding="utf-8")
-    assert 'id="code-diff-container"' in content
+    """F30.3: React CodeDiffView provides diff inspection for synthesized code changes."""
+    from engine.ui.server import STUDIO_WEB_DIR
+    diff_view = STUDIO_WEB_DIR / "src" / "components" / "CodeDiffView.tsx"
+    assert diff_view.is_file()
 
 
 def test_f30_telemetry_query_api():

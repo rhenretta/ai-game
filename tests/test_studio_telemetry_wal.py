@@ -336,3 +336,80 @@ class TestSwarmEventBusAndServerIntegration:
         assert res_evs.status_code == 200
         evs_json = res_evs.json()
         assert len(evs_json["events"]) >= 1
+
+    def test_events_history_bounds_and_game_bible_compaction(self, tmp_path: Path):
+        """Verify /api/events/history bounds row counts, omits duplicate payload_json, and compacts heavy game_bible_updated snapshots while preserving full Game Bible storage."""
+        db_path = tmp_path / "bounded_telemetry.db"
+        cartridges_root = tmp_path / "cartridges"
+        active_dir = cartridges_root / "active"
+        cartridges_root.mkdir(parents=True, exist_ok=True)
+
+        bus = SwarmEventBus(history_size=300, db_path=db_path)
+        build_id = "build_candidate_genesis_perf01"
+        bus.set_active_build_id(build_id)
+
+        heavy_bible = {
+            "deliberation": "Initial concept locked.",
+            "bible_id": "bible_perf01",
+            "cartridge_id": "candidate_genesis_perf01",
+            "status": "locked",
+            "game_title": "Synthetic Test Project",
+            "core_genre": "Simulation",
+            "elevator_pitch": "A generic systems test project.",
+            "writers_room_transcript": [
+                {"utterance_id": f"u_{idx}", "speaker_role": "Lead", "spoken_dialogue": "x" * 2000}
+                for idx in range(40)
+            ],
+            "experience_storyboard": [{"beat": "intro"}],
+            "concept_evolution": [{"step": 1}],
+            "visual_mockups": [{"path": "mockup.png"}],
+            "gameplay_pillars": ["pillar_a", "pillar_b"],
+        }
+        bus.publish_game_bible_update(heavy_bible)
+
+        for idx in range(350):
+            bus.publish_agent_stream(
+                agent_name="LeadGameplaySWEAgent",
+                deliberation=f"Progress step {idx}",
+                token=f"tok_{idx}",
+            )
+
+        app = create_app(
+            db_path=db_path,
+            cartridges_root=cartridges_root,
+            active_cartridge_dir=active_dir,
+            event_bus=bus,
+        )
+        client = TestClient(app)
+
+        # Default /api/events/history caps at 200 events and explicit limit=25 returns 25
+        res_default = client.get("/api/events/history")
+        assert res_default.status_code == 200
+        default_events = res_default.json()["events"]
+        assert len(default_events) == 200
+        for ev in default_events:
+            assert "payload_json" not in ev
+            assert list(ev.keys())[0] == "deliberation"
+
+        res_limited = client.get("/api/events/history?limit=25&cartridge=candidate_genesis_perf01")
+        assert res_limited.status_code == 200
+        assert len(res_limited.json()["events"]) == 25
+
+        # Requesting limit=400 includes the first game_bible_updated event in compacted form
+        res_all = client.get("/api/events/history?limit=400")
+        assert res_all.status_code == 200
+        bible_events = [
+            ev for ev in res_all.json()["events"]
+            if ev.get("event_type") in ("game_bible_updated", "GAME_BIBLE_UPDATED")
+        ]
+        assert len(bible_events) == 1
+        b_payload = bible_events[0]["payload"]
+        assert "writers_room_transcript" not in b_payload
+        assert b_payload["turn_count"] == 40
+        assert b_payload["pillar_count"] == 2
+        assert list(b_payload.keys())[0] == "deliberation"
+
+        # Full Game Bible endpoint still serves the complete writers_room_transcript intact
+        full_bible = bus.get_game_bible(build_id=build_id)
+        assert full_bible is not None
+        assert len(full_bible["writers_room_transcript"]) == 40

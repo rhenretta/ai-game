@@ -10,12 +10,44 @@ from pathlib import Path
 import sqlite3
 import sys
 import tempfile
-from typing import Any, Dict, List, Optional
+import threading
+from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
 logger = logging.getLogger("TelemetryDB")
 
 _PRODUCTION_TELEMETRY_DB = (Path(__file__).resolve().parent.parent.parent / "data" / "telemetry.db").resolve()
+_INIT_DB_LOCK = threading.Lock()
+_INITIALIZED_DB_KEYS: set[Tuple[str, int, int]] = set()
+
+
+def compact_game_bible_event_payload(
+    payload: Dict[str, Any],
+    fallback_deliberation: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Compacts multi-megabyte GameBibleSpec snapshots inside event-feed payloads into lightweight metadata."""
+    tx = payload.get("writers_room_transcript")
+    evo = payload.get("concept_evolution")
+    sb = payload.get("experience_storyboard")
+    mocks = payload.get("visual_mockups")
+    pillars = payload.get("gameplay_pillars")
+    return {
+        "deliberation": str(payload.get("deliberation") or fallback_deliberation or "Living Game Bible updated."),
+        "bible_id": payload.get("bible_id"),
+        "cartridge_id": payload.get("cartridge_id"),
+        "target_episode": payload.get("target_episode", 0),
+        "status": payload.get("status"),
+        "game_title": payload.get("game_title"),
+        "core_genre": payload.get("core_genre"),
+        "elevator_pitch": payload.get("elevator_pitch"),
+        "creative_vision_summary": payload.get("creative_vision_summary"),
+        "updated_at_utc": payload.get("updated_at_utc"),
+        "turn_count": payload.get("turn_count") if payload.get("turn_count") is not None else (len(tx) if isinstance(tx, list) else 0),
+        "evolution_count": payload.get("evolution_count") if payload.get("evolution_count") is not None else (len(evo) if isinstance(evo, list) else 0),
+        "storyboard_count": payload.get("storyboard_count") if payload.get("storyboard_count") is not None else (len(sb) if isinstance(sb, list) else 0),
+        "mockup_count": payload.get("mockup_count") if payload.get("mockup_count") is not None else (len(mocks) if isinstance(mocks, list) else 0),
+        "pillar_count": len(pillars) if isinstance(pillars, list) else 0,
+    }
 
 
 class TelemetryDB:
@@ -31,7 +63,27 @@ class TelemetryDB:
                 db_path = Path(tempfile.gettempdir()) / "pytest_isolated_telemetry.db"
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.initialize_database()
+        self._ensure_initialized()
+
+    def _db_cache_key(self) -> Optional[Tuple[str, int, int]]:
+        try:
+            resolved = self.db_path.resolve()
+            st = resolved.stat()
+            if st.st_size <= 0:
+                return None
+            return (str(resolved), int(st.st_dev), int(st.st_ino))
+        except OSError:
+            return None
+
+    def _ensure_initialized(self) -> None:
+        key = self._db_cache_key()
+        if key is not None and key in _INITIALIZED_DB_KEYS:
+            return
+        with _INIT_DB_LOCK:
+            key = self._db_cache_key()
+            if key is not None and key in _INITIALIZED_DB_KEYS:
+                return
+            self.initialize_database()
 
     def initialize_database(self) -> None:
         """Applies WAL pragmas and creates table schemas."""
@@ -102,6 +154,9 @@ class TelemetryDB:
             conn.commit()
         finally:
             conn.close()
+        key = self._db_cache_key()
+        if key is not None:
+            _INITIALIZED_DB_KEYS.add(key)
 
     def get_writer_connection(self) -> sqlite3.Connection:
         """Isolated connection for background writer thread with manual transaction control."""
@@ -447,17 +502,42 @@ class TelemetryDB:
                     params.append(build_id)
                 query += " ORDER BY rowid ASC"
             cur.execute(query, params)
-            rows = [dict(r) for r in cur.fetchall()]
-            for r in rows:
+            out_rows: List[Dict[str, Any]] = []
+            for raw_row in cur.fetchall():
+                r = dict(raw_row)
                 r.pop("rowid", None)
-                if "payload_json" in r and r["payload_json"]:
+                raw_payload = r.pop("payload_json", None)
+                pl: Any = {}
+                if raw_payload:
                     try:
-                        r["payload"] = json.loads(r["payload_json"])
+                        pl = json.loads(raw_payload)
                     except Exception:
-                        r["payload"] = {}
-                else:
-                    r["payload"] = {}
-            return rows
+                        pl = {}
+                if (
+                    r.get("event_type") in ("game_bible_updated", "GAME_BIBLE_UPDATED")
+                    and isinstance(pl, dict)
+                    and any(
+                        heavy_k in pl
+                        for heavy_k in (
+                            "writers_room_transcript",
+                            "experience_storyboard",
+                            "concept_evolution",
+                            "visual_mockups",
+                            "world_spec",
+                            "narrative_bible",
+                        )
+                    )
+                ):
+                    pl = compact_game_bible_event_payload(pl, r.get("deliberation"))
+                delib_val = r.pop("deliberation", None)
+                out_rows.append(
+                    {
+                        "deliberation": "" if delib_val is None else str(delib_val),
+                        **r,
+                        "payload": pl,
+                    }
+                )
+            return out_rows
         finally:
             conn.close()
 
@@ -1577,6 +1657,216 @@ class TelemetryDB:
             conn.execute("DELETE FROM playtest_wishes WHERE session_id = ?;", (session_id,))
             conn.execute("DELETE FROM playtest_sessions WHERE session_id = ?;", (session_id,))
             conn.commit()
+        finally:
+            conn.close()
+
+    # -------------------------------------------------------------------------
+    # Per-Game Multi-Bank Long-Term Memory Persistence
+    # -------------------------------------------------------------------------
+
+    def upsert_game_memory(
+        self,
+        cartridge_id: str,
+        entry: Dict[str, Any],
+        game_title: str = "",
+    ) -> None:
+        """Upserts a single long-term game memory entry into studio_game_memories."""
+        cid = (cartridge_id or "").strip()
+        mid = str(entry.get("memory_id") or "").strip()
+        if not cid or not mid:
+            return
+        now_iso = datetime.now(timezone.utc).isoformat()
+        roles = entry.get("applicable_roles")
+        if isinstance(roles, list):
+            roles_json = json.dumps([str(r) for r in roles if r])
+        else:
+            roles_json = "[]"
+
+        conn = self.get_write_connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO studio_game_memories (
+                    cartridge_id, memory_id, deliberation, game_title, memory_bank,
+                    author_role, kind, status, title, content, applicable_roles_json,
+                    slice_id, item_id, resolution_note, superseded_by_id,
+                    created_at_utc, updated_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cartridge_id, memory_id) DO UPDATE SET
+                    deliberation = excluded.deliberation,
+                    game_title = CASE WHEN excluded.game_title != '' THEN excluded.game_title ELSE studio_game_memories.game_title END,
+                    memory_bank = excluded.memory_bank,
+                    author_role = excluded.author_role,
+                    kind = excluded.kind,
+                    status = excluded.status,
+                    title = excluded.title,
+                    content = excluded.content,
+                    applicable_roles_json = excluded.applicable_roles_json,
+                    slice_id = excluded.slice_id,
+                    item_id = excluded.item_id,
+                    resolution_note = excluded.resolution_note,
+                    superseded_by_id = excluded.superseded_by_id,
+                    updated_at_utc = excluded.updated_at_utc
+                """,
+                (
+                    cid,
+                    mid,
+                    str(entry.get("deliberation") or "Durable game memory persisted."),
+                    str(game_title or ""),
+                    str(entry.get("memory_bank") or "council"),
+                    str(entry.get("author_role") or "council"),
+                    str(entry.get("kind") or "lesson_learned"),
+                    str(entry.get("status") or "active"),
+                    str(entry.get("title") or ""),
+                    str(entry.get("content") or ""),
+                    roles_json,
+                    str(entry.get("slice_id") or ""),
+                    str(entry.get("item_id") or ""),
+                    str(entry.get("resolution_note") or ""),
+                    str(entry.get("superseded_by_id") or ""),
+                    str(entry.get("created_at_utc") or now_iso),
+                    str(entry.get("updated_at_utc") or now_iso),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def sync_game_memories(
+        self,
+        cartridge_id: str,
+        entries: List[Dict[str, Any]],
+        game_title: str = "",
+    ) -> None:
+        """Atomically mirrors the authoritative `game_memory.json` entries for `cartridge_id` into SQLite WAL."""
+        cid = (cartridge_id or "").strip()
+        if not cid:
+            return
+        now_iso = datetime.now(timezone.utc).isoformat()
+        conn = self.get_write_connection()
+        try:
+            keep_ids: List[str] = []
+            for entry in entries:
+                mid = str(entry.get("memory_id") or "").strip()
+                if not mid:
+                    continue
+                keep_ids.append(mid)
+                roles = entry.get("applicable_roles")
+                roles_json = json.dumps([str(r) for r in roles if r]) if isinstance(roles, list) else "[]"
+                conn.execute(
+                    """
+                    INSERT INTO studio_game_memories (
+                        cartridge_id, memory_id, deliberation, game_title, memory_bank,
+                        author_role, kind, status, title, content, applicable_roles_json,
+                        slice_id, item_id, resolution_note, superseded_by_id,
+                        created_at_utc, updated_at_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(cartridge_id, memory_id) DO UPDATE SET
+                        deliberation = excluded.deliberation,
+                        game_title = CASE WHEN excluded.game_title != '' THEN excluded.game_title ELSE studio_game_memories.game_title END,
+                        memory_bank = excluded.memory_bank,
+                        author_role = excluded.author_role,
+                        kind = excluded.kind,
+                        status = excluded.status,
+                        title = excluded.title,
+                        content = excluded.content,
+                        applicable_roles_json = excluded.applicable_roles_json,
+                        slice_id = excluded.slice_id,
+                        item_id = excluded.item_id,
+                        resolution_note = excluded.resolution_note,
+                        superseded_by_id = excluded.superseded_by_id,
+                        updated_at_utc = excluded.updated_at_utc
+                    """,
+                    (
+                        cid,
+                        mid,
+                        str(entry.get("deliberation") or "Durable game memory persisted."),
+                        str(game_title or ""),
+                        str(entry.get("memory_bank") or "council"),
+                        str(entry.get("author_role") or "council"),
+                        str(entry.get("kind") or "lesson_learned"),
+                        str(entry.get("status") or "active"),
+                        str(entry.get("title") or ""),
+                        str(entry.get("content") or ""),
+                        roles_json,
+                        str(entry.get("slice_id") or ""),
+                        str(entry.get("item_id") or ""),
+                        str(entry.get("resolution_note") or ""),
+                        str(entry.get("superseded_by_id") or ""),
+                        str(entry.get("created_at_utc") or now_iso),
+                        str(entry.get("updated_at_utc") or now_iso),
+                    ),
+                )
+            if keep_ids:
+                placeholders = ",".join("?" for _ in keep_ids)
+                conn.execute(
+                    f"DELETE FROM studio_game_memories WHERE cartridge_id = ? AND memory_id NOT IN ({placeholders});",
+                    [cid, *keep_ids],
+                )
+            else:
+                conn.execute("DELETE FROM studio_game_memories WHERE cartridge_id = ?;", (cid,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def list_game_memories(
+        self,
+        cartridge_id: str,
+        memory_bank: Optional[str] = None,
+        kind: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Lists long-term game memory entries for `cartridge_id` ordered rationale-first."""
+        cid = (cartridge_id or "").strip()
+        if not cid:
+            return []
+        conn = self.get_reader_connection()
+        try:
+            cur = conn.cursor()
+            clauses = ["cartridge_id = ?"]
+            params: List[Any] = [cid]
+            if memory_bank and memory_bank != "all":
+                clauses.append("memory_bank = ?")
+                params.append(memory_bank)
+            if kind and kind != "all":
+                clauses.append("kind = ?")
+                params.append(kind)
+            if status and status != "all":
+                clauses.append("status = ?")
+                params.append(status)
+            where_sql = " AND ".join(clauses)
+            cur.execute(
+                f"SELECT * FROM studio_game_memories WHERE {where_sql} ORDER BY updated_at_utc DESC;",
+                params,
+            )
+            rows: List[Dict[str, Any]] = []
+            for raw in cur.fetchall():
+                d = dict(raw)
+                roles_raw = d.pop("applicable_roles_json", "[]")
+                try:
+                    roles = json.loads(roles_raw) if roles_raw else []
+                except Exception:
+                    roles = []
+                rows.append(
+                    {
+                        "deliberation": d.get("deliberation") or "Durable game memory persisted.",
+                        "memory_id": d.get("memory_id", ""),
+                        "memory_bank": d.get("memory_bank", "council"),
+                        "author_role": d.get("author_role", "council"),
+                        "kind": d.get("kind", "lesson_learned"),
+                        "status": d.get("status", "active"),
+                        "title": d.get("title", ""),
+                        "content": d.get("content", ""),
+                        "applicable_roles": roles if isinstance(roles, list) else [],
+                        "slice_id": d.get("slice_id") or "",
+                        "item_id": d.get("item_id") or "",
+                        "resolution_note": d.get("resolution_note") or "",
+                        "superseded_by_id": d.get("superseded_by_id") or "",
+                        "created_at_utc": d.get("created_at_utc", ""),
+                        "updated_at_utc": d.get("updated_at_utc", ""),
+                    }
+                )
+            return rows
         finally:
             conn.close()
 

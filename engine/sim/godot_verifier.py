@@ -487,6 +487,7 @@ class GodotHeadlessSimulator:
         self.elapsed_time = 0.0
 
         self.avg_frame_time_ms = 0.0
+        self.p95_frame_time_ms = 0.0
         self.max_frame_time_ms = 0.0
         self.frame_budget_passed = True
         self.ticks_executed = 0
@@ -720,6 +721,7 @@ class GodotHeadlessSimulator:
                         try:
                             metrics = json.loads(raw_json)
                             self.avg_frame_time_ms = float(metrics.get("avg_frame_time_ms", 0.0))
+                            self.p95_frame_time_ms = float(metrics.get("p95_frame_time_ms", 0.0))
                             self.max_frame_time_ms = float(metrics.get("max_frame_time_ms", 0.0))
                             self.frame_budget_passed = bool(metrics.get("frame_budget_passed", True))
                             self.ticks_executed = int(metrics.get("ticks_executed", 0))

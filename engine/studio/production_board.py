@@ -331,34 +331,20 @@ class ProductionBoard:
                 if i.state == "blocked" and any(d in self._items and self._items[d].state == "cancelled" for d in i.depends_on)
             ]
 
-    def snapshot_text(self, limit_chars: int = 6000) -> str:
-        """Compact board summary for council prompts."""
+    def snapshot_text(self, limit_chars: int = 16000) -> str:
+        """Compact board summary for council prompts, guaranteeing active/unstarted items are never starved by historical terminal items."""
         with self._lock:
             if not self._items:
                 return "PRODUCTION BOARD: (empty)"
             counts: Dict[str, int] = {}
             for i in self._items.values():
                 counts[i.state] = counts.get(i.state, 0) + 1
-            lines = [f"PRODUCTION BOARD ({len(self._items)} items; states={counts}; drained={self.is_drained()}):"]
+            header_line = f"PRODUCTION BOARD ({len(self._items)} items; states={counts}; drained={self.is_drained()}):"
             approved_items = [i for i in self._items.values() if i.state == "approved"]
             cancelled_items = [i for i in self._items.values() if i.state == "cancelled"]
             compact_terminals = len(self._items) > 8 and (len(approved_items) + len(cancelled_items)) >= 4
-            if compact_terminals:
-                if approved_items:
-                    lines.append(
-                        f"- APPROVED ITEMS ({len(approved_items)}): "
-                        + ", ".join(
-                            f"[{i.item_id}] ({i.kind}, mods={i.target_modules})"
-                            if i.target_modules
-                            else f"[{i.item_id}] ({i.kind})"
-                            for i in approved_items
-                        )
-                    )
-                if cancelled_items:
-                    lines.append(
-                        f"- CANCELLED ITEMS ({len(cancelled_items)}): "
-                        + ", ".join(f"[{i.item_id}] ({i.kind})" for i in cancelled_items)
-                    )
+
+            active_lines: List[str] = []
             for i in self._items.values():
                 if compact_terminals and i.state in ("approved", "cancelled"):
                     continue
@@ -397,10 +383,46 @@ class ProductionBoard:
                 elif i.state in ("in_progress", "waiting_for_lock", "changes_requested", "awaiting_review") and i.revisions and i.revisions[-1].feedback:
                     clean_fb = " ".join(i.revisions[-1].feedback.split())
                     spec_preview = f" | last_feedback: {clean_fb[:180]}{'...' if len(clean_fb) > 180 else ''}"
-                lines.append(
+                active_lines.append(
                     f"- [{i.item_id}] {i.kind} '{i.title}' state={i.state} deps={i.depends_on} "
                     f"rev={len(i.revisions)}/{i.max_revisions} by={i.raised_by_role}{extra}{spec_preview}"
                 )
+
+            terminal_lines: List[str] = []
+            if compact_terminals:
+                active_len = len(header_line) + sum(len(ln) + 1 for ln in active_lines)
+                # Bound historical terminal summaries so active/unstarted items always fit within `limit_chars`
+                terminal_budget = max(400, limit_chars - active_len - 120)
+                if approved_items:
+                    full_approved = (
+                        f"- APPROVED ITEMS ({len(approved_items)}): "
+                        + ", ".join(
+                            f"[{i.item_id}] ({i.kind}, mods={i.target_modules[:4]})"
+                            if i.target_modules
+                            else f"[{i.item_id}] ({i.kind})"
+                            for i in approved_items
+                        )
+                    )
+                    if len(full_approved) <= terminal_budget:
+                        terminal_lines.append(full_approved)
+                    else:
+                        compact_approved = (
+                            f"- APPROVED ITEMS ({len(approved_items)}): "
+                            + ", ".join(f"[{i.item_id}] ({i.kind})" for i in approved_items)
+                        )
+                        terminal_lines.append(
+                            compact_approved[:terminal_budget]
+                            + (" ...(earlier mods omitted)" if len(compact_approved) > terminal_budget else "")
+                        )
+                if cancelled_items:
+                    canc_line = (
+                        f"- CANCELLED ITEMS ({len(cancelled_items)}): "
+                        + ", ".join(f"[{i.item_id}] ({i.kind})" for i in cancelled_items)
+                    )
+                    terminal_lines.append(canc_line[: max(300, terminal_budget // 3)])
+
+            # Place active/unstarted items FIRST so they can never be truncated behind historical terminal items
+            lines = [header_line, *active_lines, *terminal_lines]
             text = "\n".join(lines)
             return text[:limit_chars] + ("\n...(truncated)" if len(text) > limit_chars else "")
 
@@ -430,15 +452,24 @@ class ProductionBoard:
                     "Production Board tasks must target production game scripts (never `tests/test_*`); QA test harnesses are authored exclusively by `qa_test_engineer` during proof verification."
                 )
         known = existing | set(batch_ids)
+        unstarted_board_ids = sorted(
+            i.item_id for i in self._items.values() if i.state in ("ready", "blocked")
+        )
+        valid_known_hint = sorted(known)
         for p in proposals:
             for d in p.depends_on:
                 if d not in known:
-                    issues.append(f"Item '{p.item_id}' depends on unknown item '{d}'.")
+                    issues.append(
+                        f"Item '{p.item_id}' depends on unknown item '{d}'. Valid item_ids: {valid_known_hint}"
+                    )
             if p.item_id in p.depends_on:
                 issues.append(f"Item '{p.item_id}' depends on itself.")
             for b in getattr(p, "blocks_items", None) or []:
                 if b not in known:
-                    issues.append(f"Item '{p.item_id}' blocks_items references unknown item '{b}'.")
+                    issues.append(
+                        f"Item '{p.item_id}' blocks_items references unknown item '{b}'. "
+                        f"Valid unstarted item_ids on board: {unstarted_board_ids or valid_known_hint}"
+                    )
                 if b == p.item_id:
                     issues.append(f"Item '{p.item_id}' cannot block itself in blocks_items.")
         # cycle detection over (existing + batch + blocks_items edges)
@@ -751,7 +782,13 @@ class ProductionBoard:
                 elif r.item_id in new_prop_map:
                     base_deps = list(new_prop_map[r.item_id].depends_on)
                 else:
-                    issues.append(f"Cannot refine unknown item '{r.item_id}'.")
+                    refinable_ids = sorted(
+                        [i.item_id for i in self._items.values() if i.state in ("ready", "blocked")]
+                        + list(new_prop_map.keys())
+                    )
+                    issues.append(
+                        f"Cannot refine unknown item '{r.item_id}'. Valid unstarted item_ids on board: {refinable_ids}"
+                    )
                     continue
                 if r.action == "no_input":
                     continue
@@ -787,7 +824,10 @@ class ProductionBoard:
                         )
                     unknown_deps = [d for d in r.add_depends_on if d not in known_ids]
                     if unknown_deps:
-                        issues.append(f"Refinement on '{r.item_id}' references unknown add_depends_on {unknown_deps}.")
+                        issues.append(
+                            f"Refinement on '{r.item_id}' references unknown add_depends_on {unknown_deps}. "
+                            f"Valid item_ids: {sorted(known_ids)}"
+                        )
                     if r.item_id in r.add_depends_on:
                         issues.append(f"Item '{r.item_id}' cannot depend on itself.")
                     merged_deps = list(dict.fromkeys(base_deps + list(r.add_depends_on)))

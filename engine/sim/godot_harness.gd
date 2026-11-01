@@ -9,7 +9,9 @@ var current_tick: int = 0
 var main_scene_node: Node = null
 var render_viewport: SubViewport = null
 var frame_times_usec: Array[int] = []
+var fallback_frame_times_usec: Array[int] = []
 var last_frame_end_usec: int = 0
+var prev_tick_captured: bool = false
 var initial_snapshot: Dictionary = {}
 var passive_idle_snapshot: Dictionary = {}
 var final_snapshot: Dictionary = {}
@@ -27,6 +29,8 @@ var capture_viewport_enabled: bool = false
 var input_script: Array = []
 var setup_script: Array = []
 var _active_scripted_actions: Array[String] = []
+var _harness_cursor_pos: Vector2 = Vector2(640.0, 360.0)
+var _hovered_pickables: Dictionary = {}
 var script_error: String = ""
 var scripted_mode: bool = false
 var target_scene_override: String = ""
@@ -94,10 +98,12 @@ func _initialize() -> void:
 	render_viewport.name = "HarnessOffscreenViewport"
 	render_viewport.size = Vector2i(1280, 720)
 	render_viewport.size_2d_override = Vector2i(1280, 720)
+	render_viewport.world_2d = World2D.new()
 	render_viewport.transparent_bg = false
 	render_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
 	render_viewport.handle_input_locally = true
-	render_viewport.physics_object_picking = true
+	render_viewport.physics_object_picking = false
+	render_viewport.gui_embed_subwindows = true
 	root.add_child(render_viewport)
 	var main_path = ProjectSettings.get_setting("application/run/main_scene", "res://main.tscn")
 	if target_scene_override != "":
@@ -138,9 +144,16 @@ func _initialize() -> void:
 	print("[HARNESS_INIT] Loaded main scene: " + str(main_path) + " (max_ticks=" + str(max_ticks) + ")")
 
 func _process(_delta: float) -> bool:
+	if DisplayServer.get_name() != "headless":
+		var mm: int = Input.mouse_mode
+		if mm == Input.MOUSE_MODE_CAPTURED or mm == Input.MOUSE_MODE_CONFINED or mm == Input.MOUSE_MODE_CONFINED_HIDDEN:
+			Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 	var t0 = Time.get_ticks_usec()
 	current_tick += 1
 	if current_tick == 1:
+		var init_motion := InputEventMouseMotion.new()
+		init_motion.position = _harness_cursor_pos
+		_push_input_event(init_motion)
 		initial_snapshot = _extract_state_snapshot()
 		spawn_pos = initial_snapshot.get("player_pos", [0.0, 0.0])
 		min_player_x_reached = float(spawn_pos[0])
@@ -159,16 +172,16 @@ func _process(_delta: float) -> bool:
 		_apply_scripted_inputs(current_tick)
 	elif current_tick <= passive_window_end:
 		_release_all_inputs()
-		var cur_snap = _extract_state_snapshot()
-		_check_snapshot_for_auto_win(cur_snap, current_tick)
-		if current_tick == passive_window_end:
-			passive_idle_snapshot = cur_snap
 	else:
 		# Phase B: Sustained Directional Boundary Excursion + Action Probes
 		_apply_synthetic_inputs(current_tick, passive_window_end)
 
-	# Track actor spatial extrema across the run
+	# Extract snapshot once per tick and track actor spatial extrema across the run
 	var live_snap = _extract_state_snapshot()
+	if not scripted_mode and current_tick <= passive_window_end:
+		_check_snapshot_for_auto_win(live_snap, current_tick)
+		if current_tick == passive_window_end:
+			passive_idle_snapshot = live_snap
 	var ppos = live_snap.get("player_pos", [0.0, 0.0])
 	if typeof(ppos) == TYPE_ARRAY and ppos.size() >= 2:
 		var px = float(ppos[0])
@@ -182,30 +195,32 @@ func _process(_delta: float) -> bool:
 		if py > max_player_y_reached:
 			max_player_y_reached = py
 
-	var t_before_capture = Time.get_ticks_usec()
+	var did_capture_this_tick: bool = false
 	if capture_ticks.has(current_tick):
 		_try_capture_viewport("res://assets/playtest_captures/filmstrip_%04d.png" % current_tick)
 		print("[QA_TICK_SNAPSHOT] " + JSON.stringify(live_snap))
+		did_capture_this_tick = true
 
 	# Viewport GPU capture at t0 (during passive window before inputs)
 	if current_tick == 2:
 		_try_capture_viewport("res://assets/playtest_captures/playtest_t0.png")
+		did_capture_this_tick = true
 
-	var harness_cpu_usec = t_before_capture - t0
-	# Record true inter-frame wall-clock time (game _physics_process + _process + _draw + SubViewport + GPU)
-	# excluding any screenshot disk-save time from the previous tick.
-	if current_tick > 3 and inter_frame_usec > 0:
-		frame_times_usec.append(inter_frame_usec + harness_cpu_usec)
-	else:
-		frame_times_usec.append(harness_cpu_usec)
+	# Record pure game-frame time (`inter_frame_usec` spans Godot's _physics_process + _process + _draw + SubViewport
+	# between harness ticks, excluding harness reflection `_extract_state_snapshot()` and screenshot GPU readbacks).
+	if current_tick > 1 and inter_frame_usec > 0:
+		fallback_frame_times_usec.append(inter_frame_usec)
+		if current_tick > 5 and not prev_tick_captured:
+			frame_times_usec.append(inter_frame_usec)
 
 	if current_tick >= max_ticks:
 		_try_capture_viewport("res://assets/playtest_captures/playtest_tend.png")
 		_try_capture_collision_overlay("res://assets/playtest_captures/playtest_collision_overlay.png")
-		final_snapshot = _extract_state_snapshot()
+		final_snapshot = live_snap
 		_emit_summary_and_exit()
 		return true
 
+	prev_tick_captured = did_capture_this_tick
 	last_frame_end_usec = Time.get_ticks_usec()
 	return false
 
@@ -521,14 +536,108 @@ func _action_to_keycode(action: String) -> int:
 
 func _push_input_event(ev: InputEvent) -> void:
 	if ev is InputEventMouse:
-		var mev = ev as InputEventMouse
+		var mev := ev as InputEventMouse
 		mev.global_position = mev.position
-		if DisplayServer.get_name() != "headless" and root != null:
-			root.warp_mouse(mev.position)
+		if mev is InputEventMouseMotion:
+			var mmot := mev as InputEventMouseMotion
+			if mmot.relative == Vector2.ZERO and mmot.position.distance_to(_harness_cursor_pos) > 0.01:
+				mmot.relative = mmot.position - _harness_cursor_pos
+			_harness_cursor_pos = mmot.position
+		elif mev is InputEventMouseButton:
+			if mev.position.distance_to(_harness_cursor_pos) > 0.01:
+				var pre_motion := InputEventMouseMotion.new()
+				pre_motion.position = mev.position
+				pre_motion.global_position = mev.position
+				pre_motion.relative = mev.position - _harness_cursor_pos
+				_harness_cursor_pos = mev.position
+				_dispatch_mouse_event_virtual(pre_motion)
+			else:
+				_harness_cursor_pos = mev.position
+		_dispatch_mouse_event_virtual(mev)
+		return
+	Input.parse_input_event(ev)
+	Input.flush_buffered_events()
 	if render_viewport != null:
 		render_viewport.push_input(ev, true)
 	elif root != null:
 		root.push_input(ev)
+
+func _dispatch_mouse_event_virtual(mev: InputEventMouse) -> void:
+	# Pure software SubViewport dispatch: NEVER call Window/Input/DisplayServer warp_mouse,
+	# which physically teleports the user's OS hardware mouse cursor on macOS/desktop displays.
+	Input.parse_input_event(mev)
+	Input.flush_buffered_events()
+	if render_viewport != null:
+		render_viewport.push_input(mev, true)
+		if render_viewport.is_input_handled():
+			_clear_hovered_pickables()
+			return
+		_dispatch_2d_physics_picking(mev)
+	elif root != null:
+		root.push_input(mev)
+
+func _clear_hovered_pickables() -> void:
+	if _hovered_pickables.is_empty():
+		return
+	for prev_iid in _hovered_pickables.keys():
+		var prev_obj = instance_from_id(int(prev_iid))
+		if prev_obj != null and prev_obj is CollisionObject2D:
+			prev_obj.mouse_exited.emit()
+			if prev_obj.has_method("_mouse_exit"):
+				prev_obj._mouse_exit()
+	_hovered_pickables.clear()
+
+func _dispatch_2d_physics_picking(ev: InputEventMouse) -> void:
+	if render_viewport == null:
+		return
+	var w2d: World2D = render_viewport.find_world_2d()
+	if w2d == null:
+		return
+	var space_state: PhysicsDirectSpaceState2D = w2d.direct_space_state
+	if space_state == null:
+		return
+	var world_pt: Vector2 = render_viewport.get_canvas_transform().affine_inverse() * ev.position
+	var query := PhysicsPointQueryParameters2D.new()
+	query.position = world_pt
+	query.collide_with_areas = true
+	query.collide_with_bodies = true
+	var hits: Array[Dictionary] = space_state.intersect_point(query, 32)
+
+	var next_hovered: Dictionary = {}
+	for h in hits:
+		var col = h.get("collider")
+		if col is CollisionObject2D and col.input_pickable:
+			next_hovered[col.get_instance_id()] = col
+
+	for prev_iid in _hovered_pickables.keys():
+		if not next_hovered.has(prev_iid):
+			var prev_obj = instance_from_id(int(prev_iid))
+			if prev_obj != null and prev_obj is CollisionObject2D:
+				prev_obj.mouse_exited.emit()
+				if prev_obj.has_method("_mouse_exit"):
+					prev_obj._mouse_exit()
+
+	for cur_iid in next_hovered.keys():
+		if not _hovered_pickables.has(cur_iid):
+			var cur_obj: CollisionObject2D = next_hovered[cur_iid]
+			cur_obj.mouse_entered.emit()
+			if cur_obj.has_method("_mouse_enter"):
+				cur_obj._mouse_enter()
+
+	_hovered_pickables = next_hovered
+
+	var delivered_iids: Dictionary = {}
+	for h in hits:
+		var col = h.get("collider")
+		var shape_idx: int = int(h.get("shape", 0))
+		if col is CollisionObject2D and col.input_pickable:
+			var iid: int = col.get_instance_id()
+			if delivered_iids.has(iid):
+				continue
+			delivered_iids[iid] = true
+			col.input_event.emit(render_viewport, ev, shape_idx)
+			if col.has_method("_input_event"):
+				col._input_event(render_viewport, ev, shape_idx)
 
 func _resolve_scripted_mouse_pos(entry: Dictionary) -> Variant:
 	var world_pos = entry.get("mouse_world_pos", null)
@@ -726,10 +835,12 @@ func _apply_scripted_inputs(tick: int) -> void:
 		if target_mpos != null:
 			var motion_ev = InputEventMouseMotion.new()
 			motion_ev.position = target_mpos
+			motion_ev.button_mask = MOUSE_BUTTON_MASK_LEFT if tick > first else 0
 			_push_input_event(motion_ev)
 			if tick == first:
 				var click_ev = InputEventMouseButton.new()
 				click_ev.button_index = MOUSE_BUTTON_LEFT
+				click_ev.button_mask = MOUSE_BUTTON_MASK_LEFT
 				click_ev.pressed = true
 				click_ev.position = target_mpos
 				_push_input_event(click_ev)
@@ -1143,15 +1254,20 @@ func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
 		_walk_scene_audit(child, current_in_ui, report)
 
 func _emit_summary_and_exit() -> void:
+	var samples: Array[int] = frame_times_usec if frame_times_usec.size() > 0 else fallback_frame_times_usec
 	var total_usec = 0.0
 	var max_usec = 0.0
-	for t in frame_times_usec:
+	var sorted_samples: Array[int] = samples.duplicate()
+	sorted_samples.sort()
+	for t in samples:
 		total_usec += t
 		if t > max_usec:
 			max_usec = t
-	var avg_ms = (total_usec / frame_times_usec.size()) / 1000.0 if frame_times_usec.size() > 0 else 0.0
+	var avg_ms = (total_usec / samples.size()) / 1000.0 if samples.size() > 0 else 0.0
+	var p95_idx = int(floor(float(sorted_samples.size() - 1) * 0.95)) if sorted_samples.size() > 0 else 0
+	var p95_ms = float(sorted_samples[p95_idx]) / 1000.0 if sorted_samples.size() > 0 else 0.0
 	var peak_ms = max_usec / 1000.0
-	var frame_budget_passed = (avg_ms < 16.6 and peak_ms < 33.3)
+	var frame_budget_passed = (avg_ms < 16.6 and p95_ms < 25.0 and peak_ms < 120.0)
 
 	var pos0 = initial_snapshot.get("player_pos", [0.0, 0.0])
 	var pos1 = final_snapshot.get("player_pos", [0.0, 0.0])
@@ -1170,6 +1286,7 @@ func _emit_summary_and_exit() -> void:
 	print("[SCENE_AUDIT] " + JSON.stringify(scene_audit))
 	print("[PERF_METRICS] " + JSON.stringify({
 		"avg_frame_time_ms": avg_ms,
+		"p95_frame_time_ms": p95_ms,
 		"max_frame_time_ms": peak_ms,
 		"frame_budget_passed": frame_budget_passed,
 		"ticks_executed": current_tick

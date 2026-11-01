@@ -67,6 +67,7 @@ var mouse_left_held: bool = false
 var transient_mouse_btn_down: int = 0
 var click_flash_ticks: int = 0
 var hovered_pickables: Dictionary = {}
+var virtual_cursor_hidden: bool = false
 
 # Current burst execution state
 var burst_total_ticks: int = 0
@@ -197,6 +198,11 @@ func _initialize() -> void:
 	})
 
 func _process(_delta: float) -> bool:
+	if DisplayServer.get_name() != "headless":
+		var cur_mm: int = Input.mouse_mode
+		if cur_mm == Input.MOUSE_MODE_CAPTURED or cur_mm == Input.MOUSE_MODE_CONFINED or cur_mm == Input.MOUSE_MODE_CONFINED_HIDDEN:
+			virtual_cursor_hidden = (cur_mm == Input.MOUSE_MODE_CAPTURED or cur_mm == Input.MOUSE_MODE_CONFINED_HIDDEN)
+			Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 	current_tick += 1
 	if current_tick == 1:
 		_emit_mouse_motion(cursor_pos, Vector2.ZERO)
@@ -276,7 +282,7 @@ func _capture_composited_frame() -> Image:
 
 func _draw_cursor_overlay(img: Image, pos: Vector2, flash_ticks: int, left_down: bool) -> void:
 	var mm: int = Input.mouse_mode
-	if mm == Input.MOUSE_MODE_CAPTURED or mm == Input.MOUSE_MODE_HIDDEN:
+	if virtual_cursor_hidden or mm == Input.MOUSE_MODE_CAPTURED or mm == Input.MOUSE_MODE_HIDDEN:
 		return
 
 	var cx: int = clampi(int(round(pos.x)), 0, VIEWPORT_W - 1)
@@ -497,6 +503,11 @@ func _configure_action_burst(msg: Dictionary) -> void:
 
 	# Resolve target cursor position (primary: screen coordinates mouse_x/mouse_y; fallback: polar distance/angle)
 	burst_mouse_action = String(msg.get("mouse_button_action", "none")).strip_edges().to_lower()
+	# Symmetric with held_keycodes: if left mouse was held from an earlier 'hold_left' burst and this
+	# burst switches to another action (other than 'hold_left' or tick-1 'release_left'), release cleanly.
+	if mouse_left_held and burst_mouse_action != "hold_left" and burst_mouse_action != "release_left":
+		mouse_left_held = false
+		_emit_mouse_button(MOUSE_BUTTON_LEFT, false, false)
 	var dest_pos: Vector2 = cursor_pos
 	var raw_mx = msg.get("mouse_x", null)
 	var raw_my = msg.get("mouse_y", null)
@@ -638,9 +649,10 @@ func _step_action_burst_inputs() -> void:
 			transient_mouse_btn_down = 0
 			_emit_mouse_button(MOUSE_BUTTON_LEFT, false, false)
 	elif burst_mouse_action == "hold_left":
-		if burst_tick_idx == click_start_tick and not mouse_left_held:
-			mouse_left_held = true
-			_emit_mouse_button(MOUSE_BUTTON_LEFT, true, false)
+		if burst_tick_idx == click_start_tick:
+			if not mouse_left_held:
+				mouse_left_held = true
+				_emit_mouse_button(MOUSE_BUTTON_LEFT, true, false)
 			click_flash_ticks = 10
 	elif burst_mouse_action == "wheel_up":
 		if burst_tick_idx == click_start_tick:

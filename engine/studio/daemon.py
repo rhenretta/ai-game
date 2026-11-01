@@ -337,6 +337,18 @@ def rehydrate_resumable_candidate_from_db(
         except Exception as pb_exc:
             logger.warning("Failed sanitizing backlog.json during rehydration: %s", pb_exc)
 
+    mem_path = staging_dir / "game_memory.json"
+    if not mem_path.is_file() and db_path and db_path.exists():
+        try:
+            from engine.studio.game_memory import GameMemoryStore
+
+            mem_store = GameMemoryStore(staging_dir, db=TelemetryDB(db_path))
+            mem_ledger = mem_store.load_ledger()
+            if mem_ledger.entries:
+                mem_store.save_ledger(mem_ledger)
+        except Exception as mem_exc:
+            logger.warning("Failed rehydrating game_memory.json from SQLite: %s", mem_exc)
+
     return staging_dir
 
 
@@ -659,9 +671,13 @@ class StudioDaemon:
                             plan = self._resolve_maybe_coroutine(
                                 self.orchestrator.generate_swarm_plan(**plan_sig_kwargs)
                             )
-                        report = self._resolve_maybe_coroutine(
-                            self.orchestrator.execute_swarm_plan(plan, staging_dir)
-                        )
+                        self.orchestrator._resume_current_requested = bool(self.config.resume_current)
+                        try:
+                            report = self._resolve_maybe_coroutine(
+                                self.orchestrator.execute_swarm_plan(plan, staging_dir)
+                            )
+                        finally:
+                            self.orchestrator._resume_current_requested = False
                     elif hasattr(self.orchestrator, "run_genesis_build"):
                         report = self._resolve_maybe_coroutine(
                             self.orchestrator.run_genesis_build(staging_dir=staging_dir)

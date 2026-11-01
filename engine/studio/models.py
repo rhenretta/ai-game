@@ -876,11 +876,203 @@ class VisualSceneLayerSpec(BaseEpistemicModel):
     associated_asset_ids: List[str] = Field(default_factory=list, description="Asset IDs from the Asset Library used on this layer.")
 
 
+MemoryKind = Literal[
+    "strategic_goal",
+    "architectural_decision",
+    "lesson_learned",
+    "domain_note",
+]
+
+MemoryStatus = Literal[
+    "active",
+    "fulfilled",
+    "superseded",
+    "archived",
+]
+
+MemoryMutationOperation = Literal[
+    "record",
+    "update",
+    "fulfill",
+    "supersede",
+    "archive",
+]
+
+CANONICAL_MEMORY_BANKS: Tuple[str, ...] = (
+    "council",
+    "CreativeDirector",
+    "GameplayDesigner",
+    "LevelAndProgressionDesigner",
+    "GameplaySystemsEngineer",
+    "StoryWorldArchitect",
+    "ScriptwriterAgent",
+    "CharacterDesigner",
+    "VisualArtDirector",
+    "UXExperienceDesigner",
+    "AudioAtmosphereDesigner",
+    "task_lead",
+    "swe_engineer",
+    "qa_test_engineer",
+    "visual_artist",
+    "audio_designer",
+    "script_writer",
+)
+
+
+class GameMemoryEntry(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    A durable per-game memory record persisted across tasks and vertical slices inside either
+    the shared 'council' bank or an individual specialist agent's memory bank.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Epistemic rationale explaining why this durable memory entry matters across tasks or vertical slices.",
+    )
+    memory_id: str = Field(
+        default_factory=lambda: f"mem_{uuid.uuid4().hex[:10]}",
+        description="Stable unique identifier for this memory entry within the game.",
+    )
+    memory_bank: str = Field(
+        default="council",
+        description="Owning memory bank ('council' for shared Council memory, or a canonical specialist role bank).",
+    )
+    author_role: str = Field(
+        default="council",
+        description="Agent role or 'executive_producer' that recorded or last updated this memory.",
+    )
+    kind: MemoryKind = Field(
+        default="lesson_learned",
+        description="Category: 'strategic_goal' (multi-slice or deferred direction), 'architectural_decision' (design/technical trade-off), 'lesson_learned' (operational/verification constraint), or 'domain_note' (craft knowledge).",
+    )
+    status: MemoryStatus = Field(
+        default="active",
+        description="Lifecycle state: 'active', 'fulfilled', 'superseded', or 'archived'.",
+    )
+    title: str = Field(
+        ...,
+        description="Concise headline summarizing the durable goal, decision, or lesson.",
+    )
+    content: str = Field(
+        ...,
+        description="Detailed, actionable guidance, rationale, or constraint for future tasks and slices.",
+    )
+    applicable_roles: List[str] = Field(
+        default_factory=list,
+        description="Optional target roles for whom ContextCuratorAgent should proactively surface this memory (empty means general to bank/game).",
+    )
+    slice_id: str = Field(
+        default="",
+        description="Slice identifier active when this memory was created or updated.",
+    )
+    item_id: str = Field(
+        default="",
+        description="Optional Production Board work item identifier linked to this memory.",
+    )
+    resolution_note: str = Field(
+        default="",
+        description="Optional explanation recorded when a memory entry is marked fulfilled, superseded, or archived.",
+    )
+    superseded_by_id: str = Field(
+        default="",
+        description="Optional memory_id that superseded this entry.",
+    )
+    created_at_utc: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(),
+    )
+    updated_at_utc: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(),
+    )
+
+
+class MemoryMutationProposal(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Structured mutation emitted by a Council or Production Board agent to record, refine,
+    fulfill, supersede, or archive a durable per-game memory entry.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Counterfactual durability rationale explaining why future tasks or vertical slices would fail or lose deferred direction without this memory, and why it is NOT already captured in the Living Game Bible, codebase, or current task spec.",
+    )
+    operation: MemoryMutationOperation = Field(
+        default="record",
+        description="'record' to add a durable memory, 'update' to refine an existing entry, 'fulfill' when a strategic goal is now delivered, 'supersede' when replaced, or 'archive' when obsolete.",
+    )
+    target_memory_id: str = Field(
+        default="",
+        description="Existing `memory_id` when operation is 'update', 'fulfill', 'supersede', or 'archive' (leave '' when operation='record').",
+    )
+    target_bank: str = Field(
+        default="self",
+        description="'self' to store in your own agent memory bank, 'council' to share cross-cutting goals/lessons with the Council, or a canonical role bank.",
+    )
+    kind: MemoryKind = Field(
+        default="lesson_learned",
+        description="'strategic_goal', 'architectural_decision', 'lesson_learned', or 'domain_note'.",
+    )
+    title: str = Field(
+        default="",
+        description="Concise headline (required when operation='record').",
+    )
+    content: str = Field(
+        default="",
+        description="Actionable long-term guidance or constraint (required when operation in ('record', 'update')).",
+    )
+    applicable_roles: List[str] = Field(
+        default_factory=list,
+        description="Optional peer roles that should proactively receive this memory during context curation.",
+    )
+    resolution_note: str = Field(
+        default="",
+        description="Optional note explaining how a strategic goal was fulfilled, superseded, or archived.",
+    )
+
+
+class GameMemoryLedger(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Per-cartridge long-term memory container persisted in `game_memory.json` and mirrored to SQLite WAL.
+    """
+    deliberation: str = Field(
+        default="Authoritative per-game multi-bank long-term memory ledger.",
+        description="MANDATORY FIRST PROPERTY: Epistemic summary of the game memory ledger.",
+    )
+    cartridge_id: str = Field(
+        default="",
+        description="Cartridge directory identifier owning this memory ledger.",
+    )
+    game_title: str = Field(
+        default="",
+        description="Current title of the game.",
+    )
+    updated_at_utc: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(),
+    )
+    entries: List[GameMemoryEntry] = Field(
+        default_factory=list,
+        description="All durable memory entries across 'council' and individual agent memory banks.",
+    )
+
+
 class AssetRequirement(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     Dynamic multimodal visual or audio asset required by the conceived game and fabricated into the Cartridge Asset Library.
     """
     deliberation: str = Field(..., description="MANDATORY FIRST: Rationale explaining why this purpose-built asset is required.")
+    memory_query_answer: str = Field(
+        default="",
+        description="If you issued `memory_query` on the previous turn, summarize what you learned from the retrieved memory entries before finalizing this asset.",
+    )
+    memory_query: str = Field(
+        default="",
+        description="Optional semantic search query against long-term game/agent memory banks before finalizing this asset (leave '' when current context suffices).",
+    )
+    memory_query_bank: str = Field(
+        default="",
+        description="Optional bank filter for `memory_query` ('', 'all', 'self', 'council', or a canonical role name).",
+    )
+    memory_updates: List[MemoryMutationProposal] = Field(
+        default_factory=list,
+        description="DEFAULT TO [] — LEAVE EMPTY ON ROUTINE TURNS. Never log task progress, summarize fabricated assets, or restate the Game Bible/asset catalog. Populate ONLY for non-obvious reusable visual craft invariants or asset-pipeline lessons needed across future tasks/slices (or to update/fulfill an existing memory_id).",
+    )
     name: str = Field(default="", description="Asset filename, e.g. 'hero_sheet.png' or 'vesper_portrait.png'")
     asset_id: str = Field(default="", description="Identifier slug, e.g. 'hero', 'conduit_pylon', 'vesper_portrait', 'bark_intro'")
     asset_type: str = Field(
@@ -1023,9 +1215,13 @@ class AssetRequirement(BaseEpistemicModel):
 
             desc = out.get("description")
             vprompt = out.get("visual_prompt_or_text")
-            final_text = desc or vprompt or out.get("purpose") or f"Asset {aid}"
-            out["description"] = final_text
-            out["visual_prompt_or_text"] = vprompt or final_text
+            if str(out.get("memory_query") or "").strip() and not vprompt:
+                out["description"] = desc or ""
+                out["visual_prompt_or_text"] = ""
+            else:
+                final_text = desc or vprompt or out.get("purpose") or f"Asset {aid}"
+                out["description"] = final_text
+                out["visual_prompt_or_text"] = vprompt or final_text
             return out
         return data
 
@@ -1037,6 +1233,22 @@ class AudioAssetPlanBatch(BaseEpistemicModel):
     deliberation: str = Field(
         ...,
         description="MANDATORY FIRST: Rationale enumerating every audio file/cue requested by the task specification or brief and its acoustic character, frequency register, and fabrication mode.",
+    )
+    memory_query_answer: str = Field(
+        default="",
+        description="If you issued `memory_query` on the previous turn, summarize what you learned from the retrieved memory entries before finalizing `assets`.",
+    )
+    memory_query: str = Field(
+        default="",
+        description="Optional semantic search query against long-term game/agent memory banks before finalizing `assets` (leave '' when current context suffices).",
+    )
+    memory_query_bank: str = Field(
+        default="",
+        description="Optional bank filter for `memory_query` ('', 'all', 'self', 'council', or a canonical role name).",
+    )
+    memory_updates: List[MemoryMutationProposal] = Field(
+        default_factory=list,
+        description="DEFAULT TO [] — LEAVE EMPTY ON ROUTINE TURNS. Never log routine cue synthesis or restate the Game Bible/asset catalog. Populate ONLY for non-obvious acoustic invariants or audio-pipeline lessons needed across future tasks/slices (or to update/fulfill an existing memory_id).",
     )
     assets: List[AssetRequirement] = Field(
         default_factory=list,
@@ -1436,6 +1648,22 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
     self_question: str = Field(
         default="",
         description="Optional self-inquiry: If you lack critical context (e.g. an imported script's exact method/signal signature, node structure, shader uniforms, or design spec) needed to write code without guessing, output your specific question here and leave `patches` and `files` empty (`[]`). ContextCuratorAgent will fetch the needed context chunks so you can answer your own question on the next turn.",
+    )
+    memory_query_answer: str = Field(
+        default="",
+        description="If you issued `memory_query` on the previous turn, write your concise synthesis of the retrieved long-term memory entries here before writing `patches` or `files`.",
+    )
+    memory_query: str = Field(
+        default="",
+        description="Optional direct query against long-term game/agent memory banks: if you want to look up prior architectural decisions, multi-slice goals, or technical lessons learned before coding, enter a semantic search query here and leave `patches` and `files` empty (`[]`).",
+    )
+    memory_query_bank: str = Field(
+        default="",
+        description="Optional bank filter when issuing `memory_query` ('', 'all', 'self', 'council', or a canonical specialist role name).",
+    )
+    memory_updates: List[MemoryMutationProposal] = Field(
+        default_factory=list,
+        description="DEFAULT TO [] — LEAVE EMPTY ON ROUTINE TURNS. Never log what code you just wrote, restate the Game Bible/spec, or record local single-file fixes. Populate ONLY when establishing a cross-module architectural invariant or hard-won runtime lesson future tasks/slices would break without knowing (or to update/fulfill an existing memory_id).",
     )
     diagnostic_test_scene_request: str = Field(
         default="",
@@ -2113,7 +2341,11 @@ class WritersRoomUtterance(BaseEpistemicModel):
     speaker_display_name: str = Field(..., description="Human-readable specialist title.")
     spoken_dialogue: str = Field(
         ...,
-        description="Natural, opinionated conversational contribution addressing the room, critiquing weak ideas, or pitching improvements."
+        description=(
+            "Direct, candid conversational contribution to the room—NEVER open with agreement filler or peer flattery "
+            "('I completely agree', 'I echo', 'Spot on', 'wonderful'). Lead immediately with concrete critique, unaddressed "
+            "risks, trade-offs, or net-new domain proposals while treating any Executive Producer message with full respect."
+        ),
     )
     addressed_to: List[str] = Field(
         default_factory=list,
@@ -2176,11 +2408,19 @@ class WritersRoomTurnProposal(BaseEpistemicModel):
     """
     deliberation: str = Field(
         ...,
-        description="MANDATORY FIRST PROPERTY: Epistemic deliberation on how to push the game experience forward and what to update in the Game Bible."
+        description=(
+            "MANDATORY FIRST PROPERTY: Skeptical first-principles deliberation examining blind spots, unverified assumptions, "
+            "or scope bloat in peer proposals, while treating any Executive Producer steering with full respect and catering "
+            "directly to it within realistic active-slice scope."
+        ),
     )
     spoken_dialogue: str = Field(
         ...,
-        description="Conversational statement to the Writers' Room."
+        description=(
+            "Direct, unvarnished statement to the Writers' Room—NEVER start with 'I completely agree with...', 'I echo...', "
+            "peer roll-call praise, or cheerleading adjectives. Jump straight into concrete domain pushback, risk diagnosis, "
+            "or net-new design substance (while treating Executive Producer direction with complete respect and catering to it)."
+        ),
     )
     addressed_to: List[str] = Field(default_factory=list)
     updated_game_title: Optional[str] = Field(default=None)
@@ -2216,6 +2456,14 @@ class WritersRoomTurnProposal(BaseEpistemicModel):
         default_factory=list,
         description="Pre-execution Council input on existing unstarted tasks on the Production Board: enrich a task's spec with domain direction/contracts (`action='enrich'`), wire dependencies (`add_depends_on`), or split an oversized task into smaller cohesive tasks (`action='split'`).",
     )
+    memory_query: str = Field(
+        default="",
+        description="Optional semantic search query against long-term game and agent memory banks before finalizing your turn (leave '' when current context suffices).",
+    )
+    memory_note: str = Field(
+        default="",
+        description="DEFAULT TO '' — LEAVE EMPTY ON ROUTINE TURNS. Never duplicate Game Bible updates, task specs, or ordinary dialogue points here. Populate ONLY when deferring a multi-slice strategic goal beyond the active slice or recording a non-obvious cross-slice constraint (format '<bank>:<kind>: <title> | <content>').",
+    )
 
     _ROLE_SCHEMA_CACHE: ClassVar[Dict[str, Type["BaseEpistemicModel"]]] = {}
     _SHARED_TURN_FIELDS: ClassVar[Tuple[str, ...]] = (
@@ -2229,6 +2477,8 @@ class WritersRoomTurnProposal(BaseEpistemicModel):
         "added_or_updated_slices",
         "backlog_additions",
         "backlog_refinements",
+        "memory_query",
+        "memory_note",
     )
     _ROLE_TURN_FIELDS: ClassVar[Dict[str, Tuple[str, ...]]] = {
         "CreativeDirector": (
@@ -2322,23 +2572,29 @@ class DirectorConvergenceCheck(BaseEpistemicModel):
     """
     deliberation: str = Field(
         ...,
-        description="MANDATORY FIRST PROPERTY: Director's critical evaluation of whether the experience, story, UX, art mockups, characters, and engineering blueprint feel like a cohesive, buildable game."
-    )
-    is_ready_to_lock_bible: bool = Field(
-        ...,
-        description="True ONLY when the Game Bible has a compelling hook, rich experience storyboard, diegetic UX plan, characters/world lore, visual mockups, and a concrete technical architecture blueprint from GameplaySystemsEngineer."
-    )
-    experience_cohesion_score: float = Field(
-        ...,
-        description="Cohesion and polish readiness score in [0.0, 1.0]."
+        description=(
+            "MANDATORY FIRST PROPERTY: Director's skeptical yet pragmatic evaluation of whether the experience, UX, art mockups, "
+            "engineering blueprint, and Executive Producer requests cohere into a genuinely fun, buildable game without scope bloat."
+        ),
     )
     missing_or_weak_elements: List[str] = Field(
         default_factory=list,
-        description="Specific gaps the room still needs to resolve if not ready."
+        description="Specific gaps the room still needs to resolve for THIS active slice if not ready.",
     )
     director_steering_prompt: str = Field(
         default="",
-        description="If not ready, the Director's next challenge or question to the room."
+        description="If not ready, the Director's candid next challenge or question to the room (zero peer flattery).",
+    )
+    experience_cohesion_score: float = Field(
+        ...,
+        description="Cohesion and polish readiness score in [0.0, 1.0].",
+    )
+    is_ready_to_lock_bible: bool = Field(
+        ...,
+        description=(
+            "True when the Game Bible has been pressure-tested across domains, faithfully honors any Executive Producer direction, "
+            "and defines a cohesive, buildable slice scope without trying to cram every future idea into one pass (strictly last per Rule 4)."
+        ),
     )
 
 
@@ -2976,6 +3232,22 @@ class FilmstripPlan(BaseEpistemicModel):
     production code (`production_defect_report`) when the game itself is broken or deadlocked.
     """
     deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this test scene architecture, diagnostic overlay/telemetry strategy, scripted inputs, and capture ticks best prove the item meets its spec (or why the production code itself is broken/deadlocked).")
+    memory_query_answer: str = Field(
+        default="",
+        description="If you issued `memory_query` on the previous turn, summarize what you learned from the retrieved long-term memory entries before finalizing your QA plan.",
+    )
+    memory_query: str = Field(
+        default="",
+        description="Optional semantic search query against long-term game/agent memory banks if you want to check prior QA/verification lessons or architectural invariants before finalizing your test scene plan (leave '' when current context suffices).",
+    )
+    memory_query_bank: str = Field(
+        default="",
+        description="Optional bank filter when issuing `memory_query` ('', 'all', 'self', 'council', or a canonical role name).",
+    )
+    memory_updates: List[MemoryMutationProposal] = Field(
+        default_factory=list,
+        description="DEFAULT TO [] — LEAVE EMPTY ON ROUTINE TURNS. Never log standard test runs or single-task test steps. Populate ONLY when discovering a non-obvious harness limitation or verification invariant that future QA/Task Lead turns would otherwise violate (or to update/fulfill an existing memory_id).",
+    )
     production_defect_report: str = Field(
         default="",
         description=(
@@ -3142,6 +3414,22 @@ class TaskShapingBatch(BaseEpistemicModel):
         default_factory=list,
         description="Refinements ('enrich') or decompositions ('split') to apply to existing unstarted tasks on the Production Board.",
     )
+    memory_query_answer: str = Field(
+        default="",
+        description="If you issued `memory_query` on the previous turn, summarize what you learned from the retrieved memory entries.",
+    )
+    memory_query: str = Field(
+        default="",
+        description="Optional semantic search query against long-term game/agent memory banks before finalizing task shaping (leave '' when current context suffices).",
+    )
+    memory_query_bank: str = Field(
+        default="",
+        description="Optional bank filter for `memory_query` ('', 'all', 'self', 'council', or a canonical role name).",
+    )
+    memory_updates: List[MemoryMutationProposal] = Field(
+        default_factory=list,
+        description="DEFAULT TO [] — LEAVE EMPTY ON ROUTINE TURNS. Never duplicate task specs or Bible content here. Populate ONLY when deferring an out-of-slice ambition or recording a cross-slice invariant (or updating an existing memory_id).",
+    )
 
 
 class ReviewDecision(BaseEpistemicModel):
@@ -3206,13 +3494,20 @@ class ReviewBatch(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     One reviewer's decisions for every item currently waiting on them.
     """
-    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Overall assessment of the proofs presented in this round.")
+    deliberation: str = Field(
+        ...,
+        description=(
+            "MANDATORY FIRST PROPERTY: Skeptical independent assessment of the rendered proofs and telemetry against each item's "
+            "spec, Executive Producer direction, and active-slice scope—distrusting unverified worker claims without inventing out-of-scope feature creep."
+        ),
+    )
     spoken_dialogue: str = Field(
         default="",
         description=(
-            "Natural first-person conversational contribution to the Council Review Roundtable in the Writers' Room, addressing fellow Council members, "
-            "stating what you determined needed to be validated from your perspective, responding to earlier reviewers' observations in this round, "
-            "and explaining what the proof frames, debug overlays, and telemetry actually show."
+            "Direct, zero-flattery critique in the Council Review Roundtable—NEVER open with 'I completely agree', 'I echo', "
+            "'I couldn't agree more', or peer praise, and NEVER repeat points an earlier reviewer already made. Lead straight "
+            "with what YOUR discipline uniquely caught in the proof frames/telemetry (or where you disagree with a peer), "
+            "while catering respectfully to any Executive Producer direction and calling in-scope items done when satisfied."
         ),
     )
     addressed_to: List[str] = Field(
@@ -3221,6 +3516,22 @@ class ReviewBatch(BaseEpistemicModel):
     )
     review_decisions: List[ReviewDecision] = Field(default_factory=list, description="One decision per item awaiting review.")
     cap_decisions: List[CapDecision] = Field(default_factory=list, description="One decision per item that hit its revision cap or stalled.")
+    memory_query_answer: str = Field(
+        default="",
+        description="If you issued `memory_query` on the previous turn, summarize what you learned from the retrieved memory entries.",
+    )
+    memory_query: str = Field(
+        default="",
+        description="Optional semantic search query against long-term game/agent memory banks before finalizing your review decisions (leave '' when current context suffices).",
+    )
+    memory_query_bank: str = Field(
+        default="",
+        description="Optional bank filter for `memory_query` ('', 'all', 'self', 'council', or a canonical role name).",
+    )
+    memory_updates: List[MemoryMutationProposal] = Field(
+        default_factory=list,
+        description="DEFAULT TO [] — LEAVE EMPTY ON ROUTINE REVIEWS. Item-specific revision feedback belongs in `verdicts`, NOT long-term memory. Populate ONLY for systemic cross-task/cross-slice lessons, deferred future-slice goals, or fulfilling an existing memory_id.",
+    )
 
 
 class SlicePlaytestRoundtableTurn(BaseEpistemicModel):
@@ -3229,7 +3540,11 @@ class SlicePlaytestRoundtableTurn(BaseEpistemicModel):
     """
     deliberation: str = Field(
         ...,
-        description="MANDATORY FIRST PROPERTY: Specialist reasoning about what must be validated from your perspective for this slice to be playable and fun, and what the playthrough filmstrip and telemetry actually reveal.",
+        description=(
+            "MANDATORY FIRST PROPERTY: Skeptical yet scope-disciplined reasoning examining what the playthrough filmstrip and "
+            "telemetry actually prove, separating must-fix current-slice problem areas (and Executive Producer priorities) "
+            "from broader changes that belong in future slices."
+        ),
     )
     validation_criteria_for_my_role: str = Field(
         default="",
@@ -3237,7 +3552,11 @@ class SlicePlaytestRoundtableTurn(BaseEpistemicModel):
     )
     spoken_dialogue: str = Field(
         ...,
-        description="Natural first-person conversational contribution to the Writers' Room discussing the slice playthrough filmstrip and telemetry with fellow Council members.",
+        description=(
+            "Candid, zero-flattery critique to the Writers' Room—NEVER open with 'I completely agree', 'I echo', or 'feels wonderful'. "
+            "State plainly what works, what is rough, which problem areas must be fixed inside this slice's scope vs. deferred, "
+            "and treat any Executive Producer direction with full respect."
+        ),
     )
     addressed_to: List[str] = Field(
         default_factory=list,
@@ -3249,7 +3568,11 @@ class SlicePlaytestRoundtableTurn(BaseEpistemicModel):
     )
     is_playable_and_fun_from_my_perspective: bool = Field(
         ...,
-        description="True ONLY if the slice playthrough proves the game is playable, responsive at human scale, and fun from your specialist perspective (strictly last).",
+        description=(
+            "True once the active slice's intended scope works end-to-end at human scale and major current-slice problem areas "
+            "are cleaned up (knowing we cannot change everything in one go); False if core slice scope or glaring visual/UX/gameplay "
+            "defects still need a surgical fix pass (strictly last)."
+        ),
     )
 
 
@@ -3262,7 +3585,11 @@ class SliceAssemblyDecision(BaseEpistemicModel):
     """
     deliberation: str = Field(
         ...,
-        description="MANDATORY FIRST PROPERTY: Holistic evaluation of the slice playthrough filmstrip, live scene tree, and entrypoint module reachability against the Living Game Bible and completed board items.",
+        description=(
+            "MANDATORY FIRST PROPERTY: Skeptical yet pragmatic evaluation of the slice playthrough filmstrip, live scene tree, "
+            "and entrypoint reachability—verifying whether active-slice scope and Executive Producer directives are met and "
+            "major problem areas are cleaned up without trying to rewrite everything in one go."
+        ),
     )
     playability_and_fun_evaluation: str = Field(
         default="",
@@ -3273,7 +3600,10 @@ class SliceAssemblyDecision(BaseEpistemicModel):
     )
     spoken_dialogue: str = Field(
         default="",
-        description="Natural first-person conversational synthesis to the Writers' Room summarizing the Council's playtest roundtable findings and next steps.",
+        description=(
+            "Direct, candid synthesis to the Writers' Room—no cheerleading or 'I completely agree' filler—stating plainly "
+            "either which bounded current-slice problem areas are being fixed now OR why the slice's scope is covered and ready to call done."
+        ),
     )
     unmounted_or_disconnected_systems: List[str] = Field(
         default_factory=list,
@@ -3281,11 +3611,19 @@ class SliceAssemblyDecision(BaseEpistemicModel):
     )
     backlog_additions: List[WorkItemProposal] = Field(
         default_factory=list,
-        description="New integration or gameplay/UI fix WorkItemProposal tasks to wire unmounted modules or resolve playability/responsiveness/cohesion issues exposed by the slice playthrough (empty when is_slice_assembled=True).",
+        description=(
+            "Tight, surgical integration or gameplay/UI/visual fix WorkItemProposal tasks (typically 1-3 items) to wire unmounted "
+            "slice modules or clean up high-impact current-slice problem areas—never an unbounded rewrite of everything at once "
+            "(empty when is_slice_assembled=True)."
+        ),
     )
     is_slice_assembled: bool = Field(
         ...,
-        description="True ONLY when all built systems for the active slice are assembled in the main entrypoint AND the slice playthrough proves the game is playable, responsive at human scale, and fun without needing further tasks (strictly last).",
+        description=(
+            "True when the active slice's scope is mounted and working end-to-end in the main entrypoint and major current-slice "
+            "problem areas are resolved (calling the slice done appropriately rather than chasing endless perfection); False when "
+            "targeted current-slice fixes are still required (strictly last)."
+        ),
     )
 
 
@@ -3297,8 +3635,9 @@ class BlindPlaytestCouncilTurn(BaseEpistemicModel):
     deliberation: str = Field(
         ...,
         description=(
-            "MANDATORY FIRST PROPERTY: Specialist reasoning analyzing the Blind Playtester's unguided session report, "
-            "sparse pillar impressions, player wishes, and visual screenshots from your discipline's perspective."
+            "MANDATORY FIRST PROPERTY: Skeptical, evidence-first analysis of the Blind Playtester's screenshots, action tape, "
+            "report, and wishes—weighing which defects must be cleaned up within this slice's scope (plus any Executive Producer "
+            "priorities) versus what should be deferred so we do not try to change everything in one go."
         ),
     )
     domain_reaction_to_blind_player: str = Field(
@@ -3307,7 +3646,11 @@ class BlindPlaytestCouncilTurn(BaseEpistemicModel):
     )
     spoken_dialogue: str = Field(
         ...,
-        description="Natural first-person conversational contribution to the Writers' Room discussing the Blind Playtester's experience and wishes with fellow Council members.",
+        description=(
+            "Candid, zero-flattery contribution to the Writers' Room—NEVER open with 'I completely agree', 'I echo', or peer "
+            "back-patting. State directly what the screenshots/tape reveal, what few high-impact issues (if any) belong in a "
+            "current-slice cleanup vs. next slice, and treat any Executive Producer input with full respect."
+        ),
     )
     addressed_to: List[str] = Field(
         default_factory=list,
@@ -3315,11 +3658,19 @@ class BlindPlaytestCouncilTurn(BaseEpistemicModel):
     )
     priority_fixes_or_refinements: List[str] = Field(
         default_factory=list,
-        description="Concrete, current-slice fixes or UX/gameplay/visual/audio refinements needed before approving this slice (empty if remaining ideas belong in future slices).",
+        description=(
+            "Bounded, high-impact current-slice fixes (broken slice mechanics, stalled objectives, glaring visual/UI craft "
+            "defects, silent audio, or Executive Producer priorities) needed before closing this slice—leave [] when the "
+            "slice's scope is covered and remaining items belong in future slices."
+        ),
     )
     recommends_slice_approval: bool = Field(
         ...,
-        description="True if this slice delivers an intuitive, cohesive, playable experience ready for approval (carrying broader expansion wishes forward); False if targeted current-slice iteration is needed first (strictly last).",
+        description=(
+            "True when the active slice's scope works end-to-end and major problem areas have been cleaned up so it is appropriate "
+            "to call this slice done and carry broader improvements into the next slice; False when targeted current-slice fixes "
+            "are still needed first (strictly last)."
+        ),
     )
 
 
@@ -3331,29 +3682,55 @@ class BlindPlaytestCouncilVerdict(BaseEpistemicModel):
     deliberation: str = Field(
         ...,
         description=(
-            "MANDATORY FIRST PROPERTY: Holistic synthesis weighing the Blind Playtester's 6-pillar Experience Report, "
-            "auto-delivered player wishes, fun rating, screenshots, and specialist roundtable perspectives against the active slice scope."
+            "MANDATORY FIRST PROPERTY: Critical yet pragmatic synthesis auditing the Blind Playtester's screenshots, action tape, "
+            "report, wishes, and Executive Producer priorities—deciding whether a bounded current-slice cleanup pass is needed "
+            "or whether the slice's scope is covered and should be called done now."
         ),
     )
     player_experience_synthesis: str = Field(
         ...,
-        description="Concise synthesis of what the Blind Playtester experienced, what worked, and which wishes/pain points require immediate current-slice iteration versus next-slice expansion.",
+        description="Candid synthesis of what actually worked, what was rough or broken, and which issues merit immediate current-slice cleanup versus next-slice carryover.",
     )
     spoken_dialogue: str = Field(
         ...,
-        description="Natural first-person Creative Director synthesis in the Writers' Room announcing the Council's decision and action plan.",
+        description=(
+            "Direct, candid Creative Director synthesis—zero cheerleading or 'I completely agree' filler—announcing either "
+            "a focused current-slice fix pass or calling the slice done while naming what carries into the next slice."
+        ),
     )
     next_slice_carryover_notes: List[str] = Field(
         default_factory=list,
-        description="Non-blocking player wishes, feature desires, and experience takeaways to carry directly into the next slice's reflection & strategy planning.",
+        description="Non-blocking player wishes, feature expansions, and honest rough-edge notes carried into the next slice so we do not try to change everything in one go.",
     )
     backlog_additions: List[WorkItemProposal] = Field(
         default_factory=list,
-        description="Targeted current-slice WorkItemProposal tasks to fix onboarding/control confusion, UX legibility, gameplay friction, missing audio/visual feedback, or progression blockers (empty when verdict='approve_slice').",
+        description=(
+            "Surgical, bounded current-slice WorkItemProposal tasks (typically 1-3 high-impact fixes) for broken slice scope, "
+            "onboarding/UX blockers, glaring visual/UI craft bugs, missing audio, or Executive Producer requests (empty when verdict='approve_slice')."
+        ),
+    )
+    memory_query_answer: str = Field(
+        default="",
+        description="If you issued `memory_query` on the previous turn, summarize what you learned from the retrieved memory entries.",
+    )
+    memory_query: str = Field(
+        default="",
+        description="Optional semantic search query against long-term game/agent memory banks before finalizing the blind playtest verdict (leave '' when current context suffices).",
+    )
+    memory_query_bank: str = Field(
+        default="",
+        description="Optional bank filter for `memory_query` ('', 'all', 'self', 'council', or a canonical role name).",
+    )
+    memory_updates: List[MemoryMutationProposal] = Field(
+        default_factory=list,
+        description="DEFAULT TO [] UNLESS HIGH-SIGNAL. Do NOT repeat active-slice fix requests already in `new_board_tasks`. Populate ONLY to persist deferred future-slice strategic goals, systemic playability lessons, or `fulfill`/`supersede`/`archive` updates on existing memory_ids.",
     )
     verdict: Literal["approve_slice", "iterate_current_slice"] = Field(
         ...,
-        description="Set 'iterate_current_slice' when concrete current-slice UX/gameplay/visual/audio fixes are needed in backlog_additions; set 'approve_slice' when the slice is intuitive, playable, and ready to close (strictly last).",
+        description=(
+            "Set 'iterate_current_slice' when focused current-slice fixes or problem-area cleanups are needed in backlog_additions; "
+            "set 'approve_slice' once the active slice's scope is covered and major rough spots are addressed so the slice is called done appropriately (strictly last)."
+        ),
     )
 
 
@@ -3367,15 +3744,15 @@ class SliceStateReflectionTurn(BaseEpistemicModel):
     deliberation: str = Field(
         ...,
         description=(
-            "MANDATORY FIRST PROPERTY: First-principles reflection as a game maker examining the rendered filmstrip, "
-            "scene tree, and codebase of the current slice through the eyes of the target player (SteamPlayerDNA)."
+            "MANDATORY FIRST PROPERTY: Skeptical first-principles reflection examining the rendered filmstrip, scene tree, "
+            "and codebase through the target player's eyes while honoring Executive Producer direction and scoping realistically for one slice."
         ),
     )
     honest_current_state_critique: str = Field(
         ...,
         description=(
             "Brutally honest assessment of what a human player actually sees and experiences booting res://main.tscn right now "
-            "(calling out any disconnected widget/slider dashboards, center-occluding panels, leaked debug harnesses, static/unreactive world visuals, or un-cohesive systems)."
+            "(calling out any disconnected widget/slider dashboards, center-occluding panels, sprite/UI craft glitches, leaked debug harnesses, static/unreactive world visuals, or un-cohesive systems)."
         ),
     )
     how_to_play_and_intuitiveness_gaps: str = Field(
@@ -3402,17 +3779,36 @@ class SliceStateReflectionTurn(BaseEpistemicModel):
     strategy_for_next_slice: str = Field(
         ...,
         description=(
-            "Concrete strategy from your specialist discipline for how the next slice must evolve the game to make it cohesive, "
-            "intuitive to play, mechanically deep, and driven by rewarding short-term and long-term goals."
+            "Focused, achievable strategy from your specialist discipline for the highest-leverage improvements Slice #N+1 should deliver "
+            "(respecting Executive Producer direction without trying to rebuild everything in one go)."
         ),
     )
     spoken_dialogue: str = Field(
         ...,
-        description="Natural first-person conversational contribution to the Writers' Room Slice Reflection Roundtable.",
+        description=(
+            "Direct, candid contribution to the Slice Reflection Roundtable—NEVER open with 'I completely agree' or peer flattery; "
+            "call out concrete flaws, push back on over-scoped wishlists, and cater respectfully to Executive Producer directives."
+        ),
     )
     addressed_to: List[str] = Field(
         default_factory=list,
         description="Fellow Council specialist role(s) you are addressing or challenging.",
+    )
+    memory_query_answer: str = Field(
+        default="",
+        description="If you issued `memory_query` on the previous turn, summarize what you learned from the retrieved memory entries.",
+    )
+    memory_query: str = Field(
+        default="",
+        description="Optional semantic search query against long-term game/agent memory banks before finalizing your slice reflection (leave '' when current context suffices).",
+    )
+    memory_query_bank: str = Field(
+        default="",
+        description="Optional bank filter for `memory_query` ('', 'all', 'self', 'council', or a canonical role name).",
+    )
+    memory_updates: List[MemoryMutationProposal] = Field(
+        default_factory=list,
+        description="High-signal cross-slice memory curation ONLY (never write slice recap summaries or duplicate Bible fields): mark completed/obsolete `[mem_...]` entries as `'fulfill'`/`'supersede'`/`'archive'`, and record ONLY genuinely deferred multi-slice goals or hard-won systemic lessons.",
     )
     current_slice_quality_score: float = Field(
         ...,
@@ -3431,13 +3827,18 @@ class NextSliceStrategyPlan(BaseEpistemicModel):
     deliberation: str = Field(
         ...,
         description=(
-            "MANDATORY FIRST PROPERTY: Holistic synthesis of the Council's empirical reflection on the current slice "
-            "and the strategic blueprint for making the next slice a cohesive, intuitive, deep, and rewarding game for the target player."
+            "MANDATORY FIRST PROPERTY: Skeptical, realistic synthesis of the Council's empirical reflection on the current slice, "
+            "catering directly and respectfully to any Executive Producer slice directive while scoping the next slice to a coherent, "
+            "achievable increment (fixing key rough spots + delivering the next slice's core loop expansion without trying to rewrite everything at once)."
         ),
     )
     spoken_dialogue: str = Field(
         ...,
-        description="Natural first-person address to the Writers' Room summarizing the reflection findings and laying out the master strategy for the next slice.",
+        description=(
+            "Direct, candid first-person address to the Writers' Room laying out what the previous slice actually fell short on, "
+            "how we are catering to any Executive Producer direction, and the bounded, achievable plan for THIS next slice "
+            "(never open with peer flattery or 'I completely agree with everyone')."
+        ),
     )
     current_slice_honest_diagnosis: str = Field(
         ...,
@@ -3505,6 +3906,22 @@ class NextSliceStrategyPlan(BaseEpistemicModel):
     backlog_additions: List[WorkItemProposal] = Field(
         default_factory=list,
         description="Initial high-level WorkItemProposal tasks on the Production Board to execute the next-slice strategy.",
+    )
+    memory_query_answer: str = Field(
+        default="",
+        description="If you issued `memory_query` on the previous turn, summarize what you learned from the retrieved memory entries.",
+    )
+    memory_query: str = Field(
+        default="",
+        description="Optional semantic search query against long-term game/agent memory banks before finalizing the next-slice strategy (leave '' when current context suffices).",
+    )
+    memory_query_bank: str = Field(
+        default="",
+        description="Optional bank filter for `memory_query` ('', 'all', 'self', 'council', or a canonical role name).",
+    )
+    memory_updates: List[MemoryMutationProposal] = Field(
+        default_factory=list,
+        description="High-signal Council memory curation ONLY (never duplicate `next_slice_spec` or Bible updates): mark delivered/replaced `[mem_...]` entries as `'fulfill'`/`'supersede'`/`'archive'`, and record ONLY deferred multi-slice strategic goals, cross-slice architectural decisions, or studio-wide lessons in `'council'`.",
     )
 
 
@@ -3635,6 +4052,22 @@ class ScriptWritingDeliverable(BaseEpistemicModel):
         ...,
         description="MANDATORY FIRST PROPERTY: Dramatic rationale evaluating how these scenes, dialogue lines, or character voices serve this specific game's tone, pacing, and gameplay.",
     )
+    memory_query_answer: str = Field(
+        default="",
+        description="If you issued `memory_query` on the previous turn, summarize what you learned from the retrieved memory entries before writing scenes or dialogue.",
+    )
+    memory_query: str = Field(
+        default="",
+        description="Optional semantic search query against long-term game/agent memory banks before finalizing narrative deliverables (leave '' when current context suffices).",
+    )
+    memory_query_bank: str = Field(
+        default="",
+        description="Optional bank filter for `memory_query` ('', 'all', 'self', 'council', or a canonical role name).",
+    )
+    memory_updates: List[MemoryMutationProposal] = Field(
+        default_factory=list,
+        description="DEFAULT TO [] — LEAVE EMPTY ON ROUTINE TURNS. Never duplicate `NarrativeBible` sheets, barks, or cutscenes here. Populate ONLY for non-obvious cross-slice narrative continuity invariants (or updating an existing memory_id).",
+    )
     added_or_updated_characters: List[CharacterSheet] = Field(
         default_factory=list,
         description="Characters added or enriched with vocal cadence, motivation, and role.",
@@ -3715,6 +4148,22 @@ class TaskLeadDecision(BaseEpistemicModel):
     self_question: str = Field(
         default="",
         description="Optional self-inquiry: If you need more context from the codebase, Game Bible, or backlog before deciding how to delegate or submit, output a specific question here. ContextCuratorAgent will fetch the needed chunks so you can answer your own question on the next turn.",
+    )
+    memory_query_answer: str = Field(
+        default="",
+        description="If you issued `memory_query` on the previous turn, write your concise synthesis of the retrieved long-term memory entries here.",
+    )
+    memory_query: str = Field(
+        default="",
+        description="Optional direct query against long-term game/agent memory banks: if you want to look up cross-slice strategic goals, prior architectural decisions, or operational lessons learned before delegating or submitting, output a semantic search query here (leaving `brief` empty).",
+    )
+    memory_query_bank: str = Field(
+        default="",
+        description="Optional bank filter when issuing `memory_query` ('', 'all', 'self', 'council', or a canonical specialist role name).",
+    )
+    memory_updates: List[MemoryMutationProposal] = Field(
+        default_factory=list,
+        description="DEFAULT TO [] — LEAVE EMPTY ON ~95% OF TURNS. Never log task progress, delegation status, or facts already in the Game Bible/codebase. Populate ONLY when a costly cross-task failure mode, operational constraint, or deferred multi-slice goal would otherwise be lost (or to update/fulfill an existing memory_id).",
     )
     current_strategy: str = Field(
         ...,

@@ -500,7 +500,11 @@ class TestForbiddenTokensVerification:
 
     def test_forbidden_tokens_in_ui_files(self):
         ui_files = [
-            Path("engine/ui/static/index.html"),
+            Path("studio-web/index.html"),
+            *[
+                p for p in sorted(Path("studio-web/src").rglob("*"))
+                if p.is_file() and p.suffix in {".ts", ".tsx", ".css"}
+            ],
             Path("engine/ui/server.py"),
             Path("engine/ui/models.py"),
         ]

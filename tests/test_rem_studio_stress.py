@@ -35,7 +35,7 @@ from engine.ui.models import (
     StudioStatusResponse,
     SwarmStreamEvent,
 )
-from engine.ui.server import STATIC_DIR, create_app, swarm_bus
+from engine.ui.server import STUDIO_WEB_DIR, create_app, swarm_bus
 import run_studio
 
 
@@ -174,57 +174,42 @@ class TestRationaleFirstUIModels:
 # ============================================================================
 
 class TestStaticAssetInvariance:
-    """Validates the zero-build Mission Control single page application DOM invariants."""
+    """Validates Mission Control studio-web React SPA entrypoint and root API route invariants."""
 
-    MANDATORY_DOM_IDS = [
-        "agent-dag-canvas",
-        "deliberation-stream",
-        "tool-invocations-list",
-        "btn-trigger-genesis",
-        "telemetry-heatmap",
-        "voice-preview-player",
-        "code-diff-container",
-    ]
-
-    def test_all_seven_dom_ids_present_in_index_html(self):
-        """Empirically verifies all 7 required DOM IDs exist in engine/ui/static/index.html."""
-        index_path = STATIC_DIR / "index.html"
-        assert index_path.exists(), f"Static index file missing at {index_path}"
-        content = index_path.read_text(encoding="utf-8")
-
-        for dom_id in self.MANDATORY_DOM_IDS:
-            expected_pattern = f'id="{dom_id}"'
-            assert expected_pattern in content, (
-                f"Mandatory DOM element missing from index.html: '{dom_id}'. "
-                f"Expected attribute '{expected_pattern}'."
-            )
+    def test_studio_web_entrypoints_present(self):
+        """Verifies studio-web index.html and core React entrypoint modules exist."""
+        index_path = STUDIO_WEB_DIR / "index.html"
+        assert index_path.is_file(), f"studio-web index file missing at {index_path}"
+        assert (STUDIO_WEB_DIR / "src" / "App.tsx").is_file()
+        assert (STUDIO_WEB_DIR / "src" / "realtime" / "useSwarmSocket.ts").is_file()
 
     def test_index_html_document_well_formedness(self):
-        """Verifies that index.html contains essential HTML5 elements and correct CSS/JS references."""
-        index_path = STATIC_DIR / "index.html"
+        """Verifies studio-web/index.html contains valid HTML5 markup and React root mount."""
+        index_path = STUDIO_WEB_DIR / "index.html"
         content = index_path.read_text(encoding="utf-8")
 
-        assert content.strip().startswith("<!DOCTYPE html>")
-        assert "<title>Mission Control</title>" in content
-        assert '<svg id="agent-dag-canvas"' in content
-        assert '<canvas id="telemetry-heatmap"' in content
-        assert '<audio id="voice-preview-player"' in content
-        assert "<script>" in content
-        assert "/ws/swarm" in content
+        assert content.strip().lower().startswith("<!doctype html>")
+        assert "Autonomous Game Studio — Mission Control" in content
+        assert '<div id="root"></div>' in content
+        assert 'src="/src/main.tsx"' in content
 
-    def test_http_get_index_serves_html(self, studio_client):
-        """Verifies GET / returns 200 OK with text/html content-type and authentic body."""
+    def test_http_get_index_serves_root_contract(self, studio_client):
+        """Verifies GET / returns 200 OK (built SPA HTML or Rationale-First API root descriptor)."""
         res = studio_client.get("/")
         assert res.status_code == 200
-        assert "text/html" in res.headers["content-type"]
-        assert "Autonomous Game Studio — Mission Control" in res.text
+        ctype = res.headers.get("content-type", "")
+        if "application/json" in ctype:
+            payload = res.json()
+            assert list(payload.keys())[0] == "deliberation"
+            assert payload["status"] == "ok"
+        else:
+            assert "text/html" in ctype
+            assert "Mission Control" in res.text
 
-    def test_static_files_mount_serves_index(self, studio_client):
-        """Verifies GET /static/index.html directly resolves from mounted StaticFiles."""
+    def test_legacy_static_index_is_not_served(self, studio_client):
+        """Verifies legacy /static/index.html is removed and returns 404."""
         res = studio_client.get("/static/index.html")
-        assert res.status_code == 200
-        assert "text/html" in res.headers["content-type"]
-        assert "agent-dag-canvas" in res.text
+        assert res.status_code == 404
 
     def test_index_disallows_invalid_http_methods(self, studio_client):
         """Verifies index endpoint rejects POST or PUT with 405 Method Not Allowed."""

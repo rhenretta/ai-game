@@ -916,6 +916,9 @@ class LeadGameplaySWEAgent:
                 f"- If you run into trouble fixing an issue or are uncertain what is causing an observed behavior at runtime, do NOT guess blindly!\n"
                 f"- Populate `diagnostic_test_scene_request` describing the diagnostic test scene, visual debug overlays, and `get_state_snapshot()` variables you need `qa_test_engineer` to capture (leaving `patches=[]` and `files=[]` if you need to inspect the diagnostic filmstrip and telemetry BEFORE modifying code).\n"
                 f"- `qa_test_engineer` will immediately build and run that diagnostic test scene and return the captured filmstrip and `[STATE_SNAPSHOT]` telemetry to you so you can implement the confirmed fix.\n\n"
+                f"LONG-TERM MEMORY DISCIPLINE (`memory_query`, `memory_updates`):\n"
+                f"- Leave `memory_updates` EMPTY (`[]`) on routine turns! NEVER log what code you just wrote, restate the Game Bible/task spec, or record single-file local details.\n"
+                f"- Populate `memory_updates` ONLY when establishing a non-obvious cross-module invariant or hard-won runtime lesson that future tasks/slices would break without knowing (and prefer updating an existing `[mem_...]` ID over recording duplicates).\n\n"
                 f"EXISTING CARTRIDGE CODE IN STAGING:\n{existing_code_block}\n\n"
                 f"{prior_error_block}"
             )
@@ -944,8 +947,17 @@ class LeadGameplaySWEAgent:
             response_model = OpenGenreCartridgeBundle
 
         from google.genai import types
+        from engine.studio.game_memory import GameMemoryStore, format_memory_query_results
+
+        mem_store = GameMemoryStore(staging_dir, client=self.client)
+        has_embed_client = callable(getattr(getattr(self.client, "models", None), "embed_content", None))
+        if active_curator is None and (staging_dir / "game_memory.json").is_file():
+            role_mem_briefing = mem_store.format_role_memory_briefing("swe_engineer")
+            if role_mem_briefing:
+                prompt = f"{prompt}\n\n{role_mem_briefing}"
+
         max_gemini_retries = 3
-        max_inquiry_turns = 2 if active_curator is not None else 0
+        max_inquiry_turns = 2 if (active_curator is not None or has_embed_client) else 0
         resolved_inquiries: List[SelfInquiryQAPair] = (
             active_curator.load_self_inquiry_memory(track.id, "swe_engineer")
             if active_curator is not None
@@ -953,6 +965,8 @@ class LeadGameplaySWEAgent:
         )
         pending_question_pack = None
         asked_questions: set[str] = {p.question.strip().lower() for p in resolved_inquiries if p.question}
+        memory_query_blocks: List[str] = []
+        asked_memory_queries: set[str] = set()
         bundle = None
         last_exc = None
 
@@ -962,7 +976,8 @@ class LeadGameplaySWEAgent:
                 if active_curator is not None
                 else ""
             )
-            turn_prompt = f"{prompt}\n{inquiry_block}" if inquiry_block else prompt
+            mem_q_section = ("\n" + "\n".join(memory_query_blocks)) if memory_query_blocks else ""
+            turn_prompt = f"{prompt}\n{inquiry_block}{mem_q_section}" if (inquiry_block or mem_q_section) else prompt
             try:
                 from engine.studio.workers import record_turn_epistemic_context, record_turn_substep
                 record_turn_epistemic_context(
@@ -1012,6 +1027,8 @@ class LeadGameplaySWEAgent:
                         "files" in bundle_dict
                         or "patches" in bundle_dict
                         or "self_question" in bundle_dict
+                        or "memory_query" in bundle_dict
+                        or "memory_updates" in bundle_dict
                         or "diagnostic_test_scene_request" in bundle_dict
                     ):
                         cand_bundle = TrackCodeSynthesisPayload(**bundle_dict)
@@ -1044,6 +1061,13 @@ class LeadGameplaySWEAgent:
 
             if bundle is None:
                 break
+
+            if isinstance(bundle, TrackCodeSynthesisPayload) and bundle.memory_updates:
+                mem_store.apply_mutations(
+                    author_role="swe_engineer",
+                    proposals=bundle.memory_updates,
+                    item_id=track.id,
+                )
 
             # 1. If the agent answered a pending self_question on this turn, record Q->A in persistent memory
             if (
@@ -1110,6 +1134,38 @@ class LeadGameplaySWEAgent:
                 for cid in pending_question_pack.selected_chunk_ids:
                     if cid not in already_included_cids:
                         already_included_cids.append(cid)
+                continue
+
+            # 4. Or if `files`/`patches` are empty and the agent issued a direct `memory_query`, query GameMemoryStore
+            mem_q = (bundle.memory_query or "").strip()
+            mem_q_key = f"{(bundle.memory_query_bank or '').strip().lower()}::{mem_q.lower()}"
+            if (
+                mem_q
+                and has_embed_client
+                and inquiry_turn < max_inquiry_turns
+                and mem_q_key not in asked_memory_queries
+            ):
+                asked_memory_queries.add(mem_q_key)
+                logger.info("SWE memory query on '%s' (turn %d): %s", track.id, inquiry_turn + 1, mem_q)
+                try:
+                    from engine.studio.workers import record_turn_substep
+
+                    record_turn_substep(
+                        "memory_query",
+                        f"SWE querying long-term memory: {mem_q}",
+                        details={"query": mem_q, "bank": bundle.memory_query_bank or "all"},
+                    )
+                except Exception:
+                    pass
+                mem_hits = mem_store.query_memories(
+                    caller_role="swe_engineer",
+                    query_text=mem_q,
+                    bank_filter=bundle.memory_query_bank,
+                    client=self.client,
+                )
+                memory_query_blocks.append(
+                    format_memory_query_results(mem_q, bundle.memory_query_bank, mem_hits)
+                )
                 continue
             break
 
@@ -1766,6 +1822,7 @@ class LeadGameplaySWEAgent:
                 GateFailureType.UNHANDLED_EXCEPTION,
                 GateFailureType.ASSET_INTEGRITY_VIOLATION,
                 GateFailureType.TELEMETRY_EMISSION_FAILURE,
+                GateFailureType.FRAME_BUDGET_EXCEEDED,
             )
         ):
             req_spec = None
@@ -1780,6 +1837,19 @@ class LeadGameplaySWEAgent:
                 c_dir=c_dir,
                 rejection_trace=rejection_trace,
                 req_spec=req_spec,
+            )
+
+        if (
+            is_godot_cartridge
+            and self._is_live_genai_client()
+            and failure_type == GateFailureType.FRAME_BUDGET_EXCEEDED
+        ):
+            reason = getattr(rejection_trace, "failure_reason", "Frame budget exceeded 16.6ms (60 FPS).")
+            remedy = getattr(rejection_trace, "recommended_remedy", "Optimize per-frame _process/_physics_process/_draw work.")
+            return self.debug_and_patch_pev_cycle(
+                c_dir=c_dir,
+                defect_summary=f"Gate D Frame Budget Optimization Required:\n- Diagnostic: {reason}\n- Remedy: {remedy}",
+                max_pev_cycles=2,
             )
 
         # ---------------------------------------------------------------------
@@ -2182,11 +2252,17 @@ class LeadGameplaySWEAgent:
     # PEV (Plan / Research -> Execute Surgical Patch -> Verify) Debugging Engine
     # -----------------------------------------------------------------------
 
-    def _build_cartridge_symbol_index(self, c_dir: Path) -> str:
+    def _build_cartridge_symbol_index(
+        self,
+        c_dir: Path,
+        include_tests: bool = False,
+        focus_files: Optional[Set[str]] = None,
+    ) -> str:
         """Builds a compact structural symbol index (classes, functions, signals, constants, enums, member vars,
-        and external script/asset references with exact 1-indexed line numbers) across all .gd files in c_dir
-        (including subdirectories like scenes/ and scripts/).
-        Avoids dumping full files or prose comments so the agent receives only high-signal structural context.
+        and external script/asset references with exact 1-indexed line numbers) across production .gd files in c_dir.
+        Excludes historical `tests/test_<item>.gd` proof harnesses by default (while preserving `tests/test_authored_beats.gd`
+        and any explicitly focused test scripts) and scopes full variable/preload detail to `focus_files` + 1-hop import
+        neighbors so multi-slice cartridges never bloat PEV prompts.
         """
         if not c_dir.is_dir():
             return ""
@@ -2199,41 +2275,93 @@ class LeadGameplaySWEAgent:
         except Exception:
             code_graph = {}
 
+        norm_focus: Set[str] = set()
+        for raw_f in (focus_files or set()):
+            clean_f = str(raw_f or "").strip().replace("\\", "/")
+            if clean_f.startswith("res://"):
+                clean_f = clean_f[len("res://"):]
+            elif clean_f.startswith("res:/"):
+                clean_f = clean_f[len("res:/"):]
+            clean_f = clean_f.lstrip("/")
+            if clean_f:
+                resolved_rel, _ = self._resolve_cartridge_gd_path(c_dir, clean_f)
+                norm_focus.add(resolved_rel or clean_f)
+
+        expanded_focus: Set[str] = set(norm_focus)
+        if norm_focus and isinstance(code_graph, dict):
+            neighbor_budget = 6
+            for f_rel in sorted(norm_focus):
+                meta = code_graph.get(f_rel) or {}
+                for neighbor in list(meta.get("imports") or []) + list(meta.get("imported_by") or []):
+                    if neighbor_budget <= 0:
+                        break
+                    n_clean = str(neighbor or "").replace("res://", "").lstrip("/")
+                    if n_clean and n_clean not in expanded_focus:
+                        expanded_focus.add(n_clean)
+                        neighbor_budget -= 1
+
+        gd_paths = list(iter_cartridge_gd_files(c_dir, include_tests=include_tests, exclude_helper_libs=True))
+        seen_paths: Set[Path] = {p.resolve() for p in gd_paths}
+        if not include_tests:
+            authored_beats = c_dir / "tests" / "test_authored_beats.gd"
+            if authored_beats.is_file() and authored_beats.resolve() not in seen_paths:
+                gd_paths.append(authored_beats)
+                seen_paths.add(authored_beats.resolve())
+            for f_rel in sorted(norm_focus):
+                if f_rel.startswith("tests/") and f_rel.endswith(".gd"):
+                    cand_test = c_dir / f_rel
+                    if cand_test.is_file() and cand_test.resolve() not in seen_paths:
+                        gd_paths.append(cand_test)
+                        seen_paths.add(cand_test.resolve())
+
+        large_cartridge = len(gd_paths) > 16
+        core_entrypoints = {"main.gd", "scenes.gd", "mechanics.gd", "entities.gd", "ui_hud.gd"}
         blocks: List[str] = []
-        gd_paths = iter_cartridge_gd_files(c_dir, include_tests=True, exclude_helper_libs=True)
         for gd_path in gd_paths:
             try:
+                rel_name = gd_path.relative_to(c_dir).as_posix()
+                is_detailed = (
+                    (rel_name in expanded_focus)
+                    if expanded_focus
+                    else (not large_cartridge or rel_name in core_entrypoints or rel_name == "tests/test_authored_beats.gd")
+                )
                 lines = gd_path.read_text(encoding="utf-8").splitlines()
                 entry_lines: List[str] = []
                 var_count = 0
+                var_cap = 16 if is_detailed else 0
+                line_cap = 55 if is_detailed else 12
                 for idx, raw_line in enumerate(lines, start=1):
                     stripped = raw_line.strip()
                     if stripped.startswith(("extends ", "class_name ", "class ", "static func ", "func ", "signal ", "enum ")):
                         entry_lines.append(f"  L{idx:4d}: {raw_line}")
-                    elif stripped.startswith("const ") or raw_line.startswith(("var ", "\tvar ", "    var ")):
-                        if var_count < 40:
+                    elif is_detailed and (stripped.startswith("const ") or raw_line.startswith(("var ", "\tvar ", "    var "))):
+                        if var_count < var_cap:
                             entry_lines.append(f"  L{idx:4d}: {raw_line}")
                             var_count += 1
-                    elif (
+                    elif "AssetLib" in stripped or "asset_library" in stripped:
+                        entry_lines.append(f"  L{idx:4d}: {raw_line}")
+                    elif is_detailed and (
                         "preload(" in stripped
                         or "load(" in stripped
-                        or "AssetLib" in stripped
-                        or "asset_library" in stripped
                         or "GDScript.new()" in stripped
                         or "collision_layer" in stripped
                         or "collision_mask" in stripped
                         or "CanvasModulate" in stripped
                     ):
                         entry_lines.append(f"  L{idx:4d}: {raw_line}")
-                rel_name = gd_path.relative_to(c_dir).as_posix()
                 node_meta = code_graph.get(rel_name, {}) if isinstance(code_graph, dict) else {}
-                imports_list = node_meta.get("imports", [])
-                imported_by_list = node_meta.get("imported_by", [])
+                imports_list = list(node_meta.get("imports", []) or [])
+                imported_by_list = list(node_meta.get("imported_by", []) or [])
                 graph_suffix = ""
                 if imports_list or imported_by_list:
-                    graph_suffix = f" [imports={imports_list} | imported_by={imported_by_list}]"
+                    imp_disp = imports_list[:6] + ([f"...+{len(imports_list) - 6}"] if len(imports_list) > 6 else [])
+                    by_disp = imported_by_list[:6] + ([f"...+{len(imported_by_list) - 6}"] if len(imported_by_list) > 6 else [])
+                    graph_suffix = f" [imports={imp_disp} | imported_by={by_disp}]"
                 header = f"=== {rel_name} ({len(lines)} lines total){graph_suffix} ==="
-                blocks.append(header + "\n" + "\n".join(entry_lines[:140]))
+                if entry_lines:
+                    blocks.append(header + "\n" + "\n".join(entry_lines[:line_cap]))
+                else:
+                    blocks.append(header)
             except Exception:
                 continue
         return "\n\n".join(blocks)
@@ -2463,9 +2591,23 @@ class LeadGameplaySWEAgent:
 
         asset_summary = ""
         try:
-            asset_summary = CartridgeAssetLibrary(cartridge_dir=c_dir).build_prompt_summary_for_swe()
+            asset_summary = CartridgeAssetLibrary(cartridge_dir=c_dir).build_prompt_summary_for_swe(compact=True)
         except Exception:
             pass
+
+        focus_files: Set[str] = set(allowed_files or set())
+        for pre_req in (pre_slice_requests or []):
+            if getattr(pre_req, "filename", ""):
+                focus_files.add(str(pre_req.filename))
+        for d in current_diagnostics:
+            d_f = getattr(d, "file_path", None)
+            if d_f:
+                try:
+                    focus_files.add(Path(d_f).resolve().relative_to(c_dir.resolve()).as_posix())
+                except Exception:
+                    focus_files.add(Path(d_f).name)
+        for m_uri in re.findall(r"(?:res://)?([A-Za-z0-9_./-]+\.gd)", defect_summary or ""):
+            focus_files.add(m_uri.lstrip("/"))
 
         from engine.studio.models import (
             TOKEN_USAGE_TRACKER,
@@ -2474,9 +2616,22 @@ class LeadGameplaySWEAgent:
             wait_if_studio_paused,
         )
 
+        symbol_index = self._build_cartridge_symbol_index(c_dir, focus_files=focus_files or None)
+        need_symbol_refresh = False
+
         for pev_cycle in range(max_pev_cycles):
             wait_if_studio_paused(candidate_dir=c_dir, label=f"LeadGameplaySWEAgent.pev_cycle[{pev_cycle + 1}]")
-            symbol_index = self._build_cartridge_symbol_index(c_dir)
+            if need_symbol_refresh:
+                symbol_index = self._build_cartridge_symbol_index(c_dir, focus_files=focus_files or None)
+                need_symbol_refresh = False
+
+            # Static prefix placed strictly at token 0 so Gemini implicit context caching hits across Phase 1 -> Phase 2 Hop 1 -> Hop 2!
+            shared_static_prefix = (
+                "You are the Lead Gameplay SWE Agent performing surgical Godot 4 (.gd) debugging and patching.\n"
+                "Always provide `deliberation` strictly first in every JSON response (Rule 4).\n\n"
+                f"--- CARTRIDGE SYMBOL & REFERENCE INDEX ---\n{symbol_index}\n\n"
+                + (f"{asset_summary}\n\n" if asset_summary else "")
+            )
 
             # Pre-extract tight +/- 18 line windows around any concrete compiler/runtime diagnostic lines
             auto_slices: List[str] = []
@@ -2557,15 +2712,14 @@ class LeadGameplaySWEAgent:
                 )
             else:
                 research_prompt = (
-                    f"You are the Lead Gameplay SWE Agent in PHASE 1 (PLAN & RESEARCH) of a PEV debugging cycle (Iteration {pev_cycle + 1}/{max_pev_cycles}).\n"
-                    f"Do NOT guess blindly and do NOT request entire large files. Analyze the defect and the Cartridge Symbol Index below, "
-                    f"formulate a root-cause hypothesis, and request ONLY the specific sub-block code slices (40-80 lines each) "
-                    f"you need to inspect to craft a compact surgical fix.\n\n"
+                    f"{shared_static_prefix}"
                     f"--- DEFECT TO RESOLVE ---\n{current_defect}\n\n"
                     f"{diag_section}"
                     f"{auto_slice_section}"
-                    f"--- CARTRIDGE SYMBOL & REFERENCE INDEX ---\n{symbol_index}\n\n"
-                    f"{asset_summary}\n"
+                    f"--- PEV PHASE 1: PLAN & RESEARCH (Iteration {pev_cycle + 1}/{max_pev_cycles}) ---\n"
+                    f"Do NOT guess blindly and do NOT request entire large files. Analyze the defect and the Cartridge Symbol Index above, "
+                    f"formulate a root-cause hypothesis, and request ONLY the specific sub-block code slices (40-80 lines each) "
+                    f"you need to inspect to craft a compact surgical fix.\n"
                     f"Return a `DebugResearchPlan` with `deliberation` strictly first."
                 )
 
@@ -2618,13 +2772,12 @@ class LeadGameplaySWEAgent:
                     else "6. FINAL HOP — YOU MUST EMIT CONCRETE `SurgicalCodePatch` ITEMS IN `patches` NOW: Do NOT leave `patches` empty on Hop 2!"
                 )
                 execute_prompt = (
-                    f"You are the Lead Gameplay SWE Agent in PHASE 2 (EXECUTE SURGICAL PATCH) of a PEV debugging cycle (Iteration {pev_cycle + 1}/{max_pev_cycles}, Hop {hop + 1}).\n"
-                    f"Root-Cause Hypothesis: {plan.root_cause_hypothesis}\n\n"
+                    f"{shared_static_prefix}"
                     f"--- DEFECT TO RESOLVE ---\n{current_defect}\n\n"
                     f"{diag_section}"
                     f"--- INSPECTED CODE SLICES (1-indexed line numbers) ---\n{slices_joined}\n\n"
-                    f"--- CARTRIDGE SYMBOL INDEX (for cross-module call signatures) ---\n{symbol_index}\n\n"
-                    f"{asset_summary}\n"
+                    f"--- PEV PHASE 2: EXECUTE SURGICAL PATCH (Iteration {pev_cycle + 1}/{max_pev_cycles}, Hop {hop + 1}) ---\n"
+                    f"Root-Cause Hypothesis: {plan.root_cause_hypothesis}\n\n"
                     f"--- SURGICAL PATCH RULES ---\n"
                     f"1. Provide `deliberation` strictly first (Rule 4).\n"
                     f"2. Emit focused `SurgicalCodePatch` items replacing ONLY the defective contiguous line ranges `[start_line..end_line]` in the target `.gd` file(s).\n"
@@ -2683,6 +2836,9 @@ class LeadGameplaySWEAgent:
                 )
                 if patched_files:
                     applied_in_cycle = True
+                    need_symbol_refresh = True
+                    for pf_rel in patched_files.keys():
+                        focus_files.add(str(pf_rel))
                     results.update(patched_files)
 
             # -----------------------------------------------------------------
@@ -3695,7 +3851,7 @@ class LeadGameplaySWEAgent:
                         )
                     )
 
-        symbol_index = self._build_cartridge_symbol_index(c_dir)
+        symbol_index = self._build_cartridge_symbol_index(c_dir, focus_files=set(unit.target_files or []))
         invariants_json = json.dumps([inv.model_dump() for inv in unit.invariants], indent=2)
 
         prompt = (

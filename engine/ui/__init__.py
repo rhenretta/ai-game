@@ -10,7 +10,8 @@ from engine.ui.models import (
     SwarmStreamEvent,
 )
 from engine.ui.server import (
-    STATIC_DIR,
+    STUDIO_WEB_DIR,
+    STUDIO_WEB_DIST_DIR,
     SwarmEventBus,
     app,
     compute_telemetry_heatmap,
@@ -24,7 +25,8 @@ __all__ = [
     "swarm_bus",
     "SwarmEventBus",
     "compute_telemetry_heatmap",
-    "STATIC_DIR",
+    "STUDIO_WEB_DIR",
+    "STUDIO_WEB_DIST_DIR",
     "StudioStatusResponse",
     "HeatmapResponse",
     "GenesisTriggerRequest",

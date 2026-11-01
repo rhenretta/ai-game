@@ -45,6 +45,7 @@ from engine.studio.models import (
     StudioAgentConfigurationError,
     StudioAgentError,
     _sanitize_gemini_json_schema,
+    bounded_thinking_config,
     is_transient_gemini_error,
 )
 
@@ -69,6 +70,27 @@ def _playtest_non_thinking_config(model_name: str) -> Any:
         if "flash-lite" in m_low and thinking_lvl is not None and hasattr(thinking_lvl, "MINIMAL"):
             return thinking_cls(thinking_level=thinking_lvl.MINIMAL)
         return thinking_cls(thinking_budget=0)
+    except Exception:
+        return None
+
+
+def _playtest_report_thinking_config(model_name: str, budget: int = 2048) -> Any:
+    """Returns a bounded ThinkingConfig for the once-per-session `PlaytestExperienceReport` synthesis so the
+    model carefully inspects HIGH-resolution screenshots and cross-checks visual craft, progression, and audio.
+    """
+    try:
+        from google.genai import types
+        thinking_cls = getattr(types, "ThinkingConfig", None)
+        if thinking_cls is None:
+            return None
+        m_low = (model_name or "").strip().lower()
+        thinking_lvl = getattr(types, "ThinkingLevel", None)
+        if "flash-lite" in m_low and thinking_lvl is not None:
+            if hasattr(thinking_lvl, "MEDIUM"):
+                return thinking_cls(thinking_level=thinking_lvl.MEDIUM)
+            if hasattr(thinking_lvl, "MINIMAL"):
+                return thinking_cls(thinking_level=thinking_lvl.MINIMAL)
+        return bounded_thinking_config(budget=budget)
     except Exception:
         return None
 
@@ -269,12 +291,14 @@ def build_blind_player_system_prompt(store_card: BlindStoreCard) -> str:
     """Minimalist, byte-0-invariant player persona prompt with zero internal hints or leading emotional cues."""
     desc_line = store_card.game_description if store_card.game_description else "(No store description provided.)"
     return (
-        f"You are a human player sitting down to play '{store_card.game_title}' for the first time.\n"
+        f"You are a discerning human player sitting down to play '{store_card.game_title}' for the first time.\n"
         f"Store Page Description: {desc_line}\n\n"
-        "You have no manual, walkthrough, or knowledge of how the game was built—only what you see on the "
-        "screen (including your white pointer arrow cursor and any in-game cursor or UI) and hear in the game audio. "
-        "Figure out how to play naturally, experiment with the world at a human pace, notice when things change or feel "
-        "off, and form an honest, nuanced impression of the whole player experience.\n\n"
+        "You have no manual, walkthrough, or knowledge of how the game was built—only what you literally see rendered "
+        "on the screen (including your white pointer arrow cursor and any in-game cursor or UI) and hear in the game audio. "
+        "Treat the Store Page Description strictly as promotional box copy: NEVER parrot its adjectives or credit the game "
+        "for aesthetics, polish, or mechanics you cannot directly verify in the pixels and audio. Figure out how to play "
+        "naturally, experiment at a human pace, notice immediately when visuals, UI, or interactions look rough or broken, "
+        "and form an unvarnished, candid impression of the actual player experience.\n\n"
         "CONTROLLER INTERFACE:\n"
         "- Mouse (Normalized 0..1000 Coordinates): Both X and Y use standard normalized 0..1000 image coordinates "
         "where (0, 0) is top-left, (500, 500) is center, and (1000, 1000) is bottom-right. Set `mouse_x` (0..1000) "
@@ -284,28 +308,47 @@ def build_blind_player_system_prompt(store_card: BlindStoreCard) -> str:
         "for clicks, drags, or scrolling. For `drag_left`, if your cursor is not already on the object you want to grab, "
         "set `drag_from_x` and `drag_from_y` (0..1000) to where the drag starts and `mouse_x`/`mouse_y` (0..1000) to where you drag it.\n"
         "- Keyboard: `hold_keys` holds keys across `duration_ms` (350..2000ms); `tap_keys` taps keys briefly.\n"
-        "- Visual detail: Set `inspect_high_res_next=true` only when small text or UI details are hard to read.\n\n"
+        "- Visual detail: Set `inspect_high_res_next=true` early (e.g., on Turn 1 so Turn 2 renders in full detail) and "
+        "whenever inspecting new UI panels, icons, sprite edges, or small text—do NOT praise graphics or UI as 'clean', "
+        "'polished', or 'legible' before checking them at HIGH resolution.\n\n"
+        "VISUAL & UI CRAFT HONESTY (LOOK WITH CRITICAL HUMAN EYES):\n"
+        "- Never grade visuals or UI on a curve. Before describing `graphics_and_visuals` or UI overlays positively, actively "
+        "scan the screen for universal rendering and layout defects:\n"
+        "  1. Sprite & icon slicing glitches: sprites sliced mid-graphic, stray floating edge slivers bleeding in from adjacent "
+        "sprite-sheet/atlas frames, or icons stretched, squished, or clipped inside UI slots/buttons.\n"
+        "  2. UI layout & typography bugs: text spilling outside its panel/box background, labels chopped off mid-word or colliding "
+        "with neighboring elements, overlapping HUD panels, or tiny/low-contrast unreadable text.\n"
+        "  3. Texture seams & style clashes: harsh unblended rectangular texture boxes pasted inside irregular polygons, visible "
+        "grid/tile seams, or crude untextured flat placeholder polygons clashing jarringly with detailed raster art.\n"
+        "- Whenever any of these defects appear on screen, call them out plainly in `impression_updates` and log each distinct "
+        "issue in `bug_reports` (`category='visual_glitch'` or `'input_ui_bug'`).\n\n"
         "PLAYER FIELD NOTES, QUESTIONS & RULEBOOK:\n"
-        "- `field_note_updates`: Jot brief notes on what you are looking at (screen layout, objects, UI indicators) "
-        "when you notice something new or when an element's state visibly changes.\n"
+        "- `turn_log_entry`, `field_note_updates`, `question_updates`, and `rulebook_updates` evaluate ONLY what ALREADY "
+        "changed between the previous turn's screen/audio and the current screen/audio—NEVER what you expect or hope your "
+        "upcoming `motor_action` will do.\n"
+        "- `field_note_updates`: Jot brief notes on what you are looking at (screen layout, exact HUD numbers/counters, objects, "
+        "UI indicators) when you notice something new or when an element's state visibly changes.\n"
         "- `question_updates`: Naturally ask questions as you explore ('What am I looking at?', 'What does X do?', "
-        "'Why is Y like that?') with `status='open'`. Test your questions as you play, and update the same `question_key` "
-        "to `status='answered'` with `answer` ONLY on a subsequent turn once you observe real visual or audio confirmation.\n"
-        "- `rulebook_updates`: Your `motor_action` executes AFTER your turn decision—never assume an action worked on the "
-        "same turn you try it! Wait until the following turn to confirm whether counters, objects, or UI actually changed. "
-        "If clicking or pressing something 2-3 times produces no observable state change, record that it is non-interactive "
-        "or unresponsive and try a different approach rather than repeating the same input.\n"
-        "- `current_plan` & `turn_log_entry`: Track what you are actively doing next and a compact 1-line note on what just happened.\n\n"
+        "'Why is Y like that?') with `status='open'`. Keep a question `status='open'` on the turn you test it, and update "
+        "that `question_key` to `status='answered'` ONLY on a subsequent turn once comparing the previous screen vs current "
+        "screen (or audio) proves the result. If later turns show counters or objects did NOT actually change, reopen the "
+        "question (`status='open'`, `answer=null`) or revise the answer.\n"
+        "- `rulebook_updates`: Your `motor_action` executes AFTER your turn decision—never record a confirmed rule on the "
+        "same turn you try an action! Wait until the following turn and cite `observed_change_from_prior_turn` first. "
+        "If an earlier Rulebook entry turns out to be wrong because numbers/objects stayed unchanged, set `action='retract'` "
+        "to remove it (or overwrite it with 'does nothing / unresponsive'), log a `bug_report` if an on-screen prompt or "
+        "control failed to work after 2-3 tries, and switch to a different interaction rather than repeating the same input.\n"
+        "- `current_plan`: After evaluating what actually happened, state what you will test next across the coming steps.\n\n"
         "MOOD, EVOLVING IMPRESSIONS, BUGS, WISHES & STOPPING:\n"
         "- `current_mood` & `mood_shift`: Keep `current_mood` steady across routine exploration and ordinary clicks—do NOT "
         "flip back and forth on minor steps. Leave `mood_shift` null on almost all turns, populating it ONLY at genuine "
         "emotional turning points (e.g., delight at a real breakthrough, surprise, mounting confusion, boredom, or frustration when stuck).\n"
-        "- `impression_updates`: Leave empty (`[]`) on most turns. Build and revise your impression across "
+        "- `impression_updates`: Leave empty (`[]`) on most turns. Build and revise your candid impression across "
         "`graphics_and_visuals`, `gameplay_and_feel`, `sound_and_audio`, `intuitiveness_and_controls`, `goals_and_pacing`, "
-        "and `world_and_atmosphere`. Early impressions are tentative—if anything changes as you keep playing, revise your "
-        "earlier note rather than letting a stale first impression stand, and never repeat unchanged notes.\n"
-        "- `bug_reports`: Keep an eye out for bugs, glitches, overlapping/raw UI, unresponsive controls, or things that behave "
-        "brokenly along the way, logging each distinct issue once without duplicating earlier bug entries.\n"
+        "and `world_and_atmosphere`. Early impressions are tentative—wait until HIGH-resolution inspection before praising "
+        "visual/UI polish, revise any earlier note immediately if closer inspection or new screens reveal defects, and never repeat unchanged notes.\n"
+        "- `bug_reports`: Log bugs, visual/sprite glitches, overflowing/truncated/overlapping UI, unresponsive controls, or broken "
+        "behaviors as soon as you spot them, recording each distinct issue once without duplicating earlier bug entries.\n"
         "- `submit_wish`: File a concrete player wish whenever you hit UX/design friction or wish something worked better—never duplicate wishes.\n"
         "- `end_playtest`: Populate once you complete the available objectives/content or confirm after testing distinct ideas that you cannot progress any further."
     )
@@ -330,8 +373,9 @@ class BlindPlaytesterAgent:
         )
 
         self.system_prompt: str = build_blind_player_system_prompt(self.store_card)
-        self.turn_schema: Dict[str, Any] = _ensure_schema_fields_required(
-            _sanitize_gemini_json_schema(copy.deepcopy(PlaytestTurnDecision.model_json_schema())),
+        raw_turn_schema = _sanitize_gemini_json_schema(copy.deepcopy(PlaytestTurnDecision.model_json_schema()))
+        _ensure_schema_fields_required(
+            raw_turn_schema,
             [
                 "field_note_updates",
                 "question_updates",
@@ -341,12 +385,25 @@ class BlindPlaytesterAgent:
                 "current_mood",
             ],
         )
+        t_props = raw_turn_schema.get("properties") or {}
+        if isinstance(t_props.get("rulebook_updates"), dict) and isinstance(t_props["rulebook_updates"].get("items"), dict):
+            _ensure_schema_fields_required(
+                t_props["rulebook_updates"]["items"],
+                ["observed_change_from_prior_turn", "action"],
+            )
+        if isinstance(t_props.get("question_updates"), dict) and isinstance(t_props["question_updates"].get("items"), dict):
+            _ensure_schema_fields_required(
+                t_props["question_updates"]["items"],
+                ["observed_change_from_prior_turn", "answer", "status"],
+            )
+        self.turn_schema: Dict[str, Any] = raw_turn_schema
         self.compaction_schema: Dict[str, Any] = _sanitize_gemini_json_schema(
             copy.deepcopy(PlaytestCompactedJournal.model_json_schema())
         )
         self.report_schema: Dict[str, Any] = _ensure_schema_fields_required(
             _sanitize_gemini_json_schema(copy.deepcopy(PlaytestExperienceReport.model_json_schema())),
             [
+                "visual_and_ui_defects_observed",
                 "key_highlights",
                 "key_pain_points",
                 "bugs_and_glitches_observed",
@@ -375,9 +432,14 @@ class BlindPlaytesterAgent:
         self.current_plan: str = "Observe the opening screen and figure out how to start or interact."
         self.current_mood: str = "curious"
         self.inspect_high_res_next: bool = False
+        self._has_seen_high_res_frame: bool = False
+        self._opening_screenshot_path: Optional[Path] = None
+        self._distinct_mid_screenshot: Optional[Tuple[int, float, Path]] = None
         self.prev_observation: Optional[TurnObservation] = None
         self._last_click_spot: Optional[Tuple[float, float, str]] = None
         self._same_spot_click_streak: int = 0
+        self._last_key_signature: Optional[Tuple[Tuple[str, ...], Tuple[str, ...]]] = None
+        self._repeated_key_streak: int = 0
 
     def reset_memory(self) -> None:
         """Clears all player memory, rulebook, notes, questions, bugs, impressions, and turn tape for a clean Reset."""
@@ -396,9 +458,14 @@ class BlindPlaytesterAgent:
         self.current_plan = "Observe the opening screen and figure out how to start or interact."
         self.current_mood = "curious"
         self.inspect_high_res_next = False
+        self._has_seen_high_res_frame = False
+        self._opening_screenshot_path = None
+        self._distinct_mid_screenshot = None
         self.prev_observation = None
         self._last_click_spot = None
         self._same_spot_click_streak = 0
+        self._last_key_signature = None
+        self._repeated_key_streak = 0
 
     def _render_epoch_header_text(self) -> str:
         """Renders `[Block 1A — Permanent Notebook (Rulebook, Notes, Questions, Bugs, Impressions)]`
@@ -534,6 +601,11 @@ class BlindPlaytesterAgent:
             f"Your Current Mood: {self.current_mood}",
             f"What You Were Actively Doing (Current Plan): {self.current_plan}",
         ]
+        if self.rulebook:
+            rb_brief = " | ".join(f"{k}: {v}" for k, v in list(self.rulebook.items())[-10:])
+            status_lines.append(
+                f"Your Confirmed Rulebook So Far (retract with action='retract' if later screens disprove an entry): {rb_brief}"
+            )
         if self.field_notes:
             fn_brief = " | ".join(f"{k}: {v}" for k, v in list(self.field_notes.items())[-10:])
             status_lines.append(f"Your Field Notes So Far: {fn_brief}")
@@ -571,11 +643,51 @@ class BlindPlaytesterAgent:
             status_lines.append(
                 "Visual Delta Note: The screen is visually identical to your previous turn — your last input caused no visible screen change."
             )
-        if self._same_spot_click_streak >= 3 and self._last_click_spot is not None:
+        auto_high_res_for_streak = (
+            self._same_spot_click_streak >= 3 or self._repeated_key_streak >= 3
+        )
+        auto_high_res_for_visual_verify = (
+            not self._has_seen_high_res_frame and "graphics_and_visuals" in self.impressions
+        )
+        if auto_high_res_for_visual_verify and not screen_unchanged:
             status_lines.append(
-                f"Action Continuity Note: You have clicked nearly the same spot ({self._last_click_spot[0]:.0f}, {self._last_click_spot[1]:.0f}) "
-                f"{self._same_spot_click_streak} turns in a row. Check carefully whether counters, objects, or UI actually changed—"
-                "if nothing progressed, that spot may be decorative/unresponsive or require a different step."
+                "Visual Acuity Note: You recorded an early `graphics_and_visuals` impression before seeing a HIGH-resolution "
+                "frame. This turn's screen is now attached at HIGH resolution—closely inspect sprite edges for cut-offs or "
+                "bleeding neighbor slivers, UI icon proportions, text spilling outside or clipping panel boxes, and harsh "
+                "texture/polygon seams; if any defects are visible, immediately revise `graphics_and_visuals` and log `bug_reports`."
+            )
+        if self._same_spot_click_streak >= 3 and self._last_click_spot is not None:
+            spot_x, spot_y, spot_act = self._last_click_spot
+            if spot_act in ("left_click", "right_click", "double_click"):
+                lead_clause = (
+                    f"Action Continuity Note: You have clicked nearly the same spot ({spot_x:.0f}, {spot_y:.0f}) "
+                    f"{self._same_spot_click_streak} turns in a row."
+                )
+            else:
+                lead_clause = (
+                    f"Action Continuity Note: You have repeated '{spot_act}' on nearly the same spot ({spot_x:.0f}, {spot_y:.0f}) "
+                    f"{self._same_spot_click_streak} turns in a row."
+                )
+            escalation_clause = (
+                f" STOP REPEATING '{spot_act}' AT ({spot_x:.0f}, {spot_y:.0f}): {self._same_spot_click_streak} consecutive attempts "
+                "is conclusive—immediately try a different control, key, UI element, or location (or populate end_playtest "
+                "with 'stuck_cannot_progress' if every distinct interaction is unresponsive)."
+                if self._same_spot_click_streak >= 5
+                else ""
+            )
+            status_lines.append(
+                f"{lead_clause} Check carefully whether exact HUD numbers, counters, objects, or UI actually changed "
+                "between Previous turn screen and Current screen—if nothing progressed, do NOT assume slow or hidden "
+                "progress: retract/reopen any mistaken Rulebook or Answered Question entries, log a bug_report if an "
+                f"on-screen prompt failed to respond, and try a different step.{escalation_clause}"
+            )
+        elif self._repeated_key_streak >= 4 and self._last_key_signature is not None:
+            hk, tk = self._last_key_signature
+            key_desc = ", ".join(list(hk) + list(tk))
+            status_lines.append(
+                f"Action Continuity Note: You have repeated the exact same key input ({key_desc}) "
+                f"{self._repeated_key_streak} turns in a row. Check carefully whether counters, position, or UI actually "
+                "changed—if nothing progressed, retract any mistaken assumptions and try a different control or interaction."
             )
         if audio_became_silent:
             status_lines.append("Perceptual Change Note: Game audio stopped and is now silent.")
@@ -605,12 +717,17 @@ class BlindPlaytesterAgent:
                         media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW,
                     )
                 )
+            use_high_res = bool(
+                self.inspect_high_res_next or auto_high_res_for_streak or auto_high_res_for_visual_verify
+            )
             cur_res = (
                 types.MediaResolution.MEDIA_RESOLUTION_HIGH
-                if self.inspect_high_res_next
+                if use_high_res
                 else types.MediaResolution.MEDIA_RESOLUTION_MEDIUM
             )
-            cur_res_label = "HIGH" if self.inspect_high_res_next else "MEDIUM"
+            cur_res_label = "HIGH" if use_high_res else "MEDIUM"
+            if use_high_res:
+                self._has_seen_high_res_frame = True
             tail_parts.append(
                 types.Part.from_text(
                     text=f"Current screen ({cur_res_label} resolution — white pointer arrow cursor is at ({norm_cx:.0f}, {norm_cy:.0f}) in 0..1000 coords):"
@@ -740,27 +857,59 @@ class BlindPlaytesterAgent:
                     "note": final_note,
                 })
 
-        # Track consecutive clicks on the same screen spot so ephemeral tail can nudge against zombie click loops
+        # Track consecutive repeated mouse-spot or key actions so ephemeral tail can break zombie loops
         act = decision.motor_action
-        if act.mouse_button_action in ("left_click", "right_click", "double_click"):
+        if act.mouse_button_action in (
+            "left_click",
+            "right_click",
+            "double_click",
+            "hold_left",
+            "drag_left",
+            "wheel_up",
+            "wheel_down",
+        ):
             click_x = act.mouse_x if act.mouse_x is not None else normalize_screen_x(obs.cursor_x)
             click_y = act.mouse_y if act.mouse_y is not None else normalize_screen_y(obs.cursor_y)
             if (
                 self._last_click_spot is not None
                 and act.mouse_button_action == self._last_click_spot[2]
-                and ((click_x - self._last_click_spot[0]) ** 2 + (click_y - self._last_click_spot[1]) ** 2) ** 0.5 <= 22.0
+                and ((click_x - self._last_click_spot[0]) ** 2 + (click_y - self._last_click_spot[1]) ** 2) ** 0.5 <= 30.0
             ):
                 self._same_spot_click_streak += 1
             else:
                 self._last_click_spot = (click_x, click_y, act.mouse_button_action)
                 self._same_spot_click_streak = 1
+            self._last_key_signature = None
+            self._repeated_key_streak = 0
         else:
             self._last_click_spot = None
             self._same_spot_click_streak = 0
+            key_sig = (
+                tuple(sorted(k.strip().upper() for k in act.hold_keys if k.strip())),
+                tuple(sorted(k.strip().upper() for k in act.tap_keys if k.strip())),
+            )
+            if key_sig[0] or key_sig[1]:
+                if self._last_key_signature == key_sig:
+                    self._repeated_key_streak += 1
+                else:
+                    self._last_key_signature = key_sig
+                    self._repeated_key_streak = 1
+            else:
+                self._last_key_signature = None
+                self._repeated_key_streak = 0
 
-        # 3. Format compact single-line append-only turn tape entry
+        # 3. Format compact single-line append-only turn tape entry & track distinct frames for report audit
         tape_line = self._format_append_tape_line(turn_index, obs, decision)
         self.epoch_turn_lines.append((turn_index, tape_line))
+        if obs.screenshot_path is not None and obs.screenshot_path.is_file():
+            if self._opening_screenshot_path is None:
+                self._opening_screenshot_path = obs.screenshot_path
+            else:
+                mse_vs_open = compute_frame_mse(self._opening_screenshot_path, obs.screenshot_path)
+                if mse_vs_open >= 0.005 and (
+                    self._distinct_mid_screenshot is None or mse_vs_open >= self._distinct_mid_screenshot[1]
+                ):
+                    self._distinct_mid_screenshot = (turn_index, mse_vs_open, obs.screenshot_path)
         self.prev_observation = obs
 
         combined_stats = {**tok_stats, **perception_meta}
@@ -882,9 +1031,11 @@ class BlindPlaytesterAgent:
         final_screenshot_path: Optional[Path] = None,
         final_audio_path: Optional[Path] = None,
         wishes_filed: Optional[List[Dict[str, Any]]] = None,
+        representative_screenshots: Optional[List[Tuple[str, Path]]] = None,
     ) -> Tuple[PlaytestExperienceReport, Dict[str, int]]:
         """Synthesizes a complete, honest first-person `PlaytestExperienceReport` at the end of a stopped or
-        completed session, reusing the active prefix-cached `[EpochHeader, ...AppendOnlyTurnLines]` prefix.
+        completed session, reusing the active prefix-cached `[EpochHeader, ...AppendOnlyTurnLines]` prefix
+        and inspecting HIGH-resolution representative screenshots with `config.report_model_name`.
         """
         from google.genai import types
 
@@ -981,26 +1132,61 @@ class BlindPlaytesterAgent:
             f"Your Sparse Running Pillar Impressions:\n{impressions_summary}\n\n"
             f"Wishes You Filed During Play:\n{wishes_block}\n\n"
             "Now write your complete, candid, first-person `PlaytestExperienceReport` covering your overall session "
-            "experience, graphics & visual clarity, gameplay & feel, sound & audio feedback, intuitiveness & onboarding, "
-            "goals/pacing & actual progression accomplished, world & atmosphere, concrete highlights, concrete pain points, "
-            "bugs & glitches observed, any unanswered questions/mysteries, and your honest 1-10 `overall_fun_rating`.\n"
-            "BE CANDID, NOT PROMOTIONAL: Cross-check the attached final screen against your earlier notes—report what "
-            "visibly and audibly progressed rather than what you hoped an action did. Explicitly call out if objectives "
-            "stayed stuck at 0, if repeated actions had no effect, if UI widgets overlapped or looked unfinished, if audio "
-            "was silent or cut out, or if mechanics played themselves without meaningful player decisions, and score "
-            "`overall_fun_rating` strictly by the rubric (never 7-10 when core progression stalled, audio was silent, or agency was missing)."
+            "experience, concrete `visual_and_ui_defects_observed`, graphics & visual clarity, gameplay & feel, sound & "
+            "audio feedback, intuitiveness & onboarding, goals/pacing & actual progression accomplished, world & atmosphere, "
+            "concrete highlights, concrete pain points, bugs & glitches observed, any unanswered questions/mysteries, and "
+            "your honest 1-10 `overall_fun_rating`.\n"
+            "BE CANDID, NOT PROMOTIONAL:\n"
+            "- VISUAL & UI PIXEL AUDIT FIRST: Closely inspect the attached HIGH-resolution session screenshot(s) BEFORE "
+            "writing `graphics_and_visuals`, and override any overly generous early `Sparse Running Pillar Impressions` or "
+            "Store Page Description marketing language if high-resolution pixels show defects. Enumerate every visible "
+            "visual/UI flaw in `visual_and_ui_defects_observed`, checking specifically for: (1) cut-off sprites or stray "
+            "floating edge slivers bleeding in from adjacent sprite-sheet/atlas frames, (2) stretched, squished, or clipped "
+            "icons inside UI slots/buttons, (3) text spilling outside panel/box borders, colliding with siblings, or "
+            "chopped off mid-word, (4) overlapping HUD panels or unreadable low-contrast labels, and (5) harsh unblended "
+            "rectangular texture boxes pasted inside irregular polygons or crude untextured flat placeholder polygons "
+            "clashing with detailed raster art. Never call graphics or UI 'clean', 'polished', or 'highly legible' when "
+            "such defects appear on screen!\n"
+            "- PROGRESSION, AUDIO & AGENCY AUDIT: Report only what visibly and audibly progressed rather than what you "
+            "hoped an action did. Explicitly call out if objectives stayed stuck at 0, if repeated actions had no effect, "
+            "if audio was silent or cut out, or if mechanics played themselves without meaningful player decisions, and "
+            "score `overall_fun_rating` strictly by the rubric (never 7-10 when core progression stalled, audio was silent, "
+            "agency was missing, or visual/UI rendering had glaring defects)."
         )
 
         tail_parts: List[Any] = [types.Part.from_text(text=report_prompt)]
-        if final_screenshot_path is not None and final_screenshot_path.is_file():
-            img_bytes = final_screenshot_path.read_bytes()
+        candidate_shots: List[Tuple[str, Path]] = []
+        if representative_screenshots:
+            candidate_shots.extend(representative_screenshots)
+        else:
+            if self._opening_screenshot_path is not None:
+                candidate_shots.append(("Opening screen of your session", self._opening_screenshot_path))
+            if self._distinct_mid_screenshot is not None:
+                mid_t, _, mid_p = self._distinct_mid_screenshot
+                candidate_shots.append((f"Mid-session screen (Turn #{mid_t})", mid_p))
+            if final_screenshot_path is not None:
+                candidate_shots.append(("Final screen at the end of your session", final_screenshot_path))
+
+        seen_shot_paths: set[str] = set()
+        dedup_shots: List[Tuple[str, Path]] = []
+        for label, shot_path in candidate_shots:
+            if shot_path is None or not shot_path.is_file():
+                continue
+            resolved_key = str(shot_path.resolve())
+            if resolved_key in seen_shot_paths:
+                continue
+            seen_shot_paths.add(resolved_key)
+            dedup_shots.append((label, shot_path))
+
+        for label, shot_path in dedup_shots[:3]:
+            img_bytes = shot_path.read_bytes()
             if img_bytes:
-                tail_parts.append(types.Part.from_text(text="Final screen at the end of your session:"))
+                tail_parts.append(types.Part.from_text(text=f"{label} (HIGH resolution for visual/UI craft audit):"))
                 tail_parts.append(
                     types.Part.from_bytes(
                         data=img_bytes,
                         mime_type="image/png",
-                        media_resolution=types.MediaResolution.MEDIA_RESOLUTION_MEDIUM,
+                        media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
                     )
                 )
         if self.config.enable_audio_perception and final_audio_path is not None and final_audio_path.is_file():
@@ -1010,15 +1196,16 @@ class BlindPlaytesterAgent:
 
         contents.append(types.Content(role="user", parts=tail_parts))
 
+        report_model = (self.config.report_model_name or self.config.model_name).strip()
         gen_cfg = types.GenerateContentConfig(
             system_instruction=self.system_prompt,
             response_mime_type="application/json",
             response_schema=self.report_schema,
             temperature=0.35,
-            thinking_config=_playtest_non_thinking_config(self.config.model_name),
+            thinking_config=_playtest_report_thinking_config(report_model),
         )
         resp = self._call_gemini_resilient(
-            model=self.config.model_name,
+            model=report_model,
             contents=contents,
             config=gen_cfg,
             label="BlindPlaytester.experience_report",
@@ -1068,14 +1255,25 @@ class BlindPlaytesterAgent:
                 continue
             existing = self.questions.get(q_key)
             asked_turn = existing.get("asked_turn", turn_index) if existing else turn_index
-            status = "answered" if (upd.status == "answered" or bool(ans_txt)) else "open"
+            if upd.status == "open" and not ans_txt:
+                status = "open"
+                resolved_answer = None
+                resolved_answered_turn = None
+            elif upd.status == "answered" or bool(ans_txt):
+                status = "answered"
+                resolved_answer = ans_txt if ans_txt else (existing.get("answer") if existing else None)
+                resolved_answered_turn = turn_index
+            else:
+                status = "open"
+                resolved_answer = None
+                resolved_answered_turn = None
             self.questions[q_key] = {
                 "question_key": q_key,
                 "question": q_txt,
                 "status": status,
-                "answer": ans_txt if ans_txt else (existing.get("answer") if existing else None),
+                "answer": resolved_answer,
                 "asked_turn": asked_turn,
-                "answered_turn": turn_index if status == "answered" else (existing.get("answered_turn") if existing else None),
+                "answered_turn": resolved_answered_turn,
             }
 
     def _apply_bug_reports(self, turn_index: int, obs: TurnObservation, reports: List[PlaytestBugReport]) -> None:
@@ -1107,10 +1305,21 @@ class BlindPlaytesterAgent:
 
     def _apply_rulebook_updates(self, updates: List[PlaytestRulebookUpdate]) -> None:
         for upd in updates:
-            key = upd.key_or_topic.strip()
-            val = upd.behavior.strip()
-            if key and val:
-                self.rulebook[key] = val
+            key = " ".join(upd.key_or_topic.split())
+            val = " ".join(upd.behavior.split())
+            if not key:
+                continue
+            matched_existing_key = next(
+                (ek for ek in self.rulebook.keys() if ek.lower() == key.lower()),
+                None,
+            )
+            if getattr(upd, "action", "confirm") == "retract":
+                if matched_existing_key is not None:
+                    del self.rulebook[matched_existing_key]
+                continue
+            if val:
+                target_key = matched_existing_key if matched_existing_key is not None else key
+                self.rulebook[target_key] = val
 
     def _apply_impression_updates(self, updates: List[PlaytestImpressionUpdate]) -> None:
         for upd in updates:
@@ -1166,7 +1375,11 @@ class BlindPlaytesterAgent:
             extras.append(f"QUESTION+[{'; '.join(q_parts)}]")
         if decision.rulebook_updates:
             rb_str = "; ".join(
-                f"{' '.join(u.key_or_topic.split())}={' '.join(u.behavior.split())}"
+                (
+                    f"RETRACTED({' '.join(u.key_or_topic.split())})"
+                    if getattr(u, "action", "confirm") == "retract"
+                    else f"{' '.join(u.key_or_topic.split())}={' '.join(u.behavior.split())}"
+                )
                 for u in decision.rulebook_updates
             )
             extras.append(f"RULEBOOK+[{rb_str}]")

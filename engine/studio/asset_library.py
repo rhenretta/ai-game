@@ -1522,7 +1522,7 @@ static func create_tiled_surface(
                 )
                 existing_file_paths.add(rel)
 
-    def build_prompt_summary_for_swe(self) -> str:
+    def build_prompt_summary_for_swe(self, compact: bool = False) -> str:
         """Formats a concise, high-signal summary of all available assets in the Cartridge Asset Library
         (assets/asset_library.json) for LeadGameplaySWEAgent prompts.
         """
@@ -1545,7 +1545,25 @@ static func create_tiled_surface(
             "",
             "AVAILABLE ASSETS IN CATALOG:",
         ]
+        referenced_part_paths: Set[str] = set()
+        for entry in self.catalog.entries.values():
+            for p in (entry.articulated_parts or []):
+                rp = str(p.get("res_path", "") or "").strip()
+                if rp:
+                    referenced_part_paths.add(rp)
+
+        purpose_limit = 56 if compact else 240
         for aid, entry in sorted(self.catalog.entries.items()):
+            if compact and entry.res_path in referenced_part_paths and entry.fabrication_mode == "static_sprite":
+                continue
+            short_purpose = (entry.purpose or "").replace("\n", " ").strip()
+            if len(short_purpose) > purpose_limit:
+                short_purpose = short_purpose[:purpose_limit] + "..."
+            if compact:
+                lines.append(
+                    f"- [{aid}] ({entry.fabrication_mode}, {entry.hframes}x{entry.vframes}, size={entry.target_display_size}) -> '{entry.res_path}'"
+                )
+                continue
             if entry.fabrication_mode == "sprite_sheet":
                 states_str = ", ".join(
                     f"{sname}(row={sinfo.get('row', 0)}, {sinfo.get('frame_count', 4)}f@{sinfo.get('fps', 8)}fps)"
@@ -1554,27 +1572,31 @@ static func create_tiled_surface(
                 lines.append(
                     f"- [{aid}] (mode=sprite_sheet) sheet='{entry.res_path}', single='res://assets/sprites/{aid}.png', "
                     f"display_size={entry.target_display_size}, tex_size={entry.texture_pixel_size}, "
-                    f"hframes={entry.hframes}, vframes={entry.vframes}, states=[{states_str}] | {entry.purpose}"
+                    f"hframes={entry.hframes}, vframes={entry.vframes}, states=[{states_str}] | {short_purpose}"
                 )
             elif entry.fabrication_mode == "articulated_parts":
-                parts_str = ", ".join(
-                    f"{p.get('part_id', '')}(path={p.get('res_path', '')}, offset={p.get('attach_offset_px', [0, 0])})"
-                    for p in entry.articulated_parts
-                )
+                if compact:
+                    part_ids = [str(p.get("part_id", "")) for p in entry.articulated_parts if p.get("part_id")]
+                    parts_str = f"part_ids={part_ids}"
+                else:
+                    parts_str = ", ".join(
+                        f"{p.get('part_id', '')}(path={p.get('res_path', '')}, offset={p.get('attach_offset_px', [0, 0])})"
+                        for p in entry.articulated_parts
+                    )
                 lines.append(
                     f"- [{aid}] (mode=articulated_parts, SINGLE-FRAME COMPOSITE: hframes={entry.hframes}, vframes={entry.vframes} — NEVER set hframes>1 or vframes>1 on this composite!) "
-                    f"composite='{entry.res_path}', parts=[{parts_str}], "
-                    f"display_size={entry.target_display_size}, tex_size={entry.texture_pixel_size} | {entry.purpose}"
+                    f"composite='{entry.res_path}', {parts_str}, "
+                    f"display_size={entry.target_display_size}, tex_size={entry.texture_pixel_size} | {short_purpose}"
                 )
             elif entry.fabrication_mode == "portrait":
                 lines.append(
-                    f"- [{aid}] (mode=portrait, UI ONLY) res_path='{entry.res_path}', display_size={entry.target_display_size}, tex_size={entry.texture_pixel_size}, hframes=1, vframes=1 | {entry.purpose}"
+                    f"- [{aid}] (mode=portrait, UI ONLY) res_path='{entry.res_path}', display_size={entry.target_display_size}, tex_size={entry.texture_pixel_size}, hframes=1, vframes=1 | {short_purpose}"
                 )
             else:
                 lines.append(
                     f"- [{aid}] (mode={entry.fabrication_mode}) res_path='{entry.res_path}', "
                     f"display_size={entry.target_display_size}, tex_size={entry.texture_pixel_size}, "
-                    f"hframes={entry.hframes}, vframes={entry.vframes} | {entry.purpose}"
+                    f"hframes={entry.hframes}, vframes={entry.vframes} | {short_purpose}"
                 )
         return "\n".join(lines)
 

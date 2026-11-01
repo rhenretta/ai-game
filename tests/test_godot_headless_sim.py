@@ -183,3 +183,104 @@ func _ready() -> void:
         assert elapsed < 10.0
         assert sim.outcome == "CRASHED"
 
+    def test_harness_and_playtest_runner_never_warp_os_mouse_and_preserve_subviewport_clicks(
+        self, tmp_path: Path
+    ):
+        """Verifies background Godot harnesses never invoke OS warp_mouse / cursor capture while
+        preserving full 1:1 SubViewport GUI Button, Area2D picking, and get_global_mouse_position() parity.
+        """
+        repo_root = Path(__file__).resolve().parent.parent
+        for rel_gd in ("engine/sim/godot_harness.gd", "engine/playtest/godot_playtest_runner.gd"):
+            gd_src = (repo_root / rel_gd).read_text(encoding="utf-8")
+            code_lines = [
+                ln.split("#", 1)[0]
+                for ln in gd_src.splitlines()
+                if not ln.lstrip().startswith("#")
+            ]
+            joined = "\n".join(code_lines)
+            assert "warp_mouse(" not in joined, f"{rel_gd} must never call warp_mouse() (moves OS cursor)"
+
+        cart_dir = tmp_path / "mouse_isolation_cartridge"
+        payload = TrackCodeSynthesisPayload(
+            deliberation="Hermetic Godot 4 cartridge verifying SubViewport mouse parity without OS cursor warp.",
+            manifest_data={"title": "Mouse Isolation Cartridge", "genre": "Simulation", "version": "1.0.0"},
+            files=[
+                ModuleFileSpec(
+                    deliberation="Scene testing GUI Button click, Area2D pickable click, and get_global_mouse_position.",
+                    filename="main.gd",
+                    content="""extends Node2D
+
+var button_clicks: int = 0
+var area_clicks: int = 0
+var area_hovered: bool = false
+var last_mouse_pos: Array = [0.0, 0.0]
+
+func _ready() -> void:
+\t# Attempt OS cursor capture (harness must neutralize to MOUSE_MODE_VISIBLE in non-headless runs)
+\tInput.mouse_mode = Input.MOUSE_MODE_CAPTURED
+\tvar hud := CanvasLayer.new()
+\tadd_child(hud)
+\tvar btn := Button.new()
+\tbtn.name = "CraftBtn"
+\tbtn.text = "Craft"
+\tbtn.position = Vector2(180.0, 120.0)
+\tbtn.size = Vector2(140.0, 60.0)
+\tbtn.pressed.connect(func(): button_clicks += 1)
+\thud.add_child(btn)
+\tvar pick_area := Area2D.new()
+\tpick_area.name = "PickTarget"
+\tpick_area.position = Vector2(760.0, 440.0)
+\tpick_area.input_pickable = true
+\tvar cs := CollisionShape2D.new()
+\tvar circle := CircleShape2D.new()
+\tcircle.radius = 48.0
+\tcs.shape = circle
+\tpick_area.add_child(cs)
+\tpick_area.mouse_entered.connect(func(): area_hovered = true)
+\tpick_area.input_event.connect(func(_vp, ev, _idx):
+\t\tif ev is InputEventMouseButton and ev.pressed and ev.button_index == MOUSE_BUTTON_LEFT:
+\t\t\tarea_clicks += 1
+\t)
+\tadd_child(pick_area)
+
+func _process(_delta: float) -> void:
+\tvar gm := get_global_mouse_position()
+\tlast_mouse_pos = [gm.x, gm.y]
+
+func get_state_snapshot() -> Dictionary:
+\treturn {
+\t\t"button_clicks": button_clicks,
+\t\t"area_clicks": area_clicks,
+\t\t"area_hovered": area_hovered,
+\t\t"last_mouse_pos": last_mouse_pos,
+\t\t"mouse_mode": int(Input.mouse_mode),
+\t\t"is_completed": false
+\t}
+""",
+                ),
+            ],
+        )
+        payload.assemble_cartridge_directory(cart_dir)
+
+        sim = GodotHeadlessSimulator(
+            cartridge_path=cart_dir,
+            telemetry_mode="null",
+            max_ticks=20,
+            capture_viewport=True,
+            input_script=[
+                {"from": 3, "to": 6, "actions": [], "mouse_click_pos": [240.0, 150.0]},
+                {"from": 10, "to": 14, "actions": [], "mouse_world_pos": [760.0, 440.0]},
+            ],
+        )
+        state = sim.run_until_complete(max_steps=20, capture_viewport=True)
+        sim.close()
+
+        assert state.outcome == "COMPLETED", f"Simulation failed: {sim.stderr}"
+        snap = sim.final_snapshot
+        assert snap.get("button_clicks") == 1, f"Expected GUI Button click in SubViewport, got {snap}"
+        assert snap.get("area_hovered") is True, f"Expected Area2D hover in SubViewport, got {snap}"
+        assert snap.get("area_clicks") == 1, f"Expected Area2D pickable click in SubViewport, got {snap}"
+        last_mp = snap.get("last_mouse_pos", [0.0, 0.0])
+        assert abs(float(last_mp[0]) - 760.0) < 1.0 and abs(float(last_mp[1]) - 440.0) < 1.0
+
+

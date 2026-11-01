@@ -326,5 +326,31 @@ CREATE INDEX IF NOT EXISTS idx_playtest_compactions_session ON playtest_compacti
 CREATE INDEX IF NOT EXISTS idx_playtest_wishes_session ON playtest_wishes(session_id);
 CREATE INDEX IF NOT EXISTS idx_playtest_wishes_candidate ON playtest_wishes(candidate_id, status);
 
+CREATE TABLE IF NOT EXISTS studio_game_memories (
+    cartridge_id TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    deliberation TEXT NOT NULL,
+    game_title TEXT DEFAULT '',
+    memory_bank TEXT NOT NULL DEFAULT 'council',
+    author_role TEXT NOT NULL DEFAULT 'council',
+    kind TEXT NOT NULL DEFAULT 'lesson_learned',
+    status TEXT NOT NULL DEFAULT 'active',
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    applicable_roles_json TEXT NOT NULL DEFAULT '[]',
+    slice_id TEXT DEFAULT '',
+    item_id TEXT DEFAULT '',
+    resolution_note TEXT DEFAULT '',
+    superseded_by_id TEXT DEFAULT '',
+    created_at_utc TEXT NOT NULL,
+    updated_at_utc TEXT NOT NULL,
+    PRIMARY KEY (cartridge_id, memory_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_studio_game_memories_cartridge_bank
+    ON studio_game_memories(cartridge_id, memory_bank, status);
+CREATE INDEX IF NOT EXISTS idx_studio_game_memories_updated
+    ON studio_game_memories(cartridge_id, updated_at_utc DESC);
+
 
 

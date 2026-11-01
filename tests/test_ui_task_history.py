@@ -565,68 +565,34 @@ class TestArtifactMetadataEnvelopeIntegrity:
 # Test Class 5: TestFrontendStaticAssetIntegrity
 # =============================================================================
 class TestFrontendStaticAssetIntegrity:
-    """Verifies engine/ui/static/index.html structure, mandatory DOM elements, and JS syntax."""
+    """Verifies studio-web React Mission Control structure, chronology drawer, and localStorage contracts."""
 
     @pytest.fixture
-    def index_content(self) -> str:
-        index_path = (
-            Path(__file__).resolve().parent.parent
-            / "engine"
-            / "ui"
-            / "static"
-            / "index.html"
-        )
-        assert index_path.exists(), f"index.html missing at {index_path}"
-        return index_path.read_text(encoding="utf-8")
+    def studio_web_root(self) -> Path:
+        root = Path(__file__).resolve().parent.parent / "studio-web"
+        assert root.is_dir(), f"studio-web directory missing at {root}"
+        return root
 
-    def test_html5_structure_and_title(self, index_content: str):
-        assert index_content.strip().startswith("<!DOCTYPE html>")
-        assert "<title>Mission Control</title>" in index_content
+    def test_html5_structure_and_title(self, studio_web_root: Path):
+        index_content = (studio_web_root / "index.html").read_text(encoding="utf-8")
+        assert index_content.strip().lower().startswith("<!doctype html>")
+        assert "<title>Autonomous Game Studio — Mission Control</title>" in index_content
 
-    def test_r5_mandatory_dom_elements(self, index_content: str):
-        mandatory_r5_ids = [
-            "task-history-drawer",
-            "agent-inspector",
-            "requirements-backlog-container",
-            "task-cards-list",
-            "task-agent-filter",
-            "task-status-filter",
-            "task-search-input",
-            "handoff-viewer",
+    def test_board_and_chronology_components_exist(self, studio_web_root: Path):
+        required_components = [
+            "src/features/board/ProductionBoardView.tsx",
+            "src/features/board/TaskChronologyDrawer.tsx",
+            "src/features/board/TurnDetailCard.tsx",
+            "src/features/board/WorkItemCard.tsx",
         ]
-        for dom_id in mandatory_r5_ids:
-            assert (
-                f'id="{dom_id}"' in index_content
-            ), f"Mandatory R5 DOM ID '{dom_id}' missing in index.html"
+        for rel in required_components:
+            assert (studio_web_root / rel).is_file(), f"Missing React board component: {rel}"
 
-    def test_zero_build_and_zero_npm_invariance(self, index_content: str):
-        assert "node_modules" not in index_content
-        assert "webpack" not in index_content
-        assert "<script src=" not in index_content, "External script tags are forbidden; UI must be zero-build"
+    def test_legacy_static_html_retired(self):
+        legacy_index = Path(__file__).resolve().parent.parent / "engine" / "ui" / "static" / "index.html"
+        assert not legacy_index.exists(), "Legacy engine/ui/static/index.html must remain removed"
 
-    def test_javascript_syntax_validity(self, index_content: str):
-        scripts = re.findall(r"<script>(.*?)</script>", index_content, re.DOTALL)
-        assert len(scripts) >= 1, "At least one inline <script> block expected in index.html"
-
-        if shutil.which("node"):
-            for i, script_body in enumerate(scripts):
-                proc = subprocess.run(
-                    ["node", "--check"],
-                    input=script_body,
-                    capture_output=True,
-                    text=True,
-                )
-                assert proc.returncode == 0, f"Inline JS syntax error in script block {i}:\n{proc.stderr}"
-        else:
-            for script_body in scripts:
-                open_braces = script_body.count("{") - script_body.count("}")
-                open_parens = script_body.count("(") - script_body.count(")")
-                open_brackets = script_body.count("[") - script_body.count("]")
-                assert open_braces == 0, f"Unbalanced braces in JS: diff={open_braces}"
-                assert open_parens == 0, f"Unbalanced parentheses in JS: diff={open_parens}"
-                assert open_brackets == 0, f"Unbalanced square brackets in JS: diff={open_brackets}"
-
-    def test_localstorage_persistence_contracts(self, index_content: str):
-        assert "localStorage.getItem" in index_content
-        assert "localStorage.setItem" in index_content
-        assert "studio_observability_state_v1" in index_content
+    def test_localstorage_persistence_contracts(self, studio_web_root: Path):
+        app_tsx = (studio_web_root / "src" / "App.tsx").read_text(encoding="utf-8")
+        assert "localStorage.getItem" in app_tsx
+        assert "localStorage.setItem" in app_tsx

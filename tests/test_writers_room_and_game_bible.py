@@ -626,18 +626,13 @@ def test_mission_control_game_bible_and_greenlight_endpoints(tmp_path: Path):
     assert g_approve.status_code == 200
     assert g_approve.json()["status"] == "greenlit"
 
-    # 5. Verify index.html contains the Writers' Room & Living Game Bible workspace, native <dialog closedby="any">, and scroll-preserving poll updates
+    # 5. Verify React studio-web Writers' Room, Living Game Bible, and ModalDialog components are present
     idx_res = client.get("/")
     assert idx_res.status_code == 200
-    html = idx_res.text
-    assert 'id="workspace-game-bible"' in html
-    assert 'id="writers-room-transcript-list"' in html
-    assert 'id="bible-mockup-lightbox" closedby="any"' in html
-    assert 'id="new-game-modal" closedby="any"' in html
-    assert "'closedBy' in HTMLDialogElement.prototype" in html
-    assert "function setHtmlIfChanged(" in html
-    assert "isWritersRoomAutoScroll" in html
-    assert "openUtteranceDelibIds" in html
+    studio_web_src = Path(__file__).resolve().parent.parent / "studio-web" / "src"
+    assert (studio_web_src / "features" / "writers-room" / "WritersRoomView.tsx").is_file()
+    assert (studio_web_src / "features" / "bible" / "GameBibleView.tsx").is_file()
+    assert (studio_web_src / "components" / "ModalDialog.tsx").is_file()
 
     # 6. Verify reset_for_new_genesis_build clears old cartridge bible and initializes fresh brainstorming state
     fresh_bible = bus.reset_for_new_genesis_build(
@@ -1290,7 +1285,7 @@ def test_council_shaping_and_review_prompts_enforce_systemic_invariants_over_coo
 
     # 2. Stage 2 Council task-shaping prompt instructs specialists to specify generalizable world-wide invariants
     shaping_prompts = []
-    room._structured_with_validation = lambda prompt, schema_cls, validator, temperature=None, parts=None: (
+    room._structured_with_validation = lambda prompt, schema_cls, validator, temperature=None, parts=None, **kwargs: (
         shaping_prompts.append(prompt),
         TaskShapingBatch(
             deliberation="d",
@@ -1315,7 +1310,7 @@ def test_council_shaping_and_review_prompts_enforce_systemic_invariants_over_coo
 
     # 3. Council proof review prompt enforces systemic root-cause diagnosis over coordinate point-patches
     review_prompts = []
-    room._structured_with_validation = lambda prompt, schema_cls, validator, temperature=None, parts=None: (
+    room._structured_with_validation = lambda prompt, schema_cls, validator, temperature=None, parts=None, **kwargs: (
         review_prompts.append(prompt),
         ReviewBatch(
             deliberation="d",

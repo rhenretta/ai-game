@@ -223,17 +223,19 @@ def test_playtest_ui_markup_rest_endpoints_and_range_streaming(tmp_path: Path):
     )
 
     with TestClient(app) as client:
-        # 1. Verify HTML workspace tab, accessible tablist/label markup, & CLS-safe <video width="1600" height="720" preload="metadata">
+        # 1. Verify React PlaytestLabView component exists and API root responds cleanly
         idx_res = client.get("/")
         assert idx_res.status_code == 200
-        html = idx_res.text
-        assert 'id="ws-tab-playtester"' in html
-        assert 'id="pt-obs-view-report"' in html
-        assert 'role="tablist"' in html
-        assert 'for="pt-producer-note"' in html
-        assert 'id="pt-replay-video"' in html
-        assert 'width="1600"' in html and 'height="720"' in html
-        assert 'preload="metadata"' in html
+        pt_view_src = (
+            Path(__file__).resolve().parent.parent
+            / "studio-web"
+            / "src"
+            / "features"
+            / "playtest"
+            / "PlaytestLabView.tsx"
+        ).read_text(encoding="utf-8")
+        assert "<video" in pt_view_src
+        assert "Experience Report" in pt_view_src
 
         # 2. List playable targets (includes completed slice_0)
         list_res = client.get("/api/playtest/sessions")
@@ -1627,14 +1629,17 @@ def test_playtest_session_history_archive_multi_run_and_council_verdict_preserva
     )
 
     with TestClient(app) as client:
-        # Verify new Session Archive & Watch Theatre UI elements are served
-        html = client.get("/").text
-        assert 'id="pt-session-archive-drawer"' in html
-        assert 'id="pt-session-history-cards"' in html
-        assert 'id="pt-frames-stage"' in html
-        assert 'id="pt-frame-reticle-svg"' in html
-        assert 'id="pt-replay-transport-bar"' in html
-        assert 'id="pt-turn-scrubber"' in html
+        # Verify React PlaytestLabView exposes session archive, frame stage, and live screen modes
+        pt_view_src = (
+            Path(__file__).resolve().parent.parent
+            / "studio-web"
+            / "src"
+            / "features"
+            / "playtest"
+            / "PlaytestLabView.tsx"
+        ).read_text(encoding="utf-8")
+        assert "type StageMode = 'video' | 'frames' | 'live'" in pt_view_src
+        assert "Turn-by-Turn Replay" in pt_view_src
 
         # Trigger Run #3 as a manual operator run on the completed slice_0
         start_res = client.post(
@@ -1717,6 +1722,192 @@ def test_playtest_session_history_archive_multi_run_and_council_verdict_preserva
     assert restored_by_run[1]["council_review"]["verdict"] == "iterate_current_slice"
     assert restored_by_run[2]["council_review"]["verdict"] == "approve_slice"
     assert len(restored_mgr.get_session_detail(restored_by_run[1]["session_id"])["turns"]) == 2
+
+
+def test_manual_playtest_send_full_report_to_council_and_multimodal_council_ingestion(tmp_path: Path):
+    """Verifies that an operator can dispatch the full report of a finished manual Blind Playtest
+    via `POST /api/playtest/sessions/{session_id}/send-report-to-council`, persisting dispatch status,
+    copying player proof screenshots, updating `game_bible.json`, approving pending session wishes,
+    and feeding the complete report + multimodal screenshots into `CreativeWritersRoom`."""
+    import time
+
+    db_path, cartridges_root, active_dir, cand_dir = _setup_workspace(tmp_path)
+    # Mirror candidate_001 game_bible.json into active_dir so `checkpoint_id='active'` also resolves provenance cleanly
+    (active_dir / "game_bible.json").write_text(
+        (cand_dir / "game_bible.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    bus = SwarmEventBus()
+
+    def _fake_llm_factory() -> Any:
+        def _gen(*, model: str, contents: Any, config: Any) -> Any:
+            schema = getattr(config, "response_schema", None)
+            props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+            usage = SimpleNamespace(
+                prompt_token_count=900,
+                cached_content_token_count=600,
+                candidates_token_count=140,
+                thoughts_token_count=30,
+            )
+            if "overall_experience_summary" in props:
+                report_payload = {
+                    "deliberation": "Synthesizing end-of-session player report for manual operator run.",
+                    "overall_experience_summary": "Cohesive modular chamber, but interactive terminal lacked hover feedback and overlapped status text.",
+                    "visual_and_ui_defects_observed": ["Bottom prompt label overlaps slot 1 border at 1280x720"],
+                    "graphics_and_visuals": "Crisp geometric silhouettes with one overlapping HUD caption.",
+                    "gameplay_and_feel": "Responsive switching once discovered.",
+                    "sound_and_audio": "Clear confirmation chime.",
+                    "intuitiveness_and_onboarding": "Unclear which terminal panel accepts initial input.",
+                    "goals_pacing_and_accomplishment": "Activating the central conduit felt earned.",
+                    "world_and_atmosphere": "Atmospheric chamber.",
+                    "key_highlights": ["Conduit power-up visual sequence"],
+                    "key_pain_points": ["Missing hover state on interactive terminal"],
+                    "bugs_and_glitches_observed": ["HUD caption overlaps slot 1"],
+                    "unanswered_questions_and_mysteries": ["How to reset a locked auxiliary valve?"],
+                    "overall_fun_rating": 6,
+                }
+                return SimpleNamespace(text=json.dumps(report_payload), usage_metadata=usage)
+
+            payload = {
+                "deliberation": "Testing terminal interaction and logging UI overlap bug + player wish.",
+                "current_plan": "Click central terminal and complete manual check.",
+                "turn_log_entry": "Clicked central terminal; noticed caption overlap.",
+                "field_note_updates": [
+                    {"deliberation": "Status bar counter", "topic": "Conduit Meter", "observation": "Shows 1/3 active links"}
+                ],
+                "question_updates": [
+                    {
+                        "deliberation": "Valve reset check",
+                        "question_key": "aux_valve_reset",
+                        "question": "How to reset a locked auxiliary valve?",
+                        "status": "open",
+                        "answer": None,
+                    }
+                ],
+                "rulebook_updates": [
+                    {"deliberation": "Left click toggles terminal", "key_or_topic": "Left Click", "behavior": "Toggles terminal"}
+                ],
+                "bug_reports": [
+                    {
+                        "deliberation": "HUD overlap spotted on bottom bar.",
+                        "bug_key": "hud_slot_overlap",
+                        "severity": "major",
+                        "category": "visual_glitch",
+                        "summary": "Bottom prompt label overlaps slot 1 border",
+                        "details": "Prompt box intersects top 6px of toolbar slot 1.",
+                    }
+                ],
+                "motor_action": {
+                    "deliberation": "Click terminal",
+                    "mouse_x": 500.0,
+                    "mouse_y": 500.0,
+                    "mouse_button_action": "left_click",
+                    "drag_from_x": None,
+                    "drag_from_y": None,
+                    "hold_keys": [],
+                    "tap_keys": [],
+                    "duration_ms": 500,
+                    "inspect_high_res_next": False,
+                },
+                "submit_wish": {
+                    "deliberation": "Terminal needs hover highlight.",
+                    "category": "controls_ux",
+                    "summary": "Add hover outline on interactive terminals",
+                    "rationale": "First-time players cannot tell the terminal is clickable.",
+                },
+                "end_playtest": {
+                    "deliberation": "Completed manual playtest pass.",
+                    "outcome": "completed",
+                    "closing_thoughts": "Solid core loop; fix HUD overlap and add hover outline.",
+                },
+            }
+            return SimpleNamespace(text=json.dumps(payload), usage_metadata=usage)
+
+        return SimpleNamespace(models=SimpleNamespace(generate_content=_gen))
+
+    pt_mgr = PlaytestSessionManager(
+        db_path=db_path,
+        cartridges_root=cartridges_root,
+        sessions_root=tmp_path / "sessions",
+        event_bus=bus,
+        client_factory=_fake_llm_factory,
+        bridge_factory=_FakeBridge,
+    )
+    app = create_app(
+        db_path=db_path,
+        active_cartridge_dir=active_dir,
+        cartridges_root=cartridges_root,
+        event_bus=bus,
+        playtest_manager=pt_mgr,
+    )
+
+    with TestClient(app) as client:
+        start_res = client.post(
+            "/api/playtest/sessions/start",
+            json={
+                "deliberation": "Start manual playtest on active cartridge.",
+                "checkpoint_id": "active",
+                "max_turns": 5,
+            },
+        )
+        assert start_res.status_code == 200
+        session_id = start_res.json()["session"]["session_id"]
+
+        for _ in range(40):
+            det_res = client.get(f"/api/playtest/sessions/{session_id}")
+            assert det_res.status_code == 200
+            det_json = det_res.json()
+            if det_json["session"]["status"] == "completed":
+                break
+            time.sleep(0.05)
+
+        assert det_json["session"]["status"] == "completed"
+        assert det_json["session"]["initiated_by"] == "operator"
+        assert det_json["session"]["report_sent_to_council_at_utc"] is None
+        assert det_json["wishes"][0]["status"] == "pending"
+        assert not (cand_dir / ".pending_council_playtest_reports.json").exists()
+
+        # Dispatch full manual report + pending wishes + producer direction to Council
+        dispatch_res = client.post(
+            f"/api/playtest/sessions/{session_id}/send-report-to-council",
+            json={
+                "deliberation": "Dispatching manual playtest report to Specialist Council for remediation.",
+                "include_pending_wishes": True,
+                "producer_note": "Fix the bottom prompt overlap and add terminal hover cues before adding new rooms.",
+            },
+        )
+        assert dispatch_res.status_code == 200
+        disp_json = dispatch_res.json()
+        assert disp_json["candidate_id"] == "candidate_001"
+        assert disp_json["session"]["report_sent_to_council_at_utc"]
+        assert disp_json["wishes"][0]["status"] == "sent_to_council"
+        assert len(disp_json["proof_image_paths"]) >= 1
+        for rel_p in disp_json["proof_image_paths"]:
+            assert (cand_dir / rel_p).is_file()
+
+        # Verify persisted session detail reflects Sent-to-Council timestamp
+        det_after = client.get(f"/api/playtest/sessions/{session_id}").json()
+        assert det_after["session"]["report_sent_to_council_at_utc"] == disp_json["session"]["report_sent_to_council_at_utc"]
+        assert det_after["wishes"][0]["status"] == "sent_to_council"
+
+        # Verify Writers' Room transcript in game_bible.json received immediate Executive Producer report utterance + screenshots
+        gb_disk = json.loads((cand_dir / "game_bible.json").read_text(encoding="utf-8"))
+        last_utt = gb_disk["writers_room_transcript"][-1]
+        assert last_utt["speaker_role"] == "ExecutiveProducer"
+        assert "Manual Playtest Report" in last_utt["speaker_display_name"]
+        assert "Fix the bottom prompt overlap" in last_utt["spoken_dialogue"]
+        assert last_utt["proof_image_paths"] == disp_json["proof_image_paths"]
+
+        # Verify CreativeWritersRoom consumes both the full structured report dossier AND multimodal screenshot Parts
+        wr = CreativeWritersRoom(client=SimpleNamespace(models=SimpleNamespace()))
+        dossier_text, multimodal_parts = wr._consume_pending_playtest_wishes(cand_dir)
+        assert "EXECUTIVE PRODUCER DISPATCHED BLIND PLAYTEST FULL REPORT & WISHES" in dossier_text
+        assert "Fix the bottom prompt overlap and add terminal hover cues before adding new rooms." in dossier_text
+        assert "Bottom prompt label overlaps slot 1 border at 1280x720" in dossier_text
+        assert "Add hover outline on interactive terminals" in dossier_text
+        assert "How to reset a locked auxiliary valve?" in dossier_text
+        assert len(multimodal_parts) >= 2
+
 
 
 

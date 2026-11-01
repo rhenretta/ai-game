@@ -517,5 +517,228 @@ def test_slice_playtest_script_and_conversational_council_roundtable(tmp_path: P
     assert qa_utts[0].artifact_emitted and qa_utts[0].artifact_emitted.get("type") == "filmstrip"
 
 
+def test_anti_sycophancy_exec_producer_respect_and_pragmatic_slice_scope_norms(tmp_path: Path):
+    """Verifies that schemas and live prompts enforce skeptical peer critique (no 'I completely agree' circle-jerk),
+    full respect and catering to Executive Producer messages, and pragmatic slice completion discipline."""
+    from engine.studio.models import (
+        BlindPlaytestCouncilTurn,
+        BlindPlaytestCouncilVerdict,
+        DirectorConvergenceCheck,
+        GameBibleSpec,
+        NextSliceStrategyPlan,
+        ReviewBatch,
+        ReviewDecision,
+        SliceAssemblyDecision,
+        SlicePlaytestRoundtableTurn,
+        SliceStateReflectionTurn,
+        SpecialistReport,
+        TaskLeadDecision,
+        WorkItem,
+        WorkItemProposal,
+        WritersRoomListenCheck,
+        WritersRoomTurnProposal,
+        WritersRoomUtterance,
+    )
+    from engine.studio.production_board import ProductionBoard
+    from engine.studio.workers import WorkerContext, plan_task_lead_turn
+    from engine.studio.writers_room import (
+        SPECIALIST_ROSTER,
+        STUDIO_CRITICAL_DISCOURSE_CHARTER,
+        CreativeWritersRoom,
+    )
+
+    # 1. Verify Rationale-First (Rule 4) & terminal field order + anti-sycophancy / scope descriptions on schemas
+    expected_last_fields = [
+        (DirectorConvergenceCheck, "is_ready_to_lock_bible"),
+        (SlicePlaytestRoundtableTurn, "is_playable_and_fun_from_my_perspective"),
+        (SliceAssemblyDecision, "is_slice_assembled"),
+        (BlindPlaytestCouncilTurn, "recommends_slice_approval"),
+        (BlindPlaytestCouncilVerdict, "verdict"),
+        (SliceStateReflectionTurn, "current_slice_quality_score"),
+    ]
+    for model_cls, last_field in expected_last_fields:
+        keys = list(model_cls.model_fields.keys())
+        assert keys[0] == "deliberation", f"{model_cls.__name__} must declare deliberation first"
+        assert keys[-1] == last_field, f"{model_cls.__name__} must declare {last_field} strictly last"
+
+    role_proposal_cls = WritersRoomTurnProposal.for_role("GameplayDesigner")
+    assert list(role_proposal_cls.model_fields.keys())[0] == "deliberation"
+    assert "I completely agree" in role_proposal_cls.model_fields["spoken_dialogue"].description
+    assert "Executive Producer" in role_proposal_cls.model_fields["spoken_dialogue"].description
+    assert "I completely agree" in WritersRoomUtterance.model_fields["spoken_dialogue"].description
+    assert "I completely agree" in ReviewBatch.model_fields["spoken_dialogue"].description
+    assert "1-3" in BlindPlaytestCouncilVerdict.model_fields["backlog_additions"].description
+    assert "called done appropriately" in BlindPlaytestCouncilVerdict.model_fields["verdict"].description.lower()
+    assert list(NextSliceStrategyPlan.model_fields.keys())[0] == "deliberation"
+
+    # 2. Verify STUDIO_CRITICAL_DISCOURSE_CHARTER covers all 3 pillars cleanly
+    assert "I completely agree with" in STUDIO_CRITICAL_DISCOURSE_CHARTER
+    assert "Executive Producer" in STUDIO_CRITICAL_DISCOURSE_CHARTER
+    assert "cannot build or fix everything in one go" in STUDIO_CRITICAL_DISCOURSE_CHARTER
+
+    # 3. Verify `_format_bible_snapshot` + `_execute_specialist_turn` (including board=None extra_context_block)
+    captured_prompts: list[str] = []
+
+    class _PromptCaptureClient:
+        def __init__(self) -> None:
+            self.models = self
+
+        def generate_content(self, model, contents, config=None):
+            prompt_text = "\n".join(str(c) for c in (contents if isinstance(contents, list) else [contents]))
+            captured_prompts.append(prompt_text)
+            schema = getattr(config, "response_schema", None) if config else None
+            sname = getattr(schema, "__name__", "")
+            if "WritersRoomTurnProposal" in sname:
+                return base._FakeGeminiResponse(
+                    WritersRoomTurnProposal(
+                        deliberation="Scrutinizing slice scope and catering to Executive Producer request.",
+                        spoken_dialogue="Our current HUD hides key bindings; let us add a compact perimeter bar for this slice.",
+                        addressed_to=["UXExperienceDesigner"],
+                    )
+                )
+            if sname == "ReviewBatch":
+                return base._FakeGeminiResponse(
+                    ReviewBatch(
+                        deliberation="Auditing proof frames directly against active-slice spec.",
+                        spoken_dialogue="Frame 3 confirms responsive causal progression and clean layout within slice scope.",
+                        addressed_to=["CreativeDirector"],
+                        review_decisions=[
+                            ReviewDecision(
+                                deliberation="Meets active slice spec cleanly.",
+                                validation_criteria_for_my_role="Responsive action and non-overlapping UI.",
+                                item_id="item_alpha",
+                                feedback="",
+                                verdict="approve",
+                            )
+                        ],
+                        cap_decisions=[],
+                    )
+                )
+            if sname == "TaskLeadDecision":
+                return base._FakeGeminiResponse(
+                    TaskLeadDecision(
+                        deliberation="Verifying specialist claims against proof image and disk diff before submitting.",
+                        current_strategy="Verify rendered frames and submit bounded task.",
+                        proof_strategy="Confirm multi-frame state progression.",
+                        submission_summary="Verified against spec.",
+                        selected_proof_paths=[str(tmp_path / "artifacts" / "proofs" / "filmstrip_item_alpha.png")],
+                        action="submit_to_council",
+                    )
+                )
+            raise AssertionError(f"Unexpected schema {sname}")
+
+    cap_client = _PromptCaptureClient()
+    room_no_board = CreativeWritersRoom(client=cap_client, board=None)
+    bible = GameBibleSpec(
+        deliberation="Initial bible state.",
+        game_title="Untitled Project",
+        core_genre="simulation",
+        writers_room_transcript=[
+            WritersRoomUtterance(
+                deliberation="Executive Producer input.",
+                utterance_id="utt_ep_1",
+                turn_index=0,
+                speaker_role="ExecutiveProducer",
+                speaker_display_name="Executive Producer",
+                spoken_dialogue="Make the primary toolbar readable at a glance.",
+                addressed_to=["Council"],
+            )
+        ],
+    )
+    gd_spec = next(s for s in SPECIALIST_ROSTER if s["role"] == "GameplayDesigner")
+    listen = WritersRoomListenCheck(
+        deliberation="Need to respond to Executive Producer toolbar direction.",
+        should_interject=True,
+        urgency_score=1.0,
+        intended_contribution_summary="Cater to toolbar readability within active slice scope.",
+    )
+    room_no_board._execute_specialist_turn(
+        specialist=gd_spec,
+        listen_check=listen,
+        game_bible=bible,
+        dna_summary="Strategy & simulation player.",
+        extra_context_block="EXTRA_CURATED_DIAGNOSTIC_CONTEXT_MARKER",
+    )
+    turn_prompt = captured_prompts[-1]
+    assert "EXTRA_CURATED_DIAGNOSTIC_CONTEXT_MARKER" in turn_prompt
+    assert "NO CIRCLE-JERK" in turn_prompt
+    assert "ALWAYS RESPECT & CATER TO THIS DIRECTION" in turn_prompt
+    assert "Make the primary toolbar readable at a glance." in turn_prompt
+
+    # 4. Verify `_review_as` preserves EARLIER COUNCIL header while banning sycophancy & out-of-scope creep
+    board = ProductionBoard()
+    added = board.add_items(
+        [
+            WorkItemProposal(
+                deliberation="Add bounded slice item.",
+                item_id="item_alpha",
+                title="Primary Control Widget",
+                kind="ui",
+                spec="Render a non-overlapping control bar.",
+                proof_spec="Filmstrip showing control bar across ticks 10..60.",
+                target_modules=["ui_hud.gd"],
+            )
+        ],
+        raised_by_role="UXExperienceDesigner",
+    )
+    claimed_list = board.claim_ready()
+    assert len(claimed_list) == 1 and claimed_list[0].item_id == added[0].item_id
+    proof_file = tmp_path / "artifacts" / "proofs" / "filmstrip_item_alpha.png"
+    proof_file.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (64, 36), (20, 40, 60)).save(proof_file)
+    board.submit_result(
+        "item_alpha",
+        WorkerResult(notes="Built control bar.", proof_images=[str(proof_file)]),
+    )
+    room_with_board = CreativeWritersRoom(client=cap_client, board=board)
+    room_with_board._review_as(
+        role="GameplayDesigner",
+        awaiting=[board.get("item_alpha")],
+        deciding=[],
+        game_bible=bible,
+        dna_summary="Strategy & simulation player.",
+        candidate_dir=tmp_path,
+        prior_roundtable_notes=["[UXExperienceDesigner]: Checked button spacing."],
+    )
+    rev_prompt = captured_prompts[-1]
+    assert "EARLIER COUNCIL PANELIST OBSERVATIONS IN THIS REVIEW ROUND" in rev_prompt
+    assert "DO NOT open `spoken_dialogue` with 'I completely agree with...'" in rev_prompt
+    assert "do NOT invent out-of-scope feature creep" in rev_prompt
+
+    # 5. Verify Task Lead prompt includes skeptical verification, Executive Producer respect, and bounded task completion
+    (tmp_path / "project.godot").write_text("[application]\nrun/main_scene=\"res://main.tscn\"\n", encoding="utf-8")
+    (tmp_path / "ui_hud.gd").write_text("extends CanvasLayer\n", encoding="utf-8")
+    w_ctx = WorkerContext(cartridge_dir=tmp_path, client=cap_client, model_name="gemini-2.5-flash", board=board)
+    w_ctx.client._is_live_test_override = True  # exercised via monkeypatch below
+    import engine.studio.workers as workers_mod
+
+    orig_is_live = workers_mod._is_live
+    workers_mod._is_live = lambda _c: True
+    try:
+        lead_dec = plan_task_lead_turn(
+            ctx=w_ctx,
+            item=board.get("item_alpha"),
+            turn_history=[
+                SpecialistReport(
+                    specialist_agent="swe_engineer",
+                    brief="Implement non-overlapping control bar in ui_hud.gd.",
+                    summary="Implemented cleanly!",
+                    touched_files=["ui_hud.gd"],
+                    proof_images=[str(proof_file)],
+                )
+            ],
+            collected_proofs=[str(proof_file)],
+        )
+    finally:
+        workers_mod._is_live = orig_is_live
+
+    assert lead_dec.action == "submit_to_council"
+    lead_prompt = captured_prompts[-1]
+    assert "SKEPTICAL VERIFICATION, EXECUTIVE PRODUCER RESPECT & PRAGMATIC TASK COMPLETION" in lead_prompt
+    assert "UNVERIFIED CLAIMS" in lead_prompt
+    assert "boil the ocean in one go" in lead_prompt
+
+
+
 
 
