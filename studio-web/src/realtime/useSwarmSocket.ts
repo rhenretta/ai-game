@@ -87,7 +87,20 @@ const CHRONOLOGY_INVALIDATION_EVENTS = new Set([
   'backlog_item_changes_requested',
 ]);
 
-function deriveLiveItemUpdate(
+function compactSingleLine(raw: string, maxChars = 140): string {
+  const normalized = raw.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= maxChars) return normalized;
+  const sliced = normalized.slice(0, maxChars - 1);
+  const lastSpace = sliced.lastIndexOf(' ');
+  return `${(lastSpace > maxChars * 0.6 ? sliced.slice(0, lastSpace) : sliced).trimEnd()}…`;
+}
+
+function shortRoleLabel(rawRole: string): string {
+  const stripped = rawRole.includes(':') ? rawRole.slice(rawRole.lastIndexOf(':') + 1) : rawRole;
+  return stripped.trim() || 'specialist';
+}
+
+export function deriveLiveItemUpdate(
   prev: LiveItemStep | undefined,
   ev: SwarmStreamEvent,
   ts: string,
@@ -119,6 +132,70 @@ function deriveLiveItemUpdate(
     sameTurn && Array.isArray(prev?.stepLog) ? [...prev.stepLog] : [];
   const startedAtUtc = sameTurn && prev?.startedAtUtc ? prev.startedAtUtc : ts;
 
+  if (evType === 'context_curator_packed' || evType === 'context_curator_question_researched') {
+    // Ignore non-board context curations (e.g. slice_reflection_* or council-level calls)
+    // that were never claimed as an active Production Board item.
+    if (!prev) return null;
+    const rawTarget =
+      (typeof payload.target_agent_role === 'string' && payload.target_agent_role) ||
+      prev.specialistAgent ||
+      prev.agentName ||
+      'specialist';
+    const roleLabel = shortRoleLabel(rawTarget);
+
+    if (evType === 'context_curator_packed') {
+      const chunkCount = Array.isArray(payload.selected_chunk_ids)
+        ? payload.selected_chunk_ids.length
+        : 0;
+      const imgCount = Array.isArray(payload.selected_image_paths)
+        ? payload.selected_image_paths.length
+        : 0;
+      const summary = `Curated ${chunkCount} context chunk${chunkCount === 1 ? '' : 's'}${
+        imgCount > 0 ? ` + ${imgCount} visual ref${imgCount === 1 ? '' : 's'}` : ''
+      } for ${roleLabel}`;
+      baseSteps.push({
+        step_type: 'context_curated',
+        specialist_agent: prev.specialistAgent || 'context_curator',
+        message: summary,
+        timestamp_utc: ts,
+      });
+      return {
+        ...prev,
+        stepSummary: `Turn #${rawTurnIdx}: ${summary}`,
+        eventType: ev.event_type,
+        timestampUtc: ts,
+        startedAtUtc,
+        stepLog: baseSteps.slice(-MAX_STEP_LOG_PER_TURN),
+      };
+    }
+
+    const question =
+      typeof payload.question === 'string' ? compactSingleLine(payload.question, 95) : '';
+    const qSummary = question
+      ? `Researched question for ${roleLabel}: "${question}"`
+      : `Researched codebase question for ${roleLabel}`;
+    baseSteps.push({
+      step_type: 'question_researched',
+      specialist_agent: prev.specialistAgent || 'context_curator',
+      message: qSummary,
+      timestamp_utc: ts,
+    });
+    return {
+      ...prev,
+      stepSummary: `Turn #${rawTurnIdx}: ${qSummary}`,
+      eventType: ev.event_type,
+      timestampUtc: ts,
+      startedAtUtc,
+      stepLog: baseSteps.slice(-MAX_STEP_LOG_PER_TURN),
+    };
+  }
+
+  // Only process Production Board item execution events (`backlog_item_*`); never allow unrelated
+  // telemetry carrying an `item_id` field to leak raw `ev.deliberation` into `liveStepsByItem`.
+  if (!evType.startsWith('backlog_item_')) {
+    return null;
+  }
+
   if (evType === 'backlog_item_claimed') {
     const ownerRole =
       (typeof payload.owner_role === 'string' && payload.owner_role) || ev.agent_name || 'TaskLead';
@@ -146,7 +223,7 @@ function deriveLiveItemUpdate(
     baseSteps.push({
       step_type: 'planning_turn',
       specialist_agent: 'task_lead',
-      message: msg,
+      message: compactSingleLine(msg, 160),
       timestamp_utc: ts,
     });
     return {
@@ -168,7 +245,8 @@ function deriveLiveItemUpdate(
     const brief = typeof payload.brief === 'string' ? payload.brief : '';
     const strategy =
       (typeof payload.current_strategy === 'string' && payload.current_strategy) || brief;
-    const msg = `Task Lead delegated Turn #${rawTurnIdx} to ${spec}${strategy ? `: ${strategy.slice(0, 140)}` : ''}`;
+    const shortStrategy = strategy ? compactSingleLine(strategy, 120) : '';
+    const msg = `Task Lead delegated Turn #${rawTurnIdx} to ${spec}${shortStrategy ? `: ${shortStrategy}` : ''}`;
     baseSteps.push({
       step_type: 'lead_decision',
       specialist_agent: spec,
@@ -181,7 +259,7 @@ function deriveLiveItemUpdate(
       specialistAgent: spec,
       turnIndex: rawTurnIdx,
       brief: brief || prev?.brief,
-      stepSummary: `Turn #${rawTurnIdx} (${spec}): ${strategy || 'Dispatching specialist...'}`,
+      stepSummary: `Turn #${rawTurnIdx} (${spec}): ${shortStrategy || 'Dispatching specialist...'}`,
       eventType: ev.event_type,
       timestampUtc: ts,
       startedAtUtc,
@@ -196,7 +274,8 @@ function deriveLiveItemUpdate(
       'specialist';
     const brief =
       (typeof payload.brief === 'string' && payload.brief) || prev?.brief || '';
-    const msg = `${spec} started Turn #${rawTurnIdx}${brief ? `: ${brief.slice(0, 140)}` : ''}`;
+    const shortBrief = brief ? compactSingleLine(brief, 120) : '';
+    const msg = `${spec} started Turn #${rawTurnIdx}${shortBrief ? `: ${shortBrief}` : ''}`;
     baseSteps.push({
       step_type: 'specialist_started',
       specialist_agent: spec,
@@ -209,7 +288,7 @@ function deriveLiveItemUpdate(
       specialistAgent: spec,
       turnIndex: rawTurnIdx,
       brief,
-      stepSummary: `Turn #${rawTurnIdx} (${spec}): ${brief || 'Synthesizing & verifying...'}`,
+      stepSummary: `Turn #${rawTurnIdx} (${spec}): ${shortBrief || 'Synthesizing & verifying...'}`,
       eventType: ev.event_type,
       timestampUtc: ts,
       startedAtUtc: ts,
@@ -225,11 +304,11 @@ function deriveLiveItemUpdate(
       'specialist';
     const stepType =
       (typeof payload.step_type === 'string' && payload.step_type) || 'substep';
-    const msg =
+    const rawMsg =
       (typeof payload.message === 'string' && payload.message) ||
       (typeof payload.step_summary === 'string' && payload.step_summary) ||
-      ev.deliberation ||
       'Executing step...';
+    const shortMsg = compactSingleLine(rawMsg, 125);
     const details =
       payload.details && typeof payload.details === 'object' && !Array.isArray(payload.details)
         ? (payload.details as Record<string, unknown>)
@@ -237,7 +316,7 @@ function deriveLiveItemUpdate(
     baseSteps.push({
       step_type: stepType,
       specialist_agent: spec,
-      message: msg,
+      message: shortMsg,
       details,
       timestamp_utc: ts,
     });
@@ -247,7 +326,7 @@ function deriveLiveItemUpdate(
       specialistAgent: spec,
       turnIndex: rawTurnIdx,
       brief: prev?.brief,
-      stepSummary: `Turn #${rawTurnIdx} (${spec}): ${msg}`,
+      stepSummary: `Turn #${rawTurnIdx} (${spec}): ${shortMsg}`,
       eventType: ev.event_type,
       timestampUtc: ts,
       startedAtUtc,
@@ -260,11 +339,11 @@ function deriveLiveItemUpdate(
       (typeof payload.specialist_agent === 'string' && payload.specialist_agent) ||
       prev?.specialistAgent ||
       'specialist';
-    const summary = typeof payload.summary === 'string' ? payload.summary : '';
+    const summary = typeof payload.summary === 'string' ? compactSingleLine(payload.summary, 120) : '';
     baseSteps.push({
       step_type: 'specialist_completed',
       specialist_agent: spec,
-      message: `${spec} completed Turn #${rawTurnIdx}${summary ? `: ${summary.slice(0, 140)}` : ''}`,
+      message: `${spec} completed Turn #${rawTurnIdx}${summary ? `: ${summary}` : ''}`,
       timestamp_utc: ts,
     });
     return {
@@ -285,8 +364,7 @@ function deriveLiveItemUpdate(
     (typeof payload.step_summary === 'string' && payload.step_summary) ||
     (typeof payload.message === 'string' && payload.message) ||
     (typeof payload.summary === 'string' && payload.summary) ||
-    ev.deliberation ||
-    ev.event_type;
+    ev.event_type.replace(/^backlog_item_/, '').replace(/_/g, ' ');
 
   return {
     itemId,
@@ -294,7 +372,7 @@ function deriveLiveItemUpdate(
     specialistAgent: prev?.specialistAgent,
     turnIndex: prev?.turnIndex,
     brief: prev?.brief,
-    stepSummary: fallbackText,
+    stepSummary: compactSingleLine(fallbackText, 130),
     eventType: ev.event_type,
     timestampUtc: ts,
     startedAtUtc,

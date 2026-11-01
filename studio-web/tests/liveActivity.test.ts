@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { GameBibleResponse, SwarmStreamEvent } from '../src/api/types';
 import {
@@ -6,6 +8,7 @@ import {
   formatTokenCount,
   summarizeSwarmEvent,
 } from '../src/domain/liveActivity';
+import { deriveLiveItemUpdate } from '../src/realtime/useSwarmSocket';
 
 function buildSyntheticBible(overrides?: Partial<GameBibleResponse>): GameBibleResponse {
   return {
@@ -255,5 +258,130 @@ describe('deriveLiveStudioActivity & summarizeSwarmEvent', () => {
     expect(formatRelativeSeconds('2026-10-31T18:00:28Z', refNow)).toBe('just now');
     expect(formatRelativeSeconds('2026-10-31T18:00:12Z', refNow)).toBe('18s ago');
     expect(formatRelativeSeconds('2026-10-31T17:58:25Z', refNow)).toBe('2m 5s ago');
+  });
+
+  it('prevents raw context_curator deliberations and foreign slice steps from flooding the live banner', () => {
+    const verboseCuratorDeliberation =
+      'The target role is council_reviewer:SyntheticReflectionCouncil for post-slice evaluation. ' +
+      'Chunks selected include `design:slice:slice_2_planning`, `board:item:integration_synthetic_01`, ' +
+      '`board:trace:integration_synthetic_01`, `code:module:main.gd`, and `code:module:main.tscn` ' +
+      'plus two visual ground-truth mockups so reviewers can verify layout invariants without exceeding token budgets.';
+
+    // 1. Non-board context_curator_packed events (no claimed board `prev`) must NOT create liveStepsByItem entries
+    const nonBoardCuratorEv: SwarmStreamEvent = {
+      deliberation: verboseCuratorDeliberation,
+      event_type: 'context_curator_packed',
+      agent_name: 'CreativeWritersRoom',
+      timestamp_utc: '2026-10-31T18:05:00Z',
+      payload: {
+        item_id: 'slice_reflection_synthetic_01',
+        target_agent_role: 'council_reviewer:SyntheticReflectionCouncil',
+        selected_chunk_ids: ['c1', 'c2', 'c3', 'c4', 'c5'],
+        selected_image_paths: ['mockup.png', 'proof.png'],
+      },
+    };
+    expect(deriveLiveItemUpdate(undefined, nonBoardCuratorEv, '2026-10-31T18:05:00Z')).toBeNull();
+
+    // 2. Active board item context curation produces a concise 1-line summary (zero raw chunk-ID dumps)
+    const claimed = deriveLiveItemUpdate(
+      undefined,
+      {
+        deliberation: 'Claimed active board task.',
+        event_type: 'backlog_item_claimed',
+        agent_name: 'TaskLead',
+        timestamp_utc: '2026-10-31T18:05:01Z',
+        payload: { item_id: 'task_active_01', owner_role: 'task_lead' },
+      },
+      '2026-10-31T18:05:01Z',
+    );
+    expect(claimed).not.toBeNull();
+    expect(claimed).not.toBe('clear');
+
+    const curatedBoardStep = deriveLiveItemUpdate(
+      claimed && claimed !== 'clear' ? claimed : undefined,
+      {
+        ...nonBoardCuratorEv,
+        payload: {
+          ...nonBoardCuratorEv.payload,
+          item_id: 'task_active_01',
+          target_agent_role: 'swe_engineer',
+        },
+      },
+      '2026-10-31T18:05:02Z',
+    );
+    expect(curatedBoardStep).not.toBeNull();
+    expect(curatedBoardStep).not.toBe('clear');
+    if (curatedBoardStep && curatedBoardStep !== 'clear') {
+      expect(curatedBoardStep.stepSummary).toBe(
+        'Turn #1: Curated 5 context chunks + 2 visual refs for swe_engineer',
+      );
+      expect(curatedBoardStep.stepSummary).not.toContain('board:trace:');
+    }
+
+    // 3. Even if a stale/foreign itemId exists in liveStepsByItem, deriveLiveStudioActivity ignores it
+    //    and matches only currently working board items with bounded single-line headlines.
+    const activeBible = buildSyntheticBible({
+      production_board: {
+        deliberation: 'Slice board in progress.',
+        cartridge_id: 'candidate_synthetic_99',
+        design_revision: 2,
+        total_items: 2,
+        counts_by_state: { in_progress: 1, ready: 1 },
+        is_drained: false,
+        items: [
+          {
+            deliberation: 'Active task',
+            item_id: 'task_active_01',
+            kind: 'feature_code',
+            title: 'Modular Telemetry Emitter',
+            spec: 'Emit structured state frames.',
+            depends_on: [],
+            target_modules: ['scripts/emitter.gd'],
+            state: 'in_progress',
+          },
+          {
+            deliberation: 'Queued task',
+            item_id: 'task_queued_02',
+            kind: 'ui_polish',
+            title: 'Inspector Panel Layout',
+            spec: 'Align inspector badges.',
+            depends_on: ['task_active_01'],
+            target_modules: ['scenes/inspector.tscn'],
+            state: 'ready',
+          },
+        ],
+      },
+    });
+
+    const activity = deriveLiveStudioActivity({
+      bible: activeBible,
+      recentEvents: [],
+      liveStepsByItem: {
+        slice_reflection_synthetic_01: {
+          itemId: 'slice_reflection_synthetic_01',
+          agentName: 'CreativeWritersRoom',
+          stepSummary: verboseCuratorDeliberation,
+          eventType: 'context_curator_packed',
+          timestampUtc: '2026-10-31T18:05:10Z',
+        },
+      },
+    });
+
+    expect(activity.phase).toBe('board_synthesis');
+    expect(activity.headline).toBe('Executing 1 active board task: Modular Telemetry Emitter');
+    expect(activity.headline).not.toContain('SyntheticReflectionCouncil');
+    expect(activity.headline.length).toBeLessThanOrEqual(160);
+
+    // 4. summarizeSwarmEvent formats context_curator_packed cleanly for LivePulseModal
+    const modalSummary = summarizeSwarmEvent(nonBoardCuratorEv);
+    expect(modalSummary.badgeText).toBe('CONTEXT PACK');
+    expect(modalSummary.title).toContain('Curated 5 context chunks + 2 visual refs');
+    expect(modalSummary.title).not.toContain('board:trace:');
+
+    // 5. CSS enforces 1-line clamping on .live-activity-headline
+    const cssSource = readFileSync(resolve(__dirname, '../src/styles/global.css'), 'utf-8');
+    expect(cssSource).toMatch(
+      /\.live-activity-headline\s*\{[^}]*-webkit-line-clamp:\s*1;[\s\S]*?line-clamp:\s*1;[\s\S]*?overflow:\s*clip;/,
+    );
   });
 });

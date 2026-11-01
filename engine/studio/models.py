@@ -1718,10 +1718,12 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
             from engine.studio.asset_library import CartridgeAssetLibrary
             visual_agent = getattr(swe_agent, "visual_agent", None) if swe_agent is not None else None
             voice_agent = getattr(swe_agent, "voice_agent", None) if swe_agent is not None else None
+            swe_client = getattr(swe_agent, "client", None) if swe_agent is not None else None
             lib = CartridgeAssetLibrary(
                 cartridge_dir=target_dir,
                 visual_agent=visual_agent,
                 voice_agent=voice_agent,
+                client=swe_client,
             )
             if self.requested_assets:
                 try:

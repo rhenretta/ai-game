@@ -3054,7 +3054,7 @@ class StudioOrchestrator:
             and (staging_dir / "backlog.json").is_file()
             and qa_esc_idx < max_board_qa_escalations
         ):
-            from engine.supervisor.supervisor import build_qa_gate_work_item_proposal
+            from engine.supervisor.supervisor import build_qa_gate_work_item_proposals
 
             trace_esc = report.rejection_trace
             pb_esc = self._build_production_board(staging_dir)
@@ -3068,7 +3068,7 @@ class StudioOrchestrator:
             if gb_esc is not None and gb_esc.slice_roadmap:
                 active_or_last = gb_esc.get_active_slice() or gb_esc.slice_roadmap[-1]
                 last_slice_id = getattr(active_or_last, "slice_id", "") or ""
-            qa_prop = build_qa_gate_work_item_proposal(
+            qa_props = build_qa_gate_work_item_proposals(
                 candidate_dir=staging_dir,
                 trace=trace_esc,
                 pass_index=100 + qa_esc_idx,
@@ -3076,28 +3076,33 @@ class StudioOrchestrator:
                 existing_item_ids={it.item_id for it in pb_esc.items()},
             )
             added_esc = pb_esc.add_items(
-                [qa_prop],
+                qa_props,
                 raised_by_role="QATestEngineer",
                 slice_id=last_slice_id,
             )
             if not added_esc:
                 break
+            lead_qa_prop = qa_props[0]
             if gb_esc is not None:
                 from engine.studio.models import WritersRoomUtterance
 
                 t_idx = len(gb_esc.writers_room_transcript)
+                addressed_esc = ["GameplaySystemsEngineer", "CreativeDirector"]
+                if any(p.kind == "visual_asset" for p in qa_props):
+                    addressed_esc.insert(0, "VisualArtDirector")
+                task_summary_esc = ", ".join(f"`{p.item_id}` ({p.kind})" for p in qa_props)
                 esc_utt = WritersRoomUtterance(
-                    deliberation=qa_prop.deliberation,
+                    deliberation=lead_qa_prop.deliberation,
                     utterance_id=f"utt_{t_idx:02d}_QATestEngineer_final_qa_esc_{qa_esc_idx}",
                     turn_index=t_idx,
                     speaker_role="QATestEngineer",
                     speaker_display_name="QA & Build Supervisor",
                     spoken_dialogue=(
                         f"[Final 5-Gate QA Escalation #{qa_esc_idx + 1}] {trace_esc.failure_gate} flagged: "
-                        f"{trace_esc.failure_reason} Created Production Board task `{qa_prop.item_id}` ({qa_prop.title}) "
+                        f"{trace_esc.failure_reason} Created {len(qa_props)} Production Board task(s) {task_summary_esc} "
                         f"for Task Lead execution and Specialist Council sign-off before promotion."
                     ),
-                    addressed_to=["GameplaySystemsEngineer", "CreativeDirector"],
+                    addressed_to=addressed_esc,
                     bible_updates_summary=[f"backlog:+{it.item_id}" for it in added_esc],
                 )
                 gb_esc.writers_room_transcript.append(esc_utt)
@@ -3107,7 +3112,7 @@ class StudioOrchestrator:
             if StudioBuildState.SYNTHESIZING in self.ALLOWED_TRANSITIONS.get(self.state, set()):
                 self.transition_to(
                     StudioBuildState.SYNTHESIZING,
-                    f"Escalating {trace_esc.failure_gate} remediation task '{qa_prop.item_id}' onto Production Board...",
+                    f"Escalating {trace_esc.failure_gate} remediation task(s) ({len(qa_props)}) onto Production Board...",
                 )
             dna_esc = context.raw_outputs.get("dna")
             gb_esc = self.run_writers_room_session(

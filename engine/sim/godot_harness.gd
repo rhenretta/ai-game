@@ -1057,6 +1057,9 @@ func _audit_scene_tree(node: Node, in_ui: bool = false) -> Dictionary:
 		"early_failure_state_detected": false,
 		"bound_sprites_audit": [],
 		"empty_sprite_frame_nodes": [],
+		"empty_atlas_region_nodes": [],
+		"null_texture_visual_nodes": [],
+		"untextured_world_polygons": [],
 		"subviewport_thrashing_nodes": [],
 		"portrait_misused_on_world_sprite": false,
 		"portrait_misused_nodes": [],
@@ -1128,6 +1131,44 @@ func _is_sprite_frame_cell_empty(tex: Texture2D, hframes: int, vframes: int, fra
 			break
 	return tex_has_alpha
 
+func _is_texture_region_empty(tex: Texture2D, region_rect: Rect2) -> bool:
+	if tex == null or region_rect.size.x <= 0.0 or region_rect.size.y <= 0.0:
+		return false
+	var img = tex.get_image()
+	if img == null or img.is_empty():
+		return false
+	if img.is_compressed():
+		img.decompress()
+	var tw = img.get_width()
+	var th = img.get_height()
+	if tw <= 0 or th <= 0:
+		return false
+	var x0 = clampi(int(floor(region_rect.position.x)), 0, max(0, tw - 1))
+	var y0 = clampi(int(floor(region_rect.position.y)), 0, max(0, th - 1))
+	var x1 = clampi(int(ceil(region_rect.position.x + region_rect.size.x)), x0 + 1, tw)
+	var y1 = clampi(int(ceil(region_rect.position.y + region_rect.size.y)), y0 + 1, th)
+	var step_x = int(max(1, (x1 - x0) / 16))
+	var step_y = int(max(1, (y1 - y0) / 16))
+	for y in range(y0, y1, step_y):
+		for x in range(x0, x1, step_x):
+			if img.get_pixel(x, y).a > 0.02:
+				return false
+	var full_sx = int(max(1, tw / 16))
+	var full_sy = int(max(1, th / 16))
+	for y in range(0, th, full_sy):
+		for x in range(0, tw, full_sx):
+			if img.get_pixel(x, y).a > 0.02:
+				return true
+	return false
+
+func _has_scripted_entity_ancestor(node: Node) -> bool:
+	var cur = node.get_parent()
+	while cur != null and cur != main_scene_node:
+		if cur.get_script() != null:
+			return true
+		cur = cur.get_parent()
+	return false
+
 func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
 	var is_fg_canvas_layer = (node is CanvasLayer) and (node.layer >= 0)
 	var is_bg_canvas_layer = (node is CanvasLayer) and (node.layer < 0)
@@ -1194,6 +1235,35 @@ func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
 				sz = Vector2(float(node.texture.get_width()), float(node.texture.get_height()))
 			if (sz.x > 110.0 or sz.y > 110.0) or (node.expand_mode == TextureRect.EXPAND_KEEP_SIZE and (node.texture.get_width() > 110 or node.texture.get_height() > 110)):
 				report["oversized_ui_portraits"].append(str(node.name) + ":" + str(sz))
+		if node.is_visible_in_tree():
+			if node.texture is AtlasTexture:
+				var at_tex: AtlasTexture = node.texture
+				if at_tex.atlas != null and _is_texture_region_empty(at_tex.atlas, at_tex.region):
+					var at_path = _resolve_texture_path(node, at_tex.atlas)
+					report["empty_atlas_region_nodes"].append(
+						str(node.name) + " (AtlasTexture=" + at_path + ", region=" + str(at_tex.region) + " crops a 100% transparent empty cell!)"
+					)
+			elif node is Sprite2D and node.region_enabled and _is_texture_region_empty(node.texture, node.region_rect):
+				var reg_path = _resolve_texture_path(node, node.texture)
+				report["empty_atlas_region_nodes"].append(
+					str(node.name) + " (Sprite2D.region_rect=" + str(node.region_rect) + " on " + reg_path + " crops a 100% transparent empty region!)"
+				)
+	elif node is Sprite2D and not current_in_ui and node.texture == null and node.is_visible_in_tree():
+		if _has_scripted_entity_ancestor(node) and not (node.get_script() != null and node.has_method("_draw")):
+			var owner_name = str(node.get_parent().name) if node.get_parent() != null else "root"
+			report["null_texture_visual_nodes"].append(
+				owner_name + "/" + str(node.name) + " (visible entity Sprite2D has texture == null at runtime!)"
+			)
+	elif node is TextureRect and current_in_ui and node.texture == null and node.is_visible_in_tree():
+		if (node.size.x >= 16.0 and node.size.y >= 16.0) or (node.custom_minimum_size.x >= 16.0 and node.custom_minimum_size.y >= 16.0):
+			report["null_texture_visual_nodes"].append(
+				str(node.name) + " (visible UI TextureRect icon slot has texture == null at runtime!)"
+			)
+	if node is Polygon2D and not current_in_ui and node.is_visible_in_tree() and node.polygon.size() >= 3 and node.texture == null:
+		if node.texture_repeat == CanvasItem.TEXTURE_REPEAT_ENABLED or node.texture_repeat == CanvasItem.TEXTURE_REPEAT_MIRROR:
+			report["untextured_world_polygons"].append(
+				str(node.name) + " (Polygon2D sets texture_repeat=ENABLED/MIRROR for tiled surface rendering, but texture == null at runtime!)"
+			)
 	if "loaded_textures" in node and typeof(node.get("loaded_textures")) == TYPE_DICTIONARY:
 		var lt: Dictionary = node.get("loaded_textures")
 		report["textures_loaded_count"] = int(report["textures_loaded_count"]) + lt.size()

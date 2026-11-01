@@ -54,10 +54,30 @@ logger = logging.getLogger("BlindPlaytesterAgent")
 UNCHANGED_FRAME_MSE_THRESHOLD = 0.0005
 
 
+def _uses_gemini_3_defaults(model_name: str) -> bool:
+    """Returns True for Gemini 3.x models (`gemini-3.5*`, `gemini-3.6*`, `gemini-3.8*`) where the SDK
+    recommends omitting manual `temperature` overrides in favor of native model defaults."""
+    m_low = (model_name or "").strip().lower()
+    return m_low.startswith(("gemini-3.", "gemini-3-"))
+
+
+def _frame_mean_luminance(path: Optional[Path]) -> float:
+    """Computes mean grayscale luminance (0..255) on a downsampled thumbnail to detect dark modal blackouts."""
+    if path is None or not path.is_file():
+        return 0.0
+    try:
+        with Image.open(path) as img:
+            gray = img.convert("L").resize((64, 36))
+            raw = gray.tobytes()
+            return (sum(raw) / len(raw)) if raw else 0.0
+    except Exception:
+        return 0.0
+
+
 def _playtest_non_thinking_config(model_name: str) -> Any:
-    """Returns a non-thinking / minimal-latency ThinkingConfig tailored to `model_name`.
-    - `gemini-3.5-flash-lite` / `gemini-3.1-flash-lite`: uses `ThinkingLevel.MINIMAL` (zero thought tokens).
-    - `gemini-3.8-flash`: uses `thinking_budget=0` (`MINIMAL` enum is rejected on 3.8-flash).
+    """Returns a fast per-turn ThinkingConfig tailored to `model_name`:
+    - `flash-lite`: uses `ThinkingLevel.MINIMAL`.
+    - `gemini-3.8-flash` (and 3.x non-lite): uses `ThinkingLevel.LOW` for fast multimodal spatial/UI acuity.
     All player reasoning is emitted directly in the Rationale-First `deliberation` JSON property (Rule 4).
     """
     try:
@@ -67,16 +87,19 @@ def _playtest_non_thinking_config(model_name: str) -> Any:
             return None
         m_low = (model_name or "").strip().lower()
         thinking_lvl = getattr(types, "ThinkingLevel", None)
-        if "flash-lite" in m_low and thinking_lvl is not None and hasattr(thinking_lvl, "MINIMAL"):
-            return thinking_cls(thinking_level=thinking_lvl.MINIMAL)
+        if thinking_lvl is not None:
+            if "flash-lite" in m_low and hasattr(thinking_lvl, "MINIMAL"):
+                return thinking_cls(thinking_level=thinking_lvl.MINIMAL)
+            if m_low.startswith(("gemini-3.", "gemini-3-")) and hasattr(thinking_lvl, "LOW"):
+                return thinking_cls(thinking_level=thinking_lvl.LOW)
         return thinking_cls(thinking_budget=0)
     except Exception:
         return None
 
 
 def _playtest_report_thinking_config(model_name: str, budget: int = 2048) -> Any:
-    """Returns a bounded ThinkingConfig for the once-per-session `PlaytestExperienceReport` synthesis so the
-    model carefully inspects HIGH-resolution screenshots and cross-checks visual craft, progression, and audio.
+    """Returns a deep ThinkingConfig (`ThinkingLevel.HIGH` on `gemini-3.8-flash`, `MEDIUM` on `flash-lite`)
+    for the once-per-session `PlaytestExperienceReport` synthesis across up to 5 HIGH-resolution screenshots.
     """
     try:
         from google.genai import types
@@ -85,11 +108,14 @@ def _playtest_report_thinking_config(model_name: str, budget: int = 2048) -> Any
             return None
         m_low = (model_name or "").strip().lower()
         thinking_lvl = getattr(types, "ThinkingLevel", None)
-        if "flash-lite" in m_low and thinking_lvl is not None:
-            if hasattr(thinking_lvl, "MEDIUM"):
-                return thinking_cls(thinking_level=thinking_lvl.MEDIUM)
-            if hasattr(thinking_lvl, "MINIMAL"):
-                return thinking_cls(thinking_level=thinking_lvl.MINIMAL)
+        if thinking_lvl is not None:
+            if "flash-lite" in m_low:
+                if hasattr(thinking_lvl, "MEDIUM"):
+                    return thinking_cls(thinking_level=thinking_lvl.MEDIUM)
+                if hasattr(thinking_lvl, "MINIMAL"):
+                    return thinking_cls(thinking_level=thinking_lvl.MINIMAL)
+            if m_low.startswith(("gemini-3.", "gemini-3-")) and hasattr(thinking_lvl, "HIGH"):
+                return thinking_cls(thinking_level=thinking_lvl.HIGH)
         return bounded_thinking_config(budget=budget)
     except Exception:
         return None
@@ -314,12 +340,14 @@ def build_blind_player_system_prompt(store_card: BlindStoreCard) -> str:
         "VISUAL & UI CRAFT HONESTY (LOOK WITH CRITICAL HUMAN EYES):\n"
         "- Never grade visuals or UI on a curve. Before describing `graphics_and_visuals` or UI overlays positively, actively "
         "scan the screen for universal rendering and layout defects:\n"
-        "  1. Sprite & icon slicing glitches: sprites sliced mid-graphic, stray floating edge slivers bleeding in from adjacent "
-        "sprite-sheet/atlas frames, or icons stretched, squished, or clipped inside UI slots/buttons.\n"
+        "  1. Sprite & icon slicing / empty-slot glitches: sprites sliced mid-graphic or showing only a fractional corner, "
+        "stray floating edge slivers bleeding in from adjacent sprite-sheet/atlas frames, empty/blank icon boxes inside open "
+        "UI menus or hotbars where sibling slots show icons, or icons stretched, squished, or clipped inside UI slots/buttons.\n"
         "  2. UI layout & typography bugs: text spilling outside its panel/box background, labels chopped off mid-word or colliding "
         "with neighboring elements, overlapping HUD panels, or tiny/low-contrast unreadable text.\n"
-        "  3. Texture seams & style clashes: harsh unblended rectangular texture boxes pasted inside irregular polygons, visible "
-        "grid/tile seams, or crude untextured flat placeholder polygons clashing jarringly with detailed raster art.\n"
+        "  3. Placeholder shapes, texture seams & style clashes: crude flat solid-color geometric placeholder shapes (unshaded "
+        "triangles, rectangles, or circles) standing in for world structures or icons alongside rendered artwork, harsh unblended "
+        "rectangular texture boxes pasted inside irregular polygons, visible grid/tile seams, or large untextured flat terrain polygons.\n"
         "- Whenever any of these defects appear on screen, call them out plainly in `impression_updates` and log each distinct "
         "issue in `bug_reports` (`category='visual_glitch'` or `'input_ui_bug'`).\n\n"
         "PLAYER FIELD NOTES, QUESTIONS & RULEBOOK:\n"
@@ -435,6 +463,7 @@ class BlindPlaytesterAgent:
         self._has_seen_high_res_frame: bool = False
         self._opening_screenshot_path: Optional[Path] = None
         self._distinct_mid_screenshot: Optional[Tuple[int, float, Path]] = None
+        self._session_screenshots: List[Tuple[int, Path, bool]] = []
         self.prev_observation: Optional[TurnObservation] = None
         self._last_click_spot: Optional[Tuple[float, float, str]] = None
         self._same_spot_click_streak: int = 0
@@ -461,6 +490,7 @@ class BlindPlaytesterAgent:
         self._has_seen_high_res_frame = False
         self._opening_screenshot_path = None
         self._distinct_mid_screenshot = None
+        self._session_screenshots.clear()
         self.prev_observation = None
         self._last_click_spot = None
         self._same_spot_click_streak = 0
@@ -768,13 +798,15 @@ class BlindPlaytesterAgent:
         self.token_tracker.check_budget()
         contents, perception_meta = self.build_turn_contents(turn_index, obs)
 
-        gen_cfg = types.GenerateContentConfig(
-            system_instruction=self.system_prompt,
-            response_mime_type="application/json",
-            response_schema=self.turn_schema,
-            temperature=0.55,
-            thinking_config=_playtest_non_thinking_config(self.config.model_name),
-        )
+        gen_cfg_kwargs: Dict[str, Any] = {
+            "system_instruction": self.system_prompt,
+            "response_mime_type": "application/json",
+            "response_schema": self.turn_schema,
+            "thinking_config": _playtest_non_thinking_config(self.config.model_name),
+        }
+        if not _uses_gemini_3_defaults(self.config.model_name):
+            gen_cfg_kwargs["temperature"] = 0.55
+        gen_cfg = types.GenerateContentConfig(**gen_cfg_kwargs)
 
         resp = self._call_gemini_resilient(
             model=self.config.model_name,
@@ -902,6 +934,8 @@ class BlindPlaytesterAgent:
         tape_line = self._format_append_tape_line(turn_index, obs, decision)
         self.epoch_turn_lines.append((turn_index, tape_line))
         if obs.screenshot_path is not None and obs.screenshot_path.is_file():
+            is_high_res = perception_meta.get("image_resolution") == "HIGH"
+            self._session_screenshots.append((turn_index, obs.screenshot_path, is_high_res))
             if self._opening_screenshot_path is None:
                 self._opening_screenshot_path = obs.screenshot_path
             else:
@@ -995,12 +1029,14 @@ class BlindPlaytesterAgent:
             f"NEW COMPLETED TURNS TO FOLD INTO YOUR JOURNAL ( up through Turn #{up_to_turn} ):\n{folded_text}"
         )
 
-        gen_cfg = types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=self.compaction_schema,
-            temperature=0.3,
-            thinking_config=_playtest_non_thinking_config(self.config.model_name),
-        )
+        compact_cfg_kwargs: Dict[str, Any] = {
+            "response_mime_type": "application/json",
+            "response_schema": self.compaction_schema,
+            "thinking_config": _playtest_non_thinking_config(self.config.model_name),
+        }
+        if not _uses_gemini_3_defaults(self.config.model_name):
+            compact_cfg_kwargs["temperature"] = 0.3
+        gen_cfg = types.GenerateContentConfig(**compact_cfg_kwargs)
         resp = self._call_gemini_resilient(
             model=self.config.model_name,
             contents=prompt,
@@ -1021,6 +1057,86 @@ class BlindPlaytesterAgent:
         self.epoch_header_text = self._render_epoch_header_text()
         self.epoch_turn_lines = carryover_lines
         return updated_journal, up_to_turn, tok_stats
+
+    def _select_stratified_report_screenshots(
+        self,
+        final_screenshot_path: Optional[Path] = None,
+    ) -> List[Tuple[str, Path]]:
+        """Selects up to 5 stratified, visually distinct screenshots across the session so that dark modal
+        overlays or single end-of-session screens never mask open-world terrain, entities, or UI menus:
+        1. Opening screen (`turn_1` / `_opening_screenshot_path`)
+        2. Early exploration (~25% session index, preferring non-blackout frames with mean luminance >= 35)
+        3. Mid-session open-world gameplay (~55% session index, preferring mean luminance >= 35)
+        4. Peak distinct UI / HIGH-resolution inspection frame (highest MSE vs opening frame)
+        5. Final screen (`final_screenshot_path` or last recorded turn)
+        """
+        valid_records: List[Tuple[int, Path, bool]] = [
+            (t_idx, p, hi)
+            for t_idx, p, hi in self._session_screenshots
+            if p is not None and p.is_file()
+        ]
+        if not valid_records:
+            fallback: List[Tuple[str, Path]] = []
+            if self._opening_screenshot_path is not None and self._opening_screenshot_path.is_file():
+                fallback.append(("Opening screen of your session", self._opening_screenshot_path))
+            if self._distinct_mid_screenshot is not None and self._distinct_mid_screenshot[2].is_file():
+                mid_t, _, mid_p = self._distinct_mid_screenshot
+                fallback.append((f"Mid-session screen (Turn #{mid_t})", mid_p))
+            if final_screenshot_path is not None and final_screenshot_path.is_file():
+                fallback.append(("Final screen at the end of your session", final_screenshot_path))
+            return fallback
+
+        open_turn, open_path, _ = valid_records[0]
+        if self._opening_screenshot_path is not None and self._opening_screenshot_path.is_file():
+            open_path = self._opening_screenshot_path
+
+        def _pick_near_fraction(frac: float, label_prefix: str) -> Optional[Tuple[str, Path]]:
+            if len(valid_records) < 3:
+                return None
+            target_idx = max(1, min(len(valid_records) - 2, int(round(frac * (len(valid_records) - 1)))))
+            window_lo = max(1, target_idx - 2)
+            window_hi = min(len(valid_records) - 1, target_idx + 3)
+            window = valid_records[window_lo:window_hi] or [valid_records[target_idx]]
+            bright = [rec for rec in window if _frame_mean_luminance(rec[1]) >= 35.0]
+            pool = bright if bright else window
+            best_rec = min(pool, key=lambda rec: abs(valid_records.index(rec) - target_idx))
+            return (f"{label_prefix} (Turn #{best_rec[0]})", best_rec[1])
+
+        selected: List[Tuple[str, Path]] = [
+            (f"Opening screen of your session (Turn #{open_turn})", open_path)
+        ]
+
+        early_pick = _pick_near_fraction(0.25, "Early exploration screen")
+        if early_pick is not None:
+            selected.append(early_pick)
+
+        mid_pick = _pick_near_fraction(0.55, "Mid-session gameplay screen")
+        if mid_pick is not None:
+            selected.append(mid_pick)
+
+        # Peak distinct UI / HIGH-resolution inspection frame
+        best_hi_rec: Optional[Tuple[int, float, Path]] = None
+        best_any_rec: Optional[Tuple[int, float, Path]] = None
+        for t_idx, p, is_hi in valid_records[1:]:
+            mse_val = compute_frame_mse(open_path, p)
+            if mse_val < 0.005:
+                continue
+            if is_hi and (best_hi_rec is None or mse_val >= best_hi_rec[1]):
+                best_hi_rec = (t_idx, mse_val, p)
+            if best_any_rec is None or mse_val >= best_any_rec[1]:
+                best_any_rec = (t_idx, mse_val, p)
+
+        peak_rec = best_hi_rec or best_any_rec or self._distinct_mid_screenshot
+        if peak_rec is not None and peak_rec[2].is_file():
+            selected.append((f"Distinct UI / inspection screen (Turn #{peak_rec[0]})", peak_rec[2]))
+
+        if final_screenshot_path is not None and final_screenshot_path.is_file():
+            selected.append(("Final screen at the end of your session", final_screenshot_path))
+        elif len(valid_records) >= 2:
+            last_t, last_p, _ = valid_records[-1]
+            selected.append((f"Final screen at the end of your session (Turn #{last_t})", last_p))
+
+        return selected
 
     def generate_experience_report(
         self,
@@ -1140,13 +1256,14 @@ class BlindPlaytesterAgent:
             "- VISUAL & UI PIXEL AUDIT FIRST: Closely inspect the attached HIGH-resolution session screenshot(s) BEFORE "
             "writing `graphics_and_visuals`, and override any overly generous early `Sparse Running Pillar Impressions` or "
             "Store Page Description marketing language if high-resolution pixels show defects. Enumerate every visible "
-            "visual/UI flaw in `visual_and_ui_defects_observed`, checking specifically for: (1) cut-off sprites or stray "
-            "floating edge slivers bleeding in from adjacent sprite-sheet/atlas frames, (2) stretched, squished, or clipped "
-            "icons inside UI slots/buttons, (3) text spilling outside panel/box borders, colliding with siblings, or "
-            "chopped off mid-word, (4) overlapping HUD panels or unreadable low-contrast labels, and (5) harsh unblended "
-            "rectangular texture boxes pasted inside irregular polygons or crude untextured flat placeholder polygons "
-            "clashing with detailed raster art. Never call graphics or UI 'clean', 'polished', or 'highly legible' when "
-            "such defects appear on screen!\n"
+            "visual/UI flaw in `visual_and_ui_defects_observed`, checking specifically for: (1) cut-off sprites, quarter-corner "
+            "slices of an object, or stray floating edge slivers bleeding in from adjacent sprite-sheet/atlas frames, "
+            "(2) blank/empty UI icon boxes (missing icons inside recipe, inventory, or hotbar slots where other slots show icons) "
+            "or stretched, squished, or clipped icons inside UI slots/buttons, (3) text spilling outside panel/box borders, "
+            "colliding with siblings, or chopped off mid-word, (4) overlapping HUD panels or unreadable low-contrast labels, "
+            "and (5) harsh unblended rectangular texture boxes pasted inside irregular polygons, missing building/world "
+            "textures, or crude flat solid-color geometric placeholder triangles/rectangles clashing with detailed raster art. "
+            "Never call graphics or UI 'clean', 'polished', or 'highly legible' when such defects appear on screen!\n"
             "- PROGRESSION, AUDIO & AGENCY AUDIT: Report only what visibly and audibly progressed rather than what you "
             "hoped an action did. Explicitly call out if objectives stayed stuck at 0, if repeated actions had no effect, "
             "if audio was silent or cut out, or if mechanics played themselves without meaningful player decisions, and "
@@ -1159,13 +1276,7 @@ class BlindPlaytesterAgent:
         if representative_screenshots:
             candidate_shots.extend(representative_screenshots)
         else:
-            if self._opening_screenshot_path is not None:
-                candidate_shots.append(("Opening screen of your session", self._opening_screenshot_path))
-            if self._distinct_mid_screenshot is not None:
-                mid_t, _, mid_p = self._distinct_mid_screenshot
-                candidate_shots.append((f"Mid-session screen (Turn #{mid_t})", mid_p))
-            if final_screenshot_path is not None:
-                candidate_shots.append(("Final screen at the end of your session", final_screenshot_path))
+            candidate_shots.extend(self._select_stratified_report_screenshots(final_screenshot_path))
 
         seen_shot_paths: set[str] = set()
         dedup_shots: List[Tuple[str, Path]] = []
@@ -1178,7 +1289,7 @@ class BlindPlaytesterAgent:
             seen_shot_paths.add(resolved_key)
             dedup_shots.append((label, shot_path))
 
-        for label, shot_path in dedup_shots[:3]:
+        for label, shot_path in dedup_shots[:5]:
             img_bytes = shot_path.read_bytes()
             if img_bytes:
                 tail_parts.append(types.Part.from_text(text=f"{label} (HIGH resolution for visual/UI craft audit):"))
@@ -1197,13 +1308,15 @@ class BlindPlaytesterAgent:
         contents.append(types.Content(role="user", parts=tail_parts))
 
         report_model = (self.config.report_model_name or self.config.model_name).strip()
-        gen_cfg = types.GenerateContentConfig(
-            system_instruction=self.system_prompt,
-            response_mime_type="application/json",
-            response_schema=self.report_schema,
-            temperature=0.35,
-            thinking_config=_playtest_report_thinking_config(report_model),
-        )
+        report_cfg_kwargs: Dict[str, Any] = {
+            "system_instruction": self.system_prompt,
+            "response_mime_type": "application/json",
+            "response_schema": self.report_schema,
+            "thinking_config": _playtest_report_thinking_config(report_model),
+        }
+        if not _uses_gemini_3_defaults(report_model):
+            report_cfg_kwargs["temperature"] = 0.35
+        gen_cfg = types.GenerateContentConfig(**report_cfg_kwargs)
         resp = self._call_gemini_resilient(
             model=report_model,
             contents=contents,

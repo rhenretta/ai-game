@@ -579,7 +579,15 @@ class BuildSupervisor:
                 failure_reason=gate_b.details,
                 asset_violations=gate_b.diagnostic_data.get("violations", [gate_b.details]),
                 remedy_type=RemedyType.REGENERATE_ASSET,
-                recommended_remedy="Ensure audio has valid 44-byte RIFF WAV header, visual assets have 8-byte PNG header, and narrative dialogue tree is valid.",
+                recommended_remedy=(
+                    "Regenerate broken/placeholder visual assets or empty multi-cell atlases in-place, and fix any "
+                    "GDScript region-slicing or unbound texture-load defects reported by Gate B."
+                ),
+                remedy_parameters={
+                    "offending_assets": list(gate_b.diagnostic_data.get("offending_assets") or []),
+                    "offending_scripts": list(gate_b.diagnostic_data.get("offending_scripts") or []),
+                    "asset_metadata": dict(gate_b.diagnostic_data.get("asset_metadata") or {}),
+                },
             )
             return gate_results, trace
 
@@ -591,6 +599,7 @@ class BuildSupervisor:
         gate_results["Gate C: Headless Execution & Progression"] = gate_c
         gate_results["Gate C: Survivability"] = gate_c
         if not gate_c.passed:
+            is_scene_asset_fail = gate_c.failure_type == GateFailureType.ASSET_INTEGRITY_VIOLATION
             trace = RejectionDiagnosticTrace(
                 deliberation=f"Gate C rejected candidate build: {gate_c.details}",
                 candidate_id=candidate_id,
@@ -600,8 +609,18 @@ class BuildSupervisor:
                 failure_type=gate_c.failure_type,
                 failure_reason=gate_c.details,
                 runtime_traceback=gate_c.diagnostic_data.get("traceback"),
-                remedy_type=RemedyType.REPAIR_CODE_EXCEPTION,
-                recommended_remedy="Resolve runtime crash or frozen progression during headless scene simulation.",
+                asset_violations=list(gate_c.diagnostic_data.get("violations") or []),
+                remedy_type=RemedyType.REGENERATE_ASSET if is_scene_asset_fail else RemedyType.REPAIR_CODE_EXCEPTION,
+                recommended_remedy=(
+                    "Resolve runtime empty atlas regions, unbound null Sprite2D/TextureRect textures, or untextured "
+                    "tiled Polygon2D surfaces in the active Godot scene tree."
+                    if is_scene_asset_fail
+                    else "Resolve runtime crash or frozen progression during headless scene simulation."
+                ),
+                remedy_parameters={
+                    "offending_assets": list(gate_c.diagnostic_data.get("offending_assets") or []),
+                    "offending_scripts": list(gate_c.diagnostic_data.get("offending_scripts") or []),
+                },
             )
             return gate_results, trace
 
@@ -722,6 +741,33 @@ class BuildSupervisor:
                     completed_slices = len(slices)
             except Exception:
                 return None
+
+        # Post-approval tamper/mutation guard: do NOT rubber-stamp `backlog.json` if any production
+        # `.gd`, `.tscn`, or game `assets/` file was modified AFTER `backlog.json` was approved!
+        try:
+            backlog_mtime = backlog_path.stat().st_mtime
+            excluded_dirs = {"playtest_captures", "mockups", "concepts", "artifacts", "tests", ".godot"}
+            for check_p in candidate_dir.rglob("*"):
+                if not check_p.is_file():
+                    continue
+                rel_parts = check_p.relative_to(candidate_dir).parts
+                if set(rel_parts) & excluded_dirs:
+                    continue
+                rel_posix = check_p.relative_to(candidate_dir).as_posix()
+                if rel_posix in ("src/studio_rig_and_collider.gd", "assets/asset_library.json"):
+                    continue
+                is_prod_code = check_p.suffix.lower() in (".gd", ".tscn")
+                is_game_asset = rel_posix.startswith("assets/") and check_p.suffix.lower() in (".png", ".wav", ".jpg", ".jpeg")
+                if (is_prod_code or is_game_asset) and check_p.stat().st_mtime > backlog_mtime + 2.0:
+                    logger.warning(
+                        "Gate F fast-path invalidated on %s: '%s' was modified %.1fs after backlog.json!",
+                        candidate_dir.name,
+                        rel_posix,
+                        check_p.stat().st_mtime - backlog_mtime,
+                    )
+                    return None
+        except Exception:
+            pass
 
         return {
             "board_managed": True,
@@ -1247,8 +1293,15 @@ class BuildSupervisor:
         )
 
     def verify_gate_b_multimodal_assets(self, candidate_dir: Path) -> QualityGateResult:
-        """Gate B: Verifies multimodal asset integrity (RIFF WAV audio, PNG sprites, acyclic narrative dialogue tree)."""
-        validator = self.asset_validator or AssetValidator()
+        """Gate B: Verifies multimodal asset integrity (RIFF WAV audio, PNG sprites/UI/atlases, GDScript slicing parity, acyclic narrative dialogue tree)."""
+        validator = self.asset_validator or AssetValidator(
+            gemini_client=self.gemini_client,
+            event_bus=self.event_bus,
+        )
+        if getattr(validator, "gemini_client", None) is None and self.gemini_client is not None:
+            validator.gemini_client = self.gemini_client
+        if getattr(validator, "event_bus", None) is None and self.event_bus is not None:
+            validator.event_bus = self.event_bus
         return validator.validate_cartridge_assets(candidate_dir)
 
     def verify_gate_c_headless_execution(
@@ -1256,20 +1309,57 @@ class BuildSupervisor:
         candidate_dir: Path,
         max_ticks: int = 120,
     ) -> Tuple[QualityGateResult, Optional[Any]]:
-        """Gate C: Spins up headless simulation, steps discrete ticks with synthetic inputs, tracks progression & exceptions."""
+        """Gate C: Spins up headless simulation, steps discrete ticks with synthetic inputs, tracks progression & runtime scene visual integrity."""
         candidate_dir = Path(candidate_dir).resolve()
         if (candidate_dir / "project.godot").is_file():
+            import re as _re
             from engine.sim.godot_verifier import GodotHeadlessSimulator
             sim = GodotHeadlessSimulator(cartridge_path=candidate_dir, max_ticks=max_ticks, telemetry_mode="in_memory")
             try:
                 sim.run_until_complete(max_steps=max_ticks)
+                scene_audit = dict(getattr(sim, "scene_audit", {}) or {})
+                scene_visual_violations: List[str] = []
+                for key_label, audit_key in (
+                    ("Empty sprite sheet cell", "empty_sprite_frame_nodes"),
+                    ("Empty AtlasTexture/region crop", "empty_atlas_region_nodes"),
+                    ("Unbound null-texture visual node", "null_texture_visual_nodes"),
+                    ("Untextured tiled Polygon2D surface", "untextured_world_polygons"),
+                ):
+                    for item_msg in (scene_audit.get(audit_key) or []):
+                        scene_visual_violations.append(f"{key_label}: {item_msg}")
+                if scene_audit.get("portrait_misused_on_world_sprite"):
+                    for p_msg in (scene_audit.get("portrait_misused_nodes") or []):
+                        scene_visual_violations.append(f"Dialogue portrait misused on world Sprite2D: {p_msg}")
+
+                if scene_visual_violations:
+                    off_assets: List[str] = []
+                    for v_msg in scene_visual_violations:
+                        for m_png in _re.findall(r"(?:res://)?(assets/[A-Za-z0-9_./-]+\.png)", v_msg):
+                            if (candidate_dir / m_png).is_file() and m_png not in off_assets:
+                                off_assets.append(m_png)
+                    details_str = "; ".join(scene_visual_violations[:8])
+                    return QualityGateResult(
+                        deliberation=f"Gate C REJECTED due to runtime scene visual/texture integrity defects: {details_str}",
+                        gate_name="Gate C: Headless Execution & Progression",
+                        passed=False,
+                        failure_type=GateFailureType.ASSET_INTEGRITY_VIOLATION,
+                        details=details_str,
+                        diagnostic_data={
+                            "godot": True,
+                            "ticks": sim.ticks_executed,
+                            "scene_audit": scene_audit,
+                            "violations": scene_visual_violations,
+                            "offending_assets": off_assets,
+                        },
+                    ), sim
+
                 return QualityGateResult(
-                    deliberation="Headless Godot simulation executed without errors.",
+                    deliberation="Headless Godot simulation executed without errors and passed runtime scene texture/atlas audit.",
                     gate_name="Gate C: Headless Execution & Progression",
                     passed=True,
                     failure_type=GateFailureType.NONE,
                     details=f"Godot headless simulation completed {sim.ticks_executed} ticks.",
-                    diagnostic_data={"godot": True, "ticks": sim.ticks_executed},
+                    diagnostic_data={"godot": True, "ticks": sim.ticks_executed, "scene_audit": scene_audit},
                 ), sim
             except Exception as exc:
                 return QualityGateResult(
@@ -2098,17 +2188,21 @@ class BuildSupervisor:
         return blockers
 
 
-def build_qa_gate_work_item_proposal(
+def build_qa_gate_work_item_proposals(
     candidate_dir: Path,
     trace: RejectionDiagnosticTrace,
     pass_index: int = 0,
     slice_id: str = "",
     existing_item_ids: Optional[Set[str]] = None,
     supported_kinds: Optional[Set[str]] = None,
-) -> Any:
-    """Translates a BuildSupervisor `RejectionDiagnosticTrace` into a tracked, Rationale-First
-    `WorkItemProposal` for the Continuous Production Board so QA gate self-repair executes
-    through Task Lead + ContextCurator + Council Review instead of mutating files off-board.
+) -> List[Any]:
+    """Translates a BuildSupervisor `RejectionDiagnosticTrace` into one or more Rationale-First
+    `WorkItemProposal`s for the Continuous Production Board:
+    - For broken/empty visual PNGs (`offending_assets`), emits 1 atomic `visual_asset` task per broken file
+      (specifying exact `target_path` for in-place overwrite + catalog grid/purpose metadata).
+    - When GDScript slicing/texture-wiring bugs (`offending_scripts`) or code/runtime defects are also present,
+      emits a dependent `mechanic_code` / `integration` task (`depends_on=[<visual_asset_ids>]`) so SWE reintegrates
+      and fixes `.gd` code right after asset regeneration completes.
     """
     import re as _re
     from engine.studio.models import WorkItemProposal
@@ -2124,13 +2218,112 @@ def build_qa_gate_work_item_proposal(
         or "Resolve the reported quality gate defect cleanly in the playable cartridge."
     ).strip()
 
+    rem_params = dict(getattr(trace, "remedy_parameters", None) or {})
+    asset_meta_map: Dict[str, Dict[str, Any]] = dict(rem_params.get("asset_metadata") or {})
+    taken: Set[str] = set(existing_item_ids or set())
+
+    def _alloc_id(base_slug: str) -> str:
+        cand = base_slug
+        sfx = 2
+        while cand in taken:
+            cand = f"{base_slug}_{sfx}"
+            sfx += 1
+        taken.add(cand)
+        return cand
+
+    offending_assets: List[str] = []
+    for raw_a in (rem_params.get("offending_assets") or []):
+        norm_a = str(raw_a or "").strip().replace("\\", "/").replace("res://", "").lstrip("/")
+        if norm_a.startswith("assets/") and norm_a.lower().endswith(".png") and norm_a not in offending_assets:
+            offending_assets.append(norm_a)
+
+    diag_blob = "\n".join(
+        str(part or "")
+        for part in (
+            fail_reason,
+            getattr(trace, "runtime_traceback", ""),
+            " ".join(str(v) for v in (getattr(trace, "asset_violations", None) or [])),
+        )
+    )
+    if fail_type == GateFailureType.ASSET_INTEGRITY_VIOLATION and not offending_assets:
+        for m_png in _re.findall(r"(?:res://)?(assets/(?:sprites|ui|tiles|portraits)/[A-Za-z0-9_./-]+\.png)", diag_blob):
+            if m_png not in offending_assets and not rem_params.get("offending_scripts"):
+                offending_assets.append(m_png)
+
+    proposals: List[Any] = []
+    visual_item_ids: List[str] = []
+    slice_slug = _re.sub(r"[^a-z0-9]+", "_", (slice_id or "slice").lower()).strip("_")[:20] or "slice"
+
+    can_emit_visual = (not supported_kinds) or ("visual_asset" in supported_kinds)
+    if offending_assets and can_emit_visual:
+        for rel_asset in offending_assets[:8]:
+            a_stem = _re.sub(r"[^a-z0-9]+", "_", Path(rel_asset).stem.lower()).strip("_")[:28] or "asset"
+            v_id = _alloc_id(f"qa_regen_{a_stem}_{slice_slug}_p{pass_index}")
+            meta = asset_meta_map.get(rel_asset, {})
+            grid_wh = meta.get("grid") or [1, 1]
+            g_cols, g_rows = max(1, int(grid_wh[0])), max(1, int(grid_wh[1]))
+            px_wh = meta.get("size") or [128, 128]
+            fmode = str(meta.get("mode") or ("diegetic_ui" if rel_asset.startswith("assets/ui/") else "static_sprite"))
+            purpose = str(meta.get("purpose") or f"Production visual asset at {rel_asset}")
+            grid_clause = (
+                f"Multi-cell {g_cols}x{g_rows} atlas (`grid_cols={g_cols}, grid_rows={g_rows}`, populate all {g_cols * g_rows} cells via `cell_prompts`)"
+                if g_cols * g_rows > 1
+                else "Single-frame (`1x1`) clean alpha sprite/tile"
+            )
+            v_spec = (
+                f"Regenerate broken visual asset `{rel_asset}` (`res://{rel_asset}`) in-place so existing cartridge references heal cleanly:\n"
+                f"- Target Path (overwrite in-place): `{rel_asset}` (`res://{rel_asset}`)\n"
+                f"- Fabrication Mode: `{fmode}` | Pixel Size: `{px_wh[0]}x{px_wh[1]}` | Grid Contract: {grid_clause}\n"
+                f"- Asset Purpose: {purpose}\n"
+                f"- QA Gate Diagnostic: {fail_reason[:500]}\n"
+                f"Acceptance Criteria:\n"
+                f"1. Synthesize high-craft artwork matching `game_bible.json` `visual_style_guide` and `assets/mockups/` concept references (zero flat geometric placeholder shapes).\n"
+                f"2. Write directly to `{rel_asset}` (`force_regenerate=True`) and verify non-empty alpha across every required cell."
+            )
+            v_proof = (
+                f"Render inspection plate `plate_{v_id}.png` for `{rel_asset}` confirming full stylistic alignment with "
+                f"`game_bible.json` and non-empty artwork across all {g_cols}x{g_rows} cell(s)."
+            )
+            proposals.append(
+                WorkItemProposal(
+                    deliberation=(
+                        f"{fail_gate} identified defective visual asset '{rel_asset}' ({fail_reason[:180]}). "
+                        f"Spawning dedicated `visual_asset` regeneration task '{v_id}' targeting '{rel_asset}' in-place."
+                    ),
+                    item_id=v_id,
+                    kind="visual_asset",
+                    title=f"Regenerate Visual Asset: {Path(rel_asset).name}",
+                    spec=v_spec,
+                    proof_spec=v_proof,
+                    depends_on=[],
+                    blocks_items=[],
+                    target_modules=[rel_asset],
+                    slice_id=slice_id,
+                )
+            )
+            visual_item_ids.append(v_id)
+
+    offending_scripts_raw: List[str] = [
+        str(s or "").strip().replace("\\", "/").replace("res://", "").lstrip("/")
+        for s in (rem_params.get("offending_scripts") or [])
+        if str(s or "").strip()
+    ]
+    needs_code_task = (
+        not visual_item_ids
+        or bool(offending_scripts_raw)
+        or fail_gate.startswith("Gate C")
+        or bool(_re.search(r"[A-Za-z0-9_./-]+\.(?:gd|tscn)\b", diag_blob))
+    )
+    if not needs_code_task:
+        return proposals
+
     mechanic_failure_types = {
         GateFailureType.SYNTAX_AST_ERROR,
         GateFailureType.UNHANDLED_EXCEPTION,
         GateFailureType.PROGRESSION_FAILURE,
         GateFailureType.FRAME_BUDGET_EXCEEDED,
     }
-    kind = "mechanic_code" if fail_type in mechanic_failure_types else "integration"
+    kind = "mechanic_code" if (fail_type in mechanic_failure_types or offending_scripts_raw) else "integration"
     if supported_kinds:
         if kind not in supported_kinds:
             if "integration" in supported_kinds:
@@ -2166,15 +2359,9 @@ def build_qa_gate_work_item_proposal(
         ):
             target_modules.append(cleaned)
 
+    for s_mod in offending_scripts_raw:
+        _add_candidate_module(s_mod)
     _add_candidate_module(getattr(trace, "file_path", None))
-    diag_blob = "\n".join(
-        str(part or "")
-        for part in (
-            fail_reason,
-            getattr(trace, "runtime_traceback", ""),
-            " ".join(str(v) for v in (getattr(trace, "asset_violations", None) or [])),
-        )
-    )
     for m_mod in _re.findall(r"(?:res://)?([A-Za-z0-9_./-]+\.(?:gd|tscn|json))", diag_blob):
         _add_candidate_module(m_mod)
 
@@ -2196,14 +2383,7 @@ def build_qa_gate_work_item_proposal(
 
     gate_slug = _re.sub(r"[^a-z0-9]+", "_", fail_gate.lower().split(":")[0]).strip("_") or "qa_gate"
     type_slug = _re.sub(r"[^a-z0-9]+", "_", fail_type_str.lower()).strip("_")[:28] or "remediation"
-    slice_slug = _re.sub(r"[^a-z0-9]+", "_", (slice_id or "slice").lower()).strip("_")[:24] or "slice"
-    base_id = f"qa_{gate_slug}_{type_slug}_{slice_slug}_p{pass_index}"
-    item_id = base_id
-    taken = existing_item_ids or set()
-    suffix = 2
-    while item_id in taken:
-        item_id = f"{base_id}_{suffix}"
-        suffix += 1
+    item_id = _alloc_id(f"qa_{gate_slug}_{type_slug}_{slice_slug}_p{pass_index}")
 
     extra_lines: List[str] = []
     if getattr(trace, "file_path", None):
@@ -2226,28 +2406,50 @@ def build_qa_gate_work_item_proposal(
         f"- Recommended Engineering Remedy: {rec_remedy}"
         f"{extra_context}\n"
         f"Acceptance Criteria:\n"
-        f"1. Fix the root cause in production cartridge modules ({', '.join(target_modules[:4])})—never mask errors or touch `tests/test_*` in place of production fixes.\n"
+        f"1. Fix the root cause in production cartridge modules ({', '.join(target_modules[:4])})—ensure texture region slicing matches `asset_library.json` `(hframes, vframes)`, bind every loaded `Texture2D` onto its target `Sprite2D`/`TextureRect`/`Polygon2D`, and never mask errors or touch `tests/test_*` in place of production fixes.\n"
         f"2. Verify that `res://main.tscn` boots cleanly, maintains 60 FPS steady-state frame budget (< 16.6ms avg), and preserves active gameplay progression."
     )
     proof_spec = (
-        f"Capture an authentic gameplay filmstrip on `res://main.tscn` demonstrating clean boot, responsive active gameplay "
-        f"progression, and full resolution of the {fail_gate} ({fail_type_str}) diagnostic with zero runtime script errors."
+        f"Capture an authentic gameplay filmstrip on `res://main.tscn` demonstrating clean boot, intact sprite/UI/terrain rendering, "
+        f"responsive active gameplay progression, and full resolution of the {fail_gate} ({fail_type_str}) diagnostic with zero runtime script errors."
     )
 
-    return WorkItemProposal(
-        deliberation=(
-            f"{fail_gate} ({fail_type_str}) rejected candidate cartridge '{c_dir.name}' ({fail_reason[:240]}). "
-            f"Creating tracked Production Board task '{item_id}' targeting {target_modules[:4]} so the Task Lead, "
-            f"domain specialists, and Specialist Council diagnose, fix, and visually verify the resolution on-board."
-        ),
-        item_id=item_id,
-        kind=kind,
-        title=f"QA {fail_gate.split(':')[0].strip()} Remediation: {fail_type_str.replace('_', ' ').title()}",
-        spec=spec_text,
-        proof_spec=proof_spec,
-        depends_on=[],
-        blocks_items=[],
-        target_modules=target_modules[:6],
-        slice_id=slice_id,
+    proposals.append(
+        WorkItemProposal(
+            deliberation=(
+                f"{fail_gate} ({fail_type_str}) rejected candidate cartridge '{c_dir.name}' ({fail_reason[:240]}). "
+                f"Creating tracked Production Board task '{item_id}' targeting {target_modules[:4]} so the Task Lead, "
+                f"domain specialists, and Specialist Council diagnose, fix, and visually verify the resolution on-board."
+            ),
+            item_id=item_id,
+            kind=kind,
+            title=f"QA {fail_gate.split(':')[0].strip()} Remediation: {fail_type_str.replace('_', ' ').title()}",
+            spec=spec_text,
+            proof_spec=proof_spec,
+            depends_on=list(visual_item_ids),
+            blocks_items=[],
+            target_modules=target_modules[:6],
+            slice_id=slice_id,
+        )
     )
+    return proposals
+
+
+def build_qa_gate_work_item_proposal(
+    candidate_dir: Path,
+    trace: RejectionDiagnosticTrace,
+    pass_index: int = 0,
+    slice_id: str = "",
+    existing_item_ids: Optional[Set[str]] = None,
+    supported_kinds: Optional[Set[str]] = None,
+) -> Any:
+    """Backward-compatible single-item wrapper around `build_qa_gate_work_item_proposals`."""
+    return build_qa_gate_work_item_proposals(
+        candidate_dir=candidate_dir,
+        trace=trace,
+        pass_index=pass_index,
+        slice_id=slice_id,
+        existing_item_ids=existing_item_ids,
+        supported_kinds=supported_kinds,
+    )[0]
 

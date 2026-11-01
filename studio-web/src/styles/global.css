@@ -1418,7 +1418,7 @@ dialog.studio-dialog::backdrop {
 
 /* ==========================================================================
    Long-Term Per-Game Memory Workspace
-   Applies modern-web-guidance: card, css, validate-input-after-interaction
+   Applies modern-web-guidance: card, css, css-layout, validate-input-after-interaction
    ========================================================================== */
 
 .memory-workspace-layout {
@@ -1498,11 +1498,18 @@ dialog.studio-dialog::backdrop {
 
 .memory-bank-btn-label {
   display: inline-flex;
-  align-items: center;
+  align-items: safe center;
   gap: 6px;
+  min-inline-size: 0;
+}
+
+.memory-bank-btn > :first-child {
+  min-inline-size: 0;
+  overflow-wrap: break-word;
 }
 
 .memory-bank-count {
+  flex-shrink: 0;
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
   font-size: 0.73rem;
@@ -1599,6 +1606,7 @@ dialog.studio-dialog::backdrop {
 .memory-filter-pills {
   display: flex;
   flex-wrap: wrap;
+  flex-wrap: balance;
   gap: 5px;
 }
 
@@ -1784,7 +1792,7 @@ dialog.studio-dialog::backdrop {
 }
 
 article.memory-card {
-  container-type: inline-size;
+  container: memory-card / inline-size;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 10px;
@@ -1817,28 +1825,32 @@ article.memory-card[data-status='superseded'] {
 
 .memory-card > .memory-card-header {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 6px;
   min-inline-size: 0;
 }
 
 .memory-card > .memory-card-header > h3 {
   margin: 0;
+  min-inline-size: 0;
   font-size: 0.94rem;
   font-weight: 700;
   line-height: 1.35;
   color: var(--text-primary);
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .memory-card-badges {
   display: flex;
   flex-wrap: wrap;
+  flex-wrap: balance;
   gap: 5px;
+  min-inline-size: 0;
 }
 
 .memory-badge {
   display: inline-flex;
-  align-items: center;
+  align-items: safe center;
   padding-block: 2px;
   padding-inline: 7px;
   border-radius: 999px;
@@ -1877,43 +1889,61 @@ article.memory-card[data-status='superseded'] {
 .memory-card-meta {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px;
+  gap: 4px 12px;
+  min-inline-size: 0;
   font-family: var(--font-mono);
   font-size: 0.73rem;
+  line-height: 1.4;
   color: var(--text-muted);
+}
+
+.memory-card-meta > span {
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  overflow-wrap: anywhere;
 }
 
 .memory-card > .memory-card-content {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
   min-inline-size: 0;
 }
 
 .memory-card-body {
   margin: 0;
+  min-inline-size: 0;
   font-size: 0.84rem;
   line-height: 1.52;
   color: var(--text-primary);
   text-wrap: pretty;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
   white-space: pre-wrap;
 }
 
 .memory-resolution-note {
   margin: 0;
+  min-inline-size: 0;
   padding: 6px 9px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border-subtle);
   background: var(--bg-canvas);
   font-size: 0.79rem;
   color: var(--text-secondary);
+  overflow-wrap: break-word;
+}
+
+.memory-resolution-note code {
+  overflow-wrap: anywhere;
 }
 
 .memory-applicable-list {
   display: flex;
-  align-items: center;
+  align-items: safe center;
   flex-wrap: wrap;
+  flex-wrap: balance;
   gap: 5px;
+  min-inline-size: 0;
 }
 
 .memory-applicable-label {
@@ -1946,16 +1976,7 @@ article.memory-card[data-status='superseded'] {
   padding-inline: 9px;
 }
 
-@container (min-width: 540px) {
-  .memory-card > .memory-card-header {
-    grid-template-columns: minmax(0, 1fr) auto;
-    align-items: baseline;
-  }
-
-  .memory-card > .memory-card-header > .memory-card-badges {
-    grid-column: 1 / -1;
-  }
-
+@container memory-card (inline-size >= 540px) {
   .memory-card > .memory-card-footer {
     justify-content: flex-end;
   }
@@ -2004,38 +2025,49 @@ article.memory-card[data-status='superseded'] {
   align-items: safe center;
   justify-content: space-between;
   flex-wrap: wrap;
-  gap: 8px 14px;
-  padding: 7px 14px;
+  gap: 6px 12px;
+  padding: 5px 14px;
 }
 
 .live-activity-primary {
   display: flex;
   align-items: safe center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 7px;
   min-inline-size: 0;
-  flex: 1 1 420px;
+  flex: 1 1 380px;
+}
+
+.live-activity-status {
+  flex: 1 1 180px;
+  min-inline-size: 0;
 }
 
 .live-activity-headline {
-  font-size: 0.84rem;
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  line-clamp: 1;
+  overflow: clip;
+  font-size: 0.82rem;
   font-weight: 600;
+  line-height: 1.35;
   color: var(--text-primary);
   min-inline-size: 0;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
-.live-activity-subnote {
-  font-size: 0.78rem;
-  color: var(--text-secondary);
-  min-inline-size: 0;
-  overflow-wrap: anywhere;
+@media (max-width: 720px) {
+  .live-activity-primary {
+    flex-wrap: wrap;
+  }
 }
 
 .live-activity-telemetry {
   display: inline-flex;
   align-items: safe center;
   flex-wrap: wrap;
+  flex-shrink: 0;
   gap: 6px;
 }
 

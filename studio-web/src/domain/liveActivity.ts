@@ -69,6 +69,20 @@ function asNumber(val: unknown): number | undefined {
   return typeof val === 'number' && Number.isFinite(val) ? val : undefined;
 }
 
+export function compactActivityText(raw: string, maxChars = 150): string {
+  const normalized = raw.replace(/\s+/g, ' ').trim();
+  if (!normalized || normalized.length <= maxChars) return normalized;
+  const sliced = normalized.slice(0, maxChars - 1);
+  const lastSpace = sliced.lastIndexOf(' ');
+  return `${(lastSpace > maxChars * 0.6 ? sliced.slice(0, lastSpace) : sliced).trimEnd()}…`;
+}
+
+function resolveCuratorTargetLabel(rawRole: string, fallbackAgent: string): string {
+  const cleaned = rawRole.includes(':') ? rawRole.slice(rawRole.lastIndexOf(':') + 1) : rawRole;
+  const candidate = cleaned.trim() || fallbackAgent;
+  return candidate ? getRoleMetadata(candidate).label : 'Specialist';
+}
+
 export function formatTokenCount(tokens: number): string {
   if (!Number.isFinite(tokens) || tokens <= 0) return '0 tok';
   if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(2)}M tok`;
@@ -247,47 +261,80 @@ export function deriveLiveStudioActivity(params: {
   );
   if (livePlaytest) {
     const turnCount = livePlaytest.turn_count ?? 0;
-    const planSuffix = livePlaytest.current_plan ? ` — ${livePlaytest.current_plan}` : '';
-    return {
-      isActive: true,
-      phase: 'blind_playtest',
-      phaseBadge: `Playtest · T${turnCount}`,
-      stageTitle: 'Council Blind AI Playtest',
-      activeAgentLabel: 'Blind Playtester',
-      headline: `Playing '${livePlaytest.game_title || bible?.game_title || 'candidate'}' unguided (Turn ${turnCount})${planSuffix}`,
-      whyPostBoardActive: allBoardApproved
-        ? `All ${approvedBoard}/${totalBoard} Production Board items are approved — Blind Playtester is now verifying the integrated slice.`
-        : undefined,
-      suggestedWorkspace: { id: 'playtest', label: 'Watch Live Playtest' },
-      latestAiCall,
-      lastActivityUtc,
-    };
-  }
+      const planSuffix = livePlaytest.current_plan
+        ? ` — ${compactActivityText(livePlaytest.current_plan, 95)}`
+        : '';
+      return {
+        isActive: true,
+        phase: 'blind_playtest',
+        phaseBadge: `Playtest · T${turnCount}`,
+        stageTitle: 'Council Blind AI Playtest',
+        activeAgentLabel: 'Blind Playtester',
+        headline: `Playing '${livePlaytest.game_title || bible?.game_title || 'candidate'}' unguided (Turn ${turnCount})${planSuffix}`,
+        whyPostBoardActive: allBoardApproved
+          ? `All ${approvedBoard}/${totalBoard} Production Board items are approved — Blind Playtester is now verifying the integrated slice.`
+          : undefined,
+        suggestedWorkspace: { id: 'playtest', label: 'Watch Live Playtest' },
+        latestAiCall,
+        lastActivityUtc,
+      };
+    }
 
-  // Scan recentEvents (newest-first) for the most recent phase-defining event (skipping pure llm_gateway_call heartbeats)
-  const qaFailure = findLatestQaFailure(recentEvents);
+    // Scan recentEvents (newest-first) for the most recent phase-defining event (skipping pure llm_gateway_call heartbeats)
+    const qaFailure = findLatestQaFailure(recentEvents);
 
-  for (const ev of recentEvents) {
-    const rawType = String(ev.event_type || '');
-    const lowerType = rawType.toLowerCase();
-    const pl = asRecord(ev.payload);
+    for (const ev of recentEvents) {
+      const rawType = String(ev.event_type || '');
+      const lowerType = rawType.toLowerCase();
+      const pl = asRecord(ev.payload);
 
-    if (lowerType === 'studio_live_activity') {
-      if (pl.stage === 'supervisor_gate_evaluation') {
-        const att = asNumber(pl.attempt);
-        const maxAtt = asNumber(pl.max_retries);
-        const attSuffix = att ? ` (Attempt ${att}${maxAtt ? `/${maxAtt}` : ''})` : '';
+      if (lowerType === 'studio_live_activity') {
+        if (pl.stage === 'supervisor_gate_evaluation') {
+          const att = asNumber(pl.attempt);
+          const maxAtt = asNumber(pl.max_retries);
+          const attSuffix = att ? ` (Attempt ${att}${maxAtt ? `/${maxAtt}` : ''})` : '';
+          return {
+            isActive: true,
+            phase: 'qa_verification',
+            phaseBadge: att ? `QA Gates · ${att}/${maxAtt ?? 3}` : 'QA Gates',
+            stageTitle: `5-Gate QA Verification${attSuffix}`,
+            activeAgentLabel: 'QA Build Supervisor',
+            headline: compactActivityText(
+              asString(ev.deliberation) ||
+                `Evaluating candidate cartridge across headless Godot 4 Quality Gates${attSuffix}...`,
+            ),
+            whyPostBoardActive: allBoardApproved
+              ? `All ${approvedBoard}/${totalBoard} board tasks are approved and Council deliberation concluded — running automated Quality Gates before slice promotion.`
+              : undefined,
+            progressValue: att,
+            progressMax: maxAtt,
+            latestAiCall,
+            lastActivityUtc,
+          };
+        }
+        continue;
+      }
+
+      // 1. Automated QA Self-Healing Repair (`AGENT_STREAM` with `phase === 'REPAIR'`)
+      if (lowerType === 'agent_stream' && String(pl.phase || '').toUpperCase() === 'REPAIR') {
+        const gate = asString(pl.failure_gate) || qaFailure?.failureGate || 'Quality Gate';
+        const remedy = asString(pl.remedy_directive) || qaFailure?.remedyDirective;
+        const att = qaFailure?.attempt;
+        const maxAtt = qaFailure?.maxRetries;
+        const attLabel = att ? ` (Attempt ${att}${maxAtt ? `/${maxAtt}` : ''})` : '';
+        const reasonSuffix = qaFailure?.failureReason
+          ? ` — ${compactActivityText(qaFailure.failureReason, 110)}`
+          : '';
         return {
           isActive: true,
-          phase: 'qa_verification',
-          phaseBadge: att ? `QA Gates · ${att}/${maxAtt ?? 3}` : 'QA Gates',
-          stageTitle: `5-Gate QA Verification${attSuffix}`,
-          activeAgentLabel: 'QA Build Supervisor',
-          headline:
-            asString(ev.deliberation) ||
-            `Evaluating candidate cartridge across headless Godot 4 Quality Gates${attSuffix}...`,
+          phase: 'qa_repair',
+          phaseBadge: att ? `QA Repair · ${att}/${maxAtt ?? 3}` : 'QA Repair',
+          stageTitle: `QA Self-Healing Repair${attLabel}`,
+          activeAgentLabel: getRoleMetadata(ev.agent_name || 'LeadGameplaySWEAgent').label,
+          headline: `Optimizing & repairing ${gate}${reasonSuffix}`,
+          detail: remedy ? compactActivityText(remedy, 180) : undefined,
           whyPostBoardActive: allBoardApproved
-            ? `All ${approvedBoard}/${totalBoard} board tasks are approved and Council deliberation concluded — running automated Quality Gates before slice promotion.`
+            ? `All ${approvedBoard}/${totalBoard} board tasks are approved and Council signed off — Lead Gameplay SWE is resolving ${gate} before final promotion.`
             : undefined,
           progressValue: att,
           progressMax: maxAtt,
@@ -295,108 +342,88 @@ export function deriveLiveStudioActivity(params: {
           lastActivityUtc,
         };
       }
-      continue;
-    }
 
-    // 1. Automated QA Self-Healing Repair (`AGENT_STREAM` with `phase === 'REPAIR'`)
-    if (lowerType === 'agent_stream' && String(pl.phase || '').toUpperCase() === 'REPAIR') {
-      const gate = asString(pl.failure_gate) || qaFailure?.failureGate || 'Quality Gate';
-      const remedy = asString(pl.remedy_directive) || qaFailure?.remedyDirective;
-      const att = qaFailure?.attempt;
-      const maxAtt = qaFailure?.maxRetries;
-      const attLabel = att ? ` (Attempt ${att}${maxAtt ? `/${maxAtt}` : ''})` : '';
-      const reasonSuffix = qaFailure?.failureReason ? ` — ${qaFailure.failureReason}` : '';
-      return {
-        isActive: true,
-        phase: 'qa_repair',
-        phaseBadge: att ? `QA Repair · ${att}/${maxAtt ?? 3}` : 'QA Repair',
-        stageTitle: `QA Self-Healing Repair${attLabel}`,
-        activeAgentLabel: getRoleMetadata(ev.agent_name || 'LeadGameplaySWEAgent').label,
-        headline: `Optimizing & repairing ${gate}${reasonSuffix}`,
-        detail: remedy || undefined,
-        whyPostBoardActive: allBoardApproved
-          ? `All ${approvedBoard}/${totalBoard} board tasks are approved and Council signed off — Lead Gameplay SWE is resolving ${gate} before final promotion.`
-          : undefined,
-        progressValue: att,
-        progressMax: maxAtt,
-        latestAiCall,
-        lastActivityUtc,
-      };
-    }
-
-    // 2. QA Gate Result / Verification State
-    if (lowerType === 'qa_gate_result') {
-      if (pl.promoted === true) {
+      // 2. QA Gate Result / Verification State
+      if (lowerType === 'qa_gate_result') {
+        if (pl.promoted === true) {
+          return {
+            isActive: true,
+            phase: 'promoting',
+            phaseBadge: 'Promoting',
+            stageTitle: 'Checkpoint & Cartridge Promotion',
+            activeAgentLabel: 'QA Build Supervisor',
+            headline: 'All Quality Gates passed — sealing checkpoint and promoting cartridge...',
+            latestAiCall,
+            lastActivityUtc,
+          };
+        }
+        const gate = asString(pl.failure_gate) || 'Quality Gate';
+        const reason = compactActivityText(
+          asString(pl.failure_reason) || asString(ev.deliberation),
+          120,
+        );
+        const att = asNumber(pl.attempt);
+        const maxAtt = asNumber(pl.max_retries);
+        const attLabel = att ? ` (Attempt ${att}${maxAtt ? `/${maxAtt}` : ''})` : '';
+        const remedy = asString(pl.remedy_directive);
         return {
           isActive: true,
-          phase: 'promoting',
-          phaseBadge: 'Promoting',
-          stageTitle: 'Checkpoint & Cartridge Promotion',
+          phase: 'qa_repair',
+          phaseBadge: att ? `QA Repair · ${att}/${maxAtt ?? 3}` : 'QA Repair',
+          stageTitle: `QA Gate Retry${attLabel}`,
           activeAgentLabel: 'QA Build Supervisor',
-          headline: 'All Quality Gates passed — sealing checkpoint and promoting cartridge...',
-          latestAiCall,
-          lastActivityUtc,
-        };
-      }
-      const gate = asString(pl.failure_gate) || 'Quality Gate';
-      const reason = asString(pl.failure_reason) || asString(ev.deliberation);
-      const att = asNumber(pl.attempt);
-      const maxAtt = asNumber(pl.max_retries);
-      const attLabel = att ? ` (Attempt ${att}${maxAtt ? `/${maxAtt}` : ''})` : '';
-      return {
-        isActive: true,
-        phase: 'qa_repair',
-        phaseBadge: att ? `QA Repair · ${att}/${maxAtt ?? 3}` : 'QA Repair',
-        stageTitle: `QA Gate Retry${attLabel}`,
-        activeAgentLabel: 'QA Build Supervisor',
-        headline: `${gate} failed${attLabel}: ${reason}`,
-        detail: asString(pl.remedy_directive) || undefined,
-        whyPostBoardActive: allBoardApproved
-          ? `All ${approvedBoard}/${totalBoard} board tasks are approved — running QA Gate verification & self-healing repair.`
-          : undefined,
-        progressValue: att,
-        progressMax: maxAtt,
-        latestAiCall,
-        lastActivityUtc,
-      };
-    }
-
-    if (lowerType === 'state_change') {
-      const st = String(pl.lifecycle_state || pl.state || '').toUpperCase();
-      if (st === 'VERIFYING') {
-        return {
-          isActive: true,
-          phase: 'qa_verification',
-          phaseBadge: 'QA Gates',
-          stageTitle: '5-Gate QA Verification',
-          activeAgentLabel: 'QA Build Supervisor',
-          headline:
-            asString(ev.deliberation) ||
-            'Evaluating integrated candidate cartridge across 5 headless Godot Quality Gates...',
+          headline: `${gate} failed${attLabel}${reason ? `: ${reason}` : ''}`,
+          detail: remedy ? compactActivityText(remedy, 180) : undefined,
           whyPostBoardActive: allBoardApproved
-            ? `All ${approvedBoard}/${totalBoard} board tasks are approved and Council signed off — running final Quality Gates before slice promotion.`
+            ? `All ${approvedBoard}/${totalBoard} board tasks are approved — running QA Gate verification & self-healing repair.`
             : undefined,
+          progressValue: att,
+          progressMax: maxAtt,
           latestAiCall,
           lastActivityUtc,
         };
       }
-      if (st === 'PROMOTED') {
-        return {
-          isActive: true,
-          phase: 'promoting',
-          phaseBadge: 'Promoting',
-          stageTitle: 'Promoting Verified Slice',
-          activeAgentLabel: 'QA Build Supervisor',
-          headline: 'Promoting verified build to active cartridge...',
-          latestAiCall,
-          lastActivityUtc,
-        };
-      }
-    }
 
-    // 3. Structured `writers_room_activity` stage updates (slice_assembly_check, slice_blind_playtest, proof_review, deliberation)
-    if (lowerType === 'writers_room_activity') {
-      const statusText = asString(pl.status_text) || asString(ev.deliberation);
+      if (lowerType === 'state_change') {
+        const st = String(pl.lifecycle_state || pl.state || '').toUpperCase();
+        if (st === 'VERIFYING') {
+          return {
+            isActive: true,
+            phase: 'qa_verification',
+            phaseBadge: 'QA Gates',
+            stageTitle: '5-Gate QA Verification',
+            activeAgentLabel: 'QA Build Supervisor',
+            headline: compactActivityText(
+              asString(ev.deliberation) ||
+                'Evaluating integrated candidate cartridge across 5 headless Godot Quality Gates...',
+            ),
+            whyPostBoardActive: allBoardApproved
+              ? `All ${approvedBoard}/${totalBoard} board tasks are approved and Council signed off — running final Quality Gates before slice promotion.`
+              : undefined,
+            latestAiCall,
+            lastActivityUtc,
+          };
+        }
+        if (st === 'PROMOTED') {
+          return {
+            isActive: true,
+            phase: 'promoting',
+            phaseBadge: 'Promoting',
+            stageTitle: 'Promoting Verified Slice',
+            activeAgentLabel: 'QA Build Supervisor',
+            headline: 'Promoting verified build to active cartridge...',
+            latestAiCall,
+            lastActivityUtc,
+          };
+        }
+      }
+
+      // 3. Structured `writers_room_activity` stage updates (slice_assembly_check, slice_blind_playtest, proof_review, deliberation)
+      if (lowerType === 'writers_room_activity') {
+        const statusText = compactActivityText(
+          asString(pl.status_text) || asString(ev.deliberation),
+          150,
+        );
       const roleMeta = getRoleMetadata(asString(pl.agent_role) || ev.agent_name);
       const delibText = asString(ev.deliberation);
 
@@ -536,11 +563,13 @@ export function deriveLiveStudioActivity(params: {
     }
   }
 
-  // Fallback to live board item state or orchestrator state
-  const finishedItemIds = new Set(
-    boardItems.filter((i) => i.state === 'approved').map((i) => i.item_id),
-  );
-  const liveSteps = Object.values(liveStepsByItem).filter((s) => !finishedItemIds.has(s.itemId));
+  // Fallback to live board item state or orchestrator state.
+  // Restrict `liveSteps` strictly to currently working board items so stale steps from prior
+  // slices or non-board IDs (e.g. `slice_reflection_*`) never hijack the banner.
+  const workingItemIds = new Set(workingBoardItems.map((i) => i.item_id));
+  const liveSteps = Object.values(liveStepsByItem)
+    .filter((s) => workingItemIds.has(s.itemId))
+    .sort((a, b) => (b.timestampUtc || '').localeCompare(a.timestampUtc || ''));
   if (liveSteps.length > 0 || workingBoardItems.length > 0) {
     const workers = proc?.scheduler_running_workers || workingBoardItems.length || liveSteps.length;
     if (awaitingReviewItems.length > 0 && liveSteps.length === 0) {
@@ -559,14 +588,16 @@ export function deriveLiveStudioActivity(params: {
       };
     }
     const primaryStep = liveSteps[0];
-    const leadItem = workingBoardItems[0];
+    const leadItem = primaryStep
+      ? workingBoardItems.find((i) => i.item_id === primaryStep.itemId) ?? workingBoardItems[0]
+      : workingBoardItems[0];
     const leadRole =
       primaryStep?.specialistAgent ||
       primaryStep?.agentName ||
       leadItem?.yielded_turn_info?.specialist_agent ||
       leadItem?.raised_by_role;
     const agentLabel = leadRole ? getRoleMetadata(leadRole).label : 'Task Pod';
-    const headline = primaryStep
+    const rawHeadline = primaryStep
       ? `${leadItem ? `[${leadItem.title}] ` : ''}${primaryStep.stepSummary}`
       : `Executing ${workingBoardItems.length} active board task${workingBoardItems.length === 1 ? '' : 's'}: ${workingBoardItems.map((i) => i.title).slice(0, 2).join(', ')}`;
     return {
@@ -575,7 +606,7 @@ export function deriveLiveStudioActivity(params: {
       phaseBadge: `${workers}w · ${approvedBoard}/${totalBoard}`,
       stageTitle: 'Production Board Synthesis',
       activeAgentLabel: agentLabel,
-      headline,
+      headline: compactActivityText(rawHeadline, 160),
       progressValue: approvedBoard,
       progressMax: totalBoard > 0 ? totalBoard : undefined,
       suggestedWorkspace: { id: 'board', label: 'View Board' },
@@ -685,12 +716,42 @@ export function summarizeSwarmEvent(ev: SwarmStreamEvent): FormattedSwarmEventSu
     };
   }
 
+  if (lower === 'context_curator_packed') {
+    const chunkCount = Array.isArray(pl.selected_chunk_ids) ? pl.selected_chunk_ids.length : 0;
+    const imgCount = Array.isArray(pl.selected_image_paths) ? pl.selected_image_paths.length : 0;
+    const targetLabel = resolveCuratorTargetLabel(asString(pl.target_agent_role), ev.agent_name);
+    const synthesis = compactActivityText(asString(pl.role_tailored_synthesis), 160);
+    return {
+      category: 'board',
+      agentLabel: 'Context Curator',
+      title: `Curated ${chunkCount} context chunk${chunkCount === 1 ? '' : 's'}${
+        imgCount > 0 ? ` + ${imgCount} visual ref${imgCount === 1 ? '' : 's'}` : ''
+      } for ${targetLabel}`,
+      subtitle: synthesis || undefined,
+      badgeText: 'CONTEXT PACK',
+      badgeTone: 'accent',
+    };
+  }
+
+  if (lower === 'context_curator_question_researched') {
+    const targetLabel = resolveCuratorTargetLabel(asString(pl.target_agent_role), ev.agent_name);
+    const question = compactActivityText(asString(pl.question), 160);
+    return {
+      category: 'board',
+      agentLabel: 'Context Curator',
+      title: `Researched self-inquiry for ${targetLabel}`,
+      subtitle: question || undefined,
+      badgeText: 'SELF-INQUIRY',
+      badgeTone: 'accent',
+    };
+  }
+
   if (lower === 'writers_room_activity') {
     const roleMeta = getRoleMetadata(asString(pl.agent_role) || ev.agent_name);
     return {
       category: 'stage',
       agentLabel: roleMeta.label,
-      title: asString(pl.status_text) || asString(ev.deliberation),
+      title: compactActivityText(asString(pl.status_text) || asString(ev.deliberation), 160),
       badgeText: 'LIVE STAGE',
       badgeTone: 'accent',
     };
@@ -699,11 +760,12 @@ export function summarizeSwarmEvent(ev: SwarmStreamEvent): FormattedSwarmEventSu
   if (lower.startsWith('backlog_item_')) {
     const itemId = asString(pl.item_id);
     const action = lower.replace('backlog_item_', '').replace(/_/g, ' ');
+    const sub = asString(pl.message) || asString(pl.summary) || asString(pl.brief);
     return {
       category: 'board',
       agentLabel: getRoleMetadata(ev.agent_name).label,
       title: `${itemId ? `[${itemId}] ` : ''}${action}`,
-      subtitle: asString(pl.message) || asString(pl.summary) || asString(pl.brief) || undefined,
+      subtitle: sub ? compactActivityText(sub, 160) : undefined,
       badgeText: action.toUpperCase(),
       badgeTone:
         lower === 'backlog_item_approved'
@@ -717,7 +779,7 @@ export function summarizeSwarmEvent(ev: SwarmStreamEvent): FormattedSwarmEventSu
   return {
     category: lower.includes('playtest') || lower.includes('slice') || lower === 'state_change' ? 'stage' : 'board',
     agentLabel: getRoleMetadata(ev.agent_name).label,
-    title: asString(pl.status_text) || asString(ev.deliberation) || ev.event_type,
+    title: compactActivityText(asString(pl.status_text) || asString(ev.deliberation) || ev.event_type, 160),
     badgeText: ev.event_type,
     badgeTone: lower === 'error' ? 'danger' : lower.includes('promoted') || lower.includes('verified') ? 'ok' : 'accent',
   };

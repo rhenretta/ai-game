@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -390,5 +392,98 @@ describe('GameMemoryView & Mission Control Memory Workspace', () => {
     await waitFor(() => {
       expect(screen.getByText('Decouple Simulation Clock Signals')).toBeInTheDocument();
     });
+  });
+
+  it('keeps memory card headers single-column and shrink-safe for long snake_case metadata tokens', async () => {
+    const longSyntheticSliceId =
+      'slice_4_autonomous_multi_region_telemetry_and_deterministic_state_routing';
+    const longSyntheticItemId = 'item_reconcile_cross_module_snapshot_serialization_09';
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      return new Response(
+        JSON.stringify({
+          deliberation: 'Loaded synthetic memory card with long metadata identifiers.',
+          cartridge_id: 'candidate_synthetic_01',
+          game_title: 'Synthetic Relay Studio',
+          bank_counts: { council: 1 },
+          total_bank_counts: { council: 1 },
+          total_count: 1,
+          active_count: 1,
+          entries: [
+            {
+              deliberation: 'Preserve deterministic rendering bounds across nested viewport overlays.',
+              memory_id: 'mem_arch_long_01',
+              cartridge_id: 'candidate_synthetic_01',
+              memory_bank: 'council',
+              author_role: 'CreativeDirector',
+              kind: 'architectural_decision',
+              status: 'active',
+              title: 'Contextual Viewport Overlay Coordinate Invariant',
+              content: 'Keep overlay coordinate transforms decoupled from camera zoom interpolation.',
+              applicable_roles: ['swe_engineer', 'qa_test_engineer'],
+              tags: [],
+              slice_id: longSyntheticSliceId,
+              item_id: longSyntheticItemId,
+              superseded_by_id: null,
+              resolution_note: null,
+              created_at_utc: '2026-10-31T14:00:00Z',
+              updated_at_utc: '2026-10-31T14:00:00Z',
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    });
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { container } = render(
+      <QueryClientProvider client={qc}>
+        <GameMemoryView
+          cartridgeId="candidate_synthetic_01"
+          gameTitle="Synthetic Relay Studio"
+          activeSliceId={longSyntheticSliceId}
+        />
+      </QueryClientProvider>,
+    );
+
+    const heading = await screen.findByRole('heading', {
+      level: 3,
+      name: 'Contextual Viewport Overlay Coordinate Invariant',
+    });
+    const header = heading.closest('header.memory-card-header');
+    expect(header).not.toBeNull();
+
+    // Header regions stack in clean source order: badges -> h3 -> meta
+    const headerChildren = Array.from(header!.children);
+    expect(headerChildren.map((el) => el.tagName)).toEqual(['DIV', 'H3', 'DIV']);
+    expect(headerChildren[0]).toHaveClass('memory-card-badges');
+    expect(headerChildren[2]).toHaveClass('memory-card-meta');
+
+    const metaSpans = container.querySelectorAll('.memory-card-meta > span');
+    expect(metaSpans.length).toBe(4);
+    expect(screen.getByText(`Slice: ${longSyntheticSliceId}`)).toBeInTheDocument();
+    expect(screen.getByText(`Task: ${longSyntheticItemId}`)).toBeInTheDocument();
+
+    // Guard CSS layout invariants so @container never splits .memory-card-header into `minmax(0, 1fr) auto`
+    // (which collapses h3 to a 0px 1-character vertical column beside long metadata tokens)
+    const cssSource = readFileSync(resolve(__dirname, '../src/styles/global.css'), 'utf-8');
+    const memoryCssStart = cssSource.indexOf('/* Semantic Direct-Region Memory Cards');
+    expect(memoryCssStart).toBeGreaterThan(-1);
+    const memoryCssEnd = cssSource.indexOf('.live-activity-banner', memoryCssStart);
+    const memoryCardCss = cssSource.slice(memoryCssStart, memoryCssEnd);
+
+    expect(memoryCardCss).toContain('container: memory-card / inline-size;');
+    expect(memoryCardCss).toMatch(
+      /\.memory-card\s*>\s*\.memory-card-header\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\);/,
+    );
+    expect(memoryCardCss).not.toMatch(
+      /@container[^{]*\{[\s\S]*?\.memory-card-header[\s\S]*?minmax\(0,\s*1fr\)\s+auto/,
+    );
+    expect(memoryCardCss).toMatch(
+      /\.memory-card\s*>\s*\.memory-card-header\s*>\s*h3\s*\{[^}]*overflow-wrap:\s*break-word;/,
+    );
+    expect(memoryCardCss).toMatch(
+      /\.memory-card-meta\s*>\s*span\s*\{[^}]*min-inline-size:\s*0;[\s\S]*?overflow-wrap:\s*anywhere;/,
+    );
   });
 });

@@ -3938,7 +3938,9 @@ class LeadGameplaySWEAgent:
             )
 
         if unit.verification_modality == "behavioral_and_animation_strip":
-            anim_info = GodotAtomicTestRunner.render_in_engine_animation_strip(c_dir, unit_id=unit.unit_id)
+            anim_info = GodotAtomicTestRunner.render_in_engine_animation_strip(
+                c_dir, unit_id=unit.unit_id, client=self.client
+            )
             rej_anims = anim_info.get("rejected_animations") or []
             if rej_anims:
                 defects.append(f"Rejected static or defective animations: {rej_anims}")

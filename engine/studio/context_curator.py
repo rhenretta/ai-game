@@ -597,20 +597,44 @@ class CartridgeSemanticIndex:
                 or aval.get("target_path")
                 or ""
             ).replace("res://", "")
+            asset_disk_path = (self.cartridge_dir / rel_file) if rel_file else None
+            actual_disk_px: Optional[List[int]] = None
+            asset_disk_mtime = 0.0
+            if asset_disk_path is not None and asset_disk_path.is_file() and asset_disk_path.suffix.lower() in (".png", ".jpg", ".jpeg"):
+                try:
+                    asset_disk_mtime = asset_disk_path.stat().st_mtime
+                    from PIL import Image as _PILImage
+                    with _PILImage.open(asset_disk_path) as _im:
+                        actual_disk_px = [int(_im.size[0]), int(_im.size[1])]
+                except Exception:
+                    pass
+
             img_path = ""
             for cand_plate in (
                 renders_dir / f"plate_{aid}.png",
                 renders_dir / f"anim_rig_{aid}.png",
                 renders_dir / f"anim_sheet_{aid}.png",
-                (self.cartridge_dir / rel_file) if rel_file else None,
             ):
-                if cand_plate is not None and cand_plate.is_file() and cand_plate.suffix.lower() in (".png", ".jpg", ".jpeg"):
-                    img_path = str(cand_plate)
+                if cand_plate.is_file() and cand_plate.suffix.lower() in (".png", ".jpg", ".jpeg"):
+                    try:
+                        plate_mtime = cand_plate.stat().st_mtime
+                    except Exception:
+                        plate_mtime = 0.0
+                    # Never serve a stale pre-overwrite render plate if the actual PNG on disk is newer!
+                    if asset_disk_path is not None and asset_disk_mtime > plate_mtime + 0.5:
+                        img_path = str(asset_disk_path)
+                    else:
+                        img_path = str(cand_plate)
                     break
+            if not img_path and asset_disk_path is not None and asset_disk_path.is_file() and asset_disk_path.suffix.lower() in (".png", ".jpg", ".jpeg"):
+                img_path = str(asset_disk_path)
+
+            if actual_disk_px is not None:
+                clean_entry["actual_disk_pixel_size"] = actual_disk_px
             fmode_val = aval.get("fabrication_mode", aval.get("asset_type", "asset"))
             hf_val = int(aval.get("hframes") or 1)
             vf_val = int(aval.get("vframes") or 1)
-            tex_sz_val = aval.get("texture_pixel_size") or aval.get("target_display_size") or []
+            tex_sz_val = actual_disk_px or aval.get("texture_pixel_size") or aval.get("target_display_size") or []
             _add(
                 ContextChunk(
                     chunk_id=f"asset:catalog:{aid}",

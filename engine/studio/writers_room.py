@@ -4313,7 +4313,7 @@ class CreativeWritersRoom:
             phase="slice_qa_gate_check",
         )
 
-        from engine.supervisor.supervisor import BuildSupervisor, build_qa_gate_work_item_proposal
+        from engine.supervisor.supervisor import BuildSupervisor, build_qa_gate_work_item_proposals
 
         if callable(evaluator_override):
             gate_results, trace = evaluator_override(c_dir, pass_index)
@@ -4350,7 +4350,7 @@ class CreativeWritersRoom:
 
         existing_ids = {it.item_id for it in self.board.items()}
         supported_set = set(self._supported_kinds())
-        proposal = build_qa_gate_work_item_proposal(
+        proposals = build_qa_gate_work_item_proposals(
             candidate_dir=c_dir,
             trace=trace,
             pass_index=pass_index,
@@ -4359,27 +4359,37 @@ class CreativeWritersRoom:
             supported_kinds=supported_set if supported_set else None,
         )
         added = self.board.add_items(
-            [proposal],
+            proposals,
             raised_by_role="QATestEngineer",
             slice_id=active_slice_id,
         )
         spawned_ids = [it.item_id for it in added]
+        lead_proposal = proposals[0]
+        combined_targets: List[str] = []
+        for p in proposals:
+            for tm in p.target_modules:
+                if tm not in combined_targets:
+                    combined_targets.append(tm)
+        addressed_roles = ["GameplaySystemsEngineer", "GameplayDesigner", "CreativeDirector"]
+        if any(p.kind == "visual_asset" for p in proposals):
+            addressed_roles.insert(0, "VisualArtDirector")
         fail_type_str = trace.failure_type.value if hasattr(trace.failure_type, "value") else str(trace.failure_type)
         turn_idx = len(game_bible.writers_room_transcript)
+        task_desc_str = ", ".join(f"`{p.item_id}` ({p.kind})" for p in proposals)
         spoken = (
             f"[5-Gate QA Verification — {active_slice_title} (Pass #{pass_index + 1})] "
             f"{trace.failure_gate} ({fail_type_str}) flagged a blocking defect: {trace.failure_reason} "
-            f"Spawning Production Board remediation task `{proposal.item_id}` ({proposal.title}) targeting "
-            f"{', '.join(proposal.target_modules[:4])} for Task Lead execution and Council sign-off."
+            f"Spawning {len(proposals)} Production Board remediation task(s) {task_desc_str} targeting "
+            f"{', '.join(combined_targets[:6])} for Task Lead execution and Council sign-off."
         )
         qa_utt = WritersRoomUtterance(
-            deliberation=proposal.deliberation,
+            deliberation=lead_proposal.deliberation,
             utterance_id=f"utt_{turn_idx:02d}_QATestEngineer_qa_gate_{pass_index}",
             turn_index=turn_idx,
             speaker_role="QATestEngineer",
             speaker_display_name="QA & Build Supervisor",
             spoken_dialogue=spoken,
-            addressed_to=["GameplaySystemsEngineer", "GameplayDesigner", "CreativeDirector"],
+            addressed_to=addressed_roles,
             bible_updates_summary=[f"backlog:+{it_id}" for it_id in spawned_ids],
         )
         game_bible.writers_room_transcript.append(qa_utt)
@@ -4402,7 +4412,7 @@ class CreativeWritersRoom:
         self._emit_event(
             "slice_qa_gate_check_completed",
             {
-                "deliberation": proposal.deliberation,
+                "deliberation": lead_proposal.deliberation,
                 "slice_id": active_slice_id,
                 "pass_index": pass_index,
                 "passed": False,
@@ -5665,6 +5675,7 @@ class CreativeWritersRoom:
                 b_carry = b_data.get("next_slice_carryover_notes") or []
                 b_wishes = b_data.get("wishes") or []
                 b_bugs_obs = b_rep.get("bugs_and_glitches_observed") or []
+                b_vis_defects = b_rep.get("visual_and_ui_defects_observed") or []
                 b_pain_pts = b_rep.get("key_pain_points") or []
                 b_unans_qs = b_rep.get("unanswered_questions_and_mysteries") or []
                 wish_lines = [
@@ -5677,7 +5688,8 @@ class CreativeWritersRoom:
                     f"Overall Fun Rating: {b_rep.get('overall_fun_rating', '?')}/10\n"
                     f"Overall Experience: {b_rep.get('overall_experience_summary', '')}\n"
                     f"Graphics & Visuals: {b_rep.get('graphics_and_visuals', '')}\n"
-                    f"Gameplay & Feel: {b_rep.get('gameplay_and_feel', '')}\n"
+                    + (f"Visual & UI Defects Observed: {json.dumps(b_vis_defects)}\n" if b_vis_defects else "")
+                    + f"Gameplay & Feel: {b_rep.get('gameplay_and_feel', '')}\n"
                     f"Sound & Audio: {b_rep.get('sound_and_audio', '')}\n"
                     f"Intuitiveness & Onboarding: {b_rep.get('intuitiveness_and_onboarding', '')}\n"
                     f"Goals & Pacing: {b_rep.get('goals_pacing_and_accomplishment', '')}\n"
@@ -5693,15 +5705,99 @@ class CreativeWritersRoom:
             except Exception as br_exc:
                 logger.debug("Could not read blind playtest report for %s: %s", prev_id, br_exc)
 
+        asset_integrity_block, _, contact_sheet_part = self._build_asset_integrity_dossier_and_sheet(c_dir, prev_id)
+        if contact_sheet_part is not None:
+            parts.append(
+                f"CARTRIDGE VISUAL ASSET CONTACT SHEET FOR `{prev_id}` "
+                "(inspect every sprite, tile, and multi-cell UI/world atlas with cell grid overlays for flat geometric "
+                "placeholder shapes, empty/blank atlas cells, or broken silhouettes):"
+            )
+            parts.append(contact_sheet_part)
+
         dossier = (
             f"=== EMPIRICAL STATE OF CURRENT GAME (`{prev_id}`: {prev_title}) ===\n"
             f"Playable Entrypoint Reachability:\n{reach.get('summary_text', '')}\n\n"
             f"Rendered Filmstrip Telemetry Progression:\n{telemetry_prog or '(no telemetry progression recorded)'}\n\n"
             f"{blind_report_block}"
+            f"{asset_integrity_block}"
             f"Cartridge Scene & Script Architecture Summary:\n{cartridge_summary}\n\n"
             f"{curated_code_block}"
         )
         return dossier, parts, (rel_reflection_path if reflection_filmstrip_path.is_file() else "")
+
+    def _build_asset_integrity_dossier_and_sheet(
+        self,
+        c_dir: Path,
+        slice_tag: str,
+    ) -> Tuple[str, Optional[Path], Any]:
+        """Runs deterministic visual/atlas/GDScript-slicing inspection and renders a contact sheet of all
+        `assets/` PNGs so Council specialists can inspect current assets, identify broken or placeholder
+        sheets, spawn in-place `visual_asset` regeneration tasks, and reintegrate `.gd` wiring cleanly.
+        """
+        import re
+        from engine.supervisor.asset_validator import (
+            audit_cartridge_visual_and_slicing_integrity,
+            render_cartridge_asset_contact_sheet,
+        )
+
+        if not c_dir.is_dir():
+            return "", None, None
+        proof_dir = c_dir / "artifacts" / "proofs"
+        proof_dir.mkdir(parents=True, exist_ok=True)
+        safe_tag = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(slice_tag or "current")).strip("_") or "current"
+        sheet_out = proof_dir / f"asset_contact_sheet_{safe_tag}.png"
+        sheet_path: Optional[Path] = None
+        sheet_part: Any = None
+        try:
+            sheet_path = render_cartridge_asset_contact_sheet(c_dir, output_path=sheet_out)
+            if sheet_path is not None and sheet_path.is_file():
+                sheet_part = self._load_image_part(sheet_path)
+        except Exception as sh_exc:
+            logger.debug("Asset contact sheet render skipped: %s", sh_exc)
+
+        try:
+            audit = audit_cartridge_visual_and_slicing_integrity(c_dir)
+        except Exception as aud_exc:
+            logger.debug("Asset slicing integrity audit skipped: %s", aud_exc)
+            return "", sheet_path, sheet_part
+
+        asset_meta = audit.get("asset_metadata") or {}
+        violations = audit.get("errors") or audit.get("violations") or []
+        offending_assets = audit.get("offending_assets") or []
+        offending_scripts = audit.get("offending_scripts") or []
+        if not asset_meta and not violations:
+            return "", sheet_path, sheet_part
+
+        lines: List[str] = [
+            "=== CARTRIDGE VISUAL ASSET & GDSCRIPT SLICING INTEGRITY AUDIT ===",
+            f"Visual Asset Files Indexed: {len(asset_meta)}",
+        ]
+        if violations:
+            lines.append(f"DETERMINISTIC ASSET / SLICING DEFECTS DETECTED ({len(violations)}):")
+            for v in violations[:20]:
+                lines.append(f"  - {v}")
+            if offending_assets:
+                lines.append(f"Offending Asset Paths Requiring In-Place Regeneration: {', '.join(offending_assets)}")
+            if offending_scripts:
+                lines.append(f"Offending GDScript Files Requiring Slicing/Texture-Wiring Reintegration: {', '.join(offending_scripts)}")
+        else:
+            lines.append(
+                "Deterministic alpha/slicing checks passed, MUST STILL visually inspect the attached "
+                "CARTRIDGE VISUAL ASSET CONTACT SHEET for crude solid-color geometric placeholder shapes, "
+                "missing atlas cells, or broken silhouettes."
+            )
+        lines.append(
+            "REMEDIATION PROTOCOL FOR BROKEN ASSETS & SLICING:\n"
+            "  1. `VisualArtDirector`: Raise an atomic `visual_asset` WorkItem in `backlog_additions` for EACH "
+            "corrupted, flat-geometric-placeholder, or missing-cell `.png` asset, naming its EXACT existing "
+            "relative path (e.g. `assets/sprites/...png` or `assets/ui/...png`) in `target_modules` and `spec` "
+            "(including exact `hframes x vframes` cell grid counts when `.gd` slices a multi-cell atlas) so the "
+            "Visual Artist overwrites it IN-PLACE.\n"
+            "  2. `UXExperienceDesigner` & `GameplaySystemsEngineer`: Raise `mechanic_code` / `integration` "
+            "WorkItem(s) (`depends_on` any regenerated `visual_asset` task IDs) to fix `.gd` region slicing, "
+            "bind loaded textures onto visual nodes, and ensure textures load BEFORE procedural geometry generation.\n\n"
+        )
+        return "\n".join(lines), sheet_path, sheet_part
 
     def _run_slice_reflection_and_strategy(
         self,
@@ -6148,10 +6244,25 @@ class CreativeWritersRoom:
             if combined_slice_directives
             else ""
         )
+        exp_asset_block = ""
+        if candidate_dir is not None:
+            prev_tag = prev_slice.slice_id if prev_slice is not None else f"slice_{max(0, next_idx - 1)}"
+            exp_asset_block, _, exp_sheet_part = self._build_asset_integrity_dossier_and_sheet(
+                Path(candidate_dir), prev_tag
+            )
+            if is_real_genai_client(self.client) and exp_sheet_part is not None:
+                exp_wish_parts.append(
+                    f"CARTRIDGE VISUAL ASSET CONTACT SHEET FOR `{prev_tag}` "
+                    "(inspect all sprites, tiles, and multi-cell UI/world atlases; raise in-place `visual_asset` "
+                    "tasks for any placeholder/broken PNGs and dependent `.gd` reintegration tasks):"
+                )
+                exp_wish_parts.append(exp_sheet_part)
+
         strategy_context_block = exp_wish_block
         if strategy_plan is not None:
             strategy_context_block = (
                 (f"{exp_wish_block}\n\n" if exp_wish_block else "")
+                + (f"{exp_asset_block}\n" if exp_asset_block else "")
                 + f"=== MASTER STRATEGY FOR SLICE #{next_idx} (`{strategy_plan.next_slice_spec.slice_id}`: {strategy_plan.next_slice_spec.title}) ===\n"
                 f"- Honest Diagnosis of Prior Slice: {strategy_plan.current_slice_honest_diagnosis}\n"
                 f"- Cohesion & World Integration Strategy: {strategy_plan.cohesion_and_world_integration_strategy}\n"
@@ -6166,10 +6277,14 @@ class CreativeWritersRoom:
                 )
                 + f"Ensure your `backlog_additions` and Bible updates directly implement this strategy in the playable game (`res://main.tscn`)!"
             )
+        elif exp_asset_block:
+            strategy_context_block = (
+                f"{exp_wish_block}\n\n{exp_asset_block}" if exp_wish_block else exp_asset_block
+            )
 
         expansion_roles: List[str] = ["LevelAndProgressionDesigner", "GameplayDesigner"]
         if is_real_genai_client(self.client):
-            expansion_roles.append("UXExperienceDesigner")
+            expansion_roles.extend(["VisualArtDirector", "UXExperienceDesigner"])
         expansion_roles.append("GameplaySystemsEngineer")
 
         for idx_r, role_name in enumerate(expansion_roles):

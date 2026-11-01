@@ -572,11 +572,22 @@ class VisualArtSpriteDesignerAgent:
         client: Optional[Any] = None,
         model_name: str = "gemini-3.1-flash-lite-image",
         text_model_name: str = DEFAULT_STUDIO_MODEL,
+        allow_offline_procedural: bool = True,
     ):
         self.client = client
         self.model_name = model_name
         self.text_model_name = text_model_name
+        self.allow_offline_procedural = bool(allow_offline_procedural)
         self.renderer = ProceduralSpriteRenderer()
+
+    def _ensure_procedural_allowed_or_raise(self, op_name: str) -> None:
+        """Rule 5: Fail fast when offline procedural synthesis is disabled and no Gemini client is configured."""
+        if not self._is_live_genai_client() and self.client is None and not self.allow_offline_procedural:
+            from engine.studio.models import StudioAgentConfigurationError
+            raise StudioAgentConfigurationError(
+                f"VisualArtSpriteDesignerAgent.{op_name} requires a configured Gemini client "
+                f"(allow_offline_procedural=False; silent procedural fallback is prohibited by Rule 5)."
+            )
 
     @classmethod
     def _get_rembg_session(cls) -> Optional[Any]:
@@ -889,6 +900,13 @@ class VisualArtSpriteDesignerAgent:
                         rgba_np[~keep_mask] = [0, 0, 0, 0]
 
         work_img = Image.fromarray(rgba_np)
+
+        # When preserving multi-cell atlases / sheets (`isolate_single_subject=False`),
+        # never tight-crop & re-center the composite bounding box, which would shift grid cell coordinates.
+        if not isolate_single_subject:
+            if work_img.getbbox() is not None:
+                return work_img if work_img.size == (w, h) else work_img.resize((w, h), Image.Resampling.LANCZOS)
+            return raw_img.convert("RGBA").resize((w, h), Image.Resampling.LANCZOS)
 
         # Step 3: Crop to tight foreground bounding box and fit into target_size with padding
         bbox = work_img.getbbox()
@@ -1902,6 +1920,7 @@ class VisualArtSpriteDesignerAgent:
                 is_animated_actor=True,
             )
         else:
+            self._ensure_procedural_allowed_or_raise("fabricate_sprite_sheet")
             renderer = ProceduralSpriteRenderer(mood=mood)
             base_img = renderer.render_dynamic_sprite(
                 dimensions=base_dims,
@@ -2204,6 +2223,7 @@ class VisualArtSpriteDesignerAgent:
                     style_guide=style_guide,
                 )
             else:
+                self._ensure_procedural_allowed_or_raise("fabricate_articulated_rig")
                 renderer = ProceduralSpriteRenderer(mood=mood)
                 p_img = renderer.render_dynamic_sprite(
                     dimensions=(pw, ph),
@@ -2283,6 +2303,7 @@ class VisualArtSpriteDesignerAgent:
                         isolate_single_subject=True,
                     )
                 else:
+                    self._ensure_procedural_allowed_or_raise("generate_dynamic_sprite")
                     cell_img = renderer.render_dynamic_sprite(
                         dimensions=(cell_w, cell_h),
                         prompt=c_prompt,
@@ -2301,6 +2322,7 @@ class VisualArtSpriteDesignerAgent:
                 isolate_single_subject=not is_multi_cell,
             )
         else:
+            self._ensure_procedural_allowed_or_raise("generate_dynamic_sprite")
             renderer = ProceduralSpriteRenderer(mood=mood)
             img = renderer.render_from_requirement(asset_req)
 

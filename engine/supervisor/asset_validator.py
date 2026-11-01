@@ -13,9 +13,12 @@ from pathlib import Path
 import struct
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
-from PIL import Image
+import numpy as np
+from PIL import Image, ImageDraw
+from pydantic import Field
 
 from engine.assets.palette import STYLE_BIBLE_16_PALETTE
+from engine.studio.models import BaseEpistemicModel, DEFAULT_STUDIO_MODEL, is_real_genai_client
 from engine.supervisor.models import (
     AssetValidationReport,
     GateFailureType,
@@ -26,6 +29,308 @@ logger = logging.getLogger("AssetValidator")
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 VALID_AUDIO_SAMPLE_RATES = {8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000, 96000}
+
+
+class AssetSheetMultimodalAuditVerdict(BaseEpistemicModel):
+    """Rationale-First (Rule 4) multimodal critic verdict over a cartridge's labeled visual asset contact sheet."""
+    offending_assets: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Relative cartridge paths (e.g. 'assets/sprites/example.png', 'assets/ui/icons.png') of assets on the "
+            "contact sheet that are visually defective: flat solid-color geometric placeholder shapes clashing with "
+            "the game's illustrated/painted style guide, blank/erased multi-cell atlas slots, garbled artifacts, "
+            "or severe visual style outliers."
+        ),
+    )
+    offending_scripts: List[str] = Field(
+        default_factory=list,
+        description="Optional relative '.gd' script paths implicated in texture-slicing or binding mismatches.",
+    )
+    remediation_summary: str = Field(
+        default="",
+        description="Concise per-asset explanation of what is broken and how each offending asset must be regenerated.",
+    )
+    all_assets_coherent_and_intact: bool = Field(
+        ...,
+        description="True ONLY when every game asset on the contact sheet is intact, populated across expected cells, and stylistically coherent with the Game Bible and concept art.",
+    )
+
+
+def collect_cartridge_visual_asset_files(cartridge_dir: Union[Path, str]) -> List[Path]:
+    """Collects production game visual PNGs across `assets/sprites/`, `assets/tiles/`, `assets/ui/`,
+    `assets/portraits/`, `assets/backgrounds/`, plus legacy `sprites/`, `tiles/`, and root `*.png`,
+    strictly excluding `mockups/`, `concepts/`, `playtest_captures/`, `artifacts/`, and `.godot/`.
+    """
+    cdir = Path(cartridge_dir).resolve()
+    excluded_parts = {"mockups", "concepts", "playtest_captures", "artifacts", ".godot", "tests"}
+    found: List[Path] = []
+    scan_dirs = [
+        cdir / "assets" / "sprites",
+        cdir / "assets" / "tiles",
+        cdir / "assets" / "ui",
+        cdir / "assets" / "portraits",
+        cdir / "assets" / "backgrounds",
+        cdir / "sprites",
+        cdir / "tiles",
+    ]
+    for sdir in scan_dirs:
+        if sdir.is_dir():
+            for p in sorted(sdir.rglob("*.png")):
+                rel_parts = set(p.relative_to(cdir).parts)
+                if rel_parts & excluded_parts:
+                    continue
+                found.append(p)
+    for p in sorted(cdir.glob("*.png")):
+        found.append(p)
+    return list(dict.fromkeys(found))
+
+
+def audit_cartridge_visual_and_slicing_integrity(cartridge_dir: Union[Path, str]) -> Dict[str, Any]:
+    """Deterministic, 100% domain-agnostic audit of:
+    1. All production visual PNGs (`assets/sprites/`, `assets/ui/`, `assets/tiles/`, `assets/portraits/`),
+    2. Multi-cell atlas occupancy (`>= 1%` opaque pixels per active cell from `asset_library.json` or `.gd` slicing),
+    3. GDScript fractional region-slicing mismatches against `1x1` catalog assets, and
+    4. Unbound local texture loads / `_init()`-before-`_ready()` texture ordering in `.gd` scripts.
+    """
+    from engine.studio.asset_library import infer_gdscript_asset_slicing_and_wiring
+
+    cdir = Path(cartridge_dir).resolve()
+    visual_files = collect_cartridge_visual_asset_files(cdir)
+    is_godot = (cdir / "project.godot").is_file()
+
+    catalog_entries: Dict[str, Dict[str, Any]] = {}
+    by_rel_path: Dict[str, Dict[str, Any]] = {}
+    cat_path = cdir / "assets" / "asset_library.json"
+    if cat_path.is_file():
+        try:
+            raw_cat = json.loads(cat_path.read_text(encoding="utf-8"))
+            raw_entries = raw_cat.get("entries", raw_cat) if isinstance(raw_cat, dict) else {}
+            if isinstance(raw_entries, dict):
+                for aid, aval in raw_entries.items():
+                    if isinstance(aval, dict):
+                        catalog_entries[str(aid)] = aval
+                        fp = str(aval.get("file_path") or aval.get("res_path") or "").replace("res://", "").lstrip("/")
+                        if fp:
+                            by_rel_path[fp] = aval
+        except Exception:
+            pass
+
+    slicing_info = infer_gdscript_asset_slicing_and_wiring(cdir)
+    inferred_grids: Dict[str, Tuple[int, int]] = dict(slicing_info.get("asset_grids") or {})
+
+    errors: List[str] = []
+    offending_assets: List[str] = []
+    offending_scripts: List[str] = []
+    asset_metadata: Dict[str, Dict[str, Any]] = {}
+
+    def _flag_asset(rel_p: str) -> None:
+        if rel_p and rel_p not in offending_assets:
+            offending_assets.append(rel_p)
+
+    def _flag_script(rel_s: str) -> None:
+        if rel_s and rel_s not in offending_scripts:
+            offending_scripts.append(rel_s)
+
+    for vfile in visual_files:
+        try:
+            rel_p = vfile.relative_to(cdir).as_posix()
+        except Exception:
+            rel_p = vfile.name
+        c_entry = by_rel_path.get(rel_p, {})
+        cat_cols = max(1, int(c_entry.get("hframes") or 1))
+        cat_rows = max(1, int(c_entry.get("vframes") or 1))
+        inf_cols, inf_rows = inferred_grids.get(rel_p, (1, 1))
+        cols = max(cat_cols, inf_cols)
+        rows = max(cat_rows, inf_rows)
+        anim_states = c_entry.get("animation_states") if isinstance(c_entry.get("animation_states"), dict) else {}
+
+        try:
+            with Image.open(vfile) as im:
+                w, h = im.size
+                rgba_arr = np.asarray(im.convert("RGBA"))
+        except Exception:
+            continue
+
+        empty_cells: List[Tuple[int, int]] = []
+        if cols * rows > 1 and w >= cols and h >= rows:
+            cw = max(1, w // cols)
+            ch = max(1, h // rows)
+            active_cells: Set[Tuple[int, int]] = set()
+            if anim_states:
+                for st_val in anim_states.values():
+                    if isinstance(st_val, dict):
+                        r_idx = int(st_val.get("row", 0) or 0)
+                        fcnt = max(1, int(st_val.get("frame_count", cols) or cols))
+                        if 0 <= r_idx < rows:
+                            for c_idx in range(min(cols, fcnt)):
+                                active_cells.add((c_idx, r_idx))
+            if not active_cells:
+                for r_idx in range(rows):
+                    for c_idx in range(cols):
+                        active_cells.add((c_idx, r_idx))
+
+            for c_idx, r_idx in sorted(active_cells):
+                cell_alpha = rgba_arr[r_idx * ch:(r_idx + 1) * ch, c_idx * cw:(c_idx + 1) * cw, 3]
+                occ = float(np.count_nonzero(cell_alpha > 16)) / float(max(1, cell_alpha.size))
+                if occ < 0.01:
+                    empty_cells.append((c_idx, r_idx))
+
+            if empty_cells:
+                _flag_asset(rel_p)
+                errors.append(
+                    f"Multi-cell {cols}x{rows} atlas '{rel_p}' ({w}x{h}px) has {len(empty_cells)}/{len(active_cells)} "
+                    f"empty/erased cell(s) (<1% opaque pixels) at (col, row)={empty_cells[:8]}."
+                )
+
+        asset_metadata[rel_p] = {
+            "size": [w, h],
+            "grid": [cols, rows],
+            "empty_cells": [list(ec) for ec in empty_cells],
+            "mode": str(c_entry.get("fabrication_mode") or c_entry.get("asset_type") or "static_sprite"),
+            "purpose": str(c_entry.get("purpose") or ""),
+        }
+
+    if is_godot:
+        for claim in slicing_info.get("script_grid_claims") or []:
+            if claim.get("kind") == "fractional_region" and not claim.get("guarded"):
+                c_cols = int(claim.get("cols") or 1)
+                c_rows = int(claim.get("rows") or 1)
+                mismatched_single_assets: List[str] = []
+                for a_rel in claim.get("assets") or []:
+                    meta = asset_metadata.get(a_rel)
+                    c_ent = by_rel_path.get(a_rel, {})
+                    grid_wh = meta.get("grid", [1, 1]) if meta else [
+                        max(1, int(c_ent.get("hframes") or 1)),
+                        max(1, int(c_ent.get("vframes") or 1)),
+                    ]
+                    if grid_wh == [1, 1] and not a_rel.endswith("_sheet.png"):
+                        mismatched_single_assets.append(a_rel)
+                if mismatched_single_assets:
+                    scr = str(claim.get("script") or "")
+                    _flag_script(scr)
+                    for caller_scr in claim.get("caller_scripts") or []:
+                        _flag_script(str(caller_scr))
+                    errors.append(
+                        f"Script '{scr}' unconditionally slices texture region 1/{c_cols} x 1/{c_rows} "
+                        f"on single-frame 1x1 asset(s) {mismatched_single_assets[:5]}, cropping a partial corner!"
+                    )
+
+        for dload in slicing_info.get("dead_texture_loads") or []:
+            scr = str(dload.get("script") or "")
+            _flag_script(scr)
+            errors.append(str(dload.get("issue") or f"Unbound texture load in {scr}"))
+
+        for order_bug in slicing_info.get("init_before_ready_texture_vars") or []:
+            scr = str(order_bug.get("script") or "")
+            _flag_script(scr)
+            errors.append(str(order_bug.get("issue") or f"_init() before _ready() texture ordering bug in {scr}"))
+
+    return {
+        "visual_files": visual_files,
+        "errors": errors,
+        "offending_assets": offending_assets,
+        "offending_scripts": offending_scripts,
+        "asset_metadata": asset_metadata,
+    }
+
+
+def render_cartridge_asset_contact_sheet(
+    cartridge_dir: Union[Path, str],
+    output_path: Optional[Union[Path, str]] = None,
+    max_tiles: int = 36,
+) -> Optional[Path]:
+    """Renders a labeled checkerboard contact sheet of a cartridge's production visual assets
+    (`assets/sprites/`, `assets/ui/`, `assets/tiles/`, `assets/portraits/`), overlaying `(hframes, vframes)`
+    cell grid lines and relative paths + pixel sizes so Gate B and the Specialist Council can inspect
+    every game asset in a single HIGH-resolution image.
+    """
+    cdir = Path(cartridge_dir).resolve()
+    audit = audit_cartridge_visual_and_slicing_integrity(cdir)
+    vfiles: List[Path] = list(audit.get("visual_files") or [])[:max_tiles]
+    if not vfiles:
+        return None
+    meta_map: Dict[str, Dict[str, Any]] = dict(audit.get("asset_metadata") or {})
+
+    cols = min(4, max(1, int(math.ceil(math.sqrt(len(vfiles))))))
+    rows = int(math.ceil(len(vfiles) / float(cols)))
+    card_w, card_h = 260, 216
+    pad = 12
+    header_h = 36
+    sheet_w = cols * card_w + (cols + 1) * pad
+    sheet_h = header_h + rows * card_h + (rows + 1) * pad
+
+    sheet = Image.new("RGBA", (sheet_w, sheet_h), (20, 23, 29, 255))
+    draw = ImageDraw.Draw(sheet)
+    draw.text(
+        (pad, 10),
+        f"CARTRIDGE VISUAL ASSET CONTACT SHEET ({len(vfiles)} assets — checkerboard=alpha, cyan lines=atlas cells)",
+        fill=(235, 240, 248, 255),
+    )
+
+    thumb_w, thumb_h = card_w - 20, card_h - 52
+    chk = 12
+    for idx, vf in enumerate(vfiles):
+        r_i = idx // cols
+        c_i = idx % cols
+        x0 = pad + c_i * (card_w + pad)
+        y0 = header_h + pad + r_i * (card_h + pad)
+        rel_p = vf.relative_to(cdir).as_posix() if vf.is_relative_to(cdir) else vf.name
+        info = meta_map.get(rel_p, {})
+        grid = info.get("grid") or [1, 1]
+        g_cols, g_rows = max(1, int(grid[0])), max(1, int(grid[1]))
+        has_empty = bool(info.get("empty_cells"))
+
+        border_col = (235, 80, 80, 255) if has_empty else (82, 94, 114, 255)
+        draw.rectangle([x0, y0, x0 + card_w - 1, y0 + card_h - 1], fill=(30, 34, 42, 255), outline=border_col, width=2)
+
+        tx0, ty0 = x0 + 10, y0 + 8
+        for cy in range(0, thumb_h, chk):
+            for cx in range(0, thumb_w, chk):
+                c_tone = (58, 63, 74, 255) if ((cx // chk + cy // chk) % 2 == 0) else (42, 46, 55, 255)
+                draw.rectangle(
+                    [tx0 + cx, ty0 + cy, min(tx0 + thumb_w - 1, tx0 + cx + chk - 1), min(ty0 + thumb_h - 1, ty0 + cy + chk - 1)],
+                    fill=c_tone,
+                )
+
+        w_px, h_px = 0, 0
+        try:
+            with Image.open(vf) as im:
+                rgba = im.convert("RGBA")
+                w_px, h_px = rgba.size
+                scale = min(thumb_w / float(max(1, w_px)), thumb_h / float(max(1, h_px)))
+                nw = max(1, int(round(w_px * scale)))
+                nh = max(1, int(round(h_px * scale)))
+                interp = Image.Resampling.NEAREST if (w_px <= 128 and h_px <= 128) else Image.Resampling.LANCZOS
+                resized = rgba.resize((nw, nh), interp)
+                px_off = tx0 + (thumb_w - nw) // 2
+                py_off = ty0 + (thumb_h - nh) // 2
+                sheet.paste(resized, (px_off, py_off), resized)
+                draw.rectangle([px_off, py_off, px_off + nw - 1, py_off + nh - 1], outline=(110, 125, 145, 200), width=1)
+                if g_cols * g_rows > 1:
+                    for gc in range(1, g_cols):
+                        gx = px_off + int(round(nw * gc / float(g_cols)))
+                        draw.line([(gx, py_off), (gx, py_off + nh - 1)], fill=(0, 225, 255, 210), width=1)
+                    for gr in range(1, g_rows):
+                        gy = py_off + int(round(nh * gr / float(g_rows)))
+                        draw.line([(px_off, gy), (px_off + nw - 1, gy)], fill=(0, 225, 255, 210), width=1)
+        except Exception:
+            draw.text((tx0 + 8, ty0 + 8), "DECODE ERROR", fill=(255, 90, 90, 255))
+
+        short_rel = rel_p.replace("assets/", "")
+        if len(short_rel) > 34:
+            short_rel = "..." + short_rel[-31:]
+        draw.text((x0 + 8, y0 + thumb_h + 14), short_rel, fill=(230, 236, 245, 255))
+        meta_lbl = f"{w_px}x{h_px}px | grid={g_cols}x{g_rows}" + (" [EMPTY CELLS!]" if has_empty else "")
+        draw.text(
+            (x0 + 8, y0 + thumb_h + 30),
+            meta_lbl,
+            fill=(255, 120, 120, 255) if has_empty else (165, 178, 198, 255),
+        )
+
+    dest = Path(output_path) if output_path is not None else (cdir / "artifacts" / "proofs" / "asset_contact_sheet.png")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    sheet.convert("RGB").save(dest, format="PNG")
+    return dest
 
 
 class AssetValidator:
@@ -39,6 +344,9 @@ class AssetValidator:
         min_audio_duration_sec: float = 0.1,
         max_audio_duration_sec: float = 30.0,
         silence_threshold_rms: float = 1.0,
+        gemini_client: Optional[Any] = None,
+        event_bus: Optional[Any] = None,
+        model_name: str = DEFAULT_STUDIO_MODEL,
     ):
         self.palette = palette or STYLE_BIBLE_16_PALETTE
         self.palette_set = set(self.palette)
@@ -46,6 +354,9 @@ class AssetValidator:
         self.min_audio_duration = float(min_audio_duration_sec)
         self.max_audio_duration = float(max_audio_duration_sec)
         self.silence_threshold_rms = float(silence_threshold_rms)
+        self.gemini_client = gemini_client
+        self.event_bus = event_bus
+        self.model_name = model_name
 
     # -------------------------------------------------------------------------
     # Audio Validation (.wav)
@@ -499,6 +810,90 @@ class AssetValidator:
 
         return errors
 
+    def _run_multimodal_contact_sheet_audit(
+        self,
+        cdir: Path,
+        contact_sheet_path: Path,
+        asset_metadata: Dict[str, Dict[str, Any]],
+    ) -> Optional[AssetSheetMultimodalAuditVerdict]:
+        """Runs a Rationale-First (Rule 4) multimodal visual audit of `contact_sheet_path` against
+        `game_bible.json` `visual_style_guide` and concept mockups using `gemini-3.8-flash`."""
+        if not is_real_genai_client(self.gemini_client) or not contact_sheet_path.is_file():
+            return None
+        try:
+            from google.genai import types
+
+            bible_data = json.loads((cdir / "game_bible.json").read_text(encoding="utf-8"))
+            style_guide = str(bible_data.get("visual_style_guide") or "")
+            camera_paradigm = str(bible_data.get("camera_and_spatial_paradigm") or "")
+            game_title = str(bible_data.get("game_title") or cdir.name)
+
+            parts: List[Any] = [
+                types.Part.from_bytes(
+                    data=contact_sheet_path.read_bytes(),
+                    mime_type="image/png",
+                    media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+                )
+            ]
+            for m_dir in (cdir / "assets" / "mockups", cdir / "artifacts" / "concept_art"):
+                if m_dir.is_dir():
+                    for mp in sorted(m_dir.glob("*.png"))[:2]:
+                        if mp.is_file():
+                            parts.append(types.Part.from_bytes(data=mp.read_bytes(), mime_type="image/png"))
+
+            manifest_lines = [
+                f"- {rel}: size={meta.get('size')}, grid={meta.get('grid')}, mode={meta.get('mode')}, purpose={str(meta.get('purpose') or '')[:90]}"
+                for rel, meta in sorted(asset_metadata.items())[:36]
+            ]
+            prompt_txt = (
+                f"You are the Gate B Multimodal Visual Asset Integrity Critic auditing '{game_title}'.\n"
+                f"Image 1 is the labeled CARTRIDGE VISUAL ASSET CONTACT SHEET (checkerboard = transparent alpha; "
+                f"cyan lines = multi-cell atlas boundaries). Any subsequent images are the Game Bible concept art mockups.\n\n"
+                f"=== GAME BIBLE VISUAL STYLE GUIDE ===\n{style_guide}\n"
+                f"Camera / Spatial Paradigm: {camera_paradigm}\n\n"
+                f"=== REGISTERED VISUAL ASSETS ===\n" + "\n".join(manifest_lines) + "\n\n"
+                f"Audit EVERY tile on the contact sheet:\n"
+                f"1. Flag any asset rendered as crude flat solid-color geometric placeholder shapes (e.g. unshaded triangles, "
+                f"rectangles, or circles) that clash with the Game Bible's illustrated/painted style guide and concept mockups.\n"
+                f"2. Flag any multi-cell atlas (`grid=CxR` with `C*R > 1`) that has blank/transparent checkerboard cells where icons or frames should be.\n"
+                f"3. Flag any garbled, severely clipped, or unreadable asset.\n"
+                f"Deliberate thoroughly first (`deliberation`), list exact relative paths (`assets/.../*.png`) in `offending_assets`, "
+                f"and set `all_assets_coherent_and_intact` last."
+            )
+            parts.append(types.Part.from_text(text=prompt_txt))
+
+            from engine.studio.models import _sanitize_gemini_json_schema
+            cfg_kwargs: Dict[str, Any] = {
+                "response_mime_type": "application/json",
+                "response_schema": _sanitize_gemini_json_schema(
+                    AssetSheetMultimodalAuditVerdict.model_json_schema()
+                ),
+            }
+            if hasattr(types, "ThinkingConfig") and hasattr(types, "ThinkingLevel"):
+                cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
+            resp = self.gemini_client.models.generate_content(
+                model=self.model_name,
+                contents=parts,
+                config=types.GenerateContentConfig(**cfg_kwargs),
+            )
+            verdict = AssetSheetMultimodalAuditVerdict.model_validate_json(resp.text or "{}")
+            logger.info("reasoning_rationale[gate_b_asset_sheet]: %s", verdict.deliberation)
+            if self.event_bus is not None and hasattr(self.event_bus, "publish_agent_stream"):
+                try:
+                    self.event_bus.publish_agent_stream(
+                        agent_name="AssetValidator",
+                        message=f"Multimodal Contact Sheet Audit: coherent={verdict.all_assets_coherent_and_intact}, offending={verdict.offending_assets}",
+                        deliberation=verdict.deliberation,
+                        log_level="INFO" if verdict.all_assets_coherent_and_intact else "WARNING",
+                        category="GATE_CHECK",
+                    )
+                except Exception:
+                    pass
+            return verdict
+        except Exception as exc:
+            logger.warning("Multimodal contact sheet audit skipped/failed on %s: %s", cdir.name, exc)
+            return None
+
     # -------------------------------------------------------------------------
     # Full Cartridge Gate E Evaluation
     # -------------------------------------------------------------------------
@@ -540,14 +935,12 @@ class AssetValidator:
                     all_errors.extend(rep.errors)
                 deliberation_parts.append(rep.deliberation)
 
-        # 3. Validate visual sprites under assets/sprites, assets/tiles, or root
-        sprite_dirs = [cdir / "assets" / "sprites", cdir / "assets" / "tiles", cdir / "sprites", cdir / "tiles"]
-        sprite_files = []
-        for sdir in sprite_dirs:
-            if sdir.is_dir():
-                sprite_files.extend(list(sdir.glob("*.png")))
-        sprite_files.extend(list(cdir.glob("*.png")))
-        sprite_files = list(dict.fromkeys(sprite_files))
+        # 3. Validate visual assets across assets/sprites, assets/tiles, assets/ui, assets/portraits, or root
+        slicing_audit = audit_cartridge_visual_and_slicing_integrity(cdir)
+        sprite_files = list(slicing_audit.get("visual_files") or [])
+        offending_assets: List[str] = list(slicing_audit.get("offending_assets") or [])
+        offending_scripts: List[str] = list(slicing_audit.get("offending_scripts") or [])
+        diagnostic_data["asset_metadata"] = dict(slicing_audit.get("asset_metadata") or {})
 
         if sprite_files:
             has_any_multimodal_assets = True
@@ -556,7 +949,46 @@ class AssetValidator:
                 rep = self.validate_visual_asset(img_file)
                 if not rep.passed:
                     all_errors.extend(rep.errors)
+                    try:
+                        rel_bad = img_file.relative_to(cdir).as_posix()
+                    except Exception:
+                        rel_bad = img_file.name
+                    if rel_bad not in offending_assets:
+                        offending_assets.append(rel_bad)
                 deliberation_parts.append(rep.deliberation)
+
+        for sa_err in slicing_audit.get("errors") or []:
+            all_errors.append(str(sa_err))
+            deliberation_parts.append(str(sa_err))
+
+        # 4. Multimodal Contact-Sheet Style & Completeness Critic (when live Gemini client + Game Bible exist)
+        if sprite_files and is_real_genai_client(self.gemini_client) and (cdir / "game_bible.json").is_file():
+            contact_sheet_p = render_cartridge_asset_contact_sheet(cdir)
+            if contact_sheet_p is not None and contact_sheet_p.is_file():
+                diagnostic_data["contact_sheet_path"] = str(contact_sheet_p)
+                mm_verdict = self._run_multimodal_contact_sheet_audit(cdir, contact_sheet_p, diagnostic_data["asset_metadata"])
+                if mm_verdict is not None:
+                    deliberation_parts.append(f"Multimodal Contact Sheet Critic: {mm_verdict.deliberation}")
+                    if not mm_verdict.all_assets_coherent_and_intact or mm_verdict.offending_assets:
+                        for raw_off in mm_verdict.offending_assets:
+                            norm_off = str(raw_off or "").replace("res://", "").lstrip("/")
+                            if not norm_off.startswith("assets/") and (cdir / "assets" / norm_off).is_file():
+                                norm_off = f"assets/{norm_off}"
+                            if (cdir / norm_off).is_file() and norm_off not in offending_assets:
+                                offending_assets.append(norm_off)
+                        for raw_scr in mm_verdict.offending_scripts:
+                            norm_scr = str(raw_scr or "").replace("res://", "").lstrip("/")
+                            if (cdir / norm_scr).is_file() and norm_scr not in offending_scripts:
+                                offending_scripts.append(norm_scr)
+                        crit_msg = (
+                            mm_verdict.remediation_summary.strip()
+                            or f"Multimodal asset sheet critic rejected incoherent/placeholder assets: {mm_verdict.offending_assets}"
+                        )
+                        all_errors.append(f"Multimodal Contact Sheet Audit: {crit_msg}")
+
+        diagnostic_data["offending_assets"] = offending_assets
+        diagnostic_data["offending_scripts"] = offending_scripts
+        diagnostic_data["violations"] = list(all_errors)
 
         # If no multimodal assets found in cartridge, pass cleanly
         if not has_any_multimodal_assets:

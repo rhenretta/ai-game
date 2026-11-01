@@ -650,11 +650,11 @@ def test_sparse_impressions_non_repetition_compaction_and_experience_report(tmp_
 
 
 def test_fast_non_thinking_model_config_and_live_notebook_questions_bugs_mood_and_audio_transition(tmp_path: Path):
-    assert DEFAULT_PLAYTEST_MODEL == "gemini-3.5-flash-lite"
+    assert DEFAULT_PLAYTEST_MODEL == "gemini-3.8-flash"
     lite_tc = _playtest_non_thinking_config("gemini-3.5-flash-lite")
     assert lite_tc.thinking_level == types.ThinkingLevel.MINIMAL
     flash_tc = _playtest_non_thinking_config("gemini-3.8-flash")
-    assert flash_tc.thinking_budget == 0
+    assert flash_tc.thinking_level == types.ThinkingLevel.LOW
 
     card = BlindStoreCard(
         deliberation="Test player notes, questions, bug spotting, live mood, and perceptual change note.",
@@ -1187,7 +1187,9 @@ def test_visual_craft_audit_high_res_verification_and_report_model(tmp_path: Pat
 
     rep_call = fake_client.calls[3]
     assert rep_call["model"] == "gemini-3.8-flash"
-    assert rep_call["config"].thinking_config.thinking_budget == 2048
+    assert rep_call["config"].thinking_config.thinking_level == types.ThinkingLevel.HIGH
+    assert rep_call["config"].temperature is None
+    assert fake_client.calls[0]["config"].temperature is None
     rep_img_parts = [
         p for p in rep_call["contents"][-1].parts if p.inline_data and p.inline_data.mime_type == "image/png"
     ]
@@ -1195,6 +1197,64 @@ def test_visual_craft_audit_high_res_verification_and_report_model(tmp_path: Pat
     assert len(rep_img_parts) == 3
     for img_part in rep_img_parts:
         assert img_part.media_resolution.level.value == "MEDIA_RESOLUTION_HIGH"
+
+
+def test_stratified_5_frame_report_sampling_skips_dark_modal_blackouts(tmp_path: Path):
+    card = BlindStoreCard(
+        deliberation="Test 5-frame stratified report screenshot selection across open-world and UI turns.",
+        checkpoint_id="cp_stratified",
+        game_title="Archipelago Survey",
+        game_description="Explore islands and craft tools.",
+    )
+    turns = [_turn_payload(i, inspect_high_res_next=(i == 6), plan=f"Step {i}") for i in range(1, 9)]
+    report_payload = {
+        "deliberation": "Auditing all 5 stratified HIGH-res frames.",
+        "overall_experience_summary": "Tested open world and UI.",
+        "visual_and_ui_defects_observed": ["Blank icon slots in workbench panel"],
+        "graphics_and_visuals": "Workbench slots missing icons.",
+        "gameplay_and_feel": "Responsive movement.",
+        "sound_and_audio": "Silent.",
+        "intuitiveness_and_onboarding": "Clear prompts.",
+        "goals_pacing_and_accomplishment": "Surveyed first zone.",
+        "world_and_atmosphere": "Bright coastline.",
+        "key_highlights": ["Responsive movement"],
+        "key_pain_points": ["Missing recipe icons"],
+        "bugs_and_glitches_observed": ["Empty icon boxes in crafting panel"],
+        "unanswered_questions_and_mysteries": [],
+        "overall_fun_rating": 5,
+    }
+    fake_client = _QueuedFakeGeminiClient([{"payload": t} for t in turns] + [{"payload": report_payload}])
+    agent = BlindPlaytesterAgent(store_card=card, client=fake_client)
+
+    # Turn 5 is a dark modal blackout (luminance < 35); neighbors Turn 4 & Turn 6 are bright open-world/UI frames!
+    bgs = [
+        (40, 90, 140),
+        (60, 130, 170),
+        (180, 170, 120),
+        (150, 190, 110),
+        (5, 5, 8),       # Turn 5 dark blackout
+        (200, 185, 140), # Turn 6 bright
+        (220, 160, 90),  # Turn 7 HIGH-res (requested by Turn 6 inspect_high_res_next=True)
+        (80, 110, 150),
+    ]
+    obs_list = [
+        _make_obs(tmp_path, idx, bg_rgb=bgs[idx - 1], marker_x=40 * idx, audio_is_silent=True)
+        for idx in range(1, 9)
+    ]
+    for idx, obs in enumerate(obs_list, start=1):
+        agent.decide_turn(idx, obs)
+
+    _, _ = agent.generate_experience_report(
+        end_status="completed",
+        end_outcome="finished_exploring",
+        final_screenshot_path=obs_list[-1].screenshot_path,
+    )
+    rep_parts = fake_client.calls[-1]["contents"][-1].parts
+    rep_imgs = [p for p in rep_parts if p.inline_data and p.inline_data.mime_type == "image/png"]
+    rep_labels = [p.text for p in rep_parts if p.text and "HIGH resolution for visual/UI craft audit" in p.text]
+    assert len(rep_imgs) == 5
+    # Turn 5 dark blackout was avoided in favor of bright neighboring open-world frame
+    assert not any("Turn #5)" in lbl for lbl in rep_labels)
 
 
 

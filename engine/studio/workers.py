@@ -443,8 +443,43 @@ def plan_asset_requirement(
                     f"({chars} chars). Do NOT concatenate multiple barks or speaker labels into one string."
                 )
         if not issues:
-            # Ensure target_path cannot collide with another task's asset file in the shared catalog
+            # Ensure target_path cannot accidentally collide with another task's asset file,
+            # while allowing intentional in-place regeneration when `req.target_path` is explicitly
+            # targeted by the WorkItem (`target_modules`, `spec`, or `title`) and no concurrent task owns it.
             safe_item_id = _safe_id(item.item_id)
+            norm_req_path = req.target_path.replace("res://", "").lstrip("/")
+            explicit_target_blob = "\n".join([
+                str(item.title or ""),
+                str(item.spec or ""),
+                *(str(m or "") for m in (item.target_modules or [])),
+            ])
+            explicitly_targets_path = bool(
+                norm_req_path and (
+                    norm_req_path in explicit_target_blob
+                    or f"res://{norm_req_path}" in explicit_target_blob
+                )
+            )
+            active_other_ids: Set[str] = set()
+            active_states = {
+                "ready", "blocked", "in_progress", "waiting_for_lock",
+                "awaiting_review", "changes_requested", "needs_decision",
+            }
+            if ctx.board is not None and hasattr(ctx.board, "items"):
+                try:
+                    for wi in ctx.board.items():
+                        if getattr(wi, "item_id", "") != item.item_id and str(getattr(wi, "state", "")).lower() in active_states:
+                            active_other_ids.add(str(wi.item_id))
+                except Exception:
+                    pass
+            elif (ctx.cartridge_dir / "backlog.json").is_file():
+                try:
+                    b_raw = json.loads((ctx.cartridge_dir / "backlog.json").read_text(encoding="utf-8"))
+                    for wi in (b_raw.get("items") or []):
+                        if isinstance(wi, dict) and str(wi.get("item_id", "")) != item.item_id and str(wi.get("state", "")).lower() in active_states:
+                            active_other_ids.add(str(wi["item_id"]))
+                except Exception:
+                    pass
+
             for cat_cand in (ctx.cartridge_dir / "catalog.json", ctx.cartridge_dir / "assets" / "asset_library.json"):
                 if cat_cand.is_file():
                     try:
@@ -456,6 +491,8 @@ def plan_asset_requirement(
                                     continue
                                 other_file = entry_val.get("file") or entry_val.get("file_path") or entry_val.get("target_path")
                                 if other_file == req.target_path:
+                                    if explicitly_targets_path and str(other_id) not in active_other_ids:
+                                        continue
                                     tp = Path(req.target_path)
                                     req.target_path = str(tp.parent / f"{safe_item_id}_{tp.name}")
                                     break
@@ -483,12 +520,34 @@ def _collect_proofs(renders_dir: Path, asset_id: str, asset_file: Optional[Path]
 
 
 def _merge_catalog_entry(ctx: WorkerContext, worker_lib: Any, asset_id: str) -> None:
-    """Merges the worker's catalog entry into the shared on-disk catalog without losing concurrent workers' updates."""
+    """Merges the worker's catalog entry into the shared on-disk catalog without losing concurrent workers' updates,
+    superseding any stale catalog entry that previously owned the exact same relative file path."""
     entry = worker_lib.catalog.entries.get(asset_id)
     if entry is None:
         raise StudioAgentError(f"Fabrication of '{asset_id}' produced no catalog entry")
+    entry_file = (
+        (entry.get("file") or entry.get("file_path") or entry.get("target_path") or "")
+        if isinstance(entry, dict)
+        else (getattr(entry, "file_path", "") or getattr(entry, "res_path", "") or "")
+    )
+    norm_entry_file = str(entry_file).replace("res://", "").lstrip("/")
+    is_visual_file = norm_entry_file.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
     with _CATALOG_LOCK:
         shared = ctx.new_library()
+        if is_visual_file and isinstance(shared.catalog.entries, dict):
+            stale_ids = []
+            for oid, oentry in list(shared.catalog.entries.items()):
+                if oid == asset_id:
+                    continue
+                ofile = (
+                    (oentry.get("file") or oentry.get("file_path") or oentry.get("target_path") or "")
+                    if isinstance(oentry, dict)
+                    else (getattr(oentry, "file_path", "") or getattr(oentry, "res_path", "") or "")
+                )
+                if str(ofile).replace("res://", "").lstrip("/") == norm_entry_file:
+                    stale_ids.append(oid)
+            for oid in stale_ids:
+                shared.catalog.entries.pop(oid, None)
         shared.catalog.entries[asset_id] = entry
         shared.save_catalog()
 
@@ -506,7 +565,7 @@ def _fabricate_visual(
         details={"asset_id": req.asset_id, "target_path": req.target_path, "mode": req.fabrication_mode},
     )
     lib = ctx.new_library()
-    eff_force = bool(item.revisions) if force_regenerate is None else bool(force_regenerate)
+    eff_force = True if force_regenerate is None else bool(force_regenerate)
     out = lib.fabricate_single_asset(req, force_regenerate=eff_force)
     if out is None or not Path(out).is_file():
         raise StudioAgentError(f"Fabrication of '{item.item_id}' produced no file (mode={req.fabrication_mode}).")
@@ -1850,7 +1909,7 @@ def run_visual_artist_specialist(
         ctx,
         sub_item,
         VISUAL_MODES,
-        force_regenerate=bool(item.revisions) or (turn_index > 0),
+        force_regenerate=True,
     )
     req_file = _item_dir(ctx, sub_item) / "requirement.json"
     touched: List[str] = list(target_paths or [])

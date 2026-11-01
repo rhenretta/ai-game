@@ -12,7 +12,7 @@ from pydantic import Field, field_validator
 from engine.studio.models import BaseEpistemicModel, DEFAULT_STUDIO_MODEL, StudioAgentError
 
 
-DEFAULT_PLAYTEST_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_PLAYTEST_MODEL = "gemini-3.8-flash"
 DEFAULT_PLAYTEST_REPORT_MODEL = DEFAULT_STUDIO_MODEL
 PLAYTEST_VIEWPORT_W = 1280
 PLAYTEST_VIEWPORT_H = 720

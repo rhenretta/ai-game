@@ -55,6 +55,9 @@ export function LiveActivityBanner({
         : Radio;
 
   const secondaryNote = activity.whyPostBoardActive || activity.detail;
+  const fullHoverTooltip = secondaryNote
+    ? `${activity.headline}\n${secondaryNote}`
+    : activity.headline;
 
   return (
     <section
@@ -65,27 +68,26 @@ export function LiveActivityBanner({
       <div className="live-activity-banner-row">
         <div className="live-activity-primary">
           <span className="live-pulse-dot" aria-hidden="true" />
-          <span className={stageBadgeCls}>
+          <span className={stageBadgeCls} style={{ flexShrink: 0 }}>
             <StageIcon size={11} aria-hidden="true" />
             {activity.stageTitle}
           </span>
-          <span className="badge" style={{ textTransform: 'none', fontWeight: 600 }}>
+          <span className="badge" style={{ textTransform: 'none', fontWeight: 600, flexShrink: 0 }}>
             {activity.activeAgentLabel}
           </span>
 
-          {/* Polite live region restricted strictly to meaningful stage/headline transitions */}
-          <div role="status" aria-live="polite" style={{ minInlineSize: 0 }}>
+          {/* Polite live region restricted strictly to concise 1-line stage/headline transitions */}
+          <div
+            role="status"
+            aria-live="polite"
+            className="live-activity-status"
+            title={fullHoverTooltip}
+          >
             <span className="visually-hidden">
               {activity.stageTitle} ({activity.activeAgentLabel}):{' '}
             </span>
             <span className="live-activity-headline">{activity.headline}</span>
           </div>
-
-          {secondaryNote ? (
-            <span className="live-activity-subnote" style={{ flexBasis: '100%' }}>
-              {secondaryNote}
-            </span>
-          ) : null}
         </div>
 
         <div className="live-activity-telemetry">

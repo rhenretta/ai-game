@@ -321,6 +321,7 @@ class GodotAtomicTestRunner:
         cls,
         cartridge_dir: Union[Path, str],
         unit_id: str = "actors",
+        client: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Tier 2 In-Engine Animation & Articulated Rig Strip Render:
         Renders a 4-frame time-stepped viewport strip in Godot (`t=2, 8, 14, 20`) while driving locomotion/action
@@ -339,10 +340,14 @@ class GodotAtomicTestRunner:
         if not t0_p.is_file() or not tend_p.is_file():
             cls.render_scene_and_collision_overlay(c_dir, unit_id=unit_id, ticks=30)
 
-        # Also verify all sprite_sheet and articulated_parts assets in the cartridge catalog
+        # Also verify all sprite_sheet and articulated_parts assets in the cartridge catalog.
+        # Rule 5: Never auto-remediate on-disk assets without a live Gemini client (prevents procedural overwrites).
         from engine.studio.asset_library import AssetLibraryManager
-        mgr = AssetLibraryManager(cartridge_dir=c_dir)
-        catalog_check = mgr.verify_all_catalog_assets_and_animations()
+        from engine.studio.models import is_real_genai_client
+        mgr = AssetLibraryManager(cartridge_dir=c_dir, client=client)
+        catalog_check = mgr.verify_all_catalog_assets_and_animations(
+            auto_remediate=is_real_genai_client(client)
+        )
 
         # Build a side-by-side t0 vs tend crop strip around the active world center
         if t0_p.is_file() and tend_p.is_file():
