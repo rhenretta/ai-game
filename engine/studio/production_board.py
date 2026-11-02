@@ -1899,10 +1899,14 @@ class BoardScheduler:
         self._thread = threading.Thread(target=_loop, name="board-scheduler", daemon=True)
         self._thread.start()
 
-    def stop(self, wait: bool = True) -> None:
+    def stop_dispatch(self, wait: bool = True) -> None:
+        """Stops the background dispatch loop from claiming new items while keeping the worker pool reusable for future `start()` calls."""
         self._stop.set()
         with self._cv:
             self._cv.notify_all()
-        if self._thread is not None:
+        if wait and self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(timeout=5.0)
+
+    def stop(self, wait: bool = True) -> None:
+        self.stop_dispatch(wait=True)
         self._pool.shutdown(wait=wait)

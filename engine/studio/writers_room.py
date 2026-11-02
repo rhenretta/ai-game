@@ -4044,6 +4044,7 @@ class CreativeWritersRoom:
                 )
 
         bible_snapshot = self._format_bible_snapshot(game_bible)
+        asm_dna_header = self._dna_header_if_absent(dna_summary, bible_snapshot)
         qa_script_dossier_block = (
             f"=== QA SLICE PLAYTEST SCRIPT SOURCE (`{pt_plan.target_scene if 'pt_plan' in locals() else 'tests/...'}`) ===\n"
             f"{playtest_test_gd_source[:2400]}\n\n"
@@ -4051,7 +4052,7 @@ class CreativeWritersRoom:
             else ""
         )
         shared_playtest_dossier = (
-            f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n\n"
+            f"{asm_dna_header}"
             f"{bible_snapshot}\n\n"
             f"{curated_assembly_block}"
             f"=== PLAYABLE ENTRYPOINT REACHABILITY GRAPH ===\n{reach.get('summary_text', '')}\n\n"
@@ -4062,93 +4063,13 @@ class CreativeWritersRoom:
             f"=== APPROVED PRODUCTION BOARD ITEMS ({len(approved_summaries)} items) ===\n"
             + ("\n".join(approved_summaries) or "  (none)")
         )
-
-        roundtable_transcript_lines: List[str] = []
-        if not blind_playtest_takes_over and (
-            is_real_genai_client(self.client) or getattr(self, "enable_slice_playtest_discussion", False)
-        ):
-            playtest_panel_roles = ["GameplayDesigner", "UXExperienceDesigner", "VisualArtDirector"]
-            self._emit_activity(
-                agent_role="CouncilReviewPanel",
-                status_text=f"Council specialists ({', '.join(playtest_panel_roles)}) are conversing on the Slice Playtest results...",
-                active_agents=playtest_panel_roles,
-                phase="slice_assembly_check",
-            )
-            for p_role in playtest_panel_roles:
-                spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == p_role), None)
-                disp_name = spec["display_name"] if spec else p_role
-                mandate = self._role_review_mandate(p_role)
-                prior_chat = (
-                    "\n".join(f"  - {line}" for line in roundtable_transcript_lines)
-                    if roundtable_transcript_lines
-                    else "  (You are opening the Council's Slice Playtest critique after QA's playthrough presentation.)"
-                )
-                turn_prompt = (
-                    f"{shared_playtest_dossier}\n\n"
-                    f"=== SLICE PLAYTEST ROUNDTABLE CONVERSATION SO FAR ===\n{prior_chat}\n\n"
-                    f"You are the {disp_name} ({p_role}) in the Writers' Room inspecting the Automated Slice Playtest filmstrip and telemetry for '{active_slice_title}' (`{active_slice_id}`, Pass #{pass_index + 1} of {int(getattr(self, 'max_assembly_passes', 3))}).\n"
-                    f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n\n"
-                    f"{mandate}\n"
-                    "INSTRUCTIONS:\n"
-                    "1. Determine `validation_criteria_for_my_role`: what must be true in this slice playtest for THIS active slice's scope (plus any Executive Producer direction) to be cohesive, intuitive (the player knows how to play), responsive, goal-driven, and genuinely playable from your specialist perspective?\n"
-                    "2. Skeptically inspect every HIGH-resolution frame of the attached playtest filmstrip and telemetry progression:\n"
-                    "   - COHESION & SPATIAL READABILITY: Is the playable world clearly visible and spatially staged around the player's actions, or is the screen dominated/occluded by a giant static panel, overlapping HUD widgets, or cut-off/bleeding sprite slicing?\n"
-                    "   - INTUITIVENESS & KNOWING HOW TO PLAY: Would a human player opening `run/main_scene` immediately understand what controls to use, what each control does in the world, and what their immediate objective is without developer telemetry?\n"
-                    "   - RESPONSIVENESS & DEPTH: Does holding player control inputs over 60–180 ticks (1–3 seconds) produce a responsive, human-playable rate of motion/turn/action and meaningful cause-and-effect in the world?\n"
-                    "   - SHORT-TERM / LONG-TERM GOALS & ACCOMPLISHMENT: Did the scripted playthrough make real causal progress toward the slice's immediate/short-term goal while keeping the longer-term goal and progress milestones visible?\n"
-                    "   - ZERO DEBUG OVERLAYS IN PRODUCTION: Are HUD instruments clean, non-overlapping, and free of developer debug text (`[DEBUG]`, `[QA ... PLAYTEST HARNESS]`, raw telemetry dumps) in the production game?\n"
-                    "3. PRAGMATIC SLICE COMPLETION JUDGMENT: Never open `spoken_dialogue` with 'I completely agree with...' or peer flattery, and never pretend rough edges are 'flawless'. "
-                    "Set `is_playable_and_fun_from_my_perspective=False` when active-slice scope is unmounted/broken, controls or causal progression fail, production debug overlays leak, high-impact visual/UI glitches (cut-off sprites, overflowing/overlapping HUD) hurt readability, or an Executive Producer directive is unmet. "
-                    "Conversely, remember we cannot change everything in one go: once the active slice's scope is covered and major problem areas are cleaned up, call the slice assembled (`is_playable_and_fun_from_my_perspective=True`) while candidly naming any minor rough spots or broader ambitions to carry into future slices.\n"
-                    "Provide `deliberation` FIRST and `is_playable_and_fun_from_my_perspective` strictly LAST."
-                )
-                turn_decision = self._structured_with_validation(
-                    turn_prompt,
-                    SlicePlaytestRoundtableTurn,
-                    lambda _t: [],
-                    temperature=0.35,
-                    parts=parts,
-                )
-                roundtable_transcript_lines.append(
-                    f"[{disp_name} ({p_role})] (is_playable_and_fun={turn_decision.is_playable_and_fun_from_my_perspective} | criteria={turn_decision.validation_criteria_for_my_role}): "
-                    f"{turn_decision.spoken_dialogue} | Issues: {turn_decision.observed_issues_or_gaps}"
-                )
-                t_idx = len(game_bible.writers_room_transcript)
-                p_utt = WritersRoomUtterance(
-                    deliberation=turn_decision.deliberation,
-                    utterance_id=f"utt_{t_idx:02d}_{p_role}_slice_playtest_{pass_index}",
-                    turn_index=t_idx,
-                    speaker_role=p_role,
-                    speaker_display_name=disp_name,
-                    spoken_dialogue=turn_decision.spoken_dialogue,
-                    addressed_to=turn_decision.addressed_to or ["CreativeDirector", "GameplaySystemsEngineer"],
-                    bible_updates_summary=[
-                        f"slice_playtest_vote:{p_role}:{'pass' if turn_decision.is_playable_and_fun_from_my_perspective else 'needs_work'}"
-                    ],
-                )
-                game_bible.writers_room_transcript.append(p_utt)
-                self._emit_event(
-                    "writers_room_utterance",
-                    {
-                        "deliberation": p_utt.deliberation,
-                        "utterance_id": p_utt.utterance_id,
-                        "turn_index": p_utt.turn_index,
-                        "speaker_role": p_utt.speaker_role,
-                        "speaker_display_name": p_utt.speaker_display_name,
-                        "spoken_dialogue": p_utt.spoken_dialogue,
-                        "addressed_to": p_utt.addressed_to,
-                        "bible_updates_summary": p_utt.bible_updates_summary,
-                        "proof_image_paths": p_utt.proof_image_paths,
-                        "artifact_emitted": p_utt.artifact_emitted,
-                    },
-                )
-
-        roundtable_summary_block = (
-            "=== COUNCIL SLICE PLAYTEST ROUNDTABLE DISCUSSION ===\n"
-            + "\n".join(f"  - {line}" for line in roundtable_transcript_lines)
-            + "\n\n"
-            if roundtable_transcript_lines
-            else ""
+        assembly_shared_prefix = f"{shared_playtest_dossier}\n\n"
+        is_final_assembly = bool(getattr(self, "_final_verification_assembly_pass", False))
+        max_asm_passes = int(getattr(self, "max_assembly_passes", 3))
+        assembly_pass_label = (
+            f"Post-Remediation Final Verification Pass after {max_asm_passes} iteration round(s)"
+            if is_final_assembly
+            else f"Pass #{pass_index + 1} of {max_asm_passes}"
         )
         final_assembly_note = (
             "\nPOST-REMEDIATION FINAL VERIFICATION PASS: All current-slice assembly iteration rounds have been spent, "
@@ -4156,74 +4077,170 @@ class CreativeWritersRoom:
             "`is_slice_assembled=True` (`backlog_additions=[]`) if the playable entrypoint boots cleanly, mounts active-slice "
             "systems, and passes automated playtest assertions, or set `is_slice_assembled=False` ONLY if a severe blocking "
             "assembly/boot defect still breaks the slice.\n"
-            if getattr(self, "_final_verification_assembly_pass", False)
+            if is_final_assembly
             else ""
         )
-        prompt = (
-            f"{shared_playtest_dossier}\n\n"
-            f"{roundtable_summary_block}"
-            f"You are the Council Chair & Gameplay Systems Engineer synthesizing the Slice Playtest & Whole-Game Readiness Check now that all currently queued Production Board items are approved (Pass #{pass_index + 1} of {int(getattr(self, 'max_assembly_passes', 3))}).\n"
-            f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n"
-            f"{final_assembly_note}\n"
-            "INSTRUCTIONS:\n"
-            "1. Compare the Living Game Bible (including any Executive Producer directives), the Approved Production Board items, and the Council Slice Playtest Roundtable Discussion above against the `PLAYABLE ENTRYPOINT REACHABILITY GRAPH` "
-            "and the attached HIGH-resolution Slice Playtest filmstrip/telemetry of the playable entrypoint (`run/main_scene`).\n"
-            "2. Check whether any built gameplay system, progression loop, or HUD/UI widget that belongs in the active slice is still unmounted or unwired "
-            "from the playable entrypoint scene tree.\n"
-            "3. Skeptically evaluate `playability_and_fun_evaluation` across ALL frames of the attached Slice Playtest filmstrip:\n"
-            "   - Verify that player inputs produce a responsive, human-playable rate of motion/turn/action over 1–3 seconds (never fighting a damping/stabilizer script at 1 deg/sec, and never plummeting/drifting off-screen).\n"
-            "   - Verify that the playable game world is spatially legible and unobstructed (no giant static control box occluding the center of the viewport), and that a player immediately knows how to play and sees their short-term and long-term goals.\n"
-            "   - Verify that the scripted playtest can actively progress through the first goal of the current slice without assertion failures.\n"
-            "   - Verify that HUD widgets coexist cleanly without overlapping/overflowing text or cut-off/bleeding sprite slicing, and that there are ZERO developer debug overlays (`[DEBUG]`, `[QA ... PLAYTEST HARNESS]`, telemetry dumps) or `func test_*()` hacks in production `main.gd` / `ui_hud.gd`.\n"
-            "4. In `spoken_dialogue`, address the Council candidly with zero agreement preambles or cheerleading—summarize what actually works, what remains rough, and whether we are calling the slice assembled or running a surgical cleanup pass.\n"
-            "5. PRAGMATIC SLICE COMPLETION RULE: You cannot fix or expand everything in one go. If the active slice's scope (and any Executive Producer request) is assembled, responsive, playable through the first goal, and free of playtest assertion failures or glaring UI/visual breakage in `run/main_scene`, CALL THE SLICE ASSEMBLED (`backlog_additions=[]` and `is_slice_assembled=True`), leaving broader wishlist expansions for future slices.\n"
-            "6. If an active-slice system is unmounted, if the playtest revealed sluggish/conflicting controls or assertion failures, if an Executive Producer directive is still unmet, or if `run/main_scene` has a high-impact visual/HUD/debug-overlay/onboarding defect, "
-            "propose a small, surgical batch (1–3 tasks) of `integration` / `mechanic_code` / `ui` task(s) in `backlog_additions` BEFORE setting `is_slice_assembled=False`:\n"
-            "   - Diagnose and specify systemic, world-wide root causes in `spec` (fixing authoritative world/UI/mechanic rules across all valid regions and player states)—treat any failed playtest `(x, y)` coordinate strictly as diagnostic evidence or a `proof_spec` test landmark, never as a coordinate whitelist or fixed target to hardcode in production scripts.\n"
-            "   - When writing `proof_spec` for a fix task, require a QA test scene (`res://tests/test_<item_id>.tscn`) with appropriate test-only diagnostic overlays and real `input_segments` proving the fix over ~120-240 ticks.\n"
-            f"Buildable kinds right now: {self._supported_kinds() or 'all'}.\n"
-            "Return `SliceAssemblyDecision` with `deliberation` FIRST and `is_slice_assembled` strictly last."
+        run_asm_roundtable = bool(
+            not blind_playtest_takes_over
+            and (is_real_genai_client(self.client) or getattr(self, "enable_slice_playtest_discussion", False))
         )
 
-        hard_playtest_gate_failed = bool(playtest_assertion_failure) and (
-            is_real_genai_client(self.client)
-            or any(
-                tok in playtest_assertion_failure
-                for tok in (
-                    "Entrypoint Parity Gate failed",
-                    "Counterfactual QA check failed",
-                    "QA filmstrip state assertions failed",
-                    "QA Diagnostic Production Defect Report",
+        roundtable_transcript_lines: List[str] = []
+        with explicit_prefix_cache_scope(self.client, ttl_seconds=600, reuse_outer=False):
+            if run_asm_roundtable:
+                playtest_panel_roles = ["GameplayDesigner", "UXExperienceDesigner", "VisualArtDirector"]
+                self._emit_activity(
+                    agent_role="CouncilReviewPanel",
+                    status_text=f"Council specialists ({', '.join(playtest_panel_roles)}) are conversing on the Slice Playtest results...",
+                    active_agents=playtest_panel_roles,
+                    phase="slice_assembly_check",
+                )
+                for p_role in playtest_panel_roles:
+                    spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == p_role), None)
+                    disp_name = spec["display_name"] if spec else p_role
+                    mandate = self._role_review_mandate(p_role)
+                    prior_chat = (
+                        "\n".join(f"  - {line}" for line in roundtable_transcript_lines)
+                        if roundtable_transcript_lines
+                        else "  (You are opening the Council's Slice Playtest critique after QA's playthrough presentation.)"
+                    )
+                    turn_prompt = (
+                        f"{assembly_shared_prefix}"
+                        f"=== SLICE PLAYTEST ROUNDTABLE CONVERSATION SO FAR ===\n{prior_chat}\n\n"
+                        f"You are the {disp_name} ({p_role}) in the Writers' Room inspecting the Automated Slice Playtest filmstrip and telemetry for '{active_slice_title}' (`{active_slice_id}`, {assembly_pass_label}).\n"
+                        f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n"
+                        f"{final_assembly_note}\n"
+                        f"{mandate}\n"
+                        "INSTRUCTIONS:\n"
+                        "1. Determine `validation_criteria_for_my_role`: what must be true in this slice playtest for THIS active slice's scope (plus any Executive Producer direction) to be cohesive, intuitive (the player knows how to play), responsive, goal-driven, and genuinely playable from your specialist perspective?\n"
+                        "2. Skeptically inspect every HIGH-resolution frame of the attached playtest filmstrip and telemetry progression:\n"
+                        "   - COHESION & SPATIAL READABILITY: Is the playable world clearly visible and spatially staged around the player's actions, or is the screen dominated/occluded by a giant static panel, overlapping HUD widgets, or cut-off/bleeding sprite slicing?\n"
+                        "   - INTUITIVENESS & KNOWING HOW TO PLAY: Would a human player opening `run/main_scene` immediately understand what controls to use, what each control does in the world, and what their immediate objective is without developer telemetry?\n"
+                        "   - RESPONSIVENESS & DEPTH: Does holding player control inputs over 60–180 ticks (1–3 seconds) produce a responsive, human-playable rate of motion/turn/action and meaningful cause-and-effect in the world?\n"
+                        "   - SHORT-TERM / LONG-TERM GOALS & ACCOMPLISHMENT: Did the scripted playthrough make real causal progress toward the slice's immediate/short-term goal while keeping the longer-term goal and progress milestones visible?\n"
+                        "   - ZERO DEBUG OVERLAYS IN PRODUCTION: Are HUD instruments clean, non-overlapping, and free of developer debug text (`[DEBUG]`, `[QA ... PLAYTEST HARNESS]`, raw telemetry dumps) in the production game?\n"
+                        "3. PRAGMATIC SLICE COMPLETION JUDGMENT: Never open `spoken_dialogue` with 'I completely agree with...' or peer flattery, and never pretend rough edges are 'flawless'. "
+                        "Set `is_playable_and_fun_from_my_perspective=False` when active-slice scope is unmounted/broken, controls or causal progression fail, production debug overlays leak, high-impact visual/UI glitches (cut-off sprites, overflowing/overlapping HUD) hurt readability, or an Executive Producer directive is unmet. "
+                        "Conversely, remember we cannot change everything in one go: once the active slice's scope is covered and major problem areas are cleaned up, call the slice assembled (`is_playable_and_fun_from_my_perspective=True`) while candidly naming any minor rough spots or broader ambitions to carry into future slices.\n"
+                        "Provide `deliberation` FIRST and `is_playable_and_fun_from_my_perspective` strictly LAST."
+                    )
+                    turn_decision = self._structured_with_validation(
+                        turn_prompt,
+                        SlicePlaytestRoundtableTurn,
+                        lambda _t: [],
+                        temperature=0.35,
+                        parts=parts,
+                        cacheable_prefix=assembly_shared_prefix,
+                        min_calls_before_create=1,
+                    )
+                    roundtable_transcript_lines.append(
+                        f"[{disp_name} ({p_role})] (is_playable_and_fun={turn_decision.is_playable_and_fun_from_my_perspective} | criteria={turn_decision.validation_criteria_for_my_role}): "
+                        f"{turn_decision.spoken_dialogue} | Issues: {turn_decision.observed_issues_or_gaps}"
+                    )
+                    t_idx = len(game_bible.writers_room_transcript)
+                    p_utt = WritersRoomUtterance(
+                        deliberation=turn_decision.deliberation,
+                        utterance_id=f"utt_{t_idx:02d}_{p_role}_slice_playtest_{pass_index}",
+                        turn_index=t_idx,
+                        speaker_role=p_role,
+                        speaker_display_name=disp_name,
+                        spoken_dialogue=turn_decision.spoken_dialogue,
+                        addressed_to=turn_decision.addressed_to or ["CreativeDirector", "GameplaySystemsEngineer"],
+                        bible_updates_summary=[
+                            f"slice_playtest_vote:{p_role}:{'pass' if turn_decision.is_playable_and_fun_from_my_perspective else 'needs_work'}"
+                        ],
+                    )
+                    game_bible.writers_room_transcript.append(p_utt)
+                    self._emit_event(
+                        "writers_room_utterance",
+                        {
+                            "deliberation": p_utt.deliberation,
+                            "utterance_id": p_utt.utterance_id,
+                            "turn_index": p_utt.turn_index,
+                            "speaker_role": p_utt.speaker_role,
+                            "speaker_display_name": p_utt.speaker_display_name,
+                            "spoken_dialogue": p_utt.spoken_dialogue,
+                            "addressed_to": p_utt.addressed_to,
+                            "bible_updates_summary": p_utt.bible_updates_summary,
+                            "proof_image_paths": p_utt.proof_image_paths,
+                            "artifact_emitted": p_utt.artifact_emitted,
+                        },
+                    )
+
+            roundtable_summary_block = (
+                "=== COUNCIL SLICE PLAYTEST ROUNDTABLE DISCUSSION ===\n"
+                + "\n".join(f"  - {line}" for line in roundtable_transcript_lines)
+                + "\n\n"
+                if roundtable_transcript_lines
+                else ""
+            )
+            prompt = (
+                f"{assembly_shared_prefix}"
+                f"{roundtable_summary_block}"
+                f"You are the Council Chair & Gameplay Systems Engineer synthesizing the Slice Playtest & Whole-Game Readiness Check now that all currently queued Production Board items are approved ({assembly_pass_label}).\n"
+                f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n"
+                f"{final_assembly_note}\n"
+                "INSTRUCTIONS:\n"
+                "1. Compare the Living Game Bible (including any Executive Producer directives), the Approved Production Board items, and the Council Slice Playtest Roundtable Discussion above against the `PLAYABLE ENTRYPOINT REACHABILITY GRAPH` "
+                "and the attached HIGH-resolution Slice Playtest filmstrip/telemetry of the playable entrypoint (`run/main_scene`).\n"
+                "2. Check whether any built gameplay system, progression loop, or HUD/UI widget that belongs in the active slice is still unmounted or unwired "
+                "from the playable entrypoint scene tree.\n"
+                "3. Skeptically evaluate `playability_and_fun_evaluation` across ALL frames of the attached Slice Playtest filmstrip:\n"
+                "   - Verify that player inputs produce a responsive, human-playable rate of motion/turn/action over 1–3 seconds (never fighting a damping/stabilizer script at 1 deg/sec, and never plummeting/drifting off-screen).\n"
+                "   - Verify that the playable game world is spatially legible and unobstructed (no giant static control box occluding the center of the viewport), and that a player immediately knows how to play and sees their short-term and long-term goals.\n"
+                "   - Verify that the scripted playtest can actively progress through the first goal of the current slice without assertion failures.\n"
+                "   - Verify that HUD widgets coexist cleanly without overlapping/overflowing text or cut-off/bleeding sprite slicing, and that there are ZERO developer debug overlays (`[DEBUG]`, `[QA ... PLAYTEST HARNESS]`, telemetry dumps) or `func test_*()` hacks in production `main.gd` / `ui_hud.gd`.\n"
+                "4. In `spoken_dialogue`, address the Council candidly with zero agreement preambles or cheerleading—summarize what actually works, what remains rough, and whether we are calling the slice assembled or running a surgical cleanup pass.\n"
+                "5. PRAGMATIC SLICE COMPLETION RULE: You cannot fix or expand everything in one go. If the active slice's scope (and any Executive Producer request) is assembled, responsive, playable through the first goal, and free of playtest assertion failures or glaring UI/visual breakage in `run/main_scene`, CALL THE SLICE ASSEMBLED (`backlog_additions=[]` and `is_slice_assembled=True`), leaving broader wishlist expansions for future slices.\n"
+                "6. If an active-slice system is unmounted, if the playtest revealed sluggish/conflicting controls or assertion failures, if an Executive Producer directive is still unmet, or if `run/main_scene` has a high-impact visual/HUD/debug-overlay/onboarding defect, "
+                "propose a small, surgical batch (1–3 tasks) of `integration` / `mechanic_code` / `ui` task(s) in `backlog_additions` BEFORE setting `is_slice_assembled=False`:\n"
+                "   - Diagnose and specify systemic, world-wide root causes in `spec` (fixing authoritative world/UI/mechanic rules across all valid regions and player states)—treat any failed playtest `(x, y)` coordinate strictly as diagnostic evidence or a `proof_spec` test landmark, never as a coordinate whitelist or fixed target to hardcode in production scripts.\n"
+                "   - When writing `proof_spec` for a fix task, require a QA test scene (`res://tests/test_<item_id>.tscn`) with appropriate test-only diagnostic overlays and real `input_segments` proving the fix over ~120-240 ticks.\n"
+                f"Buildable kinds right now: {self._supported_kinds() or 'all'}.\n"
+                "Return `SliceAssemblyDecision` with `deliberation` FIRST and `is_slice_assembled` strictly last."
+            )
+
+            hard_playtest_gate_failed = bool(playtest_assertion_failure) and (
+                is_real_genai_client(self.client)
+                or any(
+                    tok in playtest_assertion_failure
+                    for tok in (
+                        "Entrypoint Parity Gate failed",
+                        "Counterfactual QA check failed",
+                        "QA filmstrip state assertions failed",
+                        "QA Diagnostic Production Defect Report",
+                    )
                 )
             )
-        )
 
-        def _validate_assembly(decision: SliceAssemblyDecision) -> List[str]:
-            issues: List[str] = []
-            if hard_playtest_gate_failed and decision.is_slice_assembled:
-                issues.append(
-                    f"Cannot set `is_slice_assembled=True` while Automated Slice Playtest failed ({playtest_assertion_failure[:260]}). "
-                    "Set `is_slice_assembled=False` and propose focused production-module fix task(s) in `backlog_additions` (targeting real `.gd` game scripts, NEVER `tests/test_*`)."
-                )
-            if not decision.is_slice_assembled and not decision.backlog_additions:
-                issues.append(
-                    "is_slice_assembled=False requires at least one WorkItemProposal in backlog_additions "
-                    "(or set is_slice_assembled=True if no further integration tasks are needed)."
-                )
-            if decision.is_slice_assembled and decision.backlog_additions:
-                decision.is_slice_assembled = False
-            if decision.backlog_additions:
-                issues.extend(self.board.validate_proposals(decision.backlog_additions))
-                issues.extend(self._unsupported_kind_issues(decision.backlog_additions))
-            return issues
+            def _validate_assembly(decision: SliceAssemblyDecision) -> List[str]:
+                issues: List[str] = []
+                if hard_playtest_gate_failed and decision.is_slice_assembled:
+                    issues.append(
+                        f"Cannot set `is_slice_assembled=True` while Automated Slice Playtest failed ({playtest_assertion_failure[:260]}). "
+                        "Set `is_slice_assembled=False` and propose focused production-module fix task(s) in `backlog_additions` (targeting real `.gd` game scripts, NEVER `tests/test_*`)."
+                    )
+                if not decision.is_slice_assembled and not decision.backlog_additions:
+                    issues.append(
+                        "is_slice_assembled=False requires at least one WorkItemProposal in backlog_additions "
+                        "(or set is_slice_assembled=True if no further integration tasks are needed)."
+                    )
+                if decision.is_slice_assembled and decision.backlog_additions:
+                    decision.is_slice_assembled = False
+                if decision.backlog_additions:
+                    issues.extend(self.board.validate_proposals(decision.backlog_additions))
+                    issues.extend(self._unsupported_kind_issues(decision.backlog_additions))
+                return issues
 
-        decision = self._structured_with_validation(
-            prompt,
-            SliceAssemblyDecision,
-            _validate_assembly,
-            temperature=0.3,
-            parts=parts,
-        )
+            decision = self._structured_with_validation(
+                prompt,
+                SliceAssemblyDecision,
+                _validate_assembly,
+                temperature=0.3,
+                parts=parts,
+                cacheable_prefix=assembly_shared_prefix,
+                min_calls_before_create=1 if run_asm_roundtable else 2,
+            )
         self._emit_event(
             "slice_assembly_check_completed",
             {
@@ -4685,6 +4702,25 @@ class CreativeWritersRoom:
         )
 
         blind_shared_prefix = f"{blind_dossier}\n\n"
+        is_final_playtest = bool(getattr(self, "_final_verification_blind_playtest_pass", False))
+        max_pt_passes = int(
+            getattr(self, "max_blind_playtest_passes", os.environ.get("STUDIO_MAX_BLIND_PLAYTEST_PASSES", "3"))
+        )
+        blind_pass_label = (
+            f"Post-Remediation Final Verification Pass after {max_pt_passes} iteration round(s)"
+            if is_final_playtest
+            else f"Pass #{pass_index + 1} of {max_pt_passes}"
+        )
+        final_playtest_note = (
+            "\nPOST-REMEDIATION FINAL VERIFICATION PASS: All current-slice iteration rounds have been spent, and this session "
+            "verifies the repaired build. Do NOT queue speculative feature additions or minor polish—capture all non-blocking "
+            "improvements in `next_slice_carryover_notes` and choose `approve_slice` (`recommends_slice_approval=True`) if the "
+            "repaired slice boots cleanly, core player actions function, and active visual/audio assets are intact; choose "
+            "`iterate_current_slice` (`recommends_slice_approval=False`) ONLY if a severe slice-blocking defect (crash, dead-end "
+            "broken controls, or corrupted/placeholder active visual assets) still breaks playability.\n"
+            if is_final_playtest
+            else ""
+        )
         roundtable_lines: List[str] = []
         run_roundtable = getattr(self, "enable_blind_playtest_roundtable", None)
         if run_roundtable is None:
@@ -4720,8 +4756,9 @@ class CreativeWritersRoom:
                         f"{blind_shared_prefix}"
                         f"=== COUNCIL BLIND PLAYTEST DELIBERATION SO FAR ===\n{prior_chat}\n\n"
                         f"You are the {disp_name} ({p_role}) deliberating in the Writers' Room on the unguided Blind AI Playtester's "
-                        f"Experience Report and auto-delivered wishes for '{active_slice_title}' (`{active_slice_id}`, Pass #{pass_index + 1} of {int(getattr(self, 'max_blind_playtest_passes', 2))}).\n"
-                        f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n\n"
+                        f"Experience Report and auto-delivered wishes for '{active_slice_title}' (`{active_slice_id}`, {blind_pass_label}).\n"
+                        f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n"
+                        f"{final_playtest_note}\n"
                         f"{mandate}\n"
                         "INSTRUCTIONS:\n"
                         "1. Remember: the Blind Playtester is a fast non-thinking player model playing cold with ZERO internal instructions. "
@@ -4795,20 +4832,11 @@ class CreativeWritersRoom:
                 if roundtable_lines
                 else ""
             )
-            final_playtest_note = (
-                "\nPOST-REMEDIATION FINAL VERIFICATION PASS: All current-slice iteration rounds have been spent, and this session "
-                "verifies the repaired build. Do NOT queue speculative feature additions or minor polish—capture all non-blocking "
-                "improvements in `next_slice_carryover_notes` and choose `approve_slice` if the repaired slice boots cleanly, core "
-                "player actions function, and active visual/audio assets are intact; choose `iterate_current_slice` ONLY if a severe "
-                "slice-blocking defect (crash, dead-end broken controls, or corrupted/placeholder active visual assets) still breaks playability.\n"
-                if getattr(self, "_final_verification_blind_playtest_pass", False)
-                else ""
-            )
             verdict_prompt = (
                 f"{blind_shared_prefix}"
                 f"{roundtable_block}"
                 f"You are the Creative Director chairing the Council's End-of-Slice Blind Playtest Verdict for "
-                f"'{active_slice_title}' (`{active_slice_id}`, Pass #{pass_index + 1} of {int(getattr(self, 'max_blind_playtest_passes', 2))}).\n"
+                f"'{active_slice_title}' (`{active_slice_id}`, {blind_pass_label}).\n"
                 f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n"
                 f"{final_playtest_note}\n"
                 "INSTRUCTIONS:\n"
@@ -4980,7 +5008,11 @@ class CreativeWritersRoom:
         )
         self._persist_bible(game_bible, candidate_dir=candidate_dir)
 
-        if added and (is_real_genai_client(self.client) or getattr(self, "enable_task_shaping_on_playtest_iteration", False)):
+        if (
+            added
+            and not is_final_playtest
+            and (is_real_genai_client(self.client) or getattr(self, "enable_task_shaping_on_playtest_iteration", False))
+        ):
             self._run_council_task_shaping_round(game_bible, dna_summary, candidate_dir=candidate_dir)
 
         return len(added)
@@ -5181,7 +5213,7 @@ class CreativeWritersRoom:
         assembly_verified = max_assembly_passes <= 0
         blind_playtest_passes = 0
         max_blind_playtest_passes = int(
-            getattr(self, "max_blind_playtest_passes", os.environ.get("STUDIO_MAX_BLIND_PLAYTEST_PASSES", "2"))
+            getattr(self, "max_blind_playtest_passes", os.environ.get("STUDIO_MAX_BLIND_PLAYTEST_PASSES", "3"))
         )
         blind_playtest_verified = max_blind_playtest_passes <= 0
         qa_gate_passes = 0
@@ -5234,6 +5266,8 @@ class CreativeWritersRoom:
             handled_failed = self._handle_failed_items() or handled_failed
             unblocked_cancelled = self._resolve_blocked_by_cancelled() or unblocked_cancelled
             if self.board.is_drained():
+                if self.scheduler is not None and hasattr(self.scheduler, "stop_dispatch"):
+                    self.scheduler.stop_dispatch()
                 if not assembly_verified:
                     is_final_assembly_verify = assembly_passes >= max_assembly_passes
                     self._final_verification_assembly_pass = is_final_assembly_verify
@@ -7175,6 +7209,8 @@ class CreativeWritersRoom:
             raise StudioAgentError(
                 "CreativeWritersRoom.run_slice_expansion requires an active google.genai Client (Rule 5)"
             )
+        if self.scheduler is not None and hasattr(self.scheduler, "stop_dispatch"):
+            self.scheduler.stop_dispatch()
         dna_summary = self._format_dna_summary(dna)
         if not dna and getattr(game_bible, "target_player_dna_summary", ""):
             dna_summary = game_bible.target_player_dna_summary

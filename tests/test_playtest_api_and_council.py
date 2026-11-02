@@ -1909,6 +1909,363 @@ def test_manual_playtest_send_full_report_to_council_and_multimodal_council_inge
         assert len(multimodal_parts) >= 2
 
 
+def test_blind_playtest_final_pass_propagates_note_suspends_scheduler_and_resumes_cleanly(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Verifies:
+    1. Default `STUDIO_MAX_BLIND_PLAYTEST_PASSES` aligns to 3 (matching `max_assembly_passes`).
+    2. `_drain_backlog` suspends `BoardScheduler` dispatch during end-of-slice gates so newly added
+       remediation tasks are shaped before any worker can claim them.
+    3. On `_final_verification_blind_playtest_pass=True`, all 4 `BlindPlaytestCouncilTurn` panelist prompts
+       AND `BlindPlaytestCouncilVerdict` receive `POST-REMEDIATION FINAL VERIFICATION PASS` (never 'Pass #N+1 of N'),
+       and when the Council rejects promotion (`iterate_current_slice`), neither task shaping nor worker execution
+       runs before `StudioAgentError` halts cleanly with blockers persisted on `backlog.json`.
+    4. Resuming `_drain_backlog` on the halted cartridge shapes and drains the persisted blockers, runs a
+       post-remediation verification pass, and marks the slice `completed` once verified.
+    """
+    import os
+    import pytest
+    from engine.studio.models import (
+        ReviewBatch,
+        ReviewDecision,
+        StudioAgentError,
+        WorkItem,
+        WorkItemProposal,
+    )
+    from engine.studio.production_board import BoardScheduler, WorkerResult
+    from engine.studio.writers_room import BlindPlaytestCouncilTurn, BlindPlaytestCouncilVerdict
+
+    monkeypatch.delenv("STUDIO_MAX_BLIND_PLAYTEST_PASSES", raising=False)
+    db_path, cartridges_root, _active_dir, cand_dir = _setup_workspace(tmp_path)
+    sessions_root = tmp_path / "playtest_sessions"
+    proof_png = cand_dir / "proof.png"
+    Image.new("RGB", (64, 64), (40, 90, 120)).save(proof_png, format="PNG")
+
+    run_seq = {"idx": 0}
+
+    def _playtester_factory() -> Any:
+        run_seq["idx"] += 1
+        current_run = run_seq["idx"]
+        local_turn = {"n": 0}
+
+        def _gen(*, model: str, contents: Any, config: Any) -> Any:
+            schema = getattr(config, "response_schema", None)
+            props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+            usage = SimpleNamespace(
+                prompt_token_count=400,
+                cached_content_token_count=200,
+                candidates_token_count=80,
+                thoughts_token_count=0,
+            )
+            if "overall_experience_summary" in props:
+                rep = {
+                    "deliberation": f"Report for run #{current_run}.",
+                    "overall_experience_summary": f"Summary #{current_run}.",
+                    "graphics_and_visuals": "Clean.",
+                    "gameplay_and_feel": "Responsive.",
+                    "sound_and_audio": "Audible.",
+                    "intuitiveness_and_onboarding": "Clear.",
+                    "goals_pacing_and_accomplishment": "Structured.",
+                    "world_and_atmosphere": "Cohesive.",
+                    "key_highlights": ["Core interaction"],
+                    "key_pain_points": [],
+                    "bugs_and_glitches_observed": [],
+                    "unanswered_questions_and_mysteries": [],
+                    "overall_fun_rating": 8 if current_run >= 3 else 4,
+                }
+                return SimpleNamespace(text=json.dumps(rep), usage_metadata=usage)
+            local_turn["n"] += 1
+            t_n = local_turn["n"]
+            turn_payload = {
+                "deliberation": f"Turn {t_n}.",
+                "current_plan": "Test controls.",
+                "turn_log_entry": "Clicked center.",
+                "field_note_updates": [],
+                "question_updates": [],
+                "rulebook_updates": [],
+                "bug_reports": [],
+                "impression_updates": [],
+                "current_mood": "curious",
+                "motor_action": {
+                    "deliberation": "Click.",
+                    "mouse_x": 500.0,
+                    "mouse_y": 500.0,
+                    "mouse_button_action": "left_click",
+                    "drag_from_x": None,
+                    "drag_from_y": None,
+                    "hold_keys": [],
+                    "tap_keys": [],
+                    "duration_ms": 300,
+                    "inspect_high_res_next": False,
+                },
+                "mood_shift": None,
+                "submit_wish": None,
+                "end_playtest": (
+                    {"deliberation": "Done.", "outcome": "completed", "closing_thoughts": "Finished."}
+                    if t_n >= 2
+                    else None
+                ),
+            }
+            return SimpleNamespace(text=json.dumps(turn_payload), usage_metadata=usage)
+
+        return SimpleNamespace(models=SimpleNamespace(generate_content=_gen))
+
+    bus = SwarmEventBus()
+    pt_mgr = PlaytestSessionManager(
+        db_path=db_path,
+        cartridges_root=cartridges_root,
+        sessions_root=sessions_root,
+        event_bus=bus,
+        client_factory=_playtester_factory,
+        bridge_factory=_FakeBridge,
+    )
+
+    panel_prompts_by_pass: Dict[int, List[str]] = {}
+    verdict_prompts_by_pass: Dict[int, str] = {}
+    active_pass_holder = {"pass_index": 0, "approve_from_pass": 2}
+
+    def _extract_prompt_text(contents: Any) -> str:
+        if isinstance(contents, str):
+            return contents
+        if isinstance(contents, list):
+            return "\n".join(x for x in contents if isinstance(x, str))
+        return str(contents)
+
+    def _council_gen(*, model: str, contents: Any, config: Any) -> Any:
+        schema_cls = getattr(config, "response_schema", None)
+        schema_name = getattr(schema_cls, "__name__", "")
+        p_idx = active_pass_holder["pass_index"]
+        should_approve = p_idx >= active_pass_holder["approve_from_pass"]
+        p_text = _extract_prompt_text(contents)
+        usage = SimpleNamespace(
+            prompt_token_count=600,
+            cached_content_token_count=300,
+            candidates_token_count=90,
+            thoughts_token_count=10,
+        )
+        if schema_name == "BlindPlaytestCouncilTurn":
+            panel_prompts_by_pass.setdefault(p_idx, []).append(p_text)
+            t_obj = BlindPlaytestCouncilTurn(
+                deliberation="Auditing playtest session.",
+                domain_reaction_to_blind_player="Checked progression.",
+                spoken_dialogue="Ready to ship." if should_approve else f"Pass {p_idx} still has a blocking defect.",
+                addressed_to=["CreativeDirector"],
+                priority_fixes_or_refinements=[] if should_approve else [f"Fix blocker from pass {p_idx}"],
+                recommends_slice_approval=should_approve,
+            )
+            return SimpleNamespace(text=t_obj.model_dump_json(), usage_metadata=usage)
+        if schema_name == "BlindPlaytestCouncilVerdict":
+            verdict_prompts_by_pass[p_idx] = p_text
+            proposals = (
+                []
+                if should_approve
+                else [
+                    WorkItemProposal(
+                        deliberation="Repair core blocker.",
+                        item_id=f"remediation_p{p_idx}_a",
+                        kind="mechanic_code",
+                        title=f"Remediation {p_idx} A",
+                        spec="Repair primary progression state.",
+                        proof_spec="Headless verification passes.",
+                        target_modules=["main.gd"],
+                    ),
+                    WorkItemProposal(
+                        deliberation="Verify integrated loop.",
+                        item_id=f"remediation_p{p_idx}_b",
+                        kind="integration",
+                        title=f"Remediation {p_idx} B",
+                        spec="Verify end-to-end integration.",
+                        proof_spec="Headless verification passes.",
+                        depends_on=[f"remediation_p{p_idx}_a"],
+                        target_modules=["main.gd"],
+                    ),
+                ]
+            )
+            v_obj = BlindPlaytestCouncilVerdict(
+                deliberation="Synthesizing verdict.",
+                player_experience_synthesis="Verified." if should_approve else f"Blocking defect on pass {p_idx}.",
+                spoken_dialogue="Approving slice." if should_approve else f"Iterating slice on pass {p_idx}.",
+                next_slice_carryover_notes=["Future expansion idea"],
+                backlog_additions=proposals,
+                verdict="approve_slice" if should_approve else "iterate_current_slice",
+            )
+            return SimpleNamespace(text=v_obj.model_dump_json(), usage_metadata=usage)
+        raise AssertionError(f"Unexpected schema: {schema_name}")
+
+    executed_item_ids: List[str] = []
+    shaping_snapshots: List[List[tuple[str, str]]] = []
+
+    def _worker(item: WorkItem) -> WorkerResult:
+        executed_item_ids.append(item.item_id)
+        return WorkerResult(proof_images=[str(proof_png)], notes=f"Completed {item.item_id}")
+
+    board_1 = ProductionBoard(path=cand_dir / "backlog.json")
+    sched_1 = BoardScheduler(
+        board_1,
+        {"mechanic_code": _worker, "integration": _worker},
+        max_workers=2,
+        poll_interval=0.005,
+    )
+    wr_1 = CreativeWritersRoom(
+        client=SimpleNamespace(models=SimpleNamespace(generate_content=_council_gen)),
+        board=board_1,
+        scheduler=sched_1,
+        playtest_manager=pt_mgr,
+        telemetry_db=TelemetryDB(db_path),
+        drain_poll_s=0.005,
+        drain_timeout_s=10.0,
+    )
+    # Verify default max_blind_playtest_passes aligns with max_assembly_passes == 3 when not overridden
+    assert int(os.environ.get("STUDIO_MAX_BLIND_PLAYTEST_PASSES", "3")) == 3
+    wr_1.max_assembly_passes = 0
+    wr_1.max_qa_gate_passes = 0
+    wr_1.max_blind_playtest_passes = 1
+    wr_1.enable_end_of_slice_blind_playtest = True
+    wr_1.enable_task_shaping_on_playtest_iteration = True
+    wr_1.slice_playtest_max_turns = 3
+
+    orig_playtest_1 = wr_1._run_end_of_slice_blind_playtest
+
+    def _tracked_playtest_1(game_bible, dna_summary, candidate_dir, pass_index=0):
+        active_pass_holder["pass_index"] = pass_index
+        return orig_playtest_1(game_bible, dna_summary, candidate_dir, pass_index=pass_index)
+
+    wr_1._run_end_of_slice_blind_playtest = _tracked_playtest_1
+
+    def _fake_shaping_1(game_bible, dna_summary, candidate_dir=None):
+        # Sleep briefly so a still-running BoardScheduler would immediately snatch ready items if not suspended!
+        import time as _t
+
+        _t.sleep(0.03)
+        snap = [
+            (it.item_id, it.state)
+            for it in board_1.items()
+            if it.state not in ("approved", "cancelled")
+        ]
+        shaping_snapshots.append(snap)
+        for it_id, st in snap:
+            if st in ("ready", "blocked"):
+                cur = board_1.get(it_id)
+                cur.shaping_notes.append("[GameplaySystemsEngineer Direction]: Shaped cleanly before worker claim.")
+        board_1._persist()
+
+    wr_1._run_council_task_shaping_round = _fake_shaping_1
+    wr_1._review_as = lambda role, awaiting, needing, *a, **kw: ReviewBatch(
+        deliberation="Approve proofs.",
+        spoken_dialogue="Approved.",
+        review_decisions=[
+            ReviewDecision(deliberation="ok", item_id=it.item_id, verdict="approve", feedback="ok")
+            for it in awaiting
+        ],
+        cap_decisions=[],
+    )
+
+    bible = GameBibleSpec(
+        deliberation="Fixture Bible.",
+        cartridge_id="candidate_001",
+        status="in_production",
+        game_title="API Fixture Game",
+        core_genre="simulation",
+        slice_roadmap=[
+            GameSliceSpec(
+                deliberation="Slice 0.",
+                slice_id="slice_0",
+                slice_index=0,
+                title="Slice 0",
+                slice_objective="Core loop",
+                status="active",
+            )
+        ],
+        active_slice_index=0,
+    )
+
+    try:
+        with pytest.raises(StudioAgentError, match="post-remediation Blind Playtest verification after 1 iteration round"):
+            wr_1._drain_backlog(bible, "DNA", cand_dir)
+    finally:
+        sched_1.stop()
+
+    # Pass 0 was normal ("Pass #1 of 1"); Pass 1 was final verification: ALL 4 panelists + chair got the final-pass note!
+    assert len(panel_prompts_by_pass[0]) == 4
+    assert all("Pass #1 of 1" in p and "POST-REMEDIATION FINAL VERIFICATION PASS" not in p for p in panel_prompts_by_pass[0])
+    assert len(panel_prompts_by_pass[1]) == 4
+    assert all(
+        "Post-Remediation Final Verification Pass after 1 iteration round(s)" in p
+        and "POST-REMEDIATION FINAL VERIFICATION PASS" in p
+        and "Pass #2 of 1" not in p
+        for p in panel_prompts_by_pass[1]
+    )
+    assert "POST-REMEDIATION FINAL VERIFICATION PASS" in verdict_prompts_by_pass[1]
+    assert "Pass #2 of 1" not in verdict_prompts_by_pass[1]
+
+    # Task shaping ran ONLY on Pass 0 (while BoardScheduler dispatch was suspended so items stayed ready/blocked),
+    # and did NOT run on terminal Pass 1; Pass 1's blockers were NEVER claimed by workers before circuit-breaker halt!
+    assert shaping_snapshots == [[("remediation_p0_a", "ready"), ("remediation_p0_b", "blocked")]]
+    assert executed_item_ids == ["remediation_p0_a", "remediation_p0_b"]
+    assert board_1.get("remediation_p1_a").state == "ready"
+    assert board_1.get("remediation_p1_b").state == "blocked"
+    assert bible.slice_roadmap[0].status == "active"
+
+    # Now simulate operator Resume on the halted cartridge: persisted Pass 1 tasks shape, execute, and Pass 2 verifies!
+    board_2 = ProductionBoard(path=cand_dir / "backlog.json")
+    sched_2 = BoardScheduler(
+        board_2,
+        {"mechanic_code": _worker, "integration": _worker},
+        max_workers=2,
+        poll_interval=0.005,
+    )
+    wr_2 = CreativeWritersRoom(
+        client=SimpleNamespace(models=SimpleNamespace(generate_content=_council_gen)),
+        board=board_2,
+        scheduler=sched_2,
+        playtest_manager=pt_mgr,
+        telemetry_db=TelemetryDB(db_path),
+        drain_poll_s=0.005,
+        drain_timeout_s=10.0,
+    )
+    wr_2.max_assembly_passes = 0
+    wr_2.max_qa_gate_passes = 0
+    wr_2.max_blind_playtest_passes = 1
+    wr_2.enable_end_of_slice_blind_playtest = True
+    wr_2.slice_playtest_max_turns = 3
+
+    orig_playtest_2 = wr_2._run_end_of_slice_blind_playtest
+
+    def _tracked_playtest_2(game_bible, dna_summary, candidate_dir, pass_index=0):
+        active_pass_holder["pass_index"] = pass_index
+        return orig_playtest_2(game_bible, dna_summary, candidate_dir, pass_index=pass_index)
+
+    wr_2._run_end_of_slice_blind_playtest = _tracked_playtest_2
+    resumed_shaped: List[str] = []
+
+    def _fake_shaping_2(game_bible, dna_summary, candidate_dir=None):
+        for it in board_2.items():
+            if it.state in ("ready", "blocked") and not it.shaping_notes:
+                resumed_shaped.append(it.item_id)
+                it.shaping_notes.append("[GameplaySystemsEngineer Direction]: Shaped on resume.")
+        board_2._persist()
+
+    wr_2._run_council_task_shaping_round = _fake_shaping_2
+    wr_2._review_as = wr_1._review_as
+
+    try:
+        wr_2._drain_backlog(bible, "DNA", cand_dir)
+    finally:
+        sched_2.stop()
+
+    assert resumed_shaped == ["remediation_p1_a", "remediation_p1_b"]
+    assert executed_item_ids == [
+        "remediation_p0_a",
+        "remediation_p0_b",
+        "remediation_p1_a",
+        "remediation_p1_b",
+    ]
+    assert len(panel_prompts_by_pass[2]) == 4
+    assert all("POST-REMEDIATION FINAL VERIFICATION PASS" in p for p in panel_prompts_by_pass[2])
+    assert bible.slice_roadmap[0].status == "completed"
+
+
+
 
 
 
