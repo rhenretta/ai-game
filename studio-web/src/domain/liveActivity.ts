@@ -27,6 +27,11 @@ export interface LiveAiCallSummary {
   stepLabel: string;
   totalTokens: number;
   thoughtTokens: number;
+  cachedTokens?: number;
+  imageCount?: number;
+  estimatedCallCostUsd?: number;
+  sessionEstimatedCostUsd?: number;
+  sessionCacheHitPct?: number;
   timestampUtc: string;
 }
 
@@ -90,6 +95,13 @@ export function formatTokenCount(tokens: number): string {
   return `${Math.round(tokens)} tok`;
 }
 
+export function formatUsdCost(usd: number): string {
+  if (!Number.isFinite(usd) || usd <= 0) return '$0.00';
+  if (usd < 0.001) return '<$0.001';
+  if (usd < 0.1) return `$${usd.toFixed(3)}`;
+  return `$${usd.toFixed(2)}`;
+}
+
 export function formatRelativeSeconds(isoUtc: string | null | undefined, nowMs = Date.now()): string {
   if (!isoUtc) return '';
   const tsMs = Date.parse(isoUtc);
@@ -139,6 +151,11 @@ function extractLatestAiCall(recentEvents: SwarmStreamEvent[]): LiveAiCallSummar
     const stats = asRecord(pl.token_stats);
     const totalTokens = asNumber(stats.total_tokens) ?? 0;
     const thoughtTokens = asNumber(stats.thought_tokens) ?? 0;
+    const cachedTokens = asNumber(stats.cached_tokens);
+    const imageCount = asNumber(stats.image_count);
+    const estimatedCallCostUsd = asNumber(stats.estimated_call_cost_usd);
+    const sessionEstimatedCostUsd = asNumber(stats.session_estimated_cost_usd);
+    const sessionCacheHitPct = asNumber(stats.session_cache_hit_pct);
     const rawLabel = asString(pl.label);
     const parsed = parseAiCallLabel(rawLabel, ev.agent_name || 'StudioAgent');
     return {
@@ -147,6 +164,11 @@ function extractLatestAiCall(recentEvents: SwarmStreamEvent[]): LiveAiCallSummar
       stepLabel: parsed.stepLabel,
       totalTokens,
       thoughtTokens,
+      ...(cachedTokens !== undefined ? { cachedTokens } : {}),
+      ...(imageCount !== undefined ? { imageCount } : {}),
+      ...(estimatedCallCostUsd !== undefined ? { estimatedCallCostUsd } : {}),
+      ...(sessionEstimatedCostUsd !== undefined ? { sessionEstimatedCostUsd } : {}),
+      ...(sessionCacheHitPct !== undefined ? { sessionCacheHitPct } : {}),
       timestampUtc: ev.timestamp_utc,
     };
   }
@@ -654,18 +676,29 @@ export function summarizeSwarmEvent(ev: SwarmStreamEvent): FormattedSwarmEventSu
     const stats = asRecord(pl.token_stats);
     const totalTok = asNumber(stats.total_tokens) ?? 0;
     const thoughtTok = asNumber(stats.thought_tokens) ?? 0;
+    const cachedTok = asNumber(stats.cached_tokens) ?? 0;
+    const imgCount = asNumber(stats.image_count) ?? 0;
+    const callUsd = asNumber(stats.estimated_call_cost_usd);
     const callNum = asNumber(pl.total_calls);
     const parsed = parseAiCallLabel(asString(pl.label), ev.agent_name || 'StudioAgent');
+    const detailBits: string[] = [
+      totalTok > 0
+        ? thoughtTok > 0
+          ? `${formatTokenCount(totalTok)} total (${formatTokenCount(thoughtTok)} thinking)`
+          : `${formatTokenCount(totalTok)} total`
+        : imgCount > 0
+          ? `${imgCount} synthesized image${imgCount === 1 ? '' : 's'}`
+          : '0 tok',
+    ];
+    if (cachedTok > 0) detailBits.push(`${formatTokenCount(cachedTok)} cached`);
+    if (callUsd !== undefined && callUsd > 0) detailBits.push(`est ${formatUsdCost(callUsd)}`);
     return {
       category: 'ai',
       agentLabel: parsed.agentLabel,
       title: `AI Call${callNum ? ` #${callNum}` : ''}: ${parsed.stepLabel}`,
-      subtitle:
-        thoughtTok > 0
-          ? `${formatTokenCount(totalTok)} total (${formatTokenCount(thoughtTok)} thinking)`
-          : `${formatTokenCount(totalTok)} total`,
-      badgeText: formatTokenCount(totalTok),
-      badgeTone: 'neutral',
+      subtitle: detailBits.join(' · '),
+      badgeText: totalTok > 0 ? formatTokenCount(totalTok) : imgCount > 0 ? `${imgCount} img` : '0 tok',
+      badgeTone: cachedTok > 0 ? 'ok' : 'neutral',
     };
   }
 

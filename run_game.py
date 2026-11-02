@@ -5,20 +5,10 @@ Enforces graceful shutdown and SQLite WAL checkpointing.
 """
 from __future__ import annotations
 import os
-from pathlib import Path
-import random
 import signal
-import subprocess
-import sys
-import threading
-import time
-from typing import Any, Dict, List, Optional
 
-# Active Godot 4 child process tracking for signal cleanup
-_ACTIVE_GODOT_PROC: Optional[subprocess.Popen] = None
-
-# Tier 1 Early Signal Interception & Unmasking: Active immediately at line 1 of script execution
-def _early_signal_handler(signum: int, frame: Any) -> None:
+# Tier 1 Early Signal Interception & Unmasking: Active immediately before stdlib imports
+def _early_signal_handler(signum: int, frame: object) -> None:
     print(f"\n[Engine] Signal {signum} received during early bootstrap. Shutting down cleanly...", flush=True)
     os._exit(0)
 
@@ -29,6 +19,17 @@ try:
         signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT, signal.SIGTERM})
 except (ValueError, AttributeError, OSError):
     pass
+
+from pathlib import Path
+import random
+import subprocess
+import sys
+import threading
+import time
+from typing import Any, Dict, List, Optional
+
+# Active Godot 4 child process tracking for signal cleanup
+_ACTIVE_GODOT_PROC: Optional[subprocess.Popen] = None
 
 # Active subsystem registry for unified signal lifecycle management across all startup & runtime phases
 _ACTIVE_SUBSYSTEMS: Dict[str, Any] = {
@@ -493,7 +494,8 @@ def resolve_and_load_cartridge(
     falls back to the latest verified checkpoint from cartridges/checkpoints/ if one exists.
     If neither exists, prints the guidance banner and returns None.
     """
-    checkpoints_dir = config.PROJECT_ROOT / "cartridges" / "checkpoints"
+    cartridges_root = config.get_cartridges_dir()
+    checkpoints_dir = cartridges_root / "checkpoints"
 
     # 1. Explicit checkpoint request — Strict Configuration Fidelity (Rule 5)
     if requested_checkpoint:
@@ -523,7 +525,6 @@ def resolve_and_load_cartridge(
             ]
         # Automatic fallback: scan cartridges/candidate_* with completed tracks if checkpoints/ not populated yet
         if not checkpoints:
-            cartridges_root = config.PROJECT_ROOT / "cartridges"
             for cand in cartridges_root.glob("candidate*"):
                 if cand.is_dir() and not cand.name.startswith(".") and ((cand / "project.godot").is_file() or (cand / "mechanics.py").is_file()):
                     req_file = cand / "requirements_spec.json"
@@ -565,7 +566,7 @@ def resolve_and_load_cartridge(
         return target
 
     # 4. Primary: cartridges/active (only when no explicit CLI cartridge is passed)
-    active_dir = config.PROJECT_ROOT / "cartridges" / "active"
+    active_dir = cartridges_root / "active"
     if active_dir.exists() and (
         (active_dir / "project.godot").exists()
         or (active_dir / "manifest.json").exists()

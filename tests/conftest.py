@@ -16,11 +16,13 @@ os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
 # Keep Writers' Room LLM call ordering deterministic for scripted fakes (parallelism is tested explicitly).
 os.environ["STUDIO_ROOM_PARALLELISM"] = "1"
 
-# Hermetically isolate all pytest database & studio data paths away from production data/telemetry.db
+# Hermetically isolate all pytest database, cartridges & studio data paths away from production directories
 _PYTEST_DATA_DIR = Path(tempfile.mkdtemp(prefix="pytest_studio_data_"))
 _PYTEST_DB_PATH = _PYTEST_DATA_DIR / "telemetry.db"
+_PYTEST_CARTRIDGES_DIR = _PYTEST_DATA_DIR / "cartridges"
 os.environ["STUDIO_DATA_DIR"] = str(_PYTEST_DATA_DIR)
 os.environ["STUDIO_DB_PATH"] = str(_PYTEST_DB_PATH)
+os.environ["STUDIO_CARTRIDGES_DIR"] = str(_PYTEST_CARTRIDGES_DIR)
 
 import config as _root_config  # noqa: E402
 _root_config.DATA_DIR = _PYTEST_DATA_DIR
@@ -384,6 +386,43 @@ class OpenGenreCartridge(BaseCartridge):
     return dest
 
 
+def _seed_pytest_cartridges_dir(root: Path) -> None:
+    """Seeds per-worker isolated active cartridge and minimal Godot 4.3 checkpoint."""
+    create_open_genre_cartridge(root / "active")
+    cp_dir = root / "checkpoints" / "cp_001_hermetic"
+    cp_dir.mkdir(parents=True, exist_ok=True)
+    (cp_dir / "project.godot").write_text(
+        '; Engine configuration file.\n'
+        'config_version=5\n\n'
+        '[application]\n'
+        'config/name="HermeticPytestCheckpoint"\n'
+        'run/main_scene="res://main.tscn"\n'
+        'config/features=PackedStringArray("4.3")\n',
+        encoding="utf-8",
+    )
+    (cp_dir / "main.tscn").write_text(
+        '[gd_scene load_steps=2 format=3]\n'
+        '[ext_resource type="Script" path="res://main.gd" id="1"]\n'
+        '[node name="Main" type="Node2D"]\n'
+        'script = ExtResource("1")\n',
+        encoding="utf-8",
+    )
+    (cp_dir / "main.gd").write_text(
+        'extends Node2D\n'
+        'var tick_count: int = 0\n'
+        'func _physics_process(_delta: float) -> void:\n'
+        '\ttick_count += 1\n',
+        encoding="utf-8",
+    )
+    (cp_dir / "manifest.json").write_text(
+        '{"deliberation": "Hermetic checkpoint.", "name": "HermeticPytestCheckpoint", "version": "1.0.0"}',
+        encoding="utf-8",
+    )
+
+
+_seed_pytest_cartridges_dir(_PYTEST_CARTRIDGES_DIR)
+
+
 @pytest.fixture
 def sample_open_genre_cartridge(tmp_path_factory):
     """Creates a temporary, fully valid open-genre cartridge adhering to all 5 quality gates."""
@@ -436,8 +475,14 @@ def isolate_llm_and_db_in_tests(request, monkeypatch):
 
     monkeypatch.setenv("STUDIO_DATA_DIR", str(_PYTEST_DATA_DIR))
     monkeypatch.setenv("STUDIO_DB_PATH", str(_PYTEST_DB_PATH))
+    monkeypatch.setenv("STUDIO_CARTRIDGES_DIR", str(_PYTEST_CARTRIDGES_DIR))
     monkeypatch.setattr(config, "DATA_DIR", _PYTEST_DATA_DIR, raising=False)
     monkeypatch.setattr(config, "DB_PATH", _PYTEST_DB_PATH, raising=False)
+    try:
+        from engine.studio.models import TOKEN_USAGE_TRACKER
+        TOKEN_USAGE_TRACKER.reset()
+    except Exception:
+        pass
 
     # Block any unmocked google.genai.Client network instantiation
     try:
@@ -469,92 +514,17 @@ def isolate_llm_and_db_in_tests(request, monkeypatch):
 
 
 @pytest.fixture
-def stash_active_cartridge():
-    """Hermetically stashes cartridges/active for tests verifying absent active cartridge behavior.
+def stash_active_cartridge(tmp_path, monkeypatch):
+    """Hermetically provides an empty cartridges directory for tests verifying absent active cartridge behavior.
 
-    Moves cartridges/active to cartridges/.active_stash during the test, ensuring
-    subprocesses and in-process code observe no active cartridge. Touches
-    cartridges/.no_cold_boot to prevent background studio daemon cold boots.
-    Guarantees atomic restoration of the original active cartridge upon test completion.
+    Uses STUDIO_CARTRIDGES_DIR pointing to an isolated tmp_path directory so parallel xdist workers
+    and live Studio builds never touch <PROJECT_ROOT>/cartridges/active.
     """
-    import shutil
-    from pathlib import Path
-    import config
-
-    cartridges_dir = config.PROJECT_ROOT / "cartridges"
-    active_dir = cartridges_dir / "active"
-    stash_dir = cartridges_dir / ".active_stash"
-    checkpoints_dir = cartridges_dir / "checkpoints"
-    cp_stash_dir = cartridges_dir / ".checkpoints_stash"
-    no_cold_boot = cartridges_dir / ".no_cold_boot"
-    created_no_cold_boot = False
-    stashed = False
-    stashed_cp = False
-
-    # Prevent studio daemon cold boot while stashed
-    if not no_cold_boot.exists():
-        try:
-            no_cold_boot.touch(exist_ok=True)
-            created_no_cold_boot = True
-        except OSError:
-            pass
-
-    if active_dir.exists():
-        if stash_dir.exists():
-            shutil.rmtree(stash_dir, ignore_errors=True)
-        try:
-            active_dir.rename(stash_dir)
-            stashed = True
-        except OSError:
-            shutil.move(str(active_dir), str(stash_dir))
-            stashed = True
-
-    if checkpoints_dir.exists():
-        if cp_stash_dir.exists():
-            shutil.rmtree(cp_stash_dir, ignore_errors=True)
-        try:
-            checkpoints_dir.rename(cp_stash_dir)
-            stashed_cp = True
-        except OSError:
-            shutil.move(str(checkpoints_dir), str(cp_stash_dir))
-            stashed_cp = True
-
-    try:
-        yield active_dir
-    finally:
-        if stashed:
-            if active_dir.exists():
-                shutil.rmtree(active_dir, ignore_errors=True)
-            if stash_dir.exists():
-                try:
-                    stash_dir.rename(active_dir)
-                except OSError:
-                    shutil.move(str(stash_dir), str(active_dir))
-        elif stash_dir.exists() and not active_dir.exists():
-            try:
-                stash_dir.rename(active_dir)
-            except OSError:
-                shutil.move(str(stash_dir), str(active_dir))
-
-        if stashed_cp:
-            if checkpoints_dir.exists():
-                shutil.rmtree(checkpoints_dir, ignore_errors=True)
-            if cp_stash_dir.exists():
-                try:
-                    cp_stash_dir.rename(checkpoints_dir)
-                except OSError:
-                    shutil.move(str(cp_stash_dir), str(checkpoints_dir))
-        elif cp_stash_dir.exists() and not checkpoints_dir.exists():
-            try:
-                cp_stash_dir.rename(checkpoints_dir)
-            except OSError:
-                shutil.move(str(cp_stash_dir), str(checkpoints_dir))
-
-        if created_no_cold_boot and no_cold_boot.exists():
-            try:
-                no_cold_boot.unlink()
-            except OSError:
-                pass
+    empty_cartridges_dir = tmp_path / "empty_cartridges"
+    empty_cartridges_dir.mkdir(parents=True, exist_ok=True)
+    (empty_cartridges_dir / ".no_cold_boot").touch(exist_ok=True)
+    monkeypatch.setenv("STUDIO_CARTRIDGES_DIR", str(empty_cartridges_dir))
+    yield empty_cartridges_dir / "active"
 
 
 
@@ -590,10 +560,16 @@ class _NoSleepAsyncio:
 def _no_retry_backoff_sleeps(monkeypatch):
     import importlib
 
+    models_mod = importlib.import_module("engine.studio.models")
+    monkeypatch.setattr(models_mod, "_retry_sleep", lambda _seconds=0: None)
+
     for mod_name, attr, proxy in (
         ("engine.studio.swe", "time", _NoSleepTime),
         ("engine.studio.visual", "time", _NoSleepTime),
         ("engine.studio.audio", "time", _NoSleepTime),
+        ("engine.studio.audio_evaluator", "time", _NoSleepTime),
+        ("engine.playtest.agent", "time", _NoSleepTime),
+        ("engine.steam.store_api", "time", _NoSleepTime),
         ("engine.studio.orchestrator", "asyncio", _NoSleepAsyncio),
     ):
         mod = importlib.import_module(mod_name)

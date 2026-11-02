@@ -52,6 +52,30 @@ export interface ProcessStatus {
   last_error?: LastBuildError | null;
 }
 
+export interface TokenUsageSummary {
+  total_calls: number;
+  calls_with_cache_hit?: number;
+  cache_hit_call_rate_pct?: number;
+  total_prompt_tokens: number;
+  total_cached_tokens: number;
+  uncached_prompt_tokens?: number;
+  cached_token_share_pct?: number;
+  total_output_tokens: number;
+  total_thought_tokens: number;
+  total_tokens: number;
+  image_generations?: number;
+  tts_generations?: number;
+  tts_audio_seconds?: number;
+  embedding_calls?: number;
+  embedding_estimated_tokens?: number;
+  playtest_calls?: number;
+  playtest_tokens?: number;
+  playtest_estimated_cost_usd?: number;
+  estimated_cost_usd?: number;
+  estimated_cost_usd_2027_std?: number;
+  by_label?: Record<string, Record<string, number>>;
+}
+
 export interface StudioStatusResponse {
   deliberation: string;
   status: string;
@@ -62,7 +86,7 @@ export interface StudioStatusResponse {
   supervisor_state: string;
   current_episode: number;
   uptime_seconds: number;
-  token_usage?: Record<string, unknown>;
+  token_usage?: TokenUsageSummary | Record<string, unknown>;
 }
 
 export interface VerticalSliceSpec {

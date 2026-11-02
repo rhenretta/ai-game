@@ -2022,12 +2022,15 @@ def test_f33_zero_legacy_branding_tokens_repository_wide():
     """F33.1: Confirms exactly 0 occurrences of forbidden legacy branding token repository-wide."""
     forbidden = "".join(chr(c) for c in (106, 111, 97, 110))
     targets = ["engine", "cartridges", "config.py", "run_game.py", "verify_engine.py"]
-    excluded_dirs = {".git", ".venv", ".pytest_cache", "__pycache__", ".agents", "teamwork"}
+    excluded_dirs = {
+        ".git", ".venv", ".pytest_cache", "__pycache__", ".agents", "teamwork",
+        ".godot", ".godot_runtime", "checkpoints", "node_modules", "traces",
+    }
     binary_suffixes = {
         ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".ico",
         ".mp4", ".mov", ".webm", ".wav", ".mp3", ".ogg", ".flac",
         ".ttf", ".otf", ".woff", ".woff2", ".db", ".sqlite", ".sqlite3",
-        ".pyc", ".pyo", ".so", ".dylib", ".ctex", ".scn", ".res",
+        ".pyc", ".pyo", ".so", ".dylib", ".ctex", ".scn", ".res", ".zip",
     }
     project_root = Path("/Users/rhenretta/workspace/rhenretta/ai-game")
 
@@ -2036,14 +2039,26 @@ def test_f33_zero_legacy_branding_tokens_repository_wide():
         path = project_root / target
         if not path.exists():
             continue
-        files = [path] if path.is_file() else [
-            p for p in path.rglob("*")
-            if p.is_file()
-            and not any(x in p.parts for x in excluded_dirs)
-            and p.suffix.lower() not in binary_suffixes
-        ]
+        if path.is_file():
+            files = [path]
+        else:
+            files = []
+            for root, dirs, filenames in os.walk(path):
+                dirs[:] = [
+                    d for d in dirs
+                    if d not in excluded_dirs
+                    and not d.startswith("candidate_")
+                    and not d.startswith("backup_")
+                    and d != "candidate"
+                ]
+                root_p = Path(root)
+                for fname in filenames:
+                    if os.path.splitext(fname)[1].lower() not in binary_suffixes:
+                        files.append(root_p / fname)
         for f in files:
             content = f.read_text(encoding="utf-8", errors="ignore")
+            if forbidden not in content.lower():
+                continue
             for line_no, line in enumerate(content.splitlines(), start=1):
                 if forbidden in line.lower():
                     violations.append((str(f), line_no, line.strip()))

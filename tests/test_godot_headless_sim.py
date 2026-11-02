@@ -183,6 +183,37 @@ func _ready() -> void:
         assert elapsed < 10.0
         assert sim.outcome == "CRASHED"
 
+    def _read_macos_cursor_pos(self):
+        """Read-only macOS CoreGraphics query of the physical OS mouse cursor position."""
+        import platform
+        if platform.system() != "Darwin":
+            return None
+        try:
+            import ctypes
+
+            class _CGPoint(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+            cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+            cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+            cg.CGEventCreate.argtypes = [ctypes.c_void_p]
+            cg.CGEventCreate.restype = ctypes.c_void_p
+            cg.CGEventGetLocation.argtypes = [ctypes.c_void_p]
+            cg.CGEventGetLocation.restype = _CGPoint
+            cf.CFRelease.argtypes = [ctypes.c_void_p]
+            cf.CFRelease.restype = None
+
+            ev = cg.CGEventCreate(None)
+            if not ev:
+                return None
+            try:
+                pt = cg.CGEventGetLocation(ev)
+                return (float(pt.x), float(pt.y))
+            finally:
+                cf.CFRelease(ev)
+        except Exception:
+            return None
+
     def test_harness_and_playtest_runner_never_warp_os_mouse_and_preserve_subviewport_clicks(
         self, tmp_path: Path
     ):
@@ -216,8 +247,10 @@ var area_hovered: bool = false
 var last_mouse_pos: Array = [0.0, 0.0]
 
 func _ready() -> void:
-\t# Attempt OS cursor capture (harness must neutralize to MOUSE_MODE_VISIBLE in non-headless runs)
+\t# Attempt OS cursor capture and warp (harness must neutralize before _ready() in non-headless runs)
 \tInput.mouse_mode = Input.MOUSE_MODE_CAPTURED
+\tInput.warp_mouse(Vector2(13.0, 17.0))
+\tDisplayServer.warp_mouse(Vector2i(19, 23))
 \tvar hud := CanvasLayer.new()
 \tadd_child(hud)
 \tvar btn := Button.new()
@@ -262,6 +295,7 @@ func get_state_snapshot() -> Dictionary:
         )
         payload.assemble_cartridge_directory(cart_dir)
 
+        before_os_pos = self._read_macos_cursor_pos()
         sim = GodotHeadlessSimulator(
             cartridge_path=cart_dir,
             telemetry_mode="null",
@@ -274,9 +308,19 @@ func get_state_snapshot() -> Dictionary:
         )
         state = sim.run_until_complete(max_steps=20, capture_viewport=True)
         sim.close()
+        after_os_pos = self._read_macos_cursor_pos()
 
         assert state.outcome == "COMPLETED", f"Simulation failed: {sim.stderr}"
         snap = sim.final_snapshot
+        assert snap.get("mouse_mode") == 0, f"Expected MOUSE_MODE_VISIBLE (0), got {snap}"
+        if before_os_pos is not None and after_os_pos is not None:
+            if before_os_pos[0] > 35.0 or before_os_pos[1] > 35.0:
+                assert not (after_os_pos[0] <= 2.0 and after_os_pos[1] <= 2.0), (
+                    f"OS mouse cursor was warped to screen corner {after_os_pos} (was {before_os_pos})"
+                )
+                assert not (abs(after_os_pos[0] - 19.0) <= 1.0 and abs(after_os_pos[1] - 23.0) <= 1.0), (
+                    f"OS mouse cursor was warped by DisplayServer.warp_mouse to {after_os_pos} (was {before_os_pos})"
+                )
         assert snap.get("button_clicks") == 1, f"Expected GUI Button click in SubViewport, got {snap}"
         assert snap.get("area_hovered") is True, f"Expected Area2D hover in SubViewport, got {snap}"
         assert snap.get("area_clicks") == 1, f"Expected Area2D pickable click in SubViewport, got {snap}"

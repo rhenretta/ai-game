@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import math
 from pathlib import Path
+import shutil
 from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageDraw
@@ -320,8 +321,11 @@ def capture_filmstrip(
     av_mp4_path = Path(audiovisual_mp4_out_path) if audiovisual_mp4_out_path is not None else None
     if not ticks:
         raise StudioAgentError("capture_filmstrip requires at least one tick")
+    fullres_sidecar_path = out_path.with_name(f"{out_path.stem}.keyframe_fullres.png")
     if out_path.is_file():
         out_path.unlink()
+    if fullres_sidecar_path.is_file():
+        fullres_sidecar_path.unlink()
     if av_mp4_path is not None and av_mp4_path.is_file():
         av_mp4_path.unlink()
     cap_dir = cartridge_dir / "assets" / "playtest_captures"
@@ -416,6 +420,11 @@ def capture_filmstrip(
         )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     strip.save(out_path, "PNG")
+    if "_pass1" not in out_path.stem and frames:
+        try:
+            shutil.copy2(frames[-1][1], fullres_sidecar_path)
+        except Exception as kf_exc:
+            logger.debug("Skipping fullres keyframe sidecar copy for %s: %s", out_path.name, kf_exc)
     scene_audit_summary: Dict[str, Any] = {}
     if isinstance(audit_dict, dict):
         if audit_dict.get("visible_ui_texts"):

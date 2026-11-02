@@ -690,11 +690,17 @@ class GodotHeadlessSimulator:
             if xvfb_bin:
                 cmd.extend([xvfb_bin, "-a"])
             cmd.append(str(render_bin))
+            if sys_name == "Darwin":
+                cmd.extend(["-ApplePersistenceIgnoreState", "YES"])
+            bg_window_args = [
+                "--windowed",
+                "--resolution", "16x16",
+                "--position", "-32000,-32000",
+                "--single-window",
+            ]
             if want_av_mp4 and av_work_dir is not None:
-                if sys_name == "Darwin":
-                    cmd.extend(["-ApplePersistenceIgnoreState", "YES"])
                 silent_clock_avi = av_work_dir / "_silent_clock.avi"
-                cmd.extend([
+                cmd.extend(bg_window_args + [
                     "--rendering-method", "gl_compatibility",
                     "--write-movie", str(silent_clock_avi),
                     "--fixed-fps", "60",
@@ -703,7 +709,7 @@ class GodotHeadlessSimulator:
                     "--max-ticks", str(limit),
                 ] + extra_args)
             else:
-                cmd.extend([
+                cmd.extend(bg_window_args + [
                     "--audio-driver", "Dummy",
                     "--fixed-fps", "60",
                     "--path", str(self.cartridge_path),

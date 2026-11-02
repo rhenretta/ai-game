@@ -807,7 +807,7 @@ class PlaytestSessionManager:
         store_description: str,
         max_turns: int = 60,
         reaction_ticks: int = 15,
-        compaction_interval_turns: int = 30,
+        compaction_interval_turns: int = 75,
         enable_audio_perception: bool = True,
         abort_check: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:

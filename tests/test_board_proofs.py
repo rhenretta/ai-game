@@ -127,7 +127,7 @@ def _red_centroid_x(strip: Image.Image, idx: int, cell_w: int = 640, cell_h: int
 
 @pytest.mark.skipif(not _HAS_DISPLAY, reason="viewport capture needs a display or xvfb")
 def test_filmstrip_shows_scripted_input_moving_the_game_and_idle_script_does_not(tmp_path):
-    probe = Path(__file__).parent / "_filmstrip_probe"
+    probe = tmp_path / "_filmstrip_probe"
     shutil.rmtree(probe, ignore_errors=True)
     probe.mkdir(parents=True)
     try:
@@ -166,7 +166,7 @@ def test_filmstrip_requires_ticks_and_never_fabricates_missing_frames(tmp_path, 
 
 @pytest.mark.skipif(not _HAS_DISPLAY, reason="viewport capture needs a display or xvfb")
 def test_filmstrip_injects_key_events_and_setup_calls_and_catches_self_playing_demos(tmp_path):
-    probe = Path(__file__).parent / "_filmstrip_qa_probe"
+    probe = tmp_path / "_filmstrip_qa_probe"
     shutil.rmtree(probe, ignore_errors=True)
     probe.mkdir(parents=True)
     qa_script = '''extends Node2D
@@ -324,7 +324,7 @@ def test_entrypoint_parity_and_runtime_ui_audio_observability(tmp_path):
     from engine.studio.models import QAStateAssertion
     from engine.studio.proofs import format_filmstrip_telemetry_progression
 
-    probe = Path(__file__).parent / "_filmstrip_parity_probe"
+    probe = tmp_path / "_filmstrip_parity_probe"
     shutil.rmtree(probe, ignore_errors=True)
     (probe / "tests").mkdir(parents=True)
     deadlocked_main = '''extends Node2D

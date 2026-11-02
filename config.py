@@ -7,10 +7,19 @@ from typing import Dict, List, Tuple
 # Project Paths
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent
+_DEFAULT_PROJECT_ROOT = PROJECT_ROOT
 DATA_DIR = Path(os.environ["STUDIO_DATA_DIR"]) if os.environ.get("STUDIO_DATA_DIR") else (PROJECT_ROOT / "data")
 DB_PATH = Path(os.environ["STUDIO_DB_PATH"]) if os.environ.get("STUDIO_DB_PATH") else (DATA_DIR / "telemetry.db")
 SPECS_DIR = DATA_DIR / "specs"
 ASSETS_DIR = PROJECT_ROOT / "engine" / "assets"
+
+
+def get_cartridges_dir() -> Path:
+    """Resolves the cartridges root directory, honoring STUDIO_CARTRIDGES_DIR or monkeypatched PROJECT_ROOT."""
+    if PROJECT_ROOT != _DEFAULT_PROJECT_ROOT:
+        return PROJECT_ROOT / "cartridges"
+    env_dir = os.environ.get("STUDIO_CARTRIDGES_DIR")
+    return Path(env_dir) if env_dir else (PROJECT_ROOT / "cartridges")
 
 # Ensure data directories exist
 DATA_DIR.mkdir(parents=True, exist_ok=True)

@@ -52,6 +52,7 @@ ChunkCategory = Literal[
     "board_item",
     "code_module",
     "game_memory",
+    "tool_capability",
 ]
 
 
@@ -808,11 +809,14 @@ class CartridgeSemanticIndex:
                         continue
                     t_rev = t_data.get("revision", 0)
                     t_status = t_data.get("status", "")
+                    t_turns = t_data.get("turns") or []
+                    if t_status == "in_progress" and not t_turns:
+                        continue
                     t_strat = str(t_data.get("current_strategy") or "")[:300]
                     trace_lines.append(f"=== Execution Trace `{tf.name}` (rev={t_rev}, status={t_status}) ===")
                     if t_strat:
                         trace_lines.append(f"  Lead Strategy: {t_strat}")
-                    for turn in (t_data.get("turns") or [])[-6:]:
+                    for turn in t_turns[-6:]:
                         if not isinstance(turn, dict):
                             continue
                         t_idx = turn.get("turn_index", 0)
@@ -849,7 +853,7 @@ class CartridgeSemanticIndex:
                             chunk_id=f"board:trace:{iid}",
                             category="board_item",
                             title=f"Build Execution Trace, Specialist Code Diffs & QA Telemetry for [{iid}]",
-                            content="\n".join(trace_lines)[:4800],
+                            content="\n".join(trace_lines)[:2800],
                             associated_image_path=latest_proof_img,
                         )
                     )
@@ -923,6 +927,22 @@ class CartridgeSemanticIndex:
                     )
             except Exception:
                 logger.debug("Could not index game_memory.json chunks in %s", self.cartridge_dir, exc_info=True)
+
+        # 8. Progressive Studio Tool & Persona Capability Registry (`tool_registry.py`)
+        try:
+            from engine.studio.tool_registry import build_tool_capability_chunks
+
+            for t_raw in build_tool_capability_chunks():
+                _add(
+                    ContextChunk(
+                        chunk_id=str(t_raw["chunk_id"]),
+                        category="tool_capability",
+                        title=f"Studio Tool Capability: {t_raw['symbol_name']}",
+                        content=str(t_raw["content"]),
+                    )
+                )
+        except Exception:
+            logger.debug("Could not index tool_registry chunks in %s", self.cartridge_dir, exc_info=True)
 
         return chunks
 
@@ -1063,19 +1083,36 @@ class CartridgeSemanticIndex:
         seed_modules: Sequence[str],
         max_hops: int = 2,
         code_graph: Optional[Dict[str, Dict[str, Any]]] = None,
+        *,
+        include_imported_by: bool = True,
+        max_imported_by_hops: Optional[int] = None,
+        exclude_prefixes: Sequence[str] = (),
     ) -> List[str]:
-        """Walks `imports` and `imported_by` edges in `build_code_reference_graph()` up to `max_hops`
-        starting from `seed_modules` (normalizing `res://` prefixes and bare basenames) and returns
-        all discovered module relative paths in BFS order."""
+        """Walks `imports` and (optionally bounded) `imported_by` edges in `build_code_reference_graph()` up to
+        `max_hops` starting from `seed_modules` (normalizing `res://` prefixes and bare basenames) and returns
+        all discovered module relative paths in BFS order.
+
+        When `max_imported_by_hops` is set (e.g. `1`), reverse `imported_by` edges are traversed only up to that
+        depth and callers reached strictly via `imported_by` (such as hub scripts like `main.gd`) do not fan back
+        out across unrelated sibling `imports`. Modules matching `exclude_prefixes` (e.g. `('tests/',)`) are
+        skipped unless explicitly present in `seed_modules`.
+        """
         graph = code_graph if code_graph is not None else self.build_code_reference_graph()
         if not graph:
             return []
+        excl = tuple(
+            str(p).strip().replace("\\", "/").lstrip("/")
+            for p in (exclude_prefixes or ())
+            if str(p).strip()
+        )
         by_basename: Dict[str, List[str]] = {}
         for k in graph:
             by_basename.setdefault(Path(k).name, []).append(k)
 
-        queue: List[Tuple[str, int]] = []
+        # Queue entries: (module_rel_path, depth, reached_via_reverse_edge)
+        queue: List[Tuple[str, int, bool]] = []
         visited: List[str] = []
+        explicit_seeds: set[str] = set()
         for raw_seed in seed_modules:
             s = str(raw_seed or "").strip().replace("\\", "/")
             if s.startswith("res://"):
@@ -1087,22 +1124,40 @@ class CartridgeSemanticIndex:
                 continue
             resolved_seeds = [s] if s in graph else by_basename.get(Path(s).name, [])
             for rs in resolved_seeds:
+                if excl and "/" not in s and any(rs.startswith(px) for px in excl):
+                    continue
+                explicit_seeds.add(rs)
                 if rs not in visited:
                     visited.append(rs)
-                    queue.append((rs, 0))
+                    queue.append((rs, 0, False))
 
         idx = 0
         while idx < len(queue):
-            cur_mod, depth = queue[idx]
+            cur_mod, depth, via_reverse = queue[idx]
             idx += 1
             if depth >= max_hops:
                 continue
+            # When max_imported_by_hops bounds caller lookup, do not fan out from a hub caller into all its unrelated imports
+            if via_reverse and max_imported_by_hops is not None and depth >= max_imported_by_hops:
+                continue
             meta = graph.get(cur_mod) or {}
-            neighbors = list(meta.get("imports") or []) + list(meta.get("imported_by") or [])
-            for nb in neighbors:
+            forward_nbs = list(meta.get("imports") or [])
+            reverse_nbs: List[str] = []
+            if include_imported_by and (max_imported_by_hops is None or depth < max_imported_by_hops):
+                reverse_nbs = list(meta.get("imported_by") or [])
+
+            for nb in forward_nbs:
+                if excl and nb not in explicit_seeds and any(nb.startswith(px) for px in excl):
+                    continue
                 if nb in graph and nb not in visited:
                     visited.append(nb)
-                    queue.append((nb, depth + 1))
+                    queue.append((nb, depth + 1, via_reverse))
+            for nb in reverse_nbs:
+                if excl and nb not in explicit_seeds and any(nb.startswith(px) for px in excl):
+                    continue
+                if nb in graph and nb not in visited:
+                    visited.append(nb)
+                    queue.append((nb, depth + 1, True))
         return visited
 
     def _load_embedding_cache(self) -> Dict[str, List[float]]:
@@ -1540,6 +1595,30 @@ class ContextCuratorAgent:
             except Exception:
                 mem_sig = ""
 
+        deps_sig = ""
+        if item_id and self.board is not None and hasattr(self.board, "items"):
+            try:
+                all_b_items = list(self.board.items())
+                by_id_map = {str(getattr(it, "item_id", "")): it for it in all_b_items}
+                cur_it = by_id_map.get(item_id)
+                sig_parts: List[str] = []
+                if cur_it is not None:
+                    for dep_id in sorted(set(getattr(cur_it, "depends_on", None) or [])):
+                        dep_it = by_id_map.get(dep_id)
+                        if dep_it is not None:
+                            sig_parts.append(
+                                f"dep:{dep_id}:{getattr(dep_it, 'state', '')}:{len(getattr(dep_it, 'revisions', None) or [])}"
+                            )
+                for ch_it in all_b_items:
+                    if str(getattr(ch_it, "spawned_by_item_id", "") or "") == item_id:
+                        sig_parts.append(
+                            f"child:{getattr(ch_it, 'item_id', '')}:{getattr(ch_it, 'state', '')}:{len(getattr(ch_it, 'revisions', None) or [])}"
+                        )
+                if sig_parts:
+                    deps_sig = _sha256_text("|".join(sorted(sig_parts)))[:12]
+            except Exception:
+                deps_sig = ""
+
         intra_rev_sig = f"rev={current_rev}"
 
         with _CURATOR_CACHE_LOCK:
@@ -1559,6 +1638,7 @@ class ContextCuratorAgent:
                         isinstance(cached, dict)
                         and cached.get("revision") == current_rev
                         and str(cached.get("memory_sig") or "") == mem_sig
+                        and str(cached.get("deps_sig") or "") == deps_sig
                         and cached.get("prompt_block")
                         and isinstance(cached.get("decision"), dict)
                     ):
@@ -1631,7 +1711,11 @@ class ContextCuratorAgent:
                 is_applicable = "Applicable Roles: " in ch.content and norm_target_role in ch.content
                 return is_own_bank or is_council_bank or is_applicable
 
-            searchable_chunks = [ch for ch in all_chunks if _is_role_eligible_memory_chunk(ch)]
+            searchable_chunks = [
+                ch
+                for ch in all_chunks
+                if ch.category != "tool_capability" and _is_role_eligible_memory_chunk(ch)
+            ]
             queries = self._build_role_queries(
                 target_agent_role=target_agent_role,
                 task_request=task_request,
@@ -1713,14 +1797,19 @@ class ContextCuratorAgent:
             if item_kind in ("level_map", "ui", "integration"):
                 _add_seed_mod("main.gd")
 
+            allow_test_graph_neighbors = cache_role == "qa_test_engineer" or "tests/" in (task_request or "")
             graph_relations: Dict[str, str] = {}
             for sm in seed_mods:
                 graph_relations.setdefault(sm, "target/seed module")
                 meta = code_graph.get(sm) or {}
                 for imp in meta.get("imports", []):
+                    if not allow_test_graph_neighbors and imp.startswith("tests/"):
+                        continue
                     if imp in code_graph and imp not in graph_relations:
                         graph_relations[imp] = f"imported by `{sm}`"
                 for imp_by in meta.get("imported_by", []):
+                    if not allow_test_graph_neighbors and imp_by.startswith("tests/"):
+                        continue
                     if imp_by in code_graph and imp_by not in graph_relations:
                         graph_relations[imp_by] = f"imports `{sm}`"
 
@@ -1848,7 +1937,7 @@ class ContextCuratorAgent:
 
             expanded_chosen_chunks: List[ContextChunk] = []
             for c in chosen_chunks:
-                if c.chunk_id.startswith("code:module:"):
+                if c.chunk_id.startswith("code:module:") and cache_role not in ("task_lead", "swe_engineer"):
                     rel_mod = c.chunk_id[len("code:module:") :].strip().lstrip("/")
                     f_mod = self.cartridge_dir / rel_mod
                     if f_mod.is_file() and rel_mod.endswith(".gd"):
@@ -1881,6 +1970,7 @@ class ContextCuratorAgent:
                     "item_id": item_id,
                     "revision": current_rev,
                     "memory_sig": mem_sig,
+                    "deps_sig": deps_sig,
                     "intra_rev_sig": intra_rev_sig,
                     "target_agent_role": target_agent_role,
                     "normalized_role": cache_role,
@@ -1929,10 +2019,10 @@ class ContextCuratorAgent:
                 selected_media_paths=chosen_media_paths,
             )
 
-    def _expand_chunk_for_question(self, chunk: ContextChunk) -> ContextChunk:
+    def _expand_chunk_for_question(self, chunk: ContextChunk, *, target_agent_role: str = "") -> ContextChunk:
         """When a `code:module:<rel_path>` chunk is selected to help an agent answer a `self_question`,
-        expands the chunk content with the full on-disk source code of that module so the asking agent
-        can inspect exact method bodies, signal definitions, and shader uniforms."""
+        expands the chunk content with bounded, 1-indexed on-disk source code of that module so the asking agent
+        can inspect exact method bodies, signal definitions, and shader uniforms without unbounded prompt bloat."""
         if not chunk.chunk_id.startswith("code:module:"):
             return chunk
         rel_path = chunk.chunk_id[len("code:module:") :].strip().lstrip("/")
@@ -1945,10 +2035,18 @@ class ContextCuratorAgent:
             raw_src = f_path.read_text(encoding="utf-8")
         except Exception:
             return chunk
+        role_norm = self._normalized_cache_role(target_agent_role)
+        max_src_chars = 3200 if role_norm == "task_lead" else 6000
+        numbered_lines = [f"{ln:4d}: {line}" for ln, line in enumerate(raw_src.splitlines(), start=1)]
+        numbered_src = "\n".join(numbered_lines)
+        if len(numbered_src) > max_src_chars:
+            excerpt = numbered_src[:max_src_chars] + f"\n# ... [{len(numbered_src) - max_src_chars} chars omitted; ask a narrower line/function self_question if needed]"
+        else:
+            excerpt = numbered_src
         expanded_content = (
             f"{chunk.content}\n\n"
-            f"--- FULL SOURCE OF `{rel_path}` ---\n"
-            f"{raw_src[:6500]}"
+            f"--- NUMBERED SOURCE EXCERPT OF `{rel_path}` ---\n"
+            f"{excerpt}"
         )
         return chunk.model_copy(update={"content": expanded_content})
 
@@ -2058,18 +2156,19 @@ class ContextCuratorAgent:
         decision: Optional[QuestionContextResearchDecision] = None
         chosen_chunks: List[ContextChunk] = []
 
+        eff_max_chunks = min(max_selected_chunks, 3) if self._normalized_cache_role(target_agent_role) == "task_lead" else max_selected_chunks
         if is_real_genai_client(self.client):
             candidate_lines: List[str] = []
             for c, sim in filtered_pairs[:16]:
                 candidate_lines.append(
                     f"--- CHUNK id='{c.chunk_id}' category='{c.category}' similarity={sim:.3f} ---\n"
                     f"Title: {c.title}\n"
-                    f"{c.content[:1600]}\n"
+                    f"{c.content[:1200]}\n"
                 )
             prompt = (
                 f"You are the Studio Context Generator & Curator Agent researching a self-inquiry question asked by `{target_agent_role}`.\n"
                 f"CRITICAL RULE: Do NOT answer the question yourself! Your ONLY job is to select the candidate `chunk_id`s "
-                f"(up to {max_selected_chunks}) that contain the raw code, signals, variables, council decisions, or design specs "
+                f"(up to {eff_max_chunks}) that contain the raw code, signals, variables, council decisions, or design specs "
                 f"so `{target_agent_role}` can read them and answer its own question on the next turn.\n\n"
                 f"ASKING AGENT ROLE: {target_agent_role}\n"
                 f"WORK ITEM: {item_id or '(general)'}\n"
@@ -2095,14 +2194,15 @@ class ContextCuratorAgent:
                 seen_ids: set[str] = set()
                 for cid in decision.selected_chunk_ids:
                     if cid in chunks_by_id and cid not in seen_ids:
-                        chosen_chunks.append(self._expand_chunk_for_question(chunks_by_id[cid]))
+                        chosen_chunks.append(self._expand_chunk_for_question(chunks_by_id[cid], target_agent_role=target_agent_role))
                         seen_ids.add(cid)
-                        if len(chosen_chunks) >= max_selected_chunks:
+                        if len(chosen_chunks) >= eff_max_chunks:
                             break
 
         if not chosen_chunks and candidate_chunks:
             chosen_chunks = [
-                self._expand_chunk_for_question(c) for c in candidate_chunks[: min(3, max_selected_chunks)]
+                self._expand_chunk_for_question(c, target_agent_role=target_agent_role)
+                for c in candidate_chunks[: min(3, eff_max_chunks)]
             ]
 
         chunk_sections = "\n\n".join(
@@ -2147,6 +2247,71 @@ class ContextCuratorAgent:
             retrieved_chunks=chosen_chunks,
             decision=decision,
         )
+
+    def research_tool_capabilities(
+        self,
+        tool_search_query: str,
+        *,
+        caller_role: str = "task_lead",
+        item_id: str = "",
+        allowed_specialists: Optional[Sequence[str]] = None,
+        max_selected_chunks: int = 5,
+        top_k: Optional[int] = None,
+    ) -> str:
+        """Progressively searches `STUDIO_CAPABILITIES` (`category='tool_capability'`) for detailed
+        Specialist Persona schemas, internal sub-tools, parameters, and board orchestration recipes."""
+        clean_q = str(tool_search_query or "").strip()
+        if not clean_q:
+            return ""
+        eff_limit = int(top_k) if top_k is not None else int(max_selected_chunks)
+
+        from engine.studio.tool_registry import build_tool_capability_chunks
+
+        raw_tool_chunks = build_tool_capability_chunks(allowed_specialists=allowed_specialists)
+        tool_chunks = [
+            ContextChunk(
+                chunk_id=str(tc["chunk_id"]),
+                category="tool_capability",
+                title=f"Studio Tool Capability: {tc['symbol_name']}",
+                content=str(tc["content"]),
+            )
+            for tc in raw_tool_chunks
+        ]
+        if not tool_chunks:
+            return ""
+
+        ranked = self.semantic_index.semantic_search(
+            queries=[
+                clean_q,
+                f"Studio tool capability, specialist persona, subtool, or board orchestration for ({caller_role}): {clean_q}",
+            ],
+            chunks=tool_chunks,
+            top_k=min(max(1, eff_limit), len(tool_chunks)),
+        )
+        chosen = [ch for ch, _sim in ranked[:eff_limit]] or tool_chunks[: min(3, len(tool_chunks))]
+        sections = "\n\n".join(f"[{c.chunk_id}] {c.title}:\n{c.content}" for c in chosen)
+        block = (
+            f"\n=== STUDIO TOOL CAPABILITIES RESEARCHED FOR YOUR QUERY (caller={caller_role}) ===\n"
+            f"YOUR TOOL SEARCH QUERY: {clean_q}\n\n"
+            f"{sections}\n\n"
+            f"NEXT-TURN INSTRUCTION: Summarize the relevant tool modes/parameters in `tool_search_answer` and proceed with your action.\n"
+            f"=== END RESEARCHED STUDIO TOOL CAPABILITIES ===\n"
+        )
+        if self.event_callback is not None:
+            try:
+                self.event_callback(
+                    "context_curator_tool_search_completed",
+                    {
+                        "deliberation": f"Expanded {len(chosen)} Studio tool capability chunk(s) for '{caller_role}' query: {clean_q[:120]}",
+                        "item_id": item_id,
+                        "caller_role": caller_role,
+                        "tool_search_query": clean_q,
+                        "selected_chunk_ids": [c.chunk_id for c in chosen],
+                    },
+                )
+            except Exception:
+                pass
+        return block
 
     def _self_inquiry_memory_path(self, item_id: str, target_agent_role: str) -> Optional[Path]:
         safe_item = re.sub(r"[^a-z0-9_]+", "_", (item_id or "").lower()).strip("_")

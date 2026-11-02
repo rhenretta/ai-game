@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from enum import Enum
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Sequence, Set, Tuple, Type, Union
 import uuid
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -101,9 +101,13 @@ class BaseEpistemicModel(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _coerce_json_string_dicts(cls, data: Any) -> Any:
-        """Automatically parses JSON-encoded object strings returned by Gemini for Dict-typed fields."""
+        """Automatically parses JSON-encoded object strings returned by Gemini for Dict-typed fields
+        (including schemas sanitized via `_sanitize_gemini_json_schema`, which rewrites open `Dict`
+        objects without fixed properties into JSON-encoded strings)."""
         if not isinstance(data, dict):
             return data
+        from typing import Union, get_args, get_origin
+
         dict_field_names = {
             "task_manifest",
             "nodes",
@@ -118,28 +122,73 @@ class BaseEpistemicModel(BaseModel):
             "clamp_state",
             "adapted_parameters",
             "updated_episode_config",
+            "perceptual_descriptions_by_path",
+            "code_diffs",
+            "animation_states",
+            "entries",
         }
+        for f_key, f_info in getattr(cls, "model_fields", {}).items():
+            ann = getattr(f_info, "annotation", None)
+            origin = get_origin(ann)
+            if origin is dict:
+                dict_field_names.add(f_key)
+            elif origin is Union:
+                if any(get_origin(arg) is dict or arg is dict for arg in get_args(ann)):
+                    dict_field_names.add(f_key)
+
         out = dict(data)
         for fname in dict_field_names:
             if fname in out and isinstance(out[fname], str):
                 raw_str = out[fname].strip()
+                if raw_str.startswith("```"):
+                    lines = raw_str.splitlines()
+                    if len(lines) >= 2 and lines[-1].strip().startswith("```"):
+                        raw_str = "\n".join(lines[1:-1]).strip()
                 if not raw_str:
                     out[fname] = {}
                     continue
                 try:
                     parsed = json.loads(raw_str)
                     if isinstance(parsed, dict):
-                        out[fname] = parsed
+                        if fname == "perceptual_descriptions_by_path":
+                            out[fname] = {
+                                str(k): (json.dumps(v) if isinstance(v, (dict, list)) else str(v))
+                                for k, v in parsed.items()
+                                if str(k).strip()
+                            }
+                        else:
+                            out[fname] = parsed
                     elif isinstance(parsed, list) and fname == "nodes":
                         out[fname] = {
                             (item.get("node_id") or f"node_{idx}"): item
                             for idx, item in enumerate(parsed)
                             if isinstance(item, dict)
                         }
+                    elif isinstance(parsed, list) and fname == "perceptual_descriptions_by_path":
+                        mapped: Dict[str, str] = {}
+                        for idx, item in enumerate(parsed):
+                            if isinstance(item, dict):
+                                k = str(
+                                    item.get("path")
+                                    or item.get("asset_path")
+                                    or item.get("file")
+                                    or f"asset_{idx}"
+                                ).strip()
+                                v = str(
+                                    item.get("description")
+                                    or item.get("perceptual_description")
+                                    or item.get("summary")
+                                    or ""
+                                ).strip()
+                                if k:
+                                    mapped[k] = v
+                        out[fname] = mapped
+                    elif parsed is None:
+                        out[fname] = {}
                     else:
-                        out[fname] = {"value": parsed}
+                        out[fname] = {"value": str(parsed) if fname == "perceptual_descriptions_by_path" else parsed}
                 except Exception:
-                    out[fname] = {"directive": raw_str}
+                    out[fname] = {"description": raw_str} if fname == "perceptual_descriptions_by_path" else {"directive": raw_str}
         return out
 
     @classmethod
@@ -1310,7 +1359,7 @@ class AssetLibraryEntry(BaseEpistemicModel):
     concept_reference_used: Optional[str] = Field(default=None)
     perceptual_description: str = Field(
         default="",
-        description="Optional natural-language perceptual description of an audio asset's actual sound, texture, and timing from AudioEvaluatorAgent.",
+        description="Optional natural-language perceptual description of an asset's actual rendered pixels, silhouette/framing, or acoustic sound/texture/timing from VisualEvaluatorAgent or AudioEvaluatorAgent.",
     )
     duration_seconds: float = Field(
         default=0.0,
@@ -1667,6 +1716,127 @@ def apply_surgical_patches_to_directory(
     return updated
 
 
+_PROTECTED_CARTRIDGE_DELETE_FILES: Set[str] = {
+    "project.godot",
+    "main.tscn",
+    "main.gd",
+    "game_bible.json",
+    "backlog.json",
+    "production_board.json",
+    "game_memory.json",
+    "manifest.json",
+    "narrative.json",
+    "level_layout.json",
+    "assets/asset_library.json",
+    "asset_library.json",
+}
+_PROTECTED_CARTRIDGE_DELETE_DIRS: Set[str] = {
+    ".godot",
+    "artifacts",
+    "tests",
+    "mockups",
+    "concepts",
+    "playtest_captures",
+}
+_MEDIA_DELETE_SUFFIXES: Tuple[str, ...] = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".svg",
+    ".wav",
+    ".ogg",
+    ".mp3",
+    ".flac",
+    ".import",
+)
+
+
+def apply_sandboxed_cartridge_deletions(
+    cartridge_dir: Union[Path, str],
+    delete_paths: Sequence[str],
+    *,
+    caller_role: str = "",
+) -> List[str]:
+    """Deletes obsolete/orphaned files strictly inside `cartridge_dir`, blocking path traversal,
+    protected root/control files, and out-of-domain deletions, and prunes deleted assets from
+    `assets/asset_library.json`. Returns normalized relative paths deleted."""
+    if not delete_paths:
+        return []
+    cdir = Path(cartridge_dir).resolve()
+    if not cdir.is_dir():
+        return []
+
+    deleted_rel: List[str] = []
+    for raw in delete_paths:
+        rel = str(raw or "").strip().replace("\\", "/")
+        if rel.startswith("res://"):
+            rel = rel[len("res://") :]
+        elif rel.startswith("res:/"):
+            rel = rel[len("res:/") :]
+        rel = rel.lstrip("/")
+        if not rel or ".." in Path(rel).parts:
+            raise StudioAgentError(
+                f"Unsafe or invalid delete_paths entry '{raw}' rejected by cartridge sandbox."
+            )
+        if rel in _PROTECTED_CARTRIDGE_DELETE_FILES:
+            raise StudioAgentError(
+                f"Protected cartridge file '{rel}' cannot be deleted via delete_paths."
+            )
+        rel_parts = set(Path(rel).parts)
+        if rel_parts & _PROTECTED_CARTRIDGE_DELETE_DIRS:
+            raise StudioAgentError(
+                f"Protected cartridge directory path '{rel}' cannot be deleted via delete_paths."
+            )
+        if caller_role in ("visual_artist", "audio_designer"):
+            if not rel.startswith("assets/") or not rel.lower().endswith(_MEDIA_DELETE_SUFFIXES):
+                raise StudioAgentError(
+                    f"Specialist '{caller_role}' may only delete obsolete media files under 'assets/*' (got '{rel}')."
+                )
+        cand = (cdir / rel).resolve()
+        if not cand.is_relative_to(cdir) or cand == cdir:
+            raise StudioAgentError(
+                f"Path '{raw}' resolves outside cartridge directory '{cdir}' and was blocked."
+            )
+        if cand.is_dir():
+            raise StudioAgentError(
+                f"Directory deletion is not permitted via delete_paths (got '{rel}'); specify individual file paths."
+            )
+        if cand.is_file():
+            cand.unlink()
+            sidecar_import = Path(str(cand) + ".import")
+            if sidecar_import.is_file() and sidecar_import.resolve().is_relative_to(cdir):
+                sidecar_import.unlink(missing_ok=True)
+            if rel not in deleted_rel:
+                deleted_rel.append(rel)
+
+    if deleted_rel:
+        cat_path = cdir / "assets" / "asset_library.json"
+        if cat_path.is_file():
+            try:
+                raw_cat = json.loads(cat_path.read_text(encoding="utf-8"))
+                entries = raw_cat.get("entries") if isinstance(raw_cat, dict) else None
+                if isinstance(entries, dict):
+                    deleted_set = set(deleted_rel)
+                    keys_to_prune = [
+                        k
+                        for k, ent in entries.items()
+                        if isinstance(ent, dict)
+                        and str(ent.get("file_path") or ent.get("res_path") or "")
+                        .replace("res://", "")
+                        .lstrip("/")
+                        in deleted_set
+                    ]
+                    if keys_to_prune:
+                        for pk in keys_to_prune:
+                            entries.pop(pk, None)
+                        cat_path.write_text(json.dumps(raw_cat, indent=2), encoding="utf-8")
+            except Exception as cat_exc:
+                logger.warning("Failed pruning deleted assets %s from asset_library.json: %s", deleted_rel, cat_exc)
+
+    return deleted_rel
+
+
 class TrackCodeSynthesisPayload(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
     Payload returned by LeadGameplaySWEAgent for full synthesis or requirement track implementation.
@@ -1695,6 +1865,14 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
         default="",
         description="Optional bank filter when issuing `memory_query` ('', 'all', 'self', 'council', or a canonical specialist role name).",
     )
+    tool_search_answer: str = Field(
+        default="",
+        description="If you issued `tool_search_query` on the previous turn, summarize the relevant tool capabilities/modes here before proceeding.",
+    )
+    tool_search_query: str = Field(
+        default="",
+        description="Optional progressive tool discovery query: if you want detailed schemas, sub-modes, or composition patterns for Studio tools/specialists before acting, enter a semantic query here and leave `patches` and `files` empty (`[]`).",
+    )
     memory_updates: List[MemoryMutationProposal] = Field(
         default_factory=list,
         description="DEFAULT TO [] — LEAVE EMPTY ON ROUTINE TURNS. Never log what code you just wrote, restate the Game Bible/spec, or record local single-file fixes. Populate ONLY when establishing a cross-module architectural invariant or hard-won runtime lesson future tasks/slices would break without knowing (or to update/fulfill an existing memory_id).",
@@ -1707,6 +1885,17 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
             "and `get_state_snapshot()` variables you need QA to capture. If you need to inspect that diagnostic output BEFORE writing code changes, "
             "populate `diagnostic_test_scene_request` and leave `patches` and `files` empty (`[]`)."
         ),
+    )
+    inspection_report: str = Field(
+        default="",
+        description=(
+            "When `operation_mode == 'inspect_only'` (a read-only architecture, scene, shader, or asset-wiring audit requested by TaskLead or Council), "
+            "write your structured technical findings citing exact file paths, node paths, method signatures, and asset dimensions here."
+        ),
+    )
+    recommended_followups: List[str] = Field(
+        default_factory=list,
+        description="Optional concise follow-up recommendations or out-of-scope observations surfaced back to TaskLead.",
     )
     requested_assets: List[AssetRequirement] = Field(
         default_factory=list,
@@ -1729,6 +1918,33 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
     manifest_data: Dict[str, Any] = Field(
         default_factory=dict,
         description="manifest.json content with metadata, genre, version, entrypoint."
+    )
+    delete_paths: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional cartridge-relative paths of obsolete/orphaned files (e.g. unused `assets/...` PNG/WAV files "
+            "or superseded helper scripts—never `project.godot`, `main.tscn`, `main.gd`, or `tests/*`) to delete cleanly from disk."
+        ),
+    )
+    reroute_to_specialist: str = Field(
+        default="",
+        description=(
+            "Optional peer handoff: if inspecting the codebase proves the root cause belongs to another Specialist Persona "
+            "('visual_artist', 'audio_designer', 'script_writer', or 'qa_test_engineer'—for example, a corrupted/blank `.png` "
+            "file on disk rather than a GDScript bug), set that specialist's name here and set `operation_mode='reroute'`."
+        ),
+    )
+    reroute_brief: str = Field(
+        default="",
+        description="When `reroute_to_specialist` is non-empty, concrete handoff brief explaining what you verified in code and what the target specialist needs to inspect, create, or fix.",
+    )
+    reroute_target_paths: List[str] = Field(
+        default_factory=list,
+        description="Optional cartridge-relative file paths for `reroute_to_specialist`.",
+    )
+    operation_mode: Literal["edit", "inspect_only", "reroute"] = Field(
+        default="edit",
+        description="Decision (strictly last): 'edit' when creating/modifying/deleting files or requesting assets; 'inspect_only' for a lock-free read-only technical audit with `inspection_report`; 'reroute' to hand off to `reroute_to_specialist` without mutating files.",
     )
 
     def assemble_cartridge_directory(
@@ -1820,6 +2036,23 @@ class TrackCodeSynthesisPayload(BaseEpistemicModel):
 
         gate_cm = commit_gate if commit_gate is not None else contextlib.nullcontext()
         with gate_cm:
+            if self.delete_paths:
+                deleted_rel_list = apply_sandboxed_cartridge_deletions(
+                    target_dir, self.delete_paths, caller_role="swe_engineer"
+                )
+                for d_rel in deleted_rel_list:
+                    results[d_rel] = target_dir / d_rel
+                if deleted_rel_list:
+                    try:
+                        from engine.studio.workers import record_turn_substep
+                        record_turn_substep(
+                            "deleting_obsolete_files",
+                            f"Deleted obsolete cartridge file(s): {deleted_rel_list}",
+                            details={"deleted_paths": deleted_rel_list},
+                        )
+                    except Exception:
+                        pass
+
             # 1. Ensure minimal main.tscn exists
             main_tscn = target_dir / "main.tscn"
             if not main_tscn.is_file():
@@ -2500,6 +2733,21 @@ class WritersRoomTurnProposal(BaseEpistemicModel):
         default="",
         description="DEFAULT TO '' — LEAVE EMPTY ON ROUTINE TURNS. Never duplicate Game Bible updates, task specs, or ordinary dialogue points here. Populate ONLY when deferring a multi-slice strategic goal beyond the active slice or recording a non-obvious cross-slice constraint (format '<bank>:<kind>: <title> | <content>').",
     )
+    route_to_council_role: str = Field(
+        default="",
+        description=(
+            "Optional dynamic Council peer handoff: if an issue, steering request, or design decision belongs in another "
+            "Council specialist's domain (or needs immediate follow-up from a colleague), set `<RoleName>` or "
+            "`<RoleName>: <concise handoff reason>` (e.g. 'VisualArtDirector: inspect active sprite rig', "
+            "'GameplaySystemsEngineer', 'AudioAtmosphereDesigner', 'UXExperienceDesigner', 'GameplayDesigner', "
+            "'LevelAndProgressionDesigner', 'StoryWorldArchitect', 'ScriptwriterAgent', 'CharacterDesigner') "
+            "to route the floor directly to them next."
+        ),
+    )
+    routing_handoff_reason: str = Field(
+        default="",
+        description="When `route_to_council_role` is non-empty, concise explanation of why you are routing to that colleague and what they should address.",
+    )
 
     _ROLE_SCHEMA_CACHE: ClassVar[Dict[str, Type["BaseEpistemicModel"]]] = {}
     _SHARED_TURN_FIELDS: ClassVar[Tuple[str, ...]] = (
@@ -2515,6 +2763,7 @@ class WritersRoomTurnProposal(BaseEpistemicModel):
         "backlog_refinements",
         "memory_query",
         "memory_note",
+        "route_to_council_role",
     )
     _ROLE_TURN_FIELDS: ClassVar[Dict[str, Tuple[str, ...]]] = {
         "CreativeDirector": (
@@ -2838,14 +3087,12 @@ def validate_game_design(bible: "GameBibleSpec") -> List[str]:
         issues.append("engagement_plan needs entertainment_pillars.")
     if onb is None:
         issues.append("onboarding_plan is missing.")
-    elif len(onb.steps) < 3:
-        issues.append("onboarding_plan needs at least 3 steps.")
+    elif not onb.steps:
+        issues.append("onboarding_plan needs at least one step.")
     if gh is None:
         issues.append("goal_hierarchy is missing.")
-    else:
-        horizons = {g.horizon.strip() for g in gh.goals if g.horizon and g.horizon.strip()}
-        if len(horizons) < 2:
-            issues.append("goal_hierarchy needs at least two distinct goal horizons (e.g. short_term and long_term).")
+    elif not gh.goals:
+        issues.append("goal_hierarchy needs at least one goal.")
     return issues
 
 
@@ -2982,6 +3229,14 @@ class AssetVisualValidationVerdict(BaseEpistemicModel):
     visual_defects: List[str] = Field(
         default_factory=list,
         description="Specific visual defects observed on the rendered inspection plate."
+    )
+    defective_cell_indices: List[int] = Field(
+        default_factory=list,
+        description=(
+            "For multi-cell grid sheets (grid_cols * grid_rows > 1), 0-based row-major cell indices "
+            "(idx = row * grid_cols + col) that exhibit visual, framing, or alpha defects so clean cells "
+            "can be preserved during surgical regeneration. Leave empty for 1x1 assets or global sheet defects."
+        ),
     )
     prompt_refinement_directive: str = Field(
         default="",
@@ -3193,7 +3448,7 @@ class RenderingStrategySpec(BaseEpistemicModel):
 
 
 WorkItemKind = Literal[
-    "visual_asset", "audio_asset", "level_map", "animation", "mechanic_code", "integration", "ui", "narrative", "other",
+    "visual_asset", "audio_asset", "level_map", "animation", "mechanic_code", "integration", "ui", "narrative", "discovery", "other",
 ]
 WorkItemState = Literal[
     "blocked", "ready", "in_progress", "waiting_for_lock", "awaiting_review", "changes_requested",
@@ -3268,6 +3523,14 @@ class FilmstripPlan(BaseEpistemicModel):
     production code (`production_defect_report`) when the game itself is broken or deadlocked.
     """
     deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this test scene architecture, diagnostic overlay/telemetry strategy, scripted inputs, and capture ticks best prove the item meets its spec (or why the production code itself is broken/deadlocked).")
+    self_question_answer: str = Field(
+        default="",
+        description="If you asked `self_question` on the previous turn, summarize the exact node paths, method signatures, or asset properties retrieved before finalizing your QA plan.",
+    )
+    self_question: str = Field(
+        default="",
+        description="Optional semantic inquiry against the codebase, Game Bible, or asset catalog if you need exact node names, method signatures, or signals before writing `test_scene_gd_content` (leave '' when current context suffices).",
+    )
     memory_query_answer: str = Field(
         default="",
         description="If you issued `memory_query` on the previous turn, summarize what you learned from the retrieved long-term memory entries before finalizing your QA plan.",
@@ -3279,6 +3542,14 @@ class FilmstripPlan(BaseEpistemicModel):
     memory_query_bank: str = Field(
         default="",
         description="Optional bank filter when issuing `memory_query` ('', 'all', 'self', 'council', or a canonical role name).",
+    )
+    tool_search_answer: str = Field(
+        default="",
+        description="If you issued `tool_search_query` on the previous turn, summarize the relevant QA harness capabilities here.",
+    )
+    tool_search_query: str = Field(
+        default="",
+        description="Optional progressive tool discovery query for QA harness capabilities, setup_calls, or telemetry features (leave '' when current context suffices).",
     )
     memory_updates: List[MemoryMutationProposal] = Field(
         default_factory=list,
@@ -3318,8 +3589,15 @@ class FilmstripPlan(BaseEpistemicModel):
         description=(
             "Complete GDScript 2.0 (`extends Node2D`) source code for the QA test scene at `target_scene` "
             "(e.g. `res://tests/test_<item_id>.gd` paired with `res://tests/test_<item_id>.tscn`). "
-            "Can instantiate isolated feature modules OR instantiate `res://main.tscn` as a child node, layer QA diagnostic overlays "
-            "on top, and implement `func get_state_snapshot() -> Dictionary` so production `main.gd` and `ui_hud.gd` stay 100% pure game code."
+            "Leave empty ('') when reusing an already-valid on-disk `res://tests/test_<item_id>.gd` unchanged or when "
+            "applying targeted edits via `test_scene_patches`."
+        ),
+    )
+    test_scene_patches: List[SurgicalCodePatch] = Field(
+        default_factory=list,
+        description=(
+            "Optional surgical line-range patches applied to an existing `res://tests/test_<item_id>.gd` script "
+            "(leave `test_scene_gd_content=''` when patching only specific lines instead of rewriting the whole file)."
         ),
     )
     capture_ticks: List[int] = Field(default_factory=list, description="Ticks at which to capture a frame (1 to 12 frames).")
@@ -3336,6 +3614,26 @@ class FilmstripPlan(BaseEpistemicModel):
     record_audiovisual_clip: bool = Field(
         default=False,
         description="Set True when the QA brief calls for capturing a synchronized gameplay .mp4 video+audio clip alongside the frame contact sheet.",
+    )
+    reroute_to_specialist: str = Field(
+        default="",
+        description=(
+            "Optional peer handoff: if inspecting the cartridge before QA staging proves this brief was sent to QA prematurely "
+            "or belongs to another Specialist Persona ('swe_engineer', 'visual_artist', 'audio_designer', 'script_writer'), "
+            "set that specialist's name here and set `verification_mode='reroute'`."
+        ),
+    )
+    reroute_brief: str = Field(
+        default="",
+        description="When `reroute_to_specialist` is non-empty, concrete handoff brief explaining the root cause and what the target specialist should implement or fix.",
+    )
+    reroute_target_paths: List[str] = Field(
+        default_factory=list,
+        description="Optional cartridge-relative target paths for `reroute_to_specialist`.",
+    )
+    verification_mode: Literal["causal_gameplay", "exploratory_diagnostic", "reroute"] = Field(
+        default="causal_gameplay",
+        description="Decision (strictly last): 'causal_gameplay' when proving interactive gameplay behavior via player inputs/assertions; 'exploratory_diagnostic' when performing a diagnostic scene/telemetry/visual probe without mandatory input choreography; 'reroute' to hand off directly to `reroute_to_specialist`.",
     )
 
 
@@ -3967,21 +4265,85 @@ class NextSliceStrategyPlan(BaseEpistemicModel):
 
 class CouncilDiagnosticProbe(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
-    Evaluated by the Council (`GameplaySystemsEngineer`) when an Executive Producer steering / bug report arrives,
-    determining whether the root cause is already clear from static code/context or whether `qa_test_engineer`
-    should first build and run a diagnostic test scene with overlays/telemetry to isolate the runtime cause.
+    Evaluated by the Council when an Executive Producer steering / bug report or slice review question arrives,
+    determining whether the root cause is already clear from static context or whether ANY of the 5 Specialist Personas
+    (`visual_artist`, `audio_designer`, `script_writer`, `swe_engineer`, `qa_test_engineer`) should first run a
+    read-only/diagnostic inspection probe to gather ground-truth evidence.
     """
     deliberation: str = Field(
         ...,
-        description="MANDATORY FIRST PROPERTY: Technical analysis of the reported issue against the cartridge scripts and whether the runtime root cause is already clear or requires a diagnostic QA test scene.",
+        description="MANDATORY FIRST PROPERTY: Technical/artistic analysis of the reported issue against the cartridge state and whether a specialist diagnostic probe is needed.",
+    )
+    specialist_agent: Literal[
+        "visual_artist",
+        "audio_designer",
+        "script_writer",
+        "swe_engineer",
+        "qa_test_engineer",
+    ] = Field(
+        default="qa_test_engineer",
+        description="Which Specialist Persona to invoke in read-only/diagnostic inspection mode when `needs_runtime_debug_scene=True`.",
+    )
+    diagnostic_brief: str = Field(
+        default="",
+        description="Concrete diagnostic/inspection brief for `specialist_agent` specifying what asset, audio clip, script, code module, or runtime scene to inspect.",
     )
     diagnostic_qa_brief: str = Field(
         default="",
-        description="When `needs_runtime_debug_scene=True`, a concrete brief for `qa_test_engineer` specifying what test scene to stage, what inputs/ticks to run, and what visual debug overlays or `get_state_snapshot()` telemetry to capture to isolate the root cause.",
+        description="Optional alias for `diagnostic_brief` when targeting `qa_test_engineer`.",
+    )
+    target_paths: List[str] = Field(
+        default_factory=list,
+        description="Optional cartridge-relative asset, audio, narrative, or `.gd` paths to inspect.",
     )
     needs_runtime_debug_scene: bool = Field(
         ...,
-        description="True ONLY when you are not sure what is causing the reported issue from static code alone and need `qa_test_engineer` to run a diagnostic test scene with overlays/telemetry first (strictly last).",
+        description="True when a specialist diagnostic/inspection probe should run before finalizing Council task direction; False when static context is already sufficient (strictly last).",
+    )
+
+    @property
+    def effective_brief(self) -> str:
+        return (self.diagnostic_brief or "").strip() or (self.diagnostic_qa_brief or "").strip()
+
+
+class CouncilSteeringRoutingPlan(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    LLM-driven intake routing plan when Executive Producer steering or playtest feedback arrives,
+    selecting the right Council domain lead(s) and optional Specialist Persona diagnostic probe
+    rather than hardcoding a fixed role order.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Multi-domain analysis of the incoming steering/feedback against the cartridge codebase, visual asset inventory/contact sheet, audio, UX, and design.",
+    )
+    lead_council_role: str = Field(
+        ...,
+        description=(
+            "Primary Council specialist best suited to own this steering/report "
+            "('CreativeDirector', 'GameplayDesigner', 'LevelAndProgressionDesigner', 'VisualArtDirector', "
+            "'UXExperienceDesigner', 'AudioAtmosphereDesigner', 'StoryWorldArchitect', 'ScriptwriterAgent', "
+            "'CharacterDesigner', or 'GameplaySystemsEngineer')."
+        ),
+    )
+    supporting_council_roles: List[str] = Field(
+        default_factory=list,
+        description="0 to 3 additional Council specialists whose domains directly intersect this request (in speaking order).",
+    )
+    specialist_probe_agent: str = Field(
+        default="",
+        description="When `needs_specialist_probe=True`, which of the 5 Specialist Personas ('visual_artist', 'audio_designer', 'script_writer', 'swe_engineer', 'qa_test_engineer') should run a read-only diagnostic probe first.",
+    )
+    diagnostic_brief: str = Field(
+        default="",
+        description="When `needs_specialist_probe=True`, concrete inspection brief for `specialist_probe_agent`.",
+    )
+    target_paths: List[str] = Field(
+        default_factory=list,
+        description="Optional cartridge-relative asset, audio, narrative, or `.gd` paths to inspect during the probe.",
+    )
+    needs_specialist_probe: bool = Field(
+        default=False,
+        description="True when a Specialist Persona diagnostic probe should execute before Council turns; False when current codebase + visual contact-sheet context already suffices (strictly last).",
     )
 
 
@@ -4071,6 +4433,30 @@ class SpecialistReport(BaseEpistemicModel):
     summary: str = Field(default="", description="Concrete summary of what the specialist created, modified, or verified.")
     touched_files: List[str] = Field(default_factory=list, description="Paths of assets, data files, or GDScript modules created or modified.")
     proof_images: List[str] = Field(default_factory=list, description="Proof image paths generated during this specialist step.")
+    diagnostic_artifact_paths: List[str] = Field(
+        default_factory=list,
+        description="Optional diagnostic plates, contact sheets, or telemetry artifacts produced during inspection.",
+    )
+    recommended_followups: List[str] = Field(
+        default_factory=list,
+        description="Optional concise follow-up recommendations or out-of-scope observations surfaced to the Task Lead.",
+    )
+    rerouted_from: List[str] = Field(
+        default_factory=list,
+        description="Ordered chain of Specialist Personas that dynamically re-routed this turn before execution completed.",
+    )
+    reroute_to_specialist: str = Field(
+        default="",
+        description="Target Specialist Persona when this specialist determined another persona should handle the work.",
+    )
+    reroute_brief: str = Field(
+        default="",
+        description="Concrete handoff brief formulated by this specialist for `reroute_to_specialist`.",
+    )
+    reroute_target_paths: List[str] = Field(
+        default_factory=list,
+        description="Target file paths recommended for `reroute_to_specialist`.",
+    )
     verification_passed: bool = Field(default=True, description="Whether engine/QA verification passed on this specialist turn.")
     code_diffs: Dict[str, str] = Field(default_factory=dict, description="Per-file unified diffs of code/scene modules modified during this turn.")
     step_log: List[Dict[str, Any]] = Field(default_factory=list, description="Chronological log of sub-steps executed during this turn.")
@@ -4092,6 +4478,14 @@ class ScriptWritingDeliverable(BaseEpistemicModel):
         ...,
         description="MANDATORY FIRST PROPERTY: Dramatic rationale evaluating how these scenes, dialogue lines, or character voices serve this specific game's tone, pacing, and gameplay.",
     )
+    self_question_answer: str = Field(
+        default="",
+        description="If you asked `self_question` on the previous turn, summarize the retrieved codebase/Bible facts here before authoring or inspecting.",
+    )
+    self_question: str = Field(
+        default="",
+        description="Optional semantic inquiry against the codebase, Game Bible, or asset catalog when you need exact event names, character states, or script hooks before authoring (leave '' when current context suffices).",
+    )
     memory_query_answer: str = Field(
         default="",
         description="If you issued `memory_query` on the previous turn, summarize what you learned from the retrieved memory entries before writing scenes or dialogue.",
@@ -4103,6 +4497,14 @@ class ScriptWritingDeliverable(BaseEpistemicModel):
     memory_query_bank: str = Field(
         default="",
         description="Optional bank filter for `memory_query` ('', 'all', 'self', 'council', or a canonical role name).",
+    )
+    tool_search_answer: str = Field(
+        default="",
+        description="If you issued `tool_search_query` on the previous turn, summarize the relevant narrative tool capabilities here.",
+    )
+    tool_search_query: str = Field(
+        default="",
+        description="Optional progressive tool discovery query for narrative authoring/inspection schemas (leave '' when current context suffices).",
     )
     memory_updates: List[MemoryMutationProposal] = Field(
         default_factory=list,
@@ -4127,6 +4529,33 @@ class ScriptWritingDeliverable(BaseEpistemicModel):
     narrative_notes: str = Field(
         default="",
         description="Summary of the dramatic writing crafted in this pass and how GDScript or audio systems can hook into it.",
+    )
+    inspection_report: str = Field(
+        default="",
+        description="When `operation_mode == 'inspect_only'`, structured continuity, tone, character-voice, and dialogue-hook audit findings.",
+    )
+    recommended_followups: List[str] = Field(
+        default_factory=list,
+        description="Optional concise follow-up recommendations surfaced back to the Task Lead.",
+    )
+    reroute_to_specialist: str = Field(
+        default="",
+        description=(
+            "Optional peer handoff: if this brief actually belongs to another Specialist Persona "
+            "('swe_engineer', 'visual_artist', 'audio_designer', 'qa_test_engineer'), set that specialist's name here and set `operation_mode='reroute'`."
+        ),
+    )
+    reroute_brief: str = Field(
+        default="",
+        description="When `reroute_to_specialist` is non-empty, concrete handoff brief explaining what the target specialist should do.",
+    )
+    reroute_target_paths: List[str] = Field(
+        default_factory=list,
+        description="Optional cartridge-relative paths for `reroute_to_specialist`.",
+    )
+    operation_mode: Literal["author", "inspect_only", "reroute"] = Field(
+        default="author",
+        description="Decision (strictly last): 'author' when creating/updating narrative bible & cartridge dialogue data; 'inspect_only' for a read-only narrative continuity/tone audit; 'reroute' to hand off to `reroute_to_specialist`.",
     )
 
 
@@ -4164,12 +4593,248 @@ class QAPostCaptureAudit(BaseEpistemicModel):
             "missing/clipped sprites, or unfulfilled acceptance criteria)."
         ),
     )
+    recommended_followups: List[str] = Field(
+        default_factory=list,
+        description="Optional concise follow-up suggestions or non-blocking polish observations surfaced back to the Task Lead.",
+    )
     qa_passed: bool = Field(
         ...,
         description=(
             "True ONLY if every captured frame visually and behaviorally satisfies the proof_spec and keeps the relevant subjects "
             "visibly observable inside the viewport across the scenario."
         ),
+    )
+
+
+class VisualArtistPlan(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Internal tool-selection plan for the unified `visual_artist` persona (creator + perceptual visual evaluator).
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Rationale evaluating the delegated `brief`, existing assets/mockups, and whether this step requires asset fabrication, diagnostic contact-sheet rendering, native VLM perceptual inspection, or both.",
+    )
+    self_question_answer: str = Field(
+        default="",
+        description="If you asked `self_question` on the previous turn, summarize the retrieved codebase/Bible/catalog facts before acting.",
+    )
+    self_question: str = Field(
+        default="",
+        description="Optional semantic inquiry against the codebase, Game Bible, or asset catalog when you need exact pixel dimensions, sprite usage, or art direction before acting (leave '' when current context suffices).",
+    )
+    memory_query_answer: str = Field(
+        default="",
+        description="If you issued `memory_query` on the previous turn, summarize the retrieved institutional lessons before acting.",
+    )
+    memory_query: str = Field(
+        default="",
+        description="Optional semantic search query against long-term memory banks before acting (leave '' when current context suffices).",
+    )
+    memory_query_bank: str = Field(
+        default="",
+        description="Optional bank filter when issuing `memory_query`.",
+    )
+    tool_search_answer: str = Field(
+        default="",
+        description="If you issued `tool_search_query` on the previous turn, summarize the relevant visual fabrication/inspection capabilities here.",
+    )
+    tool_search_query: str = Field(
+        default="",
+        description="Optional progressive tool discovery query for visual fabrication modes, contact-sheet overlays, or VLM inspection options (leave '' when current context suffices).",
+    )
+    memory_updates: List[MemoryMutationProposal] = Field(
+        default_factory=list,
+        description="DEFAULT TO [] — LEAVE EMPTY ON ROUTINE TURNS. Populate ONLY for non-obvious cross-slice visual/art-direction invariants.",
+    )
+    target_asset_paths: List[str] = Field(
+        default_factory=list,
+        description="Relative cartridge paths (e.g. 'assets/sprites/hero.png') to fabricate, render onto a contact sheet, or inspect.",
+    )
+    fabrication_notes: str = Field(
+        default="",
+        description="Optional synthesis/refinement notes when `operation` includes fabrication.",
+    )
+    contact_sheet_output_path: str = Field(
+        default="",
+        description="Optional relative output path for a diagnostic 1:1 contact sheet plate (e.g. 'proofs/visual_audit_plate.png').",
+    )
+    grid_px: int = Field(
+        default=0,
+        ge=0,
+        description="Optional pixel-grid ruler spacing (e.g. 16, 32, 64) to draw on a diagnostic contact sheet when inspecting atlas/tile alignment; 0 for clean un-gridded 1:1 display.",
+    )
+    crop_boxes: List[Tuple[int, int, int, int]] = Field(
+        default_factory=list,
+        description="Optional list of (x, y, width, height) pixel sub-regions on the first target asset to render as zoomed 1:1 callouts on the diagnostic plate.",
+    )
+    inspection_inquiry: str = Field(
+        default="",
+        description="Specific perceptual question(s) for VLM visual inspection when `operation` includes inspection (e.g. silhouette clarity, transparency, framing, atlas sub-elements, mockup fidelity).",
+    )
+    include_concept_mockup: bool = Field(
+        default=True,
+        description="Whether to attach the active slice's 16:9 concept art mockup during VLM visual inspection for art-direction grounding.",
+    )
+    delete_paths: List[str] = Field(
+        default_factory=list,
+        description="Optional cartridge-relative `assets/...` media paths of obsolete/orphaned files to delete cleanly from disk and prune from `assets/asset_library.json`.",
+    )
+    reroute_to_specialist: str = Field(
+        default="",
+        description=(
+            "Optional peer handoff: if this brief/issue belongs to another Specialist Persona (e.g. `'swe_engineer'` when "
+            "the `.png` sprite/atlas on disk is clean and the bug is GDScript `AtlasTexture`/`region_rect`/`hframes` slicing or UI layout, "
+            "`'audio_designer'` for audio, `'script_writer'` for narrative, or `'qa_test_engineer'` for runtime verification), "
+            "set that specialist's name here and set `operation='reroute'`."
+        ),
+    )
+    reroute_brief: str = Field(
+        default="",
+        description="When `reroute_to_specialist` is non-empty, concrete handoff brief explaining why you are re-routing and what the target specialist should inspect or modify.",
+    )
+    reroute_target_paths: List[str] = Field(
+        default_factory=list,
+        description="Optional cartridge-relative paths (e.g. `.gd`, `.tscn`, `.wav`) for `reroute_to_specialist`.",
+    )
+    operation: Literal["fabricate", "inspect", "fabricate_and_inspect", "render_contact_sheet", "cleanup", "reroute"] = Field(
+        ...,
+        description="Decision (strictly last): 'fabricate' to generate/update visual asset(s); 'inspect' to perceptually evaluate existing visual asset(s) via VLM + 1:1 diagnostic plate; 'fabricate_and_inspect' to generate asset(s) and immediately perceptually audit them; 'render_contact_sheet' for deterministic 1:1 plate rendering; 'cleanup' to delete obsolete `delete_paths` without fabricating; 'reroute' to hand off to `reroute_to_specialist`.",
+    )
+
+
+class VisualEvaluationReport(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Structured multimodal VLM perceptual inspection output from VisualEvaluatorAgent.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Detailed pixel-grounded visual deliberation examining silhouette, transparency/alpha cleanliness, proportions, sub-element layout, and cohesion with the Game Bible / 16:9 concept mockup.",
+    )
+    observed_visual_properties: str = Field(
+        ...,
+        description="Concrete description of what is actually visible in the rendered PNG pixels (orientation, sub-elements, palette, alpha boundaries).",
+    )
+    dimensional_and_framing_notes: str = Field(
+        default="",
+        description="Observations on pixel dimensions, padding, frame/cell layout, or region coordinates.",
+    )
+    style_and_mockup_alignment: str = Field(
+        default="",
+        description="Evaluation of how well the inspected visuals align with the game's art direction and 16:9 concept mockup.",
+    )
+    notable_concerns: List[str] = Field(
+        default_factory=list,
+        description="Specific pixel, alpha, framing, or style discrepancies observed (empty if clean).",
+    )
+    answer_to_inquiry: str = Field(
+        default="",
+        description="Direct answer to the `inspection_inquiry` grounded in the rendered pixels.",
+    )
+    perceptual_descriptions_by_path: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Map of relative asset path -> concise perceptual description persisted to `asset_library.json` so SWE/QA/Council know what each sprite/atlas visually contains.",
+    )
+    recommended_followups: List[str] = Field(
+        default_factory=list,
+        description="Concrete follow-up actions if visual defects, framing mismatches, or missing variants were observed.",
+    )
+    reroute_to_specialist: str = Field(
+        default="",
+        description=(
+            "Optional post-inspection peer handoff: if pixel inspection proves the `.png` asset on disk is intact and the reported defect "
+            "actually lies in another Specialist Persona's domain (e.g. `'swe_engineer'` for GDScript `AtlasTexture` region slicing, `hframes`/`vframes`, "
+            "node scaling, or unbound texture loading), set that specialist's name here."
+        ),
+    )
+    reroute_brief: str = Field(
+        default="",
+        description="When `reroute_to_specialist` is non-empty, concrete handoff brief citing the exact inspected PNG dimensions/cell layout and what the target specialist should fix.",
+    )
+    reroute_target_paths: List[str] = Field(
+        default_factory=list,
+        description="Optional cartridge-relative paths (e.g. `.gd` scripts) for `reroute_to_specialist`.",
+    )
+    answers_brief_satisfactorily: bool = Field(
+        ...,
+        description="Decision (strictly last): True if the inspected visual asset(s) satisfy the brief's visual and structural intent; False if defects or mismatches require rework.",
+    )
+
+
+class AudioDesignerPlan(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Internal tool-selection plan for the unified `audio_designer` persona (creator + perceptual audio/audiovisual evaluator).
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Rationale evaluating the delegated `brief` and target/media paths to decide whether to synthesize audio, perceptually listen/inspect existing `.wav`/`.mp4` media, or synthesize and immediately listen/inspect.",
+    )
+    self_question_answer: str = Field(
+        default="",
+        description="If you asked `self_question` on the previous turn, summarize the retrieved codebase/Bible/catalog facts before acting.",
+    )
+    self_question: str = Field(
+        default="",
+        description="Optional semantic inquiry against the codebase, Game Bible, or asset catalog when you need exact cue hooks, bus setup, or character voice specs before acting (leave '' when current context suffices).",
+    )
+    memory_query_answer: str = Field(
+        default="",
+        description="If you issued `memory_query` on the previous turn, summarize the retrieved acoustic/institutional lessons before acting.",
+    )
+    memory_query: str = Field(
+        default="",
+        description="Optional semantic search query against long-term memory banks before acting (leave '' when current context suffices).",
+    )
+    memory_query_bank: str = Field(
+        default="",
+        description="Optional bank filter when issuing `memory_query`.",
+    )
+    tool_search_answer: str = Field(
+        default="",
+        description="If you issued `tool_search_query` on the previous turn, summarize the relevant audio synthesis/listening capabilities here.",
+    )
+    tool_search_query: str = Field(
+        default="",
+        description="Optional progressive tool discovery query for audio synthesis modes or multimodal listening options (leave '' when current context suffices).",
+    )
+    memory_updates: List[MemoryMutationProposal] = Field(
+        default_factory=list,
+        description="DEFAULT TO [] — LEAVE EMPTY ON ROUTINE TURNS. Populate ONLY for non-obvious cross-slice acoustic/mixing invariants.",
+    )
+    synthesis_notes: str = Field(
+        default="",
+        description="Optional synthesis/mixing guidance when `operation` includes synthesis.",
+    )
+    media_paths_to_inspect: List[str] = Field(
+        default_factory=list,
+        description="Relative `.wav` or `.mp4` paths to listen to via AudioEvaluatorAgent when `operation` is 'inspect' or 'synthesize_and_inspect'.",
+    )
+    inspection_inquiry: str = Field(
+        default="",
+        description="Specific acoustic/audiovisual question(s) to answer when listening to the media.",
+    )
+    delete_paths: List[str] = Field(
+        default_factory=list,
+        description="Optional cartridge-relative `assets/...` media paths of obsolete/orphaned audio files to delete cleanly from disk and prune from `assets/asset_library.json`.",
+    )
+    reroute_to_specialist: str = Field(
+        default="",
+        description=(
+            "Optional peer handoff: if this brief/issue belongs to another Specialist Persona (e.g. `'swe_engineer'` for "
+            "`AudioStreamPlayer` bus/signal trigger wiring in GDScript, `'script_writer'` for dialogue scripts, `'visual_artist'` for visuals, "
+            "or `'qa_test_engineer'` for runtime capture), set that specialist's name here and set `operation='reroute'`."
+        ),
+    )
+    reroute_brief: str = Field(
+        default="",
+        description="When `reroute_to_specialist` is non-empty, concrete handoff brief explaining what the target specialist should inspect or modify.",
+    )
+    reroute_target_paths: List[str] = Field(
+        default_factory=list,
+        description="Optional cartridge-relative paths for `reroute_to_specialist`.",
+    )
+    operation: Literal["synthesize", "inspect", "synthesize_and_inspect", "cleanup", "reroute"] = Field(
+        ...,
+        description="Decision (strictly last): 'synthesize' to fabricate audio asset(s); 'inspect' to perceptually listen to existing `.wav`/`.mp4` media; 'synthesize_and_inspect' to fabricate audio and immediately verify it by listening; 'cleanup' to delete obsolete `delete_paths` without synthesizing; 'reroute' to hand off to `reroute_to_specialist`.",
     )
 
 
@@ -4201,25 +4866,33 @@ class TaskLeadDecision(BaseEpistemicModel):
         default="",
         description="Optional bank filter when issuing `memory_query` ('', 'all', 'self', 'council', or a canonical specialist role name).",
     )
+    tool_search_answer: str = Field(
+        default="",
+        description="If you issued `tool_search_query` on the previous turn, write your concise synthesis of the retrieved Studio tool capabilities/modes here before delegating, spawning, splitting, or submitting.",
+    )
+    tool_search_query: str = Field(
+        default="",
+        description="Optional progressive tool discovery query: if you want detailed schemas, internal sub-tools, parameters, or composition strategies for any Specialist Persona or board action before acting, output a semantic search query here.",
+    )
     memory_updates: List[MemoryMutationProposal] = Field(
         default_factory=list,
         description="DEFAULT TO [] — LEAVE EMPTY ON ~95% OF TURNS. Never log task progress, delegation status, or facts already in the Game Bible/codebase. Populate ONLY when a costly cross-task failure mode, operational constraint, or deferred multi-slice goal would otherwise be lost (or to update/fulfill an existing memory_id).",
     )
     current_strategy: str = Field(
         ...,
-        description="Concise (<= 60 words) strategy for this turn (state explicitly whether this turn will 'delegate' to a specific specialist_agent, 'spawn_tasks', or 'submit_to_council').",
+        description="Concise (<= 60 words) strategy for this turn (state explicitly whether this turn will 'delegate' to a specific specialist_agent, 'spawn_tasks', 'split_task', or 'submit_to_council').",
     )
     proof_strategy: str = Field(
         default="",
-        description="Concise (<= 40 words) strategy for how the final proof artifact(s) will be generated and verified to satisfy `proof_spec`.",
+        description="Concise (<= 40 words) strategy for how the final proof artifact(s) or discovery findings will be generated and verified.",
     )
     specialist_agent: str = Field(
         default="",
-        description="REQUIRED non-empty specialist identifier whenever this turn delegates work ('visual_artist', 'audio_designer', 'audio_evaluator', 'script_writer', 'swe_engineer', or 'qa_test_engineer'). Because this field appears BEFORE `action` in the JSON schema, you MUST populate `specialist_agent` here whenever you will set `action` to 'delegate'!",
+        description="REQUIRED non-empty specialist identifier whenever this turn delegates work ('visual_artist', 'audio_designer', 'script_writer', 'swe_engineer', or 'qa_test_engineer'). Because this field appears BEFORE `action` in the JSON schema, you MUST populate `specialist_agent` here whenever you will set `action` to 'delegate'!",
     )
     brief: str = Field(
         default="",
-        description="REQUIRED non-empty natural-language instructions (<= 180 words) for `specialist_agent` whenever this turn delegates work. Name the target files, symbols, and behavioral/visual/acoustic requirements concisely—NEVER write raw GDScript code blocks inside `brief` (since `swe_engineer` reads the staging files directly)! Because `brief` appears BEFORE `action` in the JSON schema, you MUST write the specialist brief here whenever you will set `action` to 'delegate'!",
+        description="REQUIRED non-empty natural-language instructions (<= 180 words) for `specialist_agent` whenever this turn delegates work. Name the target files, symbols, and behavioral/visual/acoustic creation or inspection goals concisely—NEVER write raw GDScript code blocks inside `brief`! Because `brief` appears BEFORE `action` in the JSON schema, you MUST write the specialist brief here whenever you will set `action` to 'delegate'!",
     )
     target_paths: List[str] = Field(
         default_factory=list,
@@ -4227,23 +4900,35 @@ class TaskLeadDecision(BaseEpistemicModel):
     )
     submission_summary: str = Field(
         default="",
-        description="When action == 'submit_to_council', comprehensive summary for the Council explaining the strategy executed, specialist contributions, and how Council feedback was addressed.",
+        description="When action == 'submit_to_council', comprehensive summary explaining the strategy executed, specialist contributions, and how acceptance criteria or discovery questions were satisfied.",
+    )
+    discovery_findings: str = Field(
+        default="",
+        description="When completing a `kind == 'discovery'` task (or surfacing structured investigation findings alongside a build submission), write the concrete, evidence-backed findings citing exact file paths, dimensions, node properties, or visual/audio observations.",
     )
     selected_proof_paths: List[str] = Field(
         default_factory=list,
-        description="When action == 'submit_to_council', paths of the proof artifacts (.png, .wav, and/or .mp4) generated during this session to submit to the Council.",
+        description="When action == 'submit_to_council', paths of the proof or diagnostic artifacts (.png, .wav, and/or .mp4) generated during this session.",
     )
     spawned_tasks: List[WorkItemProposal] = Field(
         default_factory=list,
-        description="When action == 'spawn_tasks', new tasks dynamically reasoned out and discovered while working on this task (e.g. a required player sprite, walk animation, jump animation, sound effect, or sub-mechanic task).",
+        description="When action == 'spawn_tasks', new tasks dynamically reasoned out while working on this task—including `kind='discovery'` investigation subtasks or prerequisite/follow-up build subtasks.",
     )
     wait_for_spawned_tasks: bool = Field(
         default=True,
-        description="When action == 'spawn_tasks', True if the current task depends on the newly spawned tasks being built and approved before continuing; False if they are follow-up/parallel tasks.",
+        description="When action == 'spawn_tasks', True if the current task depends on the newly spawned tasks completing first (yields locks and resumes automatically with child findings/artifacts injected); False if they are independent follow-up/parallel tasks.",
     )
-    action: Literal["delegate", "spawn_tasks", "submit_to_council"] = Field(
+    split_tasks: List[WorkItemProposal] = Field(
+        default_factory=list,
+        description="When action == 'split_task', 2 or more cohesive child WorkItemProposals that decompose and replace the current oversized or multi-concern task (may declare intra-batch `depends_on` ordering; downstream board dependents automatically rewire to wait on these children).",
+    )
+    preserve_verified_changes_on_split: bool = Field(
+        default=False,
+        description="When action == 'split_task', False (default) cleanly reverts uncommitted staging edits from this partial session before splitting; True preserves already-verified disk changes made in earlier turns of this session.",
+    )
+    action: Literal["delegate", "spawn_tasks", "split_task", "submit_to_council"] = Field(
         ...,
-        description="Decision (strictly last): 'delegate' to outsource a step to a specialist agent and inspect its result on the next turn; 'spawn_tasks' to dynamically create new tasks on the Production Board discovered while reasoning through this task; 'submit_to_council' when work and visual proof are complete and verified.",
+        description="Decision (strictly last): 'delegate' to invoke a Specialist Persona (for creation or inspection); 'spawn_tasks' to add discovery or build subtasks to the Production Board; 'split_task' to decompose this task into 2..N smaller cohesive tasks; 'submit_to_council' when work/findings are complete.",
     )
 
 
@@ -4392,27 +5077,7 @@ def validate_level_layout(
             f"world_bounds cover only {actual_scale:.1f} viewports but intended_world_scale_in_viewports={declared:.1f}."
         )
     if not layout.world_regions:
-        issues.append("world_regions is empty; the layout must cover the whole experience, not only the opening scene.")
-    if strategy is not None and len(getattr(strategy, "level_archetypes", []) or []) >= 2:
-        num_arch = len(strategy.level_archetypes)
-        arch_ids = [a.archetype_id for a in strategy.level_archetypes]
-        if len(layout.world_regions) < 2:
-            issues.append(
-                f"level_generation_strategy defines {num_arch} distinct level_archetypes ({arch_ids}), "
-                f"but world_regions only defines {len(layout.world_regions)} region; define at least 2 connected world_regions "
-                f"realizing the multi-region progression instead of collapsing the world into a single room."
-            )
-        if declared < 2.0 or actual_scale < 1.6:
-            issues.append(
-                f"level_generation_strategy defines a multi-region progression ({num_arch} archetypes: {arch_ids}), "
-                f"so intended_world_scale_in_viewports ({declared:.1f}) and world_bounds ({layout.world_bounds}, {actual_scale:.1f} viewports) "
-                f"must span multiple screens (>= 2.0 viewports) with Camera2D traversal rather than equating a single 16:9 camera mockup frame with the entire world."
-            )
-        if len(layout.entities) < 4:
-            issues.append(
-                f"Multi-region world layout only defines {len(layout.entities)} entities; populate all regions with the landmarks, "
-                f"interactive mechanisms, hazards, and goals required for a multi-step gameplay progression (>= 4 entities)."
-            )
+        issues.append("world_regions is empty; the layout must cover at least one world region.")
     ids = {e.entity_id for e in layout.entities}
     if len(ids) != len(layout.entities):
         issues.append("Duplicate entity_id values.")
@@ -4783,7 +5448,21 @@ class TokenUsageTracker:
             self.total_output_tokens: int = 0
             self.total_thought_tokens: int = 0
             self.total_tokens: int = 0
-            self.by_label: Dict[str, Dict[str, int]] = {}
+            self.image_generations: int = 0
+            self.image_output_tokens_deducted: int = 0
+            self.explicit_caches_created: int = 0
+            self.cache_storage_token_hours: float = 0.0
+            self.tts_generations: int = 0
+            self.tts_audio_seconds: float = 0.0
+            self.embedding_calls: int = 0
+            self.embedding_estimated_tokens: int = 0
+            self.playtest_calls: int = 0
+            self.playtest_prompt_tokens: int = 0
+            self.playtest_cached_tokens: int = 0
+            self.playtest_output_tokens: int = 0
+            self.playtest_thought_tokens: int = 0
+            self.playtest_tokens: int = 0
+            self.by_label: Dict[str, Dict[str, Any]] = {}
             self.consecutive_swe_pev_calls: int = 0
             self._recorded_response_ids: List[int] = []
 
@@ -4855,20 +5534,80 @@ class TokenUsageTracker:
                 pass
             raise StudioPausedError(err_msg)
 
-    def record_response(self, response: Any, label: str = "generate_content") -> Optional[Dict[str, int]]:
+    @staticmethod
+    def _compute_cost_usd(
+        *,
+        uncached_prompt_tokens: int,
+        cached_tokens: int,
+        output_and_thought_tokens: int,
+        image_generations: int = 0,
+        embedding_tokens: int = 0,
+        tts_audio_seconds: float = 0.0,
+        cache_storage_token_hours: float = 0.0,
+        standard_2027: bool = False,
+    ) -> float:
+        import os as _os
+
+        if standard_2027:
+            in_rate = 1.50
+            cached_rate = 0.15
+            out_rate = 7.50
+        else:
+            in_rate = float(_os.environ.get("STUDIO_PRICE_INPUT_PER_1M", "0.75"))
+            cached_rate = float(_os.environ.get("STUDIO_PRICE_CACHED_PER_1M", "0.075"))
+            out_rate = float(_os.environ.get("STUDIO_PRICE_OUTPUT_PER_1M", "3.75"))
+        img_rate = float(_os.environ.get("STUDIO_PRICE_IMAGE_EACH", "0.039"))
+        embed_rate = float(_os.environ.get("STUDIO_PRICE_EMBED_PER_1M", "0.15"))
+        tts_per_min = float(_os.environ.get("STUDIO_PRICE_TTS_PER_MIN", "0.015"))
+        storage_rate = float(_os.environ.get("STUDIO_PRICE_CACHE_STORAGE_PER_1M_HR", "1.00"))
+
+        usd = (
+            (max(0, uncached_prompt_tokens) / 1_000_000.0) * in_rate
+            + (max(0, cached_tokens) / 1_000_000.0) * cached_rate
+            + (max(0, output_and_thought_tokens) / 1_000_000.0) * out_rate
+            + max(0, image_generations) * img_rate
+            + (max(0, embedding_tokens) / 1_000_000.0) * embed_rate
+            + (max(0.0, tts_audio_seconds) / 60.0) * tts_per_min
+            + (max(0.0, cache_storage_token_hours) / 1_000_000.0) * storage_rate
+        )
+        return round(usd, 6)
+
+    def record_explicit_cache_lifecycle(
+        self,
+        cached_tokens: int,
+        lifetime_seconds: float,
+    ) -> float:
+        """Records an explicit `CachedContent` storage lifecycle (tokens * seconds / 3600) on scope teardown."""
+        tok_hrs = (max(0, int(cached_tokens)) * max(1.0, float(lifetime_seconds))) / 3600.0
+        with self._lock:
+            self.explicit_caches_created += 1
+            self.cache_storage_token_hours = round(self.cache_storage_token_hours + tok_hrs, 6)
+        return tok_hrs
+
+    def record_response(
+        self,
+        response: Any,
+        label: str = "generate_content",
+        *,
+        input_chars_hint: int = 0,
+        method_name: str = "generate_content",
+    ) -> Optional[Dict[str, Any]]:
         if response is None or getattr(response, "_studio_usage_recorded", False):
             return None
-        resp_id = id(response)
-        with self._lock:
-            if resp_id in self._recorded_response_ids:
-                return None
-            self._recorded_response_ids.append(resp_id)
-            if len(self._recorded_response_ids) > 256:
-                del self._recorded_response_ids[:-256]
+        marked_on_obj = False
         try:
             setattr(response, "_studio_usage_recorded", True)
+            marked_on_obj = True
         except Exception:
             pass
+        if not marked_on_obj:
+            resp_id = id(response)
+            with self._lock:
+                if resp_id in self._recorded_response_ids:
+                    return None
+                self._recorded_response_ids.append(resp_id)
+                if len(self._recorded_response_ids) > 256:
+                    del self._recorded_response_ids[:-256]
         usage = getattr(response, "usage_metadata", None)
         interaction_usage = getattr(response, "usage", None) if usage is None else None
         if usage is not None:
@@ -4909,6 +5648,56 @@ class TokenUsageTracker:
             thought_tok = 0
             total_tok = 0
 
+        # Detect non-text media synthesis & embedding modalities even when usage_metadata is omitted
+        gen_imgs = getattr(response, "generated_images", None)
+        image_count = len(gen_imgs) if isinstance(gen_imgs, (list, tuple)) else 0
+        audio_bytes_len = 0
+        candidates_list = getattr(response, "candidates", None)
+        if isinstance(candidates_list, (list, tuple)):
+            for cand in candidates_list:
+                c_obj = getattr(cand, "content", None)
+                c_parts = getattr(c_obj, "parts", None) if c_obj is not None else None
+                if isinstance(c_parts, (list, tuple)):
+                    for pt in c_parts:
+                        inl = getattr(pt, "inline_data", None)
+                        if inl is not None:
+                            mime = str(getattr(inl, "mime_type", "") or "").lower()
+                            raw_b = getattr(inl, "data", None)
+                            b_len = len(raw_b) if isinstance(raw_b, (bytes, bytearray)) else 0
+                            if mime.startswith("image/") and b_len > 0:
+                                image_count += 1
+                            elif (mime.startswith("audio/") or "tts" in (label or "").lower()) and b_len > 0:
+                                audio_bytes_len += b_len
+
+        is_embed = (
+            method_name == "embed_content"
+            or "embed_content" in (label or "").lower()
+            or getattr(response, "embeddings", None) is not None
+        )
+        embed_est_tok = 0
+        if is_embed and total_tok == 0:
+            if input_chars_hint > 0:
+                embed_est_tok = max(1, int(input_chars_hint) // 4)
+            else:
+                embs = getattr(response, "embeddings", None)
+                embed_est_tok = max(1, (len(embs) if isinstance(embs, (list, tuple)) else 1) * 64)
+
+        tts_sec = round(audio_bytes_len / 48000.0, 3) if audio_bytes_len > 0 else 0.0
+        uncached_prompt = max(0, prompt_tok - cached_tok)
+        # Image synthesis models include ~1,290 image representation tokens in `candidates_token_count`
+        # which are already priced per image via `image_generations * img_rate` ($0.039/image).
+        img_out_deduct = min(output_tok, 1290 * image_count) if image_count > 0 else 0
+        billable_call_out = max(0, output_tok - img_out_deduct) + thought_tok
+        call_cost_usd = self._compute_cost_usd(
+            uncached_prompt_tokens=uncached_prompt,
+            cached_tokens=cached_tok,
+            output_and_thought_tokens=billable_call_out,
+            image_generations=image_count,
+            embedding_tokens=embed_est_tok,
+            tts_audio_seconds=tts_sec,
+            standard_2027=False,
+        )
+
         family = (label or "generate_content").split("[", 1)[0].strip() or "generate_content"
         with self._lock:
             self.total_calls += 1
@@ -4919,6 +5708,14 @@ class TokenUsageTracker:
             self.total_output_tokens += output_tok
             self.total_thought_tokens += thought_tok
             self.total_tokens += total_tok
+            self.image_generations += image_count
+            self.image_output_tokens_deducted += img_out_deduct
+            if tts_sec > 0.0:
+                self.tts_generations += 1
+                self.tts_audio_seconds = round(self.tts_audio_seconds + tts_sec, 3)
+            if is_embed:
+                self.embedding_calls += 1
+                self.embedding_estimated_tokens += embed_est_tok
             bucket = self.by_label.setdefault(
                 family,
                 {
@@ -4929,6 +5726,9 @@ class TokenUsageTracker:
                     "output_tokens": 0,
                     "thought_tokens": 0,
                     "total_tokens": 0,
+                    "image_generations": 0,
+                    "tts_generations": 0,
+                    "embedding_estimated_tokens": 0,
                 },
             )
             bucket["calls"] += 1
@@ -4939,13 +5739,138 @@ class TokenUsageTracker:
             bucket["output_tokens"] += output_tok
             bucket["thought_tokens"] += thought_tok
             bucket["total_tokens"] += total_tok
+            bucket["image_generations"] += image_count
+            if tts_sec > 0.0:
+                bucket["tts_generations"] += 1
+            bucket["embedding_estimated_tokens"] += embed_est_tok
+            session_uncached = max(0, self.total_prompt_tokens - self.total_cached_tokens)
+            session_billable_out = (
+                max(0, self.total_output_tokens - self.image_output_tokens_deducted)
+                + self.total_thought_tokens
+            )
+            session_cost_usd = self._compute_cost_usd(
+                uncached_prompt_tokens=session_uncached,
+                cached_tokens=self.total_cached_tokens,
+                output_and_thought_tokens=session_billable_out,
+                image_generations=self.image_generations,
+                embedding_tokens=self.embedding_estimated_tokens,
+                tts_audio_seconds=self.tts_audio_seconds,
+                cache_storage_token_hours=self.cache_storage_token_hours,
+                standard_2027=False,
+            )
+            session_cache_share_pct = (
+                round(100.0 * self.total_cached_tokens / self.total_prompt_tokens, 2)
+                if self.total_prompt_tokens > 0
+                else 0.0
+            )
+            session_total_tokens = self.total_tokens
 
         return {
             "prompt_tokens": prompt_tok,
             "cached_tokens": cached_tok,
+            "uncached_prompt_tokens": uncached_prompt,
             "output_tokens": output_tok,
             "thought_tokens": thought_tok,
             "total_tokens": total_tok,
+            "image_count": image_count,
+            "tts_audio_seconds": tts_sec,
+            "embedding_estimated_tokens": embed_est_tok,
+            "estimated_call_cost_usd": call_cost_usd,
+            "session_estimated_cost_usd": session_cost_usd,
+            "session_cache_hit_pct": session_cache_share_pct,
+            "session_total_tokens": session_total_tokens,
+        }
+
+    def record_playtest_response(
+        self,
+        response: Any,
+        label: str = "BlindPlaytester",
+    ) -> Optional[Dict[str, Any]]:
+        """Records decoupled Playtester LLM usage into dedicated `playtest_*` counters and USD totals
+        without incrementing Studio build pipeline `total_calls` or tripping Studio circuit breakers."""
+        if response is None or getattr(response, "_studio_usage_recorded", False):
+            return None
+        marked_on_obj = False
+        try:
+            setattr(response, "_studio_usage_recorded", True)
+            marked_on_obj = True
+        except Exception:
+            pass
+        if not marked_on_obj:
+            resp_id = id(response)
+            with self._lock:
+                if resp_id in self._recorded_response_ids:
+                    return None
+                self._recorded_response_ids.append(resp_id)
+                if len(self._recorded_response_ids) > 256:
+                    del self._recorded_response_ids[:-256]
+        usage = getattr(response, "usage_metadata", None)
+        if usage is not None:
+            prompt_tok = int(getattr(usage, "prompt_token_count", 0) or 0)
+            cached_tok = int(getattr(usage, "cached_content_token_count", 0) or 0)
+            output_tok = int(getattr(usage, "candidates_token_count", 0) or 0)
+            thought_tok = int(getattr(usage, "thoughts_token_count", 0) or 0)
+            total_tok = int(getattr(usage, "total_token_count", 0) or (prompt_tok + output_tok + thought_tok))
+        else:
+            prompt_tok = 0
+            cached_tok = 0
+            output_tok = 0
+            thought_tok = 0
+            total_tok = 0
+        uncached_prompt = max(0, prompt_tok - cached_tok)
+        call_cost_usd = self._compute_cost_usd(
+            uncached_prompt_tokens=uncached_prompt,
+            cached_tokens=cached_tok,
+            output_and_thought_tokens=output_tok + thought_tok,
+            standard_2027=False,
+        )
+        with self._lock:
+            self.playtest_calls += 1
+            self.playtest_prompt_tokens += prompt_tok
+            self.playtest_cached_tokens += cached_tok
+            self.playtest_output_tokens += output_tok
+            self.playtest_thought_tokens += thought_tok
+            self.playtest_tokens += total_tok
+            combined_uncached = max(0, self.total_prompt_tokens - self.total_cached_tokens) + max(
+                0, self.playtest_prompt_tokens - self.playtest_cached_tokens
+            )
+            combined_cached = self.total_cached_tokens + self.playtest_cached_tokens
+            combined_out = (
+                max(0, self.total_output_tokens - self.image_output_tokens_deducted)
+                + self.total_thought_tokens
+                + self.playtest_output_tokens
+                + self.playtest_thought_tokens
+            )
+            session_cost_usd = self._compute_cost_usd(
+                uncached_prompt_tokens=combined_uncached,
+                cached_tokens=combined_cached,
+                output_and_thought_tokens=combined_out,
+                image_generations=self.image_generations,
+                embedding_tokens=self.embedding_estimated_tokens,
+                tts_audio_seconds=self.tts_audio_seconds,
+                cache_storage_token_hours=self.cache_storage_token_hours,
+                standard_2027=False,
+            )
+            combined_prompt = self.total_prompt_tokens + self.playtest_prompt_tokens
+            session_cache_share_pct = (
+                round(100.0 * combined_cached / combined_prompt, 2) if combined_prompt > 0 else 0.0
+            )
+            session_total_tokens = self.total_tokens + self.playtest_tokens
+
+        return {
+            "prompt_tokens": prompt_tok,
+            "cached_tokens": cached_tok,
+            "uncached_prompt_tokens": uncached_prompt,
+            "output_tokens": output_tok,
+            "thought_tokens": thought_tok,
+            "total_tokens": total_tok,
+            "image_count": 0,
+            "tts_audio_seconds": 0.0,
+            "embedding_estimated_tokens": 0,
+            "estimated_call_cost_usd": call_cost_usd,
+            "session_estimated_cost_usd": session_cost_usd,
+            "session_cache_hit_pct": session_cache_share_pct,
+            "session_total_tokens": session_total_tokens,
         }
 
     def get_summary(self) -> Dict[str, Any]:
@@ -4960,17 +5885,63 @@ class TokenUsageTracker:
                 if self.total_prompt_tokens > 0
                 else 0.0
             )
+            uncached_prompt = max(0, self.total_prompt_tokens - self.total_cached_tokens)
+            playtest_uncached = max(0, self.playtest_prompt_tokens - self.playtest_cached_tokens)
+            playtest_usd = self._compute_cost_usd(
+                uncached_prompt_tokens=playtest_uncached,
+                cached_tokens=self.playtest_cached_tokens,
+                output_and_thought_tokens=self.playtest_output_tokens + self.playtest_thought_tokens,
+                standard_2027=False,
+            )
+            billable_out = (
+                max(0, self.total_output_tokens - self.image_output_tokens_deducted)
+                + self.total_thought_tokens
+                + self.playtest_output_tokens
+                + self.playtest_thought_tokens
+            )
+            est_usd = self._compute_cost_usd(
+                uncached_prompt_tokens=uncached_prompt + playtest_uncached,
+                cached_tokens=self.total_cached_tokens + self.playtest_cached_tokens,
+                output_and_thought_tokens=billable_out,
+                image_generations=self.image_generations,
+                embedding_tokens=self.embedding_estimated_tokens,
+                tts_audio_seconds=self.tts_audio_seconds,
+                cache_storage_token_hours=self.cache_storage_token_hours,
+                standard_2027=False,
+            )
+            est_usd_2027 = self._compute_cost_usd(
+                uncached_prompt_tokens=uncached_prompt + playtest_uncached,
+                cached_tokens=self.total_cached_tokens + self.playtest_cached_tokens,
+                output_and_thought_tokens=billable_out,
+                image_generations=self.image_generations,
+                embedding_tokens=self.embedding_estimated_tokens,
+                tts_audio_seconds=self.tts_audio_seconds,
+                cache_storage_token_hours=self.cache_storage_token_hours,
+                standard_2027=True,
+            )
             return {
                 "total_calls": self.total_calls,
                 "calls_with_cache_hit": self.calls_with_cache_hit,
                 "cache_hit_call_rate_pct": hit_rate,
+                "explicit_caches_created": self.explicit_caches_created,
+                "cache_storage_token_hours": round(self.cache_storage_token_hours, 4),
                 "total_prompt_tokens": self.total_prompt_tokens,
                 "total_cached_tokens": self.total_cached_tokens,
-                "uncached_prompt_tokens": max(0, self.total_prompt_tokens - self.total_cached_tokens),
+                "uncached_prompt_tokens": uncached_prompt,
                 "cached_token_share_pct": cached_share,
                 "total_output_tokens": self.total_output_tokens,
                 "total_thought_tokens": self.total_thought_tokens,
                 "total_tokens": self.total_tokens,
+                "image_generations": self.image_generations,
+                "tts_generations": self.tts_generations,
+                "tts_audio_seconds": self.tts_audio_seconds,
+                "embedding_calls": self.embedding_calls,
+                "embedding_estimated_tokens": self.embedding_estimated_tokens,
+                "playtest_calls": self.playtest_calls,
+                "playtest_tokens": self.playtest_tokens,
+                "playtest_estimated_cost_usd": playtest_usd,
+                "estimated_cost_usd": est_usd,
+                "estimated_cost_usd_2027_std": est_usd_2027,
                 "by_label": {k: dict(v) for k, v in self.by_label.items()},
             }
 
@@ -4978,7 +5949,7 @@ class TokenUsageTracker:
 TOKEN_USAGE_TRACKER = TokenUsageTracker()
 
 
-def _emit_gateway_llm_activity(label: str, stats: Optional[Dict[str, int]] = None) -> None:
+def _emit_gateway_llm_activity(label: str, stats: Optional[Dict[str, Any]] = None) -> None:
     """Broadcasts live LLM call activity to Mission Control UI when running outside pytest so
     background LLM calls can never execute invisibly while the UI appears idle."""
     import os as _os
@@ -5402,11 +6373,23 @@ def install_studio_gemini_guardrails(
                                 if "400" in str(exc) or "INVALID_ARGUMENT" in str(exc).upper():
                                     _THREAD_LOCAL_GEMINI_CALL_CTX.skip_dataset_store = True
                                 delay = 1.5 * (2 ** attempt) + _random.uniform(0.0, 0.35)
-                                _time.sleep(delay)
+                                _retry_sleep(delay)
                                 wait_if_studio_paused(candidate_dir=ctx_c_dir, label=lbl)
                                 continue
                             raise
-                    stats = TOKEN_USAGE_TRACKER.record_response(res, label=lbl)
+                    embed_chars_hint = 0
+                    if m_name == "embed_content":
+                        raw_embed_c = kwargs.get("contents", args[0] if args else "")
+                        if isinstance(raw_embed_c, (list, tuple)):
+                            embed_chars_hint = sum(len(str(x)) for x in raw_embed_c)
+                        elif raw_embed_c is not None:
+                            embed_chars_hint = len(str(raw_embed_c))
+                    stats = TOKEN_USAGE_TRACKER.record_response(
+                        res,
+                        label=lbl,
+                        input_chars_hint=embed_chars_hint,
+                        method_name=m_name,
+                    )
                     if stats is not None:
                         _emit_gateway_llm_activity(lbl, stats)
                     return res
@@ -5465,11 +6448,15 @@ def install_studio_gemini_guardrails(
                                 if "400" in str(exc) or "INVALID_ARGUMENT" in str(exc).upper():
                                     _THREAD_LOCAL_GEMINI_CALL_CTX.skip_dataset_store = True
                                 delay = 1.5 * (2 ** attempt) + _random.uniform(0.0, 0.35)
-                                _time.sleep(delay)
+                                _retry_sleep(delay)
                                 wait_if_studio_paused(candidate_dir=ctx_c_dir, label=lbl)
                                 continue
                             raise
-                    stats = TOKEN_USAGE_TRACKER.record_response(res, label=lbl)
+                    stats = TOKEN_USAGE_TRACKER.record_response(
+                        res,
+                        label=lbl,
+                        method_name="interactions.create",
+                    )
                     if stats is not None:
                         _emit_gateway_llm_activity(lbl, stats)
                     return res
@@ -5481,6 +6468,405 @@ def install_studio_gemini_guardrails(
             except Exception:
                 pass
     return client
+
+
+def _retry_sleep(seconds: float) -> None:
+    import time as _time
+    _time.sleep(seconds)
+
+
+def _is_client_explicit_cache_eligible(client: Any) -> bool:
+    import os as _os
+
+    if _os.environ.get("STUDIO_ENABLE_EXPLICIT_CACHE", "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    if client is None:
+        return False
+    if not (is_real_genai_client(client) or bool(getattr(client, "_allow_explicit_prefix_cache", False))):
+        return False
+    caches_obj = getattr(client, "caches", None)
+    return callable(getattr(caches_obj, "create", None))
+
+
+def _estimate_prefix_token_floor(parts: Sequence[Any], system_instruction: Optional[str] = None) -> int:
+    text_chars = len(system_instruction) if isinstance(system_instruction, str) else 0
+    media_tokens = 0
+    for p in parts:
+        if isinstance(p, str):
+            text_chars += len(p)
+            continue
+        p_txt = getattr(p, "text", None)
+        if isinstance(p_txt, str) and p_txt:
+            text_chars += len(p_txt)
+        inl = getattr(p, "inline_data", None)
+        if inl is not None:
+            mime = str(getattr(inl, "mime_type", "") or "").lower()
+            raw_b = getattr(inl, "data", None)
+            if isinstance(raw_b, (bytes, bytearray)) and len(raw_b) > 0:
+                if mime.startswith("image/"):
+                    media_tokens += 258
+                else:
+                    media_tokens += 128
+    return int(text_chars / 4.5) + media_tokens
+
+
+def _hash_explicit_prefix(
+    model: str,
+    system_instruction: Optional[str],
+    parts: Sequence[Any],
+) -> str:
+    import hashlib as _hashlib
+
+    h = _hashlib.sha256()
+    h.update(f"M:{model}\0SI:{system_instruction or ''}\0".encode("utf-8", errors="replace"))
+    for p in parts:
+        if isinstance(p, str):
+            b = p.encode("utf-8", errors="replace")
+            h.update(b"S:")
+            h.update(len(b).to_bytes(8, "big"))
+            h.update(b)
+            continue
+        p_txt = getattr(p, "text", None)
+        if isinstance(p_txt, str) and p_txt:
+            b = p_txt.encode("utf-8", errors="replace")
+            h.update(b"PT:")
+            h.update(len(b).to_bytes(8, "big"))
+            h.update(b)
+        inl = getattr(p, "inline_data", None)
+        if inl is not None:
+            mime = str(getattr(inl, "mime_type", "") or "")
+            raw_b = getattr(inl, "data", b"") or b""
+            h.update(f"PI:{mime}:".encode("utf-8", errors="replace"))
+            h.update(len(raw_b).to_bytes(8, "big"))
+            h.update(bytes(raw_b))
+            continue
+        if not (isinstance(p_txt, str) and p_txt):
+            rb = repr(p).encode("utf-8", errors="replace")
+            h.update(b"R:")
+            h.update(len(rb).to_bytes(8, "big"))
+            h.update(rb)
+    return h.hexdigest()
+
+
+class ExplicitPrefixCacheScope:
+    """Scoped, thread-safe manager for deterministic Gemini `client.caches.create` prefix caching.
+    Automatically deletes all created `CachedContent` resources upon scope exit so storage charges
+    last only for the exact seconds of the multi-turn loop or Council review round."""
+    deliberation: str = "Scoped, thread-safe manager for deterministic Gemini explicit prefix caching and automatic teardown."
+
+    def __init__(self, client: Any, *, ttl_seconds: int = 360) -> None:
+        import threading as _threading
+
+        self.client = client
+        self.ttl_seconds = max(60, int(ttl_seconds))
+        self.closed = False
+        self._lock = _threading.Lock()
+        self._seen_counts: Dict[str, int] = {}
+        self._created_caches: Dict[str, Dict[str, Any]] = {}
+        self._unsuitable_keys: set[str] = set()
+        self._inflight_creates: Dict[str, Any] = {}
+
+    def resolve(
+        self,
+        *,
+        model: str,
+        prefix_parts: Sequence[Any],
+        tail_parts: Sequence[Any],
+        unsplit_contents: Any = None,
+        system_instruction: Optional[str] = None,
+        min_calls_before_create: int = 2,
+        display_name: str = "studio_prefix",
+    ) -> Tuple[Any, Optional[str]]:
+        import logging as _logging
+        import os as _os
+        import time as _time
+
+        fallback = (
+            unsplit_contents
+            if unsplit_contents is not None
+            else (list(prefix_parts) + list(tail_parts))
+        )
+        if not prefix_parts or not _is_client_explicit_cache_eligible(self.client):
+            return fallback, None
+
+        min_tok_floor = int(_os.environ.get("STUDIO_EXPLICIT_CACHE_MIN_TOKENS", "4500"))
+        est_tokens = _estimate_prefix_token_floor(prefix_parts, system_instruction=system_instruction)
+        if est_tokens < min_tok_floor:
+            return fallback, None
+
+        eff_tail_list = [
+            p for p in tail_parts if not (isinstance(p, str) and not p.strip())
+        ]
+        if not eff_tail_list:
+            eff_tail_list = ["Proceed with the task above and return the structured JSON response."]
+
+        key = _hash_explicit_prefix(model, system_instruction, prefix_parts)
+        expired_entry: Optional[Dict[str, Any]] = None
+        wait_event: Optional[Any] = None
+        creator_event: Optional[Any] = None
+        now_check = _time.monotonic()
+        ttl_safety_margin = min(45.0, max(5.0, float(self.ttl_seconds) * 0.15))
+        max_reusable_age = max(5.0, float(self.ttl_seconds) - ttl_safety_margin)
+        import threading as _threading
+
+        with self._lock:
+            if self.closed or key in self._unsuitable_keys:
+                return fallback, None
+            seen = self._seen_counts.get(key, 0) + 1
+            self._seen_counts[key] = seen
+            existing = self._created_caches.get(key)
+            if existing is not None:
+                age_s = max(0.0, now_check - float(existing.get("created_at") or now_check))
+                if age_s < max_reusable_age:
+                    return eff_tail_list, str(existing["name"])
+                expired_entry = self._created_caches.pop(key, None)
+            if seen < max(1, int(min_calls_before_create)):
+                return fallback, None
+            inflight_ev = self._inflight_creates.get(key)
+            if inflight_ev is not None:
+                wait_event = inflight_ev
+            else:
+                creator_event = _threading.Event()
+                self._inflight_creates[key] = creator_event
+
+        if expired_entry is not None:
+            exp_tokens = int(expired_entry.get("tokens") or 0)
+            exp_age = min(
+                float(self.ttl_seconds),
+                max(1.0, now_check - float(expired_entry.get("created_at") or now_check)),
+            )
+            TOKEN_USAGE_TRACKER.record_explicit_cache_lifecycle(exp_tokens, exp_age)
+            exp_name = str(expired_entry.get("name") or "")
+            delete_fn_exp = getattr(getattr(self.client, "caches", None), "delete", None)
+            if exp_name and callable(delete_fn_exp):
+                try:
+                    delete_fn_exp(name=exp_name)
+                except Exception:
+                    pass
+
+        if wait_event is not None:
+            wait_event.wait(timeout=30.0)
+            with self._lock:
+                if self.closed or key in self._unsuitable_keys:
+                    return fallback, None
+                existing_after = self._created_caches.get(key)
+                if existing_after is not None:
+                    return eff_tail_list, str(existing_after["name"])
+            return fallback, None
+
+        _log = _logging.getLogger("GeminiExplicitCache")
+        try:
+            wait_if_studio_paused(label=f"caches.create[{display_name}]")
+            try:
+                from google.genai import types as _genai_types
+
+                safe_disp = sanitize_gemini_label_value(display_name) or "studio_prefix"
+                cache_cfg = _genai_types.CreateCachedContentConfig(
+                    contents=list(prefix_parts),
+                    system_instruction=system_instruction,
+                    ttl=f"{self.ttl_seconds}s",
+                    display_name=safe_disp[:60],
+                )
+            except Exception:
+                cache_cfg = {
+                    "contents": list(prefix_parts),
+                    "ttl": f"{self.ttl_seconds}s",
+                    "display_name": (display_name or "studio_prefix")[:60],
+                }
+                if system_instruction:
+                    cache_cfg["system_instruction"] = system_instruction
+
+            created_obj = None
+            for c_attempt in range(2):
+                try:
+                    created_obj = self.client.caches.create(model=model, config=cache_cfg)
+                    break
+                except StudioPausedError:
+                    raise
+                except Exception as exc:
+                    err_low = str(exc).lower()
+                    if (
+                        "too small" in err_low
+                        or "min_total_token_count" in err_low
+                        or ("minimum" in err_low and "token" in err_low)
+                        or "4096" in err_low
+                    ):
+                        with self._lock:
+                            self._unsuitable_keys.add(key)
+                        _log.debug("Prefix below model explicit cache minimum for %s: %s", display_name, exc)
+                        return fallback, None
+                    if c_attempt == 0 and is_transient_gemini_error(exc):
+                        _retry_sleep(1.0)
+                        continue
+                    raise
+
+            cache_name = str(getattr(created_obj, "name", "") or "").strip()
+            if not cache_name:
+                return fallback, None
+            c_usage = getattr(created_obj, "usage_metadata", None)
+            tok_cnt = int(getattr(c_usage, "total_token_count", 0) or est_tokens)
+            now_mono = _time.monotonic()
+            dup_to_delete: Optional[str] = None
+            with self._lock:
+                if self.closed:
+                    dup_to_delete = cache_name
+                elif key in self._created_caches:
+                    dup_to_delete = cache_name
+                    cache_name = str(self._created_caches[key]["name"])
+                else:
+                    self._created_caches[key] = {
+                        "name": cache_name,
+                        "created_at": now_mono,
+                        "tokens": tok_cnt,
+                    }
+            if dup_to_delete:
+                try:
+                    self.client.caches.delete(name=dup_to_delete)
+                except Exception:
+                    pass
+                if self.closed:
+                    return fallback, None
+            return eff_tail_list, cache_name
+        finally:
+            if creator_event is not None:
+                with self._lock:
+                    if self._inflight_creates.get(key) is creator_event:
+                        self._inflight_creates.pop(key, None)
+                creator_event.set()
+
+    def close(self) -> None:
+        import logging as _logging
+        import time as _time
+
+        with self._lock:
+            if self.closed:
+                return
+            self.closed = True
+            to_cleanup = list(self._created_caches.values())
+            self._created_caches.clear()
+
+        if not to_cleanup:
+            return
+        _log = _logging.getLogger("GeminiExplicitCache")
+        delete_fn = getattr(getattr(self.client, "caches", None), "delete", None)
+        now_mono = _time.monotonic()
+        for entry in to_cleanup:
+            c_name = str(entry.get("name") or "")
+            tok_cnt = int(entry.get("tokens") or 0)
+            lifetime_s = min(
+                float(self.ttl_seconds),
+                max(1.0, now_mono - float(entry.get("created_at") or now_mono)),
+            )
+            TOKEN_USAGE_TRACKER.record_explicit_cache_lifecycle(tok_cnt, lifetime_s)
+            if c_name and callable(delete_fn):
+                try:
+                    delete_fn(name=c_name)
+                except Exception as exc:
+                    _log.debug("Explicit cache delete cleanup note for %s: %s", c_name, exc)
+
+
+def get_active_explicit_prefix_cache_scope(client: Optional[Any] = None) -> Optional[ExplicitPrefixCacheScope]:
+    stack = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "explicit_cache_scopes", None)
+    if not stack:
+        return None
+    for scope in reversed(stack):
+        if scope.closed:
+            continue
+        if client is None or scope.client is client:
+            return scope
+    return None
+
+
+def bind_explicit_prefix_cache_scope(scope: Optional[ExplicitPrefixCacheScope]):
+    """Temporarily binds an existing `ExplicitPrefixCacheScope` into a worker thread's TLS stack without closing it."""
+    import contextlib as _contextlib
+
+    @_contextlib.contextmanager
+    def _bind():
+        if scope is None or scope.closed:
+            yield scope
+            return
+        stack = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "explicit_cache_scopes", None)
+        if stack is None:
+            stack = []
+            _THREAD_LOCAL_GEMINI_CALL_CTX.explicit_cache_scopes = stack
+        stack.append(scope)
+        try:
+            yield scope
+        finally:
+            if stack and stack[-1] is scope:
+                stack.pop()
+            elif scope in stack:
+                stack.remove(scope)
+
+    return _bind()
+
+
+def explicit_prefix_cache_scope(
+    client: Any,
+    *,
+    ttl_seconds: int = 360,
+    reuse_outer: bool = True,
+):
+    import contextlib as _contextlib
+
+    @_contextlib.contextmanager
+    def _mgr():
+        if reuse_outer:
+            outer = get_active_explicit_prefix_cache_scope(client)
+            if outer is not None:
+                yield outer
+                return
+        scope = ExplicitPrefixCacheScope(client, ttl_seconds=ttl_seconds)
+        stack = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "explicit_cache_scopes", None)
+        if stack is None:
+            stack = []
+            _THREAD_LOCAL_GEMINI_CALL_CTX.explicit_cache_scopes = stack
+        stack.append(scope)
+        try:
+            yield scope
+        finally:
+            try:
+                if stack and stack[-1] is scope:
+                    stack.pop()
+                elif scope in stack:
+                    stack.remove(scope)
+            finally:
+                scope.close()
+
+    return _mgr()
+
+
+def resolve_explicit_cached_request(
+    client: Any,
+    *,
+    model: str,
+    prefix_parts: Sequence[Any],
+    tail_parts: Sequence[Any],
+    unsplit_contents: Any = None,
+    system_instruction: Optional[str] = None,
+    min_calls_before_create: int = 2,
+    display_name: str = "studio_prefix",
+) -> Tuple[Any, Optional[str]]:
+    """Resolves `(effective_contents, cached_content_name)` against the active `ExplicitPrefixCacheScope`
+    for `client`, falling back to `(unsplit_contents, None)` when outside a scope or below token threshold."""
+    fallback = (
+        unsplit_contents
+        if unsplit_contents is not None
+        else (list(prefix_parts) + list(tail_parts))
+    )
+    scope = get_active_explicit_prefix_cache_scope(client)
+    if scope is None:
+        return fallback, None
+    return scope.resolve(
+        model=model,
+        prefix_parts=prefix_parts,
+        tail_parts=tail_parts,
+        unsplit_contents=fallback,
+        system_instruction=system_instruction,
+        min_calls_before_create=min_calls_before_create,
+        display_name=display_name,
+    )
 
 
 def call_gemini_with_transient_retry(
@@ -5548,7 +6934,7 @@ def call_gemini_with_transient_retry(
                     delay,
                     exc,
                 )
-                _time.sleep(delay)
+                _retry_sleep(delay)
                 continue
             raise
         finally:

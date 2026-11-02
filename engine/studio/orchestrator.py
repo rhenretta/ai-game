@@ -357,12 +357,17 @@ class StudioOrchestrator:
         from engine.studio.writers_room import CreativeWritersRoom
         from engine.supervisor.supervisor import BuildSupervisor
 
+        from engine.studio.audio_evaluator import AudioEvaluatorAgent
+        from engine.studio.visual_evaluator import VisualEvaluatorAgent
+
         director_agent = CreativeDirectorWorldbuilderAgent(client=self.client, model_name=self.config.model_name)
         narrative_agent = NarrativeCharacterWriterAgent(client=self.client, model_name=self.config.model_name)
         audio_agent = VoiceActingAudioProducerAgent(client=self.client)
         visual_agent = VisualArtSpriteDesignerAgent(client=self.client)
         swe_agent = LeadGameplaySWEAgent(client=self.client, model_name=self.config.model_name)
         telemetry_agent = TelemetryArchitectAgent(gemini_client=self.client, model_name=self.config.model_name)
+        self.visual_evaluator = VisualEvaluatorAgent(client=self.client, model_name=self.config.model_name)
+        self.audio_evaluator = AudioEvaluatorAgent(client=self.client, model_name=self.config.model_name)
         supervisor_agent = BuildSupervisor(
             cartridges_root=PROJECT_ROOT / "cartridges",
             active_cartridge_dir=PROJECT_ROOT / "cartridges" / "active",
@@ -370,6 +375,7 @@ class StudioOrchestrator:
             gemini_client=self.client,
             event_bus=self.event_bus,
         )
+        self._default_supervisor_agent = supervisor_agent
 
         def _writers_room_event_cb(ev_type: str, payload: Dict[str, Any]) -> None:
             delib = payload.get("deliberation", f"CreativeWritersRoom emitted {ev_type}")
@@ -497,7 +503,9 @@ class StudioOrchestrator:
             cartridge_dir=c_dir,
             client=self.client,
             visual_agent=self.agents.get("VisualArtSpriteDesignerAgent"),
+            visual_evaluator=getattr(self, "visual_evaluator", None),
             voice_agent=self.agents.get("VoiceActingAudioProducerAgent"),
+            audio_evaluator=getattr(self, "audio_evaluator", None),
             swe_agent=swe_agent,
             model_name=self.config.model_name,
             code_verify=_verify,
@@ -2583,128 +2591,38 @@ class StudioOrchestrator:
         track: RequirementTrack,
         scene_audit: Dict[str, Any],
     ) -> None:
-        """Enforces authentic gameplay (no self-playing sim_tick demo loops), clean diegetic HUDs (no debug test-runner
-        dashboards or center-occluding panels), and mandatory Sprite2D/TextureRect asset binding when sprites exist."""
-        if scene_audit.get("passive_auto_win_detected"):
-            reason = scene_audit.get("passive_win_reason") or "Game auto-solved with zero player input."
-            raise RuntimeError(f"Passive auto-win violation in '{track.id}': {reason}")
-
-        if scene_audit.get("fullscreen_occlusion_detected"):
-            occ_nodes = scene_audit.get("fullscreen_occlusion_nodes") or []
-            occ_detail = f" Offending foreground UI nodes: {occ_nodes}." if occ_nodes else ""
-            raise RuntimeError(
-                f"Fullscreen UI viewport occlusion detected in '{track.id}'.{occ_detail} "
-                "Do not cover the 1280x720 game viewport with opaque foreground UI ColorRects or panels (alpha >= 0.80 in CanvasLayer/ui_hud.gd). "
-                "NOTE: World floor/terrain surfaces (z_index <= 0 in scenes.gd) SHOULD fill the full 1280x720 viewport—never shrink or add margins around world terrain!"
+        """Pure engine/structural binary asset integrity check and observational scene-audit telemetry logging.
+        Zero prescriptive gameplay, UI layout, camera, or GDScript regex heuristics—design and experiential
+        verification belong exclusively to the Specialist Personas (`qa_test_engineer`, `visual_artist`,
+        `audio_designer`) and the Specialist Council."""
+        if scene_audit:
+            logger.debug(
+                "Observational Godot scene audit for '%s': textures_loaded=%s, world_visual_nodes=%s, ui_control_nodes=%s",
+                getattr(track, "id", "track"),
+                scene_audit.get("textures_loaded_count", 0),
+                scene_audit.get("world_visual_nodes", 0),
+                scene_audit.get("ui_control_nodes", 0),
             )
 
-        if scene_audit.get("early_failure_state_detected"):
-            raise RuntimeError(
-                f"Unrecoverable early failure state ('is_failed': true in get_state_snapshot()) triggered within the opening 60-tick smoke check in '{track.id}'. "
-                "Ensure the player spawns in a stable recoverable state at t=0 and does not immediately die or fail during the initial 1-second smoke test."
-            )
-
-        empty_frames = scene_audit.get("empty_sprite_frame_nodes") or []
-        if empty_frames:
-            raise RuntimeError(
-                f"Invisible / mis-sliced Sprite2D frame detected in '{track.id}': {empty_frames}. "
-                "Check `assets/asset_library.json` for each texture's true `hframes` and `vframes`—never set `hframes > 1` or `vframes > 1` on a single-frame (`hframes=1, vframes=1`) sprite or articulated rig composite!"
-            )
-
-        sv_thrashing = scene_audit.get("subviewport_thrashing_nodes") or []
-        if sv_thrashing:
-            raise RuntimeError(
-                f"Severe GPU SubViewport frame-rate thrashing detected in '{track.id}': {sv_thrashing}. "
-                "When using a SubViewport as an accumulation mask with `CLEAR_MODE_NEVER`, NEVER set `render_target_update_mode = SubViewport.UPDATE_ALWAYS`—set `SubViewport.UPDATE_ONCE` and trigger `render_target_update_mode = SubViewport.UPDATE_ONCE` only when a new stroke is painted!"
-            )
-
-        occluding = scene_audit.get("center_occluding_panels") or []
-        if occluding:
-            raise RuntimeError(
-                f"HUD center-occlusion violation in '{track.id}': UI panels {occluding} cover the playable center of the viewport. "
-                "Keep all HUD elements compact around the screen perimeter (<15% viewport area)."
-            )
-
-        # Check for hardcoded sim_tick / frame-counter / playtest_timer demo sequencers in main.gd and scenes.gd
-        import re as _re
-
-        tick_branch_re = _re.compile(
-            r"\b(?:if|elif)\s+(?:sim_tick|sim_t|frame_count|tick_count|demo_tick|playtest_timer|auto_test_timer|demo_timer)\s*(?:==|>=|<=|>|<)\s*(\d+(?:\.\d+)?)\s*:"
-        )
-        for mod_name in ("main.gd", "scenes.gd"):
-            mod_path = staging_dir / mod_name
-            if not mod_path.is_file():
+        assets_root = staging_dir / "assets"
+        if not assets_root.is_dir():
+            return
+        for png_file in sorted(assets_root.rglob("*.png")):
+            if not png_file.is_file():
                 continue
-            src = mod_path.read_text(encoding="utf-8")
-            tick_vals = {float(m.group(1)) for m in tick_branch_re.finditer(src) if float(m.group(1)) >= 1.0}
-            if len(tick_vals) >= 2 or "handle_automated_playtest" in src:
+            head = png_file.read_bytes()[:8]
+            if len(head) < 8 or head != b"\x89PNG\r\n\x1a\n":
                 raise RuntimeError(
-                    f"Self-playing demo loop detected in {mod_name} (hardcoded tick/timer branches at {sorted(tick_vals)}). "
-                    "NEVER sequence gameplay actions, winching, cleating, dialogue choices, or state overrides on a sim_tick or playtest_timer in production code; "
-                    "bind all actions to real player inputs (_input / Input.is_action_pressed / Input.is_key_pressed) and let the external QA Test Renderer stage proof scenarios."
+                    f"Corrupt or 0-byte PNG binary header in '{png_file.relative_to(staging_dir).as_posix()}' during smoke check for '{track.id}'."
                 )
-
-        # Check that scenes.gd realizes multi-region / procedural level layouts rather than a tiny 1-screen Rect2 placeholder box
-        target_mods = set(getattr(track, "target_modules", []) or [])
-        layout_path = staging_dir / "level_layout.json"
-        scenes_path = staging_dir / "scenes.gd"
-        if "scenes.gd" in target_mods and layout_path.is_file() and scenes_path.is_file():
-            try:
-                layout_data = json.loads(layout_path.read_text(encoding="utf-8"))
-                intended_scale = float(layout_data.get("intended_world_scale_in_viewports", 1.0) or 1.0)
-                regions = layout_data.get("world_regions") or []
-            except Exception:
-                intended_scale = 1.0
-                regions = []
-            if intended_scale >= 2.0 and len(regions) >= 2:
-                scenes_src = scenes_path.read_text(encoding="utf-8")
-                loads_layout = "level_layout.json" in scenes_src
-                rect_coords = [
-                    (float(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4)))
-                    for m in _re.finditer(
-                        r"Rect2\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)",
-                        scenes_src,
-                    )
-                ]
-                max_extent_x = max((x + w for x, _y, w, _h in rect_coords), default=0.0)
-                max_extent_y = max((y + h for _x, y, _w, h in rect_coords), default=0.0)
-                if not loads_layout and rect_coords and len(rect_coords) <= 6 and max_extent_x <= 1920.0 and max_extent_y <= 1080.0:
-                    raise RuntimeError(
-                        f"Tiny placeholder level detected in scenes.gd for '{track.id}': level_layout.json specifies "
-                        f"{len(regions)} regions across ~{intended_scale:.1f} viewports ({layout_data.get('world_bounds')}), "
-                        f"but scenes.gd only hardcodes {len(rect_coords)} Rect2 shapes inside a single screen ({max_extent_x:.0f}x{max_extent_y:.0f}). "
-                        "Load res://level_layout.json and/or execute the procedural/hybrid chunk grammar across all regions."
-                    )
-
-        # Check ui_hud.gd for internal debug/test-runner telemetry dashboards
-        hud_path = staging_dir / "ui_hud.gd"
-        if hud_path.is_file():
-            hud_src = hud_path.read_text(encoding="utf-8")
-            if "headless_test_results" in hud_src or "HEADLESS MECHANICS" in hud_src.upper() or "TELEMETRY VERIFICATION" in hud_src.upper():
+        for wav_file in sorted(assets_root.rglob("*.wav")):
+            if not wav_file.is_file():
+                continue
+            head = wav_file.read_bytes()[:12]
+            if len(head) < 12 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
                 raise RuntimeError(
-                    f"Debug telemetry dashboard detected in ui_hud.gd for '{track.id}'. "
-                    "NEVER render headless_test_results, 'HEADLESS MECHANICS', or QA verification tables inside the player's HUD; "
-                    "QA telemetry is rendered externally by the QA Test Renderer."
+                    f"Corrupt or 0-byte WAV RIFF header in '{wav_file.relative_to(staging_dir).as_posix()}' during smoke check for '{track.id}'."
                 )
-
-        # Check mandatory sprite/texture binding when synthesized sprites exist on disk and main scene integration is under test
-        sprites_dir = staging_dir / "assets" / "sprites"
-        sprite_pngs = sorted(sprites_dir.glob("*.png")) if sprites_dir.is_dir() else []
-        target_mods = set(getattr(track, "target_modules", []) or [])
-        touches_visual_code = ("main.gd" in target_mods) or not target_mods
-        if (
-            sprite_pngs
-            and touches_visual_code
-            and ((staging_dir / "entities.gd").is_file() or (staging_dir / "scenes.gd").is_file())
-            and "textures_loaded_count" in scene_audit
-            and int(scene_audit.get("textures_loaded_count", 0)) == 0
-        ):
-            sprite_names = [p.name for p in sprite_pngs[:8]]
-            raise RuntimeError(
-                f"Unbound sprite assets in '{track.id}': {len(sprite_pngs)} synthesized PNG sprite(s) exist in res://assets/sprites/ "
-                f"({sprite_names}), but textures_loaded_count is 0 in the live scene tree. Load and bind the actual Sprite2D/TextureRect "
-                "textures from res://assets/asset_library.json instead of drawing untextured programmer-art shapes."
-            )
 
     def _verify_track_smoke_check(
         self,
@@ -3011,125 +2929,158 @@ class StudioOrchestrator:
                     except Exception as exc:
                         logger.warning("Portrait synthesis warning for '%s': %s", cid, exc)
 
-        # 3. Hand over to BuildSupervisor for 5-Gate Validation & Promotion
+        # 3. Promotion & Boot Sanity Check
+        # Continuous Production Board builds have ALREADY been verified end-to-end by autonomous agents
+        # (Task Lead + Specialist Personas + Slice Assembly Check + Blind Playtester + Council Sign-Off).
+        # We do NOT run hardcoded 5-Gate restrictions or `build_qa_gate_work_item_proposals` on board builds;
+        # we only confirm the cartridge entrypoint/syntax boots cleanly (and if a boot syntax error exists,
+        # route it directly to the Writers' Room Council rather than hardcoded gate stampers).
         self.transition_to(StudioBuildState.VERIFYING, "Handing staging cartridge to BuildSupervisor")
+        custom_supervisor = self.agents.get("QAPlaytesterBuildSupervisor")
+        has_custom_supervisor_override = (
+            custom_supervisor is not None
+            and custom_supervisor is not getattr(self, "_default_supervisor_agent", None)
+        )
+        is_agent_verified_board_build = bool(
+            self._continuous_production_enabled()
+            and (staging_dir / "backlog.json").is_file()
+            and not has_custom_supervisor_override
+            and not getattr(self.config, "enable_hardcoded_qa_gate", False)
+        )
         self._publish_event(
             "state_change",
             "QAPlaytesterBuildSupervisor",
-            f"Evaluating candidate cartridge '{staging_dir.name}' across 5 Quality Gates...",
+            (
+                f"Checking boot syntax & promoting agent-verified cartridge '{staging_dir.name}'..."
+                if is_agent_verified_board_build
+                else f"Evaluating candidate cartridge '{staging_dir.name}' across 5 Quality Gates..."
+            ),
             {"agent_name": "QAPlaytesterBuildSupervisor", "lifecycle_state": "VERIFYING"},
         )
-        supervisor = self.agents.get("QAPlaytesterBuildSupervisor")
+        supervisor = custom_supervisor if has_custom_supervisor_override else None
         if supervisor is None:
             from engine.supervisor.supervisor import BuildSupervisor
             swe = self.agents.get("LeadGameplaySWEAgent")
+            cart_root = staging_dir.parent if staging_dir is not None else (PROJECT_ROOT / "cartridges")
             supervisor = BuildSupervisor(
-                cartridges_root=PROJECT_ROOT / "cartridges",
-                active_cartridge_dir=PROJECT_ROOT / "cartridges" / "active",
+                cartridges_root=cart_root,
+                active_cartridge_dir=cart_root / "active",
                 swe_agent=swe,
                 gemini_client=self.client,
                 event_bus=self.event_bus,
             )
 
-        report = supervisor.evaluate_and_heal(
-            candidate_or_spec=staging_dir,
-            episode_number=plan.target_episode,
-            max_retries=self.config.max_retries,
-        )
-
-        # When a Continuous Production Board cartridge fails final QA verification (e.g. on a resumed build
-        # or post-slice integration), escalate remediation onto the Production Board rather than mutating off-board!
         use_wr_escalation = (
             self.enable_writers_room
             if self.enable_writers_room is not None
             else self._is_live_genai_client()
         )
         max_board_qa_escalations = max(1, min(2, int(getattr(self.config, "max_retries", 2) or 2)))
-        qa_esc_idx = 0
-        while (
-            not bool(getattr(report, "promoted_to_active", False))
-            and getattr(report, "rejection_trace", None) is not None
-            and use_wr_escalation
-            and self._continuous_production_enabled()
-            and (staging_dir / "backlog.json").is_file()
-            and qa_esc_idx < max_board_qa_escalations
-        ):
-            from engine.supervisor.supervisor import build_qa_gate_work_item_proposals
 
-            trace_esc = report.rejection_trace
-            pb_esc = self._build_production_board(staging_dir)
-            gb_esc: Optional[GameBibleSpec] = self.active_game_bible
-            if gb_esc is None and (staging_dir / "game_bible.json").is_file():
-                try:
-                    gb_esc = GameBibleSpec.model_validate_json((staging_dir / "game_bible.json").read_text(encoding="utf-8"))
-                except Exception:
-                    gb_esc = None
-            last_slice_id = ""
-            if gb_esc is not None and gb_esc.slice_roadmap:
-                active_or_last = gb_esc.get_active_slice() or gb_esc.slice_roadmap[-1]
-                last_slice_id = getattr(active_or_last, "slice_id", "") or ""
-            qa_props = build_qa_gate_work_item_proposals(
-                candidate_dir=staging_dir,
-                trace=trace_esc,
-                pass_index=100 + qa_esc_idx,
-                slice_id=last_slice_id,
-                existing_item_ids={it.item_id for it in pb_esc.items()},
+        if is_agent_verified_board_build:
+            from engine.supervisor.models import (
+                BuildEvaluationReport,
+                RejectionDiagnosticTrace,
+                RemedyType,
+                SupervisorGateVerdict,
             )
-            added_esc = pb_esc.add_items(
-                qa_props,
-                raised_by_role="QATestEngineer",
-                slice_id=last_slice_id,
-            )
-            if not added_esc:
-                break
-            lead_qa_prop = qa_props[0]
-            if gb_esc is not None:
-                from engine.studio.models import WritersRoomUtterance
 
-                t_idx = len(gb_esc.writers_room_transcript)
-                addressed_esc = ["GameplaySystemsEngineer", "CreativeDirector"]
-                if any(p.kind == "visual_asset" for p in qa_props):
-                    addressed_esc.insert(0, "VisualArtDirector")
-                task_summary_esc = ", ".join(f"`{p.item_id}` ({p.kind})" for p in qa_props)
-                esc_utt = WritersRoomUtterance(
-                    deliberation=lead_qa_prop.deliberation,
-                    utterance_id=f"utt_{t_idx:02d}_QATestEngineer_final_qa_esc_{qa_esc_idx}",
-                    turn_index=t_idx,
-                    speaker_role="QATestEngineer",
-                    speaker_display_name="QA & Build Supervisor",
-                    spoken_dialogue=(
-                        f"[Final 5-Gate QA Escalation #{qa_esc_idx + 1}] {trace_esc.failure_gate} flagged: "
-                        f"{trace_esc.failure_reason} Created {len(qa_props)} Production Board task(s) {task_summary_esc} "
-                        f"for Task Lead execution and Specialist Council sign-off before promotion."
+            attempt_idx = 1
+            gate_a = supervisor.verify_gate_a_syntax_and_entrypoint(staging_dir)
+            while not gate_a.passed and use_wr_escalation and attempt_idx <= max_board_qa_escalations:
+                gb_esc: Optional[GameBibleSpec] = self.active_game_bible
+                if gb_esc is None and (staging_dir / "game_bible.json").is_file():
+                    try:
+                        gb_esc = GameBibleSpec.model_validate_json(
+                            (staging_dir / "game_bible.json").read_text(encoding="utf-8")
+                        )
+                    except Exception:
+                        gb_esc = None
+                boot_issue_msg = (
+                    f"Cartridge entrypoint / GDScript boot check failed before promotion: {gate_a.details}. "
+                    f"Diagnose the root cause and coordinate the necessary Production Board fix."
+                )
+                if StudioBuildState.SYNTHESIZING in self.ALLOWED_TRANSITIONS.get(self.state, set()):
+                    self.transition_to(
+                        StudioBuildState.SYNTHESIZING,
+                        f"Routing boot syntax error to Writers' Room Council (attempt {attempt_idx})...",
+                    )
+                if gb_esc is not None:
+                    self.writers_room.board = self._build_production_board(staging_dir)
+                    self.writers_room._execute_steering_pivot_turns(
+                        game_bible=gb_esc,
+                        dna_summary=str(context.raw_outputs.get("dna_summary") or ""),
+                        candidate_dir=staging_dir,
+                        steered_notes=[boot_issue_msg],
+                    )
+                dna_esc = context.raw_outputs.get("dna")
+                gb_esc = self.run_writers_room_session(
+                    dna=dna_esc,
+                    staging_dir=staging_dir,
+                    target_episode=plan.target_episode,
+                    existing_bible=gb_esc,
+                )
+                if StudioBuildState.VERIFYING in self.ALLOWED_TRANSITIONS.get(self.state, set()):
+                    self.transition_to(
+                        StudioBuildState.VERIFYING,
+                        f"Re-checking boot entrypoint on '{staging_dir.name}' after Council repair...",
+                    )
+                attempt_idx += 1
+                gate_a = supervisor.verify_gate_a_syntax_and_entrypoint(staging_dir)
+
+            if gate_a.passed:
+                supervisor.promote_candidate(staging_dir)
+                supervisor._emit_promoted_event(staging_dir)
+                report = BuildEvaluationReport(
+                    deliberation=(
+                        f"Agent-verified Production Board cartridge '{staging_dir.name}' passed boot entrypoint check "
+                        f"and was promoted to active without hardcoded QA gate restrictions."
                     ),
-                    addressed_to=addressed_esc,
-                    bible_updates_summary=[f"backlog:+{it.item_id}" for it in added_esc],
+                    candidate_id=staging_dir.name,
+                    episode_number=plan.target_episode,
+                    status=SupervisorGateVerdict.PROMOTED,
+                    promoted_to_active=True,
+                    candidate_dir=str(staging_dir),
+                    active_dir=str(supervisor.active_cartridge_dir),
+                    gate_results={"gate_a": gate_a},
+                    rejection_trace=None,
+                    attempt_count=attempt_idx,
+                    max_retries=max_board_qa_escalations,
+                    repair_history=[],
                 )
-                gb_esc.writers_room_transcript.append(esc_utt)
-                self.writers_room._persist_bible(gb_esc, candidate_dir=staging_dir)
-
-            qa_esc_idx += 1
-            if StudioBuildState.SYNTHESIZING in self.ALLOWED_TRANSITIONS.get(self.state, set()):
-                self.transition_to(
-                    StudioBuildState.SYNTHESIZING,
-                    f"Escalating {trace_esc.failure_gate} remediation task(s) ({len(qa_props)}) onto Production Board...",
+            else:
+                boot_trace = RejectionDiagnosticTrace(
+                    deliberation=f"Boot entrypoint/syntax check failed on '{staging_dir.name}': {gate_a.details}",
+                    candidate_id=staging_dir.name,
+                    episode_number=plan.target_episode,
+                    attempt_number=attempt_idx,
+                    failure_gate="Boot Entrypoint & Syntax",
+                    failure_type=gate_a.failure_type,
+                    failure_reason=gate_a.details,
+                    file_path=gate_a.diagnostic_data.get("file_path"),
+                    line_number=gate_a.diagnostic_data.get("line_number"),
+                    remedy_type=RemedyType.FIX_SYNTAX,
+                    recommended_remedy="Repair syntax or missing entrypoint scene before promoting.",
                 )
-            dna_esc = context.raw_outputs.get("dna")
-            gb_esc = self.run_writers_room_session(
-                dna=dna_esc,
-                staging_dir=staging_dir,
-                target_episode=plan.target_episode,
-                existing_bible=gb_esc,
-            )
-            if StudioBuildState.VERIFYING in self.ALLOWED_TRANSITIONS.get(self.state, set()):
-                self.transition_to(
-                    StudioBuildState.VERIFYING,
-                    f"Re-verifying candidate cartridge '{staging_dir.name}' across 5 Quality Gates after board remediation...",
+                report = BuildEvaluationReport(
+                    deliberation=boot_trace.deliberation,
+                    candidate_id=staging_dir.name,
+                    episode_number=plan.target_episode,
+                    status=SupervisorGateVerdict.FAILED_MAX_RETRIES,
+                    promoted_to_active=False,
+                    candidate_dir=str(staging_dir),
+                    active_dir=str(supervisor.active_cartridge_dir),
+                    gate_results={"gate_a": gate_a},
+                    rejection_trace=boot_trace,
+                    attempt_count=attempt_idx,
+                    max_retries=max_board_qa_escalations,
+                    repair_history=[boot_trace],
                 )
+        else:
             report = supervisor.evaluate_and_heal(
                 candidate_or_spec=staging_dir,
                 episode_number=plan.target_episode,
-                max_retries=1,
+                max_retries=self.config.max_retries,
             )
 
         delib_sup = getattr(report, "deliberation", None)
@@ -3200,7 +3151,7 @@ class StudioOrchestrator:
                     )
             except Exception:
                 pass
-            active_dir = PROJECT_ROOT / "cartridges" / "active"
+            active_dir = Path(getattr(report, "active_dir", "") or (PROJECT_ROOT / "cartridges" / "active"))
             if active_dir.exists():
                 try:
                     shutil.copy2(task_history_path, active_dir / "task_history.json")

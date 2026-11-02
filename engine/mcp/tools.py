@@ -9,6 +9,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import config
 from config import DB_PATH, PROJECT_ROOT
 from engine.analyst.analyst import TelemetryAnalyst
 from engine.analyst.models import BehavioralProfile
@@ -250,7 +251,7 @@ class SpatialMapTool(BaseMCPTool):
         if cartridge_path_val:
             cartridge_path = Path(cartridge_path_val).resolve()
         else:
-            active_p = PROJECT_ROOT / "cartridges" / "active"
+            active_p = config.get_cartridges_dir() / "active"
             if not active_p.exists():
                 return {
                     "deliberation": "No active cartridge exists in cartridges/active and no cartridge_path provided.",

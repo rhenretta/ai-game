@@ -39,6 +39,7 @@ from engine.studio.models import (
     ConceptSeedProposal,
     ConceptSelection,
     CouncilDiagnosticProbe,
+    CouncilSteeringRoutingPlan,
     CreativeProvocationSet,
     validate_game_design,
     DirectorConvergenceCheck,
@@ -63,13 +64,18 @@ from engine.studio.models import (
     WritersRoomTurnProposal,
     WritersRoomUtterance,
     StudioPausedError,
+    bind_explicit_prefix_cache_scope,
     bounded_thinking_config,
     call_gemini_with_transient_retry,
+    explicit_prefix_cache_scope,
+    get_active_explicit_prefix_cache_scope,
     is_candidate_build_aborted,
     is_real_genai_client,
+    resolve_explicit_cached_request,
 )
 
 from engine.studio.production_board import MAX_SPEC_RESETS, BoardScheduler, ProductionBoard
+from engine.studio.tool_registry import render_compact_tool_directory
 
 logger = logging.getLogger("CreativeWritersRoom")
 
@@ -186,6 +192,33 @@ COUNCIL_HIERARCHY: Dict[str, List[str]] = {
     lead["role"]: list(lead.get("subagents", []))
     for lead in CORE_COUNCIL_ROSTER
 }
+
+
+def _resolve_council_specialist(raw_role: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Resolves a Council specialist dictionary by exact (case-insensitive) role name in `SPECIALIST_ROSTER`."""
+    cleaned = str(raw_role or "").strip()
+    if not cleaned:
+        return None
+    lowered = cleaned.lower()
+    for spec in SPECIALIST_ROSTER:
+        if spec["role"].lower() == lowered:
+            return spec
+    return None
+
+
+def _parse_council_reroute(proposal: Any) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Extracts `(specialist_dict, handoff_reason)` from `proposal.route_to_council_role` (supporting
+    both `RoleName` + `routing_handoff_reason` and compact `RoleName: handoff reason` strings)."""
+    raw_val = str(getattr(proposal, "route_to_council_role", "") or "").strip()
+    explicit_reason = str(getattr(proposal, "routing_handoff_reason", "") or "").strip()
+    if not raw_val:
+        return None, explicit_reason
+    if ":" in raw_val:
+        role_part, inline_reason = raw_val.split(":", 1)
+        spec = _resolve_council_specialist(role_part.strip())
+        if spec is not None:
+            return spec, explicit_reason or inline_reason.strip()
+    return _resolve_council_specialist(raw_val), explicit_reason
 
 STUDIO_CRITICAL_DISCOURSE_CHARTER: str = (
     "STUDIO DISCOURSE, EXECUTIVE PRODUCER RESPECT & PRAGMATIC SLICE SCOPE CHARTER:\n"
@@ -819,6 +852,10 @@ class CreativeWritersRoom:
         schema_cls: Any,
         temperature: Optional[float] = None,
         parts: Optional[List[Any]] = None,
+        *,
+        cacheable_prefix: str = "",
+        dynamic_tail: str = "",
+        min_calls_before_create: int = 2,
     ) -> Any:
         """Invokes Gemini with structured JSON schema and high creative temperature, returning validated Pydantic instance.
         `parts` (e.g. proof images) are sent before the prompt text."""
@@ -836,16 +873,42 @@ class CreativeWritersRoom:
             if schema_name == "WritersRoomListenCheck"
             else (1024 if schema_name == "NoveltyJudgement" else 2048)
         )
+        tail_prompt = f"{prompt}{dynamic_tail}" if dynamic_tail else prompt
+        combined_prompt = f"{cacheable_prefix}{tail_prompt}" if cacheable_prefix else tail_prompt
+        unsplit_contents: Any = (list(parts) + [combined_prompt]) if parts else combined_prompt
+        if cacheable_prefix:
+            prefix_parts: List[Any] = (list(parts) + [cacheable_prefix]) if parts else [cacheable_prefix]
+            tail_parts: List[Any] = [tail_prompt]
+        elif parts:
+            prefix_parts = list(parts)
+            tail_parts = [tail_prompt]
+        elif dynamic_tail:
+            prefix_parts = [prompt]
+            tail_parts = [dynamic_tail]
+        else:
+            prefix_parts = []
+            tail_parts = [tail_prompt]
+        eff_contents, cached_name = resolve_explicit_cached_request(
+            self.client,
+            model=self.model_name,
+            prefix_parts=prefix_parts,
+            tail_parts=tail_parts,
+            unsplit_contents=unsplit_contents,
+            min_calls_before_create=min_calls_before_create,
+            display_name=f"council_{schema_name}",
+        )
+        gen_cfg = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=schema_cls,
+            temperature=effective_temp,
+            thinking_config=bounded_thinking_config(thinking_budget),
+            **({"cached_content": cached_name} if cached_name else {}),
+        )
         response = call_gemini_with_transient_retry(
             lambda: self.client.models.generate_content(
                 model=self.model_name,
-                contents=(list(parts) + [prompt]) if parts else prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=schema_cls,
-                    temperature=effective_temp,
-                    thinking_config=bounded_thinking_config(thinking_budget),
-                ),
+                contents=eff_contents,
+                config=gen_cfg,
             ),
             label=f"CreativeWritersRoom[{schema_name}]",
         )
@@ -1003,23 +1066,28 @@ class CreativeWritersRoom:
         )
         return " | ".join(parts)
 
-    def _format_bible_snapshot(self, game_bible: GameBibleSpec) -> str:
-        recent_turns = game_bible.writers_room_transcript[-6:]
+    def _format_bible_snapshot(self, game_bible: GameBibleSpec, *, compact_for_review: bool = False) -> str:
+        recent_turns = game_bible.writers_room_transcript[(-3 if compact_for_review else -6):]
         transcript_text = "\n".join(
-            f"  [Turn {u.turn_index}] {u.speaker_display_name} ({u.speaker_role}): {u.spoken_dialogue}"
+            f"  [Turn {u.turn_index}] {u.speaker_display_name} ({u.speaker_role}): "
+            f"{(u.spoken_dialogue[:480] + '...') if (compact_for_review and len(u.spoken_dialogue or '') > 480) else u.spoken_dialogue}"
             for u in recent_turns
         ) or "  (Room just opened)"
         chars = game_bible.narrative_bible.characters if game_bible.narrative_bible else []
         char_names = [f"{c.name} [character_id={c.character_id}, role={c.role}]" for c in chars]
         beats = [f"Beat {b.beat_index}: {b.phase_title} ({b.player_emotional_state})" for b in game_bible.experience_storyboard]
         mockups = [f"{m.title} ({m.image_path})" for m in game_bible.visual_mockups]
+        all_eng_specs = list(getattr(game_bible, "technical_architecture_blueprint", []) or [])
+        shown_eng_specs = all_eng_specs[-10:] if compact_for_review else all_eng_specs
         eng_specs = [
             f"{e.mechanic_id} ({e.title}) -> nodes={e.godot_node_and_collider_architecture[:80]}, assets={e.required_sprite_and_tile_assets}"
-            for e in getattr(game_bible, "technical_architecture_blueprint", [])
+            for e in shown_eng_specs
         ]
+        all_slices = list(getattr(game_bible, "slice_roadmap", []) or [])
+        shown_slices = all_slices[-4:] if compact_for_review else all_slices
         slice_summaries = [
             f"[{s.slice_id} idx={s.slice_index} status={s.status}] '{s.title}': objective={s.slice_objective[:120]} | focus={s.player_acclimation_and_mechanics_focus[:120]}"
-            for s in getattr(game_bible, "slice_roadmap", [])
+            for s in shown_slices
         ]
         active_slice = game_bible.get_active_slice() if hasattr(game_bible, "get_active_slice") else None
         active_slice_str = (
@@ -1391,8 +1459,6 @@ class CreativeWritersRoom:
             for prop in proposal.backlog_additions:  # level maps all rewrite the shared layout file: serialise them
                 if prop.kind == "level_map" and "level_layout.json" not in prop.target_modules:
                     prop.target_modules.append("level_layout.json")
-                elif prop.kind in ("visual_asset", "animation", "audio_asset"):
-                    prop.target_modules = [m for m in prop.target_modules if not str(m).endswith(".gd")]
             added = self.board.add_items(
                 proposal.backlog_additions,
                 raised_by_role=speaker_role,
@@ -1451,6 +1517,23 @@ class CreativeWritersRoom:
                 },
             )
 
+        routed_spec, handoff_reason = _parse_council_reroute(proposal)
+        effective_addressed_to = list(proposal.addressed_to or [])
+        if routed_spec is not None and routed_spec["role"] != speaker_role:
+            routed_role = routed_spec["role"]
+            effective_addressed_to = [routed_role] + [r for r in effective_addressed_to if r != routed_role]
+            updates_summary.append(f"routed_to:{routed_role}")
+            self._emit_event(
+                "council_role_rerouted",
+                {
+                    "deliberation": proposal.deliberation,
+                    "reasoning_rationale": proposal.deliberation,
+                    "from_role": speaker_role,
+                    "to_role": routed_role,
+                    "handoff_reason": handoff_reason,
+                },
+            )
+
         if self.board is not None and updates_summary:
             self.board.note_design_revision()
 
@@ -1460,7 +1543,7 @@ class CreativeWritersRoom:
             speaker_role=speaker_role,
             speaker_display_name=speaker_display_name,
             spoken_dialogue=proposal.spoken_dialogue,
-            addressed_to=proposal.addressed_to,
+            addressed_to=effective_addressed_to,
             bible_updates_summary=updates_summary,
         )
         game_bible.writers_room_transcript.append(utterance)
@@ -1533,6 +1616,8 @@ class CreativeWritersRoom:
         extra_context_block: str = "",
         require_backlog_addition: bool = False,
         extra_multimodal_parts: Optional[List[Any]] = None,
+        allow_council_reroute_handoff: bool = False,
+        visited_council_roles: Optional[set[str]] = None,
     ) -> WritersRoomTurnProposal:
         """Executes the chosen specialist's turn to speak to the room and update the Living Game Bible."""
         role = specialist["role"]
@@ -1679,6 +1764,7 @@ class CreativeWritersRoom:
             f"restatements of earlier speakers, and never recite raw telemetry floats—while treating any Executive Producer message with full respect and catering directly "
             f"to what they asked for. Keep Production Board tasks focused on covering the active slice's scope cleanly rather than trying to build everything at once. "
             f"Leave `memory_note` empty (`''`) on routine turns—never duplicate Game Bible updates or ordinary dialogue points into `memory_note`; use it ONLY when deferring an out-of-slice goal or recording a non-obvious cross-slice constraint. "
+            f"DYNAMIC PEER ROUTING (`route_to_council_role`): If an issue, Steering directive, or design/engineering question belongs primarily to another Council specialist's domain—or needs a direct follow-up turn from another Council role (`GameplayDesigner`, `StoryWorldArchitect`, `VisualArtDirector`, `LevelAndProgressionDesigner`, `GameplaySystemsEngineer`, `ScriptwriterAgent`, `CharacterDesigner`, `UXExperienceDesigner`, `AudioAtmosphereDesigner`) to author their Bible fields or domain tasks—set `route_to_council_role` to that exact role name and specify what they should handle in `routing_handoff_reason`. "
             f"Call out specific colleagues or Sub-Agents in `addressed_to`, and provide `deliberation` FIRST."
         )
         turn_schema = WritersRoomTurnProposal.for_role(role) if is_real_genai_client(self.client) else WritersRoomTurnProposal
@@ -1704,16 +1790,19 @@ class CreativeWritersRoom:
                     candidate_dir=eff_mem_dir,
                 )
             return self._call_structured_llm(full_no_board_prompt, turn_schema)
+        tool_dir_block = render_compact_tool_directory(layer="council")
         board_block = (
             f"{self.board.snapshot_text()}\n"
+            f"{tool_dir_block}\n"
             f"BUILD BACKLOG (ACTIVE SLICE — COUNCIL TASK SHAPING, ENRICHMENT & DECOMPOSITION):\n"
             f"Before tasks are built by workers, the Council shapes what is needed so the team builds a cohesive, playable game rather than disconnected subsystems.\n"
             f"1. INSPECT EXISTING TASKS ON THE PRODUCTION BOARD (`backlog_refinements`):\n"
             f"   - Review every unstarted (`ready` or `blocked`) item currently on the Production Board from your specialist perspective.\n"
             f"   - ENRICH (`action='enrich'`): If an existing task needs direction from your domain—such as how it connects to the world/levels, what shared data contracts or node structures it must expose, how the player discovers and interacts with it in the HUD/UI without overlapping panels, or which visual rigs/audio cues it should bind—add a `WorkItemRefinement` in `backlog_refinements` with `action='enrich'`, `spec_addition_or_rewrite`, and any prerequisite `add_depends_on`.\n"
             f"   - SPLIT (`action='split'`): If an existing task is too monolithic (for example, bundling core simulation physics, player placement/building tools, world progression, and HUD into one giant script task, or bundling multiple distinct rigs into one asset task), decompose it via `WorkItemRefinement` with `action='split'` and `split_items=[...]` into focused, dependency-linked tasks! Any downstream tasks on the board that depended on the original task will automatically re-point to the split tasks.\n"
-            f"2. RAISE NEW OR COMPANION TASKS (`backlog_additions`):\n"
+            f"2. RAISE NEW, DISCOVERY, OR COMPANION TASKS (`backlog_additions`):\n"
             f"   - Raise `backlog_additions` needed for the ACTIVE SLICE so Slice 0 ships as a complete, cohesive playable vertical slice (world/level traversal with proper camera tracking, core gameplay loop, empathetic new-player onboarding/HUD consolidated on a single authoritative CanvasLayer, visual assets/surfaces, and audio).\n"
+            f"   - Whenever you want a read-only perceptual or architectural investigation before or alongside implementation (e.g., 1:1 sprite/sheet inspection, acoustic evaluation, codebase/signal inspection, or exploratory viewport diagnosis), you can raise a lock-free `kind='discovery'` task and list it in `depends_on` for downstream build tasks.\n"
             f"HYBRID PROCEDURAL + GENERATED ASSETS: Do NOT settle for flat untextured `Polygon2D` slabs or bare programmer-art `Line2D` strokes! "
             f"Raise `visual_asset` tasks (`tile_surface` seamless textures for procedural `Polygon2D`/`Line2D` terrain/conduits, environmental decals/landmarks, "
             f"and `sprite_sheet`/`articulated_parts` rigs for characters and interactive structures) alongside procedural shaders and particles.\n"
@@ -1734,11 +1823,20 @@ class CreativeWritersRoom:
 
         def _validate(p: WritersRoomTurnProposal) -> List[str]:
             issues: List[str] = []
-            if require_backlog_addition and not p.backlog_additions:
+            routed_spec, _ = _parse_council_reroute(p)
+            valid_handoff = bool(
+                allow_council_reroute_handoff
+                and routed_spec is not None
+                and routed_spec["role"] != role
+                and routed_spec["role"] not in (visited_council_roles or set())
+            )
+            has_board_action = bool(p.backlog_additions or getattr(p, "backlog_refinements", None))
+            if require_backlog_addition and not has_board_action and not valid_handoff:
                 issues.append(
-                    "The Executive Producer reported a live issue or steering directive on a drained Production Board; "
-                    "you MUST populate `backlog_additions` with at least one concrete `WorkItemProposal` (`integration`, `mechanic_code`, or `ui`) "
-                    "targeting the responsible script(s) so the worker pool executes the fix."
+                    "The Executive Producer reported a live issue or steering directive on a Production Board requiring action; "
+                    "you MUST either populate `backlog_additions` / `backlog_refinements` with at least one concrete Production Board "
+                    "task (`integration`, `mechanic_code`, `ui`, `visual_asset`, `audio_asset`, `level_map`, or `discovery`), OR set "
+                    "`route_to_council_role` to an unvisited Council colleague whose domain owns creating that task."
                 )
             if p.backlog_additions:
                 issues.extend(self.board.validate_proposals(p.backlog_additions))
@@ -1789,6 +1887,8 @@ class CreativeWritersRoom:
         and any autonomous specialists engaged by the Task Lead on the latest revision.
         All panelists must unanimously approve for the item to pass review."""
         primary = cls._reviewer_for(item)
+        if item.kind == "discovery":
+            return [primary] if primary else ["CreativeDirector"]
         if item.kind in ("mechanic_code", "ui", "integration"):
             panel = [primary, "GameplayDesigner", "UXExperienceDesigner", "VisualArtDirector"]
         elif item.kind == "level_map":
@@ -1923,6 +2023,23 @@ class CreativeWritersRoom:
                 parts.append(types.Part.from_bytes(data=path.read_bytes(), mime_type=mime, media_resolution=media_res))
             else:
                 parts.append(types.Part.from_bytes(data=path.read_bytes(), mime_type=mime))
+            if is_filmstrip:
+                fullres_kf = path.with_name(f"{path.stem}.keyframe_fullres.png")
+                if fullres_kf.is_file():
+                    parts.append(
+                        f"FULL-RESOLUTION 1:1 KEYFRAME (native viewport pixels, final tick of {path.name}) for item '{item.item_id}' "
+                        "[inspect HUD icons, character portraits, text legibility, world sprites, and shader/tile seams at 1:1 fidelity]:"
+                    )
+                    if media_res is not None:
+                        parts.append(
+                            types.Part.from_bytes(
+                                data=fullres_kf.read_bytes(),
+                                mime_type="image/png",
+                                media_resolution=media_res,
+                            )
+                        )
+                    else:
+                        parts.append(types.Part.from_bytes(data=fullres_kf.read_bytes(), mime_type="image/png"))
         for ap in audio_paths[-2:]:
             a_mime = AUDIO_MIME_BY_SUFFIX[ap.suffix.lower()]
             parts.append(
@@ -2021,6 +2138,8 @@ class CreativeWritersRoom:
                 "Characters, avatars, creatures, and interactive world structures MUST bind actual fabricated sprites or articulated rigs from `res://assets/sprites/*.png` "
                 "and be coherently layered into the environment (not crudely pasted on top of each other, and never duplicated across overlapping scripts). Immediately `request_changes` if a `level_map`, `mechanic_code`, "
                 "or `integration` proof renders untextured flat polygons, bare programmer-art lines, duplicate overlapping structures, or primitive `draw_circle`/`draw_rect` stickmen/boxes. "
+                "When a FULL-RESOLUTION 1:1 KEYFRAME is attached alongside a filmstrip, closely inspect every HUD icon, portrait frame, world sprite, and shader surface at 1:1 resolution for flat 16-color geometric placeholder polygons, "
+                "squished/anamorphic or corner-clipped sprite slices, or unblended tile grid seams—if a broken `.png` asset or `.gd` consumer lies outside `target_modules`, emit atomic in-place `visual_asset` / `mechanic_code` proposals in `spawned_prerequisite_tasks` so it is repaired rather than ignored! "
                 "IMPORTANT: In `plate_*.png` and `anim_sheet_*.png` / `anim_rig_*.png`, the dark/light square checkerboard grids, cyan bounding-box borders, and horizontal yellow/gold "
                 "baseline ruler lines at the bottom of frames are external QA test-harness overlays drawn behind/around the transparent PNG—NEVER flag the QA checkerboard, cyan border, "
                 "or yellow baseline guide line as a sprite artifact! Likewise, do NOT flag the external QA contact-sheet header/footer strips ('[QA] tick ...', '[QA] pos=...') outside each 16:9 frame as in-game text.\n"
@@ -2038,6 +2157,100 @@ class CreativeWritersRoom:
             )
         return ""
 
+    def _build_shared_review_parts(
+        self,
+        review_items: List[Any],
+        game_bible: GameBibleSpec,
+        candidate_dir: Optional[Path],
+        *,
+        include_concept_mockup: bool,
+        frozen_bible_snapshot: Optional[str] = None,
+    ) -> List[Any]:
+        """Builds the byte-0 invariant text + multimodal prefix shared across all Council panelists in a review round.
+        Places the large contiguous UTF-8 text block (`shared_review_context`) strictly FIRST at `parts[0]` ahead of
+        binary proof/mockup `Part`s to maximize Gemini implicit prefix caching across back-to-back panelist calls."""
+        from engine.studio.context_curator import ContextCuratorAgent, is_real_genai_client
+
+        media_parts: List[Any] = []
+        if include_concept_mockup:
+            media_parts.extend(self._concept_mockup_parts(game_bible, candidate_dir))
+        seen_item_ids: set[str] = set()
+        for it in review_items:
+            iid = str(getattr(it, "item_id", "") or "")
+            if iid and iid in seen_item_ids:
+                continue
+            if iid:
+                seen_item_ids.add(iid)
+            media_parts.extend(self._proof_parts(it, candidate_dir))
+
+        on_disk_sprites_block = ""
+        curated_review_block = ""
+        if candidate_dir is not None:
+            try:
+                from engine.studio.workers import _summarize_cartridge_for_qa
+
+                qa_sum = _summarize_cartridge_for_qa(Path(candidate_dir), max_chars=2500)
+                if qa_sum:
+                    on_disk_sprites_block = (
+                        "CARTRIDGE MODULES, BOUND ASSETS & ON-DISK ASSET LIBRARY (`bound_assets` shows which `res://assets/...` files each `.gd` script actually loads):\n"
+                        f"{qa_sum}\n\n"
+                    )
+            except Exception:
+                pass
+            if is_real_genai_client(self.client):
+                first_item = review_items[0] if review_items else None
+                review_req = "\n".join(
+                    f"[{it.item_id}] ({it.kind}) {it.title}: {it.spec} | proof: {it.proof_spec}"
+                    for it in review_items
+                )
+                curator = ContextCuratorAgent(
+                    cartridge_dir=Path(candidate_dir),
+                    client=self.client,
+                    model_name=self.model_name,
+                    board=self.board,
+                    game_bible=game_bible,
+                    event_callback=self.event_callback,
+                )
+                pack = curator.curate_context(
+                    target_agent_role="council_reviewer",
+                    task_request=review_req,
+                    item_id=(first_item.item_id if first_item is not None else "review_batch"),
+                    item_kind=(first_item.kind if first_item is not None else "review"),
+                )
+                curated_review_block = f"{pack.prompt_block}\n"
+
+        board_review_snapshot = ""
+        if self.board is not None and hasattr(self.board, "snapshot_text"):
+            try:
+                board_review_snapshot = (
+                    "FULL PRODUCTION BOARD STATE (inspect all active, changes_requested, blocked, and approved tasks and their `mods` before attributing defects):\n"
+                    f"{self.board.snapshot_text(limit_chars=4500)}\n\n"
+                )
+            except Exception:
+                pass
+        bible_snap_str = (
+            frozen_bible_snapshot
+            if frozen_bible_snapshot is not None
+            else self._format_bible_snapshot(game_bible, compact_for_review=True)
+        )
+        cross_task_triage_guide = (
+            "CROSS-TASK ROOT-CAUSE ATTRIBUTION & SCOPE ISOLATION (PREVENTING MULTI-TASK PING-PONG):\n"
+            "- Before writing `feedback` on an item, check `FULL PRODUCTION BOARD STATE` above to see whether any visual or behavioral defect visible in the proof belongs to THIS item's core responsibility (`target_modules`) OR to a shared/external subsystem (e.g. a shared camera controller, world backdrop/scene generator, or hub script) owned by another task.\n"
+            "- NEVER instruct multiple downstream mechanic/feature tasks to directly patch the same shared camera, scene, or backdrop script in parallel (which causes workers to overwrite each other and burn revision attempts)!\n"
+            "- Instead, when a proof fails partly or wholly because of a defect in a shared/external module outside this item's primary module:\n"
+            "  1. If an unapproved task on the board (`in_progress`, `changes_requested`, `ready`, or `blocked`) ALREADY owns that shared module, add its `item_id` to `blocked_by_item_ids`, list the shared module path(s) in `out_of_scope_modules_to_prune`, and write `feedback` telling this item what remains in its own module once the blocker finishes.\n"
+            "  2. If the task that originally built that shared module is already `approved` (or no open task owns fixing the shared bug), populate `spawned_prerequisite_tasks` with a focused `WorkItemProposal` targeting that shared module (and set `blocks_items` to include all affected open tasks on the board), and list the shared module path(s) in `out_of_scope_modules_to_prune` so this item is cleanly blocked on the dedicated fix without losing a revision attempt.\n\n"
+        )
+        shared_review_context = (
+            f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n\n"
+            f"{cross_task_triage_guide}"
+            f"{board_review_snapshot}"
+            f"{on_disk_sprites_block}"
+            f"{curated_review_block}"
+            f"{bible_snap_str}\n"
+        )
+        return [shared_review_context] + media_parts
+
     def _review_as(
         self,
         role: str,
@@ -2048,17 +2261,28 @@ class CreativeWritersRoom:
         candidate_dir: Optional[Path],
         prior_roundtable_notes: Optional[List[str]] = None,
         frozen_bible_snapshot: Optional[str] = None,
+        shared_round_parts: Optional[List[Any]] = None,
+        *,
+        _eager_explicit_cache: bool = False,
     ) -> ReviewBatch:
+        from engine.studio.context_curator import is_real_genai_client
+
         spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == role), None)
         who = f"the {spec['display_name']} ({role})" if spec else "the Creative Director"
-        parts: List[Any] = []
-        if role == "VisualArtDirector" or any(
-            it.kind in ("level_map", "ui", "integration", "visual_asset", "animation")
-            for it in awaiting + deciding
-        ):
-            parts.extend(self._concept_mockup_parts(game_bible, candidate_dir))
-        for it in awaiting + deciding:
-            parts.extend(self._proof_parts(it, candidate_dir))
+        if shared_round_parts is not None:
+            parts = list(shared_round_parts)
+        else:
+            include_mockup = role == "VisualArtDirector" or any(
+                it.kind in ("level_map", "ui", "integration", "visual_asset", "animation")
+                for it in awaiting + deciding
+            )
+            parts = self._build_shared_review_parts(
+                awaiting + deciding,
+                game_bible,
+                candidate_dir,
+                include_concept_mockup=include_mockup,
+                frozen_bible_snapshot=frozen_bible_snapshot,
+            )
         awaiting_ids = {i.item_id for i in awaiting}
         deciding_ids = {i.item_id for i in deciding}
         by_id = {i.item_id: i for i in awaiting + deciding}
@@ -2075,56 +2299,6 @@ class CreativeWritersRoom:
             "  * SYSTEMIC INVARIANTS OVER COORDINATE POINT-PATCHES: Treat any `(x, y)` coordinate, tick, or angle in `[QA]` telemetry strictly as a diagnostic sample showing WHERE a general game rule broke—NEVER as the boundary of the fix! Never write `feedback` (or `replacement_spec` / `spawned_prerequisite_tasks`) instructing production code to whitelist a specific `(x, y)` coordinate/bounding box or hardcode aiming/targeting toward a fixed coordinate; instead, diagnose the underlying systemic mismatch (e.g., UI/cursor validation disagreeing with authoritative world geometry across regions, or entity targeting/orientation not driven by player controls/state) so the mechanic works everywhere in the world.\n"
             "  * VISUAL & UI INTEGRITY: Inspect every frame from Frame 1 to the final frame. If active subjects drift off-screen, if world indicators are detached from their sprites, or if HUD panels/labels overlap or collide with each other, you MUST `request_changes`!\n\n"
         )
-        on_disk_sprites_block = ""
-        curated_review_block = ""
-        if candidate_dir is not None:
-            try:
-                from engine.studio.workers import _summarize_cartridge_for_qa
-                qa_sum = _summarize_cartridge_for_qa(Path(candidate_dir), max_chars=2500)
-                if qa_sum:
-                    on_disk_sprites_block = (
-                        "CARTRIDGE MODULES, BOUND ASSETS & ON-DISK ASSET LIBRARY (`bound_assets` shows which `res://assets/...` files each `.gd` script actually loads):\n"
-                        f"{qa_sum}\n\n"
-                    )
-            except Exception:
-                pass
-            from engine.studio.context_curator import ContextCuratorAgent, is_real_genai_client
-            if is_real_genai_client(self.client):
-                review_items = awaiting + deciding
-                first_item = review_items[0] if review_items else None
-                review_req = "\n".join(
-                    f"[{it.item_id}] ({it.kind}) {it.title}: {it.spec} | proof: {it.proof_spec}"
-                    for it in review_items
-                )
-                curator = ContextCuratorAgent(
-                    cartridge_dir=Path(candidate_dir),
-                    client=self.client,
-                    model_name=self.model_name,
-                    board=self.board,
-                    game_bible=game_bible,
-                    event_callback=self.event_callback,
-                )
-                pack = curator.curate_context(
-                    target_agent_role=f"council_reviewer:{role}",
-                    task_request=review_req,
-                    item_id=(first_item.item_id if first_item is not None else "review_batch"),
-                    item_kind=(first_item.kind if first_item is not None else "review"),
-                )
-                curated_review_block = f"{pack.prompt_block}\n"
-        board_review_snapshot = ""
-        if self.board is not None and hasattr(self.board, "snapshot_text"):
-            try:
-                board_review_snapshot = (
-                    "FULL PRODUCTION BOARD STATE (inspect all active, changes_requested, blocked, and approved tasks and their `mods` before attributing defects):\n"
-                    f"{self.board.snapshot_text(limit_chars=4500)}\n\n"
-                )
-            except Exception:
-                pass
-        bible_snap_str = (
-            frozen_bible_snapshot
-            if frozen_bible_snapshot is not None
-            else self._format_bible_snapshot(game_bible)
-        )
         eff_rev_dir = self._resolve_memory_dir(candidate_dir)
         rev_mem_block = ""
         if (
@@ -2137,22 +2311,6 @@ class CreativeWritersRoom:
             rev_mem_block = GameMemoryStore(
                 eff_rev_dir, event_callback=getattr(self, "event_callback", None)
             ).format_role_memory_briefing(role)
-        shared_review_context = (
-            f"{board_review_snapshot}"
-            f"{on_disk_sprites_block}"
-            f"{curated_review_block}"
-            f"{rev_mem_block}"
-            f"{bible_snap_str}\n"
-        )
-        parts.append(shared_review_context)
-        cross_task_triage_guide = (
-            "CROSS-TASK ROOT-CAUSE ATTRIBUTION & SCOPE ISOLATION (PREVENTING MULTI-TASK PING-PONG):\n"
-            "- Before writing `feedback` on an item, check `FULL PRODUCTION BOARD STATE` above to see whether any visual or behavioral defect visible in the proof belongs to THIS item's core responsibility (`target_modules`) OR to a shared/external subsystem (e.g. a shared camera controller, world backdrop/scene generator, or hub script) owned by another task.\n"
-            "- NEVER instruct multiple downstream mechanic/feature tasks to directly patch the same shared camera, scene, or backdrop script in parallel (which causes workers to overwrite each other and burn revision attempts)!\n"
-            "- Instead, when a proof fails partly or wholly because of a defect in a shared/external module outside this item's primary module:\n"
-            "  1. If an unapproved task on the board (`in_progress`, `changes_requested`, `ready`, or `blocked`) ALREADY owns that shared module, add its `item_id` to `blocked_by_item_ids`, list the shared module path(s) in `out_of_scope_modules_to_prune`, and write `feedback` telling this item what remains in its own module once the blocker finishes.\n"
-            "  2. If the task that originally built that shared module is already `approved` (or no open task owns fixing the shared bug), populate `spawned_prerequisite_tasks` with a focused `WorkItemProposal` targeting that shared module (and set `blocks_items` to include all affected open tasks on the board), and list the shared module path(s) in `out_of_scope_modules_to_prune` so this item is cleanly blocked on the dedicated fix without losing a revision attempt.\n\n"
-        )
         roundtable_block = ""
         if prior_roundtable_notes:
             roundtable_block = (
@@ -2162,10 +2320,9 @@ class CreativeWritersRoom:
             )
         prompt = (
             f"You are {who} reviewing work built by the implementation team for the game being designed.\n"
-            f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n\n"
             f"{mandate}"
             f"{filmstrip_guide}"
-            f"{cross_task_triage_guide}"
+            f"{rev_mem_block}"
             f"{roundtable_block}"
             f"ITEMS AWAITING YOUR REVIEW (proof images and Living Game Bible context are attached above):\n"
             + ("\n".join(self._format_item_for_review(i, candidate_dir=candidate_dir) for i in awaiting) or "  (none)")
@@ -2236,6 +2393,7 @@ class CreativeWritersRoom:
             parts=parts,
             caller_role=role,
             candidate_dir=eff_rev_dir,
+            min_calls_before_create=1 if _eager_explicit_cache else 2,
         )
 
     def _run_review_round(
@@ -2277,79 +2435,97 @@ class CreativeWritersRoom:
                     if pp and str(pp) not in round_proof_paths:
                         round_proof_paths.append(str(pp))
 
-        round_bible_snapshot = self._format_bible_snapshot(game_bible)
-        for idx_r, r in enumerate(roles):
-            batch = self._review_as(
-                r,
-                groups[r][0],
-                groups[r][1],
-                game_bible,
-                dna_summary,
-                candidate_dir,
-                prior_roundtable_notes=prior_roundtable_notes,
-                frozen_bible_snapshot=round_bible_snapshot,
-            )
-            batches.append(batch)
-            spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == r), None)
-            disp_name = spec["display_name"] if spec else r
-            verdict_bits = [
-                f"`{d.item_id}` -> **{d.verdict}**"
-                + (f" (criteria: {d.validation_criteria_for_my_role})" if getattr(d, "validation_criteria_for_my_role", "") else "")
-                + (f": {d.feedback}" if d.feedback else "")
-                for d in batch.review_decisions
-            ]
-            spoken_text = (batch.spoken_dialogue or "").strip()
-            if not spoken_text:
-                spoken_text = f"[Council Proof Review] {'; '.join(verdict_bits) if verdict_bits else batch.deliberation}"
-            prior_roundtable_notes.append(f"[{disp_name} ({r})]: {spoken_text} | Verdicts: {'; '.join(verdict_bits)}")
+        round_bible_snapshot = self._format_bible_snapshot(game_bible, compact_for_review=True)
+        include_round_mockup = ("VisualArtDirector" in roles) or any(
+            it.kind in ("level_map", "ui", "integration", "visual_asset", "animation")
+            for it in all_reviewed_items
+        )
+        shared_round_parts = self._build_shared_review_parts(
+            all_reviewed_items,
+            game_bible,
+            candidate_dir,
+            include_concept_mockup=include_round_mockup,
+            frozen_bible_snapshot=round_bible_snapshot,
+        )
+        round_cache_cm = explicit_prefix_cache_scope(self.client, ttl_seconds=300, reuse_outer=False)
+        round_cache_cm.__enter__()
+        try:
+            for idx_r, r in enumerate(roles):
+                batch = self._review_as(
+                    r,
+                    groups[r][0],
+                    groups[r][1],
+                    game_bible,
+                    dna_summary,
+                    candidate_dir,
+                    prior_roundtable_notes=prior_roundtable_notes,
+                    frozen_bible_snapshot=round_bible_snapshot,
+                    shared_round_parts=shared_round_parts,
+                    _eager_explicit_cache=(len(roles) >= 2),
+                )
+                batches.append(batch)
+                spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == r), None)
+                disp_name = spec["display_name"] if spec else r
+                verdict_bits = [
+                    f"`{d.item_id}` -> **{d.verdict}**"
+                    + (f" (criteria: {d.validation_criteria_for_my_role})" if getattr(d, "validation_criteria_for_my_role", "") else "")
+                    + (f": {d.feedback}" if d.feedback else "")
+                    for d in batch.review_decisions
+                ]
+                spoken_text = (batch.spoken_dialogue or "").strip()
+                if not spoken_text:
+                    spoken_text = f"[Council Proof Review] {'; '.join(verdict_bits) if verdict_bits else batch.deliberation}"
+                prior_roundtable_notes.append(f"[{disp_name} ({r})]: {spoken_text} | Verdicts: {'; '.join(verdict_bits)}")
 
-            turn_idx = len(game_bible.writers_room_transcript)
-            other_roles = [orole for orole in roles if orole != r] or ["CreativeDirector"]
-            addressed = [a for a in (batch.addressed_to or []) if a] or other_roles
-            updates_summary = [
-                f"review:{d.item_id}:{d.verdict}" for d in batch.review_decisions
-            ] + [
-                f"cap:{c.item_id}:{c.action}" for c in batch.cap_decisions
-            ]
-            attach_proofs = round_proof_paths if idx_r == 0 else []
-            art_emitted = (
-                {
-                    "type": "filmstrip",
-                    "path": round_proof_paths[0],
-                    "item_ids": [it.item_id for it in all_reviewed_items],
-                    "caption": f"Proof under Council Review: {', '.join(it.item_id for it in all_reviewed_items)}",
-                }
-                if idx_r == 0 and round_proof_paths
-                else None
-            )
-            rev_utt = WritersRoomUtterance(
-                deliberation=batch.deliberation,
-                utterance_id=f"utt_{turn_idx:02d}_{r}_review",
-                turn_index=turn_idx,
-                speaker_role=r,
-                speaker_display_name=disp_name,
-                spoken_dialogue=spoken_text,
-                addressed_to=addressed,
-                bible_updates_summary=updates_summary,
-                proof_image_paths=attach_proofs,
-                artifact_emitted=art_emitted,
-            )
-            game_bible.writers_room_transcript.append(rev_utt)
-            self._emit_event(
-                "writers_room_utterance",
-                {
-                    "deliberation": rev_utt.deliberation,
-                    "utterance_id": rev_utt.utterance_id,
-                    "turn_index": rev_utt.turn_index,
-                    "speaker_role": rev_utt.speaker_role,
-                    "speaker_display_name": rev_utt.speaker_display_name,
-                    "spoken_dialogue": rev_utt.spoken_dialogue,
-                    "addressed_to": rev_utt.addressed_to,
-                    "bible_updates_summary": rev_utt.bible_updates_summary,
-                    "proof_image_paths": rev_utt.proof_image_paths,
-                    "artifact_emitted": rev_utt.artifact_emitted,
-                },
-            )
+                turn_idx = len(game_bible.writers_room_transcript)
+                other_roles = [orole for orole in roles if orole != r] or ["CreativeDirector"]
+                addressed = [a for a in (batch.addressed_to or []) if a] or other_roles
+                updates_summary = [
+                    f"review:{d.item_id}:{d.verdict}" for d in batch.review_decisions
+                ] + [
+                    f"cap:{c.item_id}:{c.action}" for c in batch.cap_decisions
+                ]
+                attach_proofs = round_proof_paths if idx_r == 0 else []
+                art_emitted = (
+                    {
+                        "type": "filmstrip",
+                        "path": round_proof_paths[0],
+                        "item_ids": [it.item_id for it in all_reviewed_items],
+                        "caption": f"Proof under Council Review: {', '.join(it.item_id for it in all_reviewed_items)}",
+                    }
+                    if idx_r == 0 and round_proof_paths
+                    else None
+                )
+                rev_utt = WritersRoomUtterance(
+                    deliberation=batch.deliberation,
+                    utterance_id=f"utt_{turn_idx:02d}_{r}_review",
+                    turn_index=turn_idx,
+                    speaker_role=r,
+                    speaker_display_name=disp_name,
+                    spoken_dialogue=spoken_text,
+                    addressed_to=addressed,
+                    bible_updates_summary=updates_summary,
+                    proof_image_paths=attach_proofs,
+                    artifact_emitted=art_emitted,
+                )
+                game_bible.writers_room_transcript.append(rev_utt)
+                self._emit_event(
+                    "writers_room_utterance",
+                    {
+                        "deliberation": rev_utt.deliberation,
+                        "utterance_id": rev_utt.utterance_id,
+                        "turn_index": rev_utt.turn_index,
+                        "speaker_role": rev_utt.speaker_role,
+                        "speaker_display_name": rev_utt.speaker_display_name,
+                        "spoken_dialogue": rev_utt.spoken_dialogue,
+                        "addressed_to": rev_utt.addressed_to,
+                        "bible_updates_summary": rev_utt.bible_updates_summary,
+                        "proof_image_paths": rev_utt.proof_image_paths,
+                        "artifact_emitted": rev_utt.artifact_emitted,
+                    },
+                )
+        finally:
+            round_cache_cm.__exit__(None, None, None)
         decisions_by_item: Dict[str, List[Tuple[str, ReviewDecision]]] = {}
         applied = 0
         for role, batch in zip(roles, batches):
@@ -2504,6 +2680,170 @@ class CreativeWritersRoom:
         self._check_aborted(candidate_dir)
         return max(0.0, time.monotonic() - t0)
 
+    def _run_council_diagnostic_probe(
+        self,
+        candidate_dir: Path,
+        diag_probe: CouncilDiagnosticProbe,
+        title_hint: str,
+    ) -> Tuple[str, List[Any]]:
+        """Executes a read-only/diagnostic Council probe via ANY of the 5 Specialist Personas
+        (`visual_artist`, `audio_designer`, `script_writer`, `swe_engineer`, `qa_test_engineer`),
+        following up to 2 cycle-safe peer re-route hops if the probed specialist realizes another
+        domain specialist is better suited to inspect."""
+        from engine.studio.models import WorkItem
+        from engine.studio.tool_registry import CANONICAL_SPECIALIST_PERSONAS, normalize_specialist_persona
+        from engine.studio.workers import (
+            WorkerContext,
+            run_audio_designer_specialist,
+            run_qa_test_engineer_specialist,
+            run_script_writer_specialist,
+            run_swe_engineer_specialist,
+            run_visual_artist_specialist,
+        )
+
+        initial_brief = diag_probe.effective_brief
+        if not initial_brief:
+            return "", []
+        current_persona = normalize_specialist_persona(diag_probe.specialist_agent or "qa_test_engineer")
+        current_brief = initial_brief
+        current_targets: Optional[List[str]] = list(diag_probe.target_paths) if diag_probe.target_paths else None
+
+        swe_agent_ref = None
+        if self.scheduler is not None:
+            for h_fn in (getattr(self.scheduler, "handlers", None) or {}).values():
+                w_ctx = getattr(h_fn, "_worker_ctx", None)
+                if w_ctx is not None and getattr(w_ctx, "swe_agent", None) is not None:
+                    swe_agent_ref = w_ctx.swe_agent
+                    break
+
+        diag_ctx = WorkerContext(
+            cartridge_dir=Path(candidate_dir),
+            client=self.client,
+            model_name=self.model_name,
+            swe_agent=swe_agent_ref,
+            board=self.board,
+            event_callback=self.event_callback,
+        )
+
+        max_probe_hops = 2
+        visited_personas: set[str] = set()
+        probe_sections: List[str] = []
+        probe_parts: List[Any] = []
+
+        for hop_idx in range(max_probe_hops + 1):
+            visited_personas.add(current_persona)
+            if current_persona == "swe_engineer" and diag_ctx.swe_agent is None:
+                from engine.studio.swe import LeadGameplaySWEAgent
+
+                diag_ctx.swe_agent = LeadGameplaySWEAgent(
+                    client=self.client,
+                    model_name=self.model_name,
+                )
+
+            self._emit_activity(
+                agent_role="CouncilTable",
+                status_text=(
+                    f"Running Council diagnostic probe via `{current_persona}`"
+                    + (f" (reroute hop #{hop_idx})" if hop_idx > 0 else "")
+                    + f" to investigate '{title_hint[:70]}'..."
+                ),
+                active_agents=["CouncilTable", current_persona],
+                phase="steering_diagnostic",
+            )
+            diag_item = WorkItem(
+                deliberation=diag_probe.deliberation,
+                item_id=f"council_diag_{hop_idx}",
+                kind="discovery",
+                title=f"Diagnostic investigation: {title_hint[:80]}",
+                spec=current_brief,
+                proof_spec=current_brief,
+                target_modules=list(current_targets or ["main.gd"]),
+            )
+            if current_persona == "visual_artist":
+                diag_report = run_visual_artist_specialist(
+                    diag_ctx,
+                    diag_item,
+                    brief=current_brief,
+                    target_paths=current_targets,
+                    _read_only_probe=True,
+                )
+            elif current_persona == "audio_designer":
+                diag_report = run_audio_designer_specialist(
+                    diag_ctx,
+                    diag_item,
+                    brief=current_brief,
+                    target_paths=current_targets,
+                    _force_operation="inspect",
+                )
+            elif current_persona == "script_writer":
+                diag_report = run_script_writer_specialist(
+                    diag_ctx,
+                    diag_item,
+                    brief=current_brief,
+                    target_paths=current_targets,
+                    _force_operation="inspect_only",
+                )
+            elif current_persona == "swe_engineer":
+                diag_report = run_swe_engineer_specialist(
+                    diag_ctx,
+                    diag_item,
+                    brief=current_brief,
+                    target_paths=current_targets,
+                    _inspect_only=True,
+                )
+            else:
+                diag_report = run_qa_test_engineer_specialist(
+                    diag_ctx,
+                    diag_item,
+                    brief=f"[COUNCIL DIAGNOSTIC TEST SCENE REQUEST]:\n{current_brief}",
+                    target_paths=current_targets,
+                )
+
+            for p_img in (diag_report.proof_images or [])[-2:]:
+                p_path = Path(p_img)
+                if p_path.is_file() and p_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
+                    img_part = self._load_image_part(p_path)
+                    if img_part is not None:
+                        probe_parts.append(f"COUNCIL DIAGNOSTIC PROBE PLATE ({current_persona} — {p_path.name}):")
+                        probe_parts.append(img_part)
+
+            probe_sections.append(
+                f"--- Probe Leg #{hop_idx + 1} (`{current_persona}`) ---\n"
+                f"Specialist Summary & Findings: {diag_report.summary}\n"
+                f"Diagnostic Proof Paths: {diag_report.proof_images}"
+            )
+
+            raw_reroute = str(getattr(diag_report, "reroute_to_specialist", "") or "").strip()
+            if not raw_reroute or hop_idx >= max_probe_hops:
+                break
+            next_persona = normalize_specialist_persona(raw_reroute)
+            if next_persona not in CANONICAL_SPECIALIST_PERSONAS or next_persona in visited_personas:
+                break
+            next_brief = str(getattr(diag_report, "reroute_brief", "") or "").strip() or current_brief
+            next_targets = list(getattr(diag_report, "reroute_target_paths", None) or current_targets or []) or None
+            self._emit_event(
+                "council_diagnostic_probe_rerouted",
+                {
+                    "deliberation": diag_report.deliberation,
+                    "reasoning_rationale": diag_report.deliberation,
+                    "from_specialist": current_persona,
+                    "to_specialist": next_persona,
+                    "reroute_brief": next_brief,
+                    "hop": hop_idx + 1,
+                },
+            )
+            current_persona = next_persona
+            current_brief = next_brief
+            current_targets = next_targets
+
+        probe_block = (
+            f"\n=== LIVE COUNCIL SPECIALIST DIAGNOSTIC PROBE ===\n"
+            f"Council Diagnostic Hypothesis: {diag_probe.deliberation}\n"
+            + "\n".join(probe_sections)
+            + "\n"
+        )
+        return probe_block, probe_parts
+
     def _execute_steering_pivot_turns(
         self,
         game_bible: GameBibleSpec,
@@ -2511,34 +2851,37 @@ class CreativeWritersRoom:
         candidate_dir: Optional[Path],
         steered_notes: List[str],
     ) -> None:
-        """Runs immediate CreativeDirector and GameplaySystemsEngineer turns to pivot the Game Bible and ProductionBoard
-        when live Executive Producer steering arrives during _drain_backlog."""
+        """Routes Executive Producer steering / build diagnostics dynamically across the Council roster
+        (and optional Specialist Persona diagnostic probes), allowing any speaker to hand the floor to
+        another Council specialist via `route_to_council_role`."""
+        from engine.studio.context_curator import (
+            ContextCuratorAgent,
+            compute_entrypoint_reachability,
+        )
+
         combined_steering = " | ".join(steered_notes)
         board_was_drained = bool(self.board is not None and self.board.is_drained())
         wish_context_block, wish_multimodal_parts = self._consume_pending_playtest_wishes(candidate_dir)
         curated_code_block = wish_context_block
-        if candidate_dir is not None and Path(candidate_dir).is_dir() and is_real_genai_client(self.client):
+        use_dynamic_steering_routing = bool(
+            is_real_genai_client(self.client) or getattr(self.client, "supports_steering_routing", False)
+        )
+        routing_plan: Optional[CouncilSteeringRoutingPlan] = None
+
+        if candidate_dir is not None and Path(candidate_dir).is_dir() and use_dynamic_steering_routing:
             try:
-                reach = compute_entrypoint_reachability(Path(candidate_dir))
-                curator = ContextCuratorAgent(
-                    cartridge_dir=Path(candidate_dir),
-                    client=self.client,
-                    model_name=self.model_name,
-                    board=self.board,
-                    game_bible=game_bible,
-                    event_callback=self.event_callback,
+                c_dir = Path(candidate_dir)
+                reach = compute_entrypoint_reachability(c_dir)
+                asset_dossier_txt, _, asset_sheet_part = self._build_asset_integrity_dossier_and_sheet(
+                    c_dir, "steering"
                 )
-                pack = curator.curate_context(
-                    target_agent_role="council_reviewer:GameplaySystemsEngineer",
-                    task_request=(
-                        f"Executive Producer Live Steering / Problem Report: {combined_steering}\n"
-                        f"Inspect the cartridge entrypoint (`run/main_scene`) and `.gd` scripts to identify the root cause "
-                        f"and raise/update the exact ProductionBoard task(s) needed to resolve it.\n"
-                        f"{reach.get('summary_text', '')}"
-                    ),
-                    item_id="executive_producer_steering",
-                    item_kind="integration",
-                )
+                if asset_sheet_part is not None:
+                    wish_multimodal_parts = list(wish_multimodal_parts or []) + [
+                        "CARTRIDGE VISUAL ASSET CONTACT SHEET FOR STEERING TRIAGE "
+                        "(inspect active in-game sprites vs `[UNREF]` orphaned files alongside the report):",
+                        asset_sheet_part,
+                    ]
+
                 recent_board_history = ""
                 if self.board is not None and hasattr(self.board, "items"):
                     try:
@@ -2562,103 +2905,177 @@ class CreativeWritersRoom:
                             )
                     except Exception:
                         pass
-                curated_code_block = (
-                    (f"{wish_context_block}\n\n" if wish_context_block else "")
-                    + f"=== CARTRIDGE CODEBASE & ENTRYPOINT CONTEXT FOR EXECUTIVE PRODUCER STEERING ===\n"
-                    f"{reach.get('summary_text', '')}\n"
-                    f"{recent_board_history}\n"
-                    f"{pack.prompt_block}\n"
+
+                roster_summary = "\n".join(
+                    f"  - `{sp['role']}` ({sp['display_name']}): {sp['focus']}"
+                    for sp in SPECIALIST_ROSTER
                 )
-                probe_prompt = (
-                    f"You are the GameplaySystemsEngineer evaluating an Executive Producer Live Steering / Problem Report:\n"
+                routing_prompt = (
+                    f"You are the Writers' Room Council Table routing an incoming Executive Producer Steering / Build Report:\n"
                     f"REPORT: {combined_steering}\n\n"
-                    f"{curated_code_block}\n"
-                    f"PRIOR-HYPOTHESIS FALSIFICATION & SYSTEMS THINKING:\n"
-                    f"- Check `RECENTLY EXECUTED PRODUCTION BOARD TASKS` above: if a prior task already attempted to fix this symptom and the Executive Producer reports the issue still happens, treat that prior hypothesis as FALSIFIED/INCOMPLETE!\n"
-                    f"- Consider the ENTIRE interacting scene: all active entities/nodes, how `Camera2D` computes its framing/target, and world colliders.\n"
-                    f"- Determine whether the full system-wide root cause is ALREADY 100% clear from the static code above (`needs_runtime_debug_scene = False`), OR whether you need `qa_test_engineer` to build and run a diagnostic test scene (`res://tests/test_council_diag.tscn`) with visual debug overlays and `get_state_snapshot()` telemetry first (`needs_runtime_debug_scene = True` and populate `diagnostic_qa_brief`).\n"
-                    f"Provide `deliberation` FIRST and `needs_runtime_debug_scene` LAST."
+                    f"AVAILABLE COUNCIL ROLES:\n{roster_summary}\n\n"
+                    f"{render_compact_tool_directory(layer='council')}\n\n"
+                    f"{wish_context_block}\n\n"
+                    f"ENTRYPOINT REACHABILITY:\n{reach.get('summary_text', '')}\n"
+                    f"{recent_board_history}\n"
+                    f"{asset_dossier_txt}\n"
+                    f"ROUTING & PRIOR-HYPOTHESIS FALSIFICATION INSTRUCTIONS:\n"
+                    f"1. Choose `lead_council_role` (the primary domain specialist in `AVAILABLE COUNCIL ROLES` best suited to diagnose and own this report) "
+                    f"and up to 3 `supporting_council_roles` whose domains are also affected (do NOT blindly route visual art, UX, audio, or narrative issues solely to `GameplaySystemsEngineer`).\n"
+                    f"2. Check `RECENTLY EXECUTED PRODUCTION BOARD TASKS`: if a prior task already attempted to fix this symptom and the issue persists, treat that prior hypothesis as FALSIFIED/INCOMPLETE.\n"
+                    f"3. Decide whether static context + asset contact sheet above are ALREADY sufficient (`needs_specialist_probe = False`), OR whether one of the 5 Execution Specialist Personas "
+                    f"(`visual_artist`, `audio_designer`, `script_writer`, `swe_engineer`, `qa_test_engineer`) should run a read-only diagnostic probe first (`needs_specialist_probe = True`, setting `specialist_probe_agent`, `diagnostic_brief`, and optional `target_paths`).\n"
+                    f"Provide `deliberation` FIRST and `needs_specialist_probe` LAST."
                 )
-                diag_probe = self._structured_with_validation(
-                    probe_prompt,
-                    CouncilDiagnosticProbe,
+                routing_plan = self._structured_with_validation(
+                    routing_prompt,
+                    CouncilSteeringRoutingPlan,
                     lambda p: (
-                        ["`diagnostic_qa_brief` must be non-empty when `needs_runtime_debug_scene=True`."]
-                        if p.needs_runtime_debug_scene and not p.diagnostic_qa_brief.strip()
+                        ["`lead_council_role` must match a valid role in `AVAILABLE COUNCIL ROLES`."]
+                        if _resolve_council_specialist(p.lead_council_role) is None
+                        else []
+                    )
+                    + (
+                        ["`diagnostic_brief` must be non-empty when `needs_specialist_probe=True`."]
+                        if p.needs_specialist_probe and not str(p.diagnostic_brief or "").strip()
                         else []
                     ),
+                    parts=wish_multimodal_parts or None,
+                    caller_role="CouncilTable",
+                    candidate_dir=c_dir,
                 )
-                if diag_probe.needs_runtime_debug_scene and diag_probe.diagnostic_qa_brief.strip():
-                    from engine.studio.models import WorkItem
-                    from engine.studio.workers import WorkerContext, run_qa_test_engineer_specialist
+                lead_spec = _resolve_council_specialist(routing_plan.lead_council_role)
+                lead_role_name = lead_spec["role"] if lead_spec is not None else "GameplaySystemsEngineer"
+                self._emit_event(
+                    "council_steering_routed",
+                    {
+                        "deliberation": routing_plan.deliberation,
+                        "reasoning_rationale": routing_plan.deliberation,
+                        "lead_council_role": lead_role_name,
+                        "supporting_council_roles": list(routing_plan.supporting_council_roles or []),
+                        "needs_specialist_probe": routing_plan.needs_specialist_probe,
+                        "specialist_probe_agent": routing_plan.specialist_probe_agent,
+                    },
+                )
 
-                    self._emit_activity(
-                        agent_role="GameplaySystemsEngineer",
-                        status_text="Running QA diagnostic test scene to isolate runtime cause of Executive Producer report...",
-                        active_agents=["GameplaySystemsEngineer", "qa_test_engineer"],
-                        phase="steering_diagnostic",
-                    )
-                    diag_ctx = WorkerContext(
-                        cartridge_dir=Path(candidate_dir),
+                pack_prompt_block = ""
+                if is_real_genai_client(self.client):
+                    curator = ContextCuratorAgent(
+                        cartridge_dir=c_dir,
                         client=self.client,
                         model_name=self.model_name,
                         board=self.board,
+                        game_bible=game_bible,
                         event_callback=self.event_callback,
                     )
-                    diag_item = WorkItem(
-                        deliberation=diag_probe.deliberation,
-                        item_id="council_diag",
-                        kind="ui",
-                        title=f"Diagnostic investigation: {combined_steering[:80]}",
-                        spec=diag_probe.diagnostic_qa_brief,
-                        proof_spec=diag_probe.diagnostic_qa_brief,
-                        target_modules=["main.gd"],
+                    pack = curator.curate_context(
+                        target_agent_role=f"council_reviewer:{lead_role_name}",
+                        task_request=(
+                            f"Executive Producer Live Steering / Problem Report: {combined_steering}\n"
+                            f"Council Routing Deliberation: {routing_plan.deliberation}\n"
+                            f"Inspect the cartridge entrypoint (`run/main_scene`), relevant `.gd` scripts, and asset references "
+                            f"to identify the root cause and raise/update the exact ProductionBoard task(s) needed to resolve it.\n"
+                            f"{reach.get('summary_text', '')}"
+                        ),
+                        item_id="executive_producer_steering",
+                        item_kind="integration",
                     )
-                    diag_report = run_qa_test_engineer_specialist(
-                        diag_ctx,
-                        diag_item,
-                        brief=f"[COUNCIL DIAGNOSTIC TEST SCENE REQUEST]:\n{diag_probe.diagnostic_qa_brief}",
+                    pack_prompt_block = pack.prompt_block
+                curated_code_block = (
+                    (f"{wish_context_block}\n\n" if wish_context_block else "")
+                    + f"=== CARTRIDGE CODEBASE, ASSET INVENTORY & ENTRYPOINT CONTEXT FOR STEERING ===\n"
+                    f"{reach.get('summary_text', '')}\n"
+                    f"{recent_board_history}\n"
+                    f"{asset_dossier_txt}\n"
+                    f"{pack_prompt_block}\n"
+                )
+                if routing_plan.needs_specialist_probe and str(routing_plan.diagnostic_brief or "").strip():
+                    diag_probe = CouncilDiagnosticProbe(
+                        deliberation=routing_plan.deliberation,
+                        specialist_agent=routing_plan.specialist_probe_agent or "qa_test_engineer",
+                        diagnostic_brief=routing_plan.diagnostic_brief,
+                        target_paths=list(routing_plan.target_paths or []),
+                        needs_runtime_debug_scene=True,
                     )
-                    curated_code_block += (
-                        f"\n=== LIVE QA DIAGNOSTIC TEST SCENE RESULTS & TELEMETRY ===\n"
-                        f"Council Diagnostic Hypothesis: {diag_probe.deliberation}\n"
-                        f"QA Diagnostic Summary & Telemetry: {diag_report.summary}\n"
-                        f"Diagnostic Filmstrip Path: {diag_report.proof_images}\n"
+                    probe_block, probe_parts = self._run_council_diagnostic_probe(
+                        c_dir,
+                        diag_probe,
+                        combined_steering,
                     )
+                    curated_code_block += probe_block
+                    if probe_parts:
+                        wish_multimodal_parts = list(wish_multimodal_parts or []) + probe_parts
             except Exception as cur_exc:
-                logger.warning("ContextCurator steering curation skipped: %s", cur_exc)
+                logger.warning("ContextCurator steering routing/curation skipped: %s", cur_exc)
 
-        pivot_roles = (
-            ("GameplayDesigner", "LevelAndProgressionDesigner", "VisualArtDirector", "UXExperienceDesigner", "GameplaySystemsEngineer")
-            if is_real_genai_client(self.client)
-            else ("CreativeDirector", "GameplaySystemsEngineer")
-        )
+        if use_dynamic_steering_routing and routing_plan is not None:
+            raw_queue = [routing_plan.lead_council_role] + list(routing_plan.supporting_council_roles or [])
+            pivot_queue: List[str] = []
+            for r_cand in raw_queue:
+                sp_cand = _resolve_council_specialist(r_cand)
+                if sp_cand is not None and sp_cand["role"] not in pivot_queue:
+                    pivot_queue.append(sp_cand["role"])
+            if not pivot_queue:
+                pivot_queue = ["GameplayDesigner", "VisualArtDirector", "GameplaySystemsEngineer"]
+        elif use_dynamic_steering_routing:
+            pivot_queue = [
+                "GameplayDesigner",
+                "LevelAndProgressionDesigner",
+                "VisualArtDirector",
+                "UXExperienceDesigner",
+                "GameplaySystemsEngineer",
+            ]
+        else:
+            pivot_queue = ["CreativeDirector", "GameplaySystemsEngineer"]
+
+        max_pivot_turns = 6
+        visited_roles: set[str] = set()
+        handoff_reasons: Dict[str, Tuple[str, str]] = {}
         items_before_steering = len(self.board.items()) if self.board is not None else 0
-        for idx_p, pivot_role in enumerate(pivot_roles):
-            spec = next((s for s in SPECIALIST_ROSTER if s["role"] == pivot_role), None)
-            if spec is None:
+        idx_q = 0
+        while idx_q < len(pivot_queue) and len(visited_roles) < max_pivot_turns:
+            pivot_role = pivot_queue[idx_q]
+            idx_q += 1
+            spec = _resolve_council_specialist(pivot_role)
+            if spec is None or spec["role"] in visited_roles:
                 continue
+            visited_roles.add(spec["role"])
+
+            has_remaining_speakers = any(
+                (_resolve_council_specialist(rem) is not None and _resolve_council_specialist(rem)["role"] not in visited_roles)  # type: ignore[index]
+                for rem in pivot_queue[idx_q:]
+            )
             items_now = len(self.board.items()) if self.board is not None else 0
             still_drained = bool(self.board is not None and self.board.is_drained())
             no_task_added_yet = (items_now <= items_before_steering)
             must_add_task = bool(
-                pivot_role == "GameplaySystemsEngineer"
+                (not has_remaining_speakers)
                 and (
                     (board_was_drained and still_drained)
-                    or (is_real_genai_client(self.client) and no_task_added_yet)
+                    or (use_dynamic_steering_routing and no_task_added_yet)
                 )
             )
+            can_handoff = len(visited_roles) < max_pivot_turns
+            handoff_prefix = ""
+            if spec["role"] in handoff_reasons:
+                from_role, h_reason = handoff_reasons[spec["role"]]
+                handoff_prefix = (
+                    f"[Routed directly to you by {from_role}"
+                    + (f": {h_reason}" if h_reason else "")
+                    + "] "
+                )
             listen_check = WritersRoomListenCheck(
                 deliberation=f"Immediate Council discussion and slice task planning required to honor Executive Producer steering: {combined_steering}",
                 should_interject=True,
                 urgency_score=1.0,
                 intended_contribution_summary=(
-                    f"Treat the Executive Producer's message ('{combined_steering}') with full respect and cater directly to what they asked for "
+                    f"{handoff_prefix}Treat the Executive Producer's message ('{combined_steering}') with full respect and cater directly to what they asked for "
                     f"at its full intended architectural scope without defensiveness, excuses, or silent downgrading (Rule 5). "
                     f"Be candid and self-critical about where our current build fell short of their expectations (and never open `spoken_dialogue` with "
                     f"peer flattery or 'I completely agree with...'), reason from first principles about how to integrate their direction cleanly into "
                     f"your domain, update your Living Game Bible sections, refine unstarted slice tasks in `backlog_refinements`, and raise focused, "
-                    f"achievable production-code `backlog_additions` tasks that deliver their request cleanly without boiling the ocean on unrelated systems."
+                    f"achievable production-code `backlog_additions` tasks that deliver their request cleanly without boiling the ocean on unrelated systems. "
+                    f"If another Council specialist's domain should handle or co-own this request next, set `route_to_council_role` and `routing_handoff_reason`."
                 ),
             )
             proposal = self._execute_specialist_turn(
@@ -2669,6 +3086,8 @@ class CreativeWritersRoom:
                 extra_context_block=curated_code_block,
                 require_backlog_addition=must_add_task,
                 extra_multimodal_parts=wish_multimodal_parts or None,
+                allow_council_reroute_handoff=can_handoff,
+                visited_council_roles=visited_roles,
             )
             self._apply_turn_proposal(
                 game_bible=game_bible,
@@ -2677,6 +3096,27 @@ class CreativeWritersRoom:
                 proposal=proposal,
                 candidate_dir=candidate_dir,
             )
+            routed_spec, handoff_txt = _parse_council_reroute(proposal)
+            if (
+                routed_spec is not None
+                and routed_spec["role"] not in visited_roles
+                and len(visited_roles) < max_pivot_turns
+            ):
+                routed_name = routed_spec["role"]
+                pivot_queue = pivot_queue[:idx_q] + [routed_name] + [
+                    r for r in pivot_queue[idx_q:] if r != routed_name
+                ]
+                handoff_reasons[routed_name] = (spec["role"], handoff_txt)
+                self._emit_activity(
+                    agent_role=routed_name,
+                    status_text=(
+                        f"{spec['display_name']} ({spec['role']}) routed steering turn to "
+                        f"{routed_spec['display_name']} ({routed_name})"
+                        + (f": {handoff_txt[:100]}" if handoff_txt else "")
+                    ),
+                    active_agents=[spec["role"], routed_name],
+                    phase="council_reroute",
+                )
 
     _SHAPING_COUNCIL_ROLES = (
         "GameplayDesigner",
@@ -2770,6 +3210,12 @@ class CreativeWritersRoom:
             phase="task_shaping",
         )
         board_snap = self.board.snapshot_text()
+        stage2_shared_prefix = (
+            f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n\n"
+            f"{bible_snapshot}\n\n"
+            f"{board_snap}\n\n"
+        )
+        stage2_eager = len(role_targets) >= 2
 
         def _shape_for_role(entry: Tuple[str, Dict[str, Any], List[Any]]) -> Tuple[str, TaskShapingBatch]:
             role_name, spec, targets = entry
@@ -2781,9 +3227,6 @@ class CreativeWritersRoom:
                 for t in targets
             )
             prompt = (
-                f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n\n"
-                f"{bible_snapshot}\n\n"
-                f"{board_snap}\n\n"
                 f"You are the {display_name} ({role_name}) in Stage 2 of the Council Task-Shaping Session (Full-Council Cross-Domain Direction).\n"
                 f"Your specialty focus: {spec['focus']}\n\n"
                 f"All tasks and task decompositions are now on the Production Board. Before workers start building, "
@@ -2840,9 +3283,12 @@ class CreativeWritersRoom:
                 _validate_stage2,
                 caller_role=role_name,
                 candidate_dir=eff_shape_dir,
+                cacheable_prefix=stage2_shared_prefix,
+                min_calls_before_create=1 if stage2_eager else 2,
             )
 
-        results = self._map_parallel(_shape_for_role, role_targets)
+        with explicit_prefix_cache_scope(self.client, ttl_seconds=360, reuse_outer=False):
+            results = self._map_parallel(_shape_for_role, role_targets)
         applied_count = 0
         for role_name, batch in results:
             if batch.backlog_refinements:
@@ -2878,127 +3324,137 @@ class CreativeWritersRoom:
         active_slice_obj = game_bible.get_active_slice()
         default_slice_id = active_slice_obj.slice_id if active_slice_obj is not None else ""
         total_changes = 0
+        stage1_shared_prefix = (
+            f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n\n"
+            f"{bible_snapshot}\n\n"
+        )
+        stage1_cache_cm = explicit_prefix_cache_scope(self.client, ttl_seconds=360, reuse_outer=False)
+        stage1_cache_cm.__enter__()
+        try:
+            # Stage 1: Decomposition ('split') & Missing Companion Task Discovery ('backlog_additions')
+            for role_name in self._SHAPING_COUNCIL_ROLES:
+                unstarted_now = [
+                    i for i in self.board.items()
+                    if i.state in ("ready", "blocked") and not self._has_started_execution(i, candidate_dir=candidate_dir)
+                ]
+                if not unstarted_now:
+                    break
+                role_prefix = f"[{role_name} Direction]:"
+                if any(str(n).startswith(role_prefix) for i in unstarted_now for n in (i.shaping_notes or [])):
+                    continue
+                spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == role_name), None)
+                if spec is None:
+                    continue
+                display_name = spec["display_name"]
+                self._emit_activity(
+                    agent_role=role_name,
+                    status_text=f"{display_name} ({role_name}) is decomposing tasks & checking for missing companion tasks (Stage 1)...",
+                    active_agents=[role_name],
+                    phase="task_shaping",
+                )
+                unstarted_id_lines = "\n".join(
+                    f"  - [{t.item_id}] ({t.kind}, state={t.state}, slice={t.slice_id or default_slice_id}, deps={t.depends_on}) '{t.title}'"
+                    for t in unstarted_now
+                )
+                prompt = (
+                    f"{self.board.snapshot_text()}\n\n"
+                    f"UNSTARTED TASKS CURRENTLY ON THE BOARD ({len(unstarted_now)} tasks — use ONLY these exact `item_id` values when referencing existing unstarted tasks in `backlog_refinements`, `blocks_items`, or `add_depends_on`):\n"
+                    f"{unstarted_id_lines}\n\n"
+                    f"You are the {display_name} ({role_name}) in Stage 1 of the Council Task-Shaping & Decomposition Session.\n"
+                    f"Your specialty focus: {spec['focus']}\n\n"
+                    f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n\n"
+                    f"Before the full Council gives cross-domain direction in Stage 2, skeptically audit the unstarted (`ready` or `blocked`) tasks on the Production Board (catering faithfully to any Executive Producer directives while keeping task count bounded to THIS active slice's scope rather than trying to build every future slice at once):\n"
+                    f"1. DECOMPOSE MONOLITHIC TASKS (`action='split'` in `backlog_refinements`): Should any task be split into smaller, focused tasks (for example, separating core simulation mechanics from interactive player placement/building tools, separating world/level progression from HUD telemetry, or splitting a multi-entity visual_asset bundle into 1-entity-per-item visual_asset tasks)? When you split a task, downstream dependents on the board automatically re-point to your split tasks.\n"
+                    f"2. RAISE MISSING COMPANION TASKS (`backlog_additions`): Is an essential active-slice prerequisite asset, UI affordance, level region, or sub-mechanic task missing altogether? Propose it in `backlog_additions` (and use `blocks_items` or `add_depends_on` to link it), without bloating the board with out-of-slice wishlist features.\n"
+                    f"3. CONTRIBUTE INITIAL DOMAIN DIRECTION (`action='enrich'` in `backlog_refinements`): You may also enrich existing tasks with `spec_addition_or_rewrite` and `add_depends_on` (define generalizable, world-wide system/geometry contracts rather than hardcoded `(x, y)` coordinate whitelists or fixed target coordinates for production code).\n"
+                    f"Buildable kinds right now: {self._supported_kinds() or 'all'}.\n"
+                    f"Return `TaskShapingBatch` with `deliberation` FIRST."
+                )
 
-        # Stage 1: Decomposition ('split') & Missing Companion Task Discovery ('backlog_additions')
-        for role_name in self._SHAPING_COUNCIL_ROLES:
-            unstarted_now = [
-                i for i in self.board.items()
-                if i.state in ("ready", "blocked") and not self._has_started_execution(i, candidate_dir=candidate_dir)
-            ]
-            if not unstarted_now:
-                break
-            role_prefix = f"[{role_name} Direction]:"
-            if any(str(n).startswith(role_prefix) for i in unstarted_now for n in (i.shaping_notes or [])):
-                continue
-            spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == role_name), None)
-            if spec is None:
-                continue
-            display_name = spec["display_name"]
-            self._emit_activity(
-                agent_role=role_name,
-                status_text=f"{display_name} ({role_name}) is decomposing tasks & checking for missing companion tasks (Stage 1)...",
-                active_agents=[role_name],
-                phase="task_shaping",
-            )
-            unstarted_id_lines = "\n".join(
-                f"  - [{t.item_id}] ({t.kind}, state={t.state}, slice={t.slice_id or default_slice_id}, deps={t.depends_on}) '{t.title}'"
-                for t in unstarted_now
-            )
-            prompt = (
-                f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n\n"
-                f"{bible_snapshot}\n\n"
-                f"{self.board.snapshot_text()}\n\n"
-                f"UNSTARTED TASKS CURRENTLY ON THE BOARD ({len(unstarted_now)} tasks — use ONLY these exact `item_id` values when referencing existing unstarted tasks in `backlog_refinements`, `blocks_items`, or `add_depends_on`):\n"
-                f"{unstarted_id_lines}\n\n"
-                f"You are the {display_name} ({role_name}) in Stage 1 of the Council Task-Shaping & Decomposition Session.\n"
-                f"Your specialty focus: {spec['focus']}\n\n"
-                f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n\n"
-                f"Before the full Council gives cross-domain direction in Stage 2, skeptically audit the unstarted (`ready` or `blocked`) tasks on the Production Board (catering faithfully to any Executive Producer directives while keeping task count bounded to THIS active slice's scope rather than trying to build every future slice at once):\n"
-                f"1. DECOMPOSE MONOLITHIC TASKS (`action='split'` in `backlog_refinements`): Should any task be split into smaller, focused tasks (for example, separating core simulation mechanics from interactive player placement/building tools, separating world/level progression from HUD telemetry, or splitting a multi-entity visual_asset bundle into 1-entity-per-item visual_asset tasks)? When you split a task, downstream dependents on the board automatically re-point to your split tasks.\n"
-                f"2. RAISE MISSING COMPANION TASKS (`backlog_additions`): Is an essential active-slice prerequisite asset, UI affordance, level region, or sub-mechanic task missing altogether? Propose it in `backlog_additions` (and use `blocks_items` or `add_depends_on` to link it), without bloating the board with out-of-slice wishlist features.\n"
-                f"3. CONTRIBUTE INITIAL DOMAIN DIRECTION (`action='enrich'` in `backlog_refinements`): You may also enrich existing tasks with `spec_addition_or_rewrite` and `add_depends_on` (define generalizable, world-wide system/geometry contracts rather than hardcoded `(x, y)` coordinate whitelists or fixed target coordinates for production code).\n"
-                f"Buildable kinds right now: {self._supported_kinds() or 'all'}.\n"
-                f"Return `TaskShapingBatch` with `deliberation` FIRST."
-            )
-
-            def _validate_shaping(batch: TaskShapingBatch) -> List[str]:
-                issues: List[str] = []
-                if batch.backlog_additions:
-                    issues.extend(self.board.validate_proposals(batch.backlog_additions))
-                    issues.extend(self._unsupported_kind_issues(batch.backlog_additions))
-                if batch.backlog_refinements:
-                    issues.extend(
-                        self.board.validate_refinements(
-                            batch.backlog_refinements,
-                            new_proposals=batch.backlog_additions,
+                def _validate_shaping(batch: TaskShapingBatch) -> List[str]:
+                    issues: List[str] = []
+                    if batch.backlog_additions:
+                        issues.extend(self.board.validate_proposals(batch.backlog_additions))
+                        issues.extend(self._unsupported_kind_issues(batch.backlog_additions))
+                    if batch.backlog_refinements:
+                        issues.extend(
+                            self.board.validate_refinements(
+                                batch.backlog_refinements,
+                                new_proposals=batch.backlog_additions,
+                            )
                         )
-                    )
-                    for r in batch.backlog_refinements:
-                        if r.action == "split" and r.split_items:
-                            issues.extend(self._unsupported_kind_issues(r.split_items))
-                return issues
+                        for r in batch.backlog_refinements:
+                            if r.action == "split" and r.split_items:
+                                issues.extend(self._unsupported_kind_issues(r.split_items))
+                    return issues
 
-            batch = self._structured_with_validation(prompt, TaskShapingBatch, _validate_shaping)
-            added_this_turn: List[Any] = []
-            shaped_this_turn: List[str] = []
-            if batch.backlog_additions:
-                for prop in batch.backlog_additions:
-                    if prop.kind == "level_map" and "level_layout.json" not in prop.target_modules:
-                        prop.target_modules.append("level_layout.json")
-                    elif prop.kind in ("visual_asset", "animation", "audio_asset"):
-                        prop.target_modules = [m for m in prop.target_modules if not str(m).endswith(".gd")]
-                added_this_turn = self.board.add_items(
-                    batch.backlog_additions,
-                    raised_by_role=role_name,
-                    slice_id=default_slice_id,
+                batch = self._structured_with_validation(
+                    prompt,
+                    TaskShapingBatch,
+                    _validate_shaping,
+                    cacheable_prefix=stage1_shared_prefix,
+                    min_calls_before_create=1 if len(self._SHAPING_COUNCIL_ROLES) >= 2 else 2,
                 )
-                total_changes += len(added_this_turn)
-            if batch.backlog_refinements:
-                shaped_this_turn = self.board.apply_refinements(
-                    batch.backlog_refinements,
-                    by_role=role_name,
-                )
-                total_changes += len(shaped_this_turn)
-            if added_this_turn or shaped_this_turn:
-                t_idx = len(game_bible.writers_room_transcript)
-                summary_badges: List[str] = []
-                spoken_parts: List[str] = []
-                if added_this_turn:
-                    added_ids = [it.item_id for it in added_this_turn]
-                    summary_badges.append(f"Raised {len(added_this_turn)} backlog item(s): {added_ids}")
-                    spoken_parts.append(
-                        "Added companion task(s): "
-                        + ", ".join(f"`{it.item_id}` ({it.title})" for it in added_this_turn)
-                        + "."
+                added_this_turn: List[Any] = []
+                shaped_this_turn: List[str] = []
+                if batch.backlog_additions:
+                    for prop in batch.backlog_additions:
+                        if prop.kind == "level_map" and "level_layout.json" not in prop.target_modules:
+                            prop.target_modules.append("level_layout.json")
+                    added_this_turn = self.board.add_items(
+                        batch.backlog_additions,
+                        raised_by_role=role_name,
+                        slice_id=default_slice_id,
                     )
-                if shaped_this_turn:
-                    summary_badges.append(f"Shaped/split {len(shaped_this_turn)} backlog item(s) -> {shaped_this_turn}")
-                    spoken_parts.append(f"Shaped/refined board task(s): {', '.join(f'`{sid}`' for sid in shaped_this_turn)}.")
-                shaping_utt = WritersRoomUtterance(
-                    deliberation=batch.deliberation,
-                    utterance_id=f"utt_{t_idx:02d}_{role_name}_task_shaping",
-                    turn_index=t_idx,
-                    speaker_role=role_name,
-                    speaker_display_name=display_name,
-                    spoken_dialogue=f"{batch.deliberation} {' '.join(spoken_parts)}".strip(),
-                    addressed_to=["CreativeDirector", "GameplayDesigner", "GameplaySystemsEngineer"],
-                    bible_updates_summary=summary_badges,
-                )
-                game_bible.writers_room_transcript.append(shaping_utt)
-                self._persist_bible(game_bible, candidate_dir=candidate_dir)
-                self._emit_event(
-                    "writers_room_utterance",
-                    {
-                        "deliberation": shaping_utt.deliberation,
-                        "utterance_id": shaping_utt.utterance_id,
-                        "turn_index": shaping_utt.turn_index,
-                        "speaker_role": shaping_utt.speaker_role,
-                        "speaker_display_name": shaping_utt.speaker_display_name,
-                        "spoken_dialogue": shaping_utt.spoken_dialogue,
-                        "addressed_to": shaping_utt.addressed_to,
-                        "bible_updates_summary": shaping_utt.bible_updates_summary,
-                    },
-                )
+                    total_changes += len(added_this_turn)
+                if batch.backlog_refinements:
+                    shaped_this_turn = self.board.apply_refinements(
+                        batch.backlog_refinements,
+                        by_role=role_name,
+                    )
+                    total_changes += len(shaped_this_turn)
+                if added_this_turn or shaped_this_turn:
+                    t_idx = len(game_bible.writers_room_transcript)
+                    summary_badges: List[str] = []
+                    spoken_parts: List[str] = []
+                    if added_this_turn:
+                        added_ids = [it.item_id for it in added_this_turn]
+                        summary_badges.append(f"Raised {len(added_this_turn)} backlog item(s): {added_ids}")
+                        spoken_parts.append(
+                            "Added companion task(s): "
+                            + ", ".join(f"`{it.item_id}` ({it.title})" for it in added_this_turn)
+                            + "."
+                        )
+                    if shaped_this_turn:
+                        summary_badges.append(f"Shaped/split {len(shaped_this_turn)} backlog item(s) -> {shaped_this_turn}")
+                        spoken_parts.append(f"Shaped/refined board task(s): {', '.join(f'`{sid}`' for sid in shaped_this_turn)}.")
+                    shaping_utt = WritersRoomUtterance(
+                        deliberation=batch.deliberation,
+                        utterance_id=f"utt_{t_idx:02d}_{role_name}_task_shaping",
+                        turn_index=t_idx,
+                        speaker_role=role_name,
+                        speaker_display_name=display_name,
+                        spoken_dialogue=f"{batch.deliberation} {' '.join(spoken_parts)}".strip(),
+                        addressed_to=["CreativeDirector", "GameplayDesigner", "GameplaySystemsEngineer"],
+                        bible_updates_summary=summary_badges,
+                    )
+                    game_bible.writers_room_transcript.append(shaping_utt)
+                    self._persist_bible(game_bible, candidate_dir=candidate_dir)
+                    self._emit_event(
+                        "writers_room_utterance",
+                        {
+                            "deliberation": shaping_utt.deliberation,
+                            "utterance_id": shaping_utt.utterance_id,
+                            "turn_index": shaping_utt.turn_index,
+                            "speaker_role": shaping_utt.speaker_role,
+                            "speaker_display_name": shaping_utt.speaker_display_name,
+                            "spoken_dialogue": shaping_utt.spoken_dialogue,
+                            "addressed_to": shaping_utt.addressed_to,
+                            "bible_updates_summary": shaping_utt.bible_updates_summary,
+                        },
+                    )
+        finally:
+            stage1_cache_cm.__exit__(None, None, None)
 
         # Stage 2: Parallel Full-Council Cross-Domain Direction over the complete board (including all newly added/split tasks)
         total_changes += self._run_full_council_direction_pass(
@@ -3979,6 +4435,17 @@ class CreativeWritersRoom:
             if it.state == "approved"
         ]
 
+        blind_asset_block, _, blind_sheet_part = self._build_asset_integrity_dossier_and_sheet(
+            c_dir, f"{active_slice_id}_p{pass_index}"
+        )
+        if blind_sheet_part is not None:
+            multimodal_parts.append(
+                f"CARTRIDGE VISUAL ASSET CONTACT SHEET FOR `{active_slice_id}` (Pass #{pass_index + 1} — "
+                "active in-game textures listed first; red card borders mark deterministic or multimodal-critic-flagged "
+                "broken/placeholder assets; inspect every tile against the Game Bible style guide and concept mockups):"
+            )
+            multimodal_parts.append(blind_sheet_part)
+
         blind_dossier = (
             f"PLAYER DNA & TARGET AUDIENCE:\n{dna_summary}\n\n"
             f"{self._format_bible_snapshot(game_bible)}\n\n"
@@ -4006,6 +4473,7 @@ class CreativeWritersRoom:
             f"=== CONTROLS & RULES THE BLIND PLAYER ACTUALLY FIGURED OUT ===\n{rulebook_lines}\n\n"
             f"=== SPARSE RUNNING IMPRESSIONS DURING PLAY ===\n{impressions_lines}\n\n"
             f"=== AUTO-DELIVERED BLIND PLAYER WISHES ({len(wishes)} items) ===\n{wishes_block}\n\n"
+            f"{blind_asset_block}"
             f"=== CURRENTLY APPROVED PRODUCTION BOARD ITEMS ({len(approved_board_lines)}) ===\n"
             + ("\n".join(approved_board_lines) or "  (none)")
         )
@@ -4128,11 +4596,12 @@ class CreativeWritersRoom:
             "6-pillar Experience Report, `overall_fun_rating`, discovered controls rulebook, wishes, any Executive Producer directives, and the Council Roundtable Discussion. "
             "Never rubber-stamp an inflated `overall_fun_rating`, and never open `spoken_dialogue` with 'I completely agree with the Council' or cheerleading.\n"
             "2. APPLY PRAGMATIC SLICE COMPLETION JUDGMENT (WE CANNOT CHANGE EVERYTHING IN ONE GO) — decide between two clear moves:\n"
-            "   - `iterate_current_slice`: Choose this when active-slice scope or an Executive Producer directive is unmet, OR when a few high-impact problem areas "
+            "   - `iterate_current_slice`: Choose this when active-slice scope or an Executive Producer directive is unmet, OR when high-impact problem areas "
             "(onboarding dead-ends, repetitive no-op loops, stalled progression, auto-playing/shortcutted mechanics bypassing player agency, glaring sprite-bleed/UI-overflow/overlap glitches, "
-            "or silent core audio) need surgical cleanup before closing this slice. Keep `backlog_additions` tight and surgical (1–3 focused `WorkItemProposal` tasks—never boil the ocean "
-            "with a massive redesign list!) targeting real production modules with systemic, world-wide fixes (never single-coordinate point patches) and concrete `proof_spec` verification, "
-            "and defer broader wishes to `next_slice_carryover_notes`.\n"
+            "corrupted/placeholder visual assets on the `CARTRIDGE VISUAL ASSET CONTACT SHEET`, or silent core audio) need surgical cleanup before closing this slice. Keep gameplay/UX `backlog_additions` "
+            "tight and surgical (1–3 focused gameplay/UX `WorkItemProposal` tasks—never boil the ocean with a massive redesign list!), PLUS any atomic in-place `visual_asset` regeneration tasks and "
+            "dependent `.gd` reintegration task required by `CARTRIDGE VISUAL ASSET & GDSCRIPT SLICING INTEGRITY AUDIT`, targeting real production modules with systemic, world-wide fixes (never single-coordinate point patches) "
+            "and concrete `proof_spec` verification, and defer broader feature wishes to `next_slice_carryover_notes`.\n"
             "   - `approve_slice`: CALL THE SLICE DONE when the screenshots, action tape, and code confirm that THIS slice's intended scope (and any Executive Producer request) "
             "is genuinely covered and playable through real player decisions and major problem areas have been cleaned up—even if non-blocking rough edges or broader wishes remain! "
             "Be candid in `spoken_dialogue` about what is still rough, capture those deferred improvements and wishes cleanly in `next_slice_carryover_notes`, and set `backlog_additions=[]`.\n"
@@ -4312,8 +4781,7 @@ class CreativeWritersRoom:
             return 0
         evaluator_override = getattr(self, "qa_gate_evaluator_fn", None)
         if (
-            not is_real_genai_client(self.client)
-            and not getattr(self, "enable_slice_qa_gate_check", False)
+            not getattr(self, "enable_slice_qa_gate_check", False)
             and evaluator_override is None
         ):
             return 0
@@ -4869,8 +5337,14 @@ class CreativeWritersRoom:
         workers = min(self.max_parallel_calls, len(items))
         if workers <= 1:
             return [fn(i) for i in items]
+        parent_scope = get_active_explicit_prefix_cache_scope(self.client)
+
+        def _wrapped_fn(item: Any) -> Any:
+            with bind_explicit_prefix_cache_scope(parent_scope):
+                return fn(item)
+
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            return list(pool.map(fn, items))
+            return list(pool.map(_wrapped_fn, items))
 
     def _resolve_memory_dir(self, candidate_dir: Optional[Path] = None) -> Optional[Path]:
         if candidate_dir is not None:
@@ -4890,10 +5364,43 @@ class CreativeWritersRoom:
         caller_role: Optional[str] = None,
         candidate_dir: Optional[Path] = None,
         slice_id: str = "",
+        *,
+        cacheable_prefix: str = "",
+        min_calls_before_create: int = 2,
     ) -> Any:
         """Calls the LLM until `validate` returns no issues, feeding issues back; raises after `attempts` (Rule 5).
         Also supports optional bounded `memory_query` lookups and `memory_updates`/`memory_note` persistence
         when `candidate_dir` (or an attached board path) is present."""
+        with explicit_prefix_cache_scope(self.client, ttl_seconds=300, reuse_outer=True):
+            return self._structured_with_validation_inner(
+                prompt=prompt,
+                schema_cls=schema_cls,
+                validate=validate,
+                attempts=attempts,
+                temperature=temperature,
+                parts=parts,
+                caller_role=caller_role,
+                candidate_dir=candidate_dir,
+                slice_id=slice_id,
+                cacheable_prefix=cacheable_prefix,
+                min_calls_before_create=min_calls_before_create,
+            )
+
+    def _structured_with_validation_inner(
+        self,
+        prompt: str,
+        schema_cls: Any,
+        validate: Callable[[Any], List[str]],
+        attempts: int = 3,
+        temperature: Optional[float] = None,
+        parts: Optional[List[Any]] = None,
+        caller_role: Optional[str] = None,
+        candidate_dir: Optional[Path] = None,
+        slice_id: str = "",
+        *,
+        cacheable_prefix: str = "",
+        min_calls_before_create: int = 2,
+    ) -> Any:
         issues: List[str] = []
         eff_dir = self._resolve_memory_dir(candidate_dir)
         has_embed_client = callable(getattr(getattr(self.client, "models", None), "embed_content", None))
@@ -4908,12 +5415,23 @@ class CreativeWritersRoom:
                 "\n\nYOUR PREVIOUS ANSWER FAILED VALIDATION; FIX EVERY ISSUE:\n- " + "\n- ".join(issues) if issues else ""
             )
             mem_q_block = ("\n\n" + "\n".join(mem_query_blocks)) if mem_query_blocks else ""
-            result = self._call_structured_llm(
-                prompt + mem_q_block + feedback,
-                schema_cls,
-                temperature=temperature,
-                parts=parts,
-            )
+            if getattr(self._call_structured_llm, "__func__", None) is CreativeWritersRoom._call_structured_llm:
+                result = self._call_structured_llm(
+                    prompt,
+                    schema_cls,
+                    temperature=temperature,
+                    parts=parts,
+                    cacheable_prefix=cacheable_prefix,
+                    dynamic_tail=(mem_q_block + feedback),
+                    min_calls_before_create=min_calls_before_create,
+                )
+            else:
+                result = self._call_structured_llm(
+                    cacheable_prefix + prompt + mem_q_block + feedback,
+                    schema_cls,
+                    temperature=temperature,
+                    parts=parts,
+                )
 
             if eff_dir is not None:
                 from engine.studio.game_memory import GameMemoryStore, format_memory_query_results
@@ -5315,6 +5833,9 @@ class CreativeWritersRoom:
 
         # Open-ended specialist conversation loop (skipped when resuming a build already in active production)
         turns_executed = sum(spoken_counts.values())
+        pending_routed_role = ""
+        pending_routed_from = ""
+        pending_routed_reason = ""
         if self.board is not None and self.scheduler is not None and not is_real_genai_client(self.client):
             if turns_executed >= min(3, self.max_turns) or len(self.board.items()) >= 3:
                 self.scheduler.start()
@@ -5322,6 +5843,9 @@ class CreativeWritersRoom:
             self._wait_if_paused(candidate_dir)
             steered = self._consume_pending_steering(game_bible, candidate_dir=candidate_dir)
             if steered:
+                pending_routed_role = ""
+                pending_routed_from = ""
+                pending_routed_reason = ""
                 last_speaker_role = "ExecutiveProducer"
                 last_addressed_to = ["CreativeDirector", "GameplayDesigner", "GameplaySystemsEngineer", "UXExperienceDesigner"]
                 for r in last_addressed_to:
@@ -5330,13 +5854,45 @@ class CreativeWritersRoom:
                 if self.max_turns - turns_executed < 3:
                     self.max_turns = turns_executed + 3
             effective_addressed_to = list(dict.fromkeys(list(last_addressed_to) + pending_invited_roles))
-            chosen_spec, listen_check = self._select_next_speaker(
-                last_speaker_role=last_speaker_role,
-                addressed_to=effective_addressed_to,
-                game_bible=game_bible,
-                dna_summary=dna_summary,
-                spoken_counts=spoken_counts,
-            )
+            routed_spec = _resolve_council_specialist(pending_routed_role) if pending_routed_role else None
+            routed_from_snapshot = pending_routed_from
+            routed_reason_snapshot = pending_routed_reason
+            pending_routed_role = ""
+            pending_routed_from = ""
+            pending_routed_reason = ""
+            if routed_spec is not None and routed_spec["role"] != last_speaker_role:
+                chosen_spec = routed_spec
+                listen_check = WritersRoomListenCheck(
+                    deliberation=(
+                        f"Routed directly into the Writers' Room by {routed_from_snapshot}: "
+                        f"{routed_reason_snapshot or 'Domain specialist handoff requested.'}"
+                    ),
+                    should_interject=True,
+                    urgency_score=1.0,
+                    intended_contribution_summary=(
+                        f"[Routed to you by {routed_from_snapshot}] {routed_reason_snapshot}"
+                        if routed_reason_snapshot
+                        else f"Routed in by {routed_from_snapshot} to contribute {routed_spec['display_name']} expertise."
+                    ),
+                )
+                self._emit_activity(
+                    agent_role=routed_spec["role"],
+                    status_text=(
+                        f"{routed_from_snapshot} routed the floor directly to "
+                        f"{routed_spec['display_name']} ({routed_spec['role']})"
+                        + (f": {routed_reason_snapshot[:100]}" if routed_reason_snapshot else "")
+                    ),
+                    active_agents=[routed_from_snapshot, routed_spec["role"]],
+                    phase="council_reroute",
+                )
+            else:
+                chosen_spec, listen_check = self._select_next_speaker(
+                    last_speaker_role=last_speaker_role,
+                    addressed_to=effective_addressed_to,
+                    game_bible=game_bible,
+                    dna_summary=dna_summary,
+                    spoken_counts=spoken_counts,
+                )
             role = chosen_spec["role"]
             display_name = chosen_spec["display_name"]
 
@@ -5353,6 +5909,11 @@ class CreativeWritersRoom:
                 proposal=proposal,
                 candidate_dir=candidate_dir,
             )
+            next_routed_spec, next_handoff_reason = _parse_council_reroute(proposal)
+            if next_routed_spec is not None and next_routed_spec["role"] != role:
+                pending_routed_role = next_routed_spec["role"]
+                pending_routed_from = role
+                pending_routed_reason = next_handoff_reason
             spoken_counts[role] = spoken_counts.get(role, 0) + 1
             if role in pending_invited_roles:
                 pending_invited_roles.remove(role)
@@ -5750,13 +6311,15 @@ class CreativeWritersRoom:
         c_dir: Path,
         slice_tag: str,
     ) -> Tuple[str, Optional[Path], Any]:
-        """Runs deterministic visual/atlas/GDScript-slicing inspection and renders a contact sheet of all
-        `assets/` PNGs so Council specialists can inspect current assets, identify broken or placeholder
-        sheets, spawn in-place `visual_asset` regeneration tasks, and reintegrate `.gd` wiring cleanly.
+        """Renders a neutral observational contact sheet of cartridge `assets/` PNGs and summarizes
+        `assets/asset_library.json` metadata plus active in-game `.gd`/`.tscn` reference status so Council
+        specialists can inspect every active game asset without unreferenced orphan files crowding them out,
+        and clean up obsolete orphan files via `delete_paths` when desired.
         """
         import re
+        from PIL import Image
         from engine.supervisor.asset_validator import (
-            audit_cartridge_visual_and_slicing_integrity,
+            _collect_observational_asset_metadata,
             render_cartridge_asset_contact_sheet,
         )
 
@@ -5766,58 +6329,150 @@ class CreativeWritersRoom:
         proof_dir.mkdir(parents=True, exist_ok=True)
         safe_tag = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(slice_tag or "current")).strip("_") or "current"
         sheet_out = proof_dir / f"asset_contact_sheet_{safe_tag}.png"
+
+        assets_root = c_dir / "assets"
+        visual_files: List[Path] = []
+        if assets_root.is_dir():
+            for p_png in sorted(assets_root.rglob("*.png")):
+                rel_parts = p_png.relative_to(c_dir).parts
+                if "mockups" in rel_parts or "playtest_captures" in rel_parts or "concepts" in rel_parts:
+                    continue
+                visual_files.append(p_png)
+
+        latest_mtime = 0.0
+        for p_chk in visual_files:
+            try:
+                latest_mtime = max(latest_mtime, p_chk.stat().st_mtime)
+            except OSError:
+                pass
+        cat_path = c_dir / "assets" / "asset_library.json"
+        if cat_path.is_file():
+            try:
+                latest_mtime = max(latest_mtime, cat_path.stat().st_mtime)
+            except OSError:
+                pass
+        excluded_ref_dirs = {"tests", "artifacts", ".godot", "mockups", "concepts", "playtest_captures"}
+        for ext in ("*.gd", "*.tscn", "*.tres", "*.gdshader"):
+            for ref_src in c_dir.rglob(ext):
+                try:
+                    rel_parts = ref_src.relative_to(c_dir).parts
+                    if any(part in excluded_ref_dirs for part in rel_parts):
+                        continue
+                    latest_mtime = max(latest_mtime, ref_src.stat().st_mtime)
+                except OSError:
+                    pass
+
+        cache_dict: Dict[Tuple[str, str, float], Tuple[str, Optional[Path], Any]] = getattr(
+            self, "_asset_sheet_audit_cache", None
+        ) or {}
+        self._asset_sheet_audit_cache = cache_dict
+        cache_key = (str(c_dir.resolve()), safe_tag, round(latest_mtime, 3))
+        if cache_key in cache_dict:
+            cached_txt, cached_p, cached_part = cache_dict[cache_key]
+            if cached_p is None or cached_p.is_file():
+                return cached_txt, cached_p, cached_part
+
+        obs_meta = _collect_observational_asset_metadata(c_dir, visual_files) if visual_files else {}
+        active_files: List[Path] = []
+        unreferenced_files: List[Path] = []
+        for vf in visual_files:
+            rel_vf = vf.relative_to(c_dir).as_posix()
+            if (obs_meta.get(rel_vf) or {}).get("referenced"):
+                active_files.append(vf)
+            else:
+                unreferenced_files.append(vf)
+        unreferenced_files.sort(
+            key=lambda p: (
+                0 if (obs_meta.get(p.relative_to(c_dir).as_posix()) or {}).get("in_catalog") else 1,
+                1 if "/parts/" in p.relative_to(c_dir).as_posix() else 0,
+                p.relative_to(c_dir).as_posix(),
+            )
+        )
+
         sheet_path: Optional[Path] = None
         sheet_part: Any = None
-        try:
-            sheet_path = render_cartridge_asset_contact_sheet(c_dir, output_path=sheet_out)
-            if sheet_path is not None and sheet_path.is_file():
+        if visual_files:
+            try:
+                sheet_path = render_cartridge_asset_contact_sheet(
+                    c_dir,
+                    output_path=sheet_out,
+                    active_only=bool(active_files and len(unreferenced_files) > 8),
+                )
+            except Exception as sh_exc:
+                logger.debug("Asset contact sheet render skipped: %s", sh_exc)
+
+        if sheet_path is not None and sheet_path.is_file():
+            try:
                 sheet_part = self._load_image_part(sheet_path)
-        except Exception as sh_exc:
-            logger.debug("Asset contact sheet render skipped: %s", sh_exc)
+            except Exception as lp_exc:
+                logger.debug("Could not load contact sheet image part: %s", lp_exc)
 
-        try:
-            audit = audit_cartridge_visual_and_slicing_integrity(c_dir)
-        except Exception as aud_exc:
-            logger.debug("Asset slicing integrity audit skipped: %s", aud_exc)
-            return "", sheet_path, sheet_part
+        cat_entries: Dict[str, Dict[str, Any]] = {}
+        if cat_path.is_file():
+            try:
+                raw_cat = json.loads(cat_path.read_text(encoding="utf-8"))
+                raw_entries = raw_cat.get("entries", raw_cat) if isinstance(raw_cat, dict) else raw_cat
+                iter_entries = (
+                    raw_entries.values()
+                    if isinstance(raw_entries, dict)
+                    else (raw_entries if isinstance(raw_entries, list) else [])
+                )
+                for ent in iter_entries:
+                    if isinstance(ent, dict):
+                        fp = str(
+                            ent.get("file_path") or ent.get("res_path") or ent.get("relative_path") or ""
+                        ).replace("res://", "").lstrip("/")
+                        if fp:
+                            cat_entries[fp] = ent
+            except Exception:
+                pass
 
-        asset_meta = audit.get("asset_metadata") or {}
-        violations = audit.get("errors") or audit.get("violations") or []
-        offending_assets = audit.get("offending_assets") or []
-        offending_scripts = audit.get("offending_scripts") or []
-        if not asset_meta and not violations:
-            return "", sheet_path, sheet_part
+        if not visual_files and not cat_entries:
+            res_empty = ("", sheet_path, sheet_part)
+            cache_dict[cache_key] = res_empty
+            return res_empty
+
+        def _format_asset_line(vf: Path, status_tag: str) -> str:
+            rel_vf = vf.relative_to(c_dir).as_posix()
+            dims_txt = "?"
+            try:
+                with Image.open(vf) as im:
+                    dims_txt = f"{im.width}x{im.height}px ({im.mode})"
+            except Exception:
+                pass
+            ent = cat_entries.get(rel_vf) or {}
+            meta = obs_meta.get(rel_vf) or {}
+            hf = ent.get("hframes") or meta.get("hframes") or 1
+            vf_cnt = ent.get("vframes") or meta.get("vframes") or 1
+            perc = str(ent.get("perceptual_description") or "").strip()
+            perc_suffix = f" | perceptual_notes: {perc[:180]}" if perc else ""
+            return f"  - `{rel_vf}` [{status_tag}]: {dims_txt}, grid={hf}x{vf_cnt}{perc_suffix}"
 
         lines: List[str] = [
-            "=== CARTRIDGE VISUAL ASSET & GDSCRIPT SLICING INTEGRITY AUDIT ===",
-            f"Visual Asset Files Indexed: {len(asset_meta)}",
+            "=== CARTRIDGE VISUAL ASSET INVENTORY & OBSERVATIONAL CONTACT SHEET ===",
+            (
+                f"Visual Asset Files on Disk: {len(visual_files)} "
+                f"(active_in_game={len(active_files)}, unreferenced_on_disk={len(unreferenced_files)})"
+            ),
         ]
-        if violations:
-            lines.append(f"DETERMINISTIC ASSET / SLICING DEFECTS DETECTED ({len(violations)}):")
-            for v in violations[:20]:
-                lines.append(f"  - {v}")
-            if offending_assets:
-                lines.append(f"Offending Asset Paths Requiring In-Place Regeneration: {', '.join(offending_assets)}")
-            if offending_scripts:
-                lines.append(f"Offending GDScript Files Requiring Slicing/Texture-Wiring Reintegration: {', '.join(offending_scripts)}")
-        else:
+        if active_files:
+            lines.append(f"Active In-Game Referenced Visual Assets ({len(active_files)} — loaded by production .gd/.tscn):")
+            for vf in active_files:
+                lines.append(_format_asset_line(vf, "ACTIVE"))
+        if unreferenced_files:
             lines.append(
-                "Deterministic alpha/slicing checks passed, MUST STILL visually inspect the attached "
-                "CARTRIDGE VISUAL ASSET CONTACT SHEET for crude solid-color geometric placeholder shapes, "
-                "missing atlas cells, or broken silhouettes."
+                f"Unreferenced / Orphaned PNG Files on Disk ({len(unreferenced_files)} — NOT loaded by any production .gd/.tscn; "
+                f"if obsolete, clean up via `delete_paths` on a specialist task; if intended for gameplay, wire into GDScript):"
             )
-        lines.append(
-            "REMEDIATION PROTOCOL FOR BROKEN ASSETS & SLICING:\n"
-            "  1. `VisualArtDirector`: Raise an atomic `visual_asset` WorkItem in `backlog_additions` for EACH "
-            "corrupted, flat-geometric-placeholder, or missing-cell `.png` asset, naming its EXACT existing "
-            "relative path (e.g. `assets/sprites/...png` or `assets/ui/...png`) in `target_modules` and `spec` "
-            "(including exact `hframes x vframes` cell grid counts when `.gd` slices a multi-cell atlas) so the "
-            "Visual Artist overwrites it IN-PLACE.\n"
-            "  2. `UXExperienceDesigner` & `GameplaySystemsEngineer`: Raise `mechanic_code` / `integration` "
-            "WorkItem(s) (`depends_on` any regenerated `visual_asset` task IDs) to fix `.gd` region slicing, "
-            "bind loaded textures onto visual nodes, and ensure textures load BEFORE procedural geometry generation.\n\n"
-        )
-        return "\n".join(lines), sheet_path, sheet_part
+            for vf in unreferenced_files[:40]:
+                cat_flag = "UNREFERENCED, cataloged" if (obs_meta.get(vf.relative_to(c_dir).as_posix()) or {}).get("in_catalog") else "UNREFERENCED, uncataloged"
+                lines.append(_format_asset_line(vf, cat_flag))
+            if len(unreferenced_files) > 40:
+                lines.append(f"  ... ({len(unreferenced_files) - 40} additional unreferenced PNG file(s) omitted)")
+        lines.append("")
+        res_tuple = ("\n".join(lines), sheet_path, sheet_part)
+        cache_dict[cache_key] = res_tuple
+        return res_tuple
 
     def _run_slice_reflection_and_strategy(
         self,
@@ -6120,8 +6775,6 @@ class CreativeWritersRoom:
             for prop in strategy_plan.backlog_additions:
                 if prop.kind == "level_map" and "level_layout.json" not in prop.target_modules:
                     prop.target_modules.append("level_layout.json")
-                elif prop.kind in ("visual_asset", "animation", "audio_asset"):
-                    prop.target_modules = [m for m in prop.target_modules if not str(m).endswith(".gd")]
             added_items = self.board.add_items(
                 strategy_plan.backlog_additions,
                 raised_by_role="CreativeDirector",

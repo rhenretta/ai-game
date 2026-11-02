@@ -50,6 +50,7 @@ var vid_peer: StreamPeerTCP = null
 
 var render_viewport: SubViewport = null
 var main_scene_node: Node = null
+var _sanitized_scripts: Array = []
 
 var audio_capture: AudioEffectCapture = null
 var audio_mix_rate: float = 48000.0
@@ -102,6 +103,61 @@ func _init() -> void:
 		elif arg == "--initial-settle-ticks" and i + 1 < all_args.size():
 			initial_settle_ticks = clampi(int(all_args[i + 1]), 2, 180)
 
+func _neutralize_non_headless_mouse_source(raw: String) -> String:
+	var s := raw
+	s = s.replace("MOUSE_MODE_CAPTURED", "MOUSE_MODE_VISIBLE")
+	s = s.replace("MOUSE_MODE_CONFINED_HIDDEN", "MOUSE_MODE_VISIBLE")
+	s = s.replace("MOUSE_MODE_CONFINED", "MOUSE_MODE_VISIBLE")
+	s = s.replace("MOUSE_MODE_HIDDEN", "MOUSE_MODE_VISIBLE")
+	var wm_tok := "warp_" + "mouse"
+	if s.find(wm_tok) != -1:
+		var rx_member := RegEx.new()
+		rx_member.compile("\\." + wm_tok + "\\s*\\(")
+		s = rx_member.sub(s, ".set_meta(&\"_harness_ignored_warp\", ", true)
+		var rx_bare := RegEx.new()
+		rx_bare.compile("(?m)(^\\s*|[;:\\(\\[\\{,=]\\s*)" + wm_tok + "\\s*\\(")
+		s = rx_bare.sub(s, "$1set_meta(&\"_harness_ignored_warp\", ", true)
+	return s
+
+func _collect_res_gd_files(dir_path: String, out: Array) -> void:
+	var d := DirAccess.open(dir_path)
+	if d == null:
+		return
+	d.list_dir_begin()
+	var fname := d.get_next()
+	while fname != "":
+		if fname != "." and fname != ".." and fname != ".godot":
+			var full := dir_path.path_join(fname) if dir_path != "res://" else "res://" + fname
+			if d.current_is_dir():
+				_collect_res_gd_files(full, out)
+			elif fname.ends_with(".gd"):
+				out.append(full)
+		fname = d.get_next()
+	d.list_dir_end()
+
+func _sanitize_non_headless_mouse_scripts() -> void:
+	var gd_files: Array = []
+	_collect_res_gd_files("res://", gd_files)
+	var wm_tok := "warp_" + "mouse"
+	var to_reload: Array = []
+	for full in gd_files:
+		var raw := FileAccess.get_file_as_string(full)
+		if raw.find("MOUSE_MODE_CAPTURED") != -1 or raw.find("MOUSE_MODE_CONFINED_HIDDEN") != -1 or raw.find("MOUSE_MODE_HIDDEN") != -1:
+			virtual_cursor_hidden = true
+		if raw.find("MOUSE_MODE_") != -1 or raw.find(wm_tok) != -1:
+			var cleaned := _neutralize_non_headless_mouse_source(raw)
+			if cleaned != raw:
+				var scr := GDScript.new()
+				scr.source_code = cleaned
+				scr.take_over_path(full)
+				_sanitized_scripts.append(scr)
+				to_reload.append(scr)
+	for scr in to_reload:
+		scr.reload(false)
+
+func _finalize() -> void:
+	_sanitized_scripts.clear()
+
 func _initialize() -> void:
 	Engine.max_physics_steps_per_frame = 1
 	if ipc_port <= 0 or capture_dir == "":
@@ -120,8 +176,11 @@ func _initialize() -> void:
 	DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_BORDERLESS, true)
 	DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_MOUSE_PASSTHROUGH, true)
 	DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_TRANSPARENT, true)
-	DisplayServer.window_set_position(Vector2i(-4000, -4000))
+	DisplayServer.window_set_size(Vector2i(16, 16))
+	DisplayServer.window_set_position(Vector2i(-32000, -32000))
+	DisplayServer.window_set_mouse_passthrough(PackedVector2Array([Vector2.ZERO, Vector2.ZERO, Vector2.ZERO]))
 	root.transparent_bg = true
+	_sanitize_non_headless_mouse_scripts()
 
 	# Attach standalone SubViewport directly under root (NOT SubViewportContainer, which would
 	# query DisplayServer OS mouse coordinates relative to (-4000, -4000)).
@@ -818,6 +877,7 @@ func _shutdown_runner() -> void:
 	if ctrl_peer != null:
 		ctrl_peer.disconnect_from_host()
 		ctrl_peer = null
+	_sanitized_scripts.clear()
 
 func _connect_tcp_blocking(host: String, port: int, timeout_ms: int) -> StreamPeerTCP:
 	var peer := StreamPeerTCP.new()

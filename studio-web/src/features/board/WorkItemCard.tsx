@@ -45,6 +45,7 @@ export interface WorkItemCardProps {
 export function getStateBadge(
   state: string,
   isBuildRunning = false,
+  decisionReason?: string | null,
 ): { label: string; cls: string; Icon: typeof CheckCircle2 } {
   switch (state) {
     case 'approved':
@@ -59,6 +60,11 @@ export function getStateBadge(
       return { label: 'Revising', cls: 'badge-warn', Icon: RotateCcw };
     case 'blocked':
       return { label: 'Waiting on Deps', cls: '', Icon: GitBranch };
+    case 'cancelled':
+      if (decisionReason && /^split\b/i.test(decisionReason.trim())) {
+        return { label: 'Split', cls: 'badge-purple', Icon: GitBranch };
+      }
+      return { label: 'Cancelled', cls: '', Icon: Clock };
     case 'failed':
     case 'needs_decision':
       if (isBuildRunning) {
@@ -83,7 +89,7 @@ export function WorkItemCard({
     () => normalizeSpecAndDirections(item.spec, item.shaping_notes),
     [item.spec, item.shaping_notes],
   );
-  const badge = getStateBadge(item.state, isBuildRunning);
+  const badge = getStateBadge(item.state, isBuildRunning, item.decision_reason);
   const BadgeIcon = badge.Icon;
 
   const isActivelyExecuting =
@@ -195,7 +201,11 @@ export function WorkItemCard({
                 <BadgeIcon size={11} />
                 {badge.label}
               </span>
-              <span className="badge" style={{ textTransform: 'lowercase' }}>
+              <span
+                className={`badge${item.kind === 'discovery' ? ' badge-purple' : ''}`}
+                style={{ textTransform: 'lowercase' }}
+              >
+                {item.kind === 'discovery' ? <Eye size={10} /> : null}
                 {item.kind}
               </span>
               {item.raised_by_role ? (

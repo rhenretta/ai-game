@@ -92,10 +92,10 @@ func _ready() -> void:
 
 
 @pytest.mark.skipif(not _HAS_DISPLAY, reason="viewport capture needs a display or xvfb")
-def test_lights_particles_and_shaders_render_in_capture_path():
+def test_lights_particles_and_shaders_render_in_capture_path(tmp_path):
     from engine.sim.godot_verifier import GodotHeadlessSimulator
 
-    probe = Path(__file__).parent / "_modern_effects_probe"
+    probe = tmp_path / "_modern_effects_probe"
     shutil.rmtree(probe, ignore_errors=True)
     probe.mkdir(parents=True)
     try:

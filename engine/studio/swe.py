@@ -53,7 +53,9 @@ from engine.studio.models import (
     bounded_thinking_config,
     call_gemini_with_transient_retry,
     compact_bible_json_for_prompt,
+    explicit_prefix_cache_scope,
     is_transient_gemini_error,
+    resolve_explicit_cached_request,
 )
 
 logger = logging.getLogger("LeadGameplaySWEAgent")
@@ -147,6 +149,8 @@ class LeadGameplaySWEAgent:
         self.voice_agent = voice_agent
         self.last_deliberation: Optional[str] = None
         self.last_diagnostic_test_scene_request: str = ""
+        self.last_inspection_report: str = ""
+        self.last_recommended_followups: List[str] = []
 
     def _discover_sealed_assets(self, staging_dir: Path) -> Dict[str, List[str]]:
         """Discovers visual sprites, tiles, backgrounds, UI widgets, character portraits, visual mockups, and audio clips sealed upstream into staging_dir/assets/."""
@@ -273,6 +277,9 @@ class LeadGameplaySWEAgent:
         max_gemini_retries = 3
         bundle = None
         last_exc = None
+        self.last_reroute_to_specialist = ""
+        self.last_reroute_brief = ""
+        self.last_reroute_target_paths: List[str] = []
         for g_attempt in range(1, max_gemini_retries + 1):
             try:
                 response = self.client.models.generate_content(
@@ -629,9 +636,44 @@ class LeadGameplaySWEAgent:
         Inspects existing code in staging_dir and sealed assets in staging_dir/assets/,
         generates or updates modular files, runs self-healing verification, and verifies cross-module imports.
         """
+        with explicit_prefix_cache_scope(self.client, ttl_seconds=360, reuse_outer=True):
+            return self._implement_requirement_track_inner(
+                track=track,
+                staging_dir=staging_dir,
+                requirements_spec=requirements_spec,
+                narrative_bible=narrative_bible,
+                world_spec=world_spec,
+                game_bible=game_bible,
+                prior_error=prior_error,
+                extra_image_paths=extra_image_paths,
+                board=board,
+                pre_write_hook=pre_write_hook,
+                commit_gate=commit_gate,
+                allowed_files=allowed_files,
+                stashed_bundle=stashed_bundle,
+            )
+
+    def _implement_requirement_track_inner(
+        self,
+        track: RequirementTrack,
+        staging_dir: Path,
+        requirements_spec: Optional[GameRequirementsSpec] = None,
+        narrative_bible: Optional[NarrativeBible] = None,
+        world_spec: Optional[Any] = None,
+        game_bible: Optional[Any] = None,
+        prior_error: Optional[str] = None,
+        extra_image_paths: Optional[List[str]] = None,
+        board: Optional[Any] = None,
+        pre_write_hook: Optional[Any] = None,
+        commit_gate: Optional[Any] = None,
+        allowed_files: Optional[Set[str]] = None,
+        stashed_bundle: Optional[TrackCodeSynthesisPayload] = None,
+    ) -> Dict[str, Path]:
         if self.client is None:
             raise StudioAgentError("LeadGameplaySWEAgent requires an active google.genai Client (Rule 5: Zero Silent Fallbacks)")
         self.last_diagnostic_test_scene_request = ""
+        self.last_inspection_report = ""
+        self.last_recommended_followups = []
 
         staging_dir.mkdir(parents=True, exist_ok=True)
         if stashed_bundle is not None:
@@ -683,7 +725,14 @@ class LeadGameplaySWEAgent:
         )
         active_curator: Optional[ContextCuratorAgent] = None
         already_included_cids: List[str] = []
-        seed_mods = list(getattr(track, "target_modules", None) or []) + list(existing_modules.keys())
+        raw_target_mods = [
+            str(m).strip().replace("\\", "/").replace("res://", "").lstrip("/")
+            for m in (getattr(track, "target_modules", None) or [])
+            if str(m).strip()
+        ]
+        allow_test_targets = any(m.startswith("tests/") for m in raw_target_mods)
+        excl_prefixes: Tuple[str, ...] = () if allow_test_targets else ("tests/",)
+        seed_mods = list(raw_target_mods) if raw_target_mods else ["main.gd"]
         if is_real_genai_client(self.client):
             multimodal_mockup_parts = []
             curator = ContextCuratorAgent(
@@ -713,21 +762,41 @@ class LeadGameplaySWEAgent:
                 extra_image_paths=extra_image_paths,
             )
             already_included_cids = [ch.chunk_id for ch in (pack.retrieved_chunks or [])]
-            # Load any subdirectory code modules selected by ContextCuratorAgent OR transitively imported (2 hops)
-            # by target_modules or loaded root modules (e.g., main.gd -> scripts/mechanics/*.gd, scenes.gd -> level_map.gd -> wind_shear_volume.gd)
+            # Load subdirectory production code modules selected by ContextCuratorAgent OR directly imported/called
+            # by focused `target_modules` (1-hop `imports` + 1-hop `imported_by`, avoiding full-cartridge fan-out
+            # across high-degree hub orchestrators whose unrelated leaf imports were not selected by ContextCuratorAgent).
             code_graph = curator.semantic_index.build_code_reference_graph()
             curated_mods: List[str] = []
             for ch in (pack.retrieved_chunks or []):
                 if ch.chunk_id.startswith("code:module:"):
-                    c_mod = ch.chunk_id[len("code:module:"):].strip()
+                    c_mod = ch.chunk_id[len("code:module:"):].strip().lstrip("/")
+                    if not allow_test_targets and c_mod.startswith("tests/"):
+                        continue
                     if c_mod and c_mod not in curated_mods:
                         curated_mods.append(c_mod)
+            focused_graph_seeds = [
+                sm
+                for sm in seed_mods
+                if len((code_graph.get(sm) or {}).get("imports") or []) <= 8
+            ]
+            graph_added_non_target = 0
+            seed_set = set(seed_mods)
             for trans_mod in curator.semantic_index.get_transitive_related_modules(
-                seed_mods, max_hops=2, code_graph=code_graph
+                focused_graph_seeds or seed_mods[:2],
+                max_hops=1,
+                code_graph=code_graph,
+                max_imported_by_hops=1,
+                exclude_prefixes=excl_prefixes,
             ):
                 if trans_mod and trans_mod not in curated_mods:
+                    if trans_mod not in seed_set:
+                        if graph_added_non_target >= 8:
+                            continue
+                        graph_added_non_target += 1
                     curated_mods.append(trans_mod)
             for c_mod in curated_mods:
+                if not allow_test_targets and c_mod.startswith("tests/"):
+                    continue
                 if c_mod not in existing_modules:
                     c_path = staging_dir / c_mod
                     if c_path.is_file():
@@ -748,10 +817,37 @@ class LeadGameplaySWEAgent:
                 )
                 lib.sanitize_misplaced_portraits_in_sprites_dir()
                 lib.save_catalog()
-                focused_parts.append(lib.build_prompt_summary_for_swe())
+                focused_parts.append(lib.build_prompt_summary_for_swe(compact=True))
             except Exception as lib_exc:
                 logger.debug("Could not build CartridgeAssetLibrary prompt summary: %s", lib_exc)
-            focused_parts.append(pack.prompt_block)
+            existing_norm_mods = {
+                str(k).strip().replace("\\", "/").replace("res://", "").lstrip("/")
+                for k in existing_modules.keys()
+            }
+            deduped_chunks = [
+                ch
+                for ch in (pack.retrieved_chunks or [])
+                if not (
+                    ch.chunk_id.startswith("code:module:")
+                    and ch.chunk_id[len("code:module:"):].strip().lstrip("/") in existing_norm_mods
+                )
+            ]
+            if len(deduped_chunks) != len(pack.retrieved_chunks or []) and pack.retrieved_chunks:
+                chunk_sections = "\n\n".join(
+                    f"[{c.chunk_id}] ({c.category}) {c.title}:\n{c.content}" for c in deduped_chunks
+                )
+                synth_txt = getattr(getattr(pack, "decision", None), "role_tailored_synthesis", "")
+                swe_curated_block = (
+                    f"\n=== SEMANTICALLY CURATED STUDIO CONTEXT (for swe_engineer on '{track.id}') ===\n"
+                    f"NEUTRAL CONTEXT MAP (factual inventory of retrieved chunks & cross-module links — evaluate and solve independently):\n"
+                    f"{synth_txt}\n\n"
+                    f"RETRIEVED & SELECTED STUDIO KNOWLEDGE CHUNKS ({len(deduped_chunks)} non-duplicate chunks; code modules already shown in EXISTING CARTRIDGE CODE IN STAGING omitted here):\n"
+                    f"{chunk_sections}\n"
+                    f"=== END CURATED STUDIO CONTEXT ===\n"
+                )
+            else:
+                swe_curated_block = pack.prompt_block
+            focused_parts.append(swe_curated_block)
             layout_file = staging_dir / "level_layout.json"
             if layout_file.is_file() and any(m in ("scenes.gd", "main.gd", "level_map.gd") for m in (track.target_modules or [])):
                 focused_parts.append(
@@ -764,7 +860,12 @@ class LeadGameplaySWEAgent:
         else:
             try:
                 offline_idx = CartridgeSemanticIndex(staging_dir)
-                for trans_mod in offline_idx.get_transitive_related_modules(seed_mods, max_hops=2):
+                for trans_mod in offline_idx.get_transitive_related_modules(
+                    seed_mods,
+                    max_hops=2,
+                    max_imported_by_hops=1,
+                    exclude_prefixes=excl_prefixes,
+                ):
                     if trans_mod and trans_mod not in existing_modules:
                         c_path = staging_dir / trans_mod
                         if c_path.is_file():
@@ -784,17 +885,32 @@ class LeadGameplaySWEAgent:
         ]
         criteria_context = "\n".join(criteria_lines) if criteria_lines else "Implement core requirement behavior headlessly."
 
-        target_module_set = {str(m).strip() for m in (getattr(track, "target_modules", None) or []) if str(m).strip()}
+        target_module_set = {
+            str(m).strip().replace("\\", "/").replace("res://", "").lstrip("/")
+            for m in (getattr(track, "target_modules", None) or [])
+            if str(m).strip()
+        }
         existing_code_summary = []
         summarized_only_mods: Set[str] = set()
         for mod_name, code in existing_modules.items():
-            error_references_mod = bool(prior_error and mod_name in prior_error)
+            norm_mod = str(mod_name).strip().replace("\\", "/").replace("res://", "").lstrip("/")
+            if not allow_test_targets and norm_mod.startswith("tests/"):
+                continue
+            error_references_mod = bool(prior_error and (mod_name in prior_error or norm_mod in prior_error))
             if (
-                mod_name.endswith(".gd")
+                norm_mod.endswith(".tscn")
                 and target_module_set
-                and mod_name not in target_module_set
+                and norm_mod not in target_module_set
+                and norm_mod != "main.tscn"
                 and not error_references_mod
-                and len(code) > 2000
+            ):
+                continue
+            if (
+                norm_mod.endswith(".gd")
+                and target_module_set
+                and norm_mod not in target_module_set
+                and not error_references_mod
+                and len(code) > 1200
             ):
                 summarized_only_mods.add(mod_name)
                 sig_summary = self._summarize_non_target_gd_module(mod_name, code)
@@ -903,10 +1019,7 @@ class LeadGameplaySWEAgent:
                 f"- Character Portraits (STRICTLY FOR DIALOGUE UI IN ui_hud.gd — NEVER use as world entity sprites!): {sealed_assets.get('portraits', [])}\n"
                 f"- 16:9 Visual Mockups (attached multimodally — match this camera perspective, palette, and multi-layer scene composition!): {sealed_assets.get('mockups', [])}\n"
                 f"- Audio: {sealed_assets['audio']}\n\n"
-                f"You are the Lead Gameplay SWE AI implementing requirement track {track.id}: '{track.title}' for a Code-First Godot 4.3 game cartridge.\n"
-                f"Description: {track.description}\n"
-                f"Target Modules: {track.target_modules}\n"
-                f"Acceptance Criteria:\n{criteria_context}\n\n"
+                f"EXISTING CARTRIDGE CODE IN STAGING:\n{existing_code_block}\n\n"
                 f"SELF-INQUIRY TOOL (`self_question` -> ContextCuratorAgent research -> `self_question_answer`):\n"
                 f"- If you need to verify an imported script's exact method/signal signature, node structure, shader uniform, or design spec that is not shown in your current context, do NOT guess!\n"
                 f"- Instead of outputting speculative code, output your specific question in `self_question` and leave `patches` and `files` empty (`[]`).\n"
@@ -919,11 +1032,20 @@ class LeadGameplaySWEAgent:
                 f"LONG-TERM MEMORY DISCIPLINE (`memory_query`, `memory_updates`):\n"
                 f"- Leave `memory_updates` EMPTY (`[]`) on routine turns! NEVER log what code you just wrote, restate the Game Bible/task spec, or record single-file local details.\n"
                 f"- Populate `memory_updates` ONLY when establishing a non-obvious cross-module invariant or hard-won runtime lesson that future tasks/slices would break without knowing (and prefer updating an existing `[mem_...]` ID over recording duplicates).\n\n"
-                f"EXISTING CARTRIDGE CODE IN STAGING:\n{existing_code_block}\n\n"
+                f"PEER RE-ROUTING (`reroute_to_specialist`, `operation_mode='reroute'`) & ORPHAN CLEANUP (`delete_paths`):\n"
+                f"- If inspecting the codebase proves this brief was sent to `swe_engineer` by mistake and the root cause actually belongs to another Specialist Persona (`'visual_artist'` for a blank/corrupted `.png` sprite or atlas, `'audio_designer'` for silent/broken `.wav` audio, `'script_writer'` for narrative JSON, or `'qa_test_engineer'` for `tests/test_*.gd`), set `reroute_to_specialist`, `reroute_brief`, optional `reroute_target_paths`, and `operation_mode='reroute'` (leaving `patches=[]` and `files=[]`).\n"
+                f"- When cleaning up obsolete/orphaned files inside the cartridge (never `project.godot`, `main.tscn`, `main.gd`, or `tests/*`), list them in `delete_paths`.\n"
+            )
+            dynamic_track_header = (
+                f"You are the Lead Gameplay SWE AI implementing requirement track {track.id}: '{track.title}' for a Code-First Godot 4.3 game cartridge.\n"
+                f"Description: {track.description}\n"
+                f"Target Modules: {track.target_modules}\n"
+                f"Acceptance Criteria:\n{criteria_context}\n\n"
                 f"{prior_error_block}"
             )
             response_model = TrackCodeSynthesisPayload
         else:
+            dynamic_track_header = ""
             prompt = (
                 f"You are the Lead Gameplay SWE AI implementing requirement track {track.id}: '{track.title}'.\n"
                 f"Description: {track.description}\n"
@@ -948,6 +1070,12 @@ class LeadGameplaySWEAgent:
 
         from google.genai import types
         from engine.studio.game_memory import GameMemoryStore, format_memory_query_results
+        from engine.studio.tool_registry import render_compact_tool_directory
+
+        swe_tool_dir = render_compact_tool_directory(
+            ["swe_engineer"], layer="specialist", active_persona="swe_engineer"
+        )
+        prompt = f"{prompt}\n\n{swe_tool_dir}"
 
         mem_store = GameMemoryStore(staging_dir, client=self.client)
         has_embed_client = callable(getattr(getattr(self.client, "models", None), "embed_content", None))
@@ -957,7 +1085,7 @@ class LeadGameplaySWEAgent:
                 prompt = f"{prompt}\n\n{role_mem_briefing}"
 
         max_gemini_retries = 3
-        max_inquiry_turns = 2 if (active_curator is not None or has_embed_client) else 0
+        max_inquiry_turns = 2
         resolved_inquiries: List[SelfInquiryQAPair] = (
             active_curator.load_self_inquiry_memory(track.id, "swe_engineer")
             if active_curator is not None
@@ -967,8 +1095,33 @@ class LeadGameplaySWEAgent:
         asked_questions: set[str] = {p.question.strip().lower() for p in resolved_inquiries if p.question}
         memory_query_blocks: List[str] = []
         asked_memory_queries: set[str] = set()
+        tool_search_blocks: List[str] = []
+        asked_tool_queries: set[str] = set()
         bundle = None
         last_exc = None
+        self.last_reroute_to_specialist = ""
+        self.last_reroute_brief = ""
+        self.last_reroute_target_paths: List[str] = []
+
+        static_mockup_parts: List[Any] = []
+        dynamic_proof_parts: List[Any] = []
+        if multimodal_mockup_parts:
+            idx_m = 0
+            while idx_m < len(multimodal_mockup_parts):
+                item_m = multimodal_mockup_parts[idx_m]
+                if isinstance(item_m, str) and idx_m + 1 < len(multimodal_mockup_parts):
+                    low_m = item_m.lower()
+                    target_bucket = (
+                        dynamic_proof_parts
+                        if ("filmstrip" in low_m or "captured proof" in low_m or "diagnostic" in low_m)
+                        else static_mockup_parts
+                    )
+                    target_bucket.append(item_m)
+                    target_bucket.append(multimodal_mockup_parts[idx_m + 1])
+                    idx_m += 2
+                else:
+                    static_mockup_parts.append(item_m)
+                    idx_m += 1
 
         for inquiry_turn in range(max_inquiry_turns + 1):
             inquiry_block = (
@@ -977,7 +1130,10 @@ class LeadGameplaySWEAgent:
                 else ""
             )
             mem_q_section = ("\n" + "\n".join(memory_query_blocks)) if memory_query_blocks else ""
-            turn_prompt = f"{prompt}\n{inquiry_block}{mem_q_section}" if (inquiry_block or mem_q_section) else prompt
+            tool_q_section = ("\n" + "\n".join(tool_search_blocks)) if tool_search_blocks else ""
+            extra_sections = f"{inquiry_block}{mem_q_section}{tool_q_section}"
+            dynamic_tail_base = f"{dynamic_track_header}\n{extra_sections}".strip() if is_godot else extra_sections.strip()
+            turn_prompt = f"{prompt}\n\n{dynamic_tail_base}".strip() if dynamic_tail_base else prompt
             try:
                 from engine.studio.workers import record_turn_epistemic_context, record_turn_substep
                 record_turn_epistemic_context(
@@ -998,24 +1154,58 @@ class LeadGameplaySWEAgent:
             attempt_validation_note = ""
             for g_attempt in range(1, max_gemini_retries + 1):
                 try:
-                    eff_turn_prompt = (
-                        f"{turn_prompt}\n\n{attempt_validation_note}" if attempt_validation_note else turn_prompt
+                    eff_dynamic_tail = (
+                        f"{dynamic_tail_base}\n\n{attempt_validation_note}".strip()
+                        if attempt_validation_note
+                        else dynamic_tail_base
                     )
-                    contents_payload: Any = (
-                        [eff_turn_prompt] + multimodal_mockup_parts
-                        if (multimodal_mockup_parts and self._is_live_genai_client())
-                        else eff_turn_prompt
+                    if self._is_live_genai_client() and is_godot and (static_mockup_parts or dynamic_proof_parts):
+                        # Static byte-0 prefix (`prompt` + `static_mockup_parts`) stays 100% invariant across
+                        # self-inquiry, memory_query, tool_search_query, and validation-retry turns (>= 4,096 tok)
+                        contents_payload = (
+                            [prompt]
+                            + static_mockup_parts
+                            + ([eff_dynamic_tail] if eff_dynamic_tail else [])
+                            + dynamic_proof_parts
+                        )
+                    else:
+                        # When zero binary media parts exist, `eff_turn_prompt` is a single string whose byte-0
+                        # prefix is still `prompt` (`turn_prompt = f"{prompt}\n\n{dynamic_tail_base}"`), preserving
+                        # implicit cache invariance while keeping string-only clients unified.
+                        eff_turn_prompt = (
+                            f"{turn_prompt}\n\n{attempt_validation_note}" if attempt_validation_note else turn_prompt
+                        )
+                        contents_payload = (
+                            [eff_turn_prompt] + multimodal_mockup_parts
+                            if (multimodal_mockup_parts and self._is_live_genai_client())
+                            else eff_turn_prompt
+                        )
+                    swe_prefix_parts: List[Any] = [prompt] + static_mockup_parts
+                    swe_tail_parts: List[Any] = (
+                        ([eff_dynamic_tail] if eff_dynamic_tail else [])
+                        + dynamic_proof_parts
+                    )
+                    eff_swe_contents, swe_cached_name = resolve_explicit_cached_request(
+                        self.client,
+                        model=self.model_name,
+                        prefix_parts=swe_prefix_parts,
+                        tail_parts=swe_tail_parts,
+                        unsplit_contents=contents_payload,
+                        min_calls_before_create=2,
+                        display_name=f"swe_{track.id}",
+                    )
+                    swe_gen_cfg = types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=response_model,
+                        thinking_config=bounded_thinking_config(2048),
+                        **({"cached_content": swe_cached_name} if swe_cached_name else {}),
                     )
                     lbl_suffix = f":q{inquiry_turn}" if inquiry_turn > 0 else ""
                     response = call_gemini_with_transient_retry(
                         lambda: self.client.models.generate_content(
                             model=self.model_name,
-                            contents=contents_payload,
-                            config=types.GenerateContentConfig(
-                                response_mime_type="application/json",
-                                response_schema=response_model,
-                                thinking_config=bounded_thinking_config(2048),
-                            ),
+                            contents=eff_swe_contents,
+                            config=swe_gen_cfg,
                         ),
                         label=f"implement_requirement_track[{track.id}:a{g_attempt}{lbl_suffix}]",
                     )
@@ -1028,8 +1218,13 @@ class LeadGameplaySWEAgent:
                         or "patches" in bundle_dict
                         or "self_question" in bundle_dict
                         or "memory_query" in bundle_dict
+                        or "tool_search_query" in bundle_dict
+                        or "inspection_report" in bundle_dict
+                        or "operation_mode" in bundle_dict
                         or "memory_updates" in bundle_dict
                         or "diagnostic_test_scene_request" in bundle_dict
+                        or "reroute_to_specialist" in bundle_dict
+                        or "delete_paths" in bundle_dict
                     ):
                         cand_bundle = TrackCodeSynthesisPayload(**bundle_dict)
                         self._validate_no_qa_test_harness_edits(cand_bundle, track)
@@ -1046,6 +1241,24 @@ class LeadGameplaySWEAgent:
                     self.last_diagnostic_test_scene_request = (
                         getattr(bundle, "diagnostic_test_scene_request", "") or ""
                     ).strip()
+                    self.last_inspection_report = (
+                        getattr(bundle, "inspection_report", "") or ""
+                    ).strip()
+                    self.last_recommended_followups = [
+                        str(x).strip()
+                        for x in (getattr(bundle, "recommended_followups", None) or [])
+                        if str(x).strip()
+                    ]
+                    from engine.studio.tool_registry import normalize_specialist_persona
+
+                    raw_reroute = normalize_specialist_persona(getattr(bundle, "reroute_to_specialist", "") or "")
+                    self.last_reroute_to_specialist = raw_reroute if raw_reroute != "swe_engineer" else ""
+                    self.last_reroute_brief = (getattr(bundle, "reroute_brief", "") or "").strip()
+                    self.last_reroute_target_paths = [
+                        str(p).strip()
+                        for p in (getattr(bundle, "reroute_target_paths", None) or [])
+                        if str(p).strip()
+                    ]
                     break
                 except CodeVerificationError as cv_exc:
                     last_exc = cv_exc
@@ -1101,8 +1314,15 @@ class LeadGameplaySWEAgent:
                         pass
                 pending_question_pack = None
 
-            # 2. If the agent emitted implementation files or surgical patches (or is OpenGenreCartridgeBundle), we are done!
-            if not isinstance(bundle, TrackCodeSynthesisPayload) or bundle.files or bundle.patches:
+            # 2. If the agent emitted implementation files, surgical patches, deletions, or a peer reroute, we are done!
+            if (
+                not isinstance(bundle, TrackCodeSynthesisPayload)
+                or bundle.files
+                or bundle.patches
+                or getattr(bundle, "delete_paths", None)
+                or getattr(bundle, "operation_mode", "edit") == "reroute"
+                or bool(self.last_reroute_to_specialist)
+            ):
                 break
 
             # 3. Otherwise, if `files` is empty and the agent asked a `self_question`, have ContextCuratorAgent research it
@@ -1167,6 +1387,29 @@ class LeadGameplaySWEAgent:
                     format_memory_query_results(mem_q, bundle.memory_query_bank, mem_hits)
                 )
                 continue
+
+            # 5. Or if `files`/`patches` are empty and the agent issued `tool_search_query`, expand Studio tool capabilities
+            tool_q = (getattr(bundle, "tool_search_query", "") or "").strip()
+            if tool_q and inquiry_turn < max_inquiry_turns and tool_q.lower() not in asked_tool_queries:
+                asked_tool_queries.add(tool_q.lower())
+                tool_curator = active_curator
+                if tool_curator is None:
+                    from engine.studio.context_curator import ContextCuratorAgent
+
+                    tool_curator = ContextCuratorAgent(
+                        cartridge_dir=staging_dir,
+                        client=self.client,
+                        model_name=self.model_name,
+                    )
+                t_block = tool_curator.research_tool_capabilities(
+                    tool_q,
+                    caller_role="swe_engineer",
+                    item_id=track.id,
+                    allowed_specialists=["swe_engineer"],
+                )
+                if t_block:
+                    tool_search_blocks.append(t_block)
+                    continue
             break
 
         if bundle is None:
@@ -1174,6 +1417,57 @@ class LeadGameplaySWEAgent:
             if isinstance(last_exc, (CodeVerificationError, StudioAgentError)):
                 raise last_exc
             raise StudioAgentError(f"LeadGameplaySWEAgent failed for requirement track {track.id}: {last_exc}") from last_exc
+
+        if (
+            isinstance(bundle, TrackCodeSynthesisPayload)
+            and not bundle.files
+            and not bundle.patches
+            and not bundle.requested_assets
+            and not getattr(bundle, "delete_paths", None)
+            and (
+                getattr(bundle, "operation_mode", "edit") == "reroute"
+                or bool(self.last_reroute_to_specialist)
+            )
+        ):
+            try:
+                from engine.studio.workers import record_turn_substep
+
+                record_turn_substep(
+                    "rerouting_specialist",
+                    f"SWE Engineer re-routing brief to '{self.last_reroute_to_specialist}': {(self.last_reroute_brief or bundle.deliberation)[:180]}",
+                    details={
+                        "from": "swe_engineer",
+                        "to": self.last_reroute_to_specialist,
+                        "reroute_brief": self.last_reroute_brief,
+                        "reroute_target_paths": self.last_reroute_target_paths,
+                    },
+                )
+            except Exception:
+                pass
+            return {}
+
+        if (
+            isinstance(bundle, TrackCodeSynthesisPayload)
+            and not bundle.files
+            and not bundle.patches
+            and not bundle.requested_assets
+            and not getattr(bundle, "delete_paths", None)
+            and (
+                getattr(bundle, "operation_mode", "edit") == "inspect_only"
+                or bool(self.last_inspection_report)
+            )
+        ):
+            try:
+                from engine.studio.workers import record_turn_substep
+
+                record_turn_substep(
+                    "architecture_inspection_completed",
+                    f"SWE Engineer completed read-only architecture inspection ({len(self.last_inspection_report)} chars)",
+                    details={"inspection_report": self.last_inspection_report[:500]},
+                )
+            except Exception:
+                pass
+            return {}
 
         if (
             isinstance(bundle, TrackCodeSynthesisPayload)
@@ -2628,7 +2922,10 @@ class LeadGameplaySWEAgent:
             # Static prefix placed strictly at token 0 so Gemini implicit context caching hits across Phase 1 -> Phase 2 Hop 1 -> Hop 2!
             shared_static_prefix = (
                 "You are the Lead Gameplay SWE Agent performing surgical Godot 4 (.gd) debugging and patching.\n"
-                "Always provide `deliberation` strictly first in every JSON response (Rule 4).\n\n"
+                "Always provide `deliberation` strictly first in every JSON response (Rule 4).\n"
+                "SURGICAL PATCH INVARIANTS:\n"
+                "- Emit focused `SurgicalCodePatch` items replacing ONLY the defective contiguous line ranges `[start_line..end_line]` (max 40-65 lines) without line-number prefixes (` 196: `) and preserving exact tab (`\\t`) indentation.\n"
+                "- Never reference `AssetLib` or `res://asset_library.gd`. Load PNG textures via `Image.load_from_file(ProjectSettings.globalize_path(res_path))` and `ImageTexture.create_from_image(img)` (`tex.set_meta('source_path', res_path)`), or `StudioRigHelper` (`res://src/studio_rig_and_collider.gd`). When tiling UVs > 1.0, set `texture_repeat = CanvasItem.TEXTURE_REPEAT_ENABLED`.\n\n"
                 f"--- CARTRIDGE SYMBOL & REFERENCE INDEX ---\n{symbol_index}\n\n"
                 + (f"{asset_summary}\n\n" if asset_summary else "")
             )

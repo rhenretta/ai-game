@@ -971,18 +971,16 @@ class TestMultiAgentSignOffCouncilAndHiDPI:
         assert "textures/canvas_textures/default_texture_filter=2" in updated
 
     def test_ast_inspector_catches_chipmunk_44100_and_unbound_sprites(self, tmp_path: Path):
+        """Verifies CandidateASTInspector flags genuine hollow stubs and missing cross-module methods
+        without imposing hardcoded sample-rate (44100) or unbound-sprite regex heuristics."""
         (tmp_path / "project.godot").write_text("config_version=5\n", encoding="utf-8")
         sprites_dir = tmp_path / "assets" / "sprites"
         sprites_dir.mkdir(parents=True)
         (sprites_dir / "hero_ship.png").write_bytes(b"png")
         (sprites_dir / "orphan_prop_1.png").write_bytes(b"png")
-        (sprites_dir / "orphan_prop_2.png").write_bytes(b"png")
-        audio_dir = tmp_path / "assets" / "audio"
-        audio_dir.mkdir(parents=True)
-        (audio_dir / "voice_01.wav").write_bytes(b"RIFF" + b"\x00" * 100)
 
         (tmp_path / "main.gd").write_text(
-            'extends Node2D\nfunc _ready():\n\tvar x = 1\nfunc _process(delta):\n\tdraw_circle(Vector2.ZERO, 5.0, Color.WHITE)\n',
+            'extends Node2D\nfunc _ready():\n\tif self.has_method("nonexistent_hook"):\n\t\tvar x = 1\nfunc stub_action():\n\tpass\n',
             encoding="utf-8",
         )
         (tmp_path / "ui_hud.gd").write_text(
@@ -993,70 +991,66 @@ class TestMultiAgentSignOffCouncilAndHiDPI:
         report = inspector.inspect_directory(tmp_path)
         assert report["has_critical_stubs"] is True
         reasons = [s.get("reason", "") for s in report["hollow_stubs"]]
-        assert any("44100" in r for r in reasons)
-        assert any("orphan_prop_1.png" in r for r in reasons)
+        assert any("nonexistent_hook" in r for r in reasons)
+        assert not any("44100" in r for r in reasons)
+        assert not any("orphan_prop_1.png" in r for r in reasons)
 
     def test_multi_agent_sign_off_council_enforces_hard_invariants(self, tmp_path: Path):
-        from engine.supervisor.challenger import MultiAgentSignOffCouncil, SPECIALIST_COUNCIL_ROLES
-        from engine.supervisor.models import MultiAgentSignOffReport, SpecialistSignOffVerdict
+        from engine.supervisor.challenger import ChallengerGate, MultiAgentSignOffCouncil, SPECIALIST_COUNCIL_ROLES
+        from engine.supervisor.models import (
+            ChallengerGateEvaluation,
+            MultiAgentSignOffReport,
+            SpecialistSignOffVerdict,
+        )
 
         council = MultiAgentSignOffCouncil()
-        initial_report = MultiAgentSignOffReport(
-            deliberation="Initial LLM council evaluation.",
+        vetoed_report = MultiAgentSignOffReport(
+            deliberation="LLM council specialists vetoed candidate build.",
             candidate_id="test_cand_01",
-            unanimous_approval=True,
+            unanimous_approval=True,  # _normalize_sign_off_report enforces logical unanimity from verdicts
             verdicts=[
                 SpecialistSignOffVerdict(
-                    deliberation="Looks okay at first glance.",
+                    deliberation="Specialist audit.",
                     specialist_role=role,
-                    approved=True,
+                    approved=(role == "StoryWorldArchitect"),
+                    blocking_defects=[] if role == "StoryWorldArchitect" else [f"{role} found blocking defect"],
                 )
                 for role in SPECIALIST_COUNCIL_ROLES
             ],
         )
-
-        ast_grounding = {
-            "hollow_stubs": [
-                {
-                    "module": "ui_hud.gd",
-                    "function": "play_voice_clip",
-                    "stmt": "stream.mix_rate = 44100",
-                    "reason": "AudioAtmosphereDesigner veto: mix_rate=44100 chipmunk distortion.",
-                },
-                {
-                    "module": "scenes.gd",
-                    "function": "load_sprites",
-                    "stmt": "unbound sprites",
-                    "reason": "VisualArtDirector veto: synthesized PNG sprites in assets/sprites/ are never loaded.",
-                },
-            ]
-        }
-        telemetry_grounding = {
-            "is_stagnant_or_frozen": True,
-            "scene_audit": {
-                "fullscreen_occlusion_detected": True,
-                "audio_players_found": 1,
-                "audio_streams_loaded": 1,
-                "audio_mix_rates": [44100],
-            },
-        }
-        visual_grounding = {
-            "blank_canvas_detected": False,
-            "captured_frame_paths": ["assets/playtest_captures/playtest_t0.png"],
-        }
-
-        enforced = council._enforce_specialist_invariants(
-            report=initial_report,
+        normalized = council._normalize_sign_off_report(
+            report=vetoed_report,
             candidate_id="test_cand_01",
-            ast_grounding=ast_grounding,
-            telemetry_grounding=telemetry_grounding,
-            visual_grounding=visual_grounding,
+            captured_paths=["assets/playtest_captures/playtest_t0.png"],
         )
-        assert enforced.unanimous_approval is False
-        veto_roles = [v.specialist_role for v in enforced.verdicts if not v.approved]
+        assert normalized.unanimous_approval is False
+        veto_roles = [v.specialist_role for v in normalized.verdicts if not v.approved]
         assert "AudioAtmosphereDesigner" in veto_roles
         assert "VisualArtDirector" in veto_roles
         assert "UXExperienceDesigner" in veto_roles
         assert "GameplayDesigner" in veto_roles
         assert "CreativeDirector" in veto_roles
+
+        gate = ChallengerGate(client=None)
+        spec = GameRequirementsSpec(deliberation="d", game_title="G", requirements=[])
+        final_eval = gate._finalize_structural_evaluation(
+            evaluation=ChallengerGateEvaluation(
+                deliberation="d",
+                candidate_id="test_cand_01",
+                overall_verdict=True,
+                evaluated_requirements=[],
+                specialist_sign_off=normalized,
+            ),
+            spec=spec,
+            ast_grounding={"hollow_stubs": []},
+            telemetry_grounding={"crashed": True, "error": "Null instance call"},
+            visual_grounding={"blank_canvas_detected": True},
+            candidate_id="test_cand_01",
+            episode_number=1,
+            attempt_number=1,
+        )
+        assert final_eval.overall_verdict is False
+        assert final_eval.rejection_trace is not None
+        assert "Runtime Crash" in final_eval.rejection_trace.failure_reason
+        assert "Blank canvas" in final_eval.rejection_trace.failure_reason
 

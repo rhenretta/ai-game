@@ -6,6 +6,7 @@ import {
   deriveLiveStudioActivity,
   formatRelativeSeconds,
   formatTokenCount,
+  formatUsdCost,
   summarizeSwarmEvent,
 } from '../src/domain/liveActivity';
 import { deriveLiveItemUpdate } from '../src/realtime/useSwarmSocket';
@@ -383,5 +384,74 @@ describe('deriveLiveStudioActivity & summarizeSwarmEvent', () => {
     expect(cssSource).toMatch(
       /\.live-activity-headline\s*\{[^}]*-webkit-line-clamp:\s*1;[\s\S]*?line-clamp:\s*1;[\s\S]*?overflow:\s*clip;/,
     );
+  });
+
+  it('surfaces cached token share, media synthesis counts, and USD cost telemetry', () => {
+    expect(formatUsdCost(0)).toBe('$0.00');
+    expect(formatUsdCost(0.0004)).toBe('<$0.001');
+    expect(formatUsdCost(0.0142)).toBe('$0.014');
+    expect(formatUsdCost(1.428)).toBe('$1.43');
+
+    const bible = buildSyntheticBible();
+    const cachedCallEvent: SwarmStreamEvent = {
+      event_id: 'ev_cached_1',
+      deliberation: 'Completed cached Gemini call.',
+      event_type: 'studio_live_activity',
+      agent_name: 'TaskLead',
+      timestamp_utc: '2026-10-31T18:10:00Z',
+      payload: {
+        phase: 'llm_gateway_call',
+        label: 'TaskLead.plan_task_lead_turn[mech_01:t2]',
+        total_calls: 42,
+        token_stats: {
+          prompt_tokens: 18000,
+          cached_tokens: 15000,
+          output_tokens: 450,
+          thought_tokens: 350,
+          total_tokens: 18800,
+          estimated_call_cost_usd: 0.0064,
+          session_estimated_cost_usd: 0.284,
+          session_cache_hit_pct: 76.4,
+        },
+      },
+    };
+    const act = deriveLiveStudioActivity({
+      bible,
+      recentEvents: [cachedCallEvent],
+      liveStepsByItem: {},
+    });
+    expect(act.latestAiCall?.cachedTokens).toBe(15000);
+    expect(act.latestAiCall?.estimatedCallCostUsd).toBe(0.0064);
+    expect(act.latestAiCall?.sessionEstimatedCostUsd).toBe(0.284);
+    expect(act.latestAiCall?.sessionCacheHitPct).toBe(76.4);
+
+    const row = summarizeSwarmEvent(cachedCallEvent);
+    expect(row.badgeTone).toBe('ok');
+    expect(row.subtitle).toContain('15.0k tok cached');
+    expect(row.subtitle).toContain('est $0.006');
+
+    const imageSynthEvent: SwarmStreamEvent = {
+      event_id: 'ev_img_1',
+      deliberation: 'Completed Imagen call.',
+      event_type: 'studio_live_activity',
+      agent_name: 'AssetFabricator',
+      timestamp_utc: '2026-10-31T18:10:05Z',
+      payload: {
+        phase: 'llm_gateway_call',
+        label: 'AssetFabricator.generate_images[hero_rig]',
+        total_calls: 43,
+        token_stats: {
+          total_tokens: 0,
+          thought_tokens: 0,
+          image_count: 1,
+          estimated_call_cost_usd: 0.04,
+          session_estimated_cost_usd: 0.324,
+        },
+      },
+    };
+    const imgRow = summarizeSwarmEvent(imageSynthEvent);
+    expect(imgRow.badgeText).toBe('1 img');
+    expect(imgRow.subtitle).toContain('1 synthesized image');
+    expect(imgRow.subtitle).toContain('est $0.040');
   });
 });

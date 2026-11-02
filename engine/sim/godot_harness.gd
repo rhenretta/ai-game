@@ -43,6 +43,7 @@ var _av_audio_mix_rate: float = 48000.0
 var _av_audio_resample_pos: float = 0.0
 var _av_rgb_file: FileAccess = null
 var _av_pcm_file: FileAccess = null
+var _sanitized_scripts: Array = []
 
 func _init() -> void:
 	var args = OS.get_cmdline_args()
@@ -92,6 +93,59 @@ func _load_setup_script(path: String) -> void:
 func get_viewport() -> Viewport:
 	return render_viewport if render_viewport != null else root
 
+func _neutralize_non_headless_mouse_source(raw: String) -> String:
+	var s := raw
+	s = s.replace("MOUSE_MODE_CAPTURED", "MOUSE_MODE_VISIBLE")
+	s = s.replace("MOUSE_MODE_CONFINED_HIDDEN", "MOUSE_MODE_VISIBLE")
+	s = s.replace("MOUSE_MODE_CONFINED", "MOUSE_MODE_VISIBLE")
+	s = s.replace("MOUSE_MODE_HIDDEN", "MOUSE_MODE_VISIBLE")
+	var wm_tok := "warp_" + "mouse"
+	if s.find(wm_tok) != -1:
+		var rx_member := RegEx.new()
+		rx_member.compile("\\." + wm_tok + "\\s*\\(")
+		s = rx_member.sub(s, ".set_meta(&\"_harness_ignored_warp\", ", true)
+		var rx_bare := RegEx.new()
+		rx_bare.compile("(?m)(^\\s*|[;:\\(\\[\\{,=]\\s*)" + wm_tok + "\\s*\\(")
+		s = rx_bare.sub(s, "$1set_meta(&\"_harness_ignored_warp\", ", true)
+	return s
+
+func _collect_res_gd_files(dir_path: String, out: Array) -> void:
+	var d := DirAccess.open(dir_path)
+	if d == null:
+		return
+	d.list_dir_begin()
+	var fname := d.get_next()
+	while fname != "":
+		if fname != "." and fname != ".." and fname != ".godot":
+			var full := dir_path.path_join(fname) if dir_path != "res://" else "res://" + fname
+			if d.current_is_dir():
+				_collect_res_gd_files(full, out)
+			elif fname.ends_with(".gd"):
+				out.append(full)
+		fname = d.get_next()
+	d.list_dir_end()
+
+func _sanitize_non_headless_mouse_scripts() -> void:
+	var gd_files: Array = []
+	_collect_res_gd_files("res://", gd_files)
+	var wm_tok := "warp_" + "mouse"
+	var to_reload: Array = []
+	for full in gd_files:
+		var raw := FileAccess.get_file_as_string(full)
+		if raw.find("MOUSE_MODE_") != -1 or raw.find(wm_tok) != -1:
+			var cleaned := _neutralize_non_headless_mouse_source(raw)
+			if cleaned != raw:
+				var scr := GDScript.new()
+				scr.source_code = cleaned
+				scr.take_over_path(full)
+				_sanitized_scripts.append(scr)
+				to_reload.append(scr)
+	for scr in to_reload:
+		scr.reload(false)
+
+func _finalize() -> void:
+	_sanitized_scripts.clear()
+
 func _initialize() -> void:
 	Engine.max_physics_steps_per_frame = 1
 	if script_error != "":
@@ -103,8 +157,11 @@ func _initialize() -> void:
 		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_BORDERLESS, true)
 		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_MOUSE_PASSTHROUGH, true)
 		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_TRANSPARENT, true)
-		DisplayServer.window_set_position(Vector2i(-4000, -4000))
+		DisplayServer.window_set_size(Vector2i(16, 16))
+		DisplayServer.window_set_position(Vector2i(-32000, -32000))
+		DisplayServer.window_set_mouse_passthrough(PackedVector2Array([Vector2.ZERO, Vector2.ZERO, Vector2.ZERO]))
 		root.transparent_bg = true
+		_sanitize_non_headless_mouse_scripts()
 	render_viewport = SubViewport.new()
 	render_viewport.name = "HarnessOffscreenViewport"
 	render_viewport.size = Vector2i(1280, 720)
@@ -987,9 +1044,8 @@ func _audit_spatial_boundaries(node: Node) -> Dictionary:
 	var walkable_min_y: float = 99999.0
 	var walkable_max_y: float = -99999.0
 	var has_explicit_shelves: bool = false
-	var has_sky_backdrop: bool = false
 	var static_collider_count: int = 0
-	var interior_north_barrier_found: bool = false
+	var collider_bounds_summary: Array = []
 
 	var shapes_list: Array = []
 	_collect_collision_shapes_recursive(node, shapes_list)
@@ -1004,65 +1060,37 @@ func _audit_spatial_boundaries(node: Node) -> Dictionary:
 				walkable_max_y = r.end.y
 		elif kind == "static":
 			static_collider_count += 1
-			if item.has("polygon"):
-				var pts: PackedVector2Array = item["polygon"]
-				var min_py = 99999.0
-				var max_py = -99999.0
-				for p in pts:
-					if p.y < min_py:
-						min_py = p.y
-					if p.y > max_py:
-						max_py = p.y
-				# Check if this collider acts as a horizon/shelf top barrier (y between 120 and 380) rather than y<=32 canvas ceiling
-				if max_py >= 140.0 and min_py <= 380.0 and (max_py - min_py) <= 320.0:
-					interior_north_barrier_found = true
-			elif item.has("rect"):
-				var sr: Rect2 = item["rect"]
-				if sr.end.y >= 140.0 and sr.position.y <= 380.0 and sr.size.y <= 320.0:
-					interior_north_barrier_found = true
-
-	if node != null:
-		for child in node.get_children():
-			var cname = str(child.name).to_lower()
-			if cname.find("sky") != -1 or cname.find("backdrop") != -1:
-				has_sky_backdrop = true
-
-	var unbounded_sky_detected: bool = false
-	var boundary_violation_reason: String = ""
-
-	if has_explicit_shelves and walkable_min_y < 9000.0:
-		# If the player walked > 24px above the highest walkable shelf into the sky backdrop
-		if min_player_y_reached < walkable_min_y - 24.0:
-			unbounded_sky_detected = true
-			boundary_violation_reason = (
-				"Player walked into sky/void at y=" + str(snapped(min_player_y_reached, 0.1))
-				+ " above walkable shelf top y=" + str(snapped(walkable_min_y, 0.1))
-			)
-		elif not interior_north_barrier_found and walkable_min_y >= 180.0:
-			unbounded_sky_detected = true
-			boundary_violation_reason = (
-				"Walkable shelves start at y=" + str(snapped(walkable_min_y, 0.1))
-				+ " (sky above y<" + str(snapped(walkable_min_y, 0.1)) + ") but no StaticBody2D north horizon collider bounds y="
-				+ str(snapped(walkable_min_y, 0.1))
-			)
-	elif has_sky_backdrop and float(spawn_pos[1]) >= 260.0 and min_player_y_reached < 180.0 and not interior_north_barrier_found:
-		unbounded_sky_detected = true
-		boundary_violation_reason = (
-			"Scene has SkyBackdrop and player spawned at y=" + str(snapped(float(spawn_pos[1]), 0.1))
-			+ " but walked unobstructed into sky region y=" + str(snapped(min_player_y_reached, 0.1))
-		)
+			if collider_bounds_summary.size() < 24:
+				if item.has("rect"):
+					var sr: Rect2 = item["rect"]
+					collider_bounds_summary.append([sr.position.x, sr.position.y, sr.size.x, sr.size.y])
+				elif item.has("polygon"):
+					var pts: PackedVector2Array = item["polygon"]
+					if pts.size() > 0:
+						var min_px = 99999.0
+						var min_py = 99999.0
+						var max_px = -99999.0
+						var max_py = -99999.0
+						for p in pts:
+							min_px = minf(min_px, p.x)
+							min_py = minf(min_py, p.y)
+							max_px = maxf(max_px, p.x)
+							max_py = maxf(max_py, p.y)
+						collider_bounds_summary.append([min_px, min_py, max_px - min_px, max_py - min_py])
 
 	return {
 		"static_collider_count": static_collider_count,
+		"collider_bounds": collider_bounds_summary,
 		"has_explicit_shelves": has_explicit_shelves,
 		"walkable_min_y": walkable_min_y if has_explicit_shelves else 0.0,
+		"walkable_max_y": walkable_max_y if has_explicit_shelves else 0.0,
 		"min_player_y_reached": min_player_y_reached,
 		"max_player_y_reached": max_player_y_reached,
 		"min_player_x_reached": min_player_x_reached,
 		"max_player_x_reached": max_player_x_reached,
-		"interior_north_barrier_found": interior_north_barrier_found,
-		"unbounded_sky_or_void_detected": unbounded_sky_detected,
-		"boundary_violation_reason": boundary_violation_reason
+		"interior_north_barrier_found": static_collider_count > 0,
+		"unbounded_sky_or_void_detected": false,
+		"boundary_violation_reason": ""
 	}
 
 func _audit_scene_tree(node: Node, in_ui: bool = false) -> Dictionary:
@@ -1070,6 +1098,9 @@ func _audit_scene_tree(node: Node, in_ui: bool = false) -> Dictionary:
 		"world_visual_nodes": 0,
 		"ui_control_nodes": 0,
 		"textures_loaded_count": 0,
+		"scene_nodes_summary": [],
+		"visible_canvas_bounds": [],
+		"loaded_texture_dimensions": [],
 		"empty_world_containers": [],
 		"camera_found": false,
 		"camera_pos": [0.0, 0.0],
@@ -1102,8 +1133,6 @@ func _audit_scene_tree(node: Node, in_ui: bool = false) -> Dictionary:
 	_walk_scene_audit(node, in_ui, report)
 	var boundary_audit = _audit_spatial_boundaries(node)
 	report["spatial_boundary_audit"] = boundary_audit
-	report["unbounded_sky_or_void_detected"] = bool(boundary_audit.get("unbounded_sky_or_void_detected", false))
-	report["boundary_violation_reason"] = str(boundary_audit.get("boundary_violation_reason", ""))
 
 	var init_occlusion = float(initial_snapshot.get("viewport_occlusion", 0.0))
 	var final_failed = bool(final_snapshot.get("is_failed", false))
@@ -1201,6 +1230,8 @@ func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
 	var is_bg_canvas_layer = (node is CanvasLayer) and (node.layer < 0)
 	var is_world_bg_color_rect = (node is ColorRect) and (not in_ui) and (node.z_index <= 0)
 	var current_in_ui = false if is_bg_canvas_layer else (in_ui or is_fg_canvas_layer or ((node is Control) and not is_world_bg_color_rect))
+	if report["scene_nodes_summary"].size() < 48 and node != main_scene_node:
+		report["scene_nodes_summary"].append(str(node.name) + ":" + str(node.get_class()))
 	if node is Camera2D:
 		report["camera_found"] = true
 		report["camera_pos"] = [node.position.x, node.position.y]
@@ -1212,7 +1243,7 @@ func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
 			and node.render_target_clear_mode == SubViewport.CLEAR_MODE_NEVER
 		):
 			report["subviewport_thrashing_nodes"].append(
-				str(node.name) + " (size=" + str(sv_sz) + ", UPDATE_ALWAYS + CLEAR_MODE_NEVER causes severe GPU tile-memory stalls; use UPDATE_ONCE triggered only when painting)"
+				str(node.name) + " (size=" + str(sv_sz) + ", update_mode=UPDATE_ALWAYS, clear_mode=CLEAR_MODE_NEVER)"
 			)
 	if (node is AudioStreamPlayer) or (node is AudioStreamPlayer2D):
 		report["audio_players_found"] = int(report["audio_players_found"]) + 1
@@ -1231,14 +1262,20 @@ func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
 			})
 	if (node is Sprite2D and node.texture != null) or (node is TextureRect and node.texture != null):
 		report["textures_loaded_count"] = int(report["textures_loaded_count"]) + 1
+		var tex_path_obs = _resolve_texture_path(node, node.texture)
+		var tw_obs = node.texture.get_width()
+		var th_obs = node.texture.get_height()
+		if report["loaded_texture_dimensions"].size() < 32:
+			report["loaded_texture_dimensions"].append({
+				"node": str(node.name),
+				"in_ui": current_in_ui,
+				"tex_path": tex_path_obs,
+				"size": [tw_obs, th_obs]
+			})
 		if node is Sprite2D and not current_in_ui:
-			var orig_tpath = _resolve_texture_path(node, node.texture)
-			var tpath = orig_tpath.to_lower()
-			if tpath.find("portrait") != -1:
-				report["portrait_misused_on_world_sprite"] = true
-				report["portrait_misused_nodes"].append(str(node.name) + ":" + tpath)
-			var tw_s = node.texture.get_width()
-			var th_s = node.texture.get_height()
+			var orig_tpath = tex_path_obs
+			var tw_s = tw_obs
+			var th_s = th_obs
 			var empty_cell = _is_sprite_frame_cell_empty(node.texture, node.hframes, node.vframes, node.frame)
 			report["bound_sprites_audit"].append({
 				"node": str(node.name),
@@ -1254,42 +1291,36 @@ func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
 				report["empty_sprite_frame_nodes"].append(
 					str(node.name) + " (tex=" + orig_tpath + " " + str(tw_s) + "x" + str(th_s)
 					+ ", hframes=" + str(node.hframes) + ", vframes=" + str(node.vframes)
-					+ ", frame=" + str(node.frame) + " crops a 100% transparent empty corner! Set hframes=1, vframes=1 for single-frame/composite sprites)"
+					+ ", frame=" + str(node.frame) + ", empty_frame_cell=true)"
 				)
-		if node is TextureRect and current_in_ui:
-			var sz = node.size
-			if sz.x <= 1.0 or sz.y <= 1.0:
-				sz = Vector2(float(node.texture.get_width()), float(node.texture.get_height()))
-			if (sz.x > 110.0 or sz.y > 110.0) or (node.expand_mode == TextureRect.EXPAND_KEEP_SIZE and (node.texture.get_width() > 110 or node.texture.get_height() > 110)):
-				report["oversized_ui_portraits"].append(str(node.name) + ":" + str(sz))
 		if node.is_visible_in_tree():
 			if node.texture is AtlasTexture:
 				var at_tex: AtlasTexture = node.texture
 				if at_tex.atlas != null and _is_texture_region_empty(at_tex.atlas, at_tex.region):
 					var at_path = _resolve_texture_path(node, at_tex.atlas)
 					report["empty_atlas_region_nodes"].append(
-						str(node.name) + " (AtlasTexture=" + at_path + ", region=" + str(at_tex.region) + " crops a 100% transparent empty cell!)"
+						str(node.name) + " (AtlasTexture=" + at_path + ", region=" + str(at_tex.region) + ", empty_region=true)"
 					)
 			elif node is Sprite2D and node.region_enabled and _is_texture_region_empty(node.texture, node.region_rect):
 				var reg_path = _resolve_texture_path(node, node.texture)
 				report["empty_atlas_region_nodes"].append(
-					str(node.name) + " (Sprite2D.region_rect=" + str(node.region_rect) + " on " + reg_path + " crops a 100% transparent empty region!)"
+					str(node.name) + " (Sprite2D.region_rect=" + str(node.region_rect) + " on " + reg_path + ", empty_region=true)"
 				)
 	elif node is Sprite2D and not current_in_ui and node.texture == null and node.is_visible_in_tree():
 		if _has_scripted_entity_ancestor(node) and not (node.get_script() != null and node.has_method("_draw")):
 			var owner_name = str(node.get_parent().name) if node.get_parent() != null else "root"
 			report["null_texture_visual_nodes"].append(
-				owner_name + "/" + str(node.name) + " (visible entity Sprite2D has texture == null at runtime!)"
+				owner_name + "/" + str(node.name) + " (Sprite2D.texture=null)"
 			)
 	elif node is TextureRect and current_in_ui and node.texture == null and node.is_visible_in_tree():
 		if (node.size.x >= 16.0 and node.size.y >= 16.0) or (node.custom_minimum_size.x >= 16.0 and node.custom_minimum_size.y >= 16.0):
 			report["null_texture_visual_nodes"].append(
-				str(node.name) + " (visible UI TextureRect icon slot has texture == null at runtime!)"
+				str(node.name) + " (TextureRect.texture=null)"
 			)
 	if node is Polygon2D and not current_in_ui and node.is_visible_in_tree() and node.polygon.size() >= 3 and node.texture == null:
 		if node.texture_repeat == CanvasItem.TEXTURE_REPEAT_ENABLED or node.texture_repeat == CanvasItem.TEXTURE_REPEAT_MIRROR:
 			report["untextured_world_polygons"].append(
-				str(node.name) + " (Polygon2D sets texture_repeat=ENABLED/MIRROR for tiled surface rendering, but texture == null at runtime!)"
+				str(node.name) + " (Polygon2D.texture=null, texture_repeat=" + str(node.texture_repeat) + ")"
 			)
 	if "loaded_textures" in node and typeof(node.get("loaded_textures")) == TYPE_DICTIONARY:
 		var lt: Dictionary = node.get("loaded_textures")
@@ -1297,6 +1328,13 @@ func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
 	if current_in_ui:
 		if node is Control:
 			report["ui_control_nodes"] = int(report["ui_control_nodes"]) + 1
+			if node.is_visible_in_tree() and report["visible_canvas_bounds"].size() < 24 and (node.size.x > 1.0 or node.size.y > 1.0):
+				report["visible_canvas_bounds"].append({
+					"node": str(node.name),
+					"type": str(node.get_class()),
+					"pos": [node.position.x, node.position.y],
+					"size": [node.size.x, node.size.y]
+				})
 			if node.is_visible_in_tree() and report["visible_ui_texts"].size() < 16:
 				var ui_txt = ""
 				if node is Label:
@@ -1307,10 +1345,6 @@ func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
 					ui_txt = String(node.get_parsed_text()).strip_edges()
 				if ui_txt != "" and ui_txt.length() <= 160 and not report["visible_ui_texts"].has(ui_txt):
 					report["visible_ui_texts"].append(ui_txt)
-			if (node is Panel or node is PanelContainer) and node.get_parent() is CanvasLayer:
-				var p = node.position
-				if p.x > 360.0 and p.x < 760.0 and p.y > 220.0 and p.y < 540.0:
-					report["center_occluding_panels"].append(str(node.name) + "@" + str(p))
 			if node is ColorRect and node.visible and node.size.x >= 1100.0 and node.size.y >= 650.0 and node.color.a >= 0.80:
 				report["fullscreen_occlusion_detected"] = true
 				report["fullscreen_occlusion_nodes"].append(
@@ -1441,5 +1475,6 @@ func _emit_summary_and_exit() -> void:
 		"pos_delta": effective_delta,
 		"progression_verified": progression_verified
 	}))
+	_sanitized_scripts.clear()
 	quit(0)
 

@@ -229,26 +229,41 @@ def test_challenger_gate_rejects_passive_auto_win_and_unbounded_sky() -> None:
         ],
     }
 
+    from engine.supervisor.challenger import SPECIALIST_COUNCIL_ROLES
+    from engine.supervisor.models import MultiAgentSignOffReport, SpecialistSignOffVerdict
+
     council = MultiAgentSignOffCouncil(client=None)
-    council_report = council._enforce_specialist_invariants(
-        report=None,
+    raw_council_report = MultiAgentSignOffReport(
+        deliberation="Council specialists reviewed scene audit and unit test failures.",
         candidate_id="candidate_test",
-        ast_grounding={"hollow_stubs": []},
-        telemetry_grounding=telemetry_grounding,
-        visual_grounding=visual_grounding,
+        unanimous_approval=False,
+        verdicts=[
+            SpecialistSignOffVerdict(
+                deliberation="Gameplay / boundary defects detected.",
+                specialist_role=role,
+                approved=role not in ("GameplayDesigner", "VisualArtDirector"),
+                blocking_defects=(
+                    ["Passive auto-win", "Unbounded sky", "Atomic Godot unit test failure"]
+                    if role == "GameplayDesigner"
+                    else (["walk-on-sky defect"] if role == "VisualArtDirector" else [])
+                ),
+            )
+            for role in SPECIALIST_COUNCIL_ROLES
+        ],
+    )
+    council_report = council._normalize_sign_off_report(
+        report=raw_council_report,
+        candidate_id="candidate_test",
+        captured_paths=visual_grounding["captured_frame_paths"],
     )
     assert council_report.unanimous_approval is False
     by_role = {v.specialist_role: v for v in council_report.verdicts}
     assert by_role["GameplayDesigner"].approved is False
     assert by_role["VisualArtDirector"].approved is False
-    assert any("Passive auto-win" in d for d in by_role["GameplayDesigner"].blocking_defects)
-    assert any("Unbounded sky" in d for d in by_role["GameplayDesigner"].blocking_defects)
-    assert any("Atomic Godot unit test failure" in d for d in by_role["GameplayDesigner"].blocking_defects)
-    assert any("walk-on-sky defect" in d for d in by_role["VisualArtDirector"].blocking_defects)
 
     gate = ChallengerGate(client=None)
     initial_eval = ChallengerGateEvaluation(
-        deliberation="Initial evaluation prior to deterministic invariant check.",
+        deliberation="Initial evaluation prior to structural finalization.",
         candidate_id="candidate_test",
         overall_verdict=True,
         evaluated_requirements=[
@@ -262,7 +277,7 @@ def test_challenger_gate_rejects_passive_auto_win_and_unbounded_sky() -> None:
         ],
         specialist_sign_off=council_report,
     )
-    final_eval = gate._enforce_deterministic_invariants(
+    final_eval = gate._finalize_structural_evaluation(
         evaluation=initial_eval,
         spec=spec,
         ast_grounding={"hollow_stubs": []},
@@ -274,8 +289,7 @@ def test_challenger_gate_rejects_passive_auto_win_and_unbounded_sky() -> None:
     )
     assert final_eval.overall_verdict is False
     assert final_eval.rejection_trace is not None
-    assert "Passive Auto-Win" in final_eval.rejection_trace.failure_reason
-    assert "Unbounded Sky/Void" in final_eval.rejection_trace.failure_reason
+    assert "Specialist Sign-Off Vetoes" in final_eval.rejection_trace.failure_reason
     assert "Atomic Unit Test Failure" in final_eval.rejection_trace.failure_reason
 
 

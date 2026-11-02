@@ -4,6 +4,7 @@ import type { WorkspaceId } from '../../api/types';
 import {
   formatRelativeSeconds,
   formatTokenCount,
+  formatUsdCost,
   type LiveStudioActivity,
 } from '../../domain/liveActivity';
 
@@ -94,12 +95,41 @@ export function LiveActivityBanner({
           {aiCall ? (
             <span
               className="live-ai-heartbeat-pill"
-              title={`Latest Gemini API call (#${aiCall.callNumber ?? '?'}) by ${aiCall.agentLabel} · ${aiCall.totalTokens.toLocaleString()} total tokens (${aiCall.thoughtTokens.toLocaleString()} thought tokens)`}
+              title={[
+                `Latest Gemini API call (#${aiCall.callNumber ?? '?'}) by ${aiCall.agentLabel}`,
+                `${aiCall.totalTokens.toLocaleString()} total tokens (${aiCall.thoughtTokens.toLocaleString()} thinking${
+                  aiCall.cachedTokens ? `, ${aiCall.cachedTokens.toLocaleString()} cached` : ''
+                })`,
+                aiCall.imageCount ? `${aiCall.imageCount} image(s) synthesized` : '',
+                aiCall.estimatedCallCostUsd !== undefined
+                  ? `Call est: ${formatUsdCost(aiCall.estimatedCallCostUsd)}${
+                      aiCall.sessionEstimatedCostUsd !== undefined
+                        ? ` · Session est: ${formatUsdCost(aiCall.sessionEstimatedCostUsd)}`
+                        : ''
+                    }${
+                      aiCall.sessionCacheHitPct !== undefined && aiCall.sessionCacheHitPct > 0
+                        ? ` (${Math.round(aiCall.sessionCacheHitPct)}% input cached)`
+                        : ''
+                    }`
+                  : '',
+              ]
+                .filter(Boolean)
+                .join(' · ')}
             >
               <Cpu size={12} style={{ color: 'var(--accent)', flexShrink: 0 }} aria-hidden="true" />
               <span>
                 {aiCall.callNumber ? `AI #${aiCall.callNumber}` : 'AI Call'} · {aiCall.stepLabel} ·{' '}
-                {formatTokenCount(aiCall.totalTokens)}
+                {aiCall.totalTokens > 0
+                  ? formatTokenCount(aiCall.totalTokens)
+                  : aiCall.imageCount && aiCall.imageCount > 0
+                    ? `${aiCall.imageCount} img`
+                    : formatTokenCount(aiCall.totalTokens)}
+                {aiCall.sessionCacheHitPct !== undefined && aiCall.sessionCacheHitPct > 0
+                  ? ` (${Math.round(aiCall.sessionCacheHitPct)}% cached)`
+                  : ''}
+                {aiCall.sessionEstimatedCostUsd !== undefined && aiCall.sessionEstimatedCostUsd > 0
+                  ? ` · ${formatUsdCost(aiCall.sessionEstimatedCostUsd)}`
+                  : ''}
                 {aiAge ? ` · ${aiAge}` : ''}
               </span>
             </span>

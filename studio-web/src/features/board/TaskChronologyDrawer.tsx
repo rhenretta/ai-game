@@ -85,7 +85,7 @@ export function TaskChronologyDrawer({
 
   const chron = chronQuery.data;
   const effectiveState = chron?.state || item.state;
-  const stateBadge = getStateBadge(effectiveState, isBuildRunning);
+  const stateBadge = getStateBadge(effectiveState, isBuildRunning, item.decision_reason);
   const StateBadgeIcon = stateBadge.Icon;
 
   const { cleanSpec, directions } = useMemo(

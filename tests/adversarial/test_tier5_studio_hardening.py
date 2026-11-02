@@ -502,7 +502,7 @@ class TestTier5ChallengerGateHardening:
         )
 
         challenger = ChallengerGate(client=None)
-        enforced = challenger._enforce_deterministic_invariants(
+        enforced = challenger._finalize_structural_evaluation(
             evaluation=partial_eval,
             spec=spec,
             ast_grounding={"hollow_stubs": []},
@@ -547,7 +547,7 @@ class TestTier5ChallengerGateHardening:
         visual_grounding = {"blank_canvas_detected": True, "visual_motion_verified": False}
 
         challenger = ChallengerGate(client=None)
-        enforced = challenger._enforce_deterministic_invariants(
+        enforced = challenger._finalize_structural_evaluation(
             evaluation=clean_ast_eval,
             spec=spec,
             ast_grounding=ast_grounding,

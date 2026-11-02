@@ -43,6 +43,7 @@ RUNNABLE_STATES = ("ready", "changes_requested", "waiting_for_lock")
 TERMINAL_STATES = ("approved", "cancelled")
 CODE_LOCK_KINDS = ("mechanic_code", "level_map", "ui", "integration")
 ASSET_KINDS = ("visual_asset", "animation", "audio_asset")
+PARALLEL_LOCK_FREE_KINDS = ("visual_asset", "animation", "audio_asset", "discovery")
 
 _SCHEDULER_TLS = threading.local()
 
@@ -58,6 +59,16 @@ class WorkerYielded(Exception):
 
     def __init__(self, reason: str = "code_lock_busy") -> None:
         super().__init__(reason)
+        self.reason = reason
+
+
+class WorkerSplitTask(Exception):
+    """Raised by an executing TaskLead after decomposing the active item via `board.split_active_item`,
+    signaling `BoardScheduler` not to call `submit_result` on the now-cancelled parent item."""
+
+    def __init__(self, child_item_ids: List[str], reason: str = "") -> None:
+        super().__init__(reason or f"Split into {child_item_ids}")
+        self.child_item_ids = list(child_item_ids)
         self.reason = reason
 
 
@@ -574,10 +585,6 @@ class ProductionBoard:
                     if p.item_id not in existing_wait_ids:
                         existing_wait_ids.append(p.item_id)
                     continue
-                if p.kind == "level_map" and "level_layout.json" not in p.target_modules:
-                    p.target_modules.append("level_layout.json")
-                elif p.kind in ASSET_KINDS:
-                    p.target_modules = [m for m in p.target_modules if not str(m).endswith(".gd")]
                 sanitized_proposals.append(p)
 
             issues = self._validate_batch(sanitized_proposals, existing=set(self._items)) if sanitized_proposals else []
@@ -660,6 +667,118 @@ class ProductionBoard:
                 wait_for_spawned=wait_for_spawned,
             )
             return [self._items[i.item_id].model_copy(deep=True) for i in added]
+
+    def split_active_item(
+        self,
+        parent_item_id: str,
+        proposals: List[WorkItemProposal],
+        *,
+        rationale: str = "",
+    ) -> List[WorkItem]:
+        """Atomically decomposes an executing (or runnable) task into `2..N` cohesive child tasks.
+
+        - Validates `len(proposals) >= 2` and acyclic `depends_on` edges across the board + split batch.
+        - Inherits upstream `parent.depends_on`, `slice_id`, and `shaping_notes` on every child.
+        - Rewires all downstream board items whose `depends_on` included `parent_item_id` so they wait
+          on all split children instead of becoming `blocked_by_cancelled`.
+        - Marks `parent` as `cancelled` (`decision_reason` recording the split) and clears lock/yield state.
+        """
+        with self._lock:
+            parent = self._require(parent_item_id)
+            if parent.state in TERMINAL_STATES:
+                raise BoardValidationError(
+                    f"Cannot split item '{parent_item_id}' because it is already in terminal state '{parent.state}'."
+                )
+            if len(proposals or []) < 2:
+                raise BoardValidationError(
+                    f"split_active_item on '{parent_item_id}' requires at least 2 child WorkItemProposals (got {len(proposals or [])})."
+                )
+
+            upstream_deps = [d for d in parent.depends_on if d != parent_item_id]
+            prepared_proposals: List[WorkItemProposal] = []
+            for raw_p in proposals:
+                p = raw_p.model_copy(deep=True)
+                p.depends_on = [d for d in p.depends_on if d != parent_item_id]
+                for up_d in upstream_deps:
+                    if up_d not in p.depends_on:
+                        p.depends_on.append(up_d)
+                prepared_proposals.append(p)
+
+            issues = self._validate_batch(prepared_proposals, existing=set(self._items))
+            if issues:
+                raise BoardValidationError("; ".join(issues))
+
+            new_ids = [p.item_id for p in prepared_proposals]
+            added: List[WorkItem] = []
+            split_note = (
+                f"[Split from {parent.item_id}]: {rationale.strip()}"
+                if rationale and rationale.strip()
+                else f"[Split from {parent.item_id}]"
+            )
+            for p in prepared_proposals:
+                child = WorkItem(
+                    deliberation=p.deliberation,
+                    item_id=p.item_id,
+                    kind=p.kind,
+                    title=p.title,
+                    spec=p.spec,
+                    proof_spec=p.proof_spec,
+                    depends_on=list(p.depends_on),
+                    target_modules=list(p.target_modules),
+                    raised_by_role=parent.raised_by_role or "TaskLead",
+                    slice_id=p.slice_id or parent.slice_id,
+                    spawned_by_item_id=parent.item_id,
+                    design_revision=self._design_revision,
+                    state="blocked",
+                    max_revisions=p.max_revisions or self.default_max_revisions,
+                    priority=parent.priority,
+                    shaping_notes=list(parent.shaping_notes) + [split_note],
+                )
+                self._items[child.item_id] = child
+                added.append(child)
+
+            for p in prepared_proposals:
+                for b_id in getattr(p, "blocks_items", None) or []:
+                    tgt = self._items.get(b_id)
+                    if tgt is not None and tgt.state not in TERMINAL_STATES and p.item_id not in tgt.depends_on:
+                        tgt.depends_on.append(p.item_id)
+
+            for other in self._items.values():
+                if other.item_id == parent.item_id or other.item_id in new_ids:
+                    continue
+                if parent.item_id in other.depends_on:
+                    rewired = [d for d in other.depends_on if d != parent.item_id]
+                    for nid in new_ids:
+                        if nid not in rewired:
+                            rewired.append(nid)
+                    other.depends_on = rewired
+
+            self._discard_yielded(parent.item_id)
+            if self._active_resumed_code_lock_item == parent.item_id:
+                self._active_resumed_code_lock_item = None
+            parent.waiting_on_locks = []
+            parent.state = "cancelled"
+            parent.decision_reason = (
+                f"Split by TaskLead into {new_ids}" + (f": {rationale.strip()[:240]}" if rationale and rationale.strip() else "")
+            )
+
+            self._refresh()
+            self._persist()
+            for child in added:
+                self._emit(
+                    "backlog_item_created",
+                    self._items[child.item_id],
+                    depends_on=child.depends_on,
+                    slice_id=child.slice_id,
+                    spawned_by=parent.item_id,
+                )
+            self._emit(
+                "board_item_split",
+                parent,
+                split_child_ids=new_ids,
+                rationale=rationale,
+            )
+            return [self._items[c.item_id].model_copy(deep=True) for c in added]
 
     def update_item(
         self,
@@ -900,18 +1019,13 @@ class ProductionBoard:
                         for d in r.add_depends_on:
                             if d not in tgt_item.depends_on and d != tgt_item.item_id:
                                 tgt_item.depends_on.append(d)
-                        if tgt_item.kind not in ASSET_KINDS:
-                            for m in r.add_target_modules:
-                                if m not in tgt_item.target_modules:
-                                    tgt_item.target_modules.append(m)
+                        for m in r.add_target_modules:
+                            if m not in tgt_item.target_modules:
+                                tgt_item.target_modules.append(m)
                         touched.append(tgt_item)
                 elif r.action == "split":
                     new_ids = [p.item_id for p in r.split_items]
                     for p in r.split_items:
-                        if p.kind == "level_map" and "level_layout.json" not in p.target_modules:
-                            p.target_modules.append("level_layout.json")
-                        elif p.kind in ASSET_KINDS:
-                            p.target_modules = [m for m in p.target_modules if not str(m).endswith(".gd")]
                         deps = list(dict.fromkeys(list(p.depends_on) + [d for d in item.depends_on if d not in p.depends_on]))
                         split_item = WorkItem(
                             deliberation=p.deliberation,
@@ -1155,7 +1269,7 @@ class ProductionBoard:
                     code_active = effective_code_busy or (in_progress_code_count + code_claimed_in_call) >= 1
                     if prefer_parallel_assets and code_active:
                         for cand in eligible:
-                            if cand.kind in ASSET_KINDS:
+                            if cand.kind in PARALLEL_LOCK_FREE_KINDS:
                                 chosen = cand
                                 break
                     if chosen is None:
@@ -1308,16 +1422,30 @@ class ProductionBoard:
             self._discard_yielded(item_id)
             if self._active_resumed_code_lock_item == item_id:
                 self._active_resumed_code_lock_item = None
+            auto_approve_discovery = bool(item.kind == "discovery" and item.spawned_by_item_id)
             item.revisions.append(
                 RevisionRecord(
                     revision_index=len(item.revisions),
                     worker_notes=result.notes,
                     proof_paths=list(result.proof_images),
                     proof_hashes=[_hash_file(p) for p in result.proof_images],
+                    verdict="approve" if auto_approve_discovery else "",
+                    feedback=(
+                        "Auto-completed worker-spawned discovery subtask; findings forwarded directly to parent TaskLead."
+                        if auto_approve_discovery
+                        else ""
+                    ),
                 )
             )
-            item.state = "awaiting_review"
             item.failure = ""
+            if auto_approve_discovery:
+                item.state = "approved"
+                self._refresh()
+                self._persist()
+                self._emit("backlog_item_proof_ready", item, proof_paths=list(result.proof_images), revision=len(item.revisions))
+                self._emit("backlog_item_approved", item, revision=len(item.revisions), auto_completed_discovery=True)
+                return item.model_copy(deep=True)
+            item.state = "awaiting_review"
             self._persist()
             self._emit("backlog_item_proof_ready", item, proof_paths=list(result.proof_images), revision=len(item.revisions))
             return item.model_copy(deep=True)
@@ -1363,10 +1491,6 @@ class ProductionBoard:
             for raw_p in getattr(decision, "spawned_prerequisite_tasks", None) or []:
                 p = raw_p.model_copy(deep=True)
                 p.depends_on = [d for d in p.depends_on if d in self._items and d != item.item_id]
-                if p.kind == "level_map" and "level_layout.json" not in p.target_modules:
-                    p.target_modules.append("level_layout.json")
-                elif p.kind in ASSET_KINDS:
-                    p.target_modules = [m for m in p.target_modules if not str(m).endswith(".gd")]
 
                 # Deduplicate if an open council-spawned fix task already exists with the same ID or exact target_modules
                 existing_match: Optional[WorkItem] = None
@@ -1687,6 +1811,8 @@ class BoardScheduler:
             if not isinstance(result, WorkerResult):
                 raise StudioAgentError(f"Worker for '{item.kind}' returned {type(result).__name__}, expected WorkerResult.")
             self.board.submit_result(item.item_id, result)
+        except WorkerSplitTask as ws:
+            logger.info("Worker split item %s into %s", item.item_id, ws.child_item_ids)
         except WorkerYielded as wy:
             logger.info("Worker yielded item %s: %s", item.item_id, wy.reason)
             self.board.yield_item(item.item_id, reason=wy.reason)

@@ -40,303 +40,10 @@ from engine.studio.models import (
     StudioAgentConfigurationError,
     StudioAgentError,
     bounded_thinking_config,
+    call_gemini_with_transient_retry,
 )
 
 logger = logging.getLogger("CartridgeAssetLibrary")
-
-
-def infer_gdscript_asset_slicing_and_wiring(cartridge_dir: Union[Path, str]) -> Dict[str, Any]:
-    """Deterministically inspects production `.gd` and `.tscn` files in `cartridge_dir` to infer:
-    1. `asset_grids`: `{rel_asset_path: (cols, rows)}` where scripts slice an asset via `hframes`/`vframes`
-       or fixed-cell `Rect2(col * cw, row * ch, cw, ch)` region draws against the on-disk PNG size.
-    2. `script_grid_claims`: explicit fractional or grid slicing claims (`get_width() / C`, `get_height() / R`,
-       `hframes = C`, `vframes = R`, or fixed-cell `Rect2`) mapped to referenced `assets/.../*.png` paths
-       (including 1-hop `preload("res://.../*.gd")` widget callers).
-    3. `dead_texture_loads`: local `"res://assets/..."` path variables or loaded texture variables inside a `.gd`
-       function that are never bound to `.texture`, `draw_texture*`, helper calls, containers, or return values.
-    4. `init_before_ready_texture_vars`: member texture variables assigned only in `_ready()` (or helpers called
-       from `_ready()`) that are read earlier during `_init()`.
-    """
-    cdir = Path(cartridge_dir).resolve()
-    asset_grids: Dict[str, Tuple[int, int]] = {}
-    script_grid_claims: List[Dict[str, Any]] = []
-    dead_texture_loads: List[Dict[str, Any]] = []
-    init_before_ready_texture_vars: List[Dict[str, Any]] = []
-
-    if not cdir.is_dir():
-        return {
-            "asset_grids": asset_grids,
-            "script_grid_claims": script_grid_claims,
-            "dead_texture_loads": dead_texture_loads,
-            "init_before_ready_texture_vars": init_before_ready_texture_vars,
-        }
-
-    gd_sources: Dict[str, str] = {}
-    for gd_path in sorted(cdir.rglob("*.gd")):
-        rel_gd = gd_path.relative_to(cdir).as_posix()
-        if rel_gd.startswith("tests/") or rel_gd.startswith(".godot/") or rel_gd == "src/studio_rig_and_collider.gd":
-            continue
-        try:
-            gd_sources[rel_gd] = gd_path.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            continue
-
-    def _read_png_wh(rel_asset: str) -> Optional[Tuple[int, int]]:
-        f = cdir / rel_asset
-        if not f.is_file():
-            return None
-        try:
-            with Image.open(f) as im:
-                return im.size
-        except Exception:
-            return None
-
-    # Map preload("res://.../*.gd") relationships so generic slot/icon widgets inherit caller asset paths
-    preloaded_by_callers: Dict[str, List[Tuple[str, List[str]]]] = {}
-    for caller_rel, src in gd_sources.items():
-        caller_assets = [
-            m.lstrip("/")
-            for m in re.findall(r'res://(assets/[^"\'\s]+\.png)', src)
-        ]
-        if not caller_assets:
-            continue
-        for const_var, target_gd in re.findall(
-            r'(?:const|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=\n]+)?=\s*(?:preload|load)\(\s*["\']res://([^"\']+\.gd)["\']\s*\)',
-            src,
-        ):
-            # Gather assets appearing near instantiation or in data tables passed into `const_var.new(...)`
-            if f"{const_var}.new(" in src:
-                preloaded_by_callers.setdefault(target_gd.lstrip("/"), []).append((caller_rel, caller_assets))
-
-    for rel_gd, src in gd_sources.items():
-        direct_assets = list(dict.fromkeys(
-            m.lstrip("/") for m in re.findall(r'res://(assets/[^"\'\s]+\.png)', src)
-        ))
-
-        # 1. Fractional region slicing: Rect2(..., width / C, height / R)
-        frac_matches = re.findall(
-            r'get_width\(\)\s*\)\s*/\s*(\d+(?:\.\d+)?).*?get_height\(\)\s*\)\s*/\s*(\d+(?:\.\d+)?)'
-            r'|get_width\(\)\s*/\s*(\d+(?:\.\d+)?).*?get_height\(\)\s*/\s*(\d+(?:\.\d+)?)',
-            src,
-        )
-        for m_frac in frac_matches:
-            c_raw = m_frac[0] or m_frac[2]
-            r_raw = m_frac[1] or m_frac[3]
-            try:
-                c_int = int(round(float(c_raw)))
-                r_int = int(round(float(r_raw)))
-            except Exception:
-                continue
-            if c_int >= 1 and r_int >= 1 and (c_int * r_int) > 1:
-                # Check if guarded by dimension threshold (e.g. `if tex.get_width() >= ...` or `if is_sheet:`)
-                has_sheet_guard = bool(re.search(r'if\s+[^\n]*(?:is_sheet|hframes\s*>\s*1|get_width\(\)\s*>=?\s*\d{3,})', src))
-                target_assets = list(direct_assets)
-                caller_refs: List[str] = []
-                if not target_assets and rel_gd in preloaded_by_callers:
-                    for caller_rel, c_assets in preloaded_by_callers[rel_gd]:
-                        caller_refs.append(caller_rel)
-                        for ca in c_assets:
-                            if ca not in target_assets:
-                                target_assets.append(ca)
-                script_grid_claims.append({
-                    "script": rel_gd,
-                    "caller_scripts": caller_refs,
-                    "assets": target_assets,
-                    "cols": c_int,
-                    "rows": r_int,
-                    "kind": "fractional_region",
-                    "guarded": has_sheet_guard,
-                })
-
-        # 2. Fixed-cell Rect2(col * cw, row * ch, cw, ch) region slicing on single-sheet UI/atlas scripts
-        if len(direct_assets) == 1:
-            only_asset = direct_assets[0]
-            wh = _read_png_wh(only_asset)
-            fixed_rect_matches = re.findall(
-                r'Rect2\(\s*(?:Vector2\(\s*)?[A-Za-z_][A-Za-z0-9_]*\s*\*\s*(\d+(?:\.\d+)?)\s*,\s*[A-Za-z_][A-Za-z0-9_]*\s*\*\s*(\d+(?:\.\d+)?)\s*\)?\s*,\s*(?:Vector2\(\s*)?(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\)?\s*\)',
-                src,
-            )
-            for _sx, _sy, cw_s, ch_s in fixed_rect_matches:
-                cw_i = int(round(float(cw_s)))
-                ch_i = int(round(float(ch_s)))
-                if wh and cw_i >= 8 and ch_i >= 8 and wh[0] % cw_i == 0 and wh[1] % ch_i == 0:
-                    cols_i = wh[0] // cw_i
-                    rows_i = wh[1] // ch_i
-                    if cols_i * rows_i > 1:
-                        prev = asset_grids.get(only_asset, (1, 1))
-                        if cols_i * rows_i > prev[0] * prev[1]:
-                            asset_grids[only_asset] = (cols_i, rows_i)
-                        script_grid_claims.append({
-                            "script": rel_gd,
-                            "caller_scripts": [],
-                            "assets": [only_asset],
-                            "cols": cols_i,
-                            "rows": rows_i,
-                            "cell_px": (cw_i, ch_i),
-                            "kind": "fixed_cell_region",
-                            "guarded": True,
-                        })
-
-            # Also check `.hframes = C` / `.vframes = R` when a single PNG is bound in the script
-            hf_m = re.findall(r'\bhframes\s*=\s*(\d+)', src)
-            vf_m = re.findall(r'\bvframes\s*=\s*(\d+)', src)
-            if hf_m or vf_m:
-                c_i = max([int(x) for x in hf_m] or [1])
-                r_i = max([int(x) for x in vf_m] or [1])
-                if c_i * r_i > 1:
-                    prev = asset_grids.get(only_asset, (1, 1))
-                    if c_i * r_i > prev[0] * prev[1]:
-                        asset_grids[only_asset] = (c_i, r_i)
-                    script_grid_claims.append({
-                        "script": rel_gd,
-                        "caller_scripts": [],
-                        "assets": [only_asset],
-                        "cols": c_i,
-                        "rows": r_i,
-                        "kind": "hframes_vframes",
-                        "guarded": True,
-                    })
-
-        # 3. Function-scoped dead asset path / unassigned texture load audit & _init vs _ready ordering
-        func_blocks: Dict[str, Tuple[int, str]] = {}
-        func_starts = list(re.finditer(r'(?m)^func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)\s*(?:->\s*[^:]+)?\s*:', src))
-        for idx_f, f_match in enumerate(func_starts):
-            fn_name = f_match.group(1)
-            start_pos = f_match.end()
-            end_pos = func_starts[idx_f + 1].start() if idx_f + 1 < len(func_starts) else len(src)
-            line_no = src.count("\n", 0, f_match.start()) + 1
-            func_blocks[fn_name] = (line_no, src[start_pos:end_pos])
-
-        for fn_name, (fn_line, fn_body) in func_blocks.items():
-            body_lines = [
-                re.sub(r'#.*$', '', ln)
-                for ln in fn_body.splitlines()
-            ]
-            # 3a. Local `var p_x = "res://assets/...png"` never referenced again in the function
-            local_asset_vars: Dict[str, Tuple[int, str]] = {}
-            for rel_ln_idx, clean_ln in enumerate(body_lines):
-                m_var_path = re.match(
-                    r'^\s*var\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=\s*["\'](res://assets/[^"\']+\.png)["\']\s*$',
-                    clean_ln,
-                )
-                if m_var_path:
-                    vname, res_lit = m_var_path.group(1), m_var_path.group(2)
-                    local_asset_vars[vname] = (fn_line + rel_ln_idx + 1, res_lit)
-                    rest_text = "\n".join(body_lines[rel_ln_idx + 1:])
-                    if not re.search(rf'\b{re.escape(vname)}\b', rest_text):
-                        dead_texture_loads.append({
-                            "script": rel_gd,
-                            "func": fn_name,
-                            "line": fn_line + rel_ln_idx + 1,
-                            "var": vname,
-                            "asset": res_lit.replace("res://", ""),
-                            "issue": (
-                                f"{rel_gd}:{fn_line + rel_ln_idx + 1} (`{fn_name}`): local asset path variable "
-                                f"`{vname}` (`{res_lit}`) is declared but never loaded or bound to any node."
-                            ),
-                        })
-
-            # 3b. Local `var tex_x = <loader>(<asset_path_or_var>)` checked only in `if tex_x:` and never bound
-            for rel_ln_idx, clean_ln in enumerate(body_lines):
-                m_tex_load = re.match(
-                    r'^\s*var\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=\s*([A-Za-z0-9_.]+)\(\s*([^)]+)\s*\)\s*$',
-                    clean_ln,
-                )
-                if not m_tex_load:
-                    continue
-                tvar, callee, arg_expr = m_tex_load.group(1), m_tex_load.group(2), m_tex_load.group(3).strip()
-                arg_clean = arg_expr.strip("\"'")
-                is_asset_load = (
-                    arg_clean.startswith("res://assets/")
-                    or arg_expr in local_asset_vars
-                    or ("load" in callee.lower() and "tex" in tvar.lower())
-                )
-                if not is_asset_load:
-                    continue
-                subsequent = body_lines[rel_ln_idx + 1:]
-                uses = [ln for ln in subsequent if re.search(rf'\b{re.escape(tvar)}\b', ln)]
-                non_guard_uses = [
-                    ln for ln in uses
-                    if not re.match(rf'^\s*(?:el)?if\s+{re.escape(tvar)}(?:\s*!=\s*null)?\s*:\s*$', ln)
-                ]
-                if not non_guard_uses:
-                    asset_ref = (
-                        local_asset_vars[arg_expr][1].replace("res://", "")
-                        if arg_expr in local_asset_vars
-                        else arg_clean.replace("res://", "")
-                    )
-                    dead_texture_loads.append({
-                        "script": rel_gd,
-                        "func": fn_name,
-                        "line": fn_line + rel_ln_idx + 1,
-                        "var": tvar,
-                        "asset": asset_ref,
-                        "issue": (
-                            f"{rel_gd}:{fn_line + rel_ln_idx + 1} (`{fn_name}`): loaded texture variable `{tvar}` "
-                            f"(`{asset_ref}`) is never assigned to `.texture`, drawn, passed, or returned."
-                        ),
-                    })
-
-        # 3c. Member texture variable initialized via `_ready()` but consumed earlier via `_init()`
-        if "_init" in func_blocks and "_ready" in func_blocks:
-            all_top_vars = set(
-                re.findall(r'(?m)^var\s+([A-Za-z_][A-Za-z0-9_]*)\b', src)
-            )
-            typed_tex_vars = set(
-                re.findall(
-                    r'(?m)^var\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:Texture2D|ImageTexture|AtlasTexture|CompressedTexture2D)\b',
-                    src,
-                )
-            )
-            bound_tex_vars = {
-                v for v in all_top_vars
-                if re.search(rf'\.(?:texture|atlas|texture_normal)\s*=\s*{re.escape(v)}\b', src)
-            }
-            member_tex_vars = typed_tex_vars | bound_tex_vars
-            if member_tex_vars:
-                def _reachable_bodies(root_fn: str) -> str:
-                    visited_fns: Set[str] = set()
-                    stack = [root_fn]
-                    chunks_out: List[str] = []
-                    while stack:
-                        cur_fn = stack.pop()
-                        if cur_fn in visited_fns or cur_fn not in func_blocks:
-                            continue
-                        visited_fns.add(cur_fn)
-                        f_txt = func_blocks[cur_fn][1]
-                        chunks_out.append(f_txt)
-                        for called_fn in re.findall(r'\b([A-Za-z_][A-Za-z0-9_]*)\s*\(', f_txt):
-                            if called_fn in func_blocks and called_fn not in visited_fns:
-                                stack.append(called_fn)
-                    return "\n".join(chunks_out)
-
-                init_blob = _reachable_bodies("_init")
-                ready_blob = _reachable_bodies("_ready")
-                for mvar in sorted(member_tex_vars):
-                    assigned_in_init = bool(re.search(rf'(?<![.!<>=\w]){re.escape(mvar)}\s*=(?!=)', init_blob))
-                    read_in_init = bool(
-                        re.search(
-                            rf'(?:\b(?:if|and|or)\s+{re.escape(mvar)}\b|\.(?:texture|atlas|texture_normal)\s*=\s*{re.escape(mvar)}\b)',
-                            init_blob,
-                        )
-                    )
-                    assigned_in_ready = bool(re.search(rf'(?<![.!<>=\w]){re.escape(mvar)}\s*=(?!=)', ready_blob))
-                    if read_in_init and assigned_in_ready and not assigned_in_init:
-                        init_before_ready_texture_vars.append({
-                            "script": rel_gd,
-                            "var": mvar,
-                            "issue": (
-                                f"{rel_gd}: `_init()` builds geometry reading `{mvar}` before `_ready()` loads `{mvar}`, "
-                                f"leaving initial runtime nodes with `texture == null`."
-                            ),
-                        })
-
-    return {
-        "asset_grids": asset_grids,
-        "script_grid_claims": script_grid_claims,
-        "dead_texture_loads": dead_texture_loads,
-        "init_before_ready_texture_vars": init_before_ready_texture_vars,
-    }
 
 
 class CartridgeAssetLibrary:
@@ -978,14 +685,18 @@ static func create_tiled_surface(
             )
             contents.append(prompt)
             text_model = getattr(self.visual_agent, "text_model_name", "gemini-3.8-flash") if self.visual_agent else "gemini-3.8-flash"
-            resp = client.models.generate_content(
-                model=text_model,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=DecomposedConceptManifestSpec,
-                    thinking_config=bounded_thinking_config(1024),
+            resp = call_gemini_with_transient_retry(
+                lambda: client.models.generate_content(
+                    model=text_model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=DecomposedConceptManifestSpec,
+                        thinking_config=bounded_thinking_config(1024),
+                    ),
                 ),
+                label="decompose_concept_manifest",
+                candidate_dir=self.cartridge_dir,
             )
             if resp.text:
                 manifest_spec = DecomposedConceptManifestSpec.model_validate_json(resp.text)
@@ -1331,14 +1042,21 @@ static func create_tiled_surface(
         plate_path = renders_dir / f"plate_{req.asset_id}.png"
         g_cols = max(1, int(getattr(req, "grid_cols", 1) or 1))
         g_rows = max(1, int(getattr(req, "grid_rows", 1) or 1))
+        total_grid_cells = g_cols * g_rows
+        regen_cells: Optional[List[int]] = None
         out_path = dest_path
         for attempt in range(1, max_val_attempts + 1):
+            dyn_kwargs: Dict[str, Any] = {}
+            if attempt > 1 and regen_cells and dest_path.is_file():
+                dyn_kwargs["regenerate_cell_indices"] = list(regen_cells)
+                dyn_kwargs["existing_sheet_path"] = dest_path
             out_path = self.visual_agent.generate_dynamic_sprite(
                 asset_req=req,
                 output_path=dest_path,
                 mood=self.mood,
                 reference_images=ref_images,
                 style_guide=style_guide,
+                **dyn_kwargs,
             )
             if hasattr(self.visual_agent, "render_asset_inspection_plate") and out_path.is_file():
                 try:
@@ -1367,12 +1085,37 @@ static func create_tiled_surface(
                 )
                 if verdict.accepted:
                     break
+                bad_cells = [
+                    int(i)
+                    for i in (getattr(verdict, "defective_cell_indices", None) or [])
+                    if 0 <= int(i) < total_grid_cells
+                ]
+                regen_cells = bad_cells if (0 < len(bad_cells) < total_grid_cells) else None
                 if verdict.prompt_refinement_directive:
-                    req.visual_prompt_or_text = f"{req.visual_prompt_or_text}. {verdict.prompt_refinement_directive}"
+                    directive_str = verdict.prompt_refinement_directive.strip()
+                    if directive_str and directive_str not in (req.visual_prompt_or_text or ""):
+                        req.visual_prompt_or_text = f"{req.visual_prompt_or_text}. {directive_str}".strip(". ")
+                    existing_cell_prompts = list(getattr(req, "cell_prompts", None) or [])
+                    if existing_cell_prompts and directive_str:
+                        target_prompt_idxs = set(bad_cells) if bad_cells else set(range(len(existing_cell_prompts)))
+                        updated_cell_prompts: List[str] = []
+                        for idx_cp, cp_txt in enumerate(existing_cell_prompts):
+                            if idx_cp in target_prompt_idxs and directive_str not in cp_txt:
+                                updated_cell_prompts.append(f"{cp_txt}. {directive_str}".strip(". "))
+                            else:
+                                updated_cell_prompts.append(cp_txt)
+                        req.cell_prompts = updated_cell_prompts
             else:
                 break
 
         tex_size = self._read_image_size(out_path)
+        if total_grid_cells > 1 and tex_size[0] > 0 and tex_size[1] > 0:
+            eff_display_size: Tuple[int, int] = (
+                max(16, int(tex_size[0]) // g_cols),
+                max(16, int(tex_size[1]) // g_rows),
+            )
+        else:
+            eff_display_size = tuple(req.dimensions or tex_size)
         self._supersede_same_path_entries(req.asset_id, req.target_path)
         self.catalog.entries[req.asset_id] = AssetLibraryEntry(
             deliberation=req.deliberation,
@@ -1382,7 +1125,7 @@ static func create_tiled_surface(
             purpose=req.purpose or req.description,
             res_path=f"res://{req.target_path}",
             file_path=req.target_path,
-            target_display_size=tuple(req.dimensions or tex_size),
+            target_display_size=eff_display_size,
             texture_pixel_size=tex_size,
             hframes=g_cols,
             vframes=g_rows,
@@ -1407,8 +1150,6 @@ static func create_tiled_surface(
 
         has_client = (self.client is not None) or (getattr(self.visual_agent, "client", None) is not None)
         self.index_existing_files_on_disk()
-        inferred_slicing = infer_gdscript_asset_slicing_and_wiring(self.cartridge_dir)
-        inferred_grids: Dict[str, Tuple[int, int]] = dict(inferred_slicing.get("asset_grids") or {})
         renders_dir = self.cartridge_dir / "artifacts" / "renders"
         renders_dir.mkdir(parents=True, exist_ok=True)
         style_guide = self.get_style_guide(for_environment=False)
@@ -1428,12 +1169,13 @@ static func create_tiled_surface(
                 continue
 
             plate_p = renders_dir / f"plate_{aid}.png"
-            inf_cols, inf_rows = inferred_grids.get(entry.file_path, (1, 1))
-            e_hframes = max(1, int(getattr(entry, "hframes", 1) or 1), int(inf_cols))
-            e_vframes = max(1, int(getattr(entry, "vframes", 1) or 1), int(inf_rows))
-            if e_hframes != int(getattr(entry, "hframes", 1) or 1) or e_vframes != int(getattr(entry, "vframes", 1) or 1):
-                entry.hframes = e_hframes
-                entry.vframes = e_vframes
+            e_hframes = max(1, int(getattr(entry, "hframes", 1) or 1))
+            e_vframes = max(1, int(getattr(entry, "vframes", 1) or 1))
+            stub_dims = (
+                tuple(entry.texture_pixel_size)
+                if (e_hframes * e_vframes) > 1 and entry.fabrication_mode != "sprite_sheet" and entry.texture_pixel_size
+                else (entry.target_display_size or (64, 64))
+            )
             req_stub = AssetRequirement(
                 deliberation=entry.deliberation,
                 asset_id=aid,
@@ -1445,7 +1187,7 @@ static func create_tiled_surface(
                 description=entry.purpose,
                 visual_prompt_or_text=f"{entry.purpose}. {style_guide}",
                 target_path=entry.file_path,
-                dimensions=entry.target_display_size or (64, 64),
+                dimensions=stub_dims,
                 grid_cols=e_hframes,
                 grid_rows=e_vframes,
             )
@@ -1480,16 +1222,11 @@ static func create_tiled_surface(
             # If a sprite_sheet entry was generated before keyframe_tracks were introduced, rebuild its sheet frames
             # from the matted base sprite using the 5-part biomechanical keyframe rig
             missing_kf_tracks = False
-            if entry.fabrication_mode == "sprite_sheet":
+            if entry.fabrication_mode == "sprite_sheet" and single_f.is_file() and single_f.resolve() != f_path.resolve():
                 st_dict = entry.animation_states or {}
                 if not st_dict or any(not isinstance(sv, dict) or not sv.get("keyframe_tracks") for sv in st_dict.values()):
                     missing_kf_tracks = True
-                    if (
-                        auto_remediate
-                        and has_client
-                        and single_f.is_file()
-                        and single_f.resolve() != f_path.resolve()
-                    ):
+                    if auto_remediate and has_client:
                         try:
                             with Image.open(single_f) as base_im:
                                 base_rgba = base_im.convert("RGBA")
@@ -1498,7 +1235,7 @@ static func create_tiled_surface(
                             default_states = [
                                 ("idle", "idle", 4, 6.0, True),
                                 ("move", "locomotion", 4, 10.0, True),
-                                ("jump", "aerial", 3, 8.0, False),
+                                ("jump", "aerial", 4, 8.0, False),
                                 ("action", "action", 4, 10.0, False),
                             ]
                             max_cols = 4
@@ -1575,7 +1312,7 @@ static func create_tiled_surface(
                     logger.debug("Multi-cell occupancy check warning for '%s': %s", aid, exc)
 
             v_anim = None
-            if entry.fabrication_mode == "sprite_sheet":
+            if entry.fabrication_mode == "sprite_sheet" and entry.animation_states:
                 contact_p = renders_dir / f"anim_sheet_{aid}.png"
                 _, anim_tel = self.visual_agent.render_animation_contact_sheet(
                     sheet_img=f_path,
@@ -1638,7 +1375,7 @@ static func create_tiled_surface(
                         inspection_plate_path=plate_p,
                         style_guide=style_guide,
                     )
-                    if entry.fabrication_mode == "sprite_sheet":
+                    if entry.fabrication_mode == "sprite_sheet" and entry.animation_states:
                         contact_p = renders_dir / f"anim_sheet_{aid}.png"
                         _, anim_tel = self.visual_agent.render_animation_contact_sheet(
                             sheet_img=f_path,
@@ -1825,21 +1562,8 @@ static func create_tiled_surface(
 
     def index_existing_files_on_disk(self) -> None:
         """Scans assets/portraits/, assets/sprites/, assets/tiles/, assets/backgrounds/, assets/ui/, and assets/audio/
-        to ensure any pre-existing files on disk are registered in assets/asset_library.json, inferring `(hframes, vframes)`
-        from `.gd` / `.tscn` slicing contracts when multi-cell sheets are present.
+        to ensure any pre-existing files on disk are registered in assets/asset_library.json.
         """
-        inferred_grids: Dict[str, Tuple[int, int]] = dict(
-            infer_gdscript_asset_slicing_and_wiring(self.cartridge_dir).get("asset_grids") or {}
-        )
-        # Upgrade existing 1x1 catalog entries if scripts slice them as a multi-cell atlas
-        for entry in self.catalog.entries.values():
-            fp = str(getattr(entry, "file_path", "") or "")
-            if fp in inferred_grids:
-                ic, ir = inferred_grids[fp]
-                if ic * ir > 1 and int(getattr(entry, "hframes", 1) or 1) == 1 and int(getattr(entry, "vframes", 1) or 1) == 1:
-                    entry.hframes = ic
-                    entry.vframes = ir
-
         existing_file_paths = {
             str(e.file_path) for e in self.catalog.entries.values() if getattr(e, "file_path", None)
         }
@@ -1869,7 +1593,6 @@ static func create_tiled_surface(
             rel = f"assets/sprites/{sfile.name}"
             if aid not in self.catalog.entries and rel not in existing_file_paths:
                 tex_sz = self._read_image_size(sfile)
-                ic, ir = inferred_grids.get(rel, (1, 1))
                 self.catalog.entries[aid] = AssetLibraryEntry(
                     deliberation=f"Indexed existing sprite '{aid}' from disk.",
                     asset_id=aid,
@@ -1878,10 +1601,10 @@ static func create_tiled_surface(
                     purpose=f"In-world sprite {aid}",
                     res_path=f"res://{rel}",
                     file_path=rel,
-                    target_display_size=(min(96, tex_sz[0] // max(1, ic)), min(96, tex_sz[1] // max(1, ir))),
+                    target_display_size=(min(96, tex_sz[0]), min(96, tex_sz[1])),
                     texture_pixel_size=tex_sz,
-                    hframes=ic,
-                    vframes=ir,
+                    hframes=1,
+                    vframes=1,
                     sha256_hash=self._compute_sha256(sfile),
                 )
                 existing_file_paths.add(rel)
@@ -1900,8 +1623,6 @@ static func create_tiled_surface(
                 rel = vfile.relative_to(self.cartridge_dir).as_posix()
                 if aid not in self.catalog.entries and rel not in existing_file_paths:
                     tex_sz = self._read_image_size(vfile)
-                    ic, ir = inferred_grids.get(rel, (1, 1))
-                    disp_sz = (tex_sz[0] // max(1, ic), tex_sz[1] // max(1, ir)) if (ic * ir) > 1 else tex_sz
                     self.catalog.entries[aid] = AssetLibraryEntry(
                         deliberation=f"Indexed existing {default_atype} '{aid}' from {rel}.",
                         asset_id=aid,
@@ -1910,10 +1631,10 @@ static func create_tiled_surface(
                         purpose=f"In-world {default_atype} {aid}",
                         res_path=f"res://{rel}",
                         file_path=rel,
-                        target_display_size=disp_sz,
+                        target_display_size=tex_sz,
                         texture_pixel_size=tex_sz,
-                        hframes=ic,
-                        vframes=ir,
+                        hframes=1,
+                        vframes=1,
                         sha256_hash=self._compute_sha256(vfile),
                     )
                     existing_file_paths.add(rel)
@@ -1973,6 +1694,11 @@ static func create_tiled_surface(
             short_purpose = (entry.purpose or "").replace("\n", " ").strip()
             if len(short_purpose) > purpose_limit:
                 short_purpose = short_purpose[:purpose_limit] + "..."
+            perc_desc = (getattr(entry, "perceptual_description", "") or "").replace("\n", " ").strip()
+            if perc_desc:
+                if len(perc_desc) > 200:
+                    perc_desc = perc_desc[:200] + "..."
+                short_purpose = f"{short_purpose} [Perceptual: {perc_desc}]" if short_purpose else f"[Perceptual: {perc_desc}]"
             if compact:
                 lines.append(
                     f"- [{aid}] ({entry.fabrication_mode}, {entry.hframes}x{entry.vframes}, "

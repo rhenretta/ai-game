@@ -18,7 +18,6 @@ from PIL import Image, ImageDraw
 from engine.assets.palette import STYLE_BIBLE_16_PALETTE
 from engine.studio.asset_library import (
     CartridgeAssetLibrary,
-    infer_gdscript_asset_slicing_and_wiring,
 )
 from engine.studio.context_curator import ContextCuratorAgent
 from engine.studio.models import (
@@ -38,7 +37,8 @@ from engine.studio.writers_room import CreativeWritersRoom
 from engine.supervisor.asset_validator import (
     AssetSheetMultimodalAuditVerdict,
     AssetValidator,
-    audit_cartridge_visual_and_slicing_integrity,
+    _collect_observational_asset_metadata,
+    collect_cartridge_visual_asset_files,
     render_cartridge_asset_contact_sheet,
 )
 from engine.supervisor.models import GateFailureType, RejectionDiagnosticTrace
@@ -186,8 +186,10 @@ def test_multicell_ui_atlas_preserved_by_alpha_extractor_and_indexed_from_gdscri
     lib.index_existing_files_on_disk()
     assert len(lib.catalog.entries) == 1
     entry = next(iter(lib.catalog.entries.values()))
-    assert entry.hframes == 3
-    assert entry.vframes == 2
+    assert (entry.hframes, entry.vframes) == (1, 1)  # Pure file indexing without GDScript regex slicing heuristics
+    entry.hframes = 3
+    entry.vframes = 2
+    lib.save_catalog()
 
     rep_ui = lib.verify_all_catalog_assets_and_animations(auto_remediate=False)
     assert rep_ui["all_passed"] is True, f"Valid 3x2 UI atlas failed verification: {rep_ui}"
@@ -333,9 +335,9 @@ def test_inplace_regeneration_overwrites_broken_png_deduplicates_catalog_and_ref
     planned_regen = plan_asset_requirement(ctx, regen_item, ("static_sprite", "sprite_sheet"))
     assert planned_regen.target_path == "assets/sprites/turret_base.png"
 
-    # 1b. Unrelated item proposing the same path by mistake IS disambiguated
+    # 1b. Second item proposing the exact path ALSO preserves exact configuration fidelity (zero {item_id}_ mangling, Rule 5)
     planned_accidental = plan_asset_requirement(ctx, accidental_item, ("static_sprite", "sprite_sheet"))
-    assert planned_accidental.target_path == "assets/sprites/accidental_other_prop_turret_base.png"
+    assert planned_accidental.target_path == "assets/sprites/turret_base.png"
 
     # 2. Execute visual_asset_handler on regen_item -> overwrites in-place with force_regenerate=True
     visual_asset_handler(ctx)(regen_item)
@@ -344,24 +346,20 @@ def test_inplace_regeneration_overwrites_broken_png_deduplicates_catalog_and_ref
     with Image.open(broken_png) as img_after:
         assert img_after.size == (64, 64)
 
-    # Catalog deduplicated: legacy_turret_id superseded by regen_turret_base
+    # Catalog deduplicated: canonical legacy_turret_id updated in-place with zero duplicate entries for turret_base.png
     reloaded_lib = CartridgeAssetLibrary(cartridge_dir=tmp_path, client=None)
     same_path_ids = [
         aid for aid, ent in reloaded_lib.catalog.entries.items() if ent.file_path == "assets/sprites/turret_base.png"
     ]
-    assert same_path_ids == ["regen_turret_base"]
+    assert same_path_ids == ["legacy_turret_id"]
     swe_summary = reloaded_lib.build_prompt_summary_for_swe(compact=True)
     assert "tex_px=(64, 64)" in swe_summary
 
-    # 3. ContextCurator indexes the fresh on-disk PNG (newer than stale plate) and reports actual_disk_pixel_size
-    # Simulate an older plate for regen_turret_base too so mtime preference is directly exercised
-    stale_regen_plate = renders_dir / "plate_regen_turret_base.png"
-    Image.new("RGBA", (32, 32), (9, 9, 9, 255)).save(stale_regen_plate)
-    os.utime(stale_regen_plate, (old_ts, old_ts))
-
+    # 3. ContextCurator indexes the fresh on-disk PNG (newer than stale plate_legacy_turret_id.png) and reports actual_disk_pixel_size
+    os.utime(stale_plate, (old_ts, old_ts))
     curator = ContextCuratorAgent(cartridge_dir=tmp_path, client=None, board=board)
     chunks = curator.semantic_index.extract_corpus_chunks()
-    cat_doc = next(c for c in chunks if c.chunk_id == "asset:catalog:regen_turret_base")
+    cat_doc = next(c for c in chunks if c.chunk_id == "asset:catalog:legacy_turret_id")
     assert Path(cat_doc.associated_image_path).resolve() == broken_png.resolve()
     assert json.loads(cat_doc.content)["actual_disk_pixel_size"] == [64, 64]
 
@@ -457,11 +455,6 @@ def test_gate_b_multimodal_audit_remediation_proposals_and_council_dossier(tmp_p
         encoding="utf-8",
     )
 
-    slicing_audit = infer_gdscript_asset_slicing_and_wiring(tmp_path)
-    assert slicing_audit["asset_grids"]["assets/ui/recipe_grid_icons.png"] == (3, 2)
-    assert len(slicing_audit["dead_texture_loads"]) >= 2
-    assert len(slicing_audit["init_before_ready_texture_vars"]) == 1
-
     bible = GameBibleSpec(
         deliberation="Synthetic test bible.",
         game_title="Synthetic Survey",
@@ -480,11 +473,17 @@ def test_gate_b_multimodal_audit_remediation_proposals_and_council_dossier(tmp_p
     )
     (tmp_path / "game_bible.json").write_text(bible.model_dump_json(indent=2), encoding="utf-8")
 
-    # Mock Gemini multimodal contact-sheet audit flagging flat_wedge.png as a placeholder geometric wedge
+    # Mock Gemini multimodal contact-sheet audit flagging broken/placeholder assets and implicated scripts
     verdict_json = AssetSheetMultimodalAuditVerdict(
         deliberation="Contact sheet shows recipe_grid_icons.png missing 5 of 6 cells and flat_wedge.png is a crude solid triangle.",
-        offending_assets=["assets/sprites/flat_wedge.png"],
-        remediation_summary="assets/sprites/flat_wedge.png is a flat solid-color geometric triangle placeholder.",
+        offending_assets=["assets/ui/recipe_grid_icons.png", "assets/sprites/flat_wedge.png"],
+        offending_scripts=[
+            "scripts/ui/slot_button.gd",
+            "scripts/ui/hud_bar.gd",
+            "scripts/entities/launcher_tower.gd",
+            "scripts/world/terrain_mesh.gd",
+        ],
+        remediation_summary="recipe_grid_icons.png has blank slots and flat_wedge.png is a flat solid-color geometric triangle placeholder.",
         all_assets_coherent_and_intact=False,
     ).model_dump_json()
     fake_gemini = _FakeLiveGenaiClient()
@@ -565,7 +564,7 @@ def test_gate_b_multimodal_audit_remediation_proposals_and_council_dossier(tmp_p
     dossier, parts, _ = wr._capture_current_slice_reflection_dossier(bible, bible.slice_roadmap[0], tmp_path)
     assert "Visual & UI Defects Observed:" in dossier
     assert "5 of 6 recipe slots have blank icon boxes" in dossier
-    assert "=== CARTRIDGE VISUAL ASSET & GDSCRIPT SLICING INTEGRITY AUDIT ===" in dossier
+    assert "=== CARTRIDGE VISUAL ASSET INVENTORY & OBSERVATIONAL CONTACT SHEET ===" in dossier
     assert "assets/ui/recipe_grid_icons.png" in dossier
     assert (tmp_path / "artifacts" / "proofs" / "asset_contact_sheet_slice_0.png").is_file()
 
@@ -650,3 +649,179 @@ def test_gate_c_runtime_texture_audit_and_gate_f_post_approval_mtime_guard(tmp_p
     os.utime(sprite_file, (base_ts + 15.0, base_ts + 15.0))
     summary_stale = sup._completed_production_board_summary(cand)
     assert summary_stale is None
+
+
+def test_referenced_first_contact_sheet_hframes_1x1_mismatch_submin_cells_and_writers_room_vlm_audit(
+    tmp_path: Path,
+):
+    """Verifies domain-agnostic fixes preventing silent asset corruption blind spots:
+    1. Actively referenced `.gd` / `.tscn` PNGs sort BEFORE unreferenced alphabetical staging/part PNGs
+       and `max_tiles=64` prevents silent truncation past 36 files.
+    2. Unconditional `hframes`/`vframes` slicing on a cataloged `1x1` `static_sprite` is deterministically
+       caught (no longer self-cancelled by `max(cat_cols, inf_cols)`), and multi-cell atlases with `< 16px`
+       cells (e.g. `8x3` inside `96x96` = `12x32` px/cell) are flagged as `sub_min_cell_px`.
+    3. `CreativeWritersRoom._build_asset_integrity_dossier_and_sheet()` runs the multimodal contact-sheet
+       critic when a live Gemini client is present, caches unchanged mtimes, invalidates on PNG update,
+       and `_proof_parts()` attaches `.keyframe_fullres.png` alongside `filmstrip_*.png`.
+    """
+    (tmp_path / "project.godot").write_text(
+        '[application]\nconfig/name="Domain Agnostic Audit"\nrun/main_scene="res://main.tscn"\n',
+        encoding="utf-8",
+    )
+
+    sprites_dir = tmp_path / "assets" / "sprites"
+    parts_dir = sprites_dir / "parts"
+    portraits_dir = tmp_path / "assets" / "portraits"
+    scripts_dir = tmp_path / "scripts"
+    for d in (sprites_dir, parts_dir, portraits_dir, scripts_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    # Create 40 alphabetically-early unreferenced staging & rig-part PNGs that previously pushed z_* off a 36-tile sheet
+    tiny_unused = _make_rich_rgba_cell(48, 48)
+    for i in range(30):
+        tiny_unused.save(sprites_dir / f"a_staging_unused_{i:02d}.png")
+    for i in range(10):
+        tiny_unused.save(parts_dir / f"a_rig_part_{i:02d}.png")
+
+    # Active world sprite (cataloged as 1x1 static_sprite, 96x96) + active scene portrait + 8x3 micro-cell atlas (96x96 -> 12x32px)
+    z_world_prop = sprites_dir / "z_world_prop.png"
+    z_portrait = portraits_dir / "z_speaker_bust.png"
+    z_micro_atlas = sprites_dir / "z_micro_atlas.png"
+    _make_rich_rgba_cell(96, 96).save(z_world_prop)
+    _make_rich_rgba_cell(128, 128).save(z_portrait)
+    Image.new("RGBA", (96, 96), STYLE_BIBLE_16_PALETTE[3] + (255,)).save(z_micro_atlas)
+
+    lib = CartridgeAssetLibrary(cartridge_dir=tmp_path, client=None)
+    lib.catalog.entries["z_world_prop"] = AssetLibraryEntry(
+        deliberation="Cataloged 1x1 static world prop.",
+        asset_id="z_world_prop",
+        asset_type="prop",
+        fabrication_mode="static_sprite",
+        purpose="Interactive world node",
+        res_path="res://assets/sprites/z_world_prop.png",
+        file_path="assets/sprites/z_world_prop.png",
+        target_display_size=(96, 96),
+        texture_pixel_size=(96, 96),
+        hframes=1,
+        vframes=1,
+    )
+    lib.catalog.entries["z_micro_atlas"] = AssetLibraryEntry(
+        deliberation="Cataloged 8x3 directional sheet squeezed into 96x96.",
+        asset_id="z_micro_atlas",
+        asset_type="sprite_sheet",
+        fabrication_mode="sprite_sheet",
+        purpose="Directional unit",
+        res_path="res://assets/sprites/z_micro_atlas.png",
+        file_path="assets/sprites/z_micro_atlas.png",
+        target_display_size=(32, 32),
+        texture_pixel_size=(96, 96),
+        hframes=8,
+        vframes=3,
+    )
+    lib.save_catalog()
+
+    # Bind z_speaker_bust.png via .tscn and slice 1x1 z_world_prop.png unconditionally as 4x4 in .gd
+    (tmp_path / "main.tscn").write_text(
+        '[gd_scene format=3]\n[ext_resource type="Texture2D" path="res://assets/portraits/z_speaker_bust.png" id="1"]\n',
+        encoding="utf-8",
+    )
+    (scripts_dir / "prop_node.gd").write_text(
+        'extends Node2D\n'
+        'const TEX_PATH = "res://assets/sprites/z_world_prop.png"\n'
+        'func _ready() -> void:\n'
+        '\tvar sp := Sprite2D.new()\n'
+        '\tsp.texture = load(TEX_PATH)\n'
+        '\tsp.hframes = 4\n'
+        '\tsp.vframes = 4\n'
+        '\tadd_child(sp)\n',
+        encoding="utf-8",
+    )
+
+    all_vfiles = collect_cartridge_visual_asset_files(tmp_path)
+    meta_map = _collect_observational_asset_metadata(tmp_path, all_vfiles)
+    # Cataloged non-parts assets (z_world_prop.png, z_micro_atlas.png) are marked in_catalog=True with exact grid metadata
+    assert meta_map["assets/sprites/z_world_prop.png"]["in_catalog"] is True
+    assert meta_map["assets/sprites/z_world_prop.png"]["grid"] == [1, 1]
+    assert meta_map["assets/sprites/z_micro_atlas.png"]["in_catalog"] is True
+    assert meta_map["assets/sprites/z_micro_atlas.png"]["grid"] == [8, 3]
+    sheet_check = render_cartridge_asset_contact_sheet(tmp_path, max_tiles=64)
+    assert sheet_check is not None and sheet_check.is_file()
+
+    # Verify WritersRoom _build_asset_integrity_dossier_and_sheet renders observational contact sheet, caches by mtime, and invalidates on edit
+    bible = GameBibleSpec(
+        deliberation="Synthetic test bible.",
+        game_title="Synthetic Horizon",
+        elevator_pitch="Build and explore.",
+        visual_style_guide="Rich hand-painted illustration.",
+        slice_roadmap=[
+            GameSliceSpec(
+                deliberation="Slice 0.",
+                slice_index=0,
+                slice_id="slice_0",
+                title="Init",
+                slice_objective="Playable loop",
+                status="active",
+            )
+        ],
+    )
+    (tmp_path / "game_bible.json").write_text(bible.model_dump_json(indent=2), encoding="utf-8")
+
+    wr = CreativeWritersRoom(client=None)
+    with patch(
+        "engine.supervisor.asset_validator.render_cartridge_asset_contact_sheet",
+        wraps=render_cartridge_asset_contact_sheet,
+    ) as render_spy:
+        dossier_1, sheet_p1, _ = wr._build_asset_integrity_dossier_and_sheet(tmp_path, "slice_0_p0")
+        assert render_spy.call_count == 1
+        assert "=== CARTRIDGE VISUAL ASSET INVENTORY & OBSERVATIONAL CONTACT SHEET ===" in dossier_1
+        assert "assets/sprites/z_micro_atlas.png" in dossier_1 or "assets/sprites/a_staging_unused_00.png" in dossier_1
+        assert sheet_p1 is not None and sheet_p1.is_file()
+
+        # Second call with unchanged mtimes hits cache (no duplicate contact sheet render)
+        dossier_2, _, _ = wr._build_asset_integrity_dossier_and_sheet(tmp_path, "slice_0_p0")
+        assert render_spy.call_count == 1
+        assert dossier_2 == dossier_1
+
+        # Touching a PNG invalidates cache and re-renders contact sheet
+        future_ts = time.time() + 10.0
+        os.utime(z_world_prop, (future_ts, future_ts))
+        wr._build_asset_integrity_dossier_and_sheet(tmp_path, "slice_0_p0")
+        assert render_spy.call_count == 2
+
+    # Verify _proof_parts attaches .keyframe_fullres.png sidecar alongside filmstrip_*.png
+    proof_dir = tmp_path / "artifacts" / "work_items" / "demo_item"
+    proof_dir.mkdir(parents=True, exist_ok=True)
+    strip_file = proof_dir / "filmstrip_demo_item_rev0.png"
+    fullres_file = proof_dir / "filmstrip_demo_item_rev0.keyframe_fullres.png"
+    _make_rich_rgba_cell(640, 360).save(strip_file)
+    _make_rich_rgba_cell(1280, 720).save(fullres_file)
+
+    board = ProductionBoard(tmp_path / "backlog.json")
+    added = board.add_items(
+        [
+            WorkItemProposal(
+                deliberation="Demo item.",
+                item_id="demo_item",
+                kind="integration",
+                title="Demo integration",
+                spec="Wire scene",
+                proof_spec="Filmstrip",
+            )
+        ],
+        raised_by_role="CreativeDirector",
+        slice_id="slice_0",
+    )
+    board.claim_ready(1)
+    board.submit_result(
+        "demo_item",
+        WorkerResult(
+            notes="Captured strip",
+            proof_images=[str(strip_file)],
+        ),
+    )
+    item_obj = board.get("demo_item")
+    proof_parts = wr._proof_parts(item_obj, tmp_path)
+    text_labels = [p for p in proof_parts if isinstance(p, str)]
+    assert any("filmstrip_demo_item_rev0.png" in lbl for lbl in text_labels)
+    assert any("FULL-RESOLUTION 1:1 KEYFRAME" in lbl for lbl in text_labels)
+

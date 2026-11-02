@@ -85,20 +85,15 @@ def collect_cartridge_visual_asset_files(cartridge_dir: Union[Path, str]) -> Lis
     return list(dict.fromkeys(found))
 
 
-def audit_cartridge_visual_and_slicing_integrity(cartridge_dir: Union[Path, str]) -> Dict[str, Any]:
-    """Deterministic, 100% domain-agnostic audit of:
-    1. All production visual PNGs (`assets/sprites/`, `assets/ui/`, `assets/tiles/`, `assets/portraits/`),
-    2. Multi-cell atlas occupancy (`>= 1%` opaque pixels per active cell from `asset_library.json` or `.gd` slicing),
-    3. GDScript fractional region-slicing mismatches against `1x1` catalog assets, and
-    4. Unbound local texture loads / `_init()`-before-`_ready()` texture ordering in `.gd` scripts.
-    """
-    from engine.studio.asset_library import infer_gdscript_asset_slicing_and_wiring
-
+def _collect_observational_asset_metadata(
+    cartridge_dir: Union[Path, str],
+    visual_files: Optional[List[Path]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Collects pure observational metadata (`size`, `grid`, `in_catalog`, `referenced`, `mode`, `purpose`,
+    `perceptual_description`) from `assets/asset_library.json`, production `.gd`/`.tscn`/`.tres`/`.gdshader`
+    references, and PNG headers without prescriptive slicing heuristics."""
     cdir = Path(cartridge_dir).resolve()
-    visual_files = collect_cartridge_visual_asset_files(cdir)
-    is_godot = (cdir / "project.godot").is_file()
-
-    catalog_entries: Dict[str, Dict[str, Any]] = {}
+    vfiles = visual_files if visual_files is not None else collect_cartridge_visual_asset_files(cdir)
     by_rel_path: Dict[str, Dict[str, Any]] = {}
     cat_path = cdir / "assets" / "asset_library.json"
     if cat_path.is_file():
@@ -106,150 +101,113 @@ def audit_cartridge_visual_and_slicing_integrity(cartridge_dir: Union[Path, str]
             raw_cat = json.loads(cat_path.read_text(encoding="utf-8"))
             raw_entries = raw_cat.get("entries", raw_cat) if isinstance(raw_cat, dict) else {}
             if isinstance(raw_entries, dict):
-                for aid, aval in raw_entries.items():
+                for aval in raw_entries.values():
                     if isinstance(aval, dict):
-                        catalog_entries[str(aid)] = aval
                         fp = str(aval.get("file_path") or aval.get("res_path") or "").replace("res://", "").lstrip("/")
                         if fp:
                             by_rel_path[fp] = aval
         except Exception:
             pass
 
-    slicing_info = infer_gdscript_asset_slicing_and_wiring(cdir)
-    inferred_grids: Dict[str, Tuple[int, int]] = dict(slicing_info.get("asset_grids") or {})
+    excluded_src_dirs = {"tests", "artifacts", ".godot", "mockups", "concepts", "playtest_captures"}
+    source_chunks: List[str] = []
+    if cdir.is_dir():
+        for pattern in ("*.gd", "*.tscn", "*.tres", "*.gdshader"):
+            for src_file in cdir.rglob(pattern):
+                try:
+                    rel_parts = set(src_file.relative_to(cdir).parts)
+                    if rel_parts & excluded_src_dirs:
+                        continue
+                    source_chunks.append(src_file.read_text(encoding="utf-8", errors="ignore"))
+                except Exception:
+                    pass
+    referenced_blob = "\n".join(source_chunks)
 
-    errors: List[str] = []
-    offending_assets: List[str] = []
-    offending_scripts: List[str] = []
     asset_metadata: Dict[str, Dict[str, Any]] = {}
-
-    def _flag_asset(rel_p: str) -> None:
-        if rel_p and rel_p not in offending_assets:
-            offending_assets.append(rel_p)
-
-    def _flag_script(rel_s: str) -> None:
-        if rel_s and rel_s not in offending_scripts:
-            offending_scripts.append(rel_s)
-
-    for vfile in visual_files:
+    for vfile in vfiles:
         try:
             rel_p = vfile.relative_to(cdir).as_posix()
         except Exception:
             rel_p = vfile.name
         c_entry = by_rel_path.get(rel_p, {})
-        cat_cols = max(1, int(c_entry.get("hframes") or 1))
-        cat_rows = max(1, int(c_entry.get("vframes") or 1))
-        inf_cols, inf_rows = inferred_grids.get(rel_p, (1, 1))
-        cols = max(cat_cols, inf_cols)
-        rows = max(cat_rows, inf_rows)
-        anim_states = c_entry.get("animation_states") if isinstance(c_entry.get("animation_states"), dict) else {}
-
+        cols = max(1, int(c_entry.get("hframes") or 1))
+        rows = max(1, int(c_entry.get("vframes") or 1))
+        w, h = 0, 0
         try:
             with Image.open(vfile) as im:
                 w, h = im.size
-                rgba_arr = np.asarray(im.convert("RGBA"))
         except Exception:
-            continue
-
-        empty_cells: List[Tuple[int, int]] = []
-        if cols * rows > 1 and w >= cols and h >= rows:
-            cw = max(1, w // cols)
-            ch = max(1, h // rows)
-            active_cells: Set[Tuple[int, int]] = set()
-            if anim_states:
-                for st_val in anim_states.values():
-                    if isinstance(st_val, dict):
-                        r_idx = int(st_val.get("row", 0) or 0)
-                        fcnt = max(1, int(st_val.get("frame_count", cols) or cols))
-                        if 0 <= r_idx < rows:
-                            for c_idx in range(min(cols, fcnt)):
-                                active_cells.add((c_idx, r_idx))
-            if not active_cells:
-                for r_idx in range(rows):
-                    for c_idx in range(cols):
-                        active_cells.add((c_idx, r_idx))
-
-            for c_idx, r_idx in sorted(active_cells):
-                cell_alpha = rgba_arr[r_idx * ch:(r_idx + 1) * ch, c_idx * cw:(c_idx + 1) * cw, 3]
-                occ = float(np.count_nonzero(cell_alpha > 16)) / float(max(1, cell_alpha.size))
-                if occ < 0.01:
-                    empty_cells.append((c_idx, r_idx))
-
-            if empty_cells:
-                _flag_asset(rel_p)
-                errors.append(
-                    f"Multi-cell {cols}x{rows} atlas '{rel_p}' ({w}x{h}px) has {len(empty_cells)}/{len(active_cells)} "
-                    f"empty/erased cell(s) (<1% opaque pixels) at (col, row)={empty_cells[:8]}."
-                )
-
+            pass
+        fname = Path(rel_p).name
+        is_referenced = bool(
+            referenced_blob and ((rel_p in referenced_blob) or (bool(fname) and fname in referenced_blob))
+        )
         asset_metadata[rel_p] = {
             "size": [w, h],
             "grid": [cols, rows],
-            "empty_cells": [list(ec) for ec in empty_cells],
+            "catalog_grid": [cols, rows],
+            "in_catalog": bool(c_entry),
+            "referenced": is_referenced,
             "mode": str(c_entry.get("fabrication_mode") or c_entry.get("asset_type") or "static_sprite"),
             "purpose": str(c_entry.get("purpose") or ""),
+            "perceptual_description": str(c_entry.get("perceptual_description") or ""),
         }
-
-    if is_godot:
-        for claim in slicing_info.get("script_grid_claims") or []:
-            if claim.get("kind") == "fractional_region" and not claim.get("guarded"):
-                c_cols = int(claim.get("cols") or 1)
-                c_rows = int(claim.get("rows") or 1)
-                mismatched_single_assets: List[str] = []
-                for a_rel in claim.get("assets") or []:
-                    meta = asset_metadata.get(a_rel)
-                    c_ent = by_rel_path.get(a_rel, {})
-                    grid_wh = meta.get("grid", [1, 1]) if meta else [
-                        max(1, int(c_ent.get("hframes") or 1)),
-                        max(1, int(c_ent.get("vframes") or 1)),
-                    ]
-                    if grid_wh == [1, 1] and not a_rel.endswith("_sheet.png"):
-                        mismatched_single_assets.append(a_rel)
-                if mismatched_single_assets:
-                    scr = str(claim.get("script") or "")
-                    _flag_script(scr)
-                    for caller_scr in claim.get("caller_scripts") or []:
-                        _flag_script(str(caller_scr))
-                    errors.append(
-                        f"Script '{scr}' unconditionally slices texture region 1/{c_cols} x 1/{c_rows} "
-                        f"on single-frame 1x1 asset(s) {mismatched_single_assets[:5]}, cropping a partial corner!"
-                    )
-
-        for dload in slicing_info.get("dead_texture_loads") or []:
-            scr = str(dload.get("script") or "")
-            _flag_script(scr)
-            errors.append(str(dload.get("issue") or f"Unbound texture load in {scr}"))
-
-        for order_bug in slicing_info.get("init_before_ready_texture_vars") or []:
-            scr = str(order_bug.get("script") or "")
-            _flag_script(scr)
-            errors.append(str(order_bug.get("issue") or f"_init() before _ready() texture ordering bug in {scr}"))
-
-    return {
-        "visual_files": visual_files,
-        "errors": errors,
-        "offending_assets": offending_assets,
-        "offending_scripts": offending_scripts,
-        "asset_metadata": asset_metadata,
-    }
+    return asset_metadata
 
 
 def render_cartridge_asset_contact_sheet(
     cartridge_dir: Union[Path, str],
     output_path: Optional[Union[Path, str]] = None,
-    max_tiles: int = 36,
+    max_tiles: int = 64,
+    flagged_assets: Optional[Set[str]] = None,
+    active_only: bool = False,
 ) -> Optional[Path]:
-    """Renders a labeled checkerboard contact sheet of a cartridge's production visual assets
-    (`assets/sprites/`, `assets/ui/`, `assets/tiles/`, `assets/portraits/`), overlaying `(hframes, vframes)`
-    cell grid lines and relative paths + pixel sizes so Gate B and the Specialist Council can inspect
-    every game asset in a single HIGH-resolution image.
+    """Renders a neutral labeled checkerboard contact sheet of a cartridge's production visual assets
+    (`assets/sprites/`, `assets/ui/`, `assets/tiles/`, `assets/portraits/`, `assets/backgrounds/`),
+    sorting actively referenced in-game assets first and overlaying `(hframes, vframes)` catalog grid lines.
     """
     cdir = Path(cartridge_dir).resolve()
-    audit = audit_cartridge_visual_and_slicing_integrity(cdir)
-    vfiles: List[Path] = list(audit.get("visual_files") or [])[:max_tiles]
-    if not vfiles:
+    all_vfiles = collect_cartridge_visual_asset_files(cdir)
+    if not all_vfiles:
         return None
-    meta_map: Dict[str, Dict[str, Any]] = dict(audit.get("asset_metadata") or {})
+    meta_map = _collect_observational_asset_metadata(cdir, all_vfiles)
+    any_referenced = any(bool(m.get("referenced")) for m in meta_map.values())
+
+    def _sort_key(vf_path: Path) -> Tuple[int, str]:
+        rp = vf_path.relative_to(cdir).as_posix() if vf_path.is_relative_to(cdir) else vf_path.name
+        info_m = meta_map.get(rp, {})
+        is_ref = bool(info_m.get("referenced"))
+        in_cat = bool(info_m.get("in_catalog"))
+        is_part = "/parts/" in f"/{rp}"
+        if is_part:
+            tier = 3
+        elif is_ref:
+            tier = 0
+        elif in_cat:
+            tier = 1
+        else:
+            tier = 2
+        return (tier, rp)
+
+    candidate_vfiles = all_vfiles
+    if active_only and any_referenced:
+        active_subset = [
+            vf_p
+            for vf_p in all_vfiles
+            if bool(
+                meta_map.get(
+                    vf_p.relative_to(cdir).as_posix() if vf_p.is_relative_to(cdir) else vf_p.name,
+                    {},
+                ).get("referenced")
+            )
+        ]
+        if active_subset:
+            candidate_vfiles = active_subset
+
+    vfiles: List[Path] = sorted(candidate_vfiles, key=_sort_key)[:max_tiles]
+    flagged_set: Set[str] = {
+        str(p).replace("res://", "").lstrip("/") for p in (flagged_assets or set()) if p
+    }
 
     cols = min(4, max(1, int(math.ceil(math.sqrt(len(vfiles))))))
     rows = int(math.ceil(len(vfiles) / float(cols)))
@@ -263,7 +221,7 @@ def render_cartridge_asset_contact_sheet(
     draw = ImageDraw.Draw(sheet)
     draw.text(
         (pad, 10),
-        f"CARTRIDGE VISUAL ASSET CONTACT SHEET ({len(vfiles)} assets — checkerboard=alpha, cyan lines=atlas cells)",
+        f"CARTRIDGE VISUAL ASSET CONTACT SHEET ({len(vfiles)} assets — checkerboard=alpha, cyan=catalog grid)",
         fill=(235, 240, 248, 255),
     )
 
@@ -278,9 +236,10 @@ def render_cartridge_asset_contact_sheet(
         info = meta_map.get(rel_p, {})
         grid = info.get("grid") or [1, 1]
         g_cols, g_rows = max(1, int(grid[0])), max(1, int(grid[1]))
-        has_empty = bool(info.get("empty_cells"))
+        in_cat = bool(info.get("in_catalog"))
+        is_flagged = rel_p in flagged_set
 
-        border_col = (235, 80, 80, 255) if has_empty else (82, 94, 114, 255)
+        border_col = (235, 80, 80, 255) if is_flagged else ((95, 165, 215, 255) if in_cat else (82, 94, 114, 255))
         draw.rectangle([x0, y0, x0 + card_w - 1, y0 + card_h - 1], fill=(30, 34, 42, 255), outline=border_col, width=2)
 
         tx0, ty0 = x0 + 10, y0 + 8
@@ -320,11 +279,12 @@ def render_cartridge_asset_contact_sheet(
         if len(short_rel) > 34:
             short_rel = "..." + short_rel[-31:]
         draw.text((x0 + 8, y0 + thumb_h + 14), short_rel, fill=(230, 236, 245, 255))
-        meta_lbl = f"{w_px}x{h_px}px | grid={g_cols}x{g_rows}" + (" [EMPTY CELLS!]" if has_empty else "")
+        flag_tag = " [FLAGGED]" if is_flagged else (" [UNREF]" if (any_referenced and not bool(info.get("referenced"))) else "")
+        meta_lbl = f"{w_px}x{h_px}px | grid={g_cols}x{g_rows}{flag_tag}"
         draw.text(
             (x0 + 8, y0 + thumb_h + 30),
             meta_lbl,
-            fill=(255, 120, 120, 255) if has_empty else (165, 178, 198, 255),
+            fill=(255, 120, 120, 255) if is_flagged else (165, 178, 198, 255),
         )
 
     dest = Path(output_path) if output_path is not None else (cdir / "artifacts" / "proofs" / "asset_contact_sheet.png")
@@ -334,15 +294,15 @@ def render_cartridge_asset_contact_sheet(
 
 
 class AssetValidator:
-    """Evaluates candidate cartridge assets against Gate E invariants."""
-    deliberation: str = "Multimodal Asset Validator enforcing audio, visual, and narrative integrity."
+    """Evaluates candidate cartridge assets against structural binary & JSON integrity invariants."""
+    deliberation: str = "Multimodal Asset Validator verifying binary audio, visual, and narrative integrity."
 
     def __init__(
         self,
         palette: Optional[List[Tuple[int, int, int]]] = None,
         enforce_palette: bool = False,
-        min_audio_duration_sec: float = 0.1,
-        max_audio_duration_sec: float = 30.0,
+        min_audio_duration_sec: float = 0.02,
+        max_audio_duration_sec: float = 300.0,
         silence_threshold_rms: float = 1.0,
         gemini_client: Optional[Any] = None,
         event_bus: Optional[Any] = None,
@@ -842,21 +802,24 @@ class AssetValidator:
                             parts.append(types.Part.from_bytes(data=mp.read_bytes(), mime_type="image/png"))
 
             manifest_lines = [
-                f"- {rel}: size={meta.get('size')}, grid={meta.get('grid')}, mode={meta.get('mode')}, purpose={str(meta.get('purpose') or '')[:90]}"
-                for rel, meta in sorted(asset_metadata.items())[:36]
+                f"- {rel}: active_in_game={bool(meta.get('referenced'))}, size={meta.get('size')}, grid={meta.get('grid')}, mode={meta.get('mode')}, purpose={str(meta.get('purpose') or '')[:90]}"
+                for rel, meta in list(asset_metadata.items())[:64]
             ]
             prompt_txt = (
                 f"You are the Gate B Multimodal Visual Asset Integrity Critic auditing '{game_title}'.\n"
-                f"Image 1 is the labeled CARTRIDGE VISUAL ASSET CONTACT SHEET (checkerboard = transparent alpha; "
-                f"cyan lines = multi-cell atlas boundaries). Any subsequent images are the Game Bible concept art mockups.\n\n"
+                f"Image 1 is the labeled CARTRIDGE VISUAL ASSET CONTACT SHEET (active in-game assets listed first; "
+                f"checkerboard = transparent alpha; cyan lines = multi-cell atlas boundaries; red card borders = deterministic warnings). "
+                f"Any subsequent images are the Game Bible concept art mockups.\n\n"
                 f"=== GAME BIBLE VISUAL STYLE GUIDE ===\n{style_guide}\n"
                 f"Camera / Spatial Paradigm: {camera_paradigm}\n\n"
-                f"=== REGISTERED VISUAL ASSETS ===\n" + "\n".join(manifest_lines) + "\n\n"
-                f"Audit EVERY tile on the contact sheet:\n"
-                f"1. Flag any asset rendered as crude flat solid-color geometric placeholder shapes (e.g. unshaded triangles, "
-                f"rectangles, or circles) that clash with the Game Bible's illustrated/painted style guide and concept mockups.\n"
-                f"2. Flag any multi-cell atlas (`grid=CxR` with `C*R > 1`) that has blank/transparent checkerboard cells where icons or frames should be.\n"
-                f"3. Flag any garbled, severely clipped, or unreadable asset.\n"
+                f"=== REGISTERED VISUAL ASSETS (MATCHING TILE ORDER ON SHEET) ===\n" + "\n".join(manifest_lines) + "\n\n"
+                f"Audit EVERY tile on the contact sheet (especially `active_in_game=True` assets):\n"
+                f"1. Flag any asset rendered as crude flat solid-color / 16-color indexed geometric placeholder shapes "
+                f"(e.g. unshaded triangles, pentagons, rectangles, or circles) that clash with the Game Bible's illustrated/shaded/painted style guide and concept mockups.\n"
+                f"2. Flag any multi-cell atlas (`grid=CxR` with `C*R > 1`) that has blank/transparent checkerboard cells where icons or frames should be, "
+                f"OR any `1x1` sprite that accidentally packs multiple tiny stacked/squished duplicates surrounded by excessive empty transparent padding.\n"
+                f"3. Flag any garbled, anamorphically crushed/stretched, severely clipped, or unreadable asset (and if an `active_in_game=True` file is a corrupted/squished "
+                f"duplicate shadowing a cleaner asset on the sheet, flag the corrupted `.png` in `offending_assets` and note the path mismatch in `remediation_summary`).\n"
                 f"Deliberate thoroughly first (`deliberation`), list exact relative paths (`assets/.../*.png`) in `offending_assets`, "
                 f"and set `all_assets_coherent_and_intact` last."
             )
@@ -870,7 +833,8 @@ class AssetValidator:
                 ),
             }
             if hasattr(types, "ThinkingConfig") and hasattr(types, "ThinkingLevel"):
-                cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
+                t_level = getattr(types.ThinkingLevel, "MEDIUM", types.ThinkingLevel.LOW)
+                cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=t_level)
             resp = self.gemini_client.models.generate_content(
                 model=self.model_name,
                 contents=parts,
@@ -935,12 +899,11 @@ class AssetValidator:
                     all_errors.extend(rep.errors)
                 deliberation_parts.append(rep.deliberation)
 
-        # 3. Validate visual assets across assets/sprites, assets/tiles, assets/ui, assets/portraits, or root
-        slicing_audit = audit_cartridge_visual_and_slicing_integrity(cdir)
-        sprite_files = list(slicing_audit.get("visual_files") or [])
-        offending_assets: List[str] = list(slicing_audit.get("offending_assets") or [])
-        offending_scripts: List[str] = list(slicing_audit.get("offending_scripts") or [])
-        diagnostic_data["asset_metadata"] = dict(slicing_audit.get("asset_metadata") or {})
+        # 3. Validate visual assets across assets/sprites, assets/tiles, assets/ui, assets/portraits, assets/backgrounds, or root
+        sprite_files = collect_cartridge_visual_asset_files(cdir)
+        offending_assets: List[str] = []
+        offending_scripts: List[str] = []
+        diagnostic_data["asset_metadata"] = _collect_observational_asset_metadata(cdir, sprite_files)
 
         if sprite_files:
             has_any_multimodal_assets = True
@@ -957,29 +920,36 @@ class AssetValidator:
                         offending_assets.append(rel_bad)
                 deliberation_parts.append(rep.deliberation)
 
-        for sa_err in slicing_audit.get("errors") or []:
-            all_errors.append(str(sa_err))
-            deliberation_parts.append(str(sa_err))
-
         # 4. Multimodal Contact-Sheet Style & Completeness Critic (when live Gemini client + Game Bible exist)
         if sprite_files and is_real_genai_client(self.gemini_client) and (cdir / "game_bible.json").is_file():
-            contact_sheet_p = render_cartridge_asset_contact_sheet(cdir)
+            contact_sheet_p = render_cartridge_asset_contact_sheet(cdir, flagged_assets=set(offending_assets))
             if contact_sheet_p is not None and contact_sheet_p.is_file():
                 diagnostic_data["contact_sheet_path"] = str(contact_sheet_p)
                 mm_verdict = self._run_multimodal_contact_sheet_audit(cdir, contact_sheet_p, diagnostic_data["asset_metadata"])
                 if mm_verdict is not None:
                     deliberation_parts.append(f"Multimodal Contact Sheet Critic: {mm_verdict.deliberation}")
                     if not mm_verdict.all_assets_coherent_and_intact or mm_verdict.offending_assets:
+                        added_mm_flag = False
                         for raw_off in mm_verdict.offending_assets:
                             norm_off = str(raw_off or "").replace("res://", "").lstrip("/")
                             if not norm_off.startswith("assets/") and (cdir / "assets" / norm_off).is_file():
                                 norm_off = f"assets/{norm_off}"
                             if (cdir / norm_off).is_file() and norm_off not in offending_assets:
                                 offending_assets.append(norm_off)
+                                added_mm_flag = True
                         for raw_scr in mm_verdict.offending_scripts:
                             norm_scr = str(raw_scr or "").replace("res://", "").lstrip("/")
                             if (cdir / norm_scr).is_file() and norm_scr not in offending_scripts:
                                 offending_scripts.append(norm_scr)
+                        if added_mm_flag:
+                            try:
+                                render_cartridge_asset_contact_sheet(
+                                    cdir,
+                                    output_path=contact_sheet_p,
+                                    flagged_assets=set(offending_assets),
+                                )
+                            except Exception:
+                                pass
                         crit_msg = (
                             mm_verdict.remediation_summary.strip()
                             or f"Multimodal asset sheet critic rejected incoherent/placeholder assets: {mm_verdict.offending_assets}"

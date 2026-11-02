@@ -79,10 +79,10 @@ class PlaytestSessionConfig(BaseEpistemicModel):
         description="Simulated 60 FPS frames (~250ms at 15 ticks) advanced after frame capture before holding for LLM reply.",
     )
     compaction_interval_turns: int = Field(
-        default=30,
+        default=75,
         ge=6,
-        le=120,
-        description="Number of new append-only turns before compacting older history into the episodic journal.",
+        le=150,
+        description="Number of new append-only turns before compacting older history into the episodic journal (75 keeps a full 60-turn slice playtest on one unbroken >=4,096-token implicit cache epoch).",
     )
     compaction_overlap_turns: int = Field(
         default=5,
@@ -594,7 +594,7 @@ class PlaytestSessionStartRequest(BaseEpistemicModel):
     )
     max_turns: int = Field(default=150, ge=1, le=1000)
     reaction_ticks: int = Field(default=15, ge=1, le=60)
-    compaction_interval_turns: int = Field(default=30, ge=6, le=120)
+    compaction_interval_turns: int = Field(default=75, ge=6, le=150)
     enable_audio_perception: bool = Field(default=True)
 
 

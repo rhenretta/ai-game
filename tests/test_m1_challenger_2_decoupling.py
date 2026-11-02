@@ -242,7 +242,7 @@ class TestRunGameShellScript:
         - Emits guidance banner instructing user to run run_studio.py.
         - Does NOT fall back to seed or raise uncaught exceptions.
         """
-        active_cartridge_dir = Path("cartridges/active")
+        active_cartridge_dir = Path(stash_active_cartridge)
         assert not active_cartridge_dir.exists(), "cartridges/active should not exist before Studio builds a game"
 
         # Run bash run_game.sh --headless

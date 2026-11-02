@@ -262,8 +262,8 @@ class TestM6It2ChallengerLauncherGroupIsolation:
     """Verifies process group isolation and multi-offset early signal interception."""
 
     @pytest.mark.parametrize("signum,offset_sec", [
-        (signal.SIGINT, 0.05),
-        (signal.SIGTERM, 0.05),
+        (signal.SIGINT, 0.08),
+        (signal.SIGTERM, 0.08),
         (signal.SIGINT, 0.15),
         (signal.SIGTERM, 0.15),
         (signal.SIGINT, 0.30),

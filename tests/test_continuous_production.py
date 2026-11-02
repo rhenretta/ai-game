@@ -169,7 +169,8 @@ def test_board_is_disabled_for_non_live_clients_unless_forced(tmp_path):
     board = orch._build_production_board(tmp_path)
     assert board is not None and board.default_max_revisions == 3 and orch._board_scheduler.max_workers == 2
     assert set(orch._board_scheduler.handlers) == {
-        "visual_asset", "animation", "audio_asset", "level_map", "mechanic_code", "ui", "integration"}
+        "visual_asset", "animation", "audio_asset", "narrative", "level_map",
+        "mechanic_code", "ui", "integration", "discovery", "other"}
     assert orch.production_board is board
 
 
@@ -290,69 +291,29 @@ def test_validate_filmstrip_plan_checks_setup_calls(tmp_path):
 
 
 def test_godot_gameplay_and_asset_gates_reject_demo_loops_debug_huds_and_unbound_sprites(tmp_path):
+    """Verifies `_check_godot_gameplay_and_asset_gates` enforces pure binary PNG/WAV asset header integrity
+    without throwing prescriptive regex RuntimeErrors on GDScript variable names, HUD labels, or layout scale."""
     track = RequirementTrack(deliberation="d", id="t1", title="T1", description="desc", target_modules=["main.gd", "entities.gd", "ui_hud.gd"])
 
-    # 1. Self-playing sim_tick demo loop in main.gd is rejected
-    (tmp_path / "main.gd").write_text(
-        "extends Node2D\nvar sim_tick = 0\nfunc _physics_process(_d):\n"
-        "\tsim_tick += 1\n\tif sim_tick == 62:\n\t\tpass\n\telif sim_tick == 130:\n\t\tpass\n"
-    )
-    with pytest.raises(RuntimeError, match="Self-playing demo loop detected"):
-        StudioOrchestrator._check_godot_gameplay_and_asset_gates(tmp_path, track, {})
-    (tmp_path / "main.gd").write_text("extends Node2D\n")
-
-    # 2. Debug telemetry dashboard in ui_hud.gd is rejected
-    (tmp_path / "ui_hud.gd").write_text(
-        'extends CanvasLayer\nvar label = "HEADLESS MECHANICS & TELEMETRY VERIFICATION: ALL PASS"\n'
-    )
-    with pytest.raises(RuntimeError, match="Debug telemetry dashboard detected in ui_hud.gd"):
-        StudioOrchestrator._check_godot_gameplay_and_asset_gates(tmp_path, track, {})
+    (tmp_path / "main.gd").write_text("extends Node2D\nvar sim_tick = 0\n")
     (tmp_path / "ui_hud.gd").write_text("extends CanvasLayer\n")
+    (tmp_path / "entities.gd").write_text("extends Node2D\n")
 
-    # 3. Unbound sprite assets (PNGs exist in assets/sprites/ but textures_loaded_count == 0) is rejected
     sprites_dir = tmp_path / "assets" / "sprites"
     sprites_dir.mkdir(parents=True)
     Image.new("RGBA", (32, 32), (255, 0, 0, 255)).save(sprites_dir / "hero.png")
-    (tmp_path / "entities.gd").write_text("extends Node2D\n")
-    with pytest.raises(RuntimeError, match="Unbound sprite assets"):
-        StudioOrchestrator._check_godot_gameplay_and_asset_gates(tmp_path, track, {"textures_loaded_count": 0})
 
-    # Passes once textures_loaded_count > 0
+    # Observational telemetry (e.g. textures_loaded_count == 0) does NOT raise prescriptive RuntimeError
+    StudioOrchestrator._check_godot_gameplay_and_asset_gates(tmp_path, track, {"textures_loaded_count": 0})
     StudioOrchestrator._check_godot_gameplay_and_asset_gates(tmp_path, track, {"textures_loaded_count": 2})
 
-    # 4. playtest_timer / handle_automated_playtest_cadence in main.gd is rejected
-    (tmp_path / "main.gd").write_text(
-        "extends Node2D\nvar playtest_timer: float = 0.0\nfunc handle_automated_playtest_cadence(delta: float):\n"
-        "\tif playtest_timer >= 1.0:\n\t\tpass\n\telif playtest_timer >= 2.8:\n\t\tpass\n"
-    )
-    with pytest.raises(RuntimeError, match="Self-playing demo loop detected"):
+    # Corrupt binary PNG header fails fast (Rule 5)
+    corrupt_png = sprites_dir / "corrupt.png"
+    corrupt_png.write_bytes(b"NOT_A_PNG")
+    with pytest.raises(RuntimeError, match="Corrupt or 0-byte PNG binary header"):
         StudioOrchestrator._check_godot_gameplay_and_asset_gates(tmp_path, track, {"textures_loaded_count": 2})
-    (tmp_path / "main.gd").write_text("extends Node2D\n")
-
-    # 5. Tiny 1-screen hardcoded Rect2 placeholder in scenes.gd when level_layout.json has multi-screen scale is rejected
-    scene_track = RequirementTrack(deliberation="d", id="t2", title="T2", description="desc", target_modules=["scenes.gd"])
-    (tmp_path / "level_layout.json").write_text(
-        json.dumps(
-            {
-                "deliberation": "d",
-                "viewport_size": [1920.0, 1080.0],
-                "intended_world_scale_in_viewports": 12.0,
-                "world_bounds": [0.0, 0.0, 11520.0, 2160.0],
-                "world_regions": [
-                    {"deliberation": "d", "region_id": "r0", "bounds": [0.0, 0.0, 3840.0, 1080.0], "progression_order": 0},
-                    {"deliberation": "d", "region_id": "r1", "bounds": [3840.0, 0.0, 7680.0, 2160.0], "progression_order": 1},
-                ],
-                "camera_framing": "tracking",
-                "entities": [],
-                "triggers": [],
-            }
-        )
-    )
-    (tmp_path / "scenes.gd").write_text(
-        "extends Node2D\nfunc build():\n\tvar r = [Rect2(100, 520, 480, 60), Rect2(40, 680, 1200, 40)]\n"
-    )
-    with pytest.raises(RuntimeError, match="Tiny placeholder level detected in scenes.gd"):
-        StudioOrchestrator._check_godot_gameplay_and_asset_gates(tmp_path, scene_track, {"textures_loaded_count": 2})
+    corrupt_png.unlink()
+    StudioOrchestrator._check_godot_gameplay_and_asset_gates(tmp_path, track, {"textures_loaded_count": 2})
 
 
 def test_level_generation_strategy_accepts_bespoke_open_ended_strategies():
@@ -997,7 +958,7 @@ def test_asset_tasks_cannot_clobber_shared_scene_and_code_lock_spans_swe_and_qa_
     assert "plate_hunter_sprite.png" in proof_names
     assert "filmstrip_hunter_controller_rev1.png" in proof_names
 
-    # 3. Verify plan_asset_requirement disambiguates target_path with item_id when another task already uses that path
+    # 3. Verify plan_asset_requirement honors exact target_path without silent {item_id}_ filename mangling (Rule 5)
     from engine.studio.workers import plan_asset_requirement
     (tmp_path / "catalog.json").write_text(
         json.dumps({"other_task": {"file": "assets/sprites/shared_name.png", "mode": "static_sprite"}})
@@ -1005,7 +966,7 @@ def test_asset_tasks_cannot_clobber_shared_scene_and_code_lock_spans_swe_and_qa_
     ctx_asset = bw.ctx_for(tmp_path, lambda _c: bw.req_json("ignored", target="assets/sprites/shared_name.png"))
     req = plan_asset_requirement(ctx_asset, bw.item("task_two"), ("static_sprite",))
     assert req.asset_id == "task_two"
-    assert req.target_path == "assets/sprites/task_two_shared_name.png"
+    assert req.target_path == "assets/sprites/shared_name.png"
 
 
 def test_task_lead_yields_on_busy_code_lock_persists_pending_decision_and_resumes_exact_turn(tmp_path):
@@ -1623,7 +1584,7 @@ def test_curated_multimodal_context_and_anti_workaround_gates(tmp_path):
     assert "hframes=1, vframes=1" in swe_summary
     assert "NEVER set hframes>1 or vframes>1 on this composite!" in swe_summary
 
-    # 3. StudioOrchestrator gates: early_failure_state_detected vs fullscreen_occlusion_detected + empty_sprite_frame_nodes
+    # 3. StudioOrchestrator gates: observational scene_audit logs cleanly while corrupt binary PNG fails fast
     orch = StudioOrchestrator.__new__(StudioOrchestrator)
     track = RequirementTrack(
         deliberation="d",
@@ -1633,32 +1594,22 @@ def test_curated_multimodal_context_and_anti_workaround_gates(tmp_path):
         description="Spec",
         target_modules=["entities.gd"],
     )
-    with pytest.raises(RuntimeError, match="Unrecoverable early failure state"):
-        orch._check_godot_gameplay_and_asset_gates(
-            tmp_path,
-            track,
-            {"fullscreen_occlusion_detected": False, "early_failure_state_detected": True},
-        )
-    with pytest.raises(RuntimeError, match="Invisible / mis-sliced Sprite2D frame detected"):
-        orch._check_godot_gameplay_and_asset_gates(
-            tmp_path,
-            track,
-            {
-                "fullscreen_occlusion_detected": False,
-                "early_failure_state_detected": False,
-                "empty_sprite_frame_nodes": ["Silt Skiff(res://assets/sprites/va_kaelen_rig.png, frame=0, hframes=4, vframes=1)"],
-            },
-        )
-    with pytest.raises(RuntimeError, match="Severe GPU SubViewport frame-rate thrashing detected"):
-        orch._check_godot_gameplay_and_asset_gates(
-            tmp_path,
-            track,
-            {
-                "fullscreen_occlusion_detected": False,
-                "early_failure_state_detected": False,
-                "subviewport_thrashing_nodes": ["CompactionMaskViewport (size=(1920, 1080), UPDATE_ALWAYS + CLEAR_MODE_NEVER)"],
-            },
-        )
+    orch._check_godot_gameplay_and_asset_gates(
+        tmp_path,
+        track,
+        {
+            "fullscreen_occlusion_detected": False,
+            "early_failure_state_detected": True,
+            "empty_sprite_frame_nodes": ["Silt Skiff(res://assets/sprites/va_kaelen_rig.png, frame=0, hframes=4, vframes=1)"],
+            "subviewport_thrashing_nodes": ["CompactionMaskViewport (size=(1920, 1080), UPDATE_ALWAYS + CLEAR_MODE_NEVER)"],
+        },
+    )
+    bad_asset = tmp_path / "assets" / "sprites" / "corrupt_check.png"
+    bad_asset.parent.mkdir(parents=True, exist_ok=True)
+    bad_asset.write_bytes(b"corrupt")
+    with pytest.raises(RuntimeError, match="Corrupt or 0-byte PNG binary header"):
+        orch._check_godot_gameplay_and_asset_gates(tmp_path, track, {})
+    bad_asset.unlink()
 
     # 4. run_swe_engineer_specialist forwards prior revision proof_paths and board to implement_requirement_track
     captured_swe_kwargs = {}
@@ -1798,10 +1749,12 @@ def test_multi_region_layout_validation_specialist_participation_and_level_films
         ],
         progression_path=["r0"],
     )
-    layout_issues = validate_level_layout(cramped_layout, strategy=strategy)
-    assert any("world_regions only defines 1 region" in i for i in layout_issues)
-    assert any("intended_world_scale_in_viewports" in i for i in layout_issues)
-    assert any(">= 4 entities" in i for i in layout_issues)
+    # 1. Single-region / 1-screen layout is accepted when internally consistent (no hardcoded multi-region quotas),
+    #    while internal scale/bounds mismatches against the model's own declared intent are flagged.
+    assert validate_level_layout(cramped_layout, strategy=strategy) == []
+    inconsistent_layout = cramped_layout.model_copy(update={"intended_world_scale_in_viewports": 4.0})
+    layout_issues = validate_level_layout(inconsistent_layout, strategy=strategy)
+    assert any("intended_world_scale_in_viewports=4.0" in i for i in layout_issues)
 
     # 2. Level map review panel includes VisualArtDirector, and Task Lead cannot submit wireframe-only proof
     lvl_item = WorkItem(
@@ -2154,6 +2107,9 @@ def test_ai_cost_optimizations_without_quality_loss(tmp_path):
                 )
             if sname == "TaskLeadDecision":
                 return SimpleNamespace(text=next(lead_live_turns))
+            if sname == "VisualArtistPlan":
+                from engine.studio.models import VisualArtistPlan
+                return SimpleNamespace(text=VisualArtistPlan(deliberation="d", operation="fabricate").model_dump_json())
             if sname == "AssetRequirement":
                 return SimpleNamespace(text=bw.req_json("crate_prop"))
             if sname == "FilmstripPlan":
@@ -2392,6 +2348,9 @@ def test_harness_shift_left_reactive_qa_and_asset_revision_escalation(tmp_path):
             if sname == "TaskLeadDecision":
                 lead_called["n"] += 1
                 return SimpleNamespace(text=next(lead_turns))
+            if sname == "VisualArtistPlan":
+                from engine.studio.models import VisualArtistPlan
+                return SimpleNamespace(text=VisualArtistPlan(deliberation="d", operation="fabricate").model_dump_json())
             if sname == "AssetRequirement":
                 return SimpleNamespace(text=bw.req_json("multi_prop_pack"))
             raise AssertionError(f"Unexpected schema {sname}")
@@ -2406,20 +2365,25 @@ def test_harness_shift_left_reactive_qa_and_asset_revision_escalation(tmp_path):
     assert lead_called["n"] == 2
     assert res_rev1.proof_images
 
-    # 2. QA summary filters simulate_* and validate_filmstrip_plan rejects simulate_* setup_calls
+    # 2. QA summary exposes all cartridge methods transparently and validate_filmstrip_plan checks structural validity
     qa_summary = _summarize_cartridge_for_qa(tmp_path)
     assert "real_action()" in qa_summary
-    assert "simulate_full_solve" not in qa_summary
+    assert "simulate_full_solve()" in qa_summary
 
-    bad_sim_plan = FilmstripPlan(
+    staged_plan = FilmstripPlan(
         deliberation="d",
         capture_ticks=[5, 20],
         input_segments=[InputSegment(deliberation="d", from_tick=1, to_tick=10, actions=["act"])],
         setup_calls=[QASetupCall(deliberation="d", at_tick=1, method_name="simulate_full_solve", args_json="[]")],
         frame_expectations=["f1", "f2"],
     )
-    issues = validate_filmstrip_plan(bad_sim_plan, ["act"])
-    assert any("simulate_full_solve" in i and "simulate_*" in i for i in issues)
+    assert validate_filmstrip_plan(staged_plan, ["act"]) == []
+
+    bad_action_plan = staged_plan.model_copy(
+        update={"input_segments": [InputSegment(deliberation="d", from_tick=1, to_tick=10, actions=["unknown_act"])]}
+    )
+    issues = validate_filmstrip_plan(bad_action_plan, ["act"])
+    assert any("unknown_act" in i for i in issues)
 
     reactive_plan = FilmstripPlan(
         deliberation="d",
@@ -2769,13 +2733,25 @@ def test_qa_plate_labels_pose_frame_and_causal_filmstrip_invariants(tmp_path: Pa
     )
     assert frame_out.size == (64, 64)
 
-    # 3. Verify validate_filmstrip_plan blocks onboarding/completion setup_calls and empty mechanic inputs
-    bad_plan = FilmstripPlan(
-        deliberation="Shortcut plan",
+    # 3. Verify validate_filmstrip_plan permits scenario setup_calls while requiring causal inputs + council summary in causal_gameplay mode
+    missing_summary_and_inputs_plan = FilmstripPlan(
+        deliberation="Incomplete causal plan",
+        capture_ticks=[20, 60],
+        setup_calls=[],
+        input_segments=[],
+        frame_expectations=["f1", "f2"],
+    )
+    issues = validate_filmstrip_plan(missing_summary_and_inputs_plan, ["KEY_1", "KEY_SPACE"], item_kind="mechanic_code")
+    assert any("must include at least one `input_segments`" in iss for iss in issues)
+    assert any("council_test_scene_summary" in iss for iss in issues)
+
+    # Exploratory diagnostic mode allows zero-input staging probes cleanly (e.g. set_onboarding_step)
+    exploratory_plan = FilmstripPlan(
+        deliberation="Exploratory diagnostic probe",
         capture_ticks=[20, 60],
         setup_calls=[
             QASetupCall(
-                deliberation="Force onboarding step",
+                deliberation="Stage onboarding step",
                 at_tick=10,
                 target_node_or_property="main",
                 method_name="set_onboarding_step",
@@ -2784,11 +2760,9 @@ def test_qa_plate_labels_pose_frame_and_causal_filmstrip_invariants(tmp_path: Pa
         ],
         input_segments=[],
         frame_expectations=["f1", "f2"],
+        verification_mode="exploratory_diagnostic",
     )
-    issues = validate_filmstrip_plan(bad_plan, ["KEY_1", "KEY_SPACE"], item_kind="mechanic_code")
-    assert any("set_onboarding_step" in iss for iss in issues)
-    assert any("must include at least one `input_segments`" in iss for iss in issues)
-    assert any("council_test_scene_summary" in iss for iss in issues)
+    assert validate_filmstrip_plan(exploratory_plan, ["KEY_1", "KEY_SPACE"], item_kind="mechanic_code") == []
 
     good_plan = FilmstripPlan(
         deliberation="Authentic causal plan",

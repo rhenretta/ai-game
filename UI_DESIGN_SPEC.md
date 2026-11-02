@@ -1,7 +1,7 @@
 # Studio Observability UI Design Specification (Requirement R5)
-**Document Version:** 2.0.0  
+**Document Version:** 2.1.0  
 **Status:** IMPLEMENTED  
-**Target Milestone:** M_UI → M18  
+**Target Milestone:** M_UI → M19  
 **Module Scope:** `studio-web/`, `engine/ui/server.py`, `engine/ui/models.py`  
 **Reference Requirements:** R1, R2, R3, R5  
 
@@ -504,12 +504,12 @@ Mission Control (`studio-web/src/`) unifies studio operations across 7 workspace
 ### 13.2 Immediate WebSocket Reconnect Reconciliation (`useSwarmSocket.ts`)
 - Whenever `/ws/swarm` disconnects (e.g., during a Uvicorn `--reload` restart or daemon stop) and subsequently reconnects, `useSwarmSocket.ts` fires `onReconnect` to immediately invalidate and refetch `['status']`, `['studio-status']`, `['production-board']`, and `['writers-room']` without waiting for background polling intervals—ensuring the header immediately transitions from `Building` to `Stopped` and surfaces the **`Resume`** action button without requiring a manual browser refresh.
 
-### 13.3 Live Post-Board Phase Observability & Tracked QA Self-Repair (`LiveActivityBanner.tsx`, `liveActivity.ts`)
-- `/api/studio/status` exposes `board_activity`, `writers_room_activity`, and `agent_activity` so `LiveActivityBanner.tsx` continuously displays the exact phase and specialist currently executing—even after all initial `ProductionBoard` items reach `approved` (covering **Slice Assembly Check**, **End-of-Slice Blind Playtest**, **5-Gate QA Slice Verification**, **Slice Reflection & Strategy**, and **Final Sign-Off Council**).
-- When `_run_slice_qa_gate_check` detects any Gate A–E defect, `build_qa_gate_work_item_proposal` raises a visible `qa_gate_pass*` work item directly onto `ProductionBoard` so self-repair runs transparently on the board with full `TaskChronologyDrawer`, `TurnDetailCard`, `PromptInspector`, and Council Proof Review observability.
+### 13.3 Live Post-Board Phase & AI Call Cost Observability (`LiveActivityBanner.tsx`, `liveActivity.ts`)
+- `/api/studio/status` exposes `board_activity`, `writers_room_activity`, `agent_activity`, and `token_usage` (`TokenUsageSummary`) so `LiveActivityBanner.tsx` continuously displays the exact phase, specialist, and live `llm_gateway_call` telemetry (total tokens, thinking tokens, cached prefix tokens, synthesized image count, per-call estimated USD cost, and session cache-hit percentage) across board execution, **Slice Assembly Check**, **End-of-Slice Blind Playtest**, and **Slice Reflection & Strategy**.
+- Continuous Production Board builds use autonomous agent verification (`is_agent_verified_board_build` in `StudioOrchestrator.execute_swarm_plan`), checking headless Godot boot syntax and escalating any boot syntax error directly to the Writers' Room Council rather than running hardcoded post-slice or post-build 5-Gate restrictions.
 
-### 13.4 Production Board Working Lifecycle & Live Proof Showcase (`ProductionBoardView.tsx`, `WorkItemCard.tsx`, `boardCards.ts`, `liveActivity.ts`)
-- **Strict `Working` vs `Queued` Lifecycle Separation**: `isWorkingBoardItem` (`boardCards.ts`) groups only tasks that have been picked up and are not yet approved (`in_progress`, `waiting_for_lock`, `awaiting_review`, `changes_requested`, `failed`, `needs_decision`, and Council-reviewed `blocked` tasks waiting on newly spawned prerequisites). Unstarted `ready` items—even if they hold interrupted prior-attempt counters before Council submission—remain strictly under **`Queued`** (`ready`), while `ProductionBoard.requeue_failed` preserves `changes_requested` whenever Council revision feedback already exists.
+### 13.4 Production Board Working Lifecycle, Split Tasks & Live Proof Showcase (`ProductionBoardView.tsx`, `WorkItemCard.tsx`, `TaskChronologyDrawer.tsx`, `boardCards.ts`, `liveActivity.ts`)
+- **Strict `Working` vs `Queued` Lifecycle & Decomposed `Split` Badges**: `isWorkingBoardItem` (`boardCards.ts`) groups only tasks that have been picked up and are not yet approved (`in_progress`, `waiting_for_lock`, `awaiting_review`, `changes_requested`, `failed`, `needs_decision`, and Council-reviewed `blocked` tasks waiting on newly spawned prerequisites), while `getStateBadge` (`WorkItemCard.tsx`, `TaskChronologyDrawer.tsx`) distinguishes Stage 1 Council-decomposed parent tasks (`decision_reason` indicating split) from cancelled items. Unstarted `ready` items—even if they hold interrupted prior-attempt counters before Council submission—remain strictly under **`Queued`** (`ready`), and `ProductionBoard.requeue_failed` preserves `changes_requested` whenever Council revision feedback already exists.
 - **Scoped Live Step Counts & Cache-Busted Mid-Flight Proof Showcases**: `deriveLiveStudioActivity` (`liveActivity.ts`) filters live step entries strictly to active working board item IDs, while `WorkItemCard.tsx` fetches live chronology across `in_progress`, `waiting_for_lock`, and `changes_requested` and resolves card previews via `resolveCardProofShowcase`—skipping deleted/unlinked QA retry filmstrips and appending `&v=` cache-busting tokens so newly captured revision proofs render immediately.
 
 

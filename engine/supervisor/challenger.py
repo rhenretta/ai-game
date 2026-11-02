@@ -402,120 +402,6 @@ class CandidateASTInspector:
                                         ),
                                     })
 
-            if "scenes.gd" in gd_sources:
-                world_code = "\n".join(gd_sources.values())
-                has_world_draw = any(
-                    tok in world_code
-                    for tok in (
-                        "func _draw",
-                        "draw_rect(",
-                        "draw_circle(",
-                        "draw_colored_polygon(",
-                        "draw_polygon(",
-                        "draw_line(",
-                        "draw_texture",
-                        "Sprite2D.new()",
-                        "Polygon2D.new()",
-                        "TileMapLayer.new()",
-                        "ColorRect.new()",
-                    )
-                )
-                if not has_world_draw:
-                    hollow_stubs.append({
-                        "file": "scenes.gd",
-                        "module": "scenes.gd",
-                        "function": "_draw",
-                        "line": 1,
-                        "stmt": "missing world renderer",
-                        "reason": (
-                            "scenes.gd and main.gd contain zero world rendering calls (_draw/draw_* or Sprite2D/Polygon2D nodes); "
-                            "the game viewport will render an empty gray background."
-                        ),
-                    })
-
-            all_gd_concat = "\n".join(gd_sources.values())
-            tscn_concat = "\n".join(
-                tf.read_text(encoding="utf-8", errors="ignore")
-                for tf in sorted(c_dir.rglob("*.tscn"))
-                if "tests" not in tf.relative_to(c_dir).parts
-            )
-            all_ref_concat = all_gd_concat + "\n" + tscn_concat
-            board_managed = (c_dir / "backlog.json").is_file()
-            sprites_dir = c_dir / "assets" / "sprites"
-            if sprites_dir.is_dir():
-                png_files = [
-                    p for p in sorted(sprites_dir.glob("*.png"))
-                    if "_part_" not in p.name and not p.name.endswith("_portrait.png")
-                ]
-                logical_sprites: Dict[str, Path] = {}
-                for p in png_files:
-                    base_id = p.stem[:-6] if p.stem.endswith("_sheet") else p.stem
-                    logical_sprites.setdefault(base_id, p)
-                if logical_sprites and "asset_library.json" not in all_ref_concat:
-                    if "assets/sprites" not in all_ref_concat:
-                        hollow_stubs.append({
-                            "file": "scenes.gd" if "scenes.gd" in gd_sources else "main.gd",
-                            "module": "scenes.gd" if "scenes.gd" in gd_sources else "main.gd",
-                            "function": "load_sprites",
-                            "line": 1,
-                            "stmt": "unbound sprite assets",
-                            "reason": (
-                                "Synthesized PNG sprites exist in assets/sprites/, but zero .gd scripts load or display them."
-                            ),
-                        })
-                    elif not board_managed:
-                        unbound_names = [
-                            p.name
-                            for base_id, p in logical_sprites.items()
-                            if (p.name not in all_ref_concat and base_id not in all_ref_concat)
-                        ]
-                        if unbound_names:
-                            hollow_stubs.append({
-                                "file": "scenes.gd" if "scenes.gd" in gd_sources else "main.gd",
-                                "module": "scenes.gd" if "scenes.gd" in gd_sources else "main.gd",
-                                "function": "load_sprites",
-                                "line": 1,
-                                "stmt": "unbound sprite assets",
-                                "reason": (
-                                    f"VisualArtDirector veto: synthesized PNG sprite(s) {unbound_names} in assets/sprites/ "
-                                    f"are never loaded or bound in any .gd/.tscn module."
-                                ),
-                            })
-
-            audio_dir = c_dir / "assets" / "audio"
-            if audio_dir.is_dir() and list(audio_dir.glob("*.wav")):
-                target_audio_mod = "ui_hud.gd" if "ui_hud.gd" in gd_sources else "main.gd"
-                if "AudioStreamWAV" not in all_gd_concat:
-                    hollow_stubs.append({
-                        "file": target_audio_mod,
-                        "module": target_audio_mod,
-                        "function": "load_wav_stream",
-                        "line": 1,
-                        "stmt": "ResourceLoader.exists(audio_path) without AudioStreamWAV",
-                        "reason": (
-                            f"Synthesized .wav files exist in assets/audio/, but {target_audio_mod} uses "
-                            f"ResourceLoader.exists()/load() without AudioStreamWAV. In Godot 4 runtime without .import "
-                            f"files, ResourceLoader.exists() returns false for raw .wav files, producing zero sound. "
-                            f"Must load raw PCM .wav files via FileAccess.get_file_as_bytes(ProjectSettings.globalize_path(path)) "
-                            f"(stripping the 44-byte RIFF header) into an AudioStreamWAV (FORMAT_16_BITS, mix_rate=24000)."
-                        ),
-                    })
-                elif any(
-                    bad_rate in all_gd_concat.replace(" ", "")
-                    for bad_rate in ("mix_rate=44100", "mix_rate=48000")
-                ):
-                    hollow_stubs.append({
-                        "file": target_audio_mod,
-                        "module": target_audio_mod,
-                        "function": "play_bark",
-                        "line": 1,
-                        "stmt": "mix_rate = 44100",
-                        "reason": (
-                            f"AudioAtmosphereDesigner veto: {target_audio_mod} sets AudioStreamWAV mix_rate to 44100/48000 Hz "
-                            f"instead of 24000 Hz, causing high-pitched chipmunk distortion on Gemini TTS WAV clips."
-                        ),
-                    })
-
         # 3. Disconnected classes analysis
         disconnected_symbols: List[Dict[str, Any]] = []
         entrypoint_module = "main.gd" if gd_files else "mechanics.py"
@@ -1131,15 +1017,15 @@ class MultiAgentSignOffCouncil:
 
                 prompt = (
                     f"You are the Multi-Agent Final Sign-Off Council for candidate build '{candidate_id}'.\n"
-                    f"Every single specialist who authored the Living Game Bible MUST inspect the actual rendered game frames "
-                    f"(playtest_t0.png, playtest_tend.png, and playtest_collision_overlay.png) SIDE-BY-SIDE against the Writers' Room 16:9 Concept Mockup, "
-                    f"source code, audio configuration, and runtime scene audit, and render an independent sign-off verdict:\n"
-                    f"1. VisualArtDirector: Compare the rendered game frames side-by-side against the 16:9 Concept Mockup and playtest_collision_overlay.png! CRITICAL PERSPECTIVE & COLLISION CHECK: Does the landscape orientation match the character's movement plane? Are red StaticBody2D collision boundaries aligned 1:1 with the north sky horizon and chasm edges so the player can NEVER walk on the sky or empty void? Are ALL synthesized sprites loaded with clean alpha transparency and proper world scale? Are character portraits strictly isolated in UI dialogue panels?\n"
-                    f"2. UXExperienceDesigner: Is the viewport clear on startup (zero 95% opaque frost or center-occluding panels)? Are controls, HUD elements, and player feedback clear, responsive, and faithful to the Game Bible's UI/UX design?\n"
-                    f"3. GameplayDesigner: Is there an active, responsive, navigable world loop with meaningful objectives, zero t=0 pre-solved/pre-carved cheats, recoverable hazards, and coherent spatial navigation where entities are physically bounded by StaticBody2D colliders to walkable plateau surfaces?\n"
-                    f"4. StoryWorldArchitect: Are the Narrative Bible's characters, cutscenes, dialogue trees, and voice barks staged in-game?\n"
-                    f"5. AudioAtmosphereDesigner: Are WAV files loaded at 24,000 Hz (`mix_rate = 24000`, never 44100 chipmunk distortion) with the 44-byte RIFF header stripped (`bytes.slice(44)`) and non-overlapping cooldown guards? CRITICAL PSYCHOACOUSTIC CHECK: Reject immediately if the game plays a continuous looping high-pitched sine/square wave drone (`AudioStreamWAV.LOOP_FORWARD` on `> 200 Hz` tones like a constant 523 Hz hum) or piercing `>= 800 Hz` squeals!\n"
-                    f"6. CreativeDirector: Does the final build fulfill the First 60 Seconds Hook, Core Player Fantasy, and look/play like the Writers' Room vision?\n\n"
+                    f"Every specialist who authored the Living Game Bible MUST inspect the rendered game frames "
+                    f"(playtest_t0.png, playtest_tend.png, and playtest_collision_overlay.png if present) SIDE-BY-SIDE against the Writers' Room 16:9 Concept Mockup, "
+                    f"source code, audio configuration, and observational runtime scene telemetry, and render an independent sign-off verdict:\n"
+                    f"1. VisualArtDirector: Compare the rendered game frames against the Living Game Bible's visual style guide and 16:9 Concept Mockup. Verify visual coherence, clean framing, readable silhouettes, and faithful presentation of assets.\n"
+                    f"2. UXExperienceDesigner: Evaluate player readability, onboarding clarity, controls, HUD layout, and responsive feedback against the Game Bible's UX philosophy.\n"
+                    f"3. GameplayDesigner: Verify an active, responsive, genuinely interactive gameplay loop that fulfills the Game Bible's core pillars, spatial/physical rules, and objectives without stubbed or non-functional mechanics.\n"
+                    f"4. StoryWorldArchitect: Verify that worldbuilding, narrative tone, dialogue, or diegetic context (when applicable to the game's genre) match the Living Game Bible.\n"
+                    f"5. AudioAtmosphereDesigner: Verify that synthesized audio/music/voice assets (when present) are loaded cleanly into valid Godot audio streams and fit the acoustic direction.\n"
+                    f"6. CreativeDirector: Verify that the build fulfills the First 60 Seconds Hook, Core Player Fantasy, and cohesive creative vision.\n\n"
                     f"LIVING GAME BIBLE:\n{bible_text}\n\n"
                     f"AST & CODE AUDIT:\n{json.dumps(ast_grounding or {}, indent=2)}\n\n"
                     f"RUNTIME TELEMETRY & SCENE AUDIT:\n{json.dumps(telemetry_grounding or {}, indent=2)}\n\n"
@@ -1173,15 +1059,12 @@ class MultiAgentSignOffCouncil:
                         raw_report["captured_frame_paths"] = captured_paths
                     report = MultiAgentSignOffReport(**raw_report)
             except Exception as exc:
-                logger.warning("Live Gemini MultiAgentSignOffCouncil call failed (%s); synthesizing deterministic council report.", exc)
+                logger.warning("Live Gemini MultiAgentSignOffCouncil call failed (%s); normalizing council report.", exc)
 
-        # Synthesize or enforce deterministic specialist checks across all 6 roles
-        report = self._enforce_specialist_invariants(
+        report = self._normalize_sign_off_report(
             report=report,
             candidate_id=candidate_id,
-            ast_grounding=ast_grounding or {},
-            telemetry_grounding=telemetry_grounding or {},
-            visual_grounding=visual_grounding or {},
+            captured_paths=captured_paths,
         )
 
         # Persist sign_off_report.json to candidate_dir
@@ -1196,20 +1079,14 @@ class MultiAgentSignOffCouncil:
         self._publish_sign_off_events(report)
         return report
 
-    def _enforce_specialist_invariants(
+    def _normalize_sign_off_report(
         self,
         report: Optional[MultiAgentSignOffReport],
         candidate_id: str,
-        ast_grounding: Dict[str, Any],
-        telemetry_grounding: Dict[str, Any],
-        visual_grounding: Dict[str, Any],
+        captured_paths: List[str],
     ) -> MultiAgentSignOffReport:
-        hollow_stubs = ast_grounding.get("hollow_stubs", [])
-        scene_audit = telemetry_grounding.get("scene_audit") or {}
-        atomic_suite = telemetry_grounding.get("atomic_test_suite") or {}
-        blank_detected = bool(visual_grounding.get("blank_canvas_detected", False))
-        captured_paths = list(visual_grounding.get("captured_frame_paths", []))
-
+        """Ensures schema completeness across all 6 specialist roles and logical `unanimous_approval` consistency
+        without overriding any LLM specialist's verdict with Python design heuristics."""
         existing_by_role: Dict[str, SpecialistSignOffVerdict] = {}
         if report is not None:
             for v in report.verdicts:
@@ -1218,123 +1095,18 @@ class MultiAgentSignOffCouncil:
         final_verdicts: List[SpecialistSignOffVerdict] = []
         for role in SPECIALIST_COUNCIL_ROLES:
             verdict = existing_by_role.get(role)
-            defects: List[str] = list(verdict.blocking_defects) if verdict else []
-            remedies: List[str] = list(verdict.remediation_directives) if verdict else []
-            approved: bool = verdict.approved if verdict else True
-
-            if role == "GameplayDesigner":
-                for stub in hollow_stubs:
-                    reason = str(stub.get("reason", ""))
-                    if reason:
-                        approved = False
-                        defects.append(reason)
-                        remedies.append(f"Implement complete interactive logic in {stub.get('module', 'mechanics.gd')}:{stub.get('function', '')}.")
-                if telemetry_grounding.get("is_stagnant_or_frozen"):
-                    approved = False
-                    defects.append("Simulation state remained stagnant/frozen across synthetic input schedule.")
-                    remedies.append("Ensure player inputs drive continuous spatial navigation and world state progression.")
-                if scene_audit.get("passive_auto_win_detected"):
-                    approved = False
-                    p_reason = scene_audit.get("passive_win_reason") or "Game auto-activates or completes during passive zero-input window."
-                    defects.append(f"Passive auto-win / t=0 pre-solved state detected: {p_reason}")
-                    remedies.append("Remove all t=0 pre-solved/pre-carved initialization cheats so objectives require genuine player actions.")
-                if scene_audit.get("unbounded_sky_or_void_detected"):
-                    approved = False
-                    b_reason = scene_audit.get("boundary_violation_reason") or "Player can walk into sky or chasm void."
-                    defects.append(f"Unbounded sky or chasm excursion detected: {b_reason}")
-                    remedies.append("Add StaticBody2D/CollisionPolygon2D barriers along the north sky horizon and between disconnected shelves.")
-                if isinstance(atomic_suite, dict) and int(atomic_suite.get("failed_tests", 0) or 0) > 0:
-                    approved = False
-                    defects.append(f"Atomic Godot unit test failure(s) in tests/test_*.gd: {atomic_suite.get('failed_details', [])}")
-                    remedies.append("Fix the failing atomic unit invariants verified in res://tests/test_*.gd.")
-
-            if role == "VisualArtDirector":
-                for stub in hollow_stubs:
-                    reason = str(stub.get("reason", ""))
-                    stmt = str(stub.get("stmt", ""))
-                    fn_name = str(stub.get("function", ""))
-                    if (
-                        "visualartdirector" in reason.lower()
-                        or "unbound sprite" in reason.lower()
-                        or "unbound sprite" in stmt.lower()
-                        or fn_name in ("load_sprites", "_draw")
-                    ):
-                        approved = False
-                        defects.append(reason or f"Unbound sprite or missing world renderer in {stub.get('module', 'scenes.gd')}.")
-                        remedies.append("Load and bind all synthesized PNG sprites in assets/sprites/ onto visible world nodes.")
-                if blank_detected:
-                    approved = False
-                    defects.append("Blank monochrome canvas detected during visual playtest.")
-                    remedies.append("Ensure scenes.gd and ui_hud.gd actively draw world geometry and bound sprite textures.")
-                if scene_audit.get("portrait_misused_on_world_sprite"):
-                    approved = False
-                    misused = scene_audit.get("portrait_misused_nodes", [])
-                    defects.append(f"Character portrait asset bound to world Sprite2D entity ({misused}) instead of a purpose-built transparent sprite.")
-                    remedies.append("Bind world entities to res://assets/sprites/*.png and use portraits only inside ui_hud.gd dialogue panels.")
-                if scene_audit.get("unbounded_sky_or_void_detected"):
-                    approved = False
-                    b_reason = scene_audit.get("boundary_violation_reason") or "Visual sky/chasm lacks matching StaticBody2D collider."
-                    defects.append(f"Visual-to-physics boundary mismatch (walk-on-sky defect): {b_reason}")
-                    remedies.append("Align StaticBody2D collision boundaries 1:1 with the visual walkable shelf edges in playtest_collision_overlay.png.")
-
-            if role == "UXExperienceDesigner":
-                if scene_audit.get("fullscreen_occlusion_detected"):
-                    approved = False
-                    defects.append("Full-screen viewport occlusion detected (startup frost >= 80% or unrecoverable failure overlay blinding the player).")
-                    remedies.append("Initialize frost/fog overlay <= 0.15 alpha so the exterior world is visible immediately, and make hazards recoverable.")
-                if scene_audit.get("center_occluding_panels"):
-                    approved = False
-                    defects.append(f"UI panel(s) occluding center playfield: {scene_audit.get('center_occluding_panels')}")
-                    remedies.append("Move HUD panels to the screen perimeter so the central viewport remains unobstructed.")
-                if scene_audit.get("oversized_ui_portraits"):
-                    approved = False
-                    defects.append(f"Oversized UI portrait TextureRect node(s) overlapping HUD controls: {scene_audit.get('oversized_ui_portraits')}")
-                    remedies.append("In ui_hud.gd, bound character portrait TextureRect size <= Vector2(64, 64) with TextureRect.EXPAND_IGNORE_SIZE.")
-
-            if role == "AudioAtmosphereDesigner":
-                ap_found = int(scene_audit.get("audio_players_found", 0) or 0)
-                as_loaded = int(scene_audit.get("audio_streams_loaded", 0) or 0)
-                mix_rates = scene_audit.get("audio_mix_rates") or []
-                if ap_found > 0 and as_loaded == 0:
-                    approved = False
-                    defects.append(f"{ap_found} AudioStreamPlayer node(s) found but 0 audio streams loaded.")
-                    remedies.append("Load WAV files via FileAccess.get_file_as_bytes() into AudioStreamWAV.")
-                if any(int(r) in (44100, 48000) for r in mix_rates):
-                    approved = False
-                    defects.append(f"AudioStreamWAV mix_rate set to {mix_rates} instead of 24000 Hz, causing high-pitched chipmunk distortion.")
-                    remedies.append("Set stream.mix_rate = 24000 and strip 44-byte RIFF header via bytes.slice(44).")
-
-            if role == "CreativeDirector" and not approved:
-                defects.append("CreativeDirector withholds final sign-off until all specialist domain defects are resolved.")
-
-            delib = (
-                verdict.deliberation
-                if (verdict and verdict.deliberation)
-                else (
-                    f"{role} inspected candidate '{candidate_id}' and APPROVED Pillar compliance."
-                    if approved
-                    else f"{role} VETOED candidate '{candidate_id}' due to blocking defects: {defects}"
+            if verdict is not None:
+                final_verdicts.append(verdict)
+            else:
+                final_verdicts.append(
+                    SpecialistSignOffVerdict(
+                        deliberation=f"{role} recorded default structural sign-off for '{candidate_id}'.",
+                        specialist_role=role,
+                        approved=True,
+                        blocking_defects=[],
+                        remediation_directives=[],
+                    )
                 )
-            )
-            final_verdicts.append(
-                SpecialistSignOffVerdict(
-                    deliberation=delib,
-                    specialist_role=role,
-                    approved=approved,
-                    blocking_defects=defects,
-                    remediation_directives=remedies,
-                )
-            )
-
-        # If any specialist vetoed, CreativeDirector also vetoes so unanimous_approval is False
-        any_veto = any(not v.approved for v in final_verdicts)
-        if any_veto:
-            for v in final_verdicts:
-                if v.specialist_role == "CreativeDirector" and v.approved:
-                    vetoing_roles = [x.specialist_role for x in final_verdicts if not x.approved]
-                    v.approved = False
-                    v.blocking_defects.append(f"Blocking vetoes from specialists: {vetoing_roles}")
-                    v.remediation_directives.append("Resolve all specialist blocking defects before promotion.")
 
         unanimous = all(v.approved for v in final_verdicts)
         council_delib = (
@@ -1351,7 +1123,7 @@ class MultiAgentSignOffCouncil:
             candidate_id=candidate_id,
             unanimous_approval=unanimous,
             verdicts=final_verdicts,
-            captured_frame_paths=captured_paths,
+            captured_frame_paths=list(report.captured_frame_paths) if (report and report.captured_frame_paths) else captured_paths,
         )
 
     def _publish_sign_off_events(self, report: MultiAgentSignOffReport) -> None:
@@ -1517,8 +1289,8 @@ class ChallengerGate:
         if not sign_off_report.unanimous_approval:
             evaluation.overall_verdict = False
 
-        # 6. Programmatic 100% Threshold & Hollow Stub Enforcement (Defense-in-Depth)
-        evaluation = self._enforce_deterministic_invariants(
+        # 6. Structural Consistency & Rejection Trace Synthesis (Zero Design/Genre Overrides)
+        evaluation = self._finalize_structural_evaluation(
             evaluation=evaluation,
             spec=spec,
             ast_grounding=ast_grounding,
@@ -1644,23 +1416,18 @@ class ChallengerGate:
             f"{code_section}\n"
             f"--- MANDATORY EVALUATION DIRECTIVES ---\n"
             f"1. RATIONALE-FIRST MANDATE (Rule 4): You MUST produce 'deliberation' FIRST before any decision tokens or verdict booleans.\n"
-            f"2. PURE GENERALIZABILITY MANDATE (Rule 1): Audit strictly against the provided requirements and criteria. "
-            f"Zero hardcoded genre, mechanic, or character assumptions (e.g. an abstract automation game requires zero characters).\n"
+            f"2. PURE GENERALIZABILITY MANDATE (Rule 1): Audit strictly against the provided requirements, acceptance criteria, and Living Game Bible. "
+            f"Zero hardcoded genre, mechanic, layout, or character assumptions.\n"
             f"3. STRICT 100% ACCEPTANCE THRESHOLD (R3): Every single requirement track must be genuinely fulfilled with verifiable grounding evidence. "
             f"If even 1 track or acceptance criterion is unfulfilled, stubbed out, or non-functional, overall_verdict MUST BE FALSE.\n"
-            f"4. ANTI-STUB, CAUSAL & SPATIAL INVARIANT DETECTION: Reject shallow stubs, hollow function bodies (pass, return None, return empty Node2D.new()), "
-            f"t=0 pre-solved/pre-carved state cheats (`passive_auto_win_detected == true`), missing sky/chasm physics colliders (`unbounded_sky_or_void_detected == true`), "
-            f"cross-module method name mismatches, unbound sprite/audio assets, missing MOUSE_BUTTON_LEFT placement handlers, "
-            f"and scene modules that lack active _draw() or Sprite2D world rendering.\n"
-            f"5. GAME DESIGNER & UX SIGNOFF MANDATE: Audit the candidate from a human player and Game Designer's perspective:\n"
-            f"   - Interactive Playability & Physical Boundaries: Mouse-to-world picking must use accurate canvas transforms (e.g. `get_global_mouse_position()`, never broken `get_viewport().size` math), placement/interaction guides must render on top of the terrain (`z_index > 0`), and `StaticBody2D` colliders in `playtest_collision_overlay.png` must bound the player 1:1 to walkable surfaces.\n"
-            f"   - Audio & Voice Playback: Runtime `.wav` files must be loaded into valid `AudioStreamWAV` streams via `FileAccess` at `mix_rate = 24000` with 44-byte RIFF header stripped (`bytes.slice(44)`), and player actions must trigger audible SFX without repeating/spamming.\n"
-            f"   - Visual Clarity, Experience Fidelity & UI/Onboarding: The world view must fill the viewport without gray cutoff edges or 95% opaque startup frost, UI panels must not occlude the center playfield (`center_occluding_panels` must be empty), and UI/HUD & onboarding feedback must honor the Living Game Bible and 16:9 Visual Mockups.\n"
+            f"4. ANTI-STUB & STRUCTURAL INTEGRITY DETECTION: Reject shallow stubs, hollow function bodies (`pass`, `return None`, `raise NotImplementedError`, or empty `Node2D.new()`), "
+            f"cross-module method mismatches, simulation crashes, failing unit tests, or un-rendered blank canvases.\n"
+            f"5. GAME DESIGNER & UX SIGNOFF MANDATE: Audit the candidate from a human player and Game Designer's perspective against the Living Game Bible and 16:9 Concept Mockups—verifying responsive controls, readable presentation, working audio playback (when applicable), and coherent gameplay progression.\n"
             f"6. RETURN STRUCTURE: Emit a ChallengerGateEvaluation object containing deliberation, candidate_id, overall_verdict, "
             f"and evaluated_requirements for every track.\n"
         )
 
-    def _enforce_deterministic_invariants(
+    def _finalize_structural_evaluation(
         self,
         evaluation: ChallengerGateEvaluation,
         spec: GameRequirementsSpec,
@@ -1671,64 +1438,30 @@ class ChallengerGate:
         episode_number: int,
         attempt_number: int,
     ) -> ChallengerGateEvaluation:
-        """Programmatic defense-in-depth verifying 100% threshold, specialist sign-off, and hollow stub rejection."""
+        """Pure engine/structural consistency check: verifies 100% track coverage, AST hollow-stub absence,
+        agent-authored unit test survival, non-blank rendering, and `RejectionDiagnosticTrace` synthesis—without
+        any prescriptive gameplay, UI layout, audio mix-rate, or camera heuristics."""
         evaluated_map = {r.requirement_id: r for r in evaluation.evaluated_requirements}
         missing_tracks = [r.id for r in spec.requirements if r.id not in evaluated_map]
 
-        # 1. Check hollow stubs from AST
         hollow_stubs = (ast_grounding or {}).get("hollow_stubs", [])
-        stubs_found_reasons = []
-        if hollow_stubs:
-            for stub in hollow_stubs:
-                stubs_found_reasons.append(f"{stub.get('module', '')}:{stub.get('function', '')} ({stub.get('reason', '')})")
-
-        # 1b. Check runtime scene_audit & atomic_test_suite from Godot harness
-        scene_audit = (telemetry_grounding or {}).get("scene_audit") or {}
-        if isinstance(scene_audit, dict):
-            ap_found = int(scene_audit.get("audio_players_found", 0) or 0)
-            as_loaded = int(scene_audit.get("audio_streams_loaded", 0) or 0)
-            if ap_found > 0 and as_loaded == 0:
-                stubs_found_reasons.append(
-                    f"Runtime Audio Audit: {ap_found} AudioStreamPlayer node(s) found but 0 audio streams loaded (must use FileAccess -> AudioStreamWAV)"
-                )
-            mix_rates = scene_audit.get("audio_mix_rates") or []
-            if any(int(r) in (44100, 48000) for r in mix_rates):
-                stubs_found_reasons.append(
-                    f"Runtime Audio Audit: AudioStreamWAV mix_rate set to {mix_rates} instead of 24000 Hz (causes chipmunk audio distortion)"
-                )
-            occluding = scene_audit.get("center_occluding_panels") or []
-            if occluding:
-                stubs_found_reasons.append(
-                    f"Designer UX Audit: UI panel(s) occluding center playfield: {occluding} (move tooltip/panels to screen edges)"
-                )
-            if scene_audit.get("fullscreen_occlusion_detected"):
-                stubs_found_reasons.append(
-                    "Designer UX Audit: Fullscreen viewport occlusion detected (startup frost >= 80% or unrecoverable failure lockout)"
-                )
-            oversized_portraits = scene_audit.get("oversized_ui_portraits") or []
-            if oversized_portraits:
-                stubs_found_reasons.append(
-                    f"Designer UX Audit: Oversized UI portrait TextureRect node(s) overlapping HUD controls: {oversized_portraits} (set expand_mode = TextureRect.EXPAND_IGNORE_SIZE with size <= 64x64)"
-                )
-            if scene_audit.get("passive_auto_win_detected"):
-                stubs_found_reasons.append(
-                    f"Causal Invariant Violation (Passive Auto-Win): {scene_audit.get('passive_win_reason', 'Game auto-activates/completes with zero player input during passive window')}"
-                )
-            if scene_audit.get("unbounded_sky_or_void_detected"):
-                stubs_found_reasons.append(
-                    f"Spatial Invariant Violation (Unbounded Sky/Void): {scene_audit.get('boundary_violation_reason', 'Player walked into sky/void without StaticBody2D boundary')}"
-                )
+        stubs_found_reasons = [
+            f"{stub.get('module', '')}:{stub.get('function', '')} ({stub.get('reason', '')})"
+            for stub in hollow_stubs
+        ]
 
         atomic_suite = (telemetry_grounding or {}).get("atomic_test_suite") or {}
         if isinstance(atomic_suite, dict) and int(atomic_suite.get("failed_tests", 0) or 0) > 0:
             stubs_found_reasons.append(
                 f"Atomic Unit Test Failure: {atomic_suite.get('failed_tests')} test(s) failed in tests/test_*.gd ({atomic_suite.get('failed_details', [])})"
             )
+        if bool((telemetry_grounding or {}).get("crashed", False)):
+            stubs_found_reasons.append(
+                f"Runtime Crash: {(telemetry_grounding or {}).get('error') or 'Headless simulation crashed'}"
+            )
 
-        # 2. Check blank canvas
-        blank_detected = (visual_grounding or {}).get("blank_canvas_detected", False)
+        blank_detected = bool((visual_grounding or {}).get("blank_canvas_detected", False))
 
-        # 3. Check specialist sign-off vetoes
         specialist_vetoes: List[str] = []
         if evaluation.specialist_sign_off and not evaluation.specialist_sign_off.unanimous_approval:
             for v in evaluation.specialist_sign_off.verdicts:
@@ -1738,7 +1471,6 @@ class ChallengerGate:
         unfulfilled = [r.requirement_id for r in evaluation.evaluated_requirements if not r.fulfilled]
         unfulfilled.extend(missing_tracks)
 
-        # Force overall_verdict = False if stubs found, blank canvas, specialist vetoes, or any unfulfilled
         if unfulfilled or stubs_found_reasons or blank_detected or specialist_vetoes:
             evaluation.overall_verdict = False
 
@@ -1779,8 +1511,8 @@ class ChallengerGate:
                     ast_evidence=ast_grounding,
                     telemetry_evidence=telemetry_grounding,
                     recommended_corrective_actions=[
-                        "Implement authentic mechanics logic replacing pass, return None, or hollow Node2D.new() bodies.",
-                        "Ensure entities, sprites, 24kHz WAV audio, and scenes are actively rendered and connected in the game loop.",
+                        "Implement complete mechanics logic replacing pass, return None, or hollow Node2D.new() bodies.",
+                        "Ensure all authored acceptance criteria and unit tests pass cleanly.",
                     ],
                 )
             else:

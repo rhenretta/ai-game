@@ -21,13 +21,18 @@ class TestProjectDebranding:
 
     def _collect_target_files(self) -> List[Path]:
         """Collects all source, config, cartridge, and test files to inspect."""
+        import os
+
         targets = ["engine", "cartridges", "tests", "config.py", "run_game.py", "verify_engine.py"]
-        excluded_dirs = {".git", ".venv", ".pytest_cache", "__pycache__", ".agents", "teamwork"}
+        excluded_dirs = {
+            ".git", ".venv", ".pytest_cache", "__pycache__", ".agents", "teamwork",
+            ".godot", ".godot_runtime", "checkpoints", "node_modules", "traces",
+        }
         binary_suffixes = {
             ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".ico",
             ".mp4", ".mov", ".webm", ".wav", ".mp3", ".ogg", ".flac",
             ".ttf", ".otf", ".woff", ".woff2", ".db", ".sqlite", ".sqlite3",
-            ".pyc", ".pyo", ".so", ".dylib", ".ctex", ".scn", ".res",
+            ".pyc", ".pyo", ".so", ".dylib", ".ctex", ".scn", ".res", ".zip",
         }
 
         files: List[Path] = []
@@ -38,13 +43,19 @@ class TestProjectDebranding:
             if target_path.is_file():
                 files.append(target_path)
             elif target_path.is_dir():
-                for item in target_path.rglob("*"):
-                    if item.is_file():
-                        if any(excluded in item.parts for excluded in excluded_dirs):
+                for root, dirs, filenames in os.walk(target_path):
+                    dirs[:] = [
+                        d for d in dirs
+                        if d not in excluded_dirs
+                        and not d.startswith("candidate_")
+                        and not d.startswith("backup_")
+                        and d != "candidate"
+                    ]
+                    root_path = Path(root)
+                    for fname in filenames:
+                        if os.path.splitext(fname)[1].lower() in binary_suffixes:
                             continue
-                        if item.suffix.lower() in binary_suffixes:
-                            continue
-                        files.append(item)
+                        files.append(root_path / fname)
         return files
 
     def test_zero_legacy_branding_in_codebase(self) -> None:
@@ -62,6 +73,8 @@ class TestProjectDebranding:
             except Exception as e:
                 pytest.fail(f"Failed to read file {file_path}: {e}")
 
+            if forbidden not in content.lower():
+                continue
             for line_number, line in enumerate(content.splitlines(), start=1):
                 if forbidden in line.lower():
                     violations.append((str(file_path.relative_to(PROJECT_ROOT)), line_number, line.strip()))

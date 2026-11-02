@@ -534,7 +534,14 @@ class BlindPlaytesterAgent:
         + `[Block 1B — Compacted Episodic Journal]`.
         Frozen across all turns of the current epoch so byte-0 prefix caching stays 100% invariant.
         """
-        lines: List[str] = ["=== PLAYER PERMANENT HOW-TO-PLAY RULEBOOK (CONFIRMED SO FAR) ==="]
+        lines: List[str] = [
+            "=== BLIND PLAYTESTER SESSION MEMORY & APPEND-ONLY OBSERVATION PROTOCOL ===",
+            "- Everything in this header and `RECENT APPEND-ONLY TURN LOG` below is frozen across the current play epoch so you have full continuity over what you already tried, confirmed, questioned, and observed.",
+            "- Evaluate `turn_log_entry`, `field_note_updates`, `question_updates`, and `rulebook_updates` strictly from visual/audio changes ALREADY observed between the Previous turn screen and Current screen—never pre-confirm an action before seeing its effect on the following turn.",
+            "- Keep `field_note_updates`, `question_updates`, `rulebook_updates`, `bug_reports`, and `impression_updates` sparse (`[]` when nothing new changed) so your permanent notebook stays sharp and non-repetitive.",
+            "",
+            "=== PLAYER PERMANENT HOW-TO-PLAY RULEBOOK (CONFIRMED SO FAR) ===",
+        ]
         if not self.rulebook:
             lines.append("- (No controls or rules confirmed yet.)")
         else:
@@ -664,40 +671,40 @@ class BlindPlaytesterAgent:
             f"What You Were Actively Doing (Current Plan): {self.current_plan}",
         ]
         if self.rulebook:
-            rb_brief = " | ".join(f"{k}: {v}" for k, v in list(self.rulebook.items())[-10:])
+            rb_brief = " | ".join(f"{k}: {v[:120]}" for k, v in list(self.rulebook.items())[-8:])
             status_lines.append(
                 f"Your Confirmed Rulebook So Far (retract with action='retract' if later screens disprove an entry): {rb_brief}"
             )
         if self.field_notes:
-            fn_brief = " | ".join(f"{k}: {v}" for k, v in list(self.field_notes.items())[-10:])
+            fn_brief = " | ".join(f"{k}: {v[:120]}" for k, v in list(self.field_notes.items())[-6:])
             status_lines.append(f"Your Field Notes So Far: {fn_brief}")
         if self.questions:
             open_qs = [
-                f"[{k}] {q['question']}"
+                f"[{k}] {q['question'][:120]}"
                 for k, q in self.questions.items()
                 if q.get("status") != "answered"
             ]
             ans_qs = [
-                f"[{k}] {q['question']} -> {q.get('answer', '')}"
+                f"[{k}] {q['question'][:90]} -> {str(q.get('answer', ''))[:100]}"
                 for k, q in self.questions.items()
                 if q.get("status") == "answered"
             ]
             if open_qs:
-                status_lines.append(f"Open Questions You Are Trying To Answer: {' | '.join(open_qs[-8:])}")
+                status_lines.append(f"Open Questions You Are Trying To Answer: {' | '.join(open_qs[-6:])}")
             if ans_qs:
-                status_lines.append(f"Questions Already Answered: {' | '.join(ans_qs[-6:])}")
+                status_lines.append(f"Questions Already Answered: {' | '.join(ans_qs[-4:])}")
         if self.bugs_found:
             bug_brief = "; ".join(
-                f"[{b.get('category')}/{b.get('severity')}] ({k}) {b.get('summary')}"
-                for k, b in list(self.bugs_found.items())[-10:]
+                f"[{b.get('category')}/{b.get('severity')}] ({k}) {str(b.get('summary', ''))[:110]}"
+                for k, b in list(self.bugs_found.items())[-8:]
             )
             status_lines.append(f"Bugs & Glitches Already Logged (do NOT duplicate): {bug_brief}")
         if self.impressions:
-            imp_brief = " | ".join(f"{k}: {v}" for k, v in self.impressions.items())
+            imp_brief = " | ".join(f"{k}: {v[:140]}" for k, v in self.impressions.items())
             status_lines.append(f"Your Recorded Impressions So Far (only update if changed): {imp_brief}")
         if self.filed_wish_summaries:
             status_lines.append(
-                f"Wishes You Already Filed (do NOT duplicate): {'; '.join(self.filed_wish_summaries[-10:])}"
+                f"Wishes You Already Filed (do NOT duplicate): {'; '.join(self.filed_wish_summaries[-8:])}"
             )
         if obs.interrupted_early:
             status_lines.append("Note: Your last action burst stopped early because the screen changed dramatically.")
@@ -1567,13 +1574,23 @@ class BlindPlaytesterAgent:
         label: str,
         max_retries: int = 3,
     ) -> Any:
+        from engine.studio.models import TOKEN_USAGE_TRACKER, _emit_gateway_llm_activity
+
         for attempt in range(max_retries + 1):
             try:
-                return self.client.models.generate_content(
+                resp = self.client.models.generate_content(
                     model=model,
                     contents=contents,
                     config=config,
                 )
+                if not getattr(getattr(self.client, "models", None), "_studio_guardrails_installed", False):
+                    stats = TOKEN_USAGE_TRACKER.record_playtest_response(
+                        resp,
+                        label=label,
+                    )
+                    if stats is not None:
+                        _emit_gateway_llm_activity(label, stats)
+                return resp
             except PlaytestBudgetExceededError:
                 raise
             except Exception as exc:

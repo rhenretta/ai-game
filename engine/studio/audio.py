@@ -146,6 +146,8 @@ class GeminiAudioBackend(AudioSynthesisBackend):
         for attempt in range(1, max_retries + 1):
             try:
                 from google.genai import types
+                from engine.studio.models import TOKEN_USAGE_TRACKER, _emit_gateway_llm_activity
+                tts_label = f"GeminiAudioBackend.tts[{bark_id}]"
                 response = self.client.models.generate_content(
                     model=self.model_name,
                     contents=escaped_text,
@@ -158,6 +160,9 @@ class GeminiAudioBackend(AudioSynthesisBackend):
                         ),
                     ),
                 )
+                tts_stats = TOKEN_USAGE_TRACKER.record_response(response, label=tts_label)
+                if tts_stats is not None:
+                    _emit_gateway_llm_activity(tts_label, tts_stats)
                 if response.candidates:
                     for candidate in response.candidates:
                         if candidate.content and candidate.content.parts:

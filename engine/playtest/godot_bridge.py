@@ -549,6 +549,10 @@ class GodotPlaytestBridge:
         if sys_name == "Darwin":
             cmd.extend(["-ApplePersistenceIgnoreState", "YES"])
         cmd.extend([
+            "--windowed",
+            "--resolution", "16x16",
+            "--position", "-32000,-32000",
+            "--single-window",
             "--rendering-method", "gl_compatibility",
             "--write-movie", str(silent_clock_avi),
             "--fixed-fps", "60",

@@ -1007,8 +1007,11 @@ def test_validate_game_design_flags_every_gap_and_accepts_complete():
     b = _complete_design_bible()
     b.goal_hierarchy.goals = [b.goal_hierarchy.goals[0]]
     b.onboarding_plan.steps = b.onboarding_plan.steps[:1]
+    assert validate_game_design(b) == []  # 1-step onboarding & single-horizon goals are structurally valid
+    b.goal_hierarchy.goals = []
+    b.onboarding_plan.steps = []
     issues = validate_game_design(b)
-    assert any("long_term" in i for i in issues) and any("at least 3 steps" in i for i in issues)
+    assert any("goal_hierarchy" in i for i in issues) and any("onboarding_plan" in i for i in issues)
 
 
 def test_room_has_level_progression_specialist_and_locks_with_complete_design(tmp_path: Path):

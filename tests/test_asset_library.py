@@ -236,7 +236,11 @@ def test_telemetry_db_persists_and_rehydrates_full_requirements_spec(tmp_path: P
 
 
 def test_challenger_vetoes_portrait_bound_to_world_entity(tmp_path: Path):
-    """Verifies MultiAgentSignOffCouncil vetoes portrait assets bound to world Sprite2D entities."""
+    """Verifies MultiAgentSignOffCouncil surfaces telemetry grounding to the LLM council and preserves specialist vetoes."""
+    from types import SimpleNamespace
+    from engine.supervisor.challenger import SPECIALIST_COUNCIL_ROLES
+    from engine.supervisor.models import MultiAgentSignOffReport, SpecialistSignOffVerdict
+
     (tmp_path / "project.godot").write_text('[application]\nconfig/name="Test"\n', encoding="utf-8")
     (tmp_path / "main.gd").write_text(
         "extends Node2D\nfunc _ready() -> void:\n\tvar x = 1\nfunc _process(delta: float) -> void:\n\tvar y = delta\n",
@@ -253,13 +257,40 @@ def test_challenger_vetoes_portrait_bound_to_world_entity(tmp_path: Path):
     insp = CandidateASTInspector()
     ast_report = insp.inspect_directory(tmp_path)
 
-    council = MultiAgentSignOffCouncil(client=None)
+    captured_prompts = []
+
+    class _MockCouncilClient:
+        __module__ = "google.genai.client"
+
+        def __init__(self):
+            self.models = self
+
+        def generate_content(self, *, model, contents, config=None):
+            captured_prompts.append(str(contents[0]))
+            rep = MultiAgentSignOffReport(
+                deliberation="VisualArtDirector rejected portrait texture bound onto world entity.",
+                candidate_id=tmp_path.name,
+                unanimous_approval=False,
+                verdicts=[
+                    SpecialistSignOffVerdict(
+                        deliberation="Portrait texture bound on world entity." if role == "VisualArtDirector" else "OK",
+                        specialist_role=role,
+                        approved=(role != "VisualArtDirector"),
+                        blocking_defects=["hero_portrait.png misused on world Sprite2D"] if role == "VisualArtDirector" else [],
+                    )
+                    for role in SPECIALIST_COUNCIL_ROLES
+                ],
+            )
+            return SimpleNamespace(text=rep.model_dump_json())
+
+    council = MultiAgentSignOffCouncil(client=_MockCouncilClient())
     sign_off = council.evaluate_sign_off(
         candidate_dir=tmp_path,
         ast_grounding=ast_report,
         telemetry_grounding={"scene_audit": {"portrait_misused_on_world_sprite": True, "portrait_misused_nodes": ["Player:hero_portrait.png"]}},
         visual_grounding={"blank_canvas_detected": False},
     )
+    assert any("hero_portrait.png" in p for p in captured_prompts)
     assert not sign_off.unanimous_approval
     visual_verdict = next(v for v in sign_off.verdicts if v.specialist_role == "VisualArtDirector")
     assert not visual_verdict.approved

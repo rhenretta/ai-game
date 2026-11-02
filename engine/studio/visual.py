@@ -14,7 +14,7 @@ import math
 from pathlib import Path
 import random
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw
@@ -40,6 +40,7 @@ from engine.studio.models import (
     StudioAgentError,
     VisualMockupArtifact,
     bounded_thinking_config,
+    call_gemini_with_transient_retry,
 )
 
 logger = logging.getLogger("VisualArtSpriteDesignerAgent")
@@ -1023,13 +1024,17 @@ class VisualArtSpriteDesignerAgent:
                 )
                 ref_parts = self._build_reference_parts(reference_images)
                 contents: Any = (ref_parts + [prompt]) if ref_parts else prompt
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        response_modalities=["IMAGE"],
-                        image_config=types.ImageConfig(aspect_ratio="1:1"),
+                response = call_gemini_with_transient_retry(
+                    lambda: self.client.models.generate_content(
+                        model=self.model_name,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            response_modalities=["IMAGE"],
+                            image_config=types.ImageConfig(aspect_ratio="1:1"),
+                        ),
                     ),
+                    max_transient_retries=0,
+                    label=f"synthesize_portrait[{getattr(char_obj, 'character_id', None) or out_p.stem}]",
                 )
                 if response.candidates:
                     for cand in response.candidates:
@@ -1105,13 +1110,17 @@ class VisualArtSpriteDesignerAgent:
         for attempt in range(1, max_retries + 1):
             try:
                 from google.genai import types
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_modalities=["IMAGE"],
-                        image_config=types.ImageConfig(aspect_ratio=aspect),
+                response = call_gemini_with_transient_retry(
+                    lambda: self.client.models.generate_content(
+                        model=self.model_name,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            response_modalities=["IMAGE"],
+                            image_config=types.ImageConfig(aspect_ratio=aspect),
+                        ),
                     ),
+                    max_transient_retries=0,
+                    label=f"synthesize_concept_mockup[{out_p.stem}]",
                 )
                 if response.candidates:
                     for cand in response.candidates:
@@ -1224,13 +1233,17 @@ class VisualArtSpriteDesignerAgent:
         last_exc = None
         for attempt in range(1, max_retries + 1):
             try:
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        response_modalities=["IMAGE"],
-                        image_config=types.ImageConfig(aspect_ratio=aspect),
+                response = call_gemini_with_transient_retry(
+                    lambda: self.client.models.generate_content(
+                        model=self.model_name,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            response_modalities=["IMAGE"],
+                            image_config=types.ImageConfig(aspect_ratio=aspect),
+                        ),
                     ),
+                    max_transient_retries=0,
+                    label=f"synthesize_sprite_image[{norm_type or 'sprite'}]",
                 )
                 if response.candidates:
                     for cand in response.candidates:
@@ -1865,44 +1878,60 @@ class VisualArtSpriteDesignerAgent:
         cell_w = max(32, int(cell_w))
         cell_h = max(32, int(cell_h))
 
-        states = list(asset_req.animation_states) if asset_req.animation_states else [
-            AnimationStateSpec(
-                deliberation="Default idle breathing state.",
-                state_name="idle",
-                motion_profile="idle",
-                frame_count=4,
-                fps=6.0,
-                loop=True,
-                pose_progression_prompt="Subtle breathing and alert stance",
-            ),
-            AnimationStateSpec(
-                deliberation="Default locomotion state.",
-                state_name="move",
-                motion_profile="locomotion",
-                frame_count=4,
-                fps=10.0,
-                loop=True,
-                pose_progression_prompt="Dynamic stride cycle with arm and leg swing",
-            ),
-            AnimationStateSpec(
-                deliberation="Default aerial/jump state.",
-                state_name="jump",
-                motion_profile="aerial",
-                frame_count=3,
-                fps=8.0,
-                loop=False,
-                pose_progression_prompt="Takeoff crouch, airborne leap, landing",
-            ),
-            AnimationStateSpec(
-                deliberation="Default interaction/ability state.",
-                state_name="action",
-                motion_profile="action",
-                frame_count=4,
-                fps=10.0,
-                loop=False,
-                pose_progression_prompt="Expressive action gesture or tool activation",
-            ),
-        ]
+        raw_atype = str(getattr(asset_req, "asset_type", "") or "").lower().strip()
+        if asset_req.animation_states:
+            states = list(asset_req.animation_states)
+        elif raw_atype in ("prop", "tile", "ui", "ui_element", "diegetic_ui", "backdrop", "icon"):
+            states = [
+                AnimationStateSpec(
+                    deliberation="Default inanimate 2-frame ambient state.",
+                    state_name="idle",
+                    motion_profile="idle",
+                    frame_count=2,
+                    fps=4.0,
+                    loop=True,
+                    pose_progression_prompt="Subtle idle state",
+                ),
+            ]
+        else:
+            states = [
+                AnimationStateSpec(
+                    deliberation="Default idle breathing state.",
+                    state_name="idle",
+                    motion_profile="idle",
+                    frame_count=4,
+                    fps=6.0,
+                    loop=True,
+                    pose_progression_prompt="Subtle breathing and alert stance",
+                ),
+                AnimationStateSpec(
+                    deliberation="Default locomotion state.",
+                    state_name="move",
+                    motion_profile="locomotion",
+                    frame_count=4,
+                    fps=10.0,
+                    loop=True,
+                    pose_progression_prompt="Dynamic stride cycle with arm and leg swing",
+                ),
+                AnimationStateSpec(
+                    deliberation="Default aerial/jump state.",
+                    state_name="jump",
+                    motion_profile="aerial",
+                    frame_count=4,
+                    fps=8.0,
+                    loop=False,
+                    pose_progression_prompt="Takeoff crouch, airborne leap, apex, landing",
+                ),
+                AnimationStateSpec(
+                    deliberation="Default interaction/ability state.",
+                    state_name="action",
+                    motion_profile="action",
+                    frame_count=4,
+                    fps=10.0,
+                    loop=False,
+                    pose_progression_prompt="Expressive action gesture or tool activation",
+                ),
+            ]
 
         base_dims = (cell_w * 2, cell_h * 2)
         raw_base_prompt = asset_req.visual_prompt_or_text or asset_req.description or asset_req.asset_id
@@ -2262,8 +2291,13 @@ class VisualArtSpriteDesignerAgent:
         mood: str = "retro_arcade",
         reference_images: Optional[List[Union[Path, str, bytes, Image.Image]]] = None,
         style_guide: str = "",
+        *,
+        regenerate_cell_indices: Optional[Sequence[int]] = None,
+        existing_sheet_path: Optional[Union[Path, str]] = None,
     ) -> Path:
-        """Renders and saves a dynamic sprite (or multi-cell grid/atlas sheet when grid_cols * grid_rows > 1) from an AssetRequirement."""
+        """Renders and saves a dynamic sprite (or multi-cell grid/atlas sheet when grid_cols * grid_rows > 1) from an AssetRequirement.
+        When `regenerate_cell_indices` and `existing_sheet_path` are provided for a multi-cell grid retry, preserves clean cells from
+        `existing_sheet_path` and re-synthesizes only the defective cell indices."""
         if isinstance(asset_req, dict):
             dims = asset_req.get("dimensions") or (64, 64)
             prompt = asset_req.get("visual_prompt_or_text") or asset_req.get("description") or asset_req.get("name", "game sprite")
@@ -2283,13 +2317,32 @@ class VisualArtSpriteDesignerAgent:
 
         is_multi_cell = (grid_cols * grid_rows) > 1
         if is_multi_cell and cell_prompts:
+            total_cells = grid_cols * grid_rows
             cell_w = max(32, int(dims[0]) // grid_cols)
             cell_h = max(32, int(dims[1]) // grid_rows)
             sheet_w = cell_w * grid_cols
             sheet_h = cell_h * grid_rows
-            img = Image.new("RGBA", (sheet_w, sheet_h), (0, 0, 0, 0))
+            cells_to_render = list(range(total_cells))
+            img: Optional[Image.Image] = None
+            if regenerate_cell_indices is not None and existing_sheet_path:
+                ex_p = Path(existing_sheet_path)
+                if ex_p.is_file():
+                    try:
+                        with Image.open(ex_p) as prev_im:
+                            prev_rgba = prev_im.convert("RGBA")
+                        if prev_rgba.size == (sheet_w, sheet_h):
+                            valid_regen = sorted(
+                                {int(i) for i in regenerate_cell_indices if 0 <= int(i) < total_cells}
+                            )
+                            if 0 < len(valid_regen) < total_cells:
+                                img = prev_rgba.copy()
+                                cells_to_render = valid_regen
+                    except Exception:
+                        img = None
+            if img is None:
+                img = Image.new("RGBA", (sheet_w, sheet_h), (0, 0, 0, 0))
             renderer = None if self._is_live_genai_client() else ProceduralSpriteRenderer(mood=mood)
-            for idx in range(grid_cols * grid_rows):
+            for idx in cells_to_render:
                 row_i = idx // grid_cols
                 col_i = idx % grid_cols
                 c_prompt = str(cell_prompts[idx] if idx < len(cell_prompts) else prompt).strip() or prompt
@@ -2311,6 +2364,8 @@ class VisualArtSpriteDesignerAgent:
                         seed=f"{aid}_cell_{idx}_{c_prompt[:24]}",
                     )
                 cell_rgba = cell_img.convert("RGBA").resize((cell_w, cell_h), Image.Resampling.LANCZOS)
+                cell_box = (col_i * cell_w, row_i * cell_h, (col_i + 1) * cell_w, (row_i + 1) * cell_h)
+                img.paste((0, 0, 0, 0), cell_box)
                 img.paste(cell_rgba, (col_i * cell_w, row_i * cell_h), cell_rgba)
         elif self._is_live_genai_client():
             img = self._generate_gemini_sprite_image(
@@ -2872,19 +2927,63 @@ class VisualArtSpriteDesignerAgent:
 
         g_cols = max(1, int(getattr(req, "grid_cols", 1) or 1))
         g_rows = max(1, int(getattr(req, "grid_rows", 1) or 1))
+        det_defective_cells: List[int] = []
         if (g_cols * g_rows) > 1:
             cw_chk = max(1, w // g_cols)
             ch_chk = max(1, h // g_rows)
             empty_cells: List[str] = []
+            magenta_cells: List[str] = []
+            boxed_cells: List[str] = []
             for r_i in range(g_rows):
                 for c_i in range(g_cols):
-                    sub_a = rgba_np[r_i * ch_chk:(r_i + 1) * ch_chk, c_i * cw_chk:(c_i + 1) * cw_chk, 3]
-                    if int(np.count_nonzero(sub_a > 24)) < 16:
+                    cell_idx = r_i * g_cols + c_i
+                    sub_rgba = rgba_np[r_i * ch_chk:(r_i + 1) * ch_chk, c_i * cw_chk:(c_i + 1) * cw_chk]
+                    sub_a = sub_rgba[:, :, 3]
+                    sub_total = max(1, int(sub_a.size))
+                    sub_opaque = int(np.count_nonzero(sub_a > 24))
+                    if sub_opaque < 16:
                         empty_cells.append(f"(row={r_i}, col={c_i})")
+                        det_defective_cells.append(cell_idx)
+                        continue
+                    sub_mag = int(
+                        np.count_nonzero(
+                            (sub_a > 24)
+                            & (sub_rgba[:, :, 0] > 205)
+                            & (sub_rgba[:, :, 2] > 205)
+                            & (sub_rgba[:, :, 1] < 65)
+                        )
+                    )
+                    if (sub_mag / float(sub_total)) > 0.015:
+                        magenta_cells.append(f"(row={r_i}, col={c_i})")
+                        det_defective_cells.append(cell_idx)
+                    if not is_tile and not is_backdrop and sub_rgba.shape[0] >= 4 and sub_rgba.shape[1] >= 4:
+                        c_corners = sum(
+                            1
+                            for (cy_c, cx_c) in [
+                                (0, 0),
+                                (0, sub_rgba.shape[1] - 1),
+                                (sub_rgba.shape[0] - 1, 0),
+                                (sub_rgba.shape[0] - 1, sub_rgba.shape[1] - 1),
+                            ]
+                            if int(sub_rgba[cy_c, cx_c, 3]) > 220
+                        )
+                        if c_corners == 4 and (sub_opaque / float(sub_total)) > 0.96:
+                            boxed_cells.append(f"(row={r_i}, col={c_i})")
+                            det_defective_cells.append(cell_idx)
             if empty_cells:
                 framing_ok = False
                 defects.append(
                     f"Multi-cell grid sheet ({g_cols}x{g_rows}) has empty/blank cell(s): {', '.join(empty_cells)}."
+                )
+            if magenta_cells:
+                alpha_ok = False
+                defects.append(
+                    f"Multi-cell grid sheet ({g_cols}x{g_rows}) has chroma-key magenta spill in cell(s): {', '.join(magenta_cells)}."
+                )
+            if boxed_cells:
+                alpha_ok = False
+                defects.append(
+                    f"Multi-cell grid sheet ({g_cols}x{g_rows}) has unremoved opaque background box in cell(s): {', '.join(boxed_cells)}."
                 )
 
         plate_p = Path(inspection_plate_path) if inspection_plate_path else asset_p.parent / "renders" / f"plate_{req.asset_id}.png"
@@ -2907,8 +3006,9 @@ class VisualArtSpriteDesignerAgent:
             for rp in self._build_reference_parts(reference_images)[:1]:
                 contents.append(rp)
             grid_note = (
-                f"\nMulti-Cell Grid Layout: {g_cols} columns x {g_rows} rows (cell_prompts={getattr(req, 'cell_prompts', [])}) — "
-                f"verify that every cell in the {g_cols}x{g_rows} grid contains its distinct graphic cleanly within its cyan cell boundaries."
+                f"\nMulti-Cell Grid Layout: {g_cols} columns x {g_rows} rows ({g_cols * g_rows} cells total, 0-based row-major index `idx = row * {g_cols} + col`, cell_prompts={getattr(req, 'cell_prompts', [])}) — "
+                f"verify that every cell in the {g_cols}x{g_rows} grid contains its distinct graphic cleanly within its cyan cell boundaries. "
+                f"If `accepted=False` because specific cell(s) have defects while other cells are clean, populate `defective_cell_indices` with ONLY those defective 0-based row-major cell indices (0..{g_cols * g_rows - 1}) so clean cells are preserved without regenerating the entire sheet."
                 if (g_cols * g_rows) > 1
                 else ""
             )
@@ -2917,7 +3017,7 @@ class VisualArtSpriteDesignerAgent:
                 f"Asset ID: '{req.asset_id}' | Type: '{req.asset_type}' | Mode: '{req.fabrication_mode}'\n"
                 f"Intended Purpose: {req.purpose or req.description}{grid_note}\n"
                 f"Style Guide: {style_guide}\n"
-                f"Deterministic OpenCV Pre-Check: det_passed={det_passed}, mirror_symmetry_score={mirror_sym:.3f}, pre_detected_defects={defects}\n"
+                f"Deterministic OpenCV Pre-Check: det_passed={det_passed}, mirror_symmetry_score={mirror_sym:.3f}, pre_detected_defects={defects}, pre_detected_defective_cell_indices={sorted(set(det_defective_cells))}\n"
                 f"Inspection Rules:\n"
                 f"- If mode is 'tile_surface' (shown as a 3x3 tiled grid): verify seamless edge-to-edge organic material repetition with ZERO bilateral mirror symmetry, ZERO harsh grid seams, ZERO isometric 3D block corners, and ZERO sky horizons.\n"
                 f"- If mode is 'static_sprite', 'sprite_sheet', 'diegetic_ui', or 'portrait' (shown over external QA dark and light square checkerboards with a cyan bounding-box border / grid dividers): verify clean alpha cutout silhouette (ZERO solid background boxes or picture frames inside the subject, ZERO trapped background pockets between limbs, ZERO transparent holes inside the subject's eyes or face), complete subject framing (ZERO detached environment terrain slabs or ground pedestals attached beneath the subject's base), and cohesive art style. IMPORTANT: The side-by-side dark/light square checkerboard grids and the cyan bounding-box/grid lines in `plate_*.png` are drawn externally by the QA plate renderer to visualize transparency and cell bounds—they are NOT inside the sprite PNG and must NEVER be flagged as checkerboard/grid/box defects!\n"
@@ -2926,14 +3026,18 @@ class VisualArtSpriteDesignerAgent:
             contents.append(v_prompt)
             text_model = getattr(self, "text_model_name", DEFAULT_STUDIO_MODEL) or DEFAULT_STUDIO_MODEL
             try:
-                resp = self.client.models.generate_content(
-                    model=text_model,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=AssetVisualValidationVerdict,
-                        thinking_config=bounded_thinking_config(512),
+                resp = call_gemini_with_transient_retry(
+                    lambda: self.client.models.generate_content(
+                        model=text_model,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=AssetVisualValidationVerdict,
+                            thinking_config=bounded_thinking_config(512),
+                        ),
                     ),
+                    max_transient_retries=2,
+                    label=f"verify_fabricated_asset[{req.asset_id}]",
                 )
             except Exception as exc:
                 raise StudioAgentError(
@@ -2945,6 +3049,17 @@ class VisualArtSpriteDesignerAgent:
                 )
             verdict = AssetVisualValidationVerdict.model_validate_json(resp.text)
             verdict.mirror_symmetry_score = mirror_sym
+            total_grid_cells = g_cols * g_rows
+            if total_grid_cells > 1:
+                verdict.defective_cell_indices = sorted(
+                    {
+                        int(i)
+                        for i in list(verdict.defective_cell_indices or []) + det_defective_cells
+                        if 0 <= int(i) < total_grid_cells
+                    }
+                )
+            else:
+                verdict.defective_cell_indices = []
             if not det_passed:
                 verdict.accepted = False
                 verdict.alpha_cleanliness_passed = verdict.alpha_cleanliness_passed and alpha_ok
@@ -2968,6 +3083,7 @@ class VisualArtSpriteDesignerAgent:
             mirror_symmetry_score=mirror_sym,
             style_coherence_score=9 if det_passed else 3,
             visual_defects=defects,
+            defective_cell_indices=sorted(set(det_defective_cells)),
             prompt_refinement_directive=(
                 "Ensure isolated grounded subject on flat #FF00FF chroma background with zero detached ground pedestal or bilateral mirror symmetry."
                 if not det_passed else ""
@@ -3021,14 +3137,18 @@ class VisualArtSpriteDesignerAgent:
             ]
             text_model = getattr(self, "text_model_name", DEFAULT_STUDIO_MODEL) or DEFAULT_STUDIO_MODEL
             try:
-                resp = self.client.models.generate_content(
-                    model=text_model,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=AnimationValidationVerdict,
-                        thinking_config=bounded_thinking_config(512),
+                resp = call_gemini_with_transient_retry(
+                    lambda: self.client.models.generate_content(
+                        model=text_model,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=AnimationValidationVerdict,
+                            thinking_config=bounded_thinking_config(512),
+                        ),
                     ),
+                    max_transient_retries=2,
+                    label=f"verify_animation_strip[{target_id}]",
                 )
             except Exception as exc:
                 raise StudioAgentError(
