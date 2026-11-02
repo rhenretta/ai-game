@@ -2256,7 +2256,7 @@ def build_qa_gate_work_item_proposals(
 
     can_emit_visual = (not supported_kinds) or ("visual_asset" in supported_kinds)
     if offending_assets and can_emit_visual:
-        for rel_asset in offending_assets[:8]:
+        for rel_asset in offending_assets:
             a_stem = _re.sub(r"[^a-z0-9]+", "_", Path(rel_asset).stem.lower()).strip("_")[:28] or "asset"
             v_id = _alloc_id(f"qa_regen_{a_stem}_{slice_slug}_p{pass_index}")
             meta = asset_meta_map.get(rel_asset, {})

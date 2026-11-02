@@ -825,3 +825,319 @@ def test_referenced_first_contact_sheet_hframes_1x1_mismatch_submin_cells_and_wr
     assert any("filmstrip_demo_item_rev0.png" in lbl for lbl in text_labels)
     assert any("FULL-RESOLUTION 1:1 KEYFRAME" in lbl for lbl in text_labels)
 
+
+def test_rule5_zero_procedural_fallbacks_across_visual_swe_and_checkpoint_mirror(tmp_path: Path, monkeypatch):
+    """Verifies that:
+    1. `VisualArtSpriteDesignerAgent` fails fast on `generate_sprites_from_requirements` (manifest and legacy paths)
+       and non-live stub clients when `allow_offline_procedural=False`.
+    2. `CartridgeAssetLibrary(..., allow_offline_procedural=False)` propagates `allow_offline_procedural=False` onto
+       a supplied `VisualArtSpriteDesignerAgent` and blocks procedural portrait fallback.
+    3. `LeadGameplaySWEAgent` blocks `_write_valid_tone_wav` / `_write_valid_indexed_png` when `allow_offline_procedural=False`
+       and never overwrites `.wav`/`.png` assets with procedural placeholders on `backlog.json` board cartridges.
+    4. `StudioOrchestrator._persist_verified_checkpoint` copies all runtime subdirectories (`src/`, `shaders/`, root `.gdshader`).
+    """
+    from engine.studio.models import RequirementTrack
+    from engine.studio.orchestrator import StudioOrchestrator
+    from engine.studio.swe import LeadGameplaySWEAgent
+
+    # 1. VisualArtSpriteDesignerAgent strict mode with non-live wrapper client
+    non_live_stub = SimpleNamespace(models=SimpleNamespace())
+    vis_strict = VisualArtSpriteDesignerAgent(client=non_live_stub, allow_offline_procedural=False)
+    with pytest.raises(StudioAgentConfigurationError):
+        vis_strict.generate_cartridge_sprites(
+            output_dir=tmp_path / "sprites_manifest",
+            asset_manifest=[
+                AssetRequirement(
+                    deliberation="Test prop.",
+                    asset_id="prop_alpha",
+                    name="prop_alpha.png",
+                    asset_type="prop",
+                    target_path="assets/sprites/prop_alpha.png",
+                    description="Test prop",
+                )
+            ],
+        )
+    with pytest.raises(StudioAgentConfigurationError):
+        vis_strict.generate_cartridge_sprites(output_dir=tmp_path / "sprites_legacy", asset_manifest=None)
+
+    # 2. CartridgeAssetLibrary propagates allow_offline_procedural=False onto supplied visual_agent & blocks portrait fallback
+    vis_default = VisualArtSpriteDesignerAgent(client=None)
+    assert vis_default.allow_offline_procedural is True
+    lib_strict = CartridgeAssetLibrary(
+        cartridge_dir=tmp_path / "strict_cart",
+        visual_agent=vis_default,
+        allow_offline_procedural=False,
+    )
+    assert vis_default.allow_offline_procedural is False
+    with pytest.raises(StudioAgentConfigurationError):
+        lib_strict.fabricate_single_asset(
+            AssetRequirement(
+                deliberation="Portrait asset.",
+                asset_id="mentor_portrait",
+                name="mentor_portrait.png",
+                asset_type="portrait",
+                fabrication_mode="portrait",
+                target_path="assets/portraits/mentor_portrait.png",
+                description="Portrait",
+            ),
+            force_regenerate=True,
+        )
+
+    # 3. LeadGameplaySWEAgent strict mode & board-cartridge protection
+    swe_strict = LeadGameplaySWEAgent(client=None, allow_offline_procedural=False)
+    with pytest.raises(StudioAgentConfigurationError):
+        swe_strict._write_valid_tone_wav(tmp_path / "forbidden.wav")
+    with pytest.raises(StudioAgentConfigurationError):
+        swe_strict._write_valid_indexed_png(tmp_path / "forbidden.png")
+
+    board_cart = tmp_path / "board_cart"
+    board_cart.mkdir(parents=True, exist_ok=True)
+    (board_cart / "backlog.json").write_text('{"items": []}', encoding="utf-8")
+    existing_wav = board_cart / "assets" / "audio" / "click.wav"
+    existing_wav.parent.mkdir(parents=True, exist_ok=True)
+    existing_wav.write_bytes(b"ORIGINAL_WAV_BYTES")
+    (board_cart / "narrative.json").write_text(
+        json.dumps({"dialogue_barks": [{"voice_clip": "assets/audio/missing_bark.wav"}]}),
+        encoding="utf-8",
+    )
+    swe_default = LeadGameplaySWEAgent(client=None)
+    swe_default.repair_cartridge_code(
+        board_cart,
+        RejectionDiagnosticTrace(
+            deliberation="Asset check.",
+            candidate_id="board_cart",
+            failure_gate="Gate B",
+            failure_type=GateFailureType.ASSET_INTEGRITY_VIOLATION,
+            failure_reason="Audio check",
+        ),
+    )
+    assert existing_wav.read_bytes() == b"ORIGINAL_WAV_BYTES"
+    assert not (board_cart / "assets" / "audio" / "missing_bark.wav").exists()
+
+    # 4. StudioOrchestrator._persist_verified_checkpoint copies src/, shaders/, and root .gdshader
+    import engine.studio.orchestrator as orch_mod
+
+    fake_proj_root = tmp_path / "proj_root"
+    (fake_proj_root / "cartridges").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(orch_mod, "PROJECT_ROOT", fake_proj_root)
+
+    cand_ckpt = fake_proj_root / "cartridges" / "candidate_genesis_ckpt01"
+    (cand_ckpt / "src").mkdir(parents=True, exist_ok=True)
+    (cand_ckpt / "shaders").mkdir(parents=True, exist_ok=True)
+    (cand_ckpt / "assets" / "sprites").mkdir(parents=True, exist_ok=True)
+    (cand_ckpt / "artifacts").mkdir(parents=True, exist_ok=True)
+    (cand_ckpt / "project.godot").write_text('[application]\nrun/main_scene="res://main.tscn"\n', encoding="utf-8")
+    (cand_ckpt / "main.gd").write_text("extends Node2D\n", encoding="utf-8")
+    (cand_ckpt / "water.gdshader").write_text("shader_type canvas_item;\n", encoding="utf-8")
+    (cand_ckpt / "src" / "studio_rig_and_collider.gd").write_text("class_name StudioRigHelper\nextends RefCounted\n", encoding="utf-8")
+    (cand_ckpt / "shaders" / "outline.gdshader").write_text("shader_type canvas_item;\n", encoding="utf-8")
+    (cand_ckpt / "artifacts" / "scratch.txt").write_text("skip", encoding="utf-8")
+
+    orch = StudioOrchestrator(api_key="test-key", client=non_live_stub)
+    ckpt_out = orch._persist_verified_checkpoint(
+        staging_dir=cand_ckpt,
+        track=RequirementTrack(
+            deliberation="Slice 0 checkpoint.",
+            id="slice_0_completed",
+            title="Slice 0",
+            description="Completed slice 0",
+            target_modules=["main.gd"],
+        ),
+        verified_tracks=["item_01"],
+        mirror_to_active=True,
+    )
+    active_out = fake_proj_root / "cartridges" / "active"
+    for target_root in (ckpt_out, active_out):
+        assert (target_root / "src" / "studio_rig_and_collider.gd").is_file()
+        assert (target_root / "shaders" / "outline.gdshader").is_file()
+        assert (target_root / "water.gdshader").is_file()
+        assert not (target_root / "artifacts").exists()
+
+
+def test_qa_proposals_no_8_asset_truncation_and_drain_backlog_post_remediation_verification(tmp_path: Path):
+    """Verifies that:
+    1. `build_qa_gate_work_item_proposals` emits `visual_asset` proposals for ALL >8 offending assets
+       (12 alphabetically ordered assets) without truncating after index 7.
+    2. `CreativeWritersRoom._drain_backlog` runs a mandatory post-remediation verification pass after
+       `max_blind_playtest_passes` or `max_qa_gate_passes` remediation tasks drain, completing cleanly
+       when the verification pass succeeds and raising `StudioAgentError` (leaving slice `active` and
+       persisting blockers on `backlog.json`) when defects remain unresolved.
+    """
+    from engine.studio.models import ReviewBatch, StudioAgentError
+    from engine.studio.production_board import BoardScheduler
+
+    # 1. Verify all 12 offending assets receive qa_regen_* proposals (zero [:8] truncation)
+    twelve_assets = [f"assets/sprites/asset_{idx:02d}.png" for idx in range(1, 13)]
+    trace_12 = RejectionDiagnosticTrace(
+        deliberation="12 placeholder assets flagged on contact sheet.",
+        candidate_id="cand_12",
+        episode_number=0,
+        attempt_number=1,
+        failure_gate="Gate B: Multimodal Asset Integrity",
+        failure_type=GateFailureType.ASSET_INTEGRITY_VIOLATION,
+        failure_reason="12 flat geometric placeholder PNGs detected.",
+        remedy_parameters={"offending_assets": twelve_assets, "offending_scripts": ["main.gd"]},
+    )
+    props_12 = build_qa_gate_work_item_proposals(
+        candidate_dir=tmp_path,
+        trace=trace_12,
+        pass_index=0,
+        slice_id="slice_0",
+    )
+    vis_targets = [p.target_modules[0] for p in props_12 if p.kind == "visual_asset"]
+    assert vis_targets == twelve_assets
+
+    def _make_slice_env(sub_name: str):
+        c_dir = tmp_path / sub_name
+        c_dir.mkdir(parents=True, exist_ok=True)
+        (c_dir / "project.godot").write_text('[application]\nrun/main_scene="res://main.tscn"\n', encoding="utf-8")
+        (c_dir / "main.gd").write_text("extends Node2D\n", encoding="utf-8")
+        b = ProductionBoard(c_dir / "backlog.json")
+        p_img = c_dir / "proof.png"
+        _make_rich_rgba_cell(64, 64).save(p_img)
+
+        def _worker(item: WorkItem) -> WorkerResult:
+            return WorkerResult(proof_images=[str(p_img)], notes=f"Executed {item.item_id}")
+
+        sched = BoardScheduler(
+            b,
+            {"mechanic_code": _worker, "integration": _worker, "visual_asset": _worker},
+            max_workers=1,
+        )
+        rm = CreativeWritersRoom(
+            client=object(),
+            board=b,
+            scheduler=sched,
+            drain_poll_s=0.01,
+            drain_timeout_s=5.0,
+        )
+        rm._review_as = lambda role, awaiting, needing, *a, **kw: ReviewBatch(
+            deliberation="Approve proofs.",
+            spoken_dialogue="Approved.",
+            review_decisions=[
+                ReviewDecision(deliberation="ok", item_id=it.item_id, verdict="approve", feedback="ok")
+                for it in awaiting
+            ],
+            cap_decisions=[],
+        )
+        gb = GameBibleSpec(
+            deliberation="Bible.",
+            cartridge_id=sub_name,
+            status="in_production",
+            game_title="Verification Test",
+            core_genre="simulation",
+            slice_roadmap=[
+                GameSliceSpec(
+                    deliberation="Slice 0.",
+                    slice_id="slice_0",
+                    slice_index=0,
+                    title="Slice 0",
+                    slice_objective="Core loop",
+                    status="active",
+                )
+            ],
+            active_slice_index=0,
+        )
+        return c_dir, b, sched, rm, gb
+
+    # 2a. Blind Playtest: 2 iterate_current_slice rounds + 3rd post-remediation verification pass approving -> completed!
+    c_pt_ok, b_pt_ok, sched_pt_ok, rm_pt_ok, gb_pt_ok = _make_slice_env("pt_verify_pass")
+    rm_pt_ok.max_assembly_passes = 0
+    rm_pt_ok.max_blind_playtest_passes = 2
+    pt_passes_seen: list[tuple[int, bool]] = []
+
+    def _fake_blind_pt_ok(game_bible, dna_summary, candidate_dir, pass_index=0):
+        is_final = bool(getattr(rm_pt_ok, "_final_verification_blind_playtest_pass", False))
+        pt_passes_seen.append((pass_index, is_final))
+        if pass_index < 2:
+            added_items = b_pt_ok.add_items(
+                [
+                    WorkItemProposal(
+                        deliberation="Repair gameplay.",
+                        item_id=f"pt_fix_p{pass_index}",
+                        kind="mechanic_code",
+                        title=f"PT Fix {pass_index}",
+                        spec="Fix gameplay",
+                        proof_spec="Verify",
+                        target_modules=["main.gd"],
+                    )
+                ],
+                raised_by_role="CreativeDirector",
+                slice_id="slice_0",
+            )
+            return len(added_items)
+        return 0
+
+    rm_pt_ok._run_end_of_slice_blind_playtest = _fake_blind_pt_ok
+    try:
+        rm_pt_ok._drain_backlog(gb_pt_ok, "DNA", c_pt_ok)
+    finally:
+        sched_pt_ok.stop()
+    assert pt_passes_seen == [(0, False), (1, False), (2, True)]
+    assert gb_pt_ok.slice_roadmap[0].status == "completed"
+
+    # 2b. Blind Playtest: post-remediation verification pass STILL rejects -> raises StudioAgentError, slice stays active!
+    c_pt_fail, b_pt_fail, sched_pt_fail, rm_pt_fail, gb_pt_fail = _make_slice_env("pt_verify_fail")
+    rm_pt_fail.max_assembly_passes = 0
+    rm_pt_fail.max_blind_playtest_passes = 1
+
+    def _fake_blind_pt_fail(game_bible, dna_summary, candidate_dir, pass_index=0):
+        added_items = b_pt_fail.add_items(
+            [
+                WorkItemProposal(
+                    deliberation="Still broken.",
+                    item_id=f"pt_blocker_p{pass_index}",
+                    kind="mechanic_code",
+                    title=f"Blocker {pass_index}",
+                    spec="Fix blocker",
+                    proof_spec="Verify",
+                    target_modules=["main.gd"],
+                )
+            ],
+            raised_by_role="CreativeDirector",
+            slice_id="slice_0",
+        )
+        return len(added_items)
+
+    rm_pt_fail._run_end_of_slice_blind_playtest = _fake_blind_pt_fail
+    try:
+        with pytest.raises(StudioAgentError, match="post-remediation Blind Playtest verification"):
+            rm_pt_fail._drain_backlog(gb_pt_fail, "DNA", c_pt_fail)
+    finally:
+        sched_pt_fail.stop()
+    assert gb_pt_fail.slice_roadmap[0].status == "active"
+    assert b_pt_fail.get("pt_blocker_p1") is not None
+
+    # 2c. 5-Gate QA: 2 failing remediation passes + 3rd post-remediation verification pass STILL failing -> raises StudioAgentError!
+    c_qa_fail, b_qa_fail, sched_qa_fail, rm_qa_fail, gb_qa_fail = _make_slice_env("qa_verify_fail")
+    rm_qa_fail.max_assembly_passes = 0
+    rm_qa_fail.max_blind_playtest_passes = 0
+    rm_qa_fail.max_qa_gate_passes = 2
+    qa_eval_passes: list[int] = []
+
+    def _always_failing_qa(c_path: Path, pass_idx: int):
+        qa_eval_passes.append(pass_idx)
+        return (
+            {},
+            RejectionDiagnosticTrace(
+                deliberation="Persistent crash.",
+                candidate_id=c_path.name,
+                episode_number=0,
+                attempt_number=pass_idx + 1,
+                failure_gate="Gate C: Headless Execution",
+                failure_type=GateFailureType.UNHANDLED_EXCEPTION,
+                failure_reason=f"Crash persists on pass {pass_idx}",
+                file_path="main.gd",
+            ),
+        )
+
+    rm_qa_fail.qa_gate_evaluator_fn = _always_failing_qa
+    try:
+        with pytest.raises(StudioAgentError, match="post-remediation 5-Gate QA verification"):
+            rm_qa_fail._drain_backlog(gb_qa_fail, "DNA", c_qa_fail)
+    finally:
+        sched_qa_fail.stop()
+    assert qa_eval_passes == [0, 1, 2]
+    assert gb_qa_fail.slice_roadmap[0].status == "active"
+
+

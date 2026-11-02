@@ -556,3 +556,134 @@ def test_session_manager_pause_interim_video_resume_reset_and_stop(tmp_path: Pat
     assert not sid2_user_home.exists()
     assert mgr._handles == {}
     assert call_counter["n"] == calls_before_stopped_reset
+
+
+def _measure_hud_text_sharpness(img_path: Path, box: tuple[int, int, int, int]) -> tuple[int, int]:
+    """Returns `(max_luma, max_adjacent_col_delta)` inside `box=(x0, y0, x1, y1)`."""
+    with Image.open(img_path) as im:
+        crop = im.convert("L").crop(box)
+        w, h = crop.size
+        px = crop.load()
+        max_luma = 0
+        max_col_delta = 0
+        for y in range(h):
+            prev = int(px[0, y])
+            if prev > max_luma:
+                max_luma = prev
+            for x in range(1, w):
+                cur = int(px[x, y])
+                if cur > max_luma:
+                    max_luma = cur
+                d = abs(cur - prev)
+                if d > max_col_delta:
+                    max_col_delta = d
+                prev = cur
+        return max_luma, max_col_delta
+
+
+def test_canvas_items_stretch_mode_preserves_crisp_subviewport_font_oversampling(tmp_path: Path):
+    """Regression test: when `project.godot` sets `window/stretch/mode="canvas_items"` and the offscreen
+    host window is shrunk to `16x16`, both `godot_playtest_runner.gd` and `godot_harness.gd` must keep
+    `TextServer` global font oversampling locked at `1.0` so `1280x720` SubViewport UI text renders sharply
+    instead of rasterizing at ~2px (`16/720`) and bilinearly smudging.
+    """
+    from engine.sim.godot_verifier import GodotHeadlessSimulator
+
+    cp_dir = tmp_path / "cp_canvas_items_text"
+    cp_dir.mkdir(parents=True, exist_ok=True)
+    (cp_dir / "project.godot").write_text(
+        '; Engine configuration file.\n'
+        'config_version=5\n\n'
+        '[application]\n'
+        'config/name="CanvasItems Font Crispness Fixture"\n'
+        'run/main_scene="res://main.tscn"\n'
+        'config/features=PackedStringArray("4.3", "GL Compatibility")\n\n'
+        '[display]\n'
+        'window/size/viewport_width=1280\n'
+        'window/size/viewport_height=720\n'
+        'window/stretch/mode="canvas_items"\n'
+        'window/stretch/aspect="keep"\n',
+        encoding="utf-8",
+    )
+    (cp_dir / "main.gd").write_text(
+        'extends Node2D\n\n'
+        'func _ready() -> void:\n'
+        '\tvar bg := ColorRect.new()\n'
+        '\tbg.color = Color(0.05, 0.06, 0.10, 1.0)\n'
+        '\tbg.size = Vector2(1280, 720)\n'
+        '\tadd_child(bg)\n'
+        '\tvar hud := CanvasLayer.new()\n'
+        '\tadd_child(hud)\n'
+        '\tvar panel := ColorRect.new()\n'
+        '\tpanel.position = Vector2(40, 40)\n'
+        '\tpanel.size = Vector2(520, 80)\n'
+        '\tpanel.color = Color(0.08, 0.10, 0.16, 1.0)\n'
+        '\thud.add_child(panel)\n'
+        '\tvar lbl := Label.new()\n'
+        '\tlbl.position = Vector2(56, 54)\n'
+        '\tlbl.text = "HUD STATUS: 120 / 120 | READY"\n'
+        '\tlbl.add_theme_font_size_override("font_size", 28)\n'
+        '\tlbl.add_theme_color_override("font_color", Color(1.0, 1.0, 1.0, 1.0))\n'
+        '\thud.add_child(lbl)\n'
+        '\t_record_oversampling()\n\n'
+        'func _process(_delta: float) -> void:\n'
+        '\t_record_oversampling()\n\n'
+        'func _record_oversampling() -> void:\n'
+        '\tvar ts := TextServerManager.get_primary_interface()\n'
+        '\tvar ovs: float = ts.font_get_global_oversampling() if ts != null else -1.0\n'
+        '\tvar f := FileAccess.open("user://font_probe.json", FileAccess.WRITE)\n'
+        '\tif f != null:\n'
+        '\t\tf.store_string(JSON.stringify({"font_oversampling": ovs}))\n'
+        '\t\tf.close()\n',
+        encoding="utf-8",
+    )
+    (cp_dir / "main.tscn").write_text(
+        '[gd_scene load_steps=2 format=3]\n\n'
+        '[ext_resource type="Script" path="res://main.gd" id="1"]\n\n'
+        '[node name="Main" type="Node2D"]\n'
+        'script = ExtResource("1")\n',
+        encoding="utf-8",
+    )
+
+    # 1. Verify Blind Playtester runner (`godot_playtest_runner.gd`)
+    sess_dir = tmp_path / "sess_font_crisp"
+    bridge = GodotPlaytestBridge(
+        checkpoint_dir=cp_dir,
+        session_dir=sess_dir,
+        reaction_ticks=6,
+        initial_settle_ticks=10,
+        record_video=False,
+    )
+    try:
+        obs0 = bridge.start()
+        assert bridge.user_home_dir is not None
+        probe_files = list(bridge.user_home_dir.rglob("font_probe.json"))
+        assert probe_files, "Expected user://font_probe.json from playtest runner"
+        probe_data = json.loads(probe_files[0].read_text(encoding="utf-8"))
+        assert abs(float(probe_data["font_oversampling"]) - 1.0) < 0.01, (
+            f"Expected 1.0 font oversampling in playtest runner, got {probe_data}"
+        )
+        max_luma, max_col_delta = _measure_hud_text_sharpness(obs0.screenshot_path, (50, 48, 520, 108))
+        assert max_luma >= 220, f"Expected crisp bright white glyph pixels, got max_luma={max_luma}"
+        assert max_col_delta >= 120, (
+            f"Expected sharp glyph edge contrast (>=120 adjacent column delta), got {max_col_delta} (blur regression!)"
+        )
+    finally:
+        bridge.close()
+
+    # 2. Verify QA Simulation Harness (`godot_harness.gd` with `--resolution 16x16`)
+    sim_dir = tmp_path / "cp_harness_font_crisp"
+    for fname in ("project.godot", "main.gd", "main.tscn"):
+        sim_dir.mkdir(parents=True, exist_ok=True)
+        (sim_dir / fname).write_text((cp_dir / fname).read_text(encoding="utf-8"), encoding="utf-8")
+
+    sim = GodotHeadlessSimulator(cartridge_path=sim_dir, max_ticks=8, capture_viewport=True)
+    sim.run_until_complete(max_steps=8, capture_viewport=True)
+    t0_png = sim_dir / "assets" / "playtest_captures" / "playtest_t0.png"
+    assert t0_png.is_file(), "Expected QA harness to capture playtest_t0.png"
+    h_max_luma, h_max_col_delta = _measure_hud_text_sharpness(t0_png, (50, 48, 520, 108))
+    assert h_max_luma >= 220, f"Expected crisp bright white glyph pixels in QA harness, got max_luma={h_max_luma}"
+    assert h_max_col_delta >= 120, (
+        f"Expected sharp glyph edge contrast in QA harness (>=120), got {h_max_col_delta} (blur regression!)"
+    )
+

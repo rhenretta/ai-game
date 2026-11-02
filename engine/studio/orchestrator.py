@@ -360,11 +360,16 @@ class StudioOrchestrator:
         from engine.studio.audio_evaluator import AudioEvaluatorAgent
         from engine.studio.visual_evaluator import VisualEvaluatorAgent
 
+        allow_offline = not self._is_live_genai_client()
         director_agent = CreativeDirectorWorldbuilderAgent(client=self.client, model_name=self.config.model_name)
         narrative_agent = NarrativeCharacterWriterAgent(client=self.client, model_name=self.config.model_name)
         audio_agent = VoiceActingAudioProducerAgent(client=self.client)
-        visual_agent = VisualArtSpriteDesignerAgent(client=self.client)
-        swe_agent = LeadGameplaySWEAgent(client=self.client, model_name=self.config.model_name)
+        visual_agent = VisualArtSpriteDesignerAgent(client=self.client, allow_offline_procedural=allow_offline)
+        swe_agent = LeadGameplaySWEAgent(
+            client=self.client,
+            model_name=self.config.model_name,
+            allow_offline_procedural=allow_offline,
+        )
         telemetry_agent = TelemetryArchitectAgent(gemini_client=self.client, model_name=self.config.model_name)
         self.visual_evaluator = VisualEvaluatorAgent(client=self.client, model_name=self.config.model_name)
         self.audio_evaluator = AudioEvaluatorAgent(client=self.client, model_name=self.config.model_name)
@@ -620,11 +625,24 @@ class StudioOrchestrator:
                 acceptance_criteria=[],
                 status="completed",
             )
+            mirror_active_ok = True
+            if (target_c_dir / "project.godot").is_file() and getattr(self, "_default_supervisor_agent", None) is not None:
+                try:
+                    gate_a_chk = self._default_supervisor_agent.verify_gate_a_syntax_and_entrypoint(target_c_dir)
+                    mirror_active_ok = bool(gate_a_chk.passed)
+                    if not mirror_active_ok:
+                        logger.warning(
+                            "Skipping active cartridge mirror for slice checkpoint '%s' due to Gate A entrypoint check failure: %s",
+                            slice_id_str,
+                            gate_a_chk.details,
+                        )
+                except Exception as gate_exc:
+                    logger.warning("Gate A checkpoint check raised warning for '%s': %s", slice_id_str, gate_exc)
             self._persist_verified_checkpoint(
                 staging_dir=target_c_dir,
                 track=chk_track,
                 verified_tracks=approved_ids or [slice_id_str],
-                mirror_to_active=True,
+                mirror_to_active=mirror_active_ok,
             )
 
         self.writers_room.slice_checkpoint_callback = _on_slice_checkpoint
@@ -1804,6 +1822,8 @@ class StudioOrchestrator:
                                 style_guide=asset_lib.get_style_guide(),
                             )
                         except Exception:
+                            if self._is_live_genai_client() or not getattr(agent, "allow_offline_procedural", True):
+                                raise
                             agent.renderer.render_player_idle().save(hero_sprite_path, "PNG")
 
                 asset_lib.index_existing_files_on_disk()
@@ -2458,8 +2478,8 @@ class StudioOrchestrator:
         checkpoint_dir = checkpoints_root / checkpoint_id
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. Copy code modules
-        for pattern in ["*.py", "*.gd", "*.tscn", "project.godot"]:
+        # 1. Copy root code & shader/resource modules
+        for pattern in ["*.py", "*.gd", "*.tscn", "*.gdshader", "*.tres", "project.godot"]:
             for code_f in staging_dir.glob(pattern):
                 if code_f.is_file():
                     self._copy2_unlocked(code_f, checkpoint_dir / code_f.name)
@@ -2480,14 +2500,15 @@ class StudioOrchestrator:
             if src.is_file():
                 self._copy2_unlocked(src, checkpoint_dir / json_name)
 
-        # 3. Copy assets and scenes directories if present
-        for subdir_name in ("assets", "scenes"):
-            sub_src = staging_dir / subdir_name
-            if sub_src.is_dir():
-                sub_dst = checkpoint_dir / subdir_name
-                if sub_dst.exists():
-                    self._rmtree_force(sub_dst)
-                shutil.copytree(sub_src, sub_dst, copy_function=self._copy2_unlocked)
+        # 3. Copy all runtime subdirectories (assets, scenes, src, scripts, ui, shaders, etc.) excluding scratch/test dirs
+        excluded_checkpoint_dirs = {"artifacts", "tests", "__pycache__"}
+        for sub_src in staging_dir.iterdir():
+            if not sub_src.is_dir() or sub_src.name.startswith(".") or sub_src.name in excluded_checkpoint_dirs:
+                continue
+            sub_dst = checkpoint_dir / sub_src.name
+            if sub_dst.exists():
+                self._rmtree_force(sub_dst)
+            shutil.copytree(sub_src, sub_dst, copy_function=self._copy2_unlocked)
 
         # 4. Compute cryptographic sha256 manifest
         sha256_manifest: Dict[str, str] = {}
@@ -2918,6 +2939,8 @@ class StudioOrchestrator:
                         if getattr(visual_agent, "_is_live_genai_client", lambda: False)():
                             visual_agent.generate_portrait(character=char, output_path=p_path, dimensions=(256, 256))
                         else:
+                            if hasattr(visual_agent, "_ensure_procedural_allowed_or_raise"):
+                                visual_agent._ensure_procedural_allowed_or_raise("generate_portrait")
                             img = visual_agent.renderer.render_dynamic_sprite(
                                 dimensions=(256, 256),
                                 prompt=getattr(char, "visual_description", "") or getattr(char, "name", cid),
@@ -2927,6 +2950,8 @@ class StudioOrchestrator:
                             p_path.parent.mkdir(parents=True, exist_ok=True)
                             img.save(p_path, "PNG")
                     except Exception as exc:
+                        if self._is_live_genai_client() or not getattr(visual_agent, "allow_offline_procedural", True):
+                            raise
                         logger.warning("Portrait synthesis warning for '%s': %s", cid, exc)
 
         # 3. Promotion & Boot Sanity Check

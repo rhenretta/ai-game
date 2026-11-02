@@ -582,11 +582,11 @@ class VisualArtSpriteDesignerAgent:
         self.renderer = ProceduralSpriteRenderer()
 
     def _ensure_procedural_allowed_or_raise(self, op_name: str) -> None:
-        """Rule 5: Fail fast when offline procedural synthesis is disabled and no Gemini client is configured."""
-        if not self._is_live_genai_client() and self.client is None and not self.allow_offline_procedural:
+        """Rule 5: Fail fast when offline procedural synthesis is disabled and no live Gemini client is configured."""
+        if not self._is_live_genai_client() and not self.allow_offline_procedural:
             from engine.studio.models import StudioAgentConfigurationError
             raise StudioAgentConfigurationError(
-                f"VisualArtSpriteDesignerAgent.{op_name} requires a configured Gemini client "
+                f"VisualArtSpriteDesignerAgent.{op_name} requires a configured live Gemini client "
                 f"(allow_offline_procedural=False; silent procedural fallback is prohibited by Rule 5)."
             )
 
@@ -2474,6 +2474,7 @@ class VisualArtSpriteDesignerAgent:
                         style_guide=style_guide,
                     )
                 else:
+                    self._ensure_procedural_allowed_or_raise("generate_cartridge_sprites")
                     geom = item.get("geometry_directive") if isinstance(item, dict) else getattr(item, "geometry_directive", None)
                     img = renderer.render_dynamic_sprite(
                         dimensions=dims,
@@ -2501,7 +2502,8 @@ class VisualArtSpriteDesignerAgent:
 
             return sprites
 
-        # Legacy mode: generate base sprites for backward compatibility
+        # Legacy mode: generate base sprites for backward compatibility (strictly offline opt-in only)
+        self._ensure_procedural_allowed_or_raise("generate_cartridge_sprites")
         idle_path = output_dir / "player_idle.png"
         renderer.render_player_idle().save(idle_path, "PNG")
         sprites["player_idle"] = idle_path

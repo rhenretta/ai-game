@@ -146,6 +146,20 @@ func _sanitize_non_headless_mouse_scripts() -> void:
 func _finalize() -> void:
 	_sanitized_scripts.clear()
 
+func _lock_crisp_subviewport_font_oversampling() -> void:
+	if DisplayServer.get_name() == "headless":
+		return
+	if root != null:
+		if root.content_scale_mode != Window.CONTENT_SCALE_MODE_DISABLED:
+			root.content_scale_mode = Window.CONTENT_SCALE_MODE_DISABLED
+		if root.content_scale_aspect != Window.CONTENT_SCALE_ASPECT_IGNORE:
+			root.content_scale_aspect = Window.CONTENT_SCALE_ASPECT_IGNORE
+		if root.content_scale_factor != 1.0:
+			root.content_scale_factor = 1.0
+	var ts := TextServerManager.get_primary_interface()
+	if ts != null and absf(ts.font_get_global_oversampling() - 1.0) > 0.001:
+		ts.font_set_global_oversampling(1.0)
+
 func _initialize() -> void:
 	Engine.max_physics_steps_per_frame = 1
 	if script_error != "":
@@ -153,6 +167,7 @@ func _initialize() -> void:
 		quit(1)
 		return
 	if DisplayServer.get_name() != "headless":
+		_lock_crisp_subviewport_font_oversampling()
 		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_NO_FOCUS, true)
 		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_BORDERLESS, true)
 		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_MOUSE_PASSTHROUGH, true)
@@ -161,6 +176,7 @@ func _initialize() -> void:
 		DisplayServer.window_set_position(Vector2i(-32000, -32000))
 		DisplayServer.window_set_mouse_passthrough(PackedVector2Array([Vector2.ZERO, Vector2.ZERO, Vector2.ZERO]))
 		root.transparent_bg = true
+		_lock_crisp_subviewport_font_oversampling()
 		_sanitize_non_headless_mouse_scripts()
 	render_viewport = SubViewport.new()
 	render_viewport.name = "HarnessOffscreenViewport"
@@ -210,6 +226,7 @@ func _initialize() -> void:
 				render_viewport.add_child(main_scene_node)
 			else:
 				root.add_child(main_scene_node)
+			_lock_crisp_subviewport_font_oversampling()
 		else:
 			printerr("CRITICAL: Failed instantiating scene " + str(main_path))
 			quit(1)
@@ -340,6 +357,7 @@ func _try_capture_viewport(res_target_path: String) -> void:
 	if DisplayServer.get_name() == "headless":
 		return
 	var img: Image = null
+	_lock_crisp_subviewport_font_oversampling()
 	RenderingServer.force_draw(true)
 	var vp_tex = render_viewport.get_texture() if render_viewport != null else root.get_texture()
 	if vp_tex != null:
@@ -366,6 +384,7 @@ func _try_capture_collision_overlay(res_target_path: String) -> void:
 	_collect_collision_shapes_recursive(main_scene_node, shapes_data)
 
 	var img: Image = null
+	_lock_crisp_subviewport_font_oversampling()
 	RenderingServer.force_draw(true)
 	var vp_tex = render_viewport.get_texture() if render_viewport != null else root.get_texture()
 	if vp_tex != null:
@@ -1411,6 +1430,7 @@ func _drain_av_audio_chunk() -> void:
 func _append_av_video_frame() -> void:
 	if _av_rgb_file == null or DisplayServer.get_name() == "headless":
 		return
+	_lock_crisp_subviewport_font_oversampling()
 	RenderingServer.force_draw(true)
 	var vp_tex = render_viewport.get_texture() if render_viewport != null else root.get_texture()
 	if vp_tex == null:

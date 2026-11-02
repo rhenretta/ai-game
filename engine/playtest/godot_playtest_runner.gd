@@ -158,6 +158,22 @@ func _sanitize_non_headless_mouse_scripts() -> void:
 func _finalize() -> void:
 	_sanitized_scripts.clear()
 
+func _lock_crisp_subviewport_font_oversampling() -> void:
+	# Shrinking the offscreen OS host window to 16x16 on projects using `window/stretch/mode="canvas_items"`
+	# causes Godot 4's root Window::_update_font_oversampling() to set process-global TextServer dynamic font
+	# oversampling to ~16/720 (~0.022), blurring all 1280x720 SubViewport UI glyphs into 2px smudges.
+	# Disable content-scale stretching on the dummy root Window and lock TextServer global oversampling to 1.0.
+	if root != null:
+		if root.content_scale_mode != Window.CONTENT_SCALE_MODE_DISABLED:
+			root.content_scale_mode = Window.CONTENT_SCALE_MODE_DISABLED
+		if root.content_scale_aspect != Window.CONTENT_SCALE_ASPECT_IGNORE:
+			root.content_scale_aspect = Window.CONTENT_SCALE_ASPECT_IGNORE
+		if root.content_scale_factor != 1.0:
+			root.content_scale_factor = 1.0
+	var ts := TextServerManager.get_primary_interface()
+	if ts != null and absf(ts.font_get_global_oversampling() - 1.0) > 0.001:
+		ts.font_set_global_oversampling(1.0)
+
 func _initialize() -> void:
 	Engine.max_physics_steps_per_frame = 1
 	if ipc_port <= 0 or capture_dir == "":
@@ -171,7 +187,8 @@ func _initialize() -> void:
 
 	DirAccess.make_dir_recursive_absolute(capture_dir)
 
-	# Configure silent, invisible offscreen host window
+	# Configure silent, invisible offscreen host window while locking 1.0x SubViewport font oversampling
+	_lock_crisp_subviewport_font_oversampling()
 	DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_NO_FOCUS, true)
 	DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_BORDERLESS, true)
 	DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_MOUSE_PASSTHROUGH, true)
@@ -180,6 +197,7 @@ func _initialize() -> void:
 	DisplayServer.window_set_position(Vector2i(-32000, -32000))
 	DisplayServer.window_set_mouse_passthrough(PackedVector2Array([Vector2.ZERO, Vector2.ZERO, Vector2.ZERO]))
 	root.transparent_bg = true
+	_lock_crisp_subviewport_font_oversampling()
 	_sanitize_non_headless_mouse_scripts()
 
 	# Attach standalone SubViewport directly under root (NOT SubViewportContainer, which would
@@ -245,6 +263,7 @@ func _initialize() -> void:
 		return
 
 	render_viewport.add_child(main_scene_node)
+	_lock_crisp_subviewport_font_oversampling()
 	_emit_mouse_motion(cursor_pos, Vector2.ZERO)
 
 	_send_ctrl_json({
@@ -271,7 +290,8 @@ func _process(_delta: float) -> bool:
 	if phase == PHASE_ACTION_BURST:
 		_step_action_burst_inputs()
 
-	# Render SubViewport deterministically on every tick
+	# Render SubViewport deterministically on every tick with crisp 1.0x glyph rasterization
+	_lock_crisp_subviewport_font_oversampling()
 	RenderingServer.force_draw(true)
 	var frame_img: Image = _capture_composited_frame()
 

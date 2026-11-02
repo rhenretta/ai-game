@@ -80,6 +80,8 @@ class CartridgeAssetLibrary:
             self.allow_offline_procedural = not is_live_board_cartridge
         else:
             self.allow_offline_procedural = bool(allow_offline_procedural)
+        if not self.allow_offline_procedural and self.visual_agent is not None:
+            self.visual_agent.allow_offline_procedural = False
 
         self.sprites_dir.mkdir(parents=True, exist_ok=True)
         self.portraits_dir.mkdir(parents=True, exist_ok=True)
@@ -859,6 +861,13 @@ static func create_tiled_surface(
                             reference_images=ref_images,
                         )
                     else:
+                        if hasattr(self.visual_agent, "_ensure_procedural_allowed_or_raise"):
+                            self.visual_agent._ensure_procedural_allowed_or_raise("generate_portrait")
+                        elif not self.allow_offline_procedural:
+                            raise StudioAgentConfigurationError(
+                                f"Cannot fabricate portrait '{req.asset_id}' without a Gemini client "
+                                f"(allow_offline_procedural=False; silent procedural fallback is prohibited by Rule 5)."
+                            )
                         img = self.visual_agent.renderer.render_dynamic_sprite(
                             dimensions=req.dimensions or (256, 256),
                             prompt=cur_prompt,

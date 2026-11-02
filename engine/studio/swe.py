@@ -142,15 +142,25 @@ class LeadGameplaySWEAgent:
         model_name: str = "gemini-3.8-flash",
         visual_agent: Optional[Any] = None,
         voice_agent: Optional[Any] = None,
+        allow_offline_procedural: bool = True,
     ):
         self.client = client
         self.model_name = model_name
         self.visual_agent = visual_agent
         self.voice_agent = voice_agent
+        self.allow_offline_procedural = bool(allow_offline_procedural)
         self.last_deliberation: Optional[str] = None
         self.last_diagnostic_test_scene_request: str = ""
         self.last_inspection_report: str = ""
         self.last_recommended_followups: List[str] = []
+
+    def _offline_procedural_repairs_allowed(self, candidate_dir: Optional[Path] = None) -> bool:
+        """Rule 5: Prohibits synthetic sine-wave .wav or flat-colored .png placeholder repairs on live or board cartridges."""
+        if not self.allow_offline_procedural or self._is_live_genai_client():
+            return False
+        if candidate_dir is not None and (Path(candidate_dir) / "backlog.json").is_file():
+            return False
+        return True
 
     def _discover_sealed_assets(self, staging_dir: Path) -> Dict[str, List[str]]:
         """Discovers visual sprites, tiles, backgrounds, UI widgets, character portraits, visual mockups, and audio clips sealed upstream into staging_dir/assets/."""
@@ -1849,6 +1859,12 @@ class LeadGameplaySWEAgent:
             raise CodeVerificationError(f"Gemini code repair failed for {module_name}: {exc}") from exc
 
     def _write_valid_tone_wav(self, wav_path: Path) -> None:
+        if not self.allow_offline_procedural or self._is_live_genai_client():
+            from engine.studio.models import StudioAgentConfigurationError
+            raise StudioAgentConfigurationError(
+                "LeadGameplaySWEAgent._write_valid_tone_wav placeholder audio synthesis is prohibited "
+                "(allow_offline_procedural=False or live Gemini client active; Rule 5: Zero Silent Fallbacks)."
+            )
         import wave
         import struct
         import math
@@ -1867,6 +1883,12 @@ class LeadGameplaySWEAgent:
             wf.writeframes(raw_data)
 
     def _write_valid_indexed_png(self, png_path: Path, width: int = 64, height: int = 64) -> None:
+        if not self.allow_offline_procedural or self._is_live_genai_client():
+            from engine.studio.models import StudioAgentConfigurationError
+            raise StudioAgentConfigurationError(
+                "LeadGameplaySWEAgent._write_valid_indexed_png placeholder sprite synthesis is prohibited "
+                "(allow_offline_procedural=False or live Gemini client active; Rule 5: Zero Silent Fallbacks)."
+            )
         from engine.assets.palette import quantize_image_to_indexed, STYLE_BIBLE_16_PALETTE
         from PIL import Image
         png_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2308,8 +2330,9 @@ class LeadGameplaySWEAgent:
             import struct
             import math
 
-            # Safely re-quantize PNGs via in-memory buffer in offline/mock mode so files are never truncated on error
-            if not self._is_live_genai_client():
+            # Safely re-quantize PNGs / tone WAVs ONLY in explicit offline unit-test mode (Rule 5: Zero Silent Fallbacks)
+            offline_procedural_ok = self._offline_procedural_repairs_allowed(c_dir)
+            if offline_procedural_ok:
                 for png_file in c_dir.rglob("*.png"):
                     if "mockups" in png_file.parts:
                         continue
@@ -2329,15 +2352,14 @@ class LeadGameplaySWEAgent:
                     except Exception as exc:
                         logger.warning("Could not re-quantize %s: %s", png_file, exc)
 
-            # Re-synthesize silent or invalid WAV files
-            for wav_file in c_dir.rglob("*.wav"):
-                try:
-                    self._write_valid_tone_wav(wav_file)
-                    results[wav_file.name] = wav_file
-                except Exception as exc:
-                    logger.warning("Could not fix wav %s: %s", wav_file, exc)
+                for wav_file in c_dir.rglob("*.wav"):
+                    try:
+                        self._write_valid_tone_wav(wav_file)
+                        results[wav_file.name] = wav_file
+                    except Exception as exc:
+                        logger.warning("Could not fix wav %s: %s", wav_file, exc)
 
-            # Fix narrative.json if present and synthesize any missing referenced audio files
+            # Fix narrative.json choices if present (and synthesize missing audio ONLY in offline unit-test mode)
             narrative_path = c_dir / "narrative.json"
             if narrative_path.is_file():
                 try:
@@ -2348,26 +2370,27 @@ class LeadGameplaySWEAgent:
                             choices = node.get("choices", [])
                             if not choices:
                                 node["choices"] = [{"text": "Continue", "next_node": "root"}]
-                    for bark_key in ("dialogue_barks", "barks", "cues"):
-                        barks_val = n_data.get(bark_key)
-                        if isinstance(barks_val, dict):
-                            for cue_id, cue in barks_val.items():
-                                if isinstance(cue, dict):
-                                    af = cue.get("audio_file") or cue.get("voice_clip")
-                                    if af:
-                                        af_path = c_dir / af
-                                        if not af_path.is_file():
-                                            self._write_valid_tone_wav(af_path)
-                                            results[af_path.name] = af_path
-                        elif isinstance(barks_val, list):
-                            for cue in barks_val:
-                                if isinstance(cue, dict):
-                                    af = cue.get("audio_file") or cue.get("voice_clip")
-                                    if af:
-                                        af_path = c_dir / af
-                                        if not af_path.is_file():
-                                            self._write_valid_tone_wav(af_path)
-                                            results[af_path.name] = af_path
+                    if offline_procedural_ok:
+                        for bark_key in ("dialogue_barks", "barks", "cues"):
+                            barks_val = n_data.get(bark_key)
+                            if isinstance(barks_val, dict):
+                                for cue_id, cue in barks_val.items():
+                                    if isinstance(cue, dict):
+                                        af = cue.get("audio_file") or cue.get("voice_clip")
+                                        if af:
+                                            af_path = c_dir / af
+                                            if not af_path.is_file():
+                                                self._write_valid_tone_wav(af_path)
+                                                results[af_path.name] = af_path
+                            elif isinstance(barks_val, list):
+                                for cue in barks_val:
+                                    if isinstance(cue, dict):
+                                        af = cue.get("audio_file") or cue.get("voice_clip")
+                                        if af:
+                                            af_path = c_dir / af
+                                            if not af_path.is_file():
+                                                self._write_valid_tone_wav(af_path)
+                                                results[af_path.name] = af_path
                     narrative_path.write_text(json.dumps(n_data, indent=2), encoding="utf-8")
                     results["narrative.json"] = narrative_path
                 except Exception as exc:
@@ -2439,8 +2462,12 @@ class LeadGameplaySWEAgent:
                 except Exception as exc:
                     logger.warning("Could not parse requirements_spec.json during SWE repair: %s", exc)
 
-            # Synthesize any missing audio or sprite assets defined in requirements_spec.json
-            if req_spec is not None and getattr(req_spec, "asset_manifest", None):
+            # Synthesize missing audio or sprite placeholders ONLY in explicit offline unit-test mode (Rule 5)
+            if (
+                req_spec is not None
+                and getattr(req_spec, "asset_manifest", None)
+                and self._offline_procedural_repairs_allowed(c_dir)
+            ):
                 for asset in req_spec.asset_manifest:
                     a_name = getattr(asset, "name", "")
                     a_target = getattr(asset, "target_path", "")

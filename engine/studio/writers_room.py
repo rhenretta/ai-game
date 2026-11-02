@@ -3959,11 +3959,21 @@ class CreativeWritersRoom:
             if roundtable_transcript_lines
             else ""
         )
+        final_assembly_note = (
+            "\nPOST-REMEDIATION FINAL VERIFICATION PASS: All current-slice assembly iteration rounds have been spent, "
+            "and this check verifies the repaired build. Do NOT queue optional polish or feature-creep tasks; set "
+            "`is_slice_assembled=True` (`backlog_additions=[]`) if the playable entrypoint boots cleanly, mounts active-slice "
+            "systems, and passes automated playtest assertions, or set `is_slice_assembled=False` ONLY if a severe blocking "
+            "assembly/boot defect still breaks the slice.\n"
+            if getattr(self, "_final_verification_assembly_pass", False)
+            else ""
+        )
         prompt = (
             f"{shared_playtest_dossier}\n\n"
             f"{roundtable_summary_block}"
             f"You are the Council Chair & Gameplay Systems Engineer synthesizing the Slice Playtest & Whole-Game Readiness Check now that all currently queued Production Board items are approved (Pass #{pass_index + 1} of {int(getattr(self, 'max_assembly_passes', 3))}).\n"
-            f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n\n"
+            f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n"
+            f"{final_assembly_note}\n"
             "INSTRUCTIONS:\n"
             "1. Compare the Living Game Bible (including any Executive Producer directives), the Approved Production Board items, and the Council Slice Playtest Roundtable Discussion above against the `PLAYABLE ENTRYPOINT REACHABILITY GRAPH` "
             "and the attached HIGH-resolution Slice Playtest filmstrip/telemetry of the playable entrypoint (`run/main_scene`).\n"
@@ -4585,12 +4595,22 @@ class CreativeWritersRoom:
             if roundtable_lines
             else ""
         )
+        final_playtest_note = (
+            "\nPOST-REMEDIATION FINAL VERIFICATION PASS: All current-slice iteration rounds have been spent, and this session "
+            "verifies the repaired build. Do NOT queue speculative feature additions or minor polish—capture all non-blocking "
+            "improvements in `next_slice_carryover_notes` and choose `approve_slice` if the repaired slice boots cleanly, core "
+            "player actions function, and active visual/audio assets are intact; choose `iterate_current_slice` ONLY if a severe "
+            "slice-blocking defect (crash, dead-end broken controls, or corrupted/placeholder active visual assets) still breaks playability.\n"
+            if getattr(self, "_final_verification_blind_playtest_pass", False)
+            else ""
+        )
         verdict_prompt = (
             f"{blind_dossier}\n\n"
             f"{roundtable_block}"
             f"You are the Creative Director chairing the Council's End-of-Slice Blind Playtest Verdict for "
             f"'{active_slice_title}' (`{active_slice_id}`, Pass #{pass_index + 1} of {int(getattr(self, 'max_blind_playtest_passes', 2))}).\n"
-            f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n\n"
+            f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n"
+            f"{final_playtest_note}\n"
             "INSTRUCTIONS:\n"
             "1. Independently and skeptically audit the Blind Playtester's HIGH-resolution screenshots, `BLIND PLAYER CHRONOLOGICAL ACTION TAPE`, curated source code, "
             "6-pillar Experience Report, `overall_fun_rating`, discovered controls rulebook, wishes, any Executive Producer directives, and the Council Roundtable Discussion. "
@@ -4956,26 +4976,38 @@ class CreativeWritersRoom:
         last_progress_sig = _board_progress_sig()
         assembly_passes = 0
         max_assembly_passes = int(getattr(self, "max_assembly_passes", 3))
+        assembly_verified = max_assembly_passes <= 0
         blind_playtest_passes = 0
         max_blind_playtest_passes = int(
             getattr(self, "max_blind_playtest_passes", os.environ.get("STUDIO_MAX_BLIND_PLAYTEST_PASSES", "2"))
         )
+        blind_playtest_verified = max_blind_playtest_passes <= 0
         qa_gate_passes = 0
         max_qa_gate_passes = int(
             getattr(self, "max_qa_gate_passes", os.environ.get("STUDIO_MAX_QA_GATE_PASSES", "2"))
         )
+        qa_gate_verified = max_qa_gate_passes <= 0
         active_slice_entry = game_bible.get_active_slice()
-        if candidate_dir is not None and active_slice_entry is not None:
+        if candidate_dir is not None and active_slice_entry is not None and max_blind_playtest_passes > 0:
             art_dir = Path(candidate_dir) / "artifacts"
+            last_playtest_verdict: Optional[str] = None
             while (
-                blind_playtest_passes < max_blind_playtest_passes
-                and (art_dir / f"blind_playtest_report_{active_slice_entry.slice_id}_pass{blind_playtest_passes}.json").is_file()
-            ):
+                art_dir / f"blind_playtest_report_{active_slice_entry.slice_id}_pass{blind_playtest_passes}.json"
+            ).is_file():
+                p_file = art_dir / f"blind_playtest_report_{active_slice_entry.slice_id}_pass{blind_playtest_passes}.json"
+                try:
+                    p_data = json.loads(p_file.read_text(encoding="utf-8"))
+                    last_playtest_verdict = str(p_data.get("council_verdict") or "")
+                except Exception:
+                    last_playtest_verdict = None
                 blind_playtest_passes += 1
+            if self.board.is_drained() and last_playtest_verdict == "approve_slice":
+                blind_playtest_verified = True
         if self.board.is_drained() and game_bible.writers_room_transcript:
             last_utt = game_bible.writers_room_transcript[-1]
             if "slice_assembly:verified" in (last_utt.bible_updates_summary or []):
                 assembly_passes = max_assembly_passes
+                assembly_verified = True
         while True:
             paused_dur = self._wait_if_paused(candidate_dir)
             if paused_dur > 0:
@@ -4985,7 +5017,10 @@ class CreativeWritersRoom:
                 self._execute_steering_pivot_turns(game_bible, dna_summary, candidate_dir, steered)
                 if not self.board.is_drained():
                     assembly_passes = 0
+                    assembly_verified = max_assembly_passes <= 0
+                    blind_playtest_verified = max_blind_playtest_passes <= 0
                     qa_gate_passes = 0
+                    qa_gate_verified = max_qa_gate_passes <= 0
                     if self.scheduler is not None:
                         self.scheduler.start()
             handled_failed = self._handle_failed_items()
@@ -4997,51 +5032,99 @@ class CreativeWritersRoom:
             handled_failed = self._handle_failed_items() or handled_failed
             unblocked_cancelled = self._resolve_blocked_by_cancelled() or unblocked_cancelled
             if self.board.is_drained():
-                if assembly_passes < max_assembly_passes:
-                    added_assembly = self._run_slice_assembly_check(
-                        game_bible=game_bible,
-                        dna_summary=dna_summary,
-                        candidate_dir=candidate_dir,
-                        pass_index=assembly_passes,
-                    )
+                if not assembly_verified:
+                    is_final_assembly_verify = assembly_passes >= max_assembly_passes
+                    self._final_verification_assembly_pass = is_final_assembly_verify
+                    try:
+                        added_assembly = self._run_slice_assembly_check(
+                            game_bible=game_bible,
+                            dna_summary=dna_summary,
+                            candidate_dir=candidate_dir,
+                            pass_index=assembly_passes,
+                        )
+                    finally:
+                        self._final_verification_assembly_pass = False
                     assembly_passes += 1
                     if added_assembly > 0:
+                        if is_final_assembly_verify:
+                            cur_s = game_bible.get_active_slice()
+                            raise StudioAgentError(
+                                f"Slice '{cur_s.slice_id if cur_s is not None else 'active'}' failed "
+                                f"post-remediation assembly verification after {max_assembly_passes} pass(es) "
+                                f"(persisted {added_assembly} unresolved assembly blocker task(s) on backlog.json; "
+                                f"refusing unverified promotion)."
+                            )
+                        blind_playtest_verified = max_blind_playtest_passes <= 0
                         qa_gate_passes = 0
+                        qa_gate_verified = max_qa_gate_passes <= 0
                         if self.scheduler is not None:
                             self.scheduler.start()
                         last_progress_sig = _board_progress_sig()
                         deadline = max(deadline, time.monotonic() + self.drain_timeout_s)
                         continue
-                if blind_playtest_passes < max_blind_playtest_passes:
-                    added_playtest = self._run_end_of_slice_blind_playtest(
-                        game_bible=game_bible,
-                        dna_summary=dna_summary,
-                        candidate_dir=candidate_dir,
-                        pass_index=blind_playtest_passes,
-                    )
+                    assembly_verified = True
+                if not blind_playtest_verified:
+                    is_final_playtest_verify = blind_playtest_passes >= max_blind_playtest_passes
+                    self._final_verification_blind_playtest_pass = is_final_playtest_verify
+                    try:
+                        added_playtest = self._run_end_of_slice_blind_playtest(
+                            game_bible=game_bible,
+                            dna_summary=dna_summary,
+                            candidate_dir=candidate_dir,
+                            pass_index=blind_playtest_passes,
+                        )
+                    finally:
+                        self._final_verification_blind_playtest_pass = False
                     blind_playtest_passes += 1
                     if added_playtest > 0:
+                        if is_final_playtest_verify:
+                            cur_s = game_bible.get_active_slice()
+                            raise StudioAgentError(
+                                f"Slice '{cur_s.slice_id if cur_s is not None else 'active'}' failed "
+                                f"post-remediation Blind Playtest verification after {max_blind_playtest_passes} iteration round(s) "
+                                f"(Council persisted {added_playtest} blocking task(s) on backlog.json; "
+                                f"refusing unverified promotion)."
+                            )
                         assembly_passes = 0
+                        assembly_verified = max_assembly_passes <= 0
                         qa_gate_passes = 0
+                        qa_gate_verified = max_qa_gate_passes <= 0
                         if self.scheduler is not None:
                             self.scheduler.start()
                         last_progress_sig = _board_progress_sig()
                         deadline = max(deadline, time.monotonic() + self.drain_timeout_s)
                         continue
-                if qa_gate_passes < max_qa_gate_passes:
-                    added_qa = self._run_slice_qa_gate_check(
-                        game_bible=game_bible,
-                        candidate_dir=candidate_dir,
-                        pass_index=qa_gate_passes,
-                    )
+                    blind_playtest_verified = True
+                if not qa_gate_verified:
+                    is_final_qa_verify = qa_gate_passes >= max_qa_gate_passes
+                    self._final_verification_qa_gate_pass = is_final_qa_verify
+                    try:
+                        added_qa = self._run_slice_qa_gate_check(
+                            game_bible=game_bible,
+                            candidate_dir=candidate_dir,
+                            pass_index=qa_gate_passes,
+                        )
+                    finally:
+                        self._final_verification_qa_gate_pass = False
                     qa_gate_passes += 1
                     if added_qa > 0:
+                        if is_final_qa_verify:
+                            cur_s = game_bible.get_active_slice()
+                            raise StudioAgentError(
+                                f"Slice '{cur_s.slice_id if cur_s is not None else 'active'}' failed "
+                                f"post-remediation 5-Gate QA verification after {max_qa_gate_passes} remediation pass(es) "
+                                f"(persisted {added_qa} unresolved QA remediation task(s) on backlog.json; "
+                                f"refusing unverified promotion)."
+                            )
+                        assembly_passes = 0
+                        assembly_verified = max_assembly_passes <= 0
+                        blind_playtest_verified = max_blind_playtest_passes <= 0
                         if self.scheduler is not None:
                             self.scheduler.start()
                         last_progress_sig = _board_progress_sig()
                         deadline = max(deadline, time.monotonic() + self.drain_timeout_s)
                         continue
-                    qa_gate_passes = max_qa_gate_passes
+                    qa_gate_verified = True
                 active_slice_done = game_bible.get_active_slice()
                 if active_slice_done is not None:
                     active_slice_done.status = "completed"
