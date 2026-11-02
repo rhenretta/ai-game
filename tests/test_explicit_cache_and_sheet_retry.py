@@ -580,3 +580,409 @@ def test_board_build_bypasses_hardcoded_5_gate_even_with_default_supervisor_asse
     assert (tmp_path / "active" / "project.godot").is_file()
 
 
+def test_slice_reflection_strategy_and_expansion_share_explicit_prefix_caches(
+    tmp_path: Path,
+) -> None:
+    """Verifies that:
+    1. `_run_slice_reflection_and_strategy` creates ONE shared `CachedContent` across all 5
+       `SliceStateReflectionTurn` panelists + `NextSliceStrategyPlan` (including multimodal images)
+       and cleans it up on scope exit.
+    2. `run_slice_expansion` creates ONE shared `CachedContent` across `expansion_roles` while
+       passing newly added peer utterances via `NEW WRITERS' ROOM TURNS SINCE SNAPSHOT` in the dynamic tail.
+    """
+    from engine.studio.production_board import BoardScheduler, ProductionBoard, WorkerResult
+    from engine.studio.models import (
+        GameBibleSpec,
+        GameSliceSpec,
+        NextSliceStrategyPlan,
+        ReviewBatch,
+        ReviewDecision,
+        SliceStateReflectionTurn,
+        WorkItemProposal,
+        WritersRoomTurnProposal,
+    )
+    from engine.studio.writers_room import CreativeWritersRoom
+
+    (tmp_path / "project.godot").write_text('[application]\nrun/main_scene="res://main.tscn"\n', encoding="utf-8")
+    (tmp_path / "main.tscn").write_text('[gd_scene format=3]\n[node name="Main" type="Node2D"]\n', encoding="utf-8")
+    (tmp_path / "main.gd").write_text("extends Node2D\n" + ("# padding line for realistic codebase size\n" * 600), encoding="utf-8")
+
+    proof_img = tmp_path / "proof_slice0.png"
+    Image.new("RGB", (64, 36), (30, 70, 110)).save(proof_img, "PNG")
+
+    board = ProductionBoard(tmp_path / "backlog.json")
+    board.add_items(
+        [
+            WorkItemProposal(
+                deliberation="Seed initial slice item.",
+                item_id="slice0_seed",
+                title="Core Loop Module",
+                kind="mechanic_code",
+                spec="Implement core loop state.",
+                target_modules=["main.gd"],
+                proof_spec="Verify state change.",
+            )
+        ],
+        "GameplayDesigner",
+        slice_id="slice_0_core",
+    )
+    board.claim_ready()
+    board.submit_result("slice0_seed", WorkerResult(proof_images=[str(proof_img)], notes="done"))
+    board.apply_review(ReviewDecision(deliberation="ok", item_id="slice0_seed", verdict="approve"))
+
+    sched = BoardScheduler(
+        board,
+        {"mechanic_code": lambda it: WorkerResult(proof_images=[str(proof_img)], notes=f"built {it.item_id}")},
+        max_workers=1,
+    )
+
+    recorded_calls: List[Dict[str, Any]] = []
+
+    class _CachingCouncilClient(_SpyGenAIClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.models = self
+
+        def generate_content(self, *, model: str, contents: Any, config: Any = None) -> Any:
+            schema = getattr(config, "response_schema", None)
+            sname = getattr(schema, "__name__", "")
+            cached_ref = getattr(config, "cached_content", None)
+            tail_txt = "\n".join(str(c) for c in (contents if isinstance(contents, list) else [contents]))
+            recorded_calls.append({"schema": sname, "cached_content": cached_ref, "tail": tail_txt})
+
+            if sname == "SliceStateReflectionTurn":
+                payload = SliceStateReflectionTurn(
+                    deliberation="Evaluate completed slice.",
+                    honest_current_state_critique="Needs clearer feedback.",
+                    how_to_play_and_intuitiveness_gaps="Add contextual prompt.",
+                    depth_and_fun_gaps="Add systemic trade-off.",
+                    accomplishment_and_goals_gaps="Add milestone indicator.",
+                    strategy_for_next_slice="Focus on readability and progression.",
+                    spoken_dialogue="Let us tighten feedback and goal clarity.",
+                    addressed_to=["CreativeDirector"],
+                    current_slice_quality_score=0.5,
+                ).model_dump_json()
+            elif sname == "NextSliceStrategyPlan":
+                payload = NextSliceStrategyPlan(
+                    deliberation="Synthesize next-slice master plan.",
+                    spoken_dialogue="Locking Slice 1 master plan.",
+                    current_slice_honest_diagnosis="Core loop runs; onboarding and progression need clarity.",
+                    cohesion_and_world_integration_strategy="Keep viewport unobstructed.",
+                    how_to_play_and_onboarding_strategy="Show contextual action hints.",
+                    depth_and_interesting_decisions_strategy="Add meaningful resource trade-off.",
+                    short_term_and_long_term_goals_strategy="Track short- and long-term milestones.",
+                    sense_of_accomplishment_and_reward_strategy="Celebrate completed milestones.",
+                    next_slice_spec=GameSliceSpec(
+                        deliberation="Slice 1 spec.",
+                        slice_id="slice_1_progression",
+                        slice_index=1,
+                        title="Slice 1: Readability & Progression",
+                        slice_objective="Deliver clear feedback and milestone progression.",
+                        player_acclimation_and_mechanics_focus="Contextual prompts + trade-off.",
+                        expansion_from_prior_slice="Adds milestone progression.",
+                        scope_boundaries=["Feedback + milestones"],
+                        status="active",
+                    ),
+                ).model_dump_json()
+            elif "WritersRoomTurnProposal" in sname:
+                is_swe = "You are the Lead Gameplay & Godot Systems Engineer (GameplaySystemsEngineer)" in tail_txt
+                payload = WritersRoomTurnProposal(
+                    deliberation="Contribute domain updates for Slice 1.",
+                    spoken_dialogue=(
+                        "Seeding Slice 1 mechanic task."
+                        if is_swe
+                        else "Added progression design notes for Slice 1."
+                    ),
+                    addressed_to=["CreativeDirector"],
+                    backlog_additions=(
+                        [
+                            WorkItemProposal(
+                                deliberation="Seed Slice 1 mechanic.",
+                                item_id="slice1_progression_task",
+                                title="Progression Milestone Tracker",
+                                kind="mechanic_code",
+                                spec="Implement milestone progression state.",
+                                target_modules=["main.gd"],
+                                proof_spec="Verify milestone advances.",
+                            )
+                        ]
+                        if is_swe
+                        else []
+                    ),
+                ).model_dump_json()
+            elif sname == "ReviewBatch":
+                awaiting = [i.item_id for i in board.awaiting_review()]
+                payload = ReviewBatch(
+                    deliberation="Approve verified Slice 1 task.",
+                    spoken_dialogue="Verified.",
+                    review_decisions=[
+                        ReviewDecision(deliberation="ok", item_id=iid, verdict="approve")
+                        for iid in awaiting
+                    ],
+                ).model_dump_json()
+            else:
+                raise AssertionError(f"Unexpected schema {sname}")
+
+            return SimpleNamespace(
+                text=payload,
+                usage_metadata=SimpleNamespace(
+                    prompt_token_count=9000,
+                    cached_content_token_count=7800 if cached_ref else 0,
+                    candidates_token_count=400,
+                    thoughts_token_count=100,
+                ),
+            )
+
+    spy_client = _CachingCouncilClient()
+    room = CreativeWritersRoom(
+        client=spy_client,
+        board=board,
+        scheduler=sched,
+        drain_poll_s=0.01,
+    )
+    room.enable_slice_reflection_roundtable = True
+    room.max_assembly_passes = 0
+    room.assembly_filmstrip_fn = lambda _d, _t, out_p: Image.new("RGB", (128, 72), (20, 40, 60)).save(out_p, "PNG")
+
+    long_style = (" Crisp layered 2D readability and silhouette contrast across every interactive structure." * 40).strip()
+    bible = GameBibleSpec(
+        deliberation="Initial bible.",
+        game_title="Test Cartridge",
+        core_genre="Simulation",
+        target_player_dna_summary=("Systemic builder player profile with deep optimization affinity across multi-stage loops. " * 140).strip(),
+        visual_style_guide=long_style,
+        audio_direction_guide=long_style,
+        elevator_pitch=("Build and balance interconnected systems across shifting conditions. " * 30).strip(),
+        core_fantasy=("Engineer resilient systems from first principles. " * 30).strip(),
+        slice_roadmap=[
+            GameSliceSpec(
+                deliberation="Slice 0.",
+                slice_id="slice_0_core",
+                slice_index=0,
+                title="Slice 0",
+                slice_objective=("Deliver foundational playable loop. " * 25).strip(),
+                player_acclimation_and_mechanics_focus=("Direct interaction and feedback. " * 25).strip(),
+                status="active",
+            )
+        ],
+        active_slice_index=0,
+    )
+
+    try:
+        room.run_slice_expansion(bible, candidate_dir=tmp_path)
+    finally:
+        sched.stop()
+
+    refl_calls = [c for c in recorded_calls if c["schema"] in ("SliceStateReflectionTurn", "NextSliceStrategyPlan")]
+    assert len(refl_calls) == 6
+    refl_cache_names = {c["cached_content"] for c in refl_calls}
+    assert len(refl_cache_names) == 1
+    assert None not in refl_cache_names
+    # Confirm DNA summary was NOT duplicated into the uncached tail or twice in the cached prefix
+    created_refl_cfg = spy_client.caches.created[0]["config"]
+    refl_prefix_str = "\n".join(str(p) for p in created_refl_cfg.contents)
+    assert "PLAYER DNA & STUDIO CONTEXT:" not in refl_prefix_str
+    assert "TARGET PLAYER STEAM DNA PROFILE" in refl_prefix_str
+
+    exp_calls = [c for c in recorded_calls if "WritersRoomTurnProposal" in c["schema"]]
+    assert len(exp_calls) >= 3
+    exp_cache_names = {c["cached_content"] for c in exp_calls}
+    assert len(exp_cache_names) == 1
+    assert None not in exp_cache_names
+    # Later expansion specialists receive earlier peers' spoken turns via the dynamic tail without busting the cache
+    assert "NEW WRITERS' ROOM TURNS SINCE SNAPSHOT:" not in exp_calls[0]["tail"]
+    assert "NEW WRITERS' ROOM TURNS SINCE SNAPSHOT:" in exp_calls[-1]["tail"]
+    assert "Added progression design notes for Slice 1." in exp_calls[-1]["tail"]
+
+    # Every created cache scope was deterministically deleted on exit
+    created_names = [entry["name"] for entry in spy_client.caches.created]
+    assert set(created_names).issubset(set(spy_client.caches.deleted))
+
+
+def test_memory_query_skips_redundant_second_call_when_all_hits_already_in_prompt_and_caches_multimodal_retry(
+    tmp_path: Path,
+) -> None:
+    """Verifies that:
+    1. When an agent sets `memory_query` on an already-valid structured response (`NextSliceStrategyPlan`)
+       and 100% of returned `[mem_...]` IDs are already present in the prompt's memory briefing,
+       `_structured_with_validation` returns immediately in 1 LLM call instead of discarding the response.
+    2. When `memory_query` retrieves an unseen `[mem_...]` ID from another bank, Pass 2 DOES execute, and
+       when `parts` (images) + `dynamic_tail` are both present on Pass 2, `_call_structured_llm` caches
+       `list(parts) + [prompt_body]` together (meeting the 4,500-token floor).
+    3. `_format_bible_snapshot` compacts superseded/already-attached `utt_ptrep_*` playtest report dumps
+       while preserving human `Executive Producer Direction:` notes in full.
+    """
+    from google.genai import types
+    from engine.studio.game_memory import GameMemoryStore
+    from engine.studio.models import (
+        GameBibleSpec,
+        GameSliceSpec,
+        MemoryMutationProposal,
+        NextSliceStrategyPlan,
+        WritersRoomUtterance,
+        _estimate_prefix_token_floor,
+    )
+    from engine.studio.writers_room import CreativeWritersRoom
+
+    # Verify HIGH media resolution image token floor estimation (`1120` vs `280` for LOW)
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 64), (80, 120, 160)).save(buf, format="PNG")
+    png_bytes = buf.getvalue()
+    high_part = types.Part.from_bytes(
+        data=png_bytes,
+        mime_type="image/png",
+        media_resolution=types.PartMediaResolutionLevel.MEDIA_RESOLUTION_HIGH,
+    )
+    low_part = types.Part.from_bytes(
+        data=png_bytes,
+        mime_type="image/png",
+        media_resolution=types.PartMediaResolutionLevel.MEDIA_RESOLUTION_LOW,
+    )
+    assert _estimate_prefix_token_floor([high_part]) == 1120
+    assert _estimate_prefix_token_floor([low_part]) == 280
+
+    # Seed 1 council memory (already in CreativeDirector's briefing) and 1 qa_test_engineer memory (unseen bank)
+    store = GameMemoryStore(tmp_path)
+    seeded = store.apply_mutations(
+        author_role="CreativeDirector",
+        proposals=[
+            MemoryMutationProposal(
+                deliberation="Seed council goal.",
+                operation="record",
+                target_bank="council",
+                kind="strategic_goal",
+                title="Multi-region network goal",
+                content="Expand routing across interconnected regions in Slice 2.",
+            ),
+            MemoryMutationProposal(
+                deliberation="Seed QA bank lesson.",
+                operation="record",
+                target_bank="qa_test_engineer",
+                kind="lesson_learned",
+                title="Viewport boundary camera check",
+                content="Verify camera limits cover outer region bounds.",
+            ),
+        ],
+    )
+    council_mem_id = seeded[0].memory_id
+    qa_mem_id = seeded[1].memory_id
+
+    llm_calls: List[Dict[str, Any]] = []
+    queued_plans: List[NextSliceStrategyPlan] = []
+
+    class _MemAndCacheSpyClient(_SpyGenAIClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.models = self
+
+        def embed_content(self, *, model: str, contents: Any, config: Any = None) -> Any:
+            items = contents if isinstance(contents, list) else [contents]
+            return SimpleNamespace(
+                embeddings=[SimpleNamespace(values=[1.0, 0.0, 0.0, 0.0]) for _ in items]
+            )
+
+        def generate_content(self, *, model: str, contents: Any, config: Any = None) -> Any:
+            llm_calls.append(
+                {
+                    "cached_content": getattr(config, "cached_content", None),
+                    "contents": contents,
+                }
+            )
+            plan = queued_plans.pop(0)
+            return SimpleNamespace(text=plan.model_dump_json())
+
+    def _make_plan(*, mem_q: str = "", mem_bank: str = "") -> NextSliceStrategyPlan:
+        return NextSliceStrategyPlan(
+            deliberation="Synthesizing next-slice plan.",
+            spoken_dialogue="Proceeding with next-slice plan.",
+            current_slice_honest_diagnosis="Solid foundation.",
+            cohesion_and_world_integration_strategy="Unified world space.",
+            how_to_play_and_onboarding_strategy="Contextual onboarding.",
+            depth_and_interesting_decisions_strategy="Resource trade-offs.",
+            short_term_and_long_term_goals_strategy="Clear milestone progression.",
+            sense_of_accomplishment_and_reward_strategy="Visible world progression.",
+            next_slice_spec=GameSliceSpec(
+                deliberation="Slice 1.",
+                slice_id="slice_1_next",
+                slice_index=1,
+                title="Slice 1",
+                slice_objective="Expand region progression.",
+                status="active",
+            ),
+            memory_query=mem_q,
+            memory_query_bank=mem_bank,
+        )
+
+    client = _MemAndCacheSpyClient()
+    room = CreativeWritersRoom(client=client)
+    briefing = store.format_role_memory_briefing("CreativeDirector", include_fulfilled_for_reflection=True)
+    assert f"[{council_mem_id}]" in briefing
+    assert f"[{qa_mem_id}]" not in briefing
+
+    large_prompt = ("SHARED_STRATEGY_PROMPT_BODY " * 900) + "\n\n" + briefing
+
+    # Case 1: `memory_query` targets `council` bank whose `[mem_...]` IDs are 100% already in `briefing` -> 1 call only!
+    queued_plans.append(_make_plan(mem_q="Multi-region network", mem_bank="council"))
+    res1 = room._structured_with_validation(
+        large_prompt,
+        NextSliceStrategyPlan,
+        lambda _p: [],
+        parts=[high_part],
+        caller_role="CreativeDirector",
+        candidate_dir=tmp_path,
+    )
+    assert res1.next_slice_spec.slice_id == "slice_1_next"
+    assert len(llm_calls) == 1  # No redundant 80k-token Pass 2!
+
+    # Case 2: `memory_query` targets `qa_test_engineer` bank (unseen `[qa_mem_id]`) -> Pass 2 runs AND caches `parts + prompt_body`!
+    llm_calls.clear()
+    queued_plans.extend(
+        [
+            _make_plan(mem_q="Viewport boundary camera", mem_bank="qa_test_engineer"),
+            _make_plan(),
+        ]
+    )
+    res2 = room._structured_with_validation(
+        large_prompt,
+        NextSliceStrategyPlan,
+        lambda _p: [],
+        parts=[high_part],
+        caller_role="CreativeDirector",
+        candidate_dir=tmp_path,
+    )
+    assert res2.next_slice_spec.slice_id == "slice_1_next"
+    assert len(llm_calls) == 2
+    assert llm_calls[0]["cached_content"] is None  # Lazy min_calls_before_create=2 on Attempt 1
+    assert llm_calls[1]["cached_content"] == "cachedContents/spy-cache-1"  # Cached `parts + prompt_body` on Attempt 2!
+    assert any(f"[{qa_mem_id}]" in str(c) for c in llm_calls[1]["contents"])
+
+    # Case 3: `_format_bible_snapshot` compacts already-attached/superseded playtest report dispatches while keeping EP notes
+    pt_dispatch_text = (
+        "[EXECUTIVE PRODUCER MANUAL BLIND PLAYTEST FULL REPORT DISPATCH — session `pt_sess_abc`]\n"
+        "  - Executive Producer Direction: Keep the radial build wheel snappy and add keyboard shortcuts.\n"
+        "  - Playtester Persona: `fresh_player` | Overall Fun Rating: 6/10\n"
+        + ("  - Detailed telemetry body line that is already in the structured playtest dossier.\n" * 80)
+    )
+    snap_bible = GameBibleSpec(
+        deliberation="d",
+        game_title="Test Project",
+        core_genre="Simulation",
+        writers_room_transcript=[
+            WritersRoomUtterance(
+                deliberation="Playtest report dispatch.",
+                utterance_id="utt_ptrep_pt_sess_abc",
+                turn_index=0,
+                speaker_role="ExecutiveProducer",
+                speaker_display_name="Executive Producer",
+                spoken_dialogue=pt_dispatch_text,
+                artifact_emitted={"type": "playtest_report", "session_id": "pt_sess_abc"},
+            )
+        ],
+    )
+    snap_txt = room._format_bible_snapshot(snap_bible, omit_playtest_session_ids={"pt_sess_abc"})
+    assert "Executive Producer Direction: Keep the radial build wheel snappy and add keyboard shortcuts." in snap_txt
+    assert "full structured playtest report & screenshots attached in dossier below" in snap_txt
+    assert "Detailed telemetry body line that is already in the structured playtest dossier." not in snap_txt
+
+
+

@@ -4138,7 +4138,7 @@ class SliceStateReflectionTurn(BaseEpistemicModel):
     )
     memory_query: str = Field(
         default="",
-        description="Optional semantic search query against long-term game/agent memory banks before finalizing your slice reflection (leave '' when current context suffices).",
+        description="Optional semantic search query ONLY when searching other specialist banks not already listed in your `LONG-TERM GAME & AGENT MEMORY BRIEFING` above (setting `memory_query` triggers a 2-pass lookup turn; leave '' when finalizing your slice reflection).",
     )
     memory_query_bank: str = Field(
         default="",
@@ -4251,7 +4251,7 @@ class NextSliceStrategyPlan(BaseEpistemicModel):
     )
     memory_query: str = Field(
         default="",
-        description="Optional semantic search query against long-term game/agent memory banks before finalizing the next-slice strategy (leave '' when current context suffices).",
+        description="Optional semantic search query ONLY when searching other specialist banks not already listed in your `LONG-TERM GAME & AGENT MEMORY BRIEFING` above (setting `memory_query` triggers a 2-pass lookup turn; leave '' when finalizing `NextSliceStrategyPlan`).",
     )
     memory_query_bank: str = Field(
         default="",
@@ -6504,7 +6504,13 @@ def _estimate_prefix_token_floor(parts: Sequence[Any], system_instruction: Optio
             raw_b = getattr(inl, "data", None)
             if isinstance(raw_b, (bytes, bytearray)) and len(raw_b) > 0:
                 if mime.startswith("image/"):
-                    media_tokens += 258
+                    m_res = str(getattr(p, "media_resolution", "") or "").upper()
+                    if "HIGH" in m_res:
+                        media_tokens += 1120
+                    elif "LOW" in m_res:
+                        media_tokens += 280
+                    else:
+                        media_tokens += 560
                 else:
                     media_tokens += 128
     return int(text_chars / 4.5) + media_tokens

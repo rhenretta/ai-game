@@ -557,6 +557,7 @@ class CreativeWritersRoom:
         `(formatted_provenance_block, multimodal_screenshot_parts)` so Council specialists inspect
         both the `observed_on_slice_id` provenance against current HEAD and the player's actual screenshots.
         """
+        self._last_consumed_playtest_session_ids: Set[str] = set()
         if candidate_dir is None:
             return "", []
         wf = Path(candidate_dir) / ".pending_playtest_wishes.json"
@@ -582,6 +583,10 @@ class CreativeWritersRoom:
 
         if not raw_items and not raw_reports:
             return "", []
+
+        for env_s in raw_reports:
+            if isinstance(env_s, dict) and env_s.get("session_id"):
+                self._last_consumed_playtest_session_ids.add(str(env_s["session_id"]).strip())
 
         from google.genai import types
 
@@ -873,21 +878,20 @@ class CreativeWritersRoom:
             if schema_name == "WritersRoomListenCheck"
             else (1024 if schema_name == "NoveltyJudgement" else 2048)
         )
-        tail_prompt = f"{prompt}{dynamic_tail}" if dynamic_tail else prompt
+        prompt_body = (
+            prompt[len(cacheable_prefix):]
+            if (cacheable_prefix and prompt.startswith(cacheable_prefix))
+            else prompt
+        )
+        tail_prompt = f"{prompt_body}{dynamic_tail}" if dynamic_tail else prompt_body
         combined_prompt = f"{cacheable_prefix}{tail_prompt}" if cacheable_prefix else tail_prompt
         unsplit_contents: Any = (list(parts) + [combined_prompt]) if parts else combined_prompt
         if cacheable_prefix:
             prefix_parts: List[Any] = (list(parts) + [cacheable_prefix]) if parts else [cacheable_prefix]
             tail_parts: List[Any] = [tail_prompt]
-        elif parts:
-            prefix_parts = list(parts)
-            tail_parts = [tail_prompt]
-        elif dynamic_tail:
-            prefix_parts = [prompt]
-            tail_parts = [dynamic_tail]
         else:
-            prefix_parts = []
-            tail_parts = [tail_prompt]
+            prefix_parts = (list(parts) + [prompt_body]) if parts else [prompt_body]
+            tail_parts = [dynamic_tail] if dynamic_tail else []
         eff_contents, cached_name = resolve_explicit_cached_request(
             self.client,
             model=self.model_name,
@@ -1066,13 +1070,41 @@ class CreativeWritersRoom:
         )
         return " | ".join(parts)
 
-    def _format_bible_snapshot(self, game_bible: GameBibleSpec, *, compact_for_review: bool = False) -> str:
-        recent_turns = game_bible.writers_room_transcript[(-3 if compact_for_review else -6):]
-        transcript_text = "\n".join(
-            f"  [Turn {u.turn_index}] {u.speaker_display_name} ({u.speaker_role}): "
-            f"{(u.spoken_dialogue[:480] + '...') if (compact_for_review and len(u.spoken_dialogue or '') > 480) else u.spoken_dialogue}"
-            for u in recent_turns
-        ) or "  (Room just opened)"
+    @staticmethod
+    def _dna_header_if_absent(dna_summary: str, bible_snapshot: str) -> str:
+        """Returns the `PLAYER DNA & STUDIO CONTEXT` header only when `dna_summary` is not already
+        embedded inside `bible_snapshot` (`TARGET PLAYER STEAM DNA PROFILE`), avoiding ~1.7k-token duplication."""
+        clean_dna = (dna_summary or "").strip()
+        if not clean_dna or clean_dna in (bible_snapshot or ""):
+            return ""
+        return f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n\n"
+
+    @staticmethod
+    def _compact_playtest_dispatch_text(raw_text: str, *, note_suffix: str) -> str:
+        """Preserves the deterministic header + any human `Executive Producer Direction:` line on a
+        formatted Blind Playtest report dispatch while omitting the multi-kilobyte auto-serialized
+        report body when that report is already attached in full below or superseded by a newer slice."""
+        txt = (raw_text or "").strip()
+        if not txt.startswith("[EXECUTIVE PRODUCER MANUAL BLIND PLAYTEST FULL REPORT DISPATCH"):
+            return txt
+        lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+        kept: List[str] = []
+        if lines:
+            kept.append(lines[0])
+        for ln in lines[1:]:
+            if ln.lstrip("- ").startswith("Executive Producer Direction"):
+                kept.append(ln.lstrip("- "))
+                break
+        kept.append(f"({note_suffix})")
+        return "\n    ".join(kept)
+
+    def _format_bible_snapshot(
+        self,
+        game_bible: GameBibleSpec,
+        *,
+        compact_for_review: bool = False,
+        omit_playtest_session_ids: Optional[Set[str]] = None,
+    ) -> str:
         chars = game_bible.narrative_bible.characters if game_bible.narrative_bible else []
         char_names = [f"{c.name} [character_id={c.character_id}, role={c.role}]" for c in chars]
         beats = [f"Beat {b.beat_index}: {b.phase_title} ({b.player_emotional_state})" for b in game_bible.experience_storyboard]
@@ -1097,6 +1129,20 @@ class CreativeWritersRoom:
             if active_slice is not None
             else "(not yet strategized — Slice 0 MUST deliver the complete playable game loop realizing all 3 timescales of `core_loop`, `player_agency_and_optimization_depth`, multi-horizon `goal_hierarchy`, multi-region world progression, UX onboarding, and audio—never defer the core game loop to future slices!)"
         )
+        tx_all = list(game_bible.writers_room_transcript or [])
+        last_strategy_turn_idx = -1
+        latest_pt_report_turn_idx = -1
+        for u_scan in tx_all:
+            u_upds = list(getattr(u_scan, "bible_updates_summary", None) or [])
+            if any(str(s).startswith("next_slice_strategy:") for s in u_upds):
+                last_strategy_turn_idx = max(last_strategy_turn_idx, int(u_scan.turn_index))
+            u_art = getattr(u_scan, "artifact_emitted", None) or {}
+            if (isinstance(u_art, dict) and u_art.get("type") == "playtest_report") or str(
+                getattr(u_scan, "utterance_id", "") or ""
+            ).startswith("utt_ptrep_"):
+                latest_pt_report_turn_idx = max(latest_pt_report_turn_idx, int(u_scan.turn_index))
+
+        omit_pt_sids = set(omit_playtest_session_ids or ())
         exec_entries: List[Tuple[str, str]] = []
         seen_directives: Set[str] = set()
         active_seed = (getattr(self, "_active_creative_prompt", None) or "").strip()
@@ -1104,15 +1150,60 @@ class CreativeWritersRoom:
             first_prev = (game_bible.concept_evolution[0].previous_premise or "").strip()
             if first_prev and first_prev != "Untitled Concept":
                 active_seed = first_prev
-        for u in game_bible.writers_room_transcript:
+        for u in tx_all:
             if u.speaker_role in ("ExecutiveProducer", "UserSteering") and u.spoken_dialogue and u.spoken_dialogue.strip():
-                d_txt = u.spoken_dialogue.strip()
-                if d_txt not in seen_directives:
-                    seen_directives.add(d_txt)
-                    exec_entries.append((f"Turn #{u.turn_index}", d_txt))
+                raw_d = u.spoken_dialogue.strip()
+                if raw_d in seen_directives:
+                    continue
+                seen_directives.add(raw_d)
+                u_art = getattr(u, "artifact_emitted", None) or {}
+                is_pt_rep = (
+                    (isinstance(u_art, dict) and u_art.get("type") == "playtest_report")
+                    or str(getattr(u, "utterance_id", "") or "").startswith("utt_ptrep_")
+                    or raw_d.startswith("[EXECUTIVE PRODUCER MANUAL BLIND PLAYTEST FULL REPORT DISPATCH")
+                )
+                pt_sid = str(u_art.get("session_id") or "") if isinstance(u_art, dict) else ""
+                if is_pt_rep and (
+                    (pt_sid and pt_sid in omit_pt_sids)
+                    or (pt_sid == "" and any(f"`{sid}`" in raw_d for sid in omit_pt_sids))
+                ):
+                    d_txt = self._compact_playtest_dispatch_text(
+                        raw_d,
+                        note_suffix="full structured playtest report & screenshots attached in dossier below",
+                    )
+                elif is_pt_rep and (
+                    int(u.turn_index) < last_strategy_turn_idx
+                    or int(u.turn_index) < latest_pt_report_turn_idx
+                ):
+                    d_txt = self._compact_playtest_dispatch_text(
+                        raw_d,
+                        note_suffix="prior-slice playtest report archived after slice progression",
+                    )
+                else:
+                    d_txt = raw_d
+                exec_entries.append((f"Turn #{u.turn_index}", d_txt))
         if active_seed and active_seed not in seen_directives:
             seen_directives.add(active_seed)
             exec_entries.insert(0, ("Initial Seed", active_seed))
+
+        recent_turns = tx_all[(-3 if compact_for_review else -6):]
+        recent_lines: List[str] = []
+        for u in recent_turns:
+            raw_sp = u.spoken_dialogue or ""
+            if (
+                u.speaker_role in ("ExecutiveProducer", "UserSteering")
+                and len(raw_sp) > 600
+                and raw_sp.strip() in seen_directives
+            ):
+                sp_display = "(See MANDATORY EXECUTIVE PRODUCER CREATIVE STEERING banner above)"
+            elif compact_for_review and len(raw_sp) > 480:
+                sp_display = raw_sp[:480] + "..."
+            else:
+                sp_display = raw_sp
+            recent_lines.append(
+                f"  [Turn {u.turn_index}] {u.speaker_display_name} ({u.speaker_role}): {sp_display}"
+            )
+        transcript_text = "\n".join(recent_lines) or "  (Room just opened)"
         formatted_exec_lines: List[str] = []
         for idx_d, (turn_lbl, d_txt) in enumerate(exec_entries):
             if len(exec_entries) > 1 and idx_d == len(exec_entries) - 1:
@@ -1591,8 +1682,9 @@ class CreativeWritersRoom:
                 "(or leave `consult_subagent_role = null` to speak yourself).\n\n"
             )
 
+        dna_header = self._dna_header_if_absent(dna_summary, bible_snapshot)
         prompt = (
-            f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n\n"
+            f"{dna_header}"
             f"{bible_snapshot}\n\n"
             f"You are the {display_name} ({role}) sitting in an open-ended Game Studio Writers' Room.\n"
             f"Your specialty focus: {focus}\n\n"
@@ -1607,6 +1699,35 @@ class CreativeWritersRoom:
         )
         return self._call_structured_llm(prompt, WritersRoomListenCheck, temperature=0.4)
 
+    def _build_specialist_shared_prefix(
+        self,
+        dna_summary: str,
+        bible_snapshot: str,
+        extra_context_block: str = "",
+    ) -> str:
+        dna_header = self._dna_header_if_absent(dna_summary, bible_snapshot)
+        extra_sec = (
+            f"{extra_context_block.strip()}\n\n"
+            if (extra_context_block and extra_context_block.strip())
+            else ""
+        )
+        return (
+            f"{dna_header}"
+            f"{bible_snapshot}\n\n"
+            f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n\n"
+            f"{extra_sec}"
+        )
+
+    @staticmethod
+    def _format_utterance_delta(game_bible: GameBibleSpec, start_idx: int) -> str:
+        tx = list(game_bible.writers_room_transcript or [])
+        if start_idx >= len(tx):
+            return ""
+        return "\n".join(
+            f"  [Turn {u.turn_index}] {u.speaker_display_name} ({u.speaker_role}): {u.spoken_dialogue}"
+            for u in tx[start_idx:]
+        )
+
     def _execute_specialist_turn(
         self,
         specialist: Dict[str, Any],
@@ -1618,6 +1739,12 @@ class CreativeWritersRoom:
         extra_multimodal_parts: Optional[List[Any]] = None,
         allow_council_reroute_handoff: bool = False,
         visited_council_roles: Optional[set[str]] = None,
+        *,
+        frozen_bible_snapshot: Optional[str] = None,
+        recent_turn_delta: str = "",
+        cacheable_prefix: str = "",
+        min_calls_before_create: int = 2,
+        omit_playtest_session_ids: Optional[Set[str]] = None,
     ) -> WritersRoomTurnProposal:
         """Executes the chosen specialist's turn to speak to the room and update the Living Game Bible."""
         role = specialist["role"]
@@ -1625,7 +1752,14 @@ class CreativeWritersRoom:
         focus = specialist["focus"]
         subagents = specialist.get("subagents") or []
         parent_lead = specialist.get("parent_lead")
-        bible_snapshot = self._format_bible_snapshot(game_bible)
+        bible_snapshot = (
+            frozen_bible_snapshot
+            if frozen_bible_snapshot is not None
+            else self._format_bible_snapshot(
+                game_bible,
+                omit_playtest_session_ids=omit_playtest_session_ids,
+            )
+        )
 
         self._emit_activity(
             agent_role=role,
@@ -1741,14 +1875,23 @@ class CreativeWritersRoom:
                 "is attached, raise `audio_asset` `backlog_additions` so the game's ambient and mechanical soundscape is fabricated and wired."
             )
 
+        shared_head = self._build_specialist_shared_prefix(
+            dna_summary,
+            bible_snapshot,
+            extra_context_block,
+        )
+        delta_block = (
+            f"NEW WRITERS' ROOM TURNS SINCE SNAPSHOT:\n{recent_turn_delta.strip()}\n\n"
+            if (recent_turn_delta and recent_turn_delta.strip())
+            else ""
+        )
         prompt = (
-            f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n\n"
-            f"{bible_snapshot}\n\n"
+            f"{shared_head}"
+            f"{delta_block}"
             f"You are the {display_name} ({role}) speaking in the Game Studio Writers' Room.\n"
             f"Your specialty focus: {focus}\n"
             f"{hierarchy_note}"
             f"Context for your turn: {listen_check.intended_contribution_summary}\n\n"
-            f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n\n"
             f"{domain_instructions}\n"
             f"STRATEGIZE WHAT IS BEST FOR THIS GAME (NO PRESCRIPTIONS): Do not follow rote templates. Reason from first principles about what mechanics, "
             f"world structure, empathetic new-player onboarding/UI, narrative/script moments, hybrid visual rendering (combining procedural geometry/shaders/particles "
@@ -1776,10 +1919,10 @@ class CreativeWritersRoom:
             mem_briefing = GameMemoryStore(
                 eff_mem_dir, event_callback=getattr(self, "event_callback", None)
             ).format_role_memory_briefing(role)
-        combined_extra = "\n\n".join(b for b in (extra_context_block, mem_briefing.strip()) if b)
+        mem_extra = mem_briefing.strip()
 
         if self.board is None:
-            full_no_board_prompt = prompt + ("\n\n" + combined_extra if combined_extra else "")
+            full_no_board_prompt = prompt + ("\n\n" + mem_extra if mem_extra else "")
             if eff_mem_dir is not None:
                 return self._structured_with_validation(
                     full_no_board_prompt,
@@ -1788,6 +1931,16 @@ class CreativeWritersRoom:
                     parts=extra_multimodal_parts,
                     caller_role=role,
                     candidate_dir=eff_mem_dir,
+                    cacheable_prefix=cacheable_prefix,
+                    min_calls_before_create=min_calls_before_create,
+                )
+            if getattr(self._call_structured_llm, "__func__", None) is CreativeWritersRoom._call_structured_llm:
+                return self._call_structured_llm(
+                    full_no_board_prompt,
+                    turn_schema,
+                    parts=extra_multimodal_parts,
+                    cacheable_prefix=cacheable_prefix,
+                    min_calls_before_create=min_calls_before_create,
                 )
             return self._call_structured_llm(full_no_board_prompt, turn_schema)
         tool_dir_block = render_compact_tool_directory(layer="council")
@@ -1849,7 +2002,7 @@ class CreativeWritersRoom:
                         issues.extend(self._unsupported_kind_issues(r.split_items))
             return issues
 
-        full_turn_prompt = prompt + ("\n\n" + combined_extra if combined_extra else "") + "\n" + board_block
+        full_turn_prompt = prompt + ("\n\n" + mem_extra if mem_extra else "") + "\n" + board_block
         return self._structured_with_validation(
             full_turn_prompt,
             turn_schema,
@@ -1857,6 +2010,8 @@ class CreativeWritersRoom:
             parts=extra_multimodal_parts,
             caller_role=role,
             candidate_dir=eff_mem_dir,
+            cacheable_prefix=cacheable_prefix,
+            min_calls_before_create=min_calls_before_create,
         )
 
     # ------------------------------------------------------------------
@@ -2862,6 +3017,18 @@ class CreativeWritersRoom:
         combined_steering = " | ".join(steered_notes)
         board_was_drained = bool(self.board is not None and self.board.is_drained())
         wish_context_block, wish_multimodal_parts = self._consume_pending_playtest_wishes(candidate_dir)
+        consumed_pt_sids = set(getattr(self, "_last_consumed_playtest_session_ids", None) or ())
+        steering_summary_for_prompt = (
+            " | ".join(
+                self._compact_playtest_dispatch_text(
+                    n,
+                    note_suffix="full structured playtest report & screenshots attached in dossier",
+                )
+                for n in steered_notes
+            )
+            if wish_context_block
+            else combined_steering
+        )
         curated_code_block = wish_context_block
         use_dynamic_steering_routing = bool(
             is_real_genai_client(self.client) or getattr(self.client, "supports_steering_routing", False)
@@ -2912,7 +3079,7 @@ class CreativeWritersRoom:
                 )
                 routing_prompt = (
                     f"You are the Writers' Room Council Table routing an incoming Executive Producer Steering / Build Report:\n"
-                    f"REPORT: {combined_steering}\n\n"
+                    f"REPORT: {steering_summary_for_prompt}\n\n"
                     f"AVAILABLE COUNCIL ROLES:\n{roster_summary}\n\n"
                     f"{render_compact_tool_directory(layer='council')}\n\n"
                     f"{wish_context_block}\n\n"
@@ -2971,7 +3138,7 @@ class CreativeWritersRoom:
                     pack = curator.curate_context(
                         target_agent_role=f"council_reviewer:{lead_role_name}",
                         task_request=(
-                            f"Executive Producer Live Steering / Problem Report: {combined_steering}\n"
+                            f"Executive Producer Live Steering / Problem Report: {steering_summary_for_prompt}\n"
                             f"Council Routing Deliberation: {routing_plan.deliberation}\n"
                             f"Inspect the cartridge entrypoint (`run/main_scene`), relevant `.gd` scripts, and asset references "
                             f"to identify the root cause and raise/update the exact ProductionBoard task(s) needed to resolve it.\n"
@@ -3000,7 +3167,7 @@ class CreativeWritersRoom:
                     probe_block, probe_parts = self._run_council_diagnostic_probe(
                         c_dir,
                         diag_probe,
-                        combined_steering,
+                        steering_summary_for_prompt,
                     )
                     curated_code_block += probe_block
                     if probe_parts:
@@ -3032,91 +3199,113 @@ class CreativeWritersRoom:
         visited_roles: set[str] = set()
         handoff_reasons: Dict[str, Tuple[str, str]] = {}
         items_before_steering = len(self.board.items()) if self.board is not None else 0
+        base_turn_idx = len(game_bible.writers_room_transcript)
+        base_bible_snapshot = self._format_bible_snapshot(
+            game_bible,
+            omit_playtest_session_ids=consumed_pt_sids,
+        )
+        shared_steering_prefix = self._build_specialist_shared_prefix(
+            dna_summary,
+            base_bible_snapshot,
+            curated_code_block,
+        )
+        steering_min_calls = 1 if len(pivot_queue) >= 2 else 2
         idx_q = 0
-        while idx_q < len(pivot_queue) and len(visited_roles) < max_pivot_turns:
-            pivot_role = pivot_queue[idx_q]
-            idx_q += 1
-            spec = _resolve_council_specialist(pivot_role)
-            if spec is None or spec["role"] in visited_roles:
-                continue
-            visited_roles.add(spec["role"])
+        with explicit_prefix_cache_scope(self.client, ttl_seconds=600, reuse_outer=False):
+            while idx_q < len(pivot_queue) and len(visited_roles) < max_pivot_turns:
+                pivot_role = pivot_queue[idx_q]
+                idx_q += 1
+                spec = _resolve_council_specialist(pivot_role)
+                if spec is None or spec["role"] in visited_roles:
+                    continue
+                visited_roles.add(spec["role"])
 
-            has_remaining_speakers = any(
-                (_resolve_council_specialist(rem) is not None and _resolve_council_specialist(rem)["role"] not in visited_roles)  # type: ignore[index]
-                for rem in pivot_queue[idx_q:]
-            )
-            items_now = len(self.board.items()) if self.board is not None else 0
-            still_drained = bool(self.board is not None and self.board.is_drained())
-            no_task_added_yet = (items_now <= items_before_steering)
-            must_add_task = bool(
-                (not has_remaining_speakers)
-                and (
-                    (board_was_drained and still_drained)
-                    or (use_dynamic_steering_routing and no_task_added_yet)
+                has_remaining_speakers = any(
+                    (_resolve_council_specialist(rem) is not None and _resolve_council_specialist(rem)["role"] not in visited_roles)  # type: ignore[index]
+                    for rem in pivot_queue[idx_q:]
                 )
-            )
-            can_handoff = len(visited_roles) < max_pivot_turns
-            handoff_prefix = ""
-            if spec["role"] in handoff_reasons:
-                from_role, h_reason = handoff_reasons[spec["role"]]
-                handoff_prefix = (
-                    f"[Routed directly to you by {from_role}"
-                    + (f": {h_reason}" if h_reason else "")
-                    + "] "
+                items_now = len(self.board.items()) if self.board is not None else 0
+                still_drained = bool(self.board is not None and self.board.is_drained())
+                no_task_added_yet = (items_now <= items_before_steering)
+                must_add_task = bool(
+                    (not has_remaining_speakers)
+                    and (
+                        (board_was_drained and still_drained)
+                        or (use_dynamic_steering_routing and no_task_added_yet)
+                    )
                 )
-            listen_check = WritersRoomListenCheck(
-                deliberation=f"Immediate Council discussion and slice task planning required to honor Executive Producer steering: {combined_steering}",
-                should_interject=True,
-                urgency_score=1.0,
-                intended_contribution_summary=(
-                    f"{handoff_prefix}Treat the Executive Producer's message ('{combined_steering}') with full respect and cater directly to what they asked for "
-                    f"at its full intended architectural scope without defensiveness, excuses, or silent downgrading (Rule 5). "
-                    f"Be candid and self-critical about where our current build fell short of their expectations (and never open `spoken_dialogue` with "
-                    f"peer flattery or 'I completely agree with...'), reason from first principles about how to integrate their direction cleanly into "
-                    f"your domain, update your Living Game Bible sections, refine unstarted slice tasks in `backlog_refinements`, and raise focused, "
-                    f"achievable production-code `backlog_additions` tasks that deliver their request cleanly without boiling the ocean on unrelated systems. "
-                    f"If another Council specialist's domain should handle or co-own this request next, set `route_to_council_role` and `routing_handoff_reason`."
-                ),
-            )
-            proposal = self._execute_specialist_turn(
-                specialist=spec,
-                listen_check=listen_check,
-                game_bible=game_bible,
-                dna_summary=dna_summary,
-                extra_context_block=curated_code_block,
-                require_backlog_addition=must_add_task,
-                extra_multimodal_parts=wish_multimodal_parts or None,
-                allow_council_reroute_handoff=can_handoff,
-                visited_council_roles=visited_roles,
-            )
-            self._apply_turn_proposal(
-                game_bible=game_bible,
-                speaker_role=spec["role"],
-                speaker_display_name=spec["display_name"],
-                proposal=proposal,
-                candidate_dir=candidate_dir,
-            )
-            routed_spec, handoff_txt = _parse_council_reroute(proposal)
-            if (
-                routed_spec is not None
-                and routed_spec["role"] not in visited_roles
-                and len(visited_roles) < max_pivot_turns
-            ):
-                routed_name = routed_spec["role"]
-                pivot_queue = pivot_queue[:idx_q] + [routed_name] + [
-                    r for r in pivot_queue[idx_q:] if r != routed_name
-                ]
-                handoff_reasons[routed_name] = (spec["role"], handoff_txt)
-                self._emit_activity(
-                    agent_role=routed_name,
-                    status_text=(
-                        f"{spec['display_name']} ({spec['role']}) routed steering turn to "
-                        f"{routed_spec['display_name']} ({routed_name})"
-                        + (f": {handoff_txt[:100]}" if handoff_txt else "")
+                can_handoff = len(visited_roles) < max_pivot_turns
+                handoff_prefix = ""
+                if spec["role"] in handoff_reasons:
+                    from_role, h_reason = handoff_reasons[spec["role"]]
+                    handoff_prefix = (
+                        f"[Routed directly to you by {from_role}"
+                        + (f": {h_reason}" if h_reason else "")
+                        + "] "
+                    )
+                listen_check = WritersRoomListenCheck(
+                    deliberation=f"Immediate Council discussion and slice task planning required to honor Executive Producer steering: {steering_summary_for_prompt}",
+                    should_interject=True,
+                    urgency_score=1.0,
+                    intended_contribution_summary=(
+                        f"{handoff_prefix}Treat the Executive Producer's message ('{steering_summary_for_prompt}') with full respect and cater directly to what they asked for "
+                        f"at its full intended architectural scope without defensiveness, excuses, or silent downgrading (Rule 5). "
+                        f"Be candid and self-critical about where our current build fell short of their expectations (and never open `spoken_dialogue` with "
+                        f"peer flattery or 'I completely agree with...'), reason from first principles about how to integrate their direction cleanly into "
+                        f"your domain, update your Living Game Bible sections, refine unstarted slice tasks in `backlog_refinements`, and raise focused, "
+                        f"achievable production-code `backlog_additions` tasks that deliver their request cleanly without boiling the ocean on unrelated systems. "
+                        f"If another Council specialist's domain should handle or co-own this request next, set `route_to_council_role` and `routing_handoff_reason`."
                     ),
-                    active_agents=[spec["role"], routed_name],
-                    phase="council_reroute",
                 )
+                extra_turn_kwargs: Dict[str, Any] = {}
+                if getattr(self._execute_specialist_turn, "__func__", None) is CreativeWritersRoom._execute_specialist_turn:
+                    extra_turn_kwargs = {
+                        "frozen_bible_snapshot": base_bible_snapshot,
+                        "recent_turn_delta": self._format_utterance_delta(game_bible, base_turn_idx),
+                        "cacheable_prefix": shared_steering_prefix,
+                        "min_calls_before_create": steering_min_calls,
+                        "omit_playtest_session_ids": consumed_pt_sids,
+                    }
+                proposal = self._execute_specialist_turn(
+                    specialist=spec,
+                    listen_check=listen_check,
+                    game_bible=game_bible,
+                    dna_summary=dna_summary,
+                    extra_context_block=curated_code_block,
+                    require_backlog_addition=must_add_task,
+                    extra_multimodal_parts=wish_multimodal_parts or None,
+                    allow_council_reroute_handoff=can_handoff,
+                    visited_council_roles=visited_roles,
+                    **extra_turn_kwargs,
+                )
+                self._apply_turn_proposal(
+                    game_bible=game_bible,
+                    speaker_role=spec["role"],
+                    speaker_display_name=spec["display_name"],
+                    proposal=proposal,
+                    candidate_dir=candidate_dir,
+                )
+                routed_spec, handoff_txt = _parse_council_reroute(proposal)
+                if (
+                    routed_spec is not None
+                    and routed_spec["role"] not in visited_roles
+                    and len(visited_roles) < max_pivot_turns
+                ):
+                    routed_name = routed_spec["role"]
+                    pivot_queue = pivot_queue[:idx_q] + [routed_name] + [
+                        r for r in pivot_queue[idx_q:] if r != routed_name
+                    ]
+                    handoff_reasons[routed_name] = (spec["role"], handoff_txt)
+                    self._emit_activity(
+                        agent_role=routed_name,
+                        status_text=(
+                            f"{spec['display_name']} ({spec['role']}) routed steering turn to "
+                            f"{routed_spec['display_name']} ({routed_name})"
+                            + (f": {handoff_txt[:100]}" if handoff_txt else "")
+                        ),
+                        active_agents=[spec["role"], routed_name],
+                        phase="council_reroute",
+                    )
 
     _SHAPING_COUNCIL_ROLES = (
         "GameplayDesigner",
@@ -3210,8 +3399,9 @@ class CreativeWritersRoom:
             phase="task_shaping",
         )
         board_snap = self.board.snapshot_text()
+        dna_header_s2 = self._dna_header_if_absent(dna_summary, bible_snapshot)
         stage2_shared_prefix = (
-            f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n\n"
+            f"{dna_header_s2}"
             f"{bible_snapshot}\n\n"
             f"{board_snap}\n\n"
         )
@@ -3324,8 +3514,9 @@ class CreativeWritersRoom:
         active_slice_obj = game_bible.get_active_slice()
         default_slice_id = active_slice_obj.slice_id if active_slice_obj is not None else ""
         total_changes = 0
+        dna_header_s1 = self._dna_header_if_absent(dna_summary, bible_snapshot)
         stage1_shared_prefix = (
-            f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n\n"
+            f"{dna_header_s1}"
             f"{bible_snapshot}\n\n"
         )
         stage1_cache_cm = explicit_prefix_cache_scope(self.client, ttl_seconds=360, reuse_outer=False)
@@ -4456,9 +4647,14 @@ class CreativeWritersRoom:
             )
             multimodal_parts.append(blind_sheet_part)
 
+        blind_bible_snapshot = self._format_bible_snapshot(
+            game_bible,
+            omit_playtest_session_ids={str(session_id)} if session_id else None,
+        )
+        blind_dna_header = self._dna_header_if_absent(dna_summary, blind_bible_snapshot)
         blind_dossier = (
-            f"PLAYER DNA & TARGET AUDIENCE:\n{dna_summary}\n\n"
-            f"{self._format_bible_snapshot(game_bible)}\n\n"
+            f"{blind_dna_header}"
+            f"{blind_bible_snapshot}\n\n"
             f"{curated_code_block}"
             f"=== BLIND AI PLAYTESTER END-OF-SLICE SESSION REPORT (`{session_id}` | Pass #{pass_index + 1}) ===\n"
             f"Active Slice Under Evaluation: `{active_slice_id}` — '{active_slice_title}'\n"
@@ -4488,177 +4684,183 @@ class CreativeWritersRoom:
             + ("\n".join(approved_board_lines) or "  (none)")
         )
 
+        blind_shared_prefix = f"{blind_dossier}\n\n"
         roundtable_lines: List[str] = []
         run_roundtable = getattr(self, "enable_blind_playtest_roundtable", None)
         if run_roundtable is None:
             run_roundtable = True
 
-        if run_roundtable:
-            panel_roles = [
-                "UXExperienceDesigner",
-                "GameplayDesigner",
-                "VisualArtDirector",
-                "AudioAtmosphereDesigner",
-            ]
+        with explicit_prefix_cache_scope(self.client, ttl_seconds=600, reuse_outer=False):
+            if run_roundtable:
+                panel_roles = [
+                    "UXExperienceDesigner",
+                    "GameplayDesigner",
+                    "VisualArtDirector",
+                    "AudioAtmosphereDesigner",
+                ]
+                self._emit_activity(
+                    agent_role="CouncilReviewPanel",
+                    status_text=(
+                        f"Council specialists ({', '.join(panel_roles)}) are deliberating on the Blind Playtester's "
+                        f"Experience Report & {len(wishes)} wish(es)..."
+                    ),
+                    active_agents=panel_roles + ["CreativeDirector"],
+                    phase="slice_blind_playtest",
+                )
+                for p_role in panel_roles:
+                    spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == p_role), None)
+                    disp_name = spec["display_name"] if spec else p_role
+                    mandate = self._role_review_mandate(p_role)
+                    prior_chat = (
+                        "\n".join(f"  - {line}" for line in roundtable_lines)
+                        if roundtable_lines
+                        else "  (You are opening the Council's deliberation right after reading the Blind Playtester's report.)"
+                    )
+                    turn_prompt = (
+                        f"{blind_shared_prefix}"
+                        f"=== COUNCIL BLIND PLAYTEST DELIBERATION SO FAR ===\n{prior_chat}\n\n"
+                        f"You are the {disp_name} ({p_role}) deliberating in the Writers' Room on the unguided Blind AI Playtester's "
+                        f"Experience Report and auto-delivered wishes for '{active_slice_title}' (`{active_slice_id}`, Pass #{pass_index + 1} of {int(getattr(self, 'max_blind_playtest_passes', 2))}).\n"
+                        f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n\n"
+                        f"{mandate}\n"
+                        "INSTRUCTIONS:\n"
+                        "1. Remember: the Blind Playtester is a fast non-thinking player model playing cold with ZERO internal instructions. "
+                        "Do NOT take a high `overall_fun_rating` or optimistic report prose at face value! Independently audit the attached "
+                        "HIGH-resolution screenshots, `BLIND PLAYER CHRONOLOGICAL ACTION TAPE`, and curated source code (and cater with full respect to any Executive Producer directives).\n"
+                        "2. Specifically verify (`domain_reaction_to_blind_player`):\n"
+                        "   - Did visible objectives/counters actually progress through genuine player decisions, or did the player get stuck in "
+                        "repetitive no-op clicks, hallucinate that decorative UI was interactive, or leave core slice loops unexercised?\n"
+                        "   - Did any mechanics 'play themselves' via hardcoded target coordinates, timer-driven inventory shortcuts, or fake "
+                        "progression credits instead of real player agency?\n"
+                        "   - Are there visual/UI craft defects in the HIGH-resolution screenshots—cut-off sprites or stray bleeding edge "
+                        "slivers from wrong sprite-sheet slicing, squished/distorted UI icons, text overflowing panel borders or truncated "
+                        "mid-word, overlapping/duplicate HUD widgets, harsh unblended rectangular texture boxes inside shapes, raw untextured "
+                        "placeholder polygons clashing with detailed sprites, or silent/dropped audio?\n"
+                        "3. PRAGMATIC SLICE SCOPE & COMPLETION DISCIPLINE — distinguish sharply between:\n"
+                        "   - BOUNDED CURRENT-SLICE CLEANUPS (`priority_fixes_or_refinements` — keep tight, 0–3 surgical items): unmet active-slice scope or Executive Producer direction, "
+                        "onboarding/control dead-ends, repetitive no-op traps, auto-playing/hardcoded shortcuts bypassing player agency, glaring sprite-slicing/UI-overflow/overlap glitches, or silent core audio.\n"
+                        "   - NEXT-SLICE CARRYOVER WISHES: broader mechanics, deeper content tiers, secondary polish, or new world features that we CANNOT and SHOULD NOT try to cram into this slice in one go.\n"
+                        "4. In `spoken_dialogue`, speak candidly and skeptically to your peers—NEVER open with 'I completely agree with...', 'I echo...', or peer roll-call flattery, and never repeat what an earlier speaker already caught. "
+                        "Set `recommends_slice_approval=False` if targeted current-slice scope or high-impact problem cleanup is needed right now; "
+                        "set `recommends_slice_approval=True` once the active slice's scope is covered and major problem areas are cleaned up (calling the slice done when appropriate while candidly naming what remains rough for future slices).\n"
+                        "Provide `deliberation` FIRST and `recommends_slice_approval` strictly LAST."
+                    )
+                    turn_dec = self._structured_with_validation(
+                        turn_prompt,
+                        BlindPlaytestCouncilTurn,
+                        lambda _t: [],
+                        temperature=0.35,
+                        parts=multimodal_parts,
+                        cacheable_prefix=blind_shared_prefix,
+                        min_calls_before_create=1,
+                    )
+                    roundtable_lines.append(
+                        f"[{disp_name} ({p_role})] (recommends_approval={turn_dec.recommends_slice_approval}): "
+                        f"{turn_dec.spoken_dialogue} | Priority fixes: {turn_dec.priority_fixes_or_refinements}"
+                    )
+                    t_idx = len(game_bible.writers_room_transcript)
+                    c_utt = WritersRoomUtterance(
+                        deliberation=turn_dec.deliberation,
+                        utterance_id=f"utt_{t_idx:02d}_{p_role}_blind_playtest_{pass_index}",
+                        turn_index=t_idx,
+                        speaker_role=p_role,
+                        speaker_display_name=disp_name,
+                        spoken_dialogue=turn_dec.spoken_dialogue,
+                        addressed_to=turn_dec.addressed_to or ["CreativeDirector"],
+                        bible_updates_summary=[
+                            f"blind_playtest_vote:{p_role}:{'approve' if turn_dec.recommends_slice_approval else 'iterate'}"
+                        ],
+                    )
+                    game_bible.writers_room_transcript.append(c_utt)
+                    self._emit_event(
+                        "writers_room_utterance",
+                        {
+                            "deliberation": c_utt.deliberation,
+                            "utterance_id": c_utt.utterance_id,
+                            "turn_index": c_utt.turn_index,
+                            "speaker_role": c_utt.speaker_role,
+                            "speaker_display_name": c_utt.speaker_display_name,
+                            "spoken_dialogue": c_utt.spoken_dialogue,
+                            "addressed_to": c_utt.addressed_to,
+                            "bible_updates_summary": c_utt.bible_updates_summary,
+                            "proof_image_paths": c_utt.proof_image_paths,
+                            "artifact_emitted": c_utt.artifact_emitted,
+                        },
+                    )
+
+            roundtable_block = (
+                "=== COUNCIL ROUNDTABLE DISCUSSION ON BLIND PLAYTEST ===\n"
+                + "\n".join(f"  - {line}" for line in roundtable_lines)
+                + "\n\n"
+                if roundtable_lines
+                else ""
+            )
+            final_playtest_note = (
+                "\nPOST-REMEDIATION FINAL VERIFICATION PASS: All current-slice iteration rounds have been spent, and this session "
+                "verifies the repaired build. Do NOT queue speculative feature additions or minor polish—capture all non-blocking "
+                "improvements in `next_slice_carryover_notes` and choose `approve_slice` if the repaired slice boots cleanly, core "
+                "player actions function, and active visual/audio assets are intact; choose `iterate_current_slice` ONLY if a severe "
+                "slice-blocking defect (crash, dead-end broken controls, or corrupted/placeholder active visual assets) still breaks playability.\n"
+                if getattr(self, "_final_verification_blind_playtest_pass", False)
+                else ""
+            )
+            verdict_prompt = (
+                f"{blind_shared_prefix}"
+                f"{roundtable_block}"
+                f"You are the Creative Director chairing the Council's End-of-Slice Blind Playtest Verdict for "
+                f"'{active_slice_title}' (`{active_slice_id}`, Pass #{pass_index + 1} of {int(getattr(self, 'max_blind_playtest_passes', 2))}).\n"
+                f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n"
+                f"{final_playtest_note}\n"
+                "INSTRUCTIONS:\n"
+                "1. Independently and skeptically audit the Blind Playtester's HIGH-resolution screenshots, `BLIND PLAYER CHRONOLOGICAL ACTION TAPE`, curated source code, "
+                "6-pillar Experience Report, `overall_fun_rating`, discovered controls rulebook, wishes, any Executive Producer directives, and the Council Roundtable Discussion. "
+                "Never rubber-stamp an inflated `overall_fun_rating`, and never open `spoken_dialogue` with 'I completely agree with the Council' or cheerleading.\n"
+                "2. APPLY PRAGMATIC SLICE COMPLETION JUDGMENT (WE CANNOT CHANGE EVERYTHING IN ONE GO) — decide between two clear moves:\n"
+                "   - `iterate_current_slice`: Choose this when active-slice scope or an Executive Producer directive is unmet, OR when high-impact problem areas "
+                "(onboarding dead-ends, repetitive no-op loops, stalled progression, auto-playing/shortcutted mechanics bypassing player agency, glaring sprite-bleed/UI-overflow/overlap glitches, "
+                "corrupted/placeholder visual assets on the `CARTRIDGE VISUAL ASSET CONTACT SHEET`, or silent core audio) need surgical cleanup before closing this slice. Keep gameplay/UX `backlog_additions` "
+                "tight and surgical (1–3 focused gameplay/UX `WorkItemProposal` tasks—never boil the ocean with a massive redesign list!), PLUS any atomic in-place `visual_asset` regeneration tasks and "
+                "dependent `.gd` reintegration task required by `CARTRIDGE VISUAL ASSET & GDSCRIPT SLICING INTEGRITY AUDIT`, targeting real production modules with systemic, world-wide fixes (never single-coordinate point patches) "
+                "and concrete `proof_spec` verification, and defer broader feature wishes to `next_slice_carryover_notes`.\n"
+                "   - `approve_slice`: CALL THE SLICE DONE when the screenshots, action tape, and code confirm that THIS slice's intended scope (and any Executive Producer request) "
+                "is genuinely covered and playable through real player decisions and major problem areas have been cleaned up—even if non-blocking rough edges or broader wishes remain! "
+                "Be candid in `spoken_dialogue` about what is still rough, capture those deferred improvements and wishes cleanly in `next_slice_carryover_notes`, and set `backlog_additions=[]`.\n"
+                f"Buildable kinds right now: {self._supported_kinds() or 'all'}.\n"
+                "Provide `deliberation` FIRST and `verdict` (`approve_slice` or `iterate_current_slice`) strictly LAST."
+            )
+
+            def _validate_blind_verdict(v: BlindPlaytestCouncilVerdict) -> List[str]:
+                issues: List[str] = []
+                if v.verdict == "iterate_current_slice" and not v.backlog_additions:
+                    issues.append(
+                        "verdict='iterate_current_slice' requires at least one WorkItemProposal in backlog_additions "
+                        "(or set verdict='approve_slice' if no current-slice tasks are needed)."
+                    )
+                if v.verdict == "approve_slice" and v.backlog_additions:
+                    v.verdict = "iterate_current_slice"
+                if v.backlog_additions:
+                    issues.extend(self.board.validate_proposals(v.backlog_additions))
+                    issues.extend(self._unsupported_kind_issues(v.backlog_additions))
+                return issues
+
             self._emit_activity(
-                agent_role="CouncilReviewPanel",
-                status_text=(
-                    f"Council specialists ({', '.join(panel_roles)}) are deliberating on the Blind Playtester's "
-                    f"Experience Report & {len(wishes)} wish(es)..."
-                ),
-                active_agents=panel_roles + ["CreativeDirector"],
+                agent_role="CreativeDirector",
+                status_text=f"Creative Director synthesizing Council Blind Playtest Verdict for '{active_slice_title}'...",
+                active_agents=["CreativeDirector"],
                 phase="slice_blind_playtest",
             )
-            for p_role in panel_roles:
-                spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == p_role), None)
-                disp_name = spec["display_name"] if spec else p_role
-                mandate = self._role_review_mandate(p_role)
-                prior_chat = (
-                    "\n".join(f"  - {line}" for line in roundtable_lines)
-                    if roundtable_lines
-                    else "  (You are opening the Council's deliberation right after reading the Blind Playtester's report.)"
-                )
-                turn_prompt = (
-                    f"{blind_dossier}\n\n"
-                    f"=== COUNCIL BLIND PLAYTEST DELIBERATION SO FAR ===\n{prior_chat}\n\n"
-                    f"You are the {disp_name} ({p_role}) deliberating in the Writers' Room on the unguided Blind AI Playtester's "
-                    f"Experience Report and auto-delivered wishes for '{active_slice_title}' (`{active_slice_id}`, Pass #{pass_index + 1} of {int(getattr(self, 'max_blind_playtest_passes', 2))}).\n"
-                    f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n\n"
-                    f"{mandate}\n"
-                    "INSTRUCTIONS:\n"
-                    "1. Remember: the Blind Playtester is a fast non-thinking player model playing cold with ZERO internal instructions. "
-                    "Do NOT take a high `overall_fun_rating` or optimistic report prose at face value! Independently audit the attached "
-                    "HIGH-resolution screenshots, `BLIND PLAYER CHRONOLOGICAL ACTION TAPE`, and curated source code (and cater with full respect to any Executive Producer directives).\n"
-                    "2. Specifically verify (`domain_reaction_to_blind_player`):\n"
-                    "   - Did visible objectives/counters actually progress through genuine player decisions, or did the player get stuck in "
-                    "repetitive no-op clicks, hallucinate that decorative UI was interactive, or leave core slice loops unexercised?\n"
-                    "   - Did any mechanics 'play themselves' via hardcoded target coordinates, timer-driven inventory shortcuts, or fake "
-                    "progression credits instead of real player agency?\n"
-                    "   - Are there visual/UI craft defects in the HIGH-resolution screenshots—cut-off sprites or stray bleeding edge "
-                    "slivers from wrong sprite-sheet slicing, squished/distorted UI icons, text overflowing panel borders or truncated "
-                    "mid-word, overlapping/duplicate HUD widgets, harsh unblended rectangular texture boxes inside shapes, raw untextured "
-                    "placeholder polygons clashing with detailed sprites, or silent/dropped audio?\n"
-                    "3. PRAGMATIC SLICE SCOPE & COMPLETION DISCIPLINE — distinguish sharply between:\n"
-                    "   - BOUNDED CURRENT-SLICE CLEANUPS (`priority_fixes_or_refinements` — keep tight, 0–3 surgical items): unmet active-slice scope or Executive Producer direction, "
-                    "onboarding/control dead-ends, repetitive no-op traps, auto-playing/hardcoded shortcuts bypassing player agency, glaring sprite-slicing/UI-overflow/overlap glitches, or silent core audio.\n"
-                    "   - NEXT-SLICE CARRYOVER WISHES: broader mechanics, deeper content tiers, secondary polish, or new world features that we CANNOT and SHOULD NOT try to cram into this slice in one go.\n"
-                    "4. In `spoken_dialogue`, speak candidly and skeptically to your peers—NEVER open with 'I completely agree with...', 'I echo...', or peer roll-call flattery, and never repeat what an earlier speaker already caught. "
-                    "Set `recommends_slice_approval=False` if targeted current-slice scope or high-impact problem cleanup is needed right now; "
-                    "set `recommends_slice_approval=True` once the active slice's scope is covered and major problem areas are cleaned up (calling the slice done when appropriate while candidly naming what remains rough for future slices).\n"
-                    "Provide `deliberation` FIRST and `recommends_slice_approval` strictly LAST."
-                )
-                turn_dec = self._structured_with_validation(
-                    turn_prompt,
-                    BlindPlaytestCouncilTurn,
-                    lambda _t: [],
-                    temperature=0.35,
-                    parts=multimodal_parts,
-                )
-                roundtable_lines.append(
-                    f"[{disp_name} ({p_role})] (recommends_approval={turn_dec.recommends_slice_approval}): "
-                    f"{turn_dec.spoken_dialogue} | Priority fixes: {turn_dec.priority_fixes_or_refinements}"
-                )
-                t_idx = len(game_bible.writers_room_transcript)
-                c_utt = WritersRoomUtterance(
-                    deliberation=turn_dec.deliberation,
-                    utterance_id=f"utt_{t_idx:02d}_{p_role}_blind_playtest_{pass_index}",
-                    turn_index=t_idx,
-                    speaker_role=p_role,
-                    speaker_display_name=disp_name,
-                    spoken_dialogue=turn_dec.spoken_dialogue,
-                    addressed_to=turn_dec.addressed_to or ["CreativeDirector"],
-                    bible_updates_summary=[
-                        f"blind_playtest_vote:{p_role}:{'approve' if turn_dec.recommends_slice_approval else 'iterate'}"
-                    ],
-                )
-                game_bible.writers_room_transcript.append(c_utt)
-                self._emit_event(
-                    "writers_room_utterance",
-                    {
-                        "deliberation": c_utt.deliberation,
-                        "utterance_id": c_utt.utterance_id,
-                        "turn_index": c_utt.turn_index,
-                        "speaker_role": c_utt.speaker_role,
-                        "speaker_display_name": c_utt.speaker_display_name,
-                        "spoken_dialogue": c_utt.spoken_dialogue,
-                        "addressed_to": c_utt.addressed_to,
-                        "bible_updates_summary": c_utt.bible_updates_summary,
-                        "proof_image_paths": c_utt.proof_image_paths,
-                        "artifact_emitted": c_utt.artifact_emitted,
-                    },
-                )
-
-        roundtable_block = (
-            "=== COUNCIL ROUNDTABLE DISCUSSION ON BLIND PLAYTEST ===\n"
-            + "\n".join(f"  - {line}" for line in roundtable_lines)
-            + "\n\n"
-            if roundtable_lines
-            else ""
-        )
-        final_playtest_note = (
-            "\nPOST-REMEDIATION FINAL VERIFICATION PASS: All current-slice iteration rounds have been spent, and this session "
-            "verifies the repaired build. Do NOT queue speculative feature additions or minor polish—capture all non-blocking "
-            "improvements in `next_slice_carryover_notes` and choose `approve_slice` if the repaired slice boots cleanly, core "
-            "player actions function, and active visual/audio assets are intact; choose `iterate_current_slice` ONLY if a severe "
-            "slice-blocking defect (crash, dead-end broken controls, or corrupted/placeholder active visual assets) still breaks playability.\n"
-            if getattr(self, "_final_verification_blind_playtest_pass", False)
-            else ""
-        )
-        verdict_prompt = (
-            f"{blind_dossier}\n\n"
-            f"{roundtable_block}"
-            f"You are the Creative Director chairing the Council's End-of-Slice Blind Playtest Verdict for "
-            f"'{active_slice_title}' (`{active_slice_id}`, Pass #{pass_index + 1} of {int(getattr(self, 'max_blind_playtest_passes', 2))}).\n"
-            f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n"
-            f"{final_playtest_note}\n"
-            "INSTRUCTIONS:\n"
-            "1. Independently and skeptically audit the Blind Playtester's HIGH-resolution screenshots, `BLIND PLAYER CHRONOLOGICAL ACTION TAPE`, curated source code, "
-            "6-pillar Experience Report, `overall_fun_rating`, discovered controls rulebook, wishes, any Executive Producer directives, and the Council Roundtable Discussion. "
-            "Never rubber-stamp an inflated `overall_fun_rating`, and never open `spoken_dialogue` with 'I completely agree with the Council' or cheerleading.\n"
-            "2. APPLY PRAGMATIC SLICE COMPLETION JUDGMENT (WE CANNOT CHANGE EVERYTHING IN ONE GO) — decide between two clear moves:\n"
-            "   - `iterate_current_slice`: Choose this when active-slice scope or an Executive Producer directive is unmet, OR when high-impact problem areas "
-            "(onboarding dead-ends, repetitive no-op loops, stalled progression, auto-playing/shortcutted mechanics bypassing player agency, glaring sprite-bleed/UI-overflow/overlap glitches, "
-            "corrupted/placeholder visual assets on the `CARTRIDGE VISUAL ASSET CONTACT SHEET`, or silent core audio) need surgical cleanup before closing this slice. Keep gameplay/UX `backlog_additions` "
-            "tight and surgical (1–3 focused gameplay/UX `WorkItemProposal` tasks—never boil the ocean with a massive redesign list!), PLUS any atomic in-place `visual_asset` regeneration tasks and "
-            "dependent `.gd` reintegration task required by `CARTRIDGE VISUAL ASSET & GDSCRIPT SLICING INTEGRITY AUDIT`, targeting real production modules with systemic, world-wide fixes (never single-coordinate point patches) "
-            "and concrete `proof_spec` verification, and defer broader feature wishes to `next_slice_carryover_notes`.\n"
-            "   - `approve_slice`: CALL THE SLICE DONE when the screenshots, action tape, and code confirm that THIS slice's intended scope (and any Executive Producer request) "
-            "is genuinely covered and playable through real player decisions and major problem areas have been cleaned up—even if non-blocking rough edges or broader wishes remain! "
-            "Be candid in `spoken_dialogue` about what is still rough, capture those deferred improvements and wishes cleanly in `next_slice_carryover_notes`, and set `backlog_additions=[]`.\n"
-            f"Buildable kinds right now: {self._supported_kinds() or 'all'}.\n"
-            "Provide `deliberation` FIRST and `verdict` (`approve_slice` or `iterate_current_slice`) strictly LAST."
-        )
-
-        def _validate_blind_verdict(v: BlindPlaytestCouncilVerdict) -> List[str]:
-            issues: List[str] = []
-            if v.verdict == "iterate_current_slice" and not v.backlog_additions:
-                issues.append(
-                    "verdict='iterate_current_slice' requires at least one WorkItemProposal in backlog_additions "
-                    "(or set verdict='approve_slice' if no current-slice tasks are needed)."
-                )
-            if v.verdict == "approve_slice" and v.backlog_additions:
-                v.verdict = "iterate_current_slice"
-            if v.backlog_additions:
-                issues.extend(self.board.validate_proposals(v.backlog_additions))
-                issues.extend(self._unsupported_kind_issues(v.backlog_additions))
-            return issues
-
-        self._emit_activity(
-            agent_role="CreativeDirector",
-            status_text=f"Creative Director synthesizing Council Blind Playtest Verdict for '{active_slice_title}'...",
-            active_agents=["CreativeDirector"],
-            phase="slice_blind_playtest",
-        )
-        verdict = self._structured_with_validation(
-            verdict_prompt,
-            BlindPlaytestCouncilVerdict,
-            _validate_blind_verdict,
-            temperature=0.3,
-            parts=multimodal_parts,
-            caller_role="CreativeDirector",
-            candidate_dir=c_dir,
-            slice_id=active_slice_id,
-        )
+            verdict = self._structured_with_validation(
+                verdict_prompt,
+                BlindPlaytestCouncilVerdict,
+                _validate_blind_verdict,
+                temperature=0.3,
+                parts=multimodal_parts,
+                caller_role="CreativeDirector",
+                candidate_dir=c_dir,
+                slice_id=active_slice_id,
+                cacheable_prefix=blind_shared_prefix,
+                min_calls_before_create=1 if run_roundtable else 2,
+            )
 
         added: List[Any] = []
         if verdict.verdict == "iterate_current_slice" and verdict.backlog_additions:
@@ -5493,6 +5695,11 @@ class CreativeWritersRoom:
         max_mem_queries = 2 if (eff_dir is not None and has_embed_client) else 0
         attempt = 1
 
+        eff_full_prompt = (
+            prompt
+            if (not cacheable_prefix or prompt.startswith(cacheable_prefix))
+            else (cacheable_prefix + prompt)
+        )
         while attempt <= attempts:
             feedback = (
                 "\n\nYOUR PREVIOUS ANSWER FAILED VALIDATION; FIX EVERY ISSUE:\n- " + "\n- ".join(issues) if issues else ""
@@ -5510,7 +5717,7 @@ class CreativeWritersRoom:
                 )
             else:
                 result = self._call_structured_llm(
-                    cacheable_prefix + prompt + mem_q_block + feedback,
+                    eff_full_prompt + mem_q_block + feedback,
                     schema_cls,
                     temperature=temperature,
                     parts=parts,
@@ -5543,10 +5750,12 @@ class CreativeWritersRoom:
                     )
 
                 mem_q = str(getattr(result, "memory_query", "") or "").strip()
+                mem_q_ans = str(getattr(result, "memory_query_answer", "") or "").strip()
                 mem_q_bank = str(getattr(result, "memory_query_bank", "") or "").strip()
                 mem_q_key = f"{mem_q_bank.lower()}::{mem_q.lower()}"
                 if (
                     mem_q
+                    and not mem_q_ans
                     and mem_queries_used < max_mem_queries
                     and mem_q_key not in asked_mem_queries
                 ):
@@ -5558,9 +5767,15 @@ class CreativeWritersRoom:
                         bank_filter=mem_q_bank,
                         client=self.client,
                     )
-                    mem_query_blocks.append(format_memory_query_results(mem_q, mem_q_bank, hits))
-                    issues = []
-                    continue
+                    existing_ctx = f"{eff_full_prompt}\n" + "\n".join(mem_query_blocks)
+                    has_unseen_hits = any(
+                        f"[{entry.memory_id}]" not in existing_ctx
+                        for entry, _ in hits
+                    )
+                    if has_unseen_hits:
+                        mem_query_blocks.append(format_memory_query_results(mem_q, mem_q_bank, hits))
+                        issues = []
+                        continue
 
             issues = validate(result)
             if not issues:
@@ -6225,6 +6440,9 @@ class CreativeWritersRoom:
         game_bible: GameBibleSpec,
         prev_slice: Optional[GameSliceSpec],
         candidate_dir: Optional[Path],
+        *,
+        dispatched_playtest_session_ids: Optional[Set[str]] = None,
+        has_extra_playtest_dossier: bool = False,
     ) -> Tuple[str, List[Any], str]:
         """Empirically inspects the current slice's rendered game state, scene tree, UI/HUD, and scripts
         so the Council can reflect on what is actually on screen before strategizing the next slice."""
@@ -6335,6 +6553,7 @@ class CreativeWritersRoom:
         if blind_rep_file.is_file():
             try:
                 b_data = json.loads(blind_rep_file.read_text(encoding="utf-8"))
+                b_sid = str(b_data.get("session_id") or "")
                 b_rep = b_data.get("session_report") or {}
                 b_carry = b_data.get("next_slice_carryover_notes") or []
                 b_wishes = b_data.get("wishes") or []
@@ -6347,25 +6566,36 @@ class CreativeWritersRoom:
                     for w in b_wishes
                 ]
                 carry_lines = [f"  - {n}" for n in b_carry]
-                blind_report_block = (
-                    f"=== BLIND PLAYTESTER EXPERIENCE REPORT & CARRYOVER FROM `{prev_id}` ===\n"
-                    f"Overall Fun Rating: {b_rep.get('overall_fun_rating', '?')}/10\n"
-                    f"Overall Experience: {b_rep.get('overall_experience_summary', '')}\n"
-                    f"Graphics & Visuals: {b_rep.get('graphics_and_visuals', '')}\n"
-                    + (f"Visual & UI Defects Observed: {json.dumps(b_vis_defects)}\n" if b_vis_defects else "")
-                    + f"Gameplay & Feel: {b_rep.get('gameplay_and_feel', '')}\n"
-                    f"Sound & Audio: {b_rep.get('sound_and_audio', '')}\n"
-                    f"Intuitiveness & Onboarding: {b_rep.get('intuitiveness_and_onboarding', '')}\n"
-                    f"Goals & Pacing: {b_rep.get('goals_pacing_and_accomplishment', '')}\n"
-                    f"World & Atmosphere: {b_rep.get('world_and_atmosphere', '')}\n"
-                    + (f"Key Pain Points: {json.dumps(b_pain_pts)}\n" if b_pain_pts else "")
-                    + (f"Bugs & Glitches Observed: {json.dumps(b_bugs_obs)}\n" if b_bugs_obs else "")
-                    + (f"Unanswered Player Questions: {json.dumps(b_unans_qs)}\n" if b_unans_qs else "")
-                    + f"Council Synthesis: {b_data.get('player_experience_synthesis', '')}\n"
-                    + ("Carryover Takeaways for Next Slice:\n" + "\n".join(carry_lines) + "\n" if carry_lines else "")
-                    + ("Player Wishes Recorded:\n" + "\n".join(wish_lines) + "\n" if wish_lines else "")
-                    + "\n"
-                )
+                if b_sid and b_sid in (dispatched_playtest_session_ids or set()):
+                    blind_report_block = ""
+                elif has_extra_playtest_dossier:
+                    blind_report_block = (
+                        f"=== PRIOR AUTOMATED BLIND PLAYTEST SUMMARY FROM `{prev_id}` (full newer playtest dossier attached above) ===\n"
+                        f"Overall Fun Rating: {b_rep.get('overall_fun_rating', '?')}/10\n"
+                        f"Council Synthesis: {b_data.get('player_experience_synthesis', '')}\n"
+                        + ("Carryover Takeaways for Next Slice:\n" + "\n".join(carry_lines) + "\n" if carry_lines else "")
+                        + "\n"
+                    )
+                else:
+                    blind_report_block = (
+                        f"=== BLIND PLAYTESTER EXPERIENCE REPORT & CARRYOVER FROM `{prev_id}` ===\n"
+                        f"Overall Fun Rating: {b_rep.get('overall_fun_rating', '?')}/10\n"
+                        f"Overall Experience: {b_rep.get('overall_experience_summary', '')}\n"
+                        f"Graphics & Visuals: {b_rep.get('graphics_and_visuals', '')}\n"
+                        + (f"Visual & UI Defects Observed: {json.dumps(b_vis_defects)}\n" if b_vis_defects else "")
+                        + f"Gameplay & Feel: {b_rep.get('gameplay_and_feel', '')}\n"
+                        f"Sound & Audio: {b_rep.get('sound_and_audio', '')}\n"
+                        f"Intuitiveness & Onboarding: {b_rep.get('intuitiveness_and_onboarding', '')}\n"
+                        f"Goals & Pacing: {b_rep.get('goals_pacing_and_accomplishment', '')}\n"
+                        f"World & Atmosphere: {b_rep.get('world_and_atmosphere', '')}\n"
+                        + (f"Key Pain Points: {json.dumps(b_pain_pts)}\n" if b_pain_pts else "")
+                        + (f"Bugs & Glitches Observed: {json.dumps(b_bugs_obs)}\n" if b_bugs_obs else "")
+                        + (f"Unanswered Player Questions: {json.dumps(b_unans_qs)}\n" if b_unans_qs else "")
+                        + f"Council Synthesis: {b_data.get('player_experience_synthesis', '')}\n"
+                        + ("Carryover Takeaways for Next Slice:\n" + "\n".join(carry_lines) + "\n" if carry_lines else "")
+                        + ("Player Wishes Recorded:\n" + "\n".join(wish_lines) + "\n" if wish_lines else "")
+                        + "\n"
+                    )
             except Exception as br_exc:
                 logger.debug("Could not read blind playtest report for %s: %s", prev_id, br_exc)
 
@@ -6567,6 +6797,8 @@ class CreativeWritersRoom:
         slice_directive: Optional[str] = None,
         extra_playtest_dossier: str = "",
         extra_multimodal_parts: Optional[List[Any]] = None,
+        *,
+        consumed_playtest_session_ids: Optional[Set[str]] = None,
     ) -> Optional[NextSliceStrategyPlan]:
         """Convenes the Council's Slice State Reflection Roundtable to critique the empirical state of the current
         slice from first principles of game design, then has the Creative Director synthesize a master `NextSliceStrategyPlan`
@@ -6584,10 +6816,13 @@ class CreativeWritersRoom:
             active_agents=["QATestEngineer", "CreativeDirector", "UXExperienceDesigner", "GameplayDesigner", "LevelAndProgressionDesigner", "VisualArtDirector", "GameplaySystemsEngineer"],
             phase="slice_reflection",
         )
+        has_extra_dossier = bool(extra_playtest_dossier and extra_playtest_dossier.strip())
         empirical_dossier, reflection_parts, rel_proof_path = self._capture_current_slice_reflection_dossier(
             game_bible=game_bible,
             prev_slice=prev_slice,
             candidate_dir=candidate_dir,
+            dispatched_playtest_session_ids=consumed_playtest_session_ids,
+            has_extra_playtest_dossier=has_extra_dossier,
         )
         if extra_playtest_dossier and extra_playtest_dossier.strip():
             empirical_dossier = f"{extra_playtest_dossier.strip()}\n\n{empirical_dossier}"
@@ -6649,10 +6884,19 @@ class CreativeWritersRoom:
             phase="slice_reflection",
         )
 
-        bible_snapshot = self._format_bible_snapshot(game_bible)
+        bible_snapshot = self._format_bible_snapshot(
+            game_bible,
+            omit_playtest_session_ids=consumed_playtest_session_ids,
+        )
+        eff_slice_directive = (slice_directive or "").strip()
+        if eff_slice_directive and (has_extra_dossier or consumed_playtest_session_ids):
+            eff_slice_directive = self._compact_playtest_dispatch_text(
+                eff_slice_directive,
+                note_suffix="full structured playtest report & screenshots attached in dossier below",
+            )
         directive_block = (
-            f"\nEXECUTIVE PRODUCER / DIRECTOR SLICE DIRECTIVE:\n{slice_directive.strip()}\n"
-            if slice_directive and slice_directive.strip()
+            f"\nEXECUTIVE PRODUCER / DIRECTOR SLICE DIRECTIVE:\n{eff_slice_directive}\n"
+            if eff_slice_directive
             else ""
         )
         first_principles_framework = (
@@ -6665,147 +6909,152 @@ class CreativeWritersRoom:
             "4. GOALS & SENSE OF ACCOMPLISHMENT: Are short-, mid-, and long-term goals clear and motivating for this specific player (`SteamPlayerDNA`), and does progress visibly and audibly transform the world?"
         )
 
+        dna_header = self._dna_header_if_absent(dna_summary, bible_snapshot)
+        reflection_shared_prefix = (
+            f"{dna_header}"
+            f"{directive_block}\n"
+            f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n\n"
+            f"{bible_snapshot}\n\n"
+            f"{empirical_dossier}\n\n"
+            f"{first_principles_framework}\n\n"
+        )
+
         eff_refl_dir = self._resolve_memory_dir(candidate_dir)
         reflection_turns_log: List[str] = []
-        for r_role in reflection_roles:
-            spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == r_role), None)
-            disp_name = spec["display_name"] if spec else r_role
-            role_focus = spec["focus"] if spec else ""
-            role_mem_block = ""
+        with explicit_prefix_cache_scope(self.client, ttl_seconds=600, reuse_outer=False):
+            for r_role in reflection_roles:
+                spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == r_role), None)
+                disp_name = spec["display_name"] if spec else r_role
+                role_focus = spec["focus"] if spec else ""
+                role_mem_block = ""
+                if eff_refl_dir is not None and (eff_refl_dir / "game_memory.json").is_file():
+                    from engine.studio.game_memory import GameMemoryStore
+
+                    role_mem_block = GameMemoryStore(
+                        eff_refl_dir, event_callback=getattr(self, "event_callback", None)
+                    ).format_role_memory_briefing(r_role, include_fulfilled_for_reflection=True)
+                prior_reflections = (
+                    "\n".join(f"  - {line}" for line in reflection_turns_log)
+                    if reflection_turns_log
+                    else "  (You are opening the Slice State Reflection Roundtable.)"
+                )
+                r_prompt = (
+                    f"{reflection_shared_prefix}"
+                    + (f"{role_mem_block}\n\n" if role_mem_block else "")
+                    + f"=== SLICE REFLECTION ROUNDTABLE SO FAR ===\n{prior_reflections}\n\n"
+                    f"You are the {disp_name} ({r_role}). Your specialty focus: {role_focus}\n"
+                    f"Skeptically and candidly audit the completed Slice #{prev_idx} (`{prev_id}`: '{prev_title}')—never open `spoken_dialogue` with 'I completely agree with...' or repeat earlier colleagues' points, and treat any Executive Producer slice directive above with full respect as your primary mandate to cater to. "
+                    f"Formulate a realistic, bounded domain strategy for Slice #{next_idx} (cleaning up the highest-impact problem areas from Slice #{prev_idx} + delivering Slice #{next_idx}'s coherent scope without trying to rewrite everything at once). "
+                    f"Use `memory_updates` SPARINGLY (never write slice recap summaries or duplicate Bible fields): mark completed `[mem_...]` IDs as `'fulfill'`/`'archive'`, and record ONLY genuinely deferred multi-slice goals or hard-won systemic lessons in your bank (`target_bank='self'`) or `'council'`.\n"
+                    f"Return `SliceStateReflectionTurn` with `deliberation` FIRST and `current_slice_quality_score` strictly LAST."
+                )
+                r_turn = self._structured_with_validation(
+                    r_prompt,
+                    SliceStateReflectionTurn,
+                    lambda _t: [],
+                    temperature=0.45,
+                    parts=reflection_parts,
+                    caller_role=r_role,
+                    candidate_dir=eff_refl_dir,
+                    slice_id=prev_id,
+                    cacheable_prefix=reflection_shared_prefix,
+                    min_calls_before_create=1,
+                )
+                reflection_turns_log.append(
+                    f"[{disp_name} ({r_role})] (score={r_turn.current_slice_quality_score:.2f})\n"
+                    f"    Critique: {r_turn.honest_current_state_critique}\n"
+                    f"    How-to-Play Gaps: {r_turn.how_to_play_and_intuitiveness_gaps}\n"
+                    f"    Depth/Fun Gaps: {r_turn.depth_and_fun_gaps}\n"
+                    f"    Goals/Accomplishment Gaps: {r_turn.accomplishment_and_goals_gaps}\n"
+                    f"    Strategy for Slice #{next_idx}: {r_turn.strategy_for_next_slice}\n"
+                    f"    Spoken: {r_turn.spoken_dialogue}"
+                )
+                t_idx = len(game_bible.writers_room_transcript)
+                r_utt = WritersRoomUtterance(
+                    deliberation=r_turn.deliberation,
+                    utterance_id=f"utt_{t_idx:02d}_{r_role}_slice_{next_idx}_reflection",
+                    turn_index=t_idx,
+                    speaker_role=r_role,
+                    speaker_display_name=disp_name,
+                    spoken_dialogue=r_turn.spoken_dialogue,
+                    addressed_to=r_turn.addressed_to or ["CreativeDirector", "GameplayDesigner", "UXExperienceDesigner"],
+                    bible_updates_summary=[
+                        f"slice_reflection:{r_role}:score_{r_turn.current_slice_quality_score:.2f}"
+                    ],
+                )
+                game_bible.writers_room_transcript.append(r_utt)
+                self._persist_bible(game_bible, candidate_dir=candidate_dir)
+                self._emit_event(
+                    "writers_room_utterance",
+                    {
+                        "deliberation": r_utt.deliberation,
+                        "utterance_id": r_utt.utterance_id,
+                        "turn_index": r_utt.turn_index,
+                        "speaker_role": r_utt.speaker_role,
+                        "speaker_display_name": r_utt.speaker_display_name,
+                        "spoken_dialogue": r_utt.spoken_dialogue,
+                        "addressed_to": r_utt.addressed_to,
+                        "bible_updates_summary": r_utt.bible_updates_summary,
+                    },
+                )
+
+            self._emit_activity(
+                agent_role="CreativeDirector",
+                status_text=f"Creative Director is synthesizing the master NextSliceStrategyPlan for Slice #{next_idx}...",
+                active_agents=["CreativeDirector"],
+                phase="slice_reflection",
+            )
+            director_mem_block = ""
             if eff_refl_dir is not None and (eff_refl_dir / "game_memory.json").is_file():
                 from engine.studio.game_memory import GameMemoryStore
 
-                role_mem_block = GameMemoryStore(
+                director_mem_block = GameMemoryStore(
                     eff_refl_dir, event_callback=getattr(self, "event_callback", None)
-                ).format_role_memory_briefing(r_role, include_fulfilled_for_reflection=True)
-            prior_reflections = (
-                "\n".join(f"  - {line}" for line in reflection_turns_log)
-                if reflection_turns_log
-                else "  (You are opening the Slice State Reflection Roundtable.)"
+                ).format_role_memory_briefing("CreativeDirector", include_fulfilled_for_reflection=True, max_entries=18)
+
+            director_prompt = (
+                f"{reflection_shared_prefix}"
+                + (f"{director_mem_block}\n\n" if director_mem_block else "")
+                + f"=== COUNCIL SLICE #{prev_idx} REFLECTION ROUNDTABLE ===\n"
+                + "\n".join(reflection_turns_log)
+                + f"\n\nYou are the Creative Director synthesizing the Council's candid reflection on Slice #{prev_idx} (`{prev_id}`) into an actionable, bounded Master Strategy (`NextSliceStrategyPlan`) for Slice #{next_idx}.\n"
+                f"REQUIREMENTS FOR `NextSliceStrategyPlan`:\n"
+                f"1. Diagnose the completed slice honestly and unsentimentally in `current_slice_honest_diagnosis` (zero self-congratulation; zero 'I completely agree with everyone' in `spoken_dialogue`), while catering with full respect and fidelity to any Executive Producer slice directive.\n"
+                f"2. Keep Slice #{next_idx} realistically scoped—clean up key problem areas carried over from Slice #{prev_idx} and deliver Slice #{next_idx}'s core expansion cleanly rather than trying to change everything in one go—across all five pillars (tailored to `{game_bible.game_title}` and the Target Player DNA):\n"
+                f"   - `cohesion_and_world_integration_strategy`: How Slice #{next_idx} unifies visual framing, world space, and HUD instruments so the screen is an unobstructed, living game world (and eliminates any giant center-screen static panels or leaked debug/harness overlays).\n"
+                f"   - `how_to_play_and_onboarding_strategy`: How Slice #{next_idx} teaches the player how to play intuitively in the first 60 seconds with diegetic control prompts, clear cause-and-effect, and immediate guidance.\n"
+                f"   - `depth_and_interesting_decisions_strategy`: How Slice #{next_idx} deepens gameplay with meaningful decisions, trade-offs, hazards/events, and systemic depth tailored to this player.\n"
+                f"   - `short_term_and_long_term_goals_strategy`: How Slice #{next_idx} makes short-term (15–60s), mid-term (3–5m), and long-term (session) goals visibly tracked and causally connected on screen.\n"
+                f"   - `sense_of_accomplishment_and_reward_strategy`: How Slice #{next_idx} rewards goal completion with unmistakable visual/audio payoff, world progression, and capability/milestone unlocks.\n"
+                f"3. Define `next_slice_spec` (`GameSliceSpec` with `slice_index={next_idx}`, `status='active'`, and a specific `slice_id` like `slice_{next_idx}_...`) and provide updated Bible sections (`updated_core_loop`, `updated_onboarding_plan`, `updated_goal_hierarchy`, `updated_engagement_plan`, `updated_diegetic_ui_philosophy`) whenever they should be strengthened to realize this strategy.\n"
+                f"4. Optionally seed initial high-level `backlog_additions` for Slice #{next_idx} (buildable kinds: {self._supported_kinds() or 'all'}).\n"
+                f"5. CURATE COUNCIL LONG-TERM MEMORY SPARINGLY (`memory_updates`): Review existing `[mem_...]` entries above, mark delivered/replaced goals as `operation='fulfill'`/`'supersede'`/`'archive'`, and record ONLY genuinely deferred future-slice strategic goals, cross-slice architectural invariants, or studio-wide lessons in `target_bank='council'` (never duplicate `next_slice_spec` or Bible updates).\n"
+                f"Return `NextSliceStrategyPlan` with `deliberation` FIRST."
             )
-            r_prompt = (
-                f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n"
-                f"{directive_block}\n"
-                f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n\n"
-                f"{bible_snapshot}\n\n"
-                f"{empirical_dossier}\n\n"
-                + (f"{role_mem_block}\n" if role_mem_block else "")
-                + f"{first_principles_framework}\n\n"
-                f"=== SLICE REFLECTION ROUNDTABLE SO FAR ===\n{prior_reflections}\n\n"
-                f"You are the {disp_name} ({r_role}). Your specialty focus: {role_focus}\n"
-                f"Skeptically and candidly audit the completed Slice #{prev_idx} (`{prev_id}`: '{prev_title}')—never open `spoken_dialogue` with 'I completely agree with...' or repeat earlier colleagues' points, and treat any Executive Producer slice directive above with full respect as your primary mandate to cater to. "
-                f"Formulate a realistic, bounded domain strategy for Slice #{next_idx} (cleaning up the highest-impact problem areas from Slice #{prev_idx} + delivering Slice #{next_idx}'s coherent scope without trying to rewrite everything at once). "
-                f"Use `memory_updates` SPARINGLY (never write slice recap summaries or duplicate Bible fields): mark completed `[mem_...]` IDs as `'fulfill'`/`'archive'`, and record ONLY genuinely deferred multi-slice goals or hard-won systemic lessons in your bank (`target_bank='self'`) or `'council'`.\n"
-                f"Return `SliceStateReflectionTurn` with `deliberation` FIRST and `current_slice_quality_score` strictly LAST."
-            )
-            r_turn = self._structured_with_validation(
-                r_prompt,
-                SliceStateReflectionTurn,
-                lambda _t: [],
-                temperature=0.45,
+
+            def _validate_strategy(plan: NextSliceStrategyPlan) -> List[str]:
+                issues: List[str] = []
+                plan.next_slice_spec.slice_index = next_idx
+                plan.next_slice_spec.status = "active"
+                if not (plan.next_slice_spec.slice_id or "").strip():
+                    plan.next_slice_spec.slice_id = f"slice_{next_idx}_iterative_expansion"
+                if plan.backlog_additions and self.board is not None:
+                    issues.extend(self.board.validate_proposals(plan.backlog_additions))
+                    issues.extend(self._unsupported_kind_issues(plan.backlog_additions))
+                return issues
+
+            strategy_plan = self._structured_with_validation(
+                director_prompt,
+                NextSliceStrategyPlan,
+                _validate_strategy,
+                temperature=0.4,
                 parts=reflection_parts,
-                caller_role=r_role,
+                caller_role="CreativeDirector",
                 candidate_dir=eff_refl_dir,
                 slice_id=prev_id,
+                cacheable_prefix=reflection_shared_prefix,
+                min_calls_before_create=1,
             )
-            reflection_turns_log.append(
-                f"[{disp_name} ({r_role})] (score={r_turn.current_slice_quality_score:.2f})\n"
-                f"    Critique: {r_turn.honest_current_state_critique}\n"
-                f"    How-to-Play Gaps: {r_turn.how_to_play_and_intuitiveness_gaps}\n"
-                f"    Depth/Fun Gaps: {r_turn.depth_and_fun_gaps}\n"
-                f"    Goals/Accomplishment Gaps: {r_turn.accomplishment_and_goals_gaps}\n"
-                f"    Strategy for Slice #{next_idx}: {r_turn.strategy_for_next_slice}\n"
-                f"    Spoken: {r_turn.spoken_dialogue}"
-            )
-            t_idx = len(game_bible.writers_room_transcript)
-            r_utt = WritersRoomUtterance(
-                deliberation=r_turn.deliberation,
-                utterance_id=f"utt_{t_idx:02d}_{r_role}_slice_{next_idx}_reflection",
-                turn_index=t_idx,
-                speaker_role=r_role,
-                speaker_display_name=disp_name,
-                spoken_dialogue=r_turn.spoken_dialogue,
-                addressed_to=r_turn.addressed_to or ["CreativeDirector", "GameplayDesigner", "UXExperienceDesigner"],
-                bible_updates_summary=[
-                    f"slice_reflection:{r_role}:score_{r_turn.current_slice_quality_score:.2f}"
-                ],
-            )
-            game_bible.writers_room_transcript.append(r_utt)
-            self._persist_bible(game_bible, candidate_dir=candidate_dir)
-            self._emit_event(
-                "writers_room_utterance",
-                {
-                    "deliberation": r_utt.deliberation,
-                    "utterance_id": r_utt.utterance_id,
-                    "turn_index": r_utt.turn_index,
-                    "speaker_role": r_utt.speaker_role,
-                    "speaker_display_name": r_utt.speaker_display_name,
-                    "spoken_dialogue": r_utt.spoken_dialogue,
-                    "addressed_to": r_utt.addressed_to,
-                    "bible_updates_summary": r_utt.bible_updates_summary,
-                },
-            )
-
-        self._emit_activity(
-            agent_role="CreativeDirector",
-            status_text=f"Creative Director is synthesizing the master NextSliceStrategyPlan for Slice #{next_idx}...",
-            active_agents=["CreativeDirector"],
-            phase="slice_reflection",
-        )
-        director_mem_block = ""
-        if eff_refl_dir is not None and (eff_refl_dir / "game_memory.json").is_file():
-            from engine.studio.game_memory import GameMemoryStore
-
-            director_mem_block = GameMemoryStore(
-                eff_refl_dir, event_callback=getattr(self, "event_callback", None)
-            ).format_role_memory_briefing("CreativeDirector", include_fulfilled_for_reflection=True, max_entries=18)
-
-        director_prompt = (
-            f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n"
-            f"{directive_block}\n"
-            f"{bible_snapshot}\n\n"
-            f"{empirical_dossier}\n\n"
-            + (f"{director_mem_block}\n" if director_mem_block else "")
-            + f"{first_principles_framework}\n\n"
-            f"=== COUNCIL SLICE #{prev_idx} REFLECTION ROUNDTABLE ===\n"
-            + "\n".join(reflection_turns_log)
-            + f"\n\nYou are the Creative Director synthesizing the Council's candid reflection on Slice #{prev_idx} (`{prev_id}`) into an actionable, bounded Master Strategy (`NextSliceStrategyPlan`) for Slice #{next_idx}.\n"
-            f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n\n"
-            f"REQUIREMENTS FOR `NextSliceStrategyPlan`:\n"
-            f"1. Diagnose the completed slice honestly and unsentimentally in `current_slice_honest_diagnosis` (zero self-congratulation; zero 'I completely agree with everyone' in `spoken_dialogue`), while catering with full respect and fidelity to any Executive Producer slice directive.\n"
-            f"2. Keep Slice #{next_idx} realistically scoped—clean up key problem areas carried over from Slice #{prev_idx} and deliver Slice #{next_idx}'s core expansion cleanly rather than trying to change everything in one go—across all five pillars (tailored to `{game_bible.game_title}` and the Target Player DNA):\n"
-            f"   - `cohesion_and_world_integration_strategy`: How Slice #{next_idx} unifies visual framing, world space, and HUD instruments so the screen is an unobstructed, living game world (and eliminates any giant center-screen static panels or leaked debug/harness overlays).\n"
-            f"   - `how_to_play_and_onboarding_strategy`: How Slice #{next_idx} teaches the player how to play intuitively in the first 60 seconds with diegetic control prompts, clear cause-and-effect, and immediate guidance.\n"
-            f"   - `depth_and_interesting_decisions_strategy`: How Slice #{next_idx} deepens gameplay with meaningful decisions, trade-offs, hazards/events, and systemic depth tailored to this player.\n"
-            f"   - `short_term_and_long_term_goals_strategy`: How Slice #{next_idx} makes short-term (15–60s), mid-term (3–5m), and long-term (session) goals visibly tracked and causally connected on screen.\n"
-            f"   - `sense_of_accomplishment_and_reward_strategy`: How Slice #{next_idx} rewards goal completion with unmistakable visual/audio payoff, world progression, and capability/milestone unlocks.\n"
-            f"3. Define `next_slice_spec` (`GameSliceSpec` with `slice_index={next_idx}`, `status='active'`, and a specific `slice_id` like `slice_{next_idx}_...`) and provide updated Bible sections (`updated_core_loop`, `updated_onboarding_plan`, `updated_goal_hierarchy`, `updated_engagement_plan`, `updated_diegetic_ui_philosophy`) whenever they should be strengthened to realize this strategy.\n"
-            f"4. Optionally seed initial high-level `backlog_additions` for Slice #{next_idx} (buildable kinds: {self._supported_kinds() or 'all'}).\n"
-            f"5. CURATE COUNCIL LONG-TERM MEMORY SPARINGLY (`memory_updates`): Review existing `[mem_...]` entries above, mark delivered/replaced goals as `operation='fulfill'`/`'supersede'`/`'archive'`, and record ONLY genuinely deferred future-slice strategic goals, cross-slice architectural invariants, or studio-wide lessons in `target_bank='council'` (never duplicate `next_slice_spec` or Bible updates).\n"
-            f"Return `NextSliceStrategyPlan` with `deliberation` FIRST."
-        )
-
-        def _validate_strategy(plan: NextSliceStrategyPlan) -> List[str]:
-            issues: List[str] = []
-            plan.next_slice_spec.slice_index = next_idx
-            plan.next_slice_spec.status = "active"
-            if not (plan.next_slice_spec.slice_id or "").strip():
-                plan.next_slice_spec.slice_id = f"slice_{next_idx}_iterative_expansion"
-            if plan.backlog_additions and self.board is not None:
-                issues.extend(self.board.validate_proposals(plan.backlog_additions))
-                issues.extend(self._unsupported_kind_issues(plan.backlog_additions))
-            return issues
-
-        strategy_plan = self._structured_with_validation(
-            director_prompt,
-            NextSliceStrategyPlan,
-            _validate_strategy,
-            temperature=0.4,
-            parts=reflection_parts,
-            caller_role="CreativeDirector",
-            candidate_dir=eff_refl_dir,
-            slice_id=prev_id,
-        )
 
         # Apply NextSliceStrategyPlan to GameBibleSpec
         updates_summary: List[str] = [f"next_slice_strategy:{strategy_plan.next_slice_spec.slice_id}"]
@@ -6974,6 +7223,7 @@ class CreativeWritersRoom:
         self._persist_bible(game_bible, candidate_dir=candidate_dir)
 
         pre_wish_block, pre_wish_parts = self._consume_pending_playtest_wishes(candidate_dir)
+        pre_pt_sids = set(getattr(self, "_last_consumed_playtest_session_ids", None) or ())
 
         strategy_plan = self._run_slice_reflection_and_strategy(
             game_bible=game_bible,
@@ -6984,16 +7234,28 @@ class CreativeWritersRoom:
             slice_directive=slice_directive,
             extra_playtest_dossier=pre_wish_block,
             extra_multimodal_parts=pre_wish_parts or None,
+            consumed_playtest_session_ids=pre_pt_sids,
         )
 
         steered_post_reflection = self._consume_pending_steering(game_bible, candidate_dir=candidate_dir)
         post_wish_block, post_wish_parts = self._consume_pending_playtest_wishes(candidate_dir)
+        post_pt_sids = set(getattr(self, "_last_consumed_playtest_session_ids", None) or ())
+        exp_consumed_pt_sids = pre_pt_sids | post_pt_sids
         exp_wish_block = "\n\n".join(b for b in (pre_wish_block, post_wish_block) if b)
         exp_wish_parts = list(pre_wish_parts) + list(post_wish_parts)
-        combined_slice_directives = [
+        raw_slice_directives = [
             s.strip()
             for s in ([slice_directive] if slice_directive and slice_directive.strip() else []) + list(steered_post_reflection)
             if s and s.strip()
+        ]
+        combined_slice_directives = [
+            self._compact_playtest_dispatch_text(
+                s,
+                note_suffix="full structured playtest report & screenshots attached in dossier",
+            )
+            if (exp_wish_block or exp_consumed_pt_sids)
+            else s
+            for s in raw_slice_directives
         ]
         directive_note = (
             f" User/Director expansion directive (HONOR AT FULL ARCHITECTURAL SCOPE — ZERO SILENT DOWNGRADING): {' | '.join(combined_slice_directives)}"
@@ -7043,58 +7305,91 @@ class CreativeWritersRoom:
             expansion_roles.extend(["VisualArtDirector", "UXExperienceDesigner"])
         expansion_roles.append("GameplaySystemsEngineer")
 
-        for idx_r, role_name in enumerate(expansion_roles):
-            steered_mid_expansion = self._consume_pending_steering(game_bible, candidate_dir=candidate_dir)
-            if steered_mid_expansion:
-                self._execute_steering_pivot_turns(game_bible, dna_summary, candidate_dir, steered_mid_expansion)
-                combined_slice_directives.extend(steered_mid_expansion)
-                directive_note = (
-                    f" User/Director expansion directive (HONOR AT FULL ARCHITECTURAL SCOPE — ZERO SILENT DOWNGRADING): {' | '.join(combined_slice_directives)}"
+        exp_base_turn_idx = len(game_bible.writers_room_transcript)
+        exp_base_bible_snapshot = self._format_bible_snapshot(
+            game_bible,
+            omit_playtest_session_ids=exp_consumed_pt_sids,
+        )
+        expansion_shared_prefix = self._build_specialist_shared_prefix(
+            dna_summary,
+            exp_base_bible_snapshot,
+            strategy_context_block,
+        )
+        expansion_min_calls = 1 if len(expansion_roles) >= 2 else 2
+
+        with explicit_prefix_cache_scope(self.client, ttl_seconds=600, reuse_outer=False):
+            for idx_r, role_name in enumerate(expansion_roles):
+                steered_mid_expansion = self._consume_pending_steering(game_bible, candidate_dir=candidate_dir)
+                if steered_mid_expansion:
+                    self._execute_steering_pivot_turns(game_bible, dna_summary, candidate_dir, steered_mid_expansion)
+                    combined_slice_directives.extend(steered_mid_expansion)
+                    directive_note = (
+                        f" User/Director expansion directive (HONOR AT FULL ARCHITECTURAL SCOPE — ZERO SILENT DOWNGRADING): {' | '.join(combined_slice_directives)}"
+                    )
+                    exp_base_turn_idx = len(game_bible.writers_room_transcript)
+                    exp_base_bible_snapshot = self._format_bible_snapshot(
+                        game_bible,
+                        omit_playtest_session_ids=exp_consumed_pt_sids,
+                    )
+                    expansion_shared_prefix = self._build_specialist_shared_prefix(
+                        dna_summary,
+                        exp_base_bible_snapshot,
+                        strategy_context_block,
+                    )
+                spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == role_name), None)
+                if spec is None:
+                    continue
+                active_slice_now = game_bible.get_active_slice()
+                active_slice_id_now = active_slice_now.slice_id if active_slice_now is not None else f"slice_{next_idx}"
+                has_unstarted_for_slice = bool(
+                    self.board is not None
+                    and any(
+                        i.state in ("ready", "blocked")
+                        for i in self.board.items()
+                    )
                 )
-            spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == role_name), None)
-            if spec is None:
-                continue
-            active_slice_now = game_bible.get_active_slice()
-            active_slice_id_now = active_slice_now.slice_id if active_slice_now is not None else f"slice_{next_idx}"
-            has_unstarted_for_slice = bool(
-                self.board is not None
-                and any(
-                    i.state in ("ready", "blocked")
-                    for i in self.board.items()
+                must_seed_on_last = (idx_r == len(expansion_roles) - 1) and not has_unstarted_for_slice
+                check = WritersRoomListenCheck(
+                    deliberation=(
+                        f"Advancing to iterative Slice #{next_idx} (`{active_slice_id_now}`): translating the Council's "
+                        f"reflection on Slice #{max(0, next_idx - 1)} and next-slice strategy (cohesion, intuitive onboarding, "
+                        f"mechanical depth, short/long-term goals, and sense of accomplishment) into concrete Bible updates and "
+                        f"ProductionBoard tasks for Slice #{next_idx}.{directive_note}"
+                    ),
+                    should_interject=True,
+                    urgency_score=1.0,
+                    intended_contribution_summary=(
+                        f"Strategize Slice #{next_idx} in `added_or_updated_slices` (with `slice_index={next_idx}`, `status='active'`, "
+                        f"and `expansion_from_prior_slice` explaining how it transforms Slice #{max(0, next_idx - 1)} into a more cohesive, "
+                        f"intuitive, deep, goal-driven, and rewarding game) and raise `backlog_additions` ONLY for Slice #{next_idx}.{directive_note}"
+                    ),
                 )
-            )
-            must_seed_on_last = (idx_r == len(expansion_roles) - 1) and not has_unstarted_for_slice
-            check = WritersRoomListenCheck(
-                deliberation=(
-                    f"Advancing to iterative Slice #{next_idx} (`{active_slice_id_now}`): translating the Council's "
-                    f"reflection on Slice #{max(0, next_idx - 1)} and next-slice strategy (cohesion, intuitive onboarding, "
-                    f"mechanical depth, short/long-term goals, and sense of accomplishment) into concrete Bible updates and "
-                    f"ProductionBoard tasks for Slice #{next_idx}.{directive_note}"
-                ),
-                should_interject=True,
-                urgency_score=1.0,
-                intended_contribution_summary=(
-                    f"Strategize Slice #{next_idx} in `added_or_updated_slices` (with `slice_index={next_idx}`, `status='active'`, "
-                    f"and `expansion_from_prior_slice` explaining how it transforms Slice #{max(0, next_idx - 1)} into a more cohesive, "
-                    f"intuitive, deep, goal-driven, and rewarding game) and raise `backlog_additions` ONLY for Slice #{next_idx}.{directive_note}"
-                ),
-            )
-            proposal = self._execute_specialist_turn(
-                specialist=spec,
-                listen_check=check,
-                game_bible=game_bible,
-                dna_summary=dna_summary,
-                require_backlog_addition=must_seed_on_last,
-                extra_context_block=strategy_context_block,
-                extra_multimodal_parts=exp_wish_parts or None,
-            )
-            self._apply_turn_proposal(
-                game_bible=game_bible,
-                speaker_role=role_name,
-                speaker_display_name=spec["display_name"],
-                proposal=proposal,
-                candidate_dir=candidate_dir,
-            )
+                extra_exp_kwargs: Dict[str, Any] = {}
+                if getattr(self._execute_specialist_turn, "__func__", None) is CreativeWritersRoom._execute_specialist_turn:
+                    extra_exp_kwargs = {
+                        "frozen_bible_snapshot": exp_base_bible_snapshot,
+                        "recent_turn_delta": self._format_utterance_delta(game_bible, exp_base_turn_idx),
+                        "cacheable_prefix": expansion_shared_prefix,
+                        "min_calls_before_create": expansion_min_calls,
+                        "omit_playtest_session_ids": exp_consumed_pt_sids,
+                    }
+                proposal = self._execute_specialist_turn(
+                    specialist=spec,
+                    listen_check=check,
+                    game_bible=game_bible,
+                    dna_summary=dna_summary,
+                    require_backlog_addition=must_seed_on_last,
+                    extra_context_block=strategy_context_block,
+                    extra_multimodal_parts=exp_wish_parts or None,
+                    **extra_exp_kwargs,
+                )
+                self._apply_turn_proposal(
+                    game_bible=game_bible,
+                    speaker_role=role_name,
+                    speaker_display_name=spec["display_name"],
+                    proposal=proposal,
+                    candidate_dir=candidate_dir,
+                )
 
         self._drain_backlog(game_bible, dna_summary, candidate_dir)
         game_bible.status = "locked"
