@@ -26,6 +26,7 @@ from engine.assets.palette import (
     quantize_image_to_indexed,
 )
 from engine.studio.models import (
+    DEFAULT_CONCEPT_MOCKUP_MODEL,
     DEFAULT_STUDIO_MODEL,
     AnimationStateSpec,
     AnimationValidationVerdict,
@@ -34,6 +35,7 @@ from engine.studio.models import (
     AssetRequirement,
     AssetVisualValidationVerdict,
     CharacterSheet,
+    ConceptArtShotPlan,
     GameRequirementsSpec,
     KeyframeTransformSpec,
     PartKeyframeTrackSpec,
@@ -574,9 +576,16 @@ class VisualArtSpriteDesignerAgent:
         model_name: str = "gemini-3.1-flash-lite-image",
         text_model_name: str = DEFAULT_STUDIO_MODEL,
         allow_offline_procedural: bool = True,
+        concept_mockup_model_name: Optional[str] = None,
     ):
         self.client = client
         self.model_name = model_name
+        if concept_mockup_model_name and str(concept_mockup_model_name).strip():
+            self.concept_mockup_model_name = str(concept_mockup_model_name).strip()
+        elif model_name and model_name != "gemini-3.1-flash-lite-image":
+            self.concept_mockup_model_name = model_name
+        else:
+            self.concept_mockup_model_name = DEFAULT_CONCEPT_MOCKUP_MODEL
         self.text_model_name = text_model_name
         self.allow_offline_procedural = bool(allow_offline_procedural)
         self.renderer = ProceduralSpriteRenderer()
@@ -1183,14 +1192,53 @@ class VisualArtSpriteDesignerAgent:
             quantized.save(out_p, "PNG")
         return out_p
 
+    @staticmethod
+    def _encode_explicit_reference_parts(
+        reference_images: Optional[Sequence[Union[Path, str, bytes, Image.Image]]] = None,
+    ) -> List[Any]:
+        """Encodes up to 2 explicit reference images into `google.genai.types.Part` objects for multi-image continuity."""
+        if not reference_images:
+            return []
+        parts: List[Any] = []
+        try:
+            from google.genai import types
+
+            for ref in list(reference_images)[:2]:
+                raw_bytes: Optional[bytes] = None
+                mime = "image/png"
+                if isinstance(ref, (Path, str)):
+                    p = Path(ref)
+                    if p.is_file():
+                        ext = p.suffix.lower()
+                        if ext in (".jpg", ".jpeg"):
+                            mime = "image/jpeg"
+                        elif ext == ".webp":
+                            mime = "image/webp"
+                        raw_bytes = p.read_bytes()
+                elif isinstance(ref, (bytes, bytearray)):
+                    raw_bytes = bytes(ref)
+                elif isinstance(ref, Image.Image):
+                    buf = io.BytesIO()
+                    ref.save(buf, format="PNG")
+                    raw_bytes = buf.getvalue()
+                if raw_bytes:
+                    parts.append(types.Part.from_bytes(data=raw_bytes, mime_type=mime))
+        except Exception as exc:
+            logger.debug("Explicit reference image part encoding skipped: %s", exc)
+        return parts
+
     def generate_concept_mockup(
         self,
         mockup: Union[VisualMockupArtifact, Dict[str, Any]],
         output_path: Union[Path, str],
         style_guide: str = "",
         dimensions: Tuple[int, int] = (1280, 720),
+        negative_constraints: Optional[Sequence[str]] = None,
+        reference_images: Optional[Sequence[Union[Path, str, bytes, Image.Image]]] = None,
+        shot_plan: Optional[Union[ConceptArtShotPlan, Dict[str, Any]]] = None,
+        image_size: str = "2K",
     ) -> Path:
-        """Synthesizes a 16:9 full-screen gameplay and diegetic UI visual mockup board via Gemini image model."""
+        """Synthesizes a 16:9 full-screen playable gameplay concept mockup via high-craft Gemini image model."""
         if self.client is None:
             raise StudioAgentError(
                 "VisualArtSpriteDesignerAgent requires an active google.genai Client to synthesize concept mockups (Rule 5: Zero Silent Fallbacks)"
@@ -1199,26 +1247,108 @@ class VisualArtSpriteDesignerAgent:
         out_p = Path(output_path)
         out_p.parent.mkdir(parents=True, exist_ok=True)
 
+        dict_negatives: List[str] = []
+        camera_paradigm = ""
+        palette_hex: List[str] = []
+        raw_layers: List[Any] = []
         if isinstance(mockup, dict):
-            title = mockup.get("title", "Gameplay Concept Mockup")
-            scene_desc = mockup.get("scene_description", "")
-            aspect = mockup.get("aspect_ratio", "16:9") or "16:9"
-            callouts = mockup.get("ui_callout_notes", []) or []
+            title = str(mockup.get("title") or "Gameplay Concept Mockup").strip()
+            scene_desc = str(mockup.get("scene_description") or "").strip()
+            aspect = str(mockup.get("aspect_ratio") or "16:9").strip() or "16:9"
+            callouts = [str(c).strip() for c in (mockup.get("ui_callout_notes") or []) if str(c).strip()]
+            camera_paradigm = str(mockup.get("camera_and_spatial_paradigm") or "").strip()
+            palette_hex = [str(h).strip() for h in (mockup.get("color_palette_hex") or []) if str(h).strip()]
+            raw_layers = list(mockup.get("scene_layers") or [])
+            dict_negatives = [str(n).strip() for n in (mockup.get("negative_constraints") or []) if str(n).strip()]
         else:
-            title = mockup.title
-            scene_desc = mockup.scene_description
-            aspect = mockup.aspect_ratio or "16:9"
-            callouts = mockup.ui_callout_notes or []
+            title = str(mockup.title or "Gameplay Concept Mockup").strip()
+            scene_desc = str(mockup.scene_description or "").strip()
+            aspect = str(mockup.aspect_ratio or "16:9").strip() or "16:9"
+            callouts = [str(c).strip() for c in (mockup.ui_callout_notes or []) if str(c).strip()]
+            camera_paradigm = str(getattr(mockup, "camera_and_spatial_paradigm", "") or "").strip()
+            palette_hex = [str(h).strip() for h in (getattr(mockup, "color_palette_hex", None) or []) if str(h).strip()]
+            raw_layers = list(getattr(mockup, "scene_layers", None) or [])
 
-        callout_str = "; ".join(str(c) for c in callouts) if callouts else "Clear, readable UI and visual feedback suited to the game's genre"
-        style_str = f" Art style direction: {style_guide}." if style_guide else ""
+        shot_plan_obj: Optional[ConceptArtShotPlan] = None
+        if isinstance(shot_plan, ConceptArtShotPlan):
+            shot_plan_obj = shot_plan
+        elif isinstance(shot_plan, dict) and shot_plan:
+            shot_plan_obj = ConceptArtShotPlan.model_validate(shot_plan)
 
-        prompt = (
-            f"Polished indie video game 16:9 widescreen screenshot mockup: '{title}'. "
-            f"Scene staging: {scene_desc}.{style_str} "
-            f"UI & visual feedback framing: {callout_str}. "
-            f"Rich atmospheric lighting, cohesive color palette, distinct silhouettes, expressive visual storytelling."
+        plan_negatives = list(shot_plan_obj.hard_visual_exclusions) if shot_plan_obj is not None else []
+        universal_exclusions = [
+            "rendered title text, logo typography, poster lettering, captions, or watermarks",
+            "simplified flat mobile-app badge or single-symbol emblem icon instead of multi-part game structures",
+            "miniature centered concentric bullseye or toy-diorama scale collapse",
+        ]
+        merged_negatives: List[str] = []
+        seen_neg_norm: Set[str] = set()
+        for raw_neg in [*plan_negatives, *dict_negatives, *(list(negative_constraints or [])), *universal_exclusions]:
+            clean_neg = str(raw_neg or "").strip()
+            norm_key = clean_neg.lower()
+            if clean_neg and norm_key not in seen_neg_norm:
+                seen_neg_norm.add(norm_key)
+                merged_negatives.append(clean_neg)
+
+        ref_parts = self._encode_explicit_reference_parts(reference_images)
+        ref_clause = (
+            "VISUAL CONTINUITY WITH ATTACHED REFERENCE IMAGE: Preserve the established surface craft, color script, and working visual motifs from the attached reference image while applying the updated camera, scale, and scene staging below.\n"
+            if ref_parts
+            else ""
         )
+
+        if shot_plan_obj is not None:
+            prompt = (
+                f"Authentic high-craft widescreen ({aspect}) in-engine video game gameplay viewport capture "
+                f"(pure playable frame — strictly NO title text, NO poster lettering, NO captions, NO watermarks).\n"
+                f"{ref_clause}"
+                f"RENDERING MEDIUM & SURFACE CRAFT: {shot_plan_obj.rendering_medium_and_surface_craft}\n"
+                f"LOCKED CAMERA PROJECTION & VIEWPORT SCALE: {shot_plan_obj.camera_projection_and_viewport_scale}\n"
+                f"PLAYABLE MIDGROUND COMPOSITION & RELATIVE ENTITY PROPORTIONS: {shot_plan_obj.playable_midground_composition}\n"
+                f"FOREGROUND & DEEP PARALLAX DEPTH LAYERS: {shot_plan_obj.foreground_and_parallax_depth_layers}\n"
+                f"LIGHTING & COLOR SCRIPT: {shot_plan_obj.lighting_and_color_script}\n"
+                f"IN-WORLD READABILITY & UI POLICY: {shot_plan_obj.diegetic_feedback_and_ui_policy}\n"
+                f"STRICT VISUAL EXCLUSIONS (MUST NOT APPEAR IN IMAGE): {'; '.join(merged_negatives[:14])}."
+            )
+        else:
+            layer_lines: List[str] = []
+            sorted_layers = sorted(
+                raw_layers,
+                key=lambda lyr: int(lyr.get("depth_order", 0) if isinstance(lyr, dict) else getattr(lyr, "depth_order", 0)),
+            )
+            for lyr in sorted_layers[:5]:
+                l_id = str(lyr.get("layer_id", "layer") if isinstance(lyr, dict) else getattr(lyr, "layer_id", "layer")).strip()
+                l_desc = str(
+                    lyr.get("visual_description", "") if isinstance(lyr, dict) else getattr(lyr, "visual_description", "")
+                ).strip()
+                if l_desc:
+                    layer_lines.append(f"{l_id}: {l_desc}")
+
+            callout_clause = (
+                f"IN-WORLD READABILITY & UI FRAMING: {'; '.join(callouts)}.\n"
+                if callouts
+                else (
+                    "IN-WORLD READABILITY & UI POLICY: Focus strictly on authentic in-world camera perspective, "
+                    "proportional playable entity-to-structure scale, and multi-plane depth; avoid unrequested HUD chrome, "
+                    "minimap boxes, picture-in-picture insets, floating text labels, or generic currency counters.\n"
+                )
+            )
+            cam_clause = f"LOCKED CAMERA & SPATIAL PARADIGM: {camera_paradigm}.\n" if camera_paradigm else ""
+            style_clause = f"RENDERING MEDIUM & ART DIRECTION: {style_guide}.\n" if style_guide else ""
+            palette_clause = f"COLOR PALETTE HEX ANCHORS: {', '.join(palette_hex[:10])}.\n" if palette_hex else ""
+            layers_clause = f"MULTI-PLANE DEPTH LAYERS: {' | '.join(layer_lines)}.\n" if layer_lines else ""
+            neg_clause = f"STRICT VISUAL EXCLUSIONS (MUST NOT APPEAR IN IMAGE): {'; '.join(merged_negatives[:14])}."
+
+            prompt = (
+                f"Authentic high-craft widescreen ({aspect}) in-engine video game gameplay viewport capture "
+                f"(pure playable frame — strictly NO title text, NO poster lettering, NO captions, NO watermarks).\n"
+                f"{ref_clause}"
+                f"SCENE STAGING & PLAYABLE COMPOSITION: {scene_desc}\n"
+                f"{cam_clause}{style_clause}{palette_clause}{layers_clause}{callout_clause}{neg_clause}"
+            )
+
+        target_model = getattr(self, "concept_mockup_model_name", None) or self.model_name
+        contents: Any = (ref_parts + [prompt]) if ref_parts else prompt
 
         max_retries = 3
         img_bytes = None
@@ -1226,13 +1356,17 @@ class VisualArtSpriteDesignerAgent:
         for attempt in range(1, max_retries + 1):
             try:
                 from google.genai import types
+
+                img_cfg_kwargs: Dict[str, Any] = {"aspect_ratio": aspect}
+                if image_size:
+                    img_cfg_kwargs["image_size"] = image_size
                 response = call_gemini_with_transient_retry(
                     lambda: self.client.models.generate_content(
-                        model=self.model_name,
-                        contents=prompt,
+                        model=target_model,
+                        contents=contents,
                         config=types.GenerateContentConfig(
                             response_modalities=["IMAGE"],
-                            image_config=types.ImageConfig(aspect_ratio=aspect),
+                            image_config=types.ImageConfig(**img_cfg_kwargs),
                         ),
                     ),
                     max_transient_retries=0,

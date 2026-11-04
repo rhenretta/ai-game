@@ -351,6 +351,7 @@ export function App() {
       studioApi.updateStudioSettings({
         pauseForGreenlight: Boolean(bible?.pause_for_greenlight),
         paused: pause,
+        candidateId: resolvedCartridgeId !== 'active' ? resolvedCartridgeId : undefined,
       }),
     onSuccess: () => {
       setActionError(null);
@@ -383,6 +384,8 @@ export function App() {
         await studioApi.updateStudioSettings({
           pauseForGreenlight: false,
           paused: false,
+          candidateId: resolvedCartridgeId !== 'active' ? resolvedCartridgeId : undefined,
+          autoSpawnResume: false,
           reason: `Executive Producer resumed slice build for '${resolvedCartridgeId}'.`,
         });
       }
@@ -452,20 +455,53 @@ export function App() {
     realtime.ensureHistorySeeded(resolvedCartridgeId);
   }, [shouldSeedLiveHistory, resolvedCartridgeId, realtime.ensureHistorySeeded]);
 
+  const scopedRecentEvents = useMemo(() => {
+    if (!resolvedCartridgeId || resolvedCartridgeId === 'active') {
+      return realtime.recentEvents;
+    }
+    const otherActive = bible?.process_status?.other_active_cartridge_id;
+    return realtime.recentEvents.filter((ev) => {
+      const pl = (ev.payload ?? {}) as Record<string, unknown>;
+      const rawTag =
+        (typeof pl.cartridge_id === 'string' && pl.cartridge_id) ||
+        (typeof pl.candidate_id === 'string' && pl.candidate_id) ||
+        (typeof ev.build_id === 'string' && ev.build_id) ||
+        '';
+      const cleanTag = rawTag.startsWith('build_') ? rawTag.slice('build_'.length) : rawTag;
+      if (cleanTag.startsWith('candidate_')) {
+        return cleanTag === resolvedCartridgeId;
+      }
+      return !otherActive;
+    });
+  }, [realtime.recentEvents, resolvedCartridgeId, bible?.process_status?.other_active_cartridge_id]);
+
+  const scopedPlaytestSessions = useMemo(() => {
+    const allRuns = playtestListQuery.data?.sessions;
+    if (!allRuns || !resolvedCartridgeId || resolvedCartridgeId === 'active') {
+      return allRuns;
+    }
+    const activeCid = playtestListQuery.data?.active_cartridge_id ?? '';
+    return allRuns.filter(
+      (s) =>
+        s.candidate_id === resolvedCartridgeId ||
+        (resolvedCartridgeId === activeCid && s.matches_active_cartridge),
+    );
+  }, [playtestListQuery.data, resolvedCartridgeId]);
+
   const liveActivity = useMemo(
     () =>
       deriveLiveStudioActivity({
         bible,
-        recentEvents: realtime.recentEvents,
+        recentEvents: scopedRecentEvents,
         liveStepsByItem: isBuildRunning ? realtime.liveStepsByItem : EMPTY_LIVE_STEPS,
-        playtestSessions: playtestListQuery.data?.sessions,
+        playtestSessions: scopedPlaytestSessions,
       }),
     [
       bible,
-      realtime.recentEvents,
+      scopedRecentEvents,
       isBuildRunning,
       realtime.liveStepsByItem,
-      playtestListQuery.data?.sessions,
+      scopedPlaytestSessions,
     ],
   );
   const steeringBusy = steerOrGreenlightMut.isPending || genesisMut.isPending;
@@ -553,7 +589,7 @@ export function App() {
         playtestRunsCount={playtestRunsForSelected}
         pendingWishesCount={playtestListQuery.data?.pending_wishes_count ?? 0}
         wsConnected={realtime.connected}
-        recentEventCount={realtime.recentEvents.length}
+        recentEventCount={scopedRecentEvents.length}
         onActivateGame={() => activateMut.mutate()}
         activatingGame={activateMut.isPending}
         onLaunchGame={() => launchMut.mutate(undefined)}
@@ -780,7 +816,7 @@ export function App() {
         onClose={() => setLivePulseOpen(false)}
         wsConnected={realtime.connected}
         lastEventAt={realtime.lastEventAt}
-        recentEvents={realtime.recentEvents}
+        recentEvents={scopedRecentEvents}
         studioStatus={studioStatusQuery.data}
         liveActivity={liveActivity}
       />

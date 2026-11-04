@@ -44,6 +44,8 @@ export interface ProcessStatus {
   pause_reason?: string | null;
   pause_for_greenlight: boolean;
   build_actively_running: boolean;
+  active_building_cartridge_id?: string | null;
+  other_active_cartridge_id?: string | null;
   lock_held: boolean;
   active_threads: string[];
   daemon_pid?: number | null;
@@ -847,11 +849,13 @@ export interface CoProducerConceptBrief {
   elevator_pitch: string;
   core_fantasy?: string;
   core_player_verbs: string[];
+  user_confirmed_pillars?: string[];
   first_60_seconds_feel: string;
   visual_style_direction: string;
   audio_mood_direction: string;
   color_palette_hex?: string[];
   explicit_non_goals: string[];
+  open_design_questions?: string[];
   selected_mockup_paths: string[];
   selected_sketch_asset_paths: string[];
   genre_craft_foundation?: GenreCraftFoundation | null;

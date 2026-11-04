@@ -288,16 +288,120 @@ class SwarmEventBus:
                 if tid not in self._task_order:
                     self._task_order.append(tid)
 
-    def reset_for_new_genesis_build(self, build_id: str, creative_prompt: str = "") -> Dict[str, Any]:
+    @staticmethod
+    def extract_coproducer_brief_bible_fields(cart_dir: Path) -> Optional[Dict[str, Any]]:
+        """Hydrates initial GameBible-compatible metadata strictly from `<cart_dir>/co_producer_brief.json`
+        so pre-bible commissioned cartridges never fall back to another cartridge's Game Bible or generic placeholders."""
+        if (cart_dir / "co_producer.json").is_file():
+            try:
+                from engine.studio.coproducer import CoProducerThreadStore
+
+                CoProducerThreadStore(cart_dir.parent)._sync_from_disk_if_needed(cart_dir)
+            except Exception:
+                pass
+        brief_file = cart_dir / "co_producer_brief.json"
+        if not brief_file.is_file():
+            return None
+        try:
+            cp_env = json.loads(brief_file.read_text(encoding="utf-8"))
+            if not isinstance(cp_env, dict):
+                return None
+            cb = cp_env.get("concept_brief") if isinstance(cp_env.get("concept_brief"), dict) else {}
+            cp_title = str(cb.get("working_title") or "").strip() or cart_dir.name
+            cp_genre = str(cb.get("core_genre") or "").strip() or "Interactive Experience"
+            cp_pitch = str(
+                cb.get("elevator_pitch")
+                or cp_env.get("steering_or_seed_brief")
+                or ""
+            ).strip()
+            cp_ts = str(
+                cp_env.get("updated_at_utc")
+                or cp_env.get("created_at_utc")
+                or datetime.now(timezone.utc).isoformat()
+            )
+            cp_palette = [
+                str(h).strip()
+                for h in (cb.get("color_palette_hex") or [])
+                if str(h).strip()
+            ]
+            cp_mockups: List[Dict[str, Any]] = []
+            for idx_m, rel_m in enumerate(cb.get("selected_mockup_paths") or []):
+                rel_str = str(rel_m or "").strip().lstrip("/")
+                if rel_str.startswith(f"{cart_dir.name}/"):
+                    rel_str = rel_str[len(cart_dir.name) + 1:]
+                if rel_str and (cart_dir / rel_str).is_file():
+                    cp_mockups.append(
+                        {
+                            "deliberation": "Carried-over Co-Producer 16:9 concept art mockup.",
+                            "mockup_id": f"cp_mockup_{idx_m + 1}",
+                            "title": f"{cp_title} — Concept Mockup",
+                            "image_path": rel_str,
+                            "scene_description": cp_pitch,
+                            "color_palette_hex": cp_palette,
+                        }
+                    )
+            merged_pillars: List[str] = []
+            seen_pillars: set[str] = set()
+            for raw_p in list(cb.get("user_confirmed_pillars") or []) + list(cb.get("core_player_verbs") or []):
+                clean_p = str(raw_p or "").strip()
+                if clean_p and clean_p.lower() not in seen_pillars:
+                    seen_pillars.add(clean_p.lower())
+                    merged_pillars.append(clean_p)
+            return {
+                "deliberation": str(
+                    cb.get("deliberation")
+                    or cp_env.get("deliberation")
+                    or f"Commissioned Co-Producer concept brief for '{cp_title}' awaiting Turn 0 Specialist Council deliberation."
+                ),
+                "bible_id": f"bible_{cart_dir.name}",
+                "cartridge_id": cart_dir.name,
+                "status": "brainstorming",
+                "game_title": cp_title,
+                "core_genre": cp_genre,
+                "elevator_pitch": cp_pitch,
+                "creative_vision_summary": cp_pitch,
+                "core_fantasy": str(cb.get("core_fantasy") or "").strip(),
+                "first_60_seconds_hook": str(cb.get("first_60_seconds_feel") or "").strip(),
+                "diegetic_ui_philosophy": "",
+                "color_palette_hex": cp_palette,
+                "genre_craft_foundation": cb.get("genre_craft_foundation")
+                if isinstance(cb.get("genre_craft_foundation"), dict)
+                else None,
+                "concept_evolution": [],
+                "concept_evolution_log": [],
+                "writers_room_transcript": [],
+                "experience_storyboard": [],
+                "visual_mockups": cp_mockups,
+                "gameplay_pillars": merged_pillars,
+                "visual_style_guide": str(cb.get("visual_style_direction") or "").strip(),
+                "audio_direction_guide": str(cb.get("audio_mood_direction") or "").strip(),
+                "world_spec": None,
+                "narrative_bible": None,
+                "updated_at_utc": cp_ts,
+            }
+        except Exception as exc:
+            logger.debug("Failed parsing co_producer_brief.json in %s: %s", cart_dir, exc)
+            return None
+
+    def reset_for_new_genesis_build(
+        self,
+        build_id: str,
+        creative_prompt: str = "",
+        *,
+        cartridge_id: Optional[str] = None,
+        candidate_dir: Optional[Path] = None,
+    ) -> Dict[str, Any]:
         """Resets in-memory task/requirement/bible state for a fresh Genesis build from scratch."""
         now_iso = datetime.now(timezone.utc).isoformat()
+        eff_cartridge_id = str(cartridge_id or (candidate_dir.name if candidate_dir is not None else "") or build_id).strip()
+        target_cand_name = eff_cartridge_id[len("build_"):] if eff_cartridge_id.startswith("build_") else eff_cartridge_id
         initial_bible: Dict[str, Any] = {
             "deliberation": (
                 f"Convening Multi-Agent Creative Writers' Room for new Genesis build '{build_id}'."
                 + (f" Creative seed: {creative_prompt}" if creative_prompt else "")
             ),
-            "bible_id": f"bible_{build_id}",
-            "cartridge_id": build_id,
+            "bible_id": f"bible_{eff_cartridge_id}",
+            "cartridge_id": eff_cartridge_id,
             "target_episode": 0,
             "status": "brainstorming",
             "game_title": "Convening Writers' Room...",
@@ -318,15 +422,30 @@ class SwarmEventBus:
             "narrative_bible": None,
             "updated_at_utc": now_iso,
         }
+        if candidate_dir is not None:
+            hydrated_cp = self.extract_coproducer_brief_bible_fields(candidate_dir)
+            if hydrated_cp:
+                initial_bible.update(hydrated_cp)
+                initial_bible["cartridge_id"] = eff_cartridge_id
+                initial_bible["updated_at_utc"] = now_iso
         with self._thread_lock:
             try:
-                from engine.studio.models import get_active_gemini_dataset_context, mark_candidate_build_aborted
-                mark_candidate_build_aborted(get_active_gemini_dataset_context().get("candidate_dir"))
+                from engine.studio.models import (
+                    clear_candidate_build_aborted,
+                    get_active_gemini_dataset_context,
+                    mark_candidate_build_aborted,
+                )
+                prev_ctx_dir = get_active_gemini_dataset_context().get("candidate_dir")
+                prev_ctx_name = Path(prev_ctx_dir).name if prev_ctx_dir else ""
+                if prev_ctx_dir and prev_ctx_name != target_cand_name:
+                    mark_candidate_build_aborted(prev_ctx_dir)
                 prev_bid = str(getattr(self, "_active_build_id", "") or "").strip()
                 if prev_bid.startswith("build_"):
                     prev_bid = prev_bid[len("build_"):]
-                if prev_bid.startswith("candidate_"):
+                if prev_bid.startswith("candidate_") and prev_bid != target_cand_name:
                     mark_candidate_build_aborted(prev_bid)
+                if target_cand_name.startswith("candidate_"):
+                    clear_candidate_build_aborted(target_cand_name)
             except Exception:
                 pass
             old_orch = getattr(self, "_active_orchestrator", None)
@@ -355,14 +474,14 @@ class SwarmEventBus:
                     db.record_studio_build(
                         build_id=str(build_id),
                         build_type="genesis",
-                        game_title="Convening Writers' Room...",
+                        game_title=str(initial_bible.get("game_title") or "Convening Writers' Room..."),
                         status="STARTED",
                         started_at_utc=now_iso,
                         deliberation=initial_bible["deliberation"],
                     )
                     db.upsert_game_bible(
                         bible_id=initial_bible["bible_id"],
-                        cartridge_id=str(build_id),
+                        cartridge_id=eff_cartridge_id,
                         status="BRAINSTORMING",
                         bible_dict=initial_bible,
                         build_id=str(build_id),
@@ -371,25 +490,57 @@ class SwarmEventBus:
                     logger.debug("reset_for_new_genesis_build DB init warning: %s", exc)
         return initial_bible
 
-    def get_game_bible(self, build_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def get_game_bible(
+        self,
+        build_id: Optional[str] = None,
+        *,
+        strict_build_match: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         """Returns the latest Living Game Bible dictionary from SQLite WAL or memory."""
+        def _matches_bid(cand_bible: Optional[Dict[str, Any]], expected_bid: Optional[str]) -> bool:
+            if not isinstance(cand_bible, dict):
+                return False
+            if not expected_bid:
+                return True
+            clean_exp = expected_bid[len("build_"):] if expected_bid.startswith("build_") else expected_bid
+            raw_cid = str(cand_bible.get("cartridge_id") or "").strip()
+            clean_cid = raw_cid[len("build_"):] if raw_cid.startswith("build_") else raw_cid
+            raw_bible_id = str(cand_bible.get("bible_id") or "").strip()
+            return bool(
+                (clean_cid and clean_cid == clean_exp)
+                or raw_bible_id in (f"bible_{expected_bid}", f"bible_{clean_exp}")
+            )
+
         with self._thread_lock:
+            explicit_bid = (build_id or "").strip() or None
+            target_bid = explicit_bid or self.get_active_build_id()
+            must_match = bool(strict_build_match or explicit_bid)
             if self._db_path and self._db_path.exists():
                 try:
                     from engine.telemetry.db import TelemetryDB
                     db = TelemetryDB(self._db_path)
-                    target_bid = build_id or self.get_active_build_id()
                     rec = db.get_latest_game_bible(build_id=target_bid)
-                    if not rec and target_bid:
-                        rec = db.get_latest_game_bible(build_id=None)
                     if isinstance(rec, dict):
-                        if isinstance(rec.get("bible"), dict):
-                            return rec["bible"]
-                        if "game_title" in rec or "bible_id" in rec:
-                            return rec
+                        unwrapped = rec["bible"] if isinstance(rec.get("bible"), dict) else rec
+                        if ("game_title" in unwrapped or "bible_id" in unwrapped) and (
+                            not must_match or _matches_bid(unwrapped, target_bid)
+                        ):
+                            return unwrapped
+                    # Before falling back to any arbitrary older DB bible, honor an in-memory bible
+                    # already initialized for `target_bid` (e.g. a newly commissioned pre-Turn-0 build).
+                    if self._game_bible is not None and _matches_bid(self._game_bible, target_bid):
+                        return self._game_bible
+                    if not must_match and self._game_bible is None:
+                        rec_any = db.get_latest_game_bible(build_id=None)
+                        if isinstance(rec_any, dict):
+                            unwrapped_any = rec_any["bible"] if isinstance(rec_any.get("bible"), dict) else rec_any
+                            if "game_title" in unwrapped_any or "bible_id" in unwrapped_any:
+                                return unwrapped_any
                 except Exception as exc:
                     logger.debug("Failed querying studio_game_bibles from DB: %s", exc)
             self._sync_from_disk()
+            if must_match and not _matches_bid(self._game_bible, target_bid):
+                return None
             return self._game_bible
 
     def _sync_from_disk(self) -> None:
@@ -438,12 +589,38 @@ class SwarmEventBus:
             ts = str(event_data.get("timestamp_utc") or datetime.now(timezone.utc).isoformat())
             event_data["event_id"] = eid
             event_data["timestamp_utc"] = ts
+
+            full_payload = event_data.get("payload", {})
+            resolved_bid = str(event_data.get("build_id") or "").strip()
+            if not resolved_bid and isinstance(full_payload, dict):
+                resolved_bid = str(full_payload.get("build_id") or "").strip()
+                if not resolved_bid:
+                    for ck in ("cartridge_id", "candidate_id", "resumed_candidate"):
+                        cv = str(full_payload.get(ck) or "").strip()
+                        if cv.startswith("candidate_"):
+                            resolved_bid = f"build_{cv}"
+                            break
+            if not resolved_bid:
+                try:
+                    from engine.studio.models import get_active_gemini_dataset_context
+
+                    ctx_cdir = get_active_gemini_dataset_context().get("candidate_dir")
+                    if ctx_cdir:
+                        ctx_name = Path(ctx_cdir).name
+                        if ctx_name.startswith("candidate_"):
+                            resolved_bid = f"build_{ctx_name}"
+                except Exception:
+                    pass
+            if not resolved_bid:
+                resolved_bid = str(self.get_active_build_id() or "").strip()
+            if resolved_bid:
+                event_data["build_id"] = resolved_bid
+
             self._index_event(event_data)
 
             etype = str(event_data.get("event_type", "EVENT"))
             agent = str(event_data.get("agent_name", "StudioSwarm"))
             delib = str(event_data.get("deliberation", ""))
-            full_payload = event_data.get("payload", {})
             feed_payload = full_payload
             event_for_feed = event_data
             if (
@@ -576,6 +753,21 @@ class SwarmEventBus:
             if (limit is not None and limit > 0)
             else (self._recent_events.maxlen or 300)
         )
+
+        def _matches_requested_build(ev: Dict[str, Any], req_bid: str) -> bool:
+            clean_req = req_bid[len("build_"):] if req_bid.startswith("build_") else req_bid
+            valid_ids = {req_bid, clean_req, f"build_{clean_req}"}
+            ev_bid = str(ev.get("build_id") or "").strip()
+            if ev_bid and ev_bid in valid_ids:
+                return True
+            pl = ev.get("payload")
+            if isinstance(pl, dict):
+                for k in ("build_id", "cartridge_id", "candidate_id"):
+                    v = str(pl.get(k) or "").strip()
+                    if v and v in valid_ids:
+                        return True
+            return False
+
         with self._thread_lock:
             if self._db_path and self._db_path.exists():
                 try:
@@ -591,11 +783,17 @@ class SwarmEventBus:
                         return db_events
                 except Exception as e:
                     logger.debug("Failed querying studio_events from DB: %s", e)
-                events = [ev for ev in self._recent_events if isinstance(ev, dict)]
+                events = [
+                    ev for ev in self._recent_events
+                    if isinstance(ev, dict) and (build_id is None or _matches_requested_build(ev, str(build_id)))
+                ]
                 return events[-effective_limit:]
 
             self._sync_from_disk()
-            events = [ev for ev in self._recent_events if isinstance(ev, dict)]
+            events = [
+                ev for ev in self._recent_events
+                if isinstance(ev, dict) and (build_id is None or _matches_requested_build(ev, str(build_id)))
+            ]
             return events[-effective_limit:]
 
     async def broadcast(self, event_data: Dict[str, Any]) -> None:
@@ -2968,24 +3166,9 @@ def create_app(
                         creative_prompt=creative_prompt,
                     )
 
-        target_bus._build_paused = False
-        if target_bus is not swarm_bus:
-            swarm_bus._build_paused = False
-        try:
-            pause_sentinel = target_cartridges / ".studio_paused.json"
-            if pause_sentinel.is_file():
-                pause_sentinel.unlink()
-        except Exception:
-            pass
-        if resume_current:
-            orch_active = getattr(target_bus, "_active_orchestrator", None)
-            if orch_active is not None and getattr(orch_active, "_board_scheduler", None) is not None:
-                try:
-                    orch_active._board_scheduler.resume()
-                except Exception:
-                    pass
-
         resumed_cand_name: Optional[str] = None
+        rehydrated_dir: Optional[Path] = None
+        preempted_other_candidate = False
         if resume_current:
             try:
                 from engine.studio.daemon import rehydrate_resumable_candidate_from_db
@@ -2997,16 +3180,79 @@ def create_app(
                 if rehydrated_dir is not None:
                     resumed_cand_name = rehydrated_dir.name
                     try:
-                        from engine.studio.models import clear_candidate_build_aborted
+                        from engine.studio.models import (
+                            clear_candidate_build_aborted,
+                            get_active_gemini_dataset_context,
+                            mark_candidate_build_aborted,
+                        )
+                        # Preempt any DIFFERENT active candidate BEFORE clearing pause flags so an old paused
+                        # worker thread cannot wake up and resume another cartridge's build.
+                        prev_ctx_dir = get_active_gemini_dataset_context().get("candidate_dir")
+                        prev_ctx_name = Path(prev_ctx_dir).name if prev_ctx_dir else ""
+                        prev_bus_bid = str(getattr(target_bus, "_active_build_id", "") or "").strip()
+                        if prev_bus_bid.startswith("build_"):
+                            prev_bus_bid = prev_bus_bid[len("build_"):]
+                        for other_cid in {prev_ctx_name, prev_bus_bid}:
+                            if other_cid and other_cid.startswith("candidate_") and other_cid != resumed_cand_name:
+                                mark_candidate_build_aborted(other_cid)
+                                preempted_other_candidate = True
+                        old_orch_running = getattr(target_bus, "_active_orchestrator", None)
+                        if (
+                            old_orch_running is not None
+                            and prev_ctx_name
+                            and prev_ctx_name != resumed_cand_name
+                            and hasattr(old_orch_running, "cancel_active_build")
+                        ):
+                            try:
+                                old_orch_running.cancel_active_build()
+                                preempted_other_candidate = True
+                            except Exception:
+                                pass
                         clear_candidate_build_aborted(rehydrated_dir)
                     except Exception:
                         pass
-                    build_id = f"build_{resumed_cand_name}"
-                    target_bus._active_build_id = build_id
+            except Exception as rehyd_pre_err:
+                logger.warning("Pre-unpause candidate resolution warning: %s", rehyd_pre_err)
+
+        target_bus._build_paused = False
+        if target_bus is not swarm_bus:
+            swarm_bus._build_paused = False
+        try:
+            pause_sentinel = target_cartridges / ".studio_paused.json"
+            if pause_sentinel.is_file():
+                pause_sentinel.unlink()
+        except Exception:
+            pass
+        if resume_current and not preempted_other_candidate:
+            orch_active = getattr(target_bus, "_active_orchestrator", None)
+            if orch_active is not None and getattr(orch_active, "_board_scheduler", None) is not None:
+                try:
+                    orch_active._board_scheduler.resume()
+                except Exception:
+                    pass
+
+        if resume_current and rehydrated_dir is not None and resumed_cand_name:
+            try:
+                build_id = f"build_{resumed_cand_name}"
+                target_bus._active_build_id = build_id
+                if target_bus is not swarm_bus:
+                    swarm_bus._active_build_id = build_id
+                gb_file = rehydrated_dir / "game_bible.json"
+                if not gb_file.is_file() and (rehydrated_dir / "co_producer_brief.json").is_file():
+                    target_bus.reset_for_new_genesis_build(
+                        build_id=build_id,
+                        creative_prompt=creative_prompt,
+                        cartridge_id=resumed_cand_name,
+                        candidate_dir=rehydrated_dir,
+                    )
                     if target_bus is not swarm_bus:
-                        swarm_bus._active_build_id = build_id
-                    gb_file = rehydrated_dir / "game_bible.json"
-                    if gb_file.is_file():
+                        swarm_bus.reset_for_new_genesis_build(
+                            build_id=build_id,
+                            creative_prompt=creative_prompt,
+                            cartridge_id=resumed_cand_name,
+                            candidate_dir=rehydrated_dir,
+                        )
+                if gb_file.is_file():
                         gb_data = json.loads(gb_file.read_text(encoding="utf-8"))
                         if creative_prompt:
                             now_iso_resume = datetime.now(timezone.utc).isoformat()
@@ -3973,26 +4219,44 @@ def create_app(
         cartridge_q: Optional[str],
         limit: int,
     ) -> Dict[str, Any]:
-        raw_recent = target_bus.get_recent_events(limit=limit, build_id=bid or cartridge_q)
-        if not raw_recent and bid is None and cartridge_q:
-            raw_recent = target_bus.get_recent_events(limit=limit, build_id=None)
+        sanitized_ev_cart: Optional[Path] = None
+        if cartridge_q and str(cartridge_q).strip() != "active":
+            sanitized_ev_cart, _ = _sanitize_cartridge_override(cartridge_q)
+        specific_cart_name = sanitized_ev_cart.name if (sanitized_ev_cart is not None and sanitized_ev_cart.name != "active") else None
+
+        if specific_cart_name and bid is None:
+            raw_recent = target_bus.get_recent_events(limit=limit, build_id=f"build_{specific_cart_name}")
+            if not raw_recent:
+                raw_recent = target_bus.get_recent_events(limit=limit, build_id=specific_cart_name)
+        else:
+            raw_recent = target_bus.get_recent_events(limit=limit, build_id=bid or (None if cartridge_q == "active" else cartridge_q))
+            if not raw_recent and bid is None and cartridge_q and not specific_cart_name:
+                raw_recent = target_bus.get_recent_events(limit=limit, build_id=None)
         recent = [
             ev for ev in raw_recent
             if isinstance(ev, dict)
             and ev.get("event_type") != "BACKGROUND_THREAD_EVENT"
             and ev.get("agent_name") != "WorkerThread"
         ]
-        cart_dir = target_active
-        has_active = cart_dir.exists() and cart_dir.is_dir()
-        if not has_active and target_db == config.DB_PATH and target_cartridges.exists():
-            candidates = sorted(
-                [d for d in target_cartridges.glob("candidate_*") if d.is_dir()],
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
+        if sanitized_ev_cart is not None:
+            cart_dir = sanitized_ev_cart
+            has_active = cart_dir.exists() and cart_dir.is_dir() and (
+                (cart_dir / "world_spec.json").is_file()
+                or (cart_dir / "mechanics.py").is_file()
+                or ((cart_dir / "project.godot").is_file() and (cart_dir / "game_bible.json").is_file())
             )
-            if candidates:
-                cart_dir = candidates[0]
-                has_active = True
+        else:
+            cart_dir = target_active
+            has_active = cart_dir.exists() and cart_dir.is_dir()
+            if not has_active and target_db == config.DB_PATH and target_cartridges.exists():
+                candidates = sorted(
+                    [d for d in target_cartridges.glob("candidate_*") if d.is_dir()],
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                if candidates:
+                    cart_dir = candidates[0]
+                    has_active = True
 
         # Check if recent events already contain specialist build deliberations
         has_build_events = any(
@@ -4275,7 +4539,7 @@ def create_app(
             "deliberation": f"Retrieved {len(combined_events)} historical studio swarm events.",
             "events": combined_events,
             "agent_lifecycle_states": lifecycle_states,
-            "process_status": _inspect_live_build_process(),
+            "process_status": _inspect_live_build_process(requested_cartridge_id=specific_cart_name),
         }
 
     async def events_history_handler(request):
@@ -4974,6 +5238,7 @@ def create_app(
         bible_data: Optional[Dict[str, Any]] = None
 
         # 1. Check explicit cartridge override first if provided
+        explicit_specific_cart = bool(sanitized_cart is not None and sanitized_cart.name != "active")
         cart_dir = sanitized_cart if sanitized_cart else target_active
         if not cart_dir.exists() and not sanitized_cart and target_cartridges.exists():
             candidates = sorted(
@@ -4990,40 +5255,65 @@ def create_app(
             except Exception:
                 bible_data = None
 
-        # 2. Check TelemetryDB or SwarmEventBus in-memory state
+        # 2. Check TelemetryDB or SwarmEventBus in-memory state (strictly scoped when a specific cartridge is requested)
         if bible_data is None:
-            bible_data = target_bus.get_game_bible(build_id=bid)
+            lookup_bid = bid or (f"build_{sanitized_cart.name}" if explicit_specific_cart and sanitized_cart else None)
+            bible_data = target_bus.get_game_bible(
+                build_id=lookup_bid,
+                strict_build_match=bool(explicit_specific_cart or bid),
+            )
             if bible_data is None and target_db and target_db.exists():
                 try:
                     tdb = TelemetryDB(target_db)
-                    rec = tdb.get_latest_game_bible(build_id=bid)
-                    if not rec and bid:
+                    rec = tdb.get_latest_game_bible(build_id=lookup_bid)
+                    if not rec and not explicit_specific_cart and not bid:
                         rec = tdb.get_latest_game_bible(build_id=None)
                     if isinstance(rec, dict):
-                        if isinstance(rec.get("bible"), dict):
-                            bible_data = rec["bible"]
-                        elif "game_title" in rec or "bible_id" in rec:
-                            bible_data = rec
+                        cand_rec = rec["bible"] if isinstance(rec.get("bible"), dict) else rec
+                        if "game_title" in cand_rec or "bible_id" in cand_rec:
+                            rec_cid = str(cand_rec.get("cartridge_id") or "").strip()
+                            if not explicit_specific_cart or rec_cid in (
+                                sanitized_cart.name,
+                                f"build_{sanitized_cart.name}",
+                            ):
+                                bible_data = cand_rec
                 except Exception as exc:
                     logger.debug("TelemetryDB game_bible lookup error: %s", exc)
+            # If Step 2 returned a pre-Turn-0 placeholder bible (e.g. "Convening Writers' Room...") while the
+            # cartridge has no persisted `game_bible.json` yet, hydrate live fields from `co_producer_brief.json`.
+            if (
+                bible_data is not None
+                and cart_dir.exists()
+                and not (cart_dir / "game_bible.json").is_file()
+                and ((cart_dir / "co_producer_brief.json").is_file() or (cart_dir / "co_producer.json").is_file())
+                and not (bible_data.get("writers_room_transcript") or [])
+            ):
+                cp_backfill = SwarmEventBus.extract_coproducer_brief_bible_fields(cart_dir)
+                if cp_backfill:
+                    merged_b = dict(bible_data)
+                    merged_b.update(cp_backfill)
+                    bible_data = merged_b
 
-        # 3. Check candidate_* and active cartridge directories for game_bible.json (newest first when not overridden)
+        # 3. Check candidate_* and active cartridge directories for game_bible.json (ONLY when not overridden to a specific cartridge)
         if bible_data is None:
             search_dirs: List[Path] = []
-            if sanitized_cart:
+            if explicit_specific_cart and sanitized_cart is not None:
                 search_dirs.append(sanitized_cart)
-            if target_cartridges.exists():
-                try:
-                    search_dirs.extend(
-                        sorted(
-                            [d for d in target_cartridges.glob("candidate_*") if d.is_dir()],
-                            key=lambda p: p.stat().st_mtime,
-                            reverse=True,
+            else:
+                if sanitized_cart:
+                    search_dirs.append(sanitized_cart)
+                if target_cartridges.exists():
+                    try:
+                        search_dirs.extend(
+                            sorted(
+                                [d for d in target_cartridges.glob("candidate_*") if d.is_dir()],
+                                key=lambda p: p.stat().st_mtime,
+                                reverse=True,
+                            )
                         )
-                    )
-                except OSError:
-                    pass
-            search_dirs.extend([cart_dir, target_active])
+                    except OSError:
+                        pass
+                search_dirs.extend([cart_dir, target_active])
             for sdir in search_dirs:
                 gb_file = sdir / "game_bible.json"
                 if gb_file.is_file():
@@ -5032,6 +5322,13 @@ def create_app(
                         break
                     except Exception:
                         continue
+
+        # 4a. Hydrate pre-bible Co-Producer commissioned cartridge strictly from its own `co_producer_brief.json`
+        # so viewing a newly commissioned game NEVER bleeds another cartridge's Game Bible or Writers' Room transcript.
+        if bible_data is None and cart_dir.exists() and (
+            (cart_dir / "co_producer_brief.json").is_file() or (cart_dir / "co_producer.json").is_file()
+        ):
+            bible_data = SwarmEventBus.extract_coproducer_brief_bible_fields(cart_dir)
 
         # 4. Hydrate from world_spec.json + narrative_bible.json if inspecting a cartridge built before game_bible.json
         if bible_data is None and cart_dir.exists():
@@ -5149,7 +5446,9 @@ def create_app(
                 except Exception:
                     continue
 
-        proc_info = _inspect_live_build_process()
+        proc_info = _inspect_live_build_process(
+            requested_cartridge_id=(sanitized_cart.name if explicit_specific_cart and sanitized_cart is not None else None)
+        )
         orch_state = proc_info["orchestrator_state"]
         pause_greenlight = proc_info["pause_for_greenlight"]
         build_actively_running = proc_info["build_actively_running"]
@@ -5224,6 +5523,7 @@ def create_app(
             "has_bible": False,
             "bible_id": None,
             "cartridge_id": cart_dir.name if cart_dir else "active",
+            "active_candidate_id": cart_dir.name if cart_dir else "active",
             "status": "idle",
             "game_title": "",
             "core_genre": "",
@@ -5241,6 +5541,9 @@ def create_app(
             "narrative_bible": None,
             "sign_off_report": sign_off_report,
             "pause_for_greenlight": pause_greenlight,
+            "build_actively_running": build_actively_running,
+            "build_paused": proc_info["is_paused"],
+            "process_status": proc_info,
             "orchestrator_state": orch_state,
         })
 
@@ -5829,8 +6132,10 @@ def create_app(
             "orchestrator": orch_result,
         })
 
-    def _inspect_live_build_process() -> Dict[str, Any]:
+    def _inspect_live_build_process(requested_cartridge_id: Optional[str] = None) -> Dict[str, Any]:
         """Actively inspects the live Python threads, mutex locks, external daemon PID, and pause sentinel to determine true build execution state."""
+        req_cid = str(requested_cartridge_id or "").strip()
+        specific_req_cid = req_cid if (req_cid and req_cid != "active") else None
         orch = getattr(target_bus, "_active_orchestrator", None) or getattr(swarm_bus, "_active_orchestrator", None)
         orch_state = getattr(getattr(orch, "state", None), "value", "IDLE") if orch else "IDLE"
         pause_greenlight = bool(
@@ -5866,7 +6171,8 @@ def create_app(
             lock_candidates = []
             if target_cartridges is not None:
                 lock_candidates.append(target_cartridges.parent / "studio.lock")
-                if target_cartridges.resolve() == config.CARTRIDGES_ROOT.resolve():
+                default_cartridges = Path(getattr(config, "CARTRIDGES_ROOT", config.PROJECT_ROOT / "cartridges"))
+                if target_cartridges.resolve() == default_cartridges.resolve():
                     lock_candidates.append(config.PROJECT_ROOT / "studio.lock")
             else:
                 lock_candidates.append(config.PROJECT_ROOT / "studio.lock")
@@ -5875,13 +6181,14 @@ def create_app(
                     raw_pid = lf.read_text(encoding="utf-8").strip()
                     if raw_pid.isdigit():
                         pid_val = int(raw_pid)
-                        try:
-                            os.kill(pid_val, 0)
-                            daemon_pid = pid_val
-                            daemon_alive = True
-                            break
-                        except OSError:
-                            pass
+                        if pid_val != os.getpid():
+                            try:
+                                os.kill(pid_val, 0)
+                                daemon_pid = pid_val
+                                daemon_alive = True
+                                break
+                            except OSError:
+                                pass
         except Exception:
             pass
 
@@ -5924,32 +6231,82 @@ def create_app(
             or scheduler_paused
         )
 
-        # 5. Determine if any build execution is genuinely alive right now
-        is_process_alive = bool(
+        # 5. Determine if any build execution is genuinely alive right now (and which cartridge owns it)
+        is_process_alive_global = bool(
             lock_held
             or len(active_threads) > 0
             or daemon_alive
             or scheduler_running_workers > 0
             or orch_state in ("BRAINSTORMING", "ANALYZING", "SYNTHESIZING", "VERIFYING")
         )
+        active_building_cartridge_id: Optional[str] = None
+        if is_process_alive_global or orch_state == "AWAITING_GREENLIGHT":
+            try:
+                from engine.studio.models import get_active_gemini_dataset_context
 
-        if orch_state == "AWAITING_GREENLIGHT":
-            process_state = "awaiting_greenlight"
+                ctx_cdir = get_active_gemini_dataset_context().get("candidate_dir")
+                if ctx_cdir:
+                    c_name = Path(ctx_cdir).name
+                    if c_name.startswith("candidate_"):
+                        active_building_cartridge_id = c_name
+            except Exception:
+                pass
+            if not active_building_cartridge_id and orch is not None:
+                orch_board = getattr(getattr(orch, "writers_room", None), "board", None)
+                board_path = getattr(orch_board, "path", None) if orch_board is not None else None
+                if board_path is not None and Path(board_path).parent.name.startswith("candidate_"):
+                    active_building_cartridge_id = Path(board_path).parent.name
+            if not active_building_cartridge_id:
+                raw_bid = str(target_bus.get_active_build_id() or "").strip()
+                clean_bid = raw_bid[len("build_"):] if raw_bid.startswith("build_") else raw_bid
+                if clean_bid.startswith("candidate_"):
+                    active_building_cartridge_id = clean_bid
+            if not active_building_cartridge_id and target_db and target_db.exists():
+                try:
+                    b_rec = TelemetryDB(target_db).get_latest_build()
+                    raw_bid_db = str((b_rec or {}).get("build_id") or "").strip()
+                    clean_bid_db = raw_bid_db[len("build_"):] if raw_bid_db.startswith("build_") else raw_bid_db
+                    if clean_bid_db.startswith("candidate_"):
+                        active_building_cartridge_id = clean_bid_db
+                except Exception:
+                    pass
+
+        other_active_cartridge_id: Optional[str] = None
+        if (
+            specific_req_cid
+            and active_building_cartridge_id
+            and active_building_cartridge_id != specific_req_cid
+        ):
+            other_active_cartridge_id = active_building_cartridge_id
+            orch_state = "IDLE"
+            is_process_alive = False
+            scheduler_running_workers = 0
+            process_state = "paused" if is_paused else "stopped"
             build_actively_running = False
-        elif is_paused:
-            process_state = "pausing" if scheduler_running_workers > 0 else "paused"
-            build_actively_running = False
-        elif is_process_alive:
-            process_state = "running"
-            build_actively_running = True
         else:
-            process_state = "stopped"
-            build_actively_running = False
+            is_process_alive = is_process_alive_global
+            if orch_state == "AWAITING_GREENLIGHT":
+                process_state = "awaiting_greenlight"
+                build_actively_running = False
+            elif is_paused:
+                process_state = "pausing" if scheduler_running_workers > 0 else "paused"
+                build_actively_running = False
+            elif is_process_alive:
+                process_state = "running"
+                build_actively_running = True
+            else:
+                process_state = "stopped"
+                build_actively_running = False
 
         # 6. Query true latest event timestamp from event bus or SQLite studio_events, and detect any build-stopping error
         last_event_ts: Optional[str] = None
         last_error: Optional[Dict[str, Any]] = None
-        if pause_file_active and pause_reason and "paused by operator" not in pause_reason.lower():
+        if (
+            pause_file_active
+            and pause_reason
+            and "paused by operator" not in pause_reason.lower()
+            and not other_active_cartridge_id
+        ):
             last_error = {
                 "event_type": "CIRCUIT_BREAKER_PAUSED",
                 "agent_name": "StudioCircuitBreaker",
@@ -5973,7 +6330,10 @@ def create_app(
             "STUDIO_RESUMED",
         }
         try:
-            recent_ev = target_bus.get_recent_events(limit=120)
+            scoped_bid = f"build_{specific_req_cid}" if specific_req_cid else None
+            recent_ev = target_bus.get_recent_events(limit=120, build_id=scoped_bid)
+            if not recent_ev and specific_req_cid:
+                recent_ev = target_bus.get_recent_events(limit=120, build_id=specific_req_cid)
             if recent_ev and isinstance(recent_ev[-1], dict):
                 last_event_ts = recent_ev[-1].get("timestamp_utc")
             seen_newer_progress = False
@@ -6019,14 +6379,27 @@ def create_app(
                 tdb = TelemetryDB(target_db)
                 conn = tdb.get_reader_connection()
                 try:
-                    row = conn.execute("SELECT MAX(timestamp_utc) AS max_ts FROM studio_events;").fetchone()
+                    if specific_req_cid:
+                        row = conn.execute(
+                            "SELECT MAX(timestamp_utc) AS max_ts FROM studio_events WHERE build_id IN (?, ?);",
+                            (f"build_{specific_req_cid}", specific_req_cid),
+                        ).fetchone()
+                    else:
+                        row = conn.execute("SELECT MAX(timestamp_utc) AS max_ts FROM studio_events;").fetchone()
                     if row and row["max_ts"]:
                         last_event_ts = str(row["max_ts"])
                     if last_error is None:
-                        recent_rows = conn.execute(
-                            "SELECT event_type, agent_name, timestamp_utc, payload_json FROM studio_events "
-                            "ORDER BY rowid DESC LIMIT 50;"
-                        ).fetchall()
+                        if specific_req_cid:
+                            recent_rows = conn.execute(
+                                "SELECT event_type, agent_name, timestamp_utc, payload_json FROM studio_events "
+                                "WHERE build_id IN (?, ?) ORDER BY rowid DESC LIMIT 50;",
+                                (f"build_{specific_req_cid}", specific_req_cid),
+                            ).fetchall()
+                        else:
+                            recent_rows = conn.execute(
+                                "SELECT event_type, agent_name, timestamp_utc, payload_json FROM studio_events "
+                                "ORDER BY rowid DESC LIMIT 50;"
+                            ).fetchall()
                         seen_newer_progress = False
                         progressed_items_db: Set[str] = set()
                         for r in recent_rows:
@@ -6077,6 +6450,8 @@ def create_app(
             "pause_reason": pause_reason,
             "pause_for_greenlight": pause_greenlight,
             "build_actively_running": build_actively_running,
+            "active_building_cartridge_id": active_building_cartridge_id,
+            "other_active_cartridge_id": other_active_cartridge_id,
             "lock_held": lock_held,
             "active_threads": active_threads,
             "daemon_pid": daemon_pid,
@@ -6089,6 +6464,7 @@ def create_app(
     async def studio_settings_handler(request):
         """GET/POST /api/studio/settings: Reads or updates studio orchestration settings such as pause_for_greenlight and paused."""
         orch = getattr(target_bus, "_active_orchestrator", None)
+        req_cart_for_status = (request.query_params.get("cartridge") or "").strip() or None
         if request.method == "POST":
             try:
                 raw_body = await request.json()
@@ -6110,6 +6486,8 @@ def create_app(
                     {"deliberation": "Validation failed for StudioSettingsUpdateRequest.", "error": str(val_err)},
                     status_code=422,
                 )
+            if req.candidate_id:
+                req_cart_for_status = str(req.candidate_id).strip() or req_cart_for_status
             target_bus._pause_for_greenlight = bool(req.pause_for_greenlight)
             if swarm_bus is not target_bus:
                 swarm_bus._pause_for_greenlight = bool(req.pause_for_greenlight)
@@ -6141,20 +6519,43 @@ def create_app(
                             orch._board_scheduler.resume()
                     except Exception:
                         pass
-                if not paused_flag and "PYTEST_CURRENT_TEST" not in os.environ:
+                if not paused_flag and req.auto_spawn_resume and "PYTEST_CURRENT_TEST" not in os.environ:
                     post_unpause_proc = _inspect_live_build_process()
                     if not post_unpause_proc["is_process_alive"] and target_cartridges and target_cartridges.is_dir():
-                        resumable_cands = sorted(
-                            [
-                                d
-                                for d in target_cartridges.iterdir()
-                                if d.is_dir() and d.name.startswith("candidate_") and (d / "game_bible.json").is_file()
-                            ],
-                            key=lambda d: d.stat().st_mtime,
-                            reverse=True,
-                        )
-                        if resumable_cands:
-                            cand_to_resume = resumable_cands[0].name
+                        cand_to_resume: Optional[str] = None
+                        pref_cid = (req.candidate_id or "").strip()
+                        if (
+                            pref_cid
+                            and pref_cid != "active"
+                            and "/" not in pref_cid
+                            and "\\" not in pref_cid
+                            and ".." not in pref_cid
+                            and (target_cartridges / pref_cid).is_dir()
+                            and (
+                                (target_cartridges / pref_cid / "game_bible.json").is_file()
+                                or (target_cartridges / pref_cid / "co_producer_brief.json").is_file()
+                                or (target_cartridges / pref_cid / "backlog.json").is_file()
+                            )
+                        ):
+                            cand_to_resume = pref_cid
+                        else:
+                            resumable_cands = sorted(
+                                [
+                                    d
+                                    for d in target_cartridges.iterdir()
+                                    if d.is_dir()
+                                    and d.name.startswith("candidate_")
+                                    and (
+                                        (d / "game_bible.json").is_file()
+                                        or (d / "co_producer_brief.json").is_file()
+                                    )
+                                ],
+                                key=lambda d: d.stat().st_mtime,
+                                reverse=True,
+                            )
+                            if resumable_cands:
+                                cand_to_resume = resumable_cands[0].name
+                        if cand_to_resume:
                             from engine.studio.daemon import StudioDaemon, StudioDaemonConfig
 
                             def _run_bg_unpause_resume() -> None:
@@ -6195,7 +6596,7 @@ def create_app(
                                 daemon=True,
                             ).start()
 
-        proc_info = _inspect_live_build_process()
+        proc_info = _inspect_live_build_process(requested_cartridge_id=req_cart_for_status)
         pause_val = proc_info["pause_for_greenlight"]
         paused_val = proc_info["is_paused"]
         if request.method == "POST":
@@ -7311,12 +7712,16 @@ def create_app(
         initial_bible = target_bus.reset_for_new_genesis_build(
             build_id=build_id,
             creative_prompt=creative_prompt,
+            cartridge_id=candidate_dir.name,
+            candidate_dir=candidate_dir,
         )
         initial_bible["cartridge_id"] = candidate_dir.name
         if swarm_bus is not None and swarm_bus is not target_bus:
             sb_bible = swarm_bus.reset_for_new_genesis_build(
                 build_id=build_id,
                 creative_prompt=creative_prompt,
+                cartridge_id=candidate_dir.name,
+                candidate_dir=candidate_dir,
             )
             sb_bible["cartridge_id"] = candidate_dir.name
 
@@ -7755,35 +8160,58 @@ def create_app(
             return len(touched)
 
         if action_kind == "commission_game":
-            new_cid = f"candidate_genesis_{uuid.uuid4().hex[:6]}"
-            new_c_dir = target_cartridges / new_cid
             carry_paths = [
                 str(x)
                 for x in (list(found_prop.get("carry_over_asset_paths") or []) + list(req.carry_over_asset_paths or []))
                 if str(x).strip()
             ]
-            if thread_meta.get("scope_kind") == "draft":
-                grad_meta = store.graduate_draft_to_cartridge(
-                    draft_thread_id=req.thread_id,
-                    new_cartridge_dir=new_c_dir,
+            is_existing_pre_bible_cartridge = bool(
+                thread_meta.get("scope_kind") == "cartridge"
+                and cid
+                and c_dir is not None
+                and c_dir.is_dir()
+                and not (c_dir / "game_bible.json").is_file()
+                and not (c_dir / "backlog.json").is_file()
+            )
+            if is_existing_pre_bible_cartridge and c_dir is not None:
+                # Update this cartridge's pre-bible `co_producer_brief.json` in place and start its build
+                # instead of forking a duplicate `candidate_genesis_*` directory.
+                if isinstance(concept_brief, dict) and concept_brief:
+                    store.save_concept_brief(thread_meta, concept_brief)
+                store._sync_cartridge_brief_file(
+                    thread_meta,
+                    concept_brief if isinstance(concept_brief, dict) else (thread_meta.get("concept_brief") or {}),
+                    override_seed_brief=eff_brief_text,
                     handoff_mode=eff_handoff,
-                    steering_or_seed_brief=eff_brief_text,
-                    concept_brief=concept_brief,
-                    carry_over_asset_paths=carry_paths,
                 )
-                target_tid = grad_meta["thread_id"]
+                target_cid = cid
+                target_c_dir = c_dir
+                target_tid = str(thread_meta.get("thread_id") or req.thread_id)
             else:
-                fork_meta = store.fork_cartridge_thread_and_assets(
-                    source_cartridge_dir=c_dir if (c_dir and c_dir.is_dir()) else None,
-                    new_cartridge_dir=new_c_dir,
-                    handoff_mode=eff_handoff,
-                    steering_or_seed_brief=eff_brief_text,
-                    concept_brief=concept_brief,
-                    carry_over_asset_paths=carry_paths,
-                )
-                target_tid = fork_meta["thread_id"]
+                target_cid = f"candidate_genesis_{uuid.uuid4().hex[:6]}"
+                target_c_dir = target_cartridges / target_cid
+                if thread_meta.get("scope_kind") == "draft":
+                    grad_meta = store.graduate_draft_to_cartridge(
+                        draft_thread_id=req.thread_id,
+                        new_cartridge_dir=target_c_dir,
+                        handoff_mode=eff_handoff,
+                        steering_or_seed_brief=eff_brief_text,
+                        concept_brief=concept_brief,
+                        carry_over_asset_paths=carry_paths,
+                    )
+                    target_tid = grad_meta["thread_id"]
+                else:
+                    fork_meta = store.fork_cartridge_thread_and_assets(
+                        source_cartridge_dir=c_dir if (c_dir and c_dir.is_dir()) else None,
+                        new_cartridge_dir=target_c_dir,
+                        handoff_mode=eff_handoff,
+                        steering_or_seed_brief=eff_brief_text,
+                        concept_brief=concept_brief,
+                        carry_over_asset_paths=carry_paths,
+                    )
+                    target_tid = fork_meta["thread_id"]
             job_id = _spawn_commissioned_genesis_daemon(
-                candidate_dir=new_c_dir,
+                candidate_dir=target_c_dir,
                 creative_prompt=eff_brief_text,
                 pause_for_greenlight=eff_pause_greenlight,
             )
@@ -7792,18 +8220,18 @@ def create_app(
 
                 record_milestone_notice(
                     cartridges_root=target_cartridges,
-                    cartridge_id=new_cid,
-                    deliberation=f"Executive Producer directly commissioned '{new_cid}' in '{eff_handoff}' mode.",
+                    cartridge_id=target_cid,
+                    deliberation=f"Executive Producer directly commissioned '{target_cid}' in '{eff_handoff}' mode.",
                     content_markdown=(
-                        f"### Commissioned `{new_cid}` (`{eff_handoff}`)\n\n"
-                        f"Graduated Concept Lab conversation into **`{new_cid}`** in **`{eff_handoff}`** mode "
-                        f"and launched Specialist Council production (`job_id={job_id}`)."
+                        f"### Commissioned `{target_cid}` (`{eff_handoff}`)\n\n"
+                        f"Launched Specialist Council production for **`{target_cid}`** in **`{eff_handoff}`** mode "
+                        f"(`job_id={job_id}`)."
                     ),
                     db=_get_coproducer_db(),
                 )
             result_meta.update(
                 {
-                    "target_cartridge_id": new_cid,
+                    "target_cartridge_id": target_cid,
                     "target_thread_id": target_tid,
                     "handoff_mode": eff_handoff,
                     "job_id": job_id,
@@ -7960,21 +8388,41 @@ def create_app(
             for ps in [target_cartridges / ".studio_paused.json", *([c_dir / ".studio_paused.json"] if c_dir else [])]:
                 if ps.is_file():
                     ps.unlink(missing_ok=True)
-            orch = getattr(target_bus, "_active_orchestrator", None) or getattr(swarm_bus, "_active_orchestrator", None)
-            if orch is not None and getattr(orch, "_board_scheduler", None) is not None:
-                try:
-                    orch._board_scheduler.resume()
-                except Exception:
-                    pass
-            if eff_brief_text and c_dir is not None and c_dir.is_dir():
-                sf = c_dir / ".pending_steering.json"
-                arr = json.loads(sf.read_text(encoding="utf-8")) if sf.is_file() else []
-                if not isinstance(arr, list):
-                    arr = []
-                if eff_brief_text not in arr:
-                    arr.append(eff_brief_text)
-                sf.write_text(json.dumps(arr, indent=2), encoding="utf-8")
-            wake_job = _wake_candidate_resume_if_idle(cid)
+            if (
+                c_dir is not None
+                and c_dir.is_dir()
+                and not (c_dir / "game_bible.json").is_file()
+                and not (c_dir / "backlog.json").is_file()
+            ):
+                if isinstance(concept_brief, dict) and concept_brief:
+                    store.save_concept_brief(thread_meta, concept_brief)
+                store._sync_cartridge_brief_file(
+                    thread_meta,
+                    concept_brief if isinstance(concept_brief, dict) else (thread_meta.get("concept_brief") or {}),
+                    override_seed_brief=eff_brief_text,
+                    handoff_mode=eff_handoff,
+                )
+                wake_job = _spawn_commissioned_genesis_daemon(
+                    candidate_dir=c_dir,
+                    creative_prompt=eff_brief_text,
+                    pause_for_greenlight=eff_pause_greenlight,
+                )
+            else:
+                orch = getattr(target_bus, "_active_orchestrator", None) or getattr(swarm_bus, "_active_orchestrator", None)
+                if orch is not None and getattr(orch, "_board_scheduler", None) is not None:
+                    try:
+                        orch._board_scheduler.resume()
+                    except Exception:
+                        pass
+                if eff_brief_text and c_dir is not None and c_dir.is_dir():
+                    sf = c_dir / ".pending_steering.json"
+                    arr = json.loads(sf.read_text(encoding="utf-8")) if sf.is_file() else []
+                    if not isinstance(arr, list):
+                        arr = []
+                    if eff_brief_text not in arr:
+                        arr.append(eff_brief_text)
+                    sf.write_text(json.dumps(arr, indent=2), encoding="utf-8")
+                wake_job = _wake_candidate_resume_if_idle(cid)
             result_meta.update({"target_cartridge_id": cid, "wake_job_id": wake_job, "recommended_workspace": "board"})
 
         elif action_kind == "pause_build":

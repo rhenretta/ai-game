@@ -1607,3 +1607,665 @@ def test_coproducer_is_active_council_member_and_leads_council_deliberation(
     assert "YOUR 1-ON-1 CO-PRODUCER SESSION MEMORY WITH THE EXECUTIVE PRODUCER" in captured_coproducer_turn_prompts[0]
     assert "Keep placement strictly manual where the cursor clicks" in captured_coproducer_turn_prompts[0]
     assert "Zero passive resource generation" in captured_coproducer_turn_prompts[0]
+
+
+def test_coproducer_cumulative_pillars_negative_sketch_constraints_and_council_context(
+    tmp_path: Path,
+) -> None:
+    """Verifies cumulative non-destructive concept briefs (`user_confirmed_pillars` + `explicit_non_goals`),
+    `sketch_negative_constraints` enforcement without forced HUD chrome, full-context Council huddles when
+    `query_or_question` is blank, latest-turn mockup curation into `assets/mockups/`, and pre-bible
+    `commission_game` -> `resume_build` normalization."""
+    # Rule 4 check on new CoProducer schemas
+    for cls in (CoProducerConceptBrief, CoProducerToolCall, CoProducerFinalTurn):
+        assert list(cls.model_fields.keys())[0] == "deliberation"
+
+    cartridges_root = tmp_path / "cartridges"
+    db = TelemetryDB(tmp_path / "telemetry.db")
+    cand_dir = cartridges_root / "candidate_prebible_01"
+    (cand_dir / "assets" / "sketches").mkdir(parents=True)
+    # Seed an earlier Turn 1 sketch on disk inside the cartridge thread
+    sk1_rel_in_cart = "assets/sketches/mockup_turn1.png"
+    (cand_dir / sk1_rel_in_cart).write_bytes(_make_png_bytes(320, 180, (20, 40, 60, 255)))
+
+    store = CoProducerThreadStore(cartridges_root, db=db)
+    t_meta = store.get_or_create_cartridge_thread(cand_dir.name, game_title="Signal Loom")
+    t_meta, _ = store.append_message(
+        t_meta,
+        {
+            "deliberation": "Turn 1 user design direction.",
+            "sender_role": "user",
+            "content_markdown": "Keep node placement 1:1 with clicks and never show top-bar currency counters.",
+        },
+    )
+    t_meta = store.save_concept_brief(
+        t_meta,
+        CoProducerConceptBrief(
+            deliberation="Turn 1 baseline concept brief.",
+            working_title="Signal Loom",
+            core_genre="systemic_routing_puzzle",
+            elevator_pitch="Weave clean harmonic signal paths across modular relay plates.",
+            core_player_verbs=["place_node", "link_conduit"],
+            user_confirmed_pillars=[
+                "1:1 manual node placement",
+                "Diegetic in-world charge state",
+            ],
+            explicit_non_goals=["No top-bar currency counters"],
+            open_design_questions=["How should conduit intersections resolve phase collisions?"],
+            selected_sketch_asset_paths=[f"{cand_dir.name}/{sk1_rel_in_cart}"],
+        ).model_dump(),
+    )
+    # Pre-bible commissioned handoff file on disk
+    assert (cand_dir / "co_producer_brief.json").is_file()
+
+    captured_advisory_prompts: List[str] = []
+    captured_image_prompts: List[str] = []
+
+    class _CumulativeTestModels(_FakeCoProducerGeminiModels):
+        def generate_content(self, model: str, contents: Any, config: Any = None) -> Any:
+            schema = getattr(config, "response_schema", None) if config else None
+            modalities = getattr(config, "response_modalities", None) if config else None
+            schema_name = getattr(schema, "__name__", "") if schema else ""
+            if modalities and "IMAGE" in modalities:
+                captured_image_prompts.append(str(contents))
+                return super().generate_content(model=model, contents=contents, config=config)
+            if schema_name == "CoProducerAdvisorySpecialistTurn":
+                captured_advisory_prompts.append(str(contents))
+                return super().generate_content(model=model, contents=contents, config=config)
+            if schema_name == "CoProducerFinalTurn":
+                # Deliberately omit Turn 1's user_confirmed_pillars & explicit_non_goals to verify
+                # deterministic cumulative merge, and emit a pre-bible `commission_game` proposal
+                # to verify normalization to `resume_build`.
+                return _FakeGeminiResponse(
+                    CoProducerFinalTurn(
+                        deliberation="Audited fresh sketch and merging targeted conduit-splitting pillar onto prior commitments.",
+                        sketch_fidelity_audit="Verified clean orthographic relay plate with zero corner minimap or currency counters.",
+                        updated_thread_title="Signal Loom",
+                        updated_concept_brief=CoProducerConceptBrief(
+                            deliberation="Incremental delta adding phase-split junctions.",
+                            working_title="Signal Loom",
+                            core_genre="systemic_routing_puzzle",
+                            elevator_pitch="Weave clean harmonic signal paths across modular relay plates.",
+                            core_player_verbs=["place_node", "link_conduit", "split_phase"],
+                            user_confirmed_pillars=["Phase-splitting conduit junctions"],
+                            explicit_non_goals=["No corner minimap"],
+                            open_design_questions=[],
+                        ),
+                        action_proposals=[
+                            CoProducerActionProposal(
+                                deliberation="Offering build launch on pre-bible cartridge.",
+                                proposal_id="prop_launch_prebible",
+                                action_kind="commission_game",
+                                handoff_mode="refined_concept",
+                                title="Commission Signal Loom",
+                                summary="Start autonomous production.",
+                                steering_or_seed_brief="Build Signal Loom with cumulative pillars.",
+                            )
+                        ],
+                        spoken_response="Updated the relay plate sketch without corner chrome and added phase-splitting junctions alongside your manual placement pillars.",
+                    )
+                )
+            return super().generate_content(model=model, contents=contents, config=config)
+
+    step_decisions = [
+        CoProducerStepDecision(
+            deliberation="Consult GameplayDesigner with full conversation context and sketch clean relay plate.",
+            next_step_intent="Run huddle + constrained mockup sketch.",
+            response_mode="creative_ideation",
+            action="call_tools",
+            tool_calls=[
+                CoProducerToolCall(
+                    deliberation="Consult GameplayDesigner even when query_or_question is omitted.",
+                    tool_name="consult_council",
+                    council_mode="huddle",
+                    specialist_roles=["GameplayDesigner"],
+                    query_or_question="",
+                ),
+                CoProducerToolCall(
+                    deliberation="Render clean relay plate without minimap or text labels.",
+                    tool_name="sketch_multimodal_concept",
+                    sketch_kind="concept_mockup_16x9",
+                    sketch_title="Clean Relay Plate",
+                    query_or_question="Orthographic slate relay plate with glowing conduits",
+                    sketch_negative_constraints=["No floating text labels", "No corner minimap"],
+                ),
+            ],
+        )
+    ]
+    client = _FakeCoProducerClient(step_decisions=step_decisions)
+    client.models = _CumulativeTestModels(step_decisions=step_decisions)
+
+    agent = CoProducerAgent(client=client, cartridges_root=cartridges_root, db=db)
+    turn_res = agent.run_turn(
+        thread_id=t_meta["thread_id"],
+        user_message="Keep the earlier manual placement rules, add phase-splitting junctions, and remove any corner minimap from the sketch.",
+    )
+
+    # 1. Council huddle received full conversation history + latest user message + synthesized question
+    assert len(captured_advisory_prompts) == 1
+    adv_prompt = captured_advisory_prompts[0]
+    assert "LATEST EXECUTIVE PRODUCER MESSAGE" in adv_prompt
+    assert "add phase-splitting junctions" in adv_prompt
+    assert "RECENT CONVERSATION HISTORY" in adv_prompt
+    assert "Keep node placement 1:1 with clicks" in adv_prompt
+    assert "EXECUTIVE PRODUCER PRIMACY" in adv_prompt
+    assert "BACKGROUND PLAYER TASTE SIGNALS (OPTIONAL INSPIRATION ONLY)" in adv_prompt
+
+    # 2. Sketch synthesis enforced STRICT VISUAL EXCLUSIONS (merging sketch_negative_constraints + explicit_non_goals)
+    #    and did NOT inject unrequested generic HUD chrome when ui_callout_notes was empty.
+    assert len(captured_image_prompts) == 1
+    img_prompt = captured_image_prompts[0]
+    assert "STRICT VISUAL EXCLUSIONS (MUST NOT APPEAR IN IMAGE)" in img_prompt
+    assert "No floating text labels" in img_prompt
+    assert "No top-bar currency counters" in img_prompt
+    assert "avoid unrequested HUD chrome, minimap boxes" in img_prompt
+
+    # 3. Cumulative concept brief preserved Turn 1 pillars & non-goals alongside Turn 2 additions
+    merged_brief = turn_res["thread"]["concept_brief"]
+    assert merged_brief["user_confirmed_pillars"] == [
+        "1:1 manual node placement",
+        "Diegetic in-world charge state",
+        "Phase-splitting conduit junctions",
+    ]
+    assert merged_brief["explicit_non_goals"] == [
+        "No top-bar currency counters",
+        "No corner minimap",
+    ]
+    # Earlier Turn 1 sketch is retained in selected_sketch_asset_paths while latest Turn 2 mockup
+    # occupies selected_mockup_paths!
+    assert merged_brief["selected_sketch_asset_paths"] == [f"{cand_dir.name}/{sk1_rel_in_cart}"]
+    assert len(merged_brief["selected_mockup_paths"]) == 1
+
+    # 4. Synced `co_producer_brief.json` copied the latest Turn 2 mockup cleanly to `assets/mockups/`
+    #    (stripping the `<cid>/` prefix) and focused `selected_mockup_paths` on the latest turn mockup!
+    synced_disk_brief = json.loads((cand_dir / "co_producer_brief.json").read_text(encoding="utf-8"))
+    assert synced_disk_brief["concept_brief"]["user_confirmed_pillars"] == merged_brief["user_confirmed_pillars"]
+    assert len(synced_disk_brief["concept_brief"]["selected_mockup_paths"]) == 1
+    latest_mockup_rel = synced_disk_brief["concept_brief"]["selected_mockup_paths"][0]
+    assert latest_mockup_rel.startswith("assets/mockups/")
+    assert (cand_dir / latest_mockup_rel).is_file()
+
+    # 5. Pre-bible `commission_game` proposal on an already-commissioned cartridge normalized to `resume_build`
+    proposals = turn_res["assistant_message"]["action_proposals"]
+    assert len(proposals) == 1
+    assert proposals[0]["action_kind"] == "resume_build"
+
+
+def test_strict_cartridge_isolation_and_inplace_prebible_commission_without_fork(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies zero cross-cartridge bleed across `/api/studio/game-bible`, `/api/events/history`,
+    and `process_status` when switching between an active/previous cartridge and a pre-bible cartridge,
+    plus in-place execution on pre-bible cartridges without creating duplicate `candidate_genesis_*` folders."""
+    import os
+
+    cartridges_root = tmp_path / "cartridges"
+    db_path = tmp_path / "telemetry.db"
+    db = TelemetryDB(db_path)
+
+    # 1. Seed previous game (`candidate_prev_aaa`) with full GameBibleSpec, Writers' Room transcript,
+    #    event history, `active` symlink, and a live PID marker simulating an active background build on prev_aaa.
+    prev_dir = _seed_synthetic_cartridge(cartridges_root, db, "candidate_prev_aaa")
+    active_link = cartridges_root / "active"
+    active_link.symlink_to(prev_dir.resolve())
+
+    bus = SwarmEventBus(log_path=tmp_path / "events.jsonl", db_path=db_path)
+    prev_bible = GameBibleSpec(
+        deliberation="Previous game locked bible.",
+        game_title="Previous Horizon",
+        core_genre="tactical_deckbuilder",
+        elevator_pitch="Previous game pitch that must never bleed into another cartridge.",
+        writers_room_transcript=[
+            {
+                "deliberation": "Previous game Council turn.",
+                "turn_index": 0,
+                "speaker_role": "CoProducer",
+                "speaker_display_name": "Co-Producer (Council Chair)",
+                "spoken_dialogue": "Previous game Council dialogue that must stay isolated.",
+            }
+        ],
+    )
+    db.upsert_game_bible(
+        bible_id="bible_prev_aaa",
+        cartridge_id="candidate_prev_aaa",
+        status="LOCKED",
+        bible_dict=prev_bible.model_dump(),
+        build_id="build_candidate_prev_aaa",
+    )
+    bus._active_build_id = "build_candidate_prev_aaa"
+    bus._game_bible = prev_bible.model_dump()
+    bus.publish_threadsafe(
+        {
+            "deliberation": "Previous game Writers' Room event",
+            "event_type": "WRITERS_ROOM_TURN",
+            "agent_name": "CreativeWritersRoom",
+            "build_id": "build_candidate_prev_aaa",
+            "payload": {"cartridge_id": "candidate_prev_aaa", "message": "Previous game Writers' Room event"},
+        }
+    )
+    # Simulate live external build daemon running on `candidate_prev_aaa` (using parent PID so pid != getpid() and kill(pid, 0) is alive)
+    (tmp_path / "studio.lock").write_text(str(os.getppid()), encoding="utf-8")
+
+    # 2. Seed current pre-bible cartridge (`candidate_curr_bbb`) with pre-Turn-0 placeholder DB row
+    #    + newer `co_producer.json` & `co_producer_brief.json` + sketch mockup.
+    curr_dir = cartridges_root / "candidate_curr_bbb"
+    (curr_dir / "assets" / "sketches").mkdir(parents=True)
+    (curr_dir / "src").mkdir(parents=True)
+    (curr_dir / "project.godot").write_text('[application]\nconfig/name="Current Lattice"\n', encoding="utf-8")
+    sk_rel = "assets/sketches/mockup_curr.png"
+    (curr_dir / sk_rel).write_bytes(_make_png_bytes(320, 180, (50, 90, 140, 255)))
+
+    # Seed pre-Turn-0 placeholder bible in DB (simulating `reset_for_new_genesis_build` before Turn 0 finishes)
+    db.upsert_game_bible(
+        bible_id="bible_curr_bbb",
+        cartridge_id="candidate_curr_bbb",
+        status="BRAINSTORMING",
+        bible_dict={
+            "bible_id": "bible_curr_bbb",
+            "cartridge_id": "candidate_curr_bbb",
+            "game_title": "Stale Working Title",
+            "core_genre": "pending",
+            "elevator_pitch": "Convening Writers' Room...",
+            "core_loop": {"player_verbs": []},
+            "writers_room_transcript": [],
+        },
+        build_id="build_candidate_curr_bbb",
+    )
+
+    store = CoProducerThreadStore(cartridges_root, db=db)
+    curr_thread = store.get_or_create_cartridge_thread("candidate_curr_bbb", game_title="Current Lattice")
+    curr_thread = store.save_concept_brief(
+        curr_thread,
+        CoProducerConceptBrief(
+            deliberation="Updated concept brief on current cartridge.",
+            working_title="Current Lattice",
+            core_genre="spatial_signal_craft",
+            elevator_pitch="Current game pitch synced directly from Co-Producer session.",
+            core_player_verbs=["place_emitter", "tune_harmonic"],
+            user_confirmed_pillars=["Zero HUD clutter", "Manual node alignment"],
+            first_60_seconds_feel="Place first emitter in silent space to awaken harmonic grid.",
+            selected_mockup_paths=[f"candidate_curr_bbb/{sk_rel}"],
+        ).model_dump(),
+    )
+    curr_thread, launch_msg = store.append_message(
+        curr_thread,
+        {
+            "deliberation": "Assistant turn with launch proposal.",
+            "sender_role": "coproducer",
+            "content_markdown": "Ready when you want to start building Current Lattice.",
+            "action_proposals": [
+                {
+                    "deliberation": "Offer in-place pre-bible launch.",
+                    "proposal_id": "prop_inplace_launch",
+                    "action_kind": "commission_game",
+                    "handoff_mode": "refined_concept",
+                    "title": "Start Current Lattice",
+                    "summary": "Launch Council & build on Current Lattice in place.",
+                    "steering_or_seed_brief": "Build Current Lattice faithfully to confirmed pillars.",
+                    "status": "pending",
+                }
+            ],
+        },
+    )
+
+    app = create_app(
+        db_path=db_path,
+        event_bus=bus,
+        cartridges_root=cartridges_root,
+        genai_client=_FakeCoProducerClient(),
+    )
+    with TestClient(app) as http:
+        # A. Game Bible endpoint strictly scopes to `candidate_curr_bbb`, heals from `co_producer_brief.json`,
+        #    exposes zero transcript bleed from `candidate_prev_aaa`, and accurately scopes `process_status`!
+        gb_resp = http.get("/api/studio/game-bible?cartridge=candidate_curr_bbb")
+        assert gb_resp.status_code == 200
+        gb_body = gb_resp.json()
+        assert gb_body["cartridge_id"] == "candidate_curr_bbb"
+        assert gb_body["game_title"] == "Current Lattice"
+        assert gb_body["elevator_pitch"] == "Current game pitch synced directly from Co-Producer session."
+        assert "Zero HUD clutter" in gb_body["gameplay_pillars"]
+        assert "place_emitter" in gb_body["gameplay_pillars"]
+        assert gb_body["writers_room_transcript"] == []
+        assert any(str(m.get("image_path") or "").startswith("assets/mockups/") for m in gb_body["visual_mockups"])
+        assert "Previous Horizon" not in json.dumps(gb_body)
+
+        proc = gb_body["process_status"]
+        assert proc["build_actively_running"] is False
+        assert proc["process_state"] == "stopped"
+        assert proc["active_building_cartridge_id"] == "candidate_prev_aaa"
+        assert proc["other_active_cartridge_id"] == "candidate_prev_aaa"
+
+        # B. Events history endpoint strictly scopes to `candidate_curr_bbb` and never falls back to `candidate_prev_aaa`
+        ev_resp = http.get("/api/events/history?cartridge=candidate_curr_bbb")
+        assert ev_resp.status_code == 200
+        ev_body = ev_resp.json()
+        assert ev_body["events"] == []
+        assert "Previous game Writers' Room event" not in json.dumps(ev_body)
+
+        # C. Executing `commission_game` on pre-bible `candidate_curr_bbb` launches it IN PLACE without forking
+        before_dirs = sorted(p.name for p in cartridges_root.iterdir() if p.is_dir() and not p.is_symlink())
+        exec_resp = http.post(
+            "/api/coproducer/actions/execute",
+            json={
+                "deliberation": "Executive Producer approved in-place pre-bible launch.",
+                "thread_id": curr_thread["thread_id"],
+                "message_id": launch_msg["message_id"],
+                "proposal_id": "prop_inplace_launch",
+            },
+        )
+        assert exec_resp.status_code == 200
+        exec_body = exec_resp.json()
+        assert exec_body["status"] == "executed"
+        assert exec_body["result"]["target_cartridge_id"] == "candidate_curr_bbb"
+        after_dirs = sorted(p.name for p in cartridges_root.iterdir() if p.is_dir() and not p.is_symlink())
+        assert after_dirs == before_dirs
+
+
+def test_visual_concept_mockup_uses_nano_banana_21_2k_no_poster_text_and_reference_images(
+    tmp_path: Path,
+) -> None:
+    """Verifies Rule 4 on ConceptArtShotPlan/ConceptArtCritiqueVerdict, default gemini-nano-banana-2.1 2K
+    synthesis, elimination of quoted poster-title triggers, reference image forwarding, and AI Studio
+    media-synthesis log-storage suppression."""
+    from google.genai import types
+    from engine.studio.models import (
+        ConceptArtCritiqueVerdict,
+        ConceptArtShotPlan,
+        DEFAULT_CONCEPT_MOCKUP_MODEL,
+        VisualMockupArtifact,
+        VisualSceneLayerSpec,
+        inject_gemini_dataset_config,
+    )
+    from engine.studio.visual import VisualArtSpriteDesignerAgent
+
+    # Rule 4: deliberation strictly at index 0
+    for cls in (ConceptArtShotPlan, ConceptArtCritiqueVerdict):
+        assert list(cls.model_fields.keys())[0] == "deliberation"
+
+    shot_plan = ConceptArtShotPlan(
+        deliberation="Lock orthographic top-down viewport scale and convey vast world depth via underlayer parallax.",
+        rendering_medium_and_surface_craft="Crisp high-definition 2D digital illustration with clean shader-lit surfaces.",
+        camera_projection_and_viewport_scale="Pure 90-degree orthographic top-down 2D local playable viewport.",
+        playable_midground_composition="Modular multi-unit relay hub spanning 30% width with player craft at 4% frame height.",
+        foreground_and_parallax_depth_layers="Subtle foreground particulate drift over sweeping deep background strata.",
+        lighting_and_color_script="Directional cool rim light against obsidian slate (#0F172A, #38BDF8, #F472B6).",
+        hard_visual_exclusions=["No floating callout labels"],
+    )
+    assert list(json.loads(shot_plan.model_dump_json()).keys())[0] == "deliberation"
+
+    recorded_calls: List[Dict[str, Any]] = []
+
+    class _MockupCaptureModels:
+        def generate_content(self, model: str, contents: Any, config: Any = None) -> Any:
+            recorded_calls.append({"model": model, "contents": contents, "config": config})
+            png_bytes = _make_png_bytes(640, 360, (18, 36, 68, 255))
+
+            class _InlineData:
+                data = png_bytes
+
+            class _Part:
+                inline_data = _InlineData()
+
+            class _Content:
+                parts = [_Part()]
+
+            class _Cand:
+                content = _Content()
+
+            class _Resp:
+                candidates = [_Cand()]
+
+            return _Resp()
+
+    class _MockupCaptureClient:
+        models = _MockupCaptureModels()
+
+    vis = VisualArtSpriteDesignerAgent(client=_MockupCaptureClient())
+    assert vis.model_name == "gemini-3.1-flash-lite-image"
+    assert vis.concept_mockup_model_name == DEFAULT_CONCEPT_MOCKUP_MODEL == "gemini-nano-banana-2.1"
+
+    ref_img_path = tmp_path / "prior_ref.png"
+    ref_img_path.write_bytes(_make_png_bytes(320, 180, (40, 80, 120, 255)))
+
+    artifact = VisualMockupArtifact(
+        deliberation="Stage readable playable relay hub without poster lettering.",
+        mockup_id="relay_hub_v1",
+        title="Poster Title Trigger Phrase",
+        scene_description="Modular relay hub with linked conduits and docked utility craft.",
+        image_path="assets/mockups/relay_hub_v1.png",
+        camera_and_spatial_paradigm="Pure 90-degree orthographic top-down 2D",
+        color_palette_hex=["#0F172A", "#38BDF8", "#F472B6"],
+        scene_layers=[
+            VisualSceneLayerSpec(
+                deliberation="Deep parallax background layer.",
+                layer_id="deep_parallax",
+                depth_order=0,
+                visual_description="Sweeping atmospheric horizon far beneath the playable plane.",
+            )
+        ],
+    )
+    out_file = tmp_path / "assets" / "mockups" / "relay_hub_v1.png"
+    vis.generate_concept_mockup(
+        mockup=artifact,
+        output_path=out_file,
+        style_guide="Crisp HD 2D illustrated game art",
+        dimensions=(640, 360),
+        reference_images=[ref_img_path],
+    )
+    assert out_file.is_file()
+    assert len(recorded_calls) == 1
+    call_rec = recorded_calls[0]
+    assert call_rec["model"] == "gemini-nano-banana-2.1"
+    img_cfg = getattr(call_rec["config"], "image_config", None)
+    assert img_cfg is not None
+    assert img_cfg.aspect_ratio == "16:9"
+    assert img_cfg.image_size == "2K"
+    # Reference image part + prompt string passed together
+    assert isinstance(call_rec["contents"], list) and len(call_rec["contents"]) == 2
+    prompt_sent = call_rec["contents"][1]
+    assert isinstance(prompt_sent, str)
+    # Never inject quoted title text into the image generation prompt
+    assert "Poster Title Trigger Phrase" not in prompt_sent
+    assert "Pure 90-degree orthographic top-down 2D" in prompt_sent
+    assert "#38BDF8" in prompt_sent
+    assert "deep_parallax" in prompt_sent
+
+    # Dataset config guardrail treats gemini-nano-banana-2.1 as media synthesis (no store=True http_options)
+    injected = inject_gemini_dataset_config(
+        {
+            "model": "gemini-nano-banana-2.1",
+            "contents": "Test frame",
+            "config": types.GenerateContentConfig(temperature=0.4),
+        },
+        label="VisualArtSpriteDesignerAgent.generate_concept_mockup",
+        dataset_name="concept_bench",
+        store_logs=True,
+    )
+    assert injected["config"].labels["dataset"] == "concept_bench"
+    assert injected["config"].http_options is None
+
+
+def test_coproducer_art_direction_shot_compiler_and_multimodal_critic_auto_regeneration(
+    tmp_path: Path,
+) -> None:
+    """Verifies CoProducerAgent's Art-Direction Shot Compiler (`ConceptArtShotPlan`) + Pre-Presentation
+    Multimodal Art Critic (`ConceptArtCritiqueVerdict`) catches a flawed first render, auto-regenerates
+    with corrective staging (dropping prior reference image so bad composition cannot poison retry),
+    and surfaces the honest pixel audit in the tool observation."""
+    from engine.studio.models import ConceptArtCritiqueVerdict, ConceptArtShotPlan
+
+    cartridges_root = tmp_path / "cartridges"
+    db = TelemetryDB(tmp_path / "telemetry.db")
+    store = CoProducerThreadStore(cartridges_root, db=db)
+    draft = store.create_draft_thread(title="Prism Conduit")
+
+    t_dir = store.resolve_thread_dir(draft)
+    prior_sk_rel = f"_coproducer_drafts/{draft['thread_id']}/assets/sketches/mockup_prior_good.png"
+    prior_sk_abs = cartridges_root / prior_sk_rel
+    prior_sk_abs.parent.mkdir(parents=True, exist_ok=True)
+    prior_sk_abs.write_bytes(_make_png_bytes(320, 180, (25, 55, 95, 255)))
+
+    draft = store.save_concept_brief(
+        draft,
+        CoProducerConceptBrief(
+            deliberation="Seeded concept brief with approved prior mockup.",
+            working_title="Prism Conduit",
+            core_genre="top_down_2d_logistics",
+            visual_style_direction="Crisp high-definition 2D geometric illustration with luminous conduits",
+            user_confirmed_pillars=["Pure top-down 2D playable camera", "Small utility craft docking at multi-module hubs"],
+            explicit_non_goals=["No HUD bars", "No 3D perspective tilt"],
+            selected_mockup_paths=[prior_sk_rel],
+        ).model_dump(),
+    )
+
+    image_calls: List[Dict[str, Any]] = []
+    critique_count = 0
+    emitted_events: List[tuple] = []
+
+    class _ArtPipelineTestModels(_FakeCoProducerGeminiModels):
+        def generate_content(self, model: str, contents: Any, config: Any = None) -> Any:
+            nonlocal critique_count
+            schema = getattr(config, "response_schema", None) if config else None
+            modalities = getattr(config, "response_modalities", None) if config else None
+            schema_name = getattr(schema, "__name__", "") if schema else ""
+
+            if schema_name == "ConceptArtShotPlan":
+                return _FakeGeminiResponse(
+                    ConceptArtShotPlan(
+                        deliberation="Lock camera to local top-down playable viewport and push macro vista into deep underlayer parallax.",
+                        rendering_medium_and_surface_craft="Crisp high-definition 2D geometric digital illustration with emissive conduits.",
+                        camera_projection_and_viewport_scale="Pure 90-degree orthographic top-down 2D local viewport.",
+                        playable_midground_composition="Multi-module relay complex spanning 32% of frame width with docked craft at 4% frame height.",
+                        foreground_and_parallax_depth_layers="Subtle foreground dust motes above sweeping deep underlayer cloud strata.",
+                        lighting_and_color_script="High-contrast cyan/amber emissive conduits over deep indigo (#0B1020, #22D3EE, #F59E0B).",
+                        hard_visual_exclusions=["No centered miniature bullseye ring", "No HUD bars"],
+                    )
+                )
+
+            if modalities and "IMAGE" in modalities:
+                image_calls.append({"model": model, "contents": contents, "config": config})
+                color = (180, 40, 40, 255) if len(image_calls) == 1 else (30, 160, 190, 255)
+                png_bytes = _make_png_bytes(640, 360, color)
+
+                class _InlineData:
+                    data = png_bytes
+
+                class _Part:
+                    inline_data = _InlineData()
+
+                class _Content:
+                    parts = [_Part()]
+
+                class _Cand:
+                    content = _Content()
+
+                class _ImgResp:
+                    candidates = [_Cand()]
+
+                return _ImgResp()
+
+            if schema_name == "ConceptArtCritiqueVerdict":
+                critique_count += 1
+                if critique_count == 1:
+                    return _FakeGeminiResponse(
+                        ConceptArtCritiqueVerdict(
+                            deliberation="Attempt 1 collapsed scale into a miniature centered bullseye emblem instead of a multi-module playable hub.",
+                            observed_camera_and_scale_assessment="Zoomed-out diagram with oversized flat cross emblem.",
+                            strengths_observed=["Clean color palette"],
+                            flaws_or_constraint_violations=[
+                                "Oversized flat cross icon instead of multi-module playable structure",
+                                "Miniature concentric bullseye scale collapse",
+                            ],
+                            honest_producer_summary="Initial draft collapsed scale into a simplified emblem; requires local playable viewport retry.",
+                            corrective_scene_rewrite=(
+                                "Close-in orthographic top-down 2D playable frame showing an asymmetric 6-module relay station "
+                                "connected by glowing conduits, a tiny utility craft (~4% frame height) docked at the lower airlock, "
+                                "diagonal mineral drift edge-to-edge, and a vast sweeping horizon far below in deep parallax."
+                            ),
+                            passes_art_direction_bar=False,
+                        )
+                    )
+                return _FakeGeminiResponse(
+                    ConceptArtCritiqueVerdict(
+                        deliberation="Attempt 2 faithfully renders the orthographic top-down multi-module hub, proportional tiny craft, and deep underlayer parallax.",
+                        observed_camera_and_scale_assessment="Pure 90-degree orthographic top-down 2D with ~4% craft scale and sweeping deep parallax.",
+                        strengths_observed=[
+                            "Multi-module functional hub geometry",
+                            "True tiny craft-to-structure scale",
+                            "Zero text or HUD clutter",
+                        ],
+                        flaws_or_constraint_violations=[],
+                        honest_producer_summary="Orthographic 2D scale, multi-module hub complexity, and deep underlayer parallax all landed cleanly.",
+                        corrective_scene_rewrite="",
+                        passes_art_direction_bar=True,
+                    )
+                )
+
+            return super().generate_content(model=model, contents=contents, config=config)
+
+    step_decisions = [
+        CoProducerStepDecision(
+            deliberation="Sketch refined 16:9 playable viewport using prior reference and run art-direction quality gate.",
+            next_step_intent="Synthesize and audit 16:9 concept art.",
+            response_mode="creative_ideation",
+            action="call_tools",
+            tool_calls=[
+                CoProducerToolCall(
+                    deliberation="Refine prior sketch while fixing scale and multi-module hub detail.",
+                    tool_name="sketch_multimodal_concept",
+                    sketch_kind="concept_mockup_16x9",
+                    sketch_title="Local Viewport Hub Scale",
+                    query_or_question="Orthographic top-down multi-module hub with tiny docked utility craft and deep parallax horizon",
+                    sketch_secondary_direction="Crisp HD 2D geometric illustration, pure 90-degree top-down",
+                    sketch_negative_constraints=["No poster text", "No miniature bullseye"],
+                    use_prior_sketch_as_reference=True,
+                )
+            ],
+        )
+    ]
+    fake_client = _FakeCoProducerClient(step_decisions=step_decisions)
+    fake_client.models = _ArtPipelineTestModels(step_decisions=step_decisions)
+
+    agent = CoProducerAgent(
+        client=fake_client,
+        cartridges_root=cartridges_root,
+        db=db,
+        enable_art_direction_pipeline=True,
+        event_callback=lambda etype, payload: emitted_events.append((etype, payload)),
+    )
+    res = agent.run_turn(
+        thread_id=draft["thread_id"],
+        user_message="Fix the scale so the craft is genuinely small next to a multi-module 2D hub over a vast horizon.",
+    )
+
+    # 2 image synthesis calls occurred (Attempt 1 rejected by critic -> Attempt 2 passed)
+    assert len(image_calls) == 2
+    assert critique_count == 2
+    assert image_calls[0]["model"] == "gemini-nano-banana-2.1"
+    assert image_calls[1]["model"] == "gemini-nano-banana-2.1"
+    # Attempt 1 included prior reference image part; Attempt 2 dropped reference image so rejected composition didn't bleed
+    assert isinstance(image_calls[0]["contents"], list) and len(image_calls[0]["contents"]) == 2
+    assert isinstance(image_calls[1]["contents"], str)
+    assert "asymmetric 6-module relay station" in image_calls[1]["contents"]
+    assert "Oversized flat cross icon" in image_calls[1]["contents"]
+
+    # Regeneration observability event emitted with deliberation at index 0
+    regen_events = [p for et, p in emitted_events if et == "coproducer_sketch_regenerating"]
+    assert len(regen_events) == 1
+    assert list(regen_events[0].keys())[0] == "deliberation"
+
+    # Strictly ONE clean media card staged for the user, backed by Attempt 2's regenerated PNG
+    msg = res["assistant_message"]
+    assert len(msg["media_cards"]) == 1
+    staged_rel = msg["media_cards"][0]["items"][0]["artifact_path"]
+    staged_abs = cartridges_root / staged_rel
+    assert staged_abs.is_file()
+    with Image.open(staged_abs) as final_im:
+        assert final_im.getpixel((10, 10))[:3] == (30, 160, 190)
+
+    # Tool trace recorded honest Art-Direction Pixel Audit summary
+    obs_excerpt = msg["tool_trace"][0]["observation_excerpt"]
+    assert "attempts=2" in obs_excerpt
+    assert "Art-Direction Pixel Audit: passed_bar=True" in obs_excerpt
+
+

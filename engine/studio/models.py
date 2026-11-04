@@ -13,6 +13,7 @@ import uuid
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 DEFAULT_STUDIO_MODEL = "gemini-3.8-flash"
+DEFAULT_CONCEPT_MOCKUP_MODEL = "gemini-nano-banana-2.1"
 
 
 def is_real_genai_client(client: Any) -> bool:
@@ -236,6 +237,10 @@ class StudioOrchestratorConfig(BaseEpistemicModel):
     model_name: str = Field(default="gemini-3.8-flash", description="Default model for text/code reasoning")
     tts_model_name: str = Field(default="gemini-3.8-flash-tts", description="Model for voice synthesis")
     image_model_name: str = Field(default="gemini-3.1-flash-lite-image", description="Model for image generation")
+    concept_mockup_model_name: str = Field(
+        default=DEFAULT_CONCEPT_MOCKUP_MODEL,
+        description="High-craft model for 16:9 concept art & gameplay mockups",
+    )
     max_retries: int = Field(default=3, description="Maximum self-healing repair iterations")
     timeout_seconds: float = Field(default=300.0, description="Per-agent inference timeout")
     pause_for_greenlight: bool = Field(
@@ -6498,6 +6503,7 @@ def inject_gemini_dataset_config(
         modalities = [str(m).upper() for m in getattr(cfg, "response_modalities")]
     is_media_synthesis = (
         "image" in model_str
+        or "nano-banana" in model_str
         or "tts" in model_str
         or "IMAGE" in modalities
         or "AUDIO" in modalities
@@ -6618,6 +6624,7 @@ def inject_gemini_interactions_config(
     modalities = [str(m).upper() for m in (out_kwargs.get("response_modalities") or [])]
     is_media_synthesis = (
         "image" in model_str
+        or "nano-banana" in model_str
         or "tts" in model_str
         or "IMAGE" in modalities
         or "AUDIO" in modalities
@@ -7338,9 +7345,21 @@ class CoProducerConceptBrief(BaseEpistemicModel):
         default_factory=list,
         description="Optional hex palette swatches (e.g. '#1E293B').",
     )
+    user_confirmed_pillars: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Cumulative ledger of core pillars, systemic depth requirements, spatial/camera rules, and progression arcs "
+            "explicitly requested or confirmed by the user across all prior turns. Must be preserved across turns unless "
+            "explicitly retracted or replaced by the user."
+        ),
+    )
     explicit_non_goals: List[str] = Field(
         default_factory=list,
-        description="Explicit anti-goals or rejected mechanics the Council must avoid.",
+        description="Cumulative explicit anti-goals, rejected visual tropes, or unwanted mechanics the studio and concept art must strictly avoid.",
+    )
+    open_design_questions: List[str] = Field(
+        default_factory=list,
+        description="Unresolved design or feel questions still being collaboratively shaped with the user before commissioning.",
     )
     selected_mockup_paths: List[str] = Field(
         default_factory=list,
@@ -7435,11 +7454,140 @@ class CoProducerToolCall(BaseEpistemicModel):
     )
     sketch_secondary_direction: str = Field(
         default="",
-        description="Optional style guide, voice acting direction, or secondary constraint for sketch_multimodal_concept.",
+        description="Optional style guide, camera/perspective lock, voice acting direction, or secondary constraint for sketch_multimodal_concept.",
+    )
+    sketch_negative_constraints: List[str] = Field(
+        default_factory=list,
+        description="Explicit visual elements, camera angles, background tropes, or HUD chrome that MUST NOT appear in sketch_multimodal_concept.",
+    )
+    use_prior_sketch_as_reference: bool = Field(
+        default=False,
+        description=(
+            "For sketch_multimodal_concept ('concept_mockup_16x9'): Set True ONLY when making targeted refinements "
+            "to a strong prior sketch whose camera angle, relative scale, and composition already worked. "
+            "Leave False when creating a new shot or resetting a drifted/rejected composition."
+        ),
     )
     loop_audio: bool = Field(
         default=False,
         description="For sfx_or_ambience: True for seamless ambient loop, False for one-shot SFX.",
+    )
+
+
+class ConceptArtShotPlan(BaseEpistemicModel):
+    """Rationale-First Art-Direction Shot Compiler contract translating raw design prose into a coherent,
+    playable-scale in-world game viewport specification before image synthesis (Rule 4)."""
+
+    deliberation: str = Field(
+        ...,
+        description=(
+            "MANDATORY FIRST PROPERTY: Art-direction reasoning resolving any macro-vs-micro camera/scale paradoxes, "
+            "reconciling gameplay readability with environmental vastness, and translating confirmed gameplay pillars "
+            "into concrete multi-layer visual staging."
+        ),
+    )
+    rendering_medium_and_surface_craft: str = Field(
+        ...,
+        description=(
+            "Exact visual medium, shader/material finish, linework, and surface craft matching the game's art direction "
+            "(e.g., crisp high-definition 2D digital illustration with clean geometric silhouettes and emissive shaders, "
+            "hand-painted gouache, stylized cel-shaded 3D, or crisp pixel art ONLY when pixel art was explicitly requested). "
+            "Never default to generic mobile-icon clip art or unrequested pixel art."
+        ),
+    )
+    camera_projection_and_viewport_scale: str = Field(
+        ...,
+        description=(
+            "Single coherent camera lens/projection and world-space span visible in the 16:9 viewport. "
+            "When staging a small playable craft, character, or local facility inside a colossal environment, "
+            "keep the camera locked to the LOCAL PLAYABLE VIEWPORT scale while expressing world vastness via "
+            "edge-to-edge environmental fields and deep background/underlayer parallax—NEVER zoom out to a whole-world "
+            "diagram with oversized icons, and NEVER shrink a vast world into a tiny centered bullseye/diorama."
+        ),
+    )
+    playable_midground_composition: str = Field(
+        ...,
+        description=(
+            "Primary playable entities, multi-component functional gameplay structures (interconnected modules, conduits, "
+            "machinery, terrain topology—never a single flat simplified emblem/icon), and explicit relative proportions "
+            "(e.g., player unit ~3-7% of frame height vs. multi-part structure ~20-40% of frame width)."
+        ),
+    )
+    foreground_and_parallax_depth_layers: str = Field(
+        ...,
+        description=(
+            "Multi-plane depth staging across subtle foreground framing cues and deep background/underlayer parallax vistas "
+            "that convey environmental scale without violating the locked playable camera projection."
+        ),
+    )
+    lighting_and_color_script: str = Field(
+        ...,
+        description=(
+            "Key light direction, contrast hierarchy separating playable foreground/midground silhouettes from deep "
+            "background layers, and concrete hex/material color anchors."
+        ),
+    )
+    diegetic_feedback_and_ui_policy: str = Field(
+        default="Pure in-world gameplay viewport capture with readable world-space state cues; zero title text, zero floating labels, and zero HUD chrome unless explicitly requested.",
+        description="In-world visual state readability and strict UI/HUD policy for this frame.",
+    )
+    hard_visual_exclusions: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Cumulative list of user non-goals plus mandatory anti-slop exclusions (zero rendered title/poster text, "
+            "zero watermarks, zero unrequested HUD bars/minimaps, zero simplified single-icon base emblems, zero "
+            "centered miniature bullseye/toy-diorama scale collapse)."
+        ),
+    )
+
+
+class ConceptArtCritiqueVerdict(BaseEpistemicModel):
+    """Rationale-First multimodal art-director critique evaluating a rendered concept PNG before presentation (Rule 4)."""
+
+    deliberation: str = Field(
+        ...,
+        description=(
+            "MANDATORY FIRST PROPERTY: Pixel-level multimodal examination of the rendered PNG against the user's latest "
+            "feedback, confirmed pillars, locked camera projection, relative entity-to-structure-to-world scale, "
+            "rendering medium, and hard_visual_exclusions."
+        ),
+    )
+    observed_camera_and_scale_assessment: str = Field(
+        ...,
+        description=(
+            "Objective description of the camera angle and relative unit/structure/environment scale actually visible "
+            "in the rendered pixels (explicitly checking for perspective drift, miniature bullseye diorama collapse, "
+            "or oversized toy icon pasted onto a macro diagram)."
+        ),
+    )
+    strengths_observed: List[str] = Field(
+        default_factory=list,
+        description="Concrete visual qualities that succeeded in the rendered frame.",
+    )
+    flaws_or_constraint_violations: List[str] = Field(
+        default_factory=list,
+        description="Specific visual defects, scale/camera drift, rendering-medium mismatch, text artifacts, or violated exclusions (empty if none).",
+    )
+    honest_producer_summary: str = Field(
+        ...,
+        description=(
+            "Candid 1-2 sentence assessment for the Co-Producer's tool observation accurately describing what succeeded "
+            "and any remaining imperfections so the Co-Producer never gaslights the user."
+        ),
+    )
+    corrective_scene_rewrite: str = Field(
+        default="",
+        description=(
+            "When passes_art_direction_bar is False, a complete, self-contained revised playable scene & camera staging "
+            "directive that eliminates every observed defect on retry; empty when passes_art_direction_bar is True."
+        ),
+    )
+    passes_art_direction_bar: bool = Field(
+        ...,
+        description=(
+            "FINAL DECISION TOKEN: True ONLY when camera projection, relative scale, rendering medium, functional "
+            "structure complexity, and all hard_visual_exclusions are faithfully satisfied."
+        ),
     )
 
 
@@ -7700,7 +7848,15 @@ class CoProducerFinalTurn(BaseEpistemicModel):
 
     deliberation: str = Field(
         ...,
-        description="MANDATORY FIRST PROPERTY: Full showrunner and creative partner deliberation weighing user intent, specialist feedback, visual/audio evidence, and contrasting creative options.",
+        description="MANDATORY FIRST PROPERTY: Full showrunner and creative partner deliberation weighing user intent, cumulative prior commitments, specialist feedback, visual/audio evidence, and contrasting creative options.",
+    )
+    sketch_fidelity_audit: str = Field(
+        default="",
+        description=(
+            "When an inline visual sketch was synthesized on this turn, audit the actual rendered PNG pixels against "
+            "the user's explicit camera, spatial scale, aesthetic, and negative constraints (`explicit_non_goals`) BEFORE "
+            "writing `spoken_response`. Explicitly note any discrepancy so `spoken_response` stays 100% honest."
+        ),
     )
     updated_thread_title: str = Field(
         default="",

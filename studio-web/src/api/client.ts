@@ -251,6 +251,8 @@ export const studioApi = {
   updateStudioSettings(params: {
     pauseForGreenlight: boolean;
     paused?: boolean;
+    candidateId?: string;
+    autoSpawnResume?: boolean;
     reason?: string;
   }): Promise<{ deliberation: string; pause_for_greenlight: boolean; paused: boolean }> {
     const payload = {
@@ -259,6 +261,8 @@ export const studioApi = {
         `Executive Producer updated studio orchestration settings (paused=${String(params.paused)}, pause_for_greenlight=${String(params.pauseForGreenlight)}).`,
       pause_for_greenlight: params.pauseForGreenlight,
       ...(params.paused !== undefined ? { paused: params.paused } : {}),
+      ...(params.candidateId ? { candidate_id: params.candidateId } : {}),
+      ...(params.autoSpawnResume !== undefined ? { auto_spawn_resume: params.autoSpawnResume } : {}),
     };
     return requestJson('/api/studio/settings', {
       method: 'POST',

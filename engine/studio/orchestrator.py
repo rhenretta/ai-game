@@ -364,7 +364,12 @@ class StudioOrchestrator:
         director_agent = CreativeDirectorWorldbuilderAgent(client=self.client, model_name=self.config.model_name)
         narrative_agent = NarrativeCharacterWriterAgent(client=self.client, model_name=self.config.model_name)
         audio_agent = VoiceActingAudioProducerAgent(client=self.client)
-        visual_agent = VisualArtSpriteDesignerAgent(client=self.client, allow_offline_procedural=allow_offline)
+        visual_agent = VisualArtSpriteDesignerAgent(
+            client=self.client,
+            model_name=self.config.image_model_name,
+            concept_mockup_model_name=self.config.concept_mockup_model_name,
+            allow_offline_procedural=allow_offline,
+        )
         swe_agent = LeadGameplaySWEAgent(
             client=self.client,
             model_name=self.config.model_name,

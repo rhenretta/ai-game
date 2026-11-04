@@ -6712,10 +6712,14 @@ class CreativeWritersRoom:
                 f"Your domain focus: {spec['focus']}\n\n"
                 f"The Co-Producer is consulting you mid-conversation with the Executive Producer:\n"
                 f"QUESTION FOR YOU: {clean_q}\n\n"
-                f"CURRENT GAME / CONCEPT CONTEXT:\n{context_summary or '(pre-genesis exploration)'}\n"
-                f"PLAYER TASTE SIGNALS:\n{dna_summary or '(none)'}\n\n"
-                f"Give a sharp, concrete, creative perspective strictly from your {spec['display_name']} lens—propose a specific mechanic, visual/sonic hook, "
-                f"or architectural trade-off rather than generic praise. Provide `deliberation` FIRST."
+                f"CURRENT GAME / CONCEPT & CONVERSATION CONTEXT:\n{context_summary or '(pre-genesis exploration)'}\n"
+                f"BACKGROUND PLAYER TASTE SIGNALS (OPTIONAL INSPIRATION ONLY):\n{dna_summary or '(none)'}\n\n"
+                f"CRITICAL RULES FOR YOUR ADVICE:\n"
+                f"1. EXECUTIVE PRODUCER PRIMACY: Every explicit pillar, camera/scale rule, progression goal, and non-goal from the Executive Producer in `CURRENT GAME / CONCEPT & CONVERSATION CONTEXT` takes 100% precedence over `BACKGROUND PLAYER TASTE SIGNALS`.\n"
+                f"2. DO NOT INJECT UNREQUESTED SIMULATION CHORES: Never use Player Taste Signals to push unasked-for babysitting friction or side-mechanics that compete with or distract from the core systems the Executive Producer actually asked to deepen.\n"
+                f"3. CUMULATIVE COHERENCE: Address `QUESTION FOR YOU` while keeping the entire multi-pillar vision intact rather than hyper-fixating on a single sub-mechanic.\n"
+                f"Give a sharp, concrete, creative perspective strictly from your {spec['display_name']} lens—propose specific mechanics, visual/sonic hooks, "
+                f"or architectural trade-offs rather than generic praise. Provide `deliberation` FIRST."
             )
             return self._call_structured_llm(
                 prompt,

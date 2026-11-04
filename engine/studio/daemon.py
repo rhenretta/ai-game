@@ -123,6 +123,30 @@ def rehydrate_resumable_candidate_from_db(
         except Exception as exc:
             logger.warning("Failed reading telemetry DB during candidate rehydration: %s", exc)
 
+    # Prefer a newer pre-staged Co-Producer commissioned cartridge (`co_producer_brief.json`) on disk
+    # when no explicit `preferred_candidate_id` was provided and its Turn-0 bible has not been written yet.
+    if not preferred_candidate_id:
+        commissioned_cands = sorted(
+            [
+                d
+                for d in cartridges_root.glob("candidate_genesis_*")
+                if d.is_dir() and (d / "co_producer_brief.json").is_file() and not (d / "game_bible.json").is_file()
+            ],
+            key=lambda d: d.stat().st_mtime,
+            reverse=True,
+        )
+        if commissioned_cands:
+            newest_comm = commissioned_cands[0]
+            existing_mtime = (
+                (cartridges_root / cand_name).stat().st_mtime
+                if cand_name and (cartridges_root / cand_name).is_dir()
+                else 0.0
+            )
+            if newest_comm.stat().st_mtime >= existing_mtime:
+                cand_name = newest_comm.name
+                bible_dict = None
+                req_rows = []
+
     if not cand_name:
         existing_cands = sorted(
             [
@@ -544,53 +568,75 @@ class StudioDaemon:
                     preferred_candidate_id=self.config.resume_candidate_id,
                 )
 
+            from engine.studio.models import set_active_gemini_dataset_context
+
             if resumed_dir is not None:
                 staging_dir = resumed_dir
+                staging_mode = "resume"
+            elif self.config.initial_candidate_dir is not None:
+                staging_dir = Path(self.config.initial_candidate_dir)
+                staging_dir.mkdir(parents=True, exist_ok=True)
+                staging_mode = "commissioned"
+            else:
+                staging_dir = self.config.cartridges_root / f"candidate_genesis_{uuid.uuid4().hex[:6]}"
+                staging_dir.mkdir(parents=True, exist_ok=True)
+                staging_mode = "cold_boot"
+
+            active_bid = f"build_{staging_dir.name}"
+            set_active_gemini_dataset_context(
+                dataset_name=self.config.dataset_name or staging_dir.name,
+                candidate_dir=staging_dir,
+            )
+            if self.event_bus is not None and hasattr(self.event_bus, "set_active_build_id"):
+                try:
+                    self.event_bus.set_active_build_id(active_bid)
+                except Exception:
+                    pass
+
+            if staging_mode == "resume":
                 logger.info("Resuming existing Genesis build in %s...", staging_dir)
                 self.event_bus.publish_threadsafe({
                     "deliberation": f"Resuming Genesis game development in '{staging_dir.name}' from persisted Game Bible and requirement tracks.",
                     "event_type": "genesis_starting",
                     "agent_name": "StudioDaemon",
+                    "build_id": active_bid,
                     "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                     "payload": {
                         "profile_tag": self.config.steam_profile,
                         "resumed_candidate": staging_dir.name,
+                        "candidate_id": staging_dir.name,
+                        "cartridge_id": staging_dir.name,
                         "resume_current": True,
                     },
                 })
-            elif self.config.initial_candidate_dir is not None:
-                staging_dir = Path(self.config.initial_candidate_dir)
-                staging_dir.mkdir(parents=True, exist_ok=True)
+            elif staging_mode == "commissioned":
                 logger.info("Starting commissioned Genesis build in pre-staged directory %s...", staging_dir)
                 self.event_bus.publish_threadsafe({
                     "deliberation": f"Initiating commissioned Genesis build cycle in pre-staged cartridge '{staging_dir.name}'.",
                     "event_type": "genesis_starting",
                     "agent_name": "StudioDaemon",
+                    "build_id": active_bid,
                     "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                     "payload": {
                         "profile_tag": self.config.steam_profile,
                         "candidate_id": staging_dir.name,
+                        "cartridge_id": staging_dir.name,
                     },
                 })
             else:
                 logger.info("Cold boot detected: Initiating Genesis Build...")
-                staging_dir = self.config.cartridges_root / f"candidate_genesis_{uuid.uuid4().hex[:6]}"
-                staging_dir.mkdir(parents=True, exist_ok=True)
                 self.event_bus.publish_threadsafe({
                     "deliberation": "Cold boot detected; initiating autonomous Genesis build cycle.",
                     "event_type": "genesis_starting",
                     "agent_name": "StudioDaemon",
+                    "build_id": active_bid,
                     "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                     "payload": {
                         "profile_tag": self.config.steam_profile,
                         "candidate_id": staging_dir.name,
+                        "cartridge_id": staging_dir.name,
                     },
                 })
-            from engine.studio.models import set_active_gemini_dataset_context
-            set_active_gemini_dataset_context(
-                dataset_name=self.config.dataset_name or staging_dir.name,
-                candidate_dir=staging_dir,
-            )
             report = None
 
             try:
@@ -624,9 +670,29 @@ class StudioDaemon:
                         except Exception as dna_exc:
                             logger.warning("Steam DNA extraction warning during Genesis: %s", dna_exc)
 
-                        if self.config.creative_prompt:
-                            self.orchestrator._creative_prompt = self.config.creative_prompt
-                            if self.config.resume_current and hasattr(self.orchestrator, "enqueue_user_steering"):
+                        has_persisted_bible = (staging_dir / "game_bible.json").is_file()
+                        effective_prompt = self.config.creative_prompt
+                        if not effective_prompt and not has_persisted_bible and (staging_dir / "co_producer_brief.json").is_file():
+                            try:
+                                cp_env = json.loads((staging_dir / "co_producer_brief.json").read_text(encoding="utf-8"))
+                                if isinstance(cp_env, dict):
+                                    cb_inner = cp_env.get("concept_brief") if isinstance(cp_env.get("concept_brief"), dict) else {}
+                                    effective_prompt = str(
+                                        cp_env.get("steering_or_seed_brief")
+                                        or cb_inner.get("elevator_pitch")
+                                        or ""
+                                    ).strip() or None
+                            except Exception:
+                                effective_prompt = None
+
+                        if effective_prompt:
+                            self.orchestrator._creative_prompt = effective_prompt
+                            if (
+                                self.config.resume_current
+                                and has_persisted_bible
+                                and self.config.creative_prompt
+                                and hasattr(self.orchestrator, "enqueue_user_steering")
+                            ):
                                 try:
                                     self.orchestrator.enqueue_user_steering(self.config.creative_prompt)
                                 except Exception:

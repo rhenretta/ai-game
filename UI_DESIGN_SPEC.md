@@ -1,7 +1,7 @@
 # Studio Observability UI Design Specification (Requirement R5)
-- **Document Version:** 2.2.0
+- **Document Version:** 2.3.0
 - **Status:** IMPLEMENTED
-- **Target Milestone:** M_UI → M20
+- **Target Milestone:** M_UI → M21
 - **Module Scope:** `studio-web/`, `engine/ui/server.py`, `engine/ui/models.py`
 - **Reference Requirements:** R1, R2, R3, R5
 
@@ -527,12 +527,15 @@ Mission Control (`studio-web/src/`) unifies studio operations across 8 workspace
 3. **Synchronous `t=0ms` Optimistic Message Submission**:
    - Submitting a message clears the composer `<textarea>` synchronously at `t=0ms` and appends an optimistic Executive Producer bubble into the conversation history immediately (`pendingSubmission`) before awaiting `POST /api/coproducer/threads/{thread_id}/messages`, restoring the draft text into the composer if a network/API error occurs so zero user input is ever lost.
 
-### 14.2 Curated Presentation vs. Deep Observability (`CoProducerCards.tsx`, `CoProducerTurnDecision`)
+### 14.2 Curated Presentation, Shot-Compiled `2K` Concept Sketches & Deep Observability (`CoProducerCards.tsx`, `CoProducerFinalTurn`)
 1. **Curated Default Replies (`presented_card_ids` / `show_by_default`)**:
-   - By default, each Co-Producer reply renders only the conversational markdown response, any confirmation-gated `CoProducerActionProposal` cards (`commission_game`, `pivot_course_correction`, `pivot_structural`, `pivot_fork_cartridge`), and media/consultation cards explicitly selected by `CoProducerTurnDecision.presented_card_ids` (`show_by_default = true`).
-2. **Expandable Behind-the-Scenes Drill-Down (`.coproducer-bts-disclosure`)**:
-   - Full epistemic `deliberation`, executed `tool_trace` steps (`curate_genre_fun_foundation`, `consult_council`, `dispatch_specialist_probe`, `sketch_multimodal_concept`, `query_game_memory`, `inspect_game_state`), unpresented background research/consultation cards, token telemetry, and raw `prompt_trace` payloads remain 100% inspectable inside collapsible native `<details>` disclosures (`Behind the scenes`)—preserving complete Rule 4 observability without overwhelming the conversation stream.
-   - An optional **`Brief`** header toggle opens a collapsible right-hand Concept Brief & Studio State drawer (`genre_craft_foundation` summary, working title, fantasy, loop, pillars, open questions, and non-goals).
+   - By default, each Co-Producer reply renders only the conversational markdown response, any confirmation-gated `CoProducerActionProposal` cards (`commission_game`, `pivot_course_correction`, `pivot_structural`, `pivot_fork_cartridge`, with pre-bible cartridges normalizing `commission_game` in-place to `resume_build`), and media cards explicitly selected by `CoProducerFinalTurn.presented_card_ids` (`show_by_default = true`).
+2. **Shot-Compiled `2K` Concept Art & Pre-Presentation Multimodal Quality Gate (`ConceptArtShotPlan`, `ConceptArtCritiqueVerdict`)**:
+   - Inline `concept_mockup_16x9` sketches compile raw design prose and cumulative `user_confirmed_pillars` / `explicit_non_goals` into a coherent local-viewport `ConceptArtShotPlan`, synthesize at `2K` 16:9 via `gemini-nano-banana-2.1` (supporting selective `use_prior_sketch_as_reference` continuity and zero poster-title text triggers), run `_critique_concept_art_render` on the rendered PNG before staging, auto-regenerate once (`coproducer_sketch_regenerating`) if scale/perspective/slop defects are detected, and attach an honest pixel audit (`sketch_fidelity_audit`) into Behind-the-Scenes observability.
+3. **Expandable Behind-the-Scenes Drill-Down (`.coproducer-bts-disclosure`) & Strict Cartridge Isolation**:
+   - Full epistemic `deliberation`, executed `tool_trace` steps (`curate_genre_fun_foundation`, `consult_council`, `dispatch_specialist_probe`, `sketch_multimodal_concept`, `inspect_studio_progress`, `inspect_game_bible_and_dna`, `inspect_playtest_sessions`, `browse_cartridge_media_and_code`), unpresented background research/consultation cards, token telemetry, and raw `prompt_trace` payloads remain 100% inspectable inside collapsible native `<details>` disclosures (`Behind the scenes`).
+   - `/api/studio/game-bible` and `/api/events/history` strictly scope `process_status` (`active_building_cartridge_id`, `other_active_cartridge_id`) and `build_<candidate_id>` event streams to the selected cartridge (healing pre-Turn-0 bibles live from `co_producer_brief.json` with zero cross-cartridge Writers' Room bleed).
+   - An optional **`Brief`** header toggle opens a collapsible right-hand Concept Brief & Studio State drawer (`genre_craft_foundation` summary, working title, fantasy, loop, `user_confirmed_pillars`, `open_design_questions`, and `explicit_non_goals`).
 
 ### 14.3 `GenreCraftFoundation` Game Bible Showcase & `CoProducer` Council Chair Parity (`GameBibleView.tsx`, `WritersRoomView.tsx`, `roles.ts`)
 1. **Game Bible `GenreCraftFoundation` Section (`GameBibleView.tsx`)**:

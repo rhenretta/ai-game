@@ -713,6 +713,14 @@ class StudioSettingsUpdateRequest(BaseModel):
         default=None,
         description="When True, pauses active build workers and Writers' Room turns until resumed.",
     )
+    candidate_id: Optional[str] = Field(
+        default=None,
+        description="Optional explicit candidate cartridge ID to resume when unpausing an idle studio.",
+    )
+    auto_spawn_resume: bool = Field(
+        default=True,
+        description="When True (default), unpausing an idle studio automatically spawns a resume worker for the target cartridge.",
+    )
 
 
 class GameLaunchRequest(BaseModel):

@@ -33,6 +33,8 @@ import uuid
 from google.genai import types
 
 from engine.studio.models import (
+    ConceptArtCritiqueVerdict,
+    ConceptArtShotPlan,
     CoProducerActionProposal,
     CoProducerConceptBrief,
     CoProducerConsultationCard,
@@ -41,6 +43,7 @@ from engine.studio.models import (
     CoProducerMediaItem,
     CoProducerStepDecision,
     CoProducerToolCall,
+    DEFAULT_CONCEPT_MOCKUP_MODEL,
     DEFAULT_STUDIO_MODEL,
     GameBibleSpec,
     StudioAgentConfigurationError,
@@ -117,6 +120,98 @@ class CoProducerThreadStore:
         os.replace(tmp_path, snap_path)
         return snap_path
 
+    def _sync_cartridge_brief_file(
+        self,
+        thread_meta: Dict[str, Any],
+        concept_brief: Optional[Dict[str, Any]],
+        *,
+        override_seed_brief: Optional[str] = None,
+        handoff_mode: Optional[str] = None,
+    ) -> None:
+        """Keeps `<cartridge_dir>/co_producer_brief.json` and `assets/mockups/` synchronized whenever a
+        cartridge-bound Co-Producer thread refines its `concept_brief`, preventing stale Turn-N handoff snapshots."""
+        if not isinstance(concept_brief, dict) or not concept_brief:
+            return
+        if str(thread_meta.get("scope_kind") or "") != "cartridge":
+            return
+        cid = str(thread_meta.get("cartridge_id") or "").strip()
+        if not cid:
+            return
+        c_dir = self.cartridges_root / cid
+        if not c_dir.is_dir():
+            return
+        brief_path = c_dir / HANDOFF_BRIEF_FILENAME
+        existing_env: Dict[str, Any] = {}
+        if brief_path.is_file():
+            try:
+                loaded = json.loads(brief_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    existing_env = loaded
+            except Exception:
+                existing_env = {}
+        elif (c_dir / "game_bible.json").is_file():
+            # Do not create a brand-new pre-genesis handoff file on legacy cartridges that started directly from Genesis
+            return
+
+        eff_cb = dict(concept_brief)
+        remapped_mockups: List[str] = []
+        for raw_m in list(eff_cb.get("selected_mockup_paths") or []):
+            rel_m = str(raw_m or "").strip().lstrip("/")
+            if rel_m.startswith(f"{cid}/"):
+                rel_m = rel_m[len(cid) + 1:]
+            if not rel_m:
+                continue
+            src_candidate = c_dir / rel_m
+            if src_candidate.is_file():
+                dst_mockups = c_dir / "assets" / "mockups"
+                dst_mockups.mkdir(parents=True, exist_ok=True)
+                dst_file = dst_mockups / src_candidate.name
+                if src_candidate.resolve() != dst_file.resolve():
+                    shutil.copy2(src_candidate, dst_file)
+                mapped_rel = f"assets/mockups/{dst_file.name}"
+                if mapped_rel not in remapped_mockups:
+                    remapped_mockups.append(mapped_rel)
+            elif rel_m not in remapped_mockups:
+                remapped_mockups.append(rel_m)
+        if remapped_mockups:
+            eff_cb["selected_mockup_paths"] = remapped_mockups
+
+        eff_mode = (
+            handoff_mode
+            or str(existing_env.get("handoff_mode") or "").strip()
+            or ("refined_concept" if eff_cb.get("working_title") else "loose_spark")
+        )
+        pillars_summary = "; ".join(
+            str(p).strip()
+            for p in (eff_cb.get("user_confirmed_pillars") or eff_cb.get("core_player_verbs") or [])[:6]
+            if str(p).strip()
+        )
+        synthesized_seed = str(override_seed_brief or "").strip()
+        if not synthesized_seed:
+            pitch_txt = str(eff_cb.get("elevator_pitch") or "").strip()
+            if pitch_txt:
+                synthesized_seed = (
+                    f"{pitch_txt} Core pillars: {pillars_summary}" if pillars_summary else pitch_txt
+                )
+            else:
+                synthesized_seed = str(existing_env.get("steering_or_seed_brief") or "").strip()
+
+        now_iso = _utc_now_iso()
+        updated_env = _ordered_rationale_dict(
+            str(eff_cb.get("deliberation") or existing_env.get("deliberation") or f"Synced living Co-Producer brief for '{cid}'."),
+            handoff_mode=eff_mode,
+            graduated_from_thread_id=str(existing_env.get("graduated_from_thread_id") or thread_meta.get("thread_id") or ""),
+            cartridge_id=cid,
+            steering_or_seed_brief=synthesized_seed,
+            concept_brief=eff_cb,
+            created_at_utc=str(existing_env.get("created_at_utc") or now_iso),
+            updated_at_utc=now_iso,
+        )
+        tmp_brief = brief_path.with_suffix(".json.tmp")
+        tmp_brief.write_text(json.dumps(updated_env, indent=2, default=str), encoding="utf-8")
+        os.replace(tmp_brief, brief_path)
+        thread_meta["concept_brief"] = eff_cb
+
     def _sync_from_disk_if_needed(self, thread_dir: Path) -> Optional[Dict[str, Any]]:
         snap_path = self._snapshot_path(thread_dir)
         if not snap_path.is_file():
@@ -132,6 +227,17 @@ class CoProducerThreadStore:
         msgs = raw.get("messages")
         if not isinstance(t_meta, dict) or not str(t_meta.get("thread_id") or "").strip():
             return None
+        # Heal stale co_producer_brief.json if co_producer.json has a newer updated_at_utc
+        brief_path = Path(thread_dir) / HANDOFF_BRIEF_FILENAME
+        if brief_path.is_file() and isinstance(t_meta.get("concept_brief"), dict) and t_meta.get("concept_brief"):
+            try:
+                b_env = json.loads(brief_path.read_text(encoding="utf-8"))
+                b_ts = str((b_env if isinstance(b_env, dict) else {}).get("updated_at_utc") or (b_env if isinstance(b_env, dict) else {}).get("created_at_utc") or "")
+                t_ts = str(t_meta.get("updated_at_utc") or "")
+                if t_ts and (not b_ts or t_ts > b_ts):
+                    self._sync_cartridge_brief_file(t_meta, t_meta["concept_brief"])
+            except Exception:
+                pass
         if self.db is not None and hasattr(self.db, "get_coproducer_thread"):
             existing = self.db.get_coproducer_thread(str(t_meta["thread_id"]))
             if existing is None:
@@ -362,6 +468,7 @@ class CoProducerThreadStore:
                 updated_meta["title"] = updated_title.strip()
             if isinstance(updated_concept_brief, dict) and updated_concept_brief:
                 updated_meta["concept_brief"] = updated_concept_brief
+                self._sync_cartridge_brief_file(updated_meta, updated_concept_brief)
             updated_meta["updated_at_utc"] = now_iso
             msgs.append(msg_record)
             updated_meta["message_count"] = len(msgs)
@@ -385,6 +492,7 @@ class CoProducerThreadStore:
             msgs = list((existing_detail or {}).get("messages") or [])
             updated_meta = dict(thread_meta)
             updated_meta["concept_brief"] = dict(concept_brief)
+            self._sync_cartridge_brief_file(updated_meta, updated_meta["concept_brief"])
             updated_meta["updated_at_utc"] = _utc_now_iso()
             if self.db is not None and hasattr(self.db, "upsert_coproducer_thread"):
                 self.db.upsert_coproducer_thread(updated_meta)
@@ -647,9 +755,11 @@ class CoProducerAgent:
         db: Optional[Any] = None,
         model_name: str = DEFAULT_STUDIO_MODEL,
         image_model_name: str = "gemini-3.1-flash-lite-image",
+        concept_mockup_model_name: str = DEFAULT_CONCEPT_MOCKUP_MODEL,
         tts_model_name: str = "gemini-3.8-flash-tts",
         event_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         max_tool_hops: int = 4,
+        enable_art_direction_pipeline: Optional[bool] = None,
     ) -> None:
         self.client = client
         self.cartridges_root = Path(cartridges_root)
@@ -657,9 +767,15 @@ class CoProducerAgent:
         self.store = CoProducerThreadStore(self.cartridges_root, db=db)
         self.model_name = (model_name or DEFAULT_STUDIO_MODEL).strip()
         self.image_model_name = (image_model_name or "gemini-3.1-flash-lite-image").strip()
+        self.concept_mockup_model_name = (concept_mockup_model_name or DEFAULT_CONCEPT_MOCKUP_MODEL).strip()
         self.tts_model_name = (tts_model_name or "gemini-3.8-flash-tts").strip()
         self.event_callback = event_callback
         self.max_tool_hops = max(1, min(6, int(max_tool_hops)))
+        self.enable_art_direction_pipeline = (
+            bool(is_real_genai_client(client))
+            if enable_art_direction_pipeline is None
+            else bool(enable_art_direction_pipeline)
+        )
 
     def _emit(self, event_type: str, deliberation: str, payload: Dict[str, Any]) -> None:
         ordered = _ordered_rationale_dict(
@@ -845,13 +961,33 @@ class CoProducerAgent:
                 "core_genre",
                 "elevator_pitch",
                 "core_player_verbs",
+                "user_confirmed_pillars",
                 "explicit_non_goals",
+                "open_design_questions",
                 "genre_craft_foundation",
             )
         ):
+            confirmed_pillars = [str(x).strip() for x in (brief.get("user_confirmed_pillars") or []) if str(x).strip()]
+            non_goals = [str(x).strip() for x in (brief.get("explicit_non_goals") or []) if str(x).strip()]
+            open_qs = [str(x).strip() for x in (brief.get("open_design_questions") or []) if str(x).strip()]
+            if confirmed_pillars:
+                lines.append(
+                    "USER_CONFIRMED_PILLARS_LEDGER (MUST PRESERVE CUMULATIVELY UNLESS USER RETRACTS):\n- "
+                    + "\n- ".join(confirmed_pillars)
+                )
+            if non_goals:
+                lines.append(
+                    "EXPLICIT_NON_GOALS_AND_VISUAL_EXCLUSIONS (STRICT HARD CONSTRAINTS):\n- "
+                    + "\n- ".join(non_goals)
+                )
+            if open_qs:
+                lines.append(
+                    "OPEN_DESIGN_QUESTIONS:\n- "
+                    + "\n- ".join(open_qs)
+                )
             brief_preview = {k: v for k, v in brief.items() if k != "genre_craft_foundation"}
             if brief_preview:
-                lines.append(f"EVOLVING_CONCEPT_BRIEF_JSON:\n{json.dumps(brief_preview, indent=2, default=str)[:2200]}")
+                lines.append(f"EVOLVING_CONCEPT_BRIEF_JSON:\n{json.dumps(brief_preview, indent=2, default=str)[:4500]}")
 
         active_gcf = self._resolve_active_genre_foundation(thread_meta)
         if active_gcf:
@@ -868,6 +1004,7 @@ class CoProducerAgent:
         if scope == "cartridge" and cid:
             c_dir = self.cartridges_root / cid
             gb_path = c_dir / "game_bible.json"
+            lines.append(f"HAS_PERSISTED_GAME_BIBLE: {gb_path.is_file()}")
             if gb_path.is_file():
                 try:
                     gb = json.loads(gb_path.read_text(encoding="utf-8"))
@@ -1176,7 +1313,38 @@ class CoProducerAgent:
                 except Exception as exc:
                     out_sections.append(f"Error parsing game_bible.json for `{cid}`: {exc}")
             else:
-                out_sections.append(f"No `game_bible.json` exists yet for `{cid}`.")
+                hb_path = c_dir / HANDOFF_BRIEF_FILENAME
+                if hb_path.is_file():
+                    try:
+                        hb = json.loads(hb_path.read_text(encoding="utf-8"))
+                        cb = hb.get("concept_brief") if isinstance(hb.get("concept_brief"), dict) else hb
+                        out_sections.append(
+                            f"=== PRE-BIBLE COMMISSIONED CONCEPT BRIEF (`{cid}/{HANDOFF_BRIEF_FILENAME}`) ===\n"
+                            f"Note: `game_bible.json` has not been synthesized by the Writers' Room yet; this cartridge is still in pre-bible refinement.\n"
+                            f"Handoff Mode: {hb.get('handoff_mode', 'refined_concept')}\n"
+                            f"Working Title: {cb.get('working_title', '')}\n"
+                            f"Core Genre: {cb.get('core_genre', '')}\n"
+                            f"Elevator Pitch: {cb.get('elevator_pitch', '')}\n"
+                            f"Core Fantasy: {cb.get('core_fantasy', '')}\n"
+                            f"Player Verbs: {cb.get('core_player_verbs', [])}\n"
+                            f"User-Confirmed Pillars: {cb.get('user_confirmed_pillars', [])}\n"
+                            f"Visual Style Direction: {cb.get('visual_style_direction', '')}\n"
+                            f"Audio Mood Direction: {cb.get('audio_mood_direction', '')}\n"
+                            f"Explicit Non-Goals: {cb.get('explicit_non_goals', [])}\n"
+                            f"Open Design Questions: {cb.get('open_design_questions', [])}\n"
+                            f"Selected Mockups: {cb.get('selected_mockup_paths', [])}"
+                        )
+                        for raw_mp in list(cb.get("selected_mockup_paths") or [])[-2:]:
+                            mp_clean = str(raw_mp or "").lstrip("/")
+                            mp = (c_dir / mp_clean) if not mp_clean.startswith(f"{cid}/") else (self.cartridges_root / mp_clean)
+                            part = self._load_png_part(mp)
+                            if part is not None:
+                                multimodal_parts.append(f"PRE-BIBLE CONCEPT MOCKUP (`{raw_mp}`):")
+                                multimodal_parts.append(part)
+                    except Exception as hb_exc:
+                        out_sections.append(f"No `game_bible.json` exists yet for `{cid}` (error reading `{HANDOFF_BRIEF_FILENAME}`: {hb_exc}).")
+                else:
+                    out_sections.append(f"No `game_bible.json` exists yet for `{cid}`.")
 
         if focus in ("player_dna", "both"):
             dna_loaded = None
@@ -1196,7 +1364,7 @@ class CoProducerAgent:
                     for g in (getattr(dna_loaded, "top_games", None) or [])[:8]
                 ]
                 out_sections.append(
-                    f"=== PLAYER TASTE DNA ===\n"
+                    f"=== BACKGROUND PLAYER TASTE DNA (OPTIONAL INSPIRATION ONLY — SUBORDINATE TO EXPLICIT USER DIRECTIVES) ===\n"
                     f"Top Genres: {dna_loaded.top_genres}\n"
                     f"Thematic Biases: {dna_loaded.thematic_biases}\n"
                     f"Mechanical Biases: {dna_loaded.mechanical_biases}\n"
@@ -1673,8 +1841,21 @@ class CoProducerAgent:
         thread_meta: Dict[str, Any],
         multimodal_parts: List[Any],
         consultation_cards: List[CoProducerConsultationCard],
+        *,
+        latest_user_message: str = "",
+        conversation_history: str = "",
     ) -> str:
         from engine.studio.writers_room import CreativeWritersRoom
+
+        effective_question = (call.query_or_question or "").strip()
+        if not effective_question:
+            if (latest_user_message or "").strip():
+                effective_question = (
+                    "Address the Executive Producer's latest message directly while preserving all previously "
+                    f"confirmed game pillars and explicit non-goals: {latest_user_message.strip()}"
+                )
+            else:
+                effective_question = "Offer sharp, contrasting creative and systemic ideas."
 
         if is_real_genai_client(self.client) and self._resolve_active_genre_foundation(thread_meta) is None:
             try:
@@ -1684,7 +1865,7 @@ class CoProducerAgent:
                         "the Council so specialists have zero blind spots on what makes this genre genuinely fun."
                     ),
                     tool_name="curate_genre_fun_foundation",
-                    query_or_question=call.query_or_question,
+                    query_or_question=effective_question,
                 )
                 self._tool_curate_genre_fun_foundation(auto_call, thread_meta, consultation_cards)
             except Exception as gcf_exc:
@@ -1698,9 +1879,16 @@ class CoProducerAgent:
         )
         dna_summary = self._load_dna_summary_text()
 
-        ctx_summary = self._build_lightweight_context_header(thread_meta)
+        ctx_parts = [self._build_lightweight_context_header(thread_meta)]
+        if (conversation_history or "").strip():
+            ctx_parts.append(f"RECENT CONVERSATION HISTORY:\n{conversation_history.strip()[-3500:]}")
+        if (latest_user_message or "").strip():
+            ctx_parts.append(
+                f"LATEST EXECUTIVE PRODUCER MESSAGE (PRIMARY DIRECTIVE):\n{latest_user_message.strip()}"
+            )
+        ctx_summary = "\n\n".join(ctx_parts)
         card: CoProducerConsultationCard = room.run_advisory_consultation(
-            question=call.query_or_question or "Offer sharp, contrasting creative and systemic ideas.",
+            question=effective_question,
             mode=call.council_mode or "huddle",
             specialist_roles=list(call.specialist_roles or []),
             context_summary=ctx_summary,
@@ -1803,18 +1991,174 @@ class CoProducerAgent:
         consultation_cards.append(card)
         return f"SPECIALIST PROBE (`{persona}`) COMPLETED:\n{rep.summary}\nProofs: {rel_proofs}"
 
+    def _resolve_prior_sketch_reference_path(
+        self,
+        thread_meta: Dict[str, Any],
+        sketches_dir: Path,
+    ) -> Optional[Path]:
+        """Resolves the most recent approved 16:9 mockup PNG when targeted reference-based refinement is requested."""
+        t_dir = self.store.resolve_thread_dir(thread_meta)
+        brief = dict(thread_meta.get("concept_brief") or {})
+        for raw_rel in reversed(list(brief.get("selected_mockup_paths") or [])):
+            clean_rel = str(raw_rel or "").strip().lstrip("/")
+            if not clean_rel:
+                continue
+            for cand in (t_dir / clean_rel, self.cartridges_root / clean_rel):
+                if cand.is_file():
+                    return cand
+        if sketches_dir.is_dir():
+            existing = sorted(sketches_dir.glob("mockup_*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if existing:
+                return existing[0]
+        return None
+
+    def _compile_concept_art_shot_plan(
+        self,
+        *,
+        title: str,
+        raw_scene_request: str,
+        effective_style: str,
+        neg_constraints: Sequence[str],
+        thread_meta: Dict[str, Any],
+        latest_user_message: str = "",
+        conversation_history: str = "",
+        prior_reference_path: Optional[Path] = None,
+        candidate_dir: Optional[Path] = None,
+        prompt_trace_sink: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[ConceptArtShotPlan, Dict[str, int]]:
+        """Compiles raw creative ideation prose and user feedback into a spatially coherent, playable-scale
+        `ConceptArtShotPlan` before invoking the image generation model."""
+        brief = dict(thread_meta.get("concept_brief") or {})
+        pillars = [str(p).strip() for p in (brief.get("user_confirmed_pillars") or []) if str(p).strip()]
+        palette = [str(c).strip() for c in (brief.get("color_palette_hex") or []) if str(c).strip()]
+        genre = str(brief.get("core_genre") or "").strip()
+        pitch = str(brief.get("elevator_pitch") or "").strip()
+
+        mm_parts: List[Any] = []
+        if prior_reference_path is not None:
+            ref_part = self._load_png_part(prior_reference_path)
+            if ref_part is not None:
+                mm_parts.append(f"PRIOR CONCEPT SKETCH REFERENCE (`{prior_reference_path.name}`):")
+                mm_parts.append(ref_part)
+
+        shot_prompt = (
+            "You are the Principal Game Art Director & Cinematography Shot Compiler.\n"
+            "Translate the design intent and user feedback below into a single coherent, playable-scale 16:9 in-engine "
+            "gameplay viewport `ConceptArtShotPlan`.\n\n"
+            "MANDATORY ART-DIRECTION INVARIANTS:\n"
+            "1. SINGLE COHERENT CAMERA & VIEWPORT SCALE (RESOLVE MACRO-VS-MICRO PARADOXES):\n"
+            "   - Lock ONE consistent camera projection across all playable entities and structures (e.g., pure 90-degree "
+            "orthographic top-down 2D, 2D side cross-section, fixed-angle isometric, etc.).\n"
+            "   - Whenever a small playable craft, character, or local facility operates inside a vast or colossal world, "
+            "keep the camera locked to the LOCAL PLAYABLE VIEWPORT scale where the player unit (~3-7% of frame height) and "
+            "multi-module gameplay structures (~20-40% of frame width) are crisp, readable, and proportionally scaled.\n"
+            "   - Convey colossal world vastness via edge-to-edge environmental fields and deep background/underlayer parallax "
+            "vistas sweeping across or beneath the frame — NEVER zoom out to a whole-world diagram/map with an oversized "
+            "continent-scale icon pasted on top, and NEVER shrink a vast world into a tiny centered concentric bullseye or "
+            "miniature toy diorama around the player.\n"
+            "2. EXPLICIT RENDERING MEDIUM & SURFACE CRAFT:\n"
+            "   - Specify the exact rendering medium, shader/material finish, linework, and lighting craft matching the game's "
+            "direction (e.g., crisp high-definition 2D digital illustration with clean geometric silhouettes, shader-lit "
+            "materials, emissive conduits, and multi-plane parallax; painterly 2D illustration; stylized cel-shaded 3D; or "
+            "deliberate pixel art ONLY when pixel art was explicitly requested). Avoid vague 'indie game' phrasing that "
+            "causes accidental retro pixel-art drift or simplified mobile-app clip art.\n"
+            "3. FUNCTIONAL MULTI-PART GAMEPLAY ARCHITECTURE:\n"
+            "   - Describe structures, machinery, terrain, and interactables as believable multi-component game systems with "
+            "interconnected sub-modules, clear silhouettes, and active in-world visual state — NEVER a single flat "
+            "simplified cross, badge, or logo emblem.\n"
+            "4. PURE IN-WORLD VIEWPORT POLICY:\n"
+            "   - Unless HUD widgets were explicitly requested for this shot, specify zero title text, zero poster typography, "
+            "zero watermarks, zero floating text labels, and zero generic HUD chrome.\n\n"
+            f"SHOT WORKING LABEL (INTERNAL ONLY — DO NOT RENDER AS TEXT): {title}\n"
+            f"CORE GENRE: {genre or '(evolving)'}\n"
+            f"ELEVATOR PITCH: {pitch or '(evolving)'}\n"
+            f"CONFIRMED GAMEPLAY PILLARS:\n"
+            + ("\n".join(f"- {p}" for p in pillars) if pillars else "- (none locked yet)")
+            + f"\n\nSTYLE & CAMERA DIRECTION:\n{effective_style or '(derive crisp high-craft medium fitting the concept)'}\n"
+            f"COLOR PALETTE HEX ANCHORS: {', '.join(palette) if palette else '(derive cohesive high-contrast game palette)'}\n"
+            f"RECENT CONVERSATION CONTEXT:\n{(conversation_history or '(none)')[-2800:]}\n\n"
+            f"LATEST USER MESSAGE:\n{latest_user_message or '(none)'}\n\n"
+            f"CO-PRODUCER SCENE REQUEST:\n{raw_scene_request}\n\n"
+            f"CUMULATIVE HARD VISUAL EXCLUSIONS:\n"
+            + ("\n".join(f"- {n}" for n in neg_constraints) if neg_constraints else "- (apply universal anti-slop exclusions)")
+            + "\n\nProvide `deliberation` FIRST."
+        )
+        return self._call_structured(
+            prompt=shot_prompt,
+            schema_cls=ConceptArtShotPlan,
+            temperature=0.35,
+            label="CoProducerAgent.compile_concept_art_shot_plan",
+            multimodal_parts=mm_parts or None,
+            candidate_dir=candidate_dir,
+            prompt_trace_sink=prompt_trace_sink,
+        )
+
+    def _critique_concept_art_render(
+        self,
+        *,
+        rendered_path: Path,
+        shot_plan: ConceptArtShotPlan,
+        latest_user_message: str = "",
+        attempt: int = 1,
+        candidate_dir: Optional[Path] = None,
+        prompt_trace_sink: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[ConceptArtCritiqueVerdict, Dict[str, int]]:
+        """Multimodally inspects a rendered 16:9 concept PNG before staging it to catch scale collapse,
+        perspective drift, poster text, or violated user constraints."""
+        img_part = self._load_png_part(rendered_path)
+        if img_part is None:
+            raise StudioAgentError(f"Rendered concept art PNG at '{rendered_path}' could not be loaded for multimodal critique.")
+
+        critique_prompt = (
+            f"You are the Studio Art-Direction Quality Gate inspecting candidate 16:9 concept render attempt #{attempt}.\n"
+            "Examine the attached PNG pixels carefully and honestly against the user's latest feedback and `ConceptArtShotPlan`.\n\n"
+            "AUTOMATIC REJECTION CONDITIONS (`passes_art_direction_bar = False` if ANY occur in the image):\n"
+            "1. TEXT / POSTER / HUD SLOP: Visible title lettering, poster headers, watermarks, floating callout text labels, "
+            "or unrequested HUD bars/minimaps.\n"
+            "2. CAMERA PROJECTION DRIFT: Camera angle violates `camera_projection_and_viewport_scale` (e.g., 3D perspective, "
+            "isometric tilt, or side-view platformer cross-section when pure top-down 2D was specified, or vice versa).\n"
+            "3. SPATIAL SCALE COLLAPSE: Either (a) shrinking a vast environment into a tiny centered concentric bullseye / "
+            "miniature toy ring around a single unit, OR (b) zooming out to a whole-world diagram and pasting a giant "
+            "continent-sized flat icon/cross on top instead of proportional playable structures.\n"
+            "4. RENDERING MEDIUM DRIFT: Unrequested chunky retro pixel art or simplified mobile-app clip-art icon when crisp "
+            "high-definition 2D/3D game art was specified.\n"
+            "5. HARD EXCLUSION VIOLATION: Any item in `hard_visual_exclusions` appears in the rendered pixels.\n\n"
+            f"LATEST USER MESSAGE:\n{latest_user_message or '(none)'}\n\n"
+            f"TARGET CONCEPT ART SHOT PLAN JSON:\n{shot_plan.model_dump_json(indent=2)}\n\n"
+            "If `passes_art_direction_bar` is False, write a concrete, self-contained `corrective_scene_rewrite` that fixes "
+            "every observed defect by describing the exact playable viewport geometry, relative proportions, depth layers, "
+            "and surface craft to render instead.\n"
+            "Provide `deliberation` FIRST and `passes_art_direction_bar` LAST."
+        )
+        return self._call_structured(
+            prompt=critique_prompt,
+            schema_cls=ConceptArtCritiqueVerdict,
+            temperature=0.20,
+            label=f"CoProducerAgent.critique_concept_art[attempt{attempt}]",
+            multimodal_parts=[f"CANDIDATE CONCEPT MOCKUP ATTEMPT #{attempt} (`{rendered_path.name}`):", img_part],
+            candidate_dir=candidate_dir,
+            prompt_trace_sink=prompt_trace_sink,
+        )
+
     def _tool_sketch_multimodal_concept(
         self,
         call: CoProducerToolCall,
         thread_meta: Dict[str, Any],
         multimodal_parts: List[Any],
         staged_media_cards: List[CoProducerMediaCard],
+        *,
+        latest_user_message: str = "",
+        conversation_history: str = "",
+        prompt_trace_sink: Optional[List[Dict[str, Any]]] = None,
+        usage_accumulator: Optional[Callable[[Dict[str, int]], None]] = None,
     ) -> str:
         if self.client is None:
             raise StudioAgentConfigurationError(
                 "sketch_multimodal_concept requires an active Gemini client (Rule 5: Zero Silent Fallbacks)."
             )
         t_dir = self.store.resolve_thread_dir(thread_meta)
+        cid = str(thread_meta.get("cartridge_id") or "").strip()
+        cand_dir = (self.cartridges_root / cid) if cid else None
         sketches_dir = t_dir / "assets" / "sketches"
         sketches_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1822,22 +2166,159 @@ class CoProducerAgent:
         title = (call.sketch_title or "").strip() or kind.replace("_", " ").title()
         prompt_text = (call.query_or_question or "").strip() or title
         secondary = (call.sketch_secondary_direction or "").strip()
+        brief = dict(thread_meta.get("concept_brief") or {})
+        brief_style = str(brief.get("visual_style_direction") or "").strip()
+        effective_style = (
+            f"{secondary}\nEstablished Concept Style Direction: {brief_style}"
+            if (secondary and brief_style and brief_style.lower() not in secondary.lower())
+            else (secondary or brief_style)
+        )
+        neg_constraints: List[str] = []
+        seen_neg: set[str] = set()
+        for raw_neg in list(call.sketch_negative_constraints or []) + list(brief.get("explicit_non_goals") or []):
+            clean_neg = str(raw_neg or "").strip()
+            if clean_neg and clean_neg.lower() not in seen_neg:
+                seen_neg.add(clean_neg.lower())
+                neg_constraints.append(clean_neg)
+
         slug = _safe_slug(title, kind)
         stamp = uuid.uuid4().hex[:6]
 
         if kind == "concept_mockup_16x9":
             from engine.studio.visual import VisualArtSpriteDesignerAgent
 
-            vis = VisualArtSpriteDesignerAgent(client=self.client, model_name=self.image_model_name)
-            out_path = sketches_dir / f"mockup_{slug}_{stamp}.png"
-            vis.generate_concept_mockup(
-                {
-                    "title": title,
-                    "scene_description": prompt_text,
-                },
-                output_path=out_path,
-                style_guide=secondary,
+            vis = VisualArtSpriteDesignerAgent(
+                client=self.client,
+                model_name=self.image_model_name,
+                concept_mockup_model_name=self.concept_mockup_model_name,
             )
+            out_path = sketches_dir / f"mockup_{slug}_{stamp}.png"
+            prior_ref_path = (
+                self._resolve_prior_sketch_reference_path(thread_meta, sketches_dir)
+                if bool(getattr(call, "use_prior_sketch_as_reference", False))
+                else None
+            )
+            ref_list = [prior_ref_path] if prior_ref_path is not None else None
+
+            final_verdict: Optional[ConceptArtCritiqueVerdict] = None
+            attempts_used = 1
+            caption_summary = prompt_text[:220]
+
+            if self.enable_art_direction_pipeline:
+                shot_plan, plan_usage = self._compile_concept_art_shot_plan(
+                    title=title,
+                    raw_scene_request=prompt_text,
+                    effective_style=effective_style,
+                    neg_constraints=neg_constraints,
+                    thread_meta=thread_meta,
+                    latest_user_message=latest_user_message,
+                    conversation_history=conversation_history,
+                    prior_reference_path=prior_ref_path,
+                    candidate_dir=cand_dir,
+                    prompt_trace_sink=prompt_trace_sink,
+                )
+                if callable(usage_accumulator):
+                    usage_accumulator(plan_usage)
+                caption_summary = shot_plan.playable_midground_composition[:220]
+
+                vis.generate_concept_mockup(
+                    {
+                        "title": title,
+                        "scene_description": prompt_text,
+                        "negative_constraints": neg_constraints,
+                    },
+                    output_path=out_path,
+                    style_guide=effective_style,
+                    negative_constraints=neg_constraints,
+                    reference_images=ref_list,
+                    shot_plan=shot_plan,
+                )
+
+                verdict_1, crit_usage_1 = self._critique_concept_art_render(
+                    rendered_path=out_path,
+                    shot_plan=shot_plan,
+                    latest_user_message=latest_user_message,
+                    attempt=1,
+                    candidate_dir=cand_dir,
+                    prompt_trace_sink=prompt_trace_sink,
+                )
+                if callable(usage_accumulator):
+                    usage_accumulator(crit_usage_1)
+                final_verdict = verdict_1
+
+                if not verdict_1.passes_art_direction_bar and (
+                    verdict_1.corrective_scene_rewrite.strip() or verdict_1.flaws_or_constraint_violations
+                ):
+                    attempts_used = 2
+                    self._emit(
+                        "coproducer_sketch_regenerating",
+                        verdict_1.deliberation,
+                        {
+                            "thread_id": thread_meta.get("thread_id"),
+                            "cartridge_id": cid or None,
+                            "title": title,
+                            "flaws_detected": list(verdict_1.flaws_or_constraint_violations),
+                        },
+                    )
+                    retry_exclusions: List[str] = []
+                    seen_retry_ex: set[str] = set()
+                    for ex_item in (
+                        list(shot_plan.hard_visual_exclusions)
+                        + list(neg_constraints)
+                        + list(verdict_1.flaws_or_constraint_violations)
+                    ):
+                        clean_ex = str(ex_item or "").strip()
+                        if clean_ex and clean_ex.lower() not in seen_retry_ex:
+                            seen_retry_ex.add(clean_ex.lower())
+                            retry_exclusions.append(clean_ex)
+
+                    revised_midground = (
+                        verdict_1.corrective_scene_rewrite.strip()
+                        or shot_plan.playable_midground_composition
+                    )
+                    revised_shot_plan = shot_plan.model_copy(
+                        update={
+                            "playable_midground_composition": revised_midground,
+                            "hard_visual_exclusions": retry_exclusions,
+                        }
+                    )
+                    caption_summary = revised_midground[:220]
+                    vis.generate_concept_mockup(
+                        {
+                            "title": title,
+                            "scene_description": revised_midground,
+                            "negative_constraints": retry_exclusions,
+                        },
+                        output_path=out_path,
+                        style_guide=effective_style,
+                        negative_constraints=retry_exclusions,
+                        reference_images=None,
+                        shot_plan=revised_shot_plan,
+                    )
+                    verdict_2, crit_usage_2 = self._critique_concept_art_render(
+                        rendered_path=out_path,
+                        shot_plan=revised_shot_plan,
+                        latest_user_message=latest_user_message,
+                        attempt=2,
+                        candidate_dir=cand_dir,
+                        prompt_trace_sink=prompt_trace_sink,
+                    )
+                    if callable(usage_accumulator):
+                        usage_accumulator(crit_usage_2)
+                    final_verdict = verdict_2
+            else:
+                vis.generate_concept_mockup(
+                    {
+                        "title": title,
+                        "scene_description": prompt_text,
+                        "negative_constraints": neg_constraints,
+                    },
+                    output_path=out_path,
+                    style_guide=effective_style,
+                    negative_constraints=neg_constraints,
+                    reference_images=ref_list,
+                )
+
             rel_path = self._artifact_rel_for_thread(out_path, thread_meta)
             w_px, h_px = self._image_dimensions(out_path)
             part = self._load_png_part(out_path)
@@ -1846,7 +2327,11 @@ class CoProducerAgent:
                 multimodal_parts.append(part)
             staged_media_cards.append(
                 CoProducerMediaCard(
-                    deliberation=f"Synthesized 16:9 inline concept mockup '{title}' for creative ideation.",
+                    deliberation=(
+                        final_verdict.deliberation
+                        if final_verdict is not None
+                        else f"Synthesized 16:9 inline concept mockup '{title}' for creative ideation."
+                    ),
                     card_id=f"sketch_{stamp}",
                     card_kind="sketch_showcase",
                     title=f"16:9 Concept Sketch — {title}",
@@ -1857,7 +2342,7 @@ class CoProducerAgent:
                             item_id=f"item_{stamp}",
                             media_kind="image",
                             label=title,
-                            caption=prompt_text[:220],
+                            caption=caption_summary,
                             artifact_path=rel_path,
                             mime_type="image/png",
                             width=w_px or 1280,
@@ -1866,7 +2351,20 @@ class CoProducerAgent:
                     ],
                 )
             )
-            return f"Synthesized 16:9 concept mockup at `{rel_path}` ({w_px}x{h_px})."
+            obs_msg = f"Synthesized 16:9 concept mockup at `{rel_path}` ({w_px}x{h_px}, model={self.concept_mockup_model_name}, attempts={attempts_used})."
+            if final_verdict is not None:
+                obs_msg += (
+                    f"\n[Art-Direction Pixel Audit: passed_bar={final_verdict.passes_art_direction_bar} | "
+                    f"scale_and_camera={final_verdict.observed_camera_and_scale_assessment} | "
+                    f"summary={final_verdict.honest_producer_summary}"
+                    + (
+                        f" | remaining_imperfections_to_acknowledge_honestly={final_verdict.flaws_or_constraint_violations}"
+                        if final_verdict.flaws_or_constraint_violations
+                        else ""
+                    )
+                    + "]"
+                )
+            return obs_msg
 
         if kind == "sprite_sketch":
             from engine.studio.visual import VisualArtSpriteDesignerAgent
@@ -1874,16 +2372,21 @@ class CoProducerAgent:
             vis = VisualArtSpriteDesignerAgent(client=self.client, model_name=self.image_model_name)
             sprite_path = sketches_dir / f"sprite_{slug}_{stamp}.png"
             plate_path = sketches_dir / f"sprite_{slug}_{stamp}_plate.png"
+            sprite_prompt = (
+                f"{prompt_text}\nSTRICT VISUAL EXCLUSIONS: {'; '.join(neg_constraints)}"
+                if neg_constraints
+                else prompt_text
+            )
             vis.generate_dynamic_sprite(
                 {
                     "asset_id": f"sketch_{slug}",
                     "name": title,
                     "asset_type": "sprite",
                     "dimensions": (128, 128),
-                    "visual_prompt_or_text": prompt_text,
+                    "visual_prompt_or_text": sprite_prompt,
                 },
                 output_path=sprite_path,
-                style_guide=secondary,
+                style_guide=effective_style,
             )
             vis.render_asset_inspection_plate(sprite_path, asset_type="sprite", output_path=plate_path)
             rel_sprite = self._artifact_rel_for_thread(sprite_path, thread_meta)
@@ -2005,6 +2508,11 @@ class CoProducerAgent:
         multimodal_parts: List[Any],
         staged_media_cards: List[CoProducerMediaCard],
         consultation_cards: List[CoProducerConsultationCard],
+        *,
+        latest_user_message: str = "",
+        conversation_history: str = "",
+        prompt_trace_sink: Optional[List[Dict[str, Any]]] = None,
+        usage_accumulator: Optional[Callable[[Dict[str, int]], None]] = None,
     ) -> str:
         t_name = call.tool_name
         if t_name == "inspect_studio_progress":
@@ -2018,11 +2526,27 @@ class CoProducerAgent:
         if t_name == "curate_genre_fun_foundation":
             return self._tool_curate_genre_fun_foundation(call, thread_meta, consultation_cards)
         if t_name == "consult_council":
-            return self._tool_consult_council(call, thread_meta, multimodal_parts, consultation_cards)
+            return self._tool_consult_council(
+                call,
+                thread_meta,
+                multimodal_parts,
+                consultation_cards,
+                latest_user_message=latest_user_message,
+                conversation_history=conversation_history,
+            )
         if t_name == "dispatch_specialist_probe":
             return self._tool_dispatch_specialist_probe(call, thread_meta, multimodal_parts, consultation_cards)
         if t_name == "sketch_multimodal_concept":
-            return self._tool_sketch_multimodal_concept(call, thread_meta, multimodal_parts, staged_media_cards)
+            return self._tool_sketch_multimodal_concept(
+                call,
+                thread_meta,
+                multimodal_parts,
+                staged_media_cards,
+                latest_user_message=latest_user_message,
+                conversation_history=conversation_history,
+                prompt_trace_sink=prompt_trace_sink,
+                usage_accumulator=usage_accumulator,
+            )
         raise StudioAgentError(f"Unsupported CoProducerToolCall.tool_name: {t_name!r}")
 
     # -------------------------------------------------------------------------
@@ -2135,6 +2659,8 @@ class CoProducerAgent:
                     "2. When the user asks about build status, progress, assets, code, or playtest results/videos, call the matching inspection tool(s) first so you show real cards and never guess.\n"
                     "3. When exploring a new genre, diagnosing why a game isn't fun, or pivoting a game's core loop where `GENRE_CRAFT_FOUNDATION` is not yet synthesized (or needs evolving), call `curate_genre_fun_foundation` so you and the Council share a deep first-principles foundation of what makes that genre genuinely fun.\n"
                     "4. When brainstorming or pressure-testing mechanics/art/story where specialist perspectives or inline visual/audio sketches will delight or clarify, call `consult_council` and/or `sketch_multimodal_concept`.\n"
+                    "   - Whenever calling `consult_council`, ALWAYS populate `query_or_question` with the exact design trade-off, system, or user correction raised in `LATEST USER MESSAGE`—never leave `query_or_question` empty.\n"
+                    "   - Whenever calling `sketch_multimodal_concept`, ALWAYS populate `query_or_question` with concrete playable viewport composition, single coherent camera projection, and explicit relative entity-to-structure-to-world proportions (keeping the camera locked to the local playable viewport and conveying colossal world scale via edge-to-edge fields + deep background parallax rather than impossible whole-world diagrams); populate `sketch_secondary_direction` with exact rendering medium & camera rules; populate `sketch_negative_constraints` with EVERY excluded visual element, forbidden camera angle, or unrequested UI chrome across the conversation; and set `use_prior_sketch_as_reference = True` ONLY when making targeted refinements to a prior sketch whose composition and scale already worked (leave `False` when resetting a rejected or drifted composition).\n"
                     "5. For quick conversational follow-ups where context is already sufficient, choose `action = 'respond'` immediately.\n"
                     "Provide `deliberation` FIRST and `action` LAST."
                 )
@@ -2173,6 +2699,10 @@ class CoProducerAgent:
                         multimodal_parts=multimodal_parts,
                         staged_media_cards=staged_media_cards,
                         consultation_cards=consultation_cards,
+                        latest_user_message=clean_user_msg,
+                        conversation_history=history_block,
+                        prompt_trace_sink=prompt_trace,
+                        usage_accumulator=_accum_usage,
                     )
                     tool_observations.append(f"[Tool `{tc.tool_name}`]:\n{obs_text}")
                     trace_entry = _ordered_rationale_dict(
@@ -2211,26 +2741,32 @@ class CoProducerAgent:
                 "- Keep `spoken_response` concise, conversational, and high-signal (typically 1–3 focused paragraphs or a tight scannable list—like a human Creative Producer talking across the table). Do NOT dump walls of exhaustive bullet points, raw internal telemetry, or repetitive restatements of attached cards; deep backstage details are already accessible via the UI's Behind-the-Scenes observability drill-down.\n"
                 "- NEVER roleplay multiple speakers inline in `spoken_response`; any Council huddles or specialist probes are already attached separately in Behind-the-Scenes observability—synthesize only their sharpest insights and trade-offs in your own voice.\n"
                 "- During creative ideation, be imaginative and concrete: ground your pitches, critiques, and trade-offs in `GENRE_CRAFT_FOUNDATION` (why players genuinely love this genre, how `t=0` starts unsolved with manual agency and scarcity, spatial/UX precision, and avoiding genre-killing anti-patterns), offering vivid playable hooks, tactile moment-to-moment player verbs, and contrasting creative forks without jargon salad.\n"
-                "- During studio status/playtest/media reviews, ground every statement in the real metrics, attached screenshots, and staged media cards.\n"
-                "- CURATE WHAT THE USER SEES (`presented_card_ids`): Set `presented_card_ids` to ONLY the `card_id`s from `AUTO-STAGED MEDIA CARDS` that you genuinely want displayed front-and-center beneath your reply right now (e.g., newly sketched `sketch_showcase` prototypes, or `playtest_video` / `qa_clip` / `image_gallery` / `code_diff` when showing media directly supports your message or answers a status/media request). Pass `presented_card_ids = []` when you merely ran inspection tools for background context during a conversation; unpresented cards remain safely inspectable in Behind-the-Scenes observability.\n\n"
-                "WHEN TO PROPOSE `action_proposals` (leave `action_proposals = []` during early exploratory riffing when options are still wide open):\n"
-                "1. Pre-Genesis / New Game Commissioning (`commission_game`):\n"
-                "   - ALWAYS include a `commission_game` proposal whenever the user asks to start, build, or commission the game, OR in a `draft` thread once `updated_concept_brief` has converged on a clear `working_title` and `core_player_verbs` and the user confirms or refines that direction.\n"
-                "   - `handoff_mode = 'loose_spark'`: User has an exciting open spark and wants the Writers' Room Council to run divergent concept genesis around it.\n"
-                "   - `handoff_mode = 'refined_concept'`: User & Co-Producer have converged on a specific game vision (`working_title`, `core_player_verbs`, `visual_style_direction`, `explicit_non_goals`)—locks that vision into `GameBibleSpec` and skips blind concept genesis.\n"
-                "2. Active Cartridge Pivots (Three-Tier Pivot Engine):\n"
+                "- During studio status/playtest/media reviews, ground every statement in the real metrics, attached screenshots, and staged media cards.\n\n"
+                "COLLABORATIVE MEMORY, CONSTRAINT FIDELITY & HONEST SKETCH CRITIQUE:\n"
+                "1. CUMULATIVE BRIEF INTEGRITY (NO RECENCY OVERWRITING): Treat a targeted user correction or critique on one detail as an incremental delta on top of ALL previously agreed pillars in `PRIOR CONVERSATION` and `USER_CONFIRMED_PILLARS_LEDGER`. NEVER overwrite or narrow `updated_concept_brief` around only the latest message! Carry forward all active confirmed mechanics, scale layers, progression arcs, and exclusions in `user_confirmed_pillars` and `explicit_non_goals`, modifying or removing an entry ONLY if the user explicitly retracts or replaces it. Record unresolved design trade-offs in `open_design_questions`.\n"
+                "2. EXECUTIVE PRODUCER PRIMACY OVER BACKGROUND DNA: Steam Player DNA is passive background inspiration only. When the user specifies desired mechanics, systems, or feel, prioritize their explicit goals 100%—never push unrequested simulation chores, physics micromanagement, or unrelated genre detours over the systems the user asked to deepen. When a design tension is open, lay out 2–3 crisp mechanical options and ask a focused follow-up question.\n"
+                "3. HONEST MULTIMODAL SKETCH AUDIT (`sketch_fidelity_audit`): Before composing `spoken_response`, carefully inspect BOTH any `[Art-Direction Pixel Audit: ...]` notes in `GATHERED TOOL EVIDENCE` AND the attached sketch/mockup PNG pixels against the user's requested camera angle, relative playable scale, rendering medium, and `EXPLICIT_NON_GOALS_AND_VISUAL_EXCLUSIONS`. If a rendered sketch still drifted or retained any imperfection (e.g., wrong camera perspective, oversized/undersized scale ratio, forbidden background element, or unrequested HUD chrome), call out candidly what landed and what missed in `spoken_response`—NEVER gaslight the user or claim tiny/exact scale when the rendered pixels show otherwise.\n"
+                "4. CURATE WHAT THE USER SEES (`presented_card_ids`): Set `presented_card_ids` to ONLY the `card_id`s from `AUTO-STAGED MEDIA CARDS` that you genuinely want displayed front-and-center beneath your reply right now (e.g., newly sketched `sketch_showcase` prototypes, or `playtest_video` / `qa_clip` / `image_gallery` / `code_diff` when showing media directly supports your message). Pass `presented_card_ids = []` when you merely ran inspection tools for background context.\n\n"
+                "WHEN TO PROPOSE `action_proposals` (DO NOT BE A PREMATURE CLOSER — DEFAULT TO `action_proposals = []`):\n"
+                "- Leave `action_proposals = []` whenever the user is critiquing a sketch, correcting a misunderstanding, expressing reservations, asking questions, or actively exploring `open_design_questions`.\n"
+                "1. Pre-Genesis / New Game Commissioning (`commission_game` — ONLY on `SCOPE: draft` threads):\n"
+                "   - Propose `commission_game` ONLY when the user explicitly asks to commission/start/build the game, OR explicitly signals they are happy with the converged concept and ready to kick off production.\n"
+                "   - NEVER propose `commission_game` when `SCOPE: cartridge` already has a `cartridge_id` and `HAS_PERSISTED_GAME_BIBLE: False` (your `updated_concept_brief` already syncs live to `co_producer_brief.json` automatically; propose `resume_build` ONLY if the user explicitly asks to start the autonomous build).\n"
+                "   - `handoff_mode = 'loose_spark'`: User has an open spark and wants the Writers' Room Council to run divergent concept genesis around it.\n"
+                "   - `handoff_mode = 'refined_concept'`: User & Co-Producer have converged on a specific game vision (`working_title`, `core_player_verbs`, `user_confirmed_pillars`, `visual_style_direction`, `explicit_non_goals`)—locks that vision into `GameBibleSpec` and skips blind concept genesis.\n"
+                "2. Active Cartridge Pivots (Three-Tier Pivot Engine — when `HAS_PERSISTED_GAME_BIBLE: True`):\n"
                 "   - `pivot_course_correction` (Tier 1): Additive tuning, feel/art/UI polish, or new mechanic within the current game—queues live `.pending_steering.json` without cancelling active work.\n"
                 "   - `pivot_structural` (Tier 2): Major mechanic/camera/loop overhaul—pauses workers, cancels obsolete `cancel_item_ids`, applies `memory_mutations` (`supersede` old rules / `record` new constraints), and triggers Council replan.\n"
                 "   - `pivot_fork_cartridge` (Tier 3): Premise/genre reboot—forks a fresh `candidate_genesis_*` cartridge while preserving the current cartridge untouched and copying `carry_over_asset_paths`.\n"
-                "3. Direct Studio Operations (when explicitly requested or clearly appropriate): `greenlight_bible`, `trigger_next_slice`, `pause_build`, `resume_build`, `launch_game`, `start_blind_playtest`, `record_game_memory`.\n\n"
+                "3. Direct Studio Operations (ONLY when explicitly requested or clearly warranted by a milestone): `greenlight_bible`, `trigger_next_slice`, `pause_build`, `resume_build`, `launch_game`, `start_blind_playtest`, `record_game_memory`.\n\n"
                 f"=== THREAD & CARTRIDGE SNAPSHOT ===\n{context_header}\n\n"
                 f"=== PRIOR CONVERSATION ===\n{history_block}\n\n"
                 f"=== LATEST USER MESSAGE ===\n{clean_user_msg}\n\n"
                 f"=== GATHERED TOOL EVIDENCE ===\n{obs_final_block}\n\n"
                 f"=== AUTO-STAGED MEDIA CARDS (select which `card_id`s to show inline via `presented_card_ids`; you may leave `media_cards=[]` or add extra cards using ONLY real artifact paths from GATHERED TOOL EVIDENCE) ===\n{staged_cards_json}\n\n"
                 f"=== ATTACHED CONSULTATION CARDS (preserved in Behind-the-Scenes observability) ===\n{consult_json}\n\n"
-                "Keep `updated_concept_brief` updated whenever game ideas, player verbs, style direction, sketches, or explicit non-goals evolve. "
-                "Provide `deliberation` FIRST and `spoken_response` LAST."
+                "Keep `updated_concept_brief` cumulatively updated across ALL confirmed pillars, player verbs, style direction, sketches, explicit non-goals, and open design questions. "
+                "Provide `deliberation` FIRST, `sketch_fidelity_audit` SECOND, and `spoken_response` LAST."
             )
 
             final_turn, synth_usage = self._call_structured(
@@ -2289,17 +2825,69 @@ class CoProducerAgent:
                 seen_paths.add(p)
             merged_media.append(d)
 
-        # Normalize action proposals with unique IDs and attached concept_brief fallback
+        # Normalize action proposals with unique IDs and non-destructive cumulative concept_brief merge
+        prev_brief: Dict[str, Any] = (
+            dict(thread_meta["concept_brief"]) if isinstance(thread_meta.get("concept_brief"), dict) else {}
+        )
         eff_brief_dict: Optional[Dict[str, Any]] = None
         if final_turn.updated_concept_brief is not None:
             eff_brief_dict = final_turn.updated_concept_brief.model_dump()
-        elif isinstance(thread_meta.get("concept_brief"), dict):
-            eff_brief_dict = dict(thread_meta["concept_brief"])
+        elif prev_brief:
+            eff_brief_dict = dict(prev_brief)
 
-        # Auto-append any newly sketched 16:9 mockups or assets onto eff_brief_dict if not already tracked
         if eff_brief_dict is not None:
-            mock_list = list(eff_brief_dict.get("selected_mockup_paths") or [])
-            sketch_list = list(eff_brief_dict.get("selected_sketch_asset_paths") or [])
+            prev_title = str(prev_brief.get("working_title") or "").strip()
+            new_title = str(eff_brief_dict.get("working_title") or "").strip()
+            prev_genre = str(prev_brief.get("core_genre") or "").strip()
+            new_genre = str(eff_brief_dict.get("core_genre") or "").strip()
+            has_fork_proposal = any(
+                getattr(p, "action_kind", "") == "pivot_fork_cartridge"
+                for p in (final_turn.action_proposals or [])
+            )
+            is_premise_reboot = has_fork_proposal or bool(
+                prev_title
+                and new_title
+                and prev_title.lower() != new_title.lower()
+                and prev_genre
+                and new_genre
+                and prev_genre.lower() != new_genre.lower()
+            )
+            if not is_premise_reboot and prev_brief:
+                for list_key in ("user_confirmed_pillars", "explicit_non_goals"):
+                    merged_items: List[str] = []
+                    seen_norm: set[str] = set()
+                    for raw_item in list(prev_brief.get(list_key) or []) + list(eff_brief_dict.get(list_key) or []):
+                        clean_item = str(raw_item or "").strip()
+                        if clean_item and clean_item.lower() not in seen_norm:
+                            seen_norm.add(clean_item.lower())
+                            merged_items.append(clean_item)
+                    eff_brief_dict[list_key] = merged_items
+                for carry_key in (
+                    "working_title",
+                    "core_genre",
+                    "elevator_pitch",
+                    "core_fantasy",
+                    "first_60_seconds_feel",
+                    "visual_style_direction",
+                    "audio_mood_direction",
+                    "core_player_verbs",
+                    "color_palette_hex",
+                ):
+                    if not eff_brief_dict.get(carry_key) and prev_brief.get(carry_key):
+                        eff_brief_dict[carry_key] = (
+                            list(prev_brief[carry_key])
+                            if isinstance(prev_brief[carry_key], list)
+                            else prev_brief[carry_key]
+                        )
+
+            existing_mocks = list(eff_brief_dict.get("selected_mockup_paths") or prev_brief.get("selected_mockup_paths") or [])
+            sketch_list: List[str] = []
+            for sk_p in list(prev_brief.get("selected_sketch_asset_paths") or []) + list(eff_brief_dict.get("selected_sketch_asset_paths") or []):
+                clean_sk = str(sk_p or "").strip()
+                if clean_sk and clean_sk not in sketch_list:
+                    sketch_list.append(clean_sk)
+
+            new_turn_mockups: List[str] = []
             for sc in staged_media_cards:
                 if sc.card_kind != "sketch_showcase":
                     continue
@@ -2307,22 +2895,44 @@ class CoProducerAgent:
                     ap = str(it.artifact_path or "").strip()
                     if not ap:
                         continue
-                    if "mockup_" in ap and ap not in mock_list:
-                        mock_list.append(ap)
+                    if "mockup_" in ap:
+                        if ap not in new_turn_mockups:
+                            new_turn_mockups.append(ap)
                     elif ap not in sketch_list:
                         sketch_list.append(ap)
+
+            if new_turn_mockups:
+                for old_m in existing_mocks:
+                    clean_old = str(old_m or "").strip()
+                    if clean_old and clean_old not in new_turn_mockups and clean_old not in sketch_list:
+                        sketch_list.append(clean_old)
+                mock_list = new_turn_mockups
+            else:
+                mock_list = existing_mocks
+
             eff_brief_dict["selected_mockup_paths"] = mock_list
             eff_brief_dict["selected_sketch_asset_paths"] = sketch_list
-            prev_gcf = (thread_meta.get("concept_brief") or {}).get("genre_craft_foundation")
+            prev_gcf = prev_brief.get("genre_craft_foundation")
             if not eff_brief_dict.get("genre_craft_foundation") and isinstance(prev_gcf, dict) and prev_gcf:
                 eff_brief_dict["genre_craft_foundation"] = dict(prev_gcf)
 
+        is_pre_bible_cartridge = bool(
+            str(thread_meta.get("scope_kind") or "") == "cartridge"
+            and cid
+            and cand_dir is not None
+            and not (cand_dir / "game_bible.json").is_file()
+            and not (cand_dir / "backlog.json").is_file()
+        )
         normalized_proposals: List[Dict[str, Any]] = []
         for idx, prop in enumerate(final_turn.action_proposals or []):
             p_dict = prop.model_dump()
             if not p_dict.get("proposal_id"):
                 p_dict["proposal_id"] = f"act_{uuid.uuid4().hex[:8]}_{idx}"
             p_dict["status"] = "pending"
+            if is_pre_bible_cartridge and p_dict.get("action_kind") == "commission_game":
+                p_dict["action_kind"] = "resume_build"
+                if not p_dict.get("button_label") or "commission" in str(p_dict.get("button_label") or "").lower():
+                    p_dict["button_label"] = "Start Autonomous Build"
             if p_dict.get("action_kind") in ("commission_game", "pivot_fork_cartridge", "pivot_structural"):
                 if p_dict.get("action_kind") in ("commission_game", "pivot_fork_cartridge") and not p_dict.get("handoff_mode"):
                     has_refined = bool(
