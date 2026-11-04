@@ -1393,6 +1393,22 @@ class AssetLibraryEntry(BaseEpistemicModel):
     file_path: str = Field(..., description="Relative file path in cartridge, e.g. 'assets/sprites/hero.png'.")
     target_display_size: Tuple[int, int] = Field(default=(64, 64), description="Intended in-world display size (width, height) in pixels.")
     texture_pixel_size: Tuple[int, int] = Field(default=(256, 256), description="Actual PNG dimensions (width, height) on disk.")
+    master_res_path: str = Field(
+        default="",
+        description="Godot resource path to the full-resolution master PNG (e.g. 'res://assets/masters/sprites/hero_master.png') preserved from synthesis.",
+    )
+    master_file_path: str = Field(
+        default="",
+        description="Relative file path in cartridge to the full-resolution master PNG.",
+    )
+    master_pixel_size: Tuple[int, int] = Field(
+        default=(0, 0),
+        description="Full-resolution master PNG pixel dimensions (width, height) on disk.",
+    )
+    variants: Dict[str, Dict[str, Any]] = Field(
+        default_factory=dict,
+        description="Context-sized runtime textures derived from the full-size master, keyed by usage context (e.g. 'world_1x', 'hud_icon').",
+    )
     hframes: int = Field(default=1, ge=1, description="Number of horizontal frames if sprite sheet.")
     vframes: int = Field(default=1, ge=1, description="Number of vertical rows if sprite sheet.")
     animation_states: Dict[str, Dict[str, Any]] = Field(

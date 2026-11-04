@@ -62,7 +62,7 @@ def collect_cartridge_visual_asset_files(cartridge_dir: Union[Path, str]) -> Lis
     strictly excluding `mockups/`, `concepts/`, `playtest_captures/`, `artifacts/`, and `.godot/`.
     """
     cdir = Path(cartridge_dir).resolve()
-    excluded_parts = {"mockups", "concepts", "playtest_captures", "artifacts", ".godot", "tests"}
+    excluded_parts = {"mockups", "concepts", "playtest_captures", "artifacts", ".godot", "tests", "masters", "variants"}
     found: List[Path] = []
     scan_dirs = [
         cdir / "assets" / "sprites",
@@ -139,8 +139,18 @@ def _collect_observational_asset_metadata(
         except Exception:
             pass
         fname = Path(rel_p).name
+        variant_paths = [
+            str(vv.get("file_path") or vv.get("res_path") or "").replace("res://", "").lstrip("/")
+            for vv in (c_entry.get("variants") or {}).values()
+            if isinstance(vv, dict)
+        ]
         is_referenced = bool(
-            referenced_blob and ((rel_p in referenced_blob) or (bool(fname) and fname in referenced_blob))
+            referenced_blob
+            and (
+                (rel_p in referenced_blob)
+                or (bool(fname) and fname in referenced_blob)
+                or any(vp and (vp in referenced_blob or Path(vp).name in referenced_blob) for vp in variant_paths)
+            )
         )
         asset_metadata[rel_p] = {
             "size": [w, h],

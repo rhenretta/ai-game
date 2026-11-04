@@ -67,6 +67,8 @@ class CartridgeAssetLibrary:
         self.portraits_dir = self.assets_dir / "portraits"
         self.mockups_dir = self.assets_dir / "mockups"
         self.audio_dir = self.assets_dir / "audio"
+        self.masters_dir = self.assets_dir / "masters"
+        self.variants_dir = self.assets_dir / "variants"
         self.catalog_path = self.assets_dir / "asset_library.json"
         self.client = client
         self.visual_agent = visual_agent
@@ -156,6 +158,22 @@ class CartridgeAssetLibrary:
         helper_path = src_dir / "studio_rig_and_collider.gd"
         code = '''class_name StudioRigHelper
 extends RefCounted
+
+static func load_context_texture(res_path: String, enable_mipmaps: bool = true) -> Texture2D:
+\tif res_path.is_empty():
+\t\treturn null
+\tif enable_mipmaps:
+\t\tvar abs_path := ProjectSettings.globalize_path(res_path)
+\t\tif FileAccess.file_exists(abs_path):
+\t\t\tvar img := Image.load_from_file(abs_path)
+\t\t\tif img != null and not img.is_empty():
+\t\t\t\timg.generate_mipmaps()
+\t\t\t\treturn ImageTexture.create_from_image(img)
+\tif ResourceLoader.exists(res_path):
+\t\tvar loaded := load(res_path)
+\t\tif loaded is Texture2D:
+\t\t\treturn loaded
+\treturn null
 
 static func attach_sprite_sheet_animation_player(
 \thost: Node2D,
@@ -362,6 +380,187 @@ static func create_tiled_surface(
         except Exception:
             return (64, 64)
 
+    def _is_pixel_art_cartridge(self) -> bool:
+        """Returns True when the cartridge's RenderingStrategySpec explicitly declares a pixel-art style."""
+        rs = self.get_rendering_strategy(require=False)
+        return bool(rs is not None and getattr(rs, "pixelated_style_intended", False))
+
+    @staticmethod
+    def _master_rel_for_runtime_rel(runtime_rel: str) -> str:
+        norm = str(runtime_rel or "").replace("res://", "").lstrip("/")
+        if norm.startswith("assets/"):
+            sub = norm[len("assets/"):]
+        else:
+            sub = norm
+        return f"assets/masters/{sub}"
+
+    def _upgrade_req_for_hidpi_context(self, req: AssetRequirement) -> AssetRequirement:
+        """Upgrades runtime texture `dimensions` for non-pixel-art live Gemini synthesis so the primary
+        runtime asset is crisp at HiDPI (`2560x1440` + camera zoom) while preserving the logical `1280x720`
+        `world_footprint_px` display size. Full `1K`/`2K` masters are always archived alongside in `assets/masters/`.
+        """
+        if not (hasattr(self.visual_agent, "_is_live_genai_client") and self.visual_agent._is_live_genai_client()):
+            return req
+        if self._is_pixel_art_cartridge():
+            return req
+
+        fmode = str(req.fabrication_mode or "").lower().strip()
+        atype = str(req.asset_type or "").lower().strip()
+        if fmode in ("audio_bark", "sfx", "ambient_loop") or atype in ("audio_bark", "sfx", "ambient_loop"):
+            return req
+        if fmode == "articulated_parts" or atype == "articulated_rig":
+            return req
+
+        cur_d = tuple(req.dimensions or (256, 256))
+        cw_raw, ch_raw = max(16, int(cur_d[0])), max(16, int(cur_d[1]))
+
+        if fmode == "portrait" or atype == "portrait":
+            if max(cw_raw, ch_raw) < 512:
+                scale_p = 512.0 / float(max(cw_raw, ch_raw))
+                return req.model_copy(
+                    update={"dimensions": (int(round(cw_raw * scale_p)), int(round(ch_raw * scale_p)))}
+                )
+            return req
+
+        if fmode == "parallax_layer" or atype in ("backdrop", "parallax_layer"):
+            updates_bg: Dict[str, Any] = {}
+            if getattr(req, "world_footprint_px", None) is None:
+                updates_bg["world_footprint_px"] = (cw_raw, ch_raw)
+            if cw_raw <= 1280 and ch_raw <= 720:
+                updates_bg["dimensions"] = (2560, 1440)
+            return req.model_copy(update=updates_bg) if updates_bg else req
+
+        if fmode == "tile_surface" or atype in ("tile", "tile_surface"):
+            updates_tile: Dict[str, Any] = {}
+            if getattr(req, "world_footprint_px", None) is None:
+                updates_tile["world_footprint_px"] = (cw_raw, ch_raw)
+            if max(cw_raw, ch_raw) < 512:
+                scale_t = 512.0 / float(max(cw_raw, ch_raw))
+                updates_tile["dimensions"] = (int(round(cw_raw * scale_t)), int(round(ch_raw * scale_t)))
+            return req.model_copy(update=updates_tile) if updates_tile else req
+
+        has_grid_prompts = (
+            max(1, int(getattr(req, "grid_cols", 1) or 1)) * max(1, int(getattr(req, "grid_rows", 1) or 1)) > 1
+            and bool(getattr(req, "cell_prompts", None))
+        )
+        is_single_actor_sheet = (fmode == "sprite_sheet" or atype == "sprite_sheet") and not has_grid_prompts
+        g_c = 1 if is_single_actor_sheet else max(1, int(getattr(req, "grid_cols", 1) or 1))
+        g_r = 1 if is_single_actor_sheet else max(1, int(getattr(req, "grid_rows", 1) or 1))
+        cell_w = max(16, cw_raw // g_c)
+        cell_h = max(16, ch_raw // g_r)
+
+        fp = getattr(req, "world_footprint_px", None)
+        logical_cw = int(fp[0]) if (isinstance(fp, (list, tuple)) and len(fp) >= 2 and int(fp[0]) > 0) else cell_w
+        logical_ch = int(fp[1]) if (isinstance(fp, (list, tuple)) and len(fp) >= 2 and int(fp[1]) > 0) else cell_h
+        target_longest = min(512, max(256, max(logical_cw, logical_ch) * 2))
+        if max(cell_w, cell_h) >= target_longest:
+            if fp is None and g_c == 1 and g_r == 1:
+                return req.model_copy(update={"world_footprint_px": (logical_cw, logical_ch)})
+            return req
+
+        scale_s = float(target_longest) / float(max(cell_w, cell_h))
+        new_cw = max(cell_w, int(round(cell_w * scale_s)))
+        new_ch = max(cell_h, int(round(cell_h * scale_s)))
+        hi_updates: Dict[str, Any] = {
+            "dimensions": (new_cw * g_c, new_ch * g_r),
+        }
+        if fp is None:
+            hi_updates["world_footprint_px"] = (logical_cw, logical_ch)
+        if getattr(req, "cell_target_sizes", None):
+            sx = float(new_cw) / float(max(1, cell_w))
+            sy = float(new_ch) / float(max(1, cell_h))
+            hi_updates["cell_target_sizes"] = [
+                (max(4, int(round(int(pair[0]) * sx))), max(4, int(round(int(pair[1]) * sy))))
+                for pair in req.cell_target_sizes
+            ]
+        return req.model_copy(update=hi_updates)
+
+    def derive_context_variant(
+        self,
+        asset_id: str,
+        context_name: str,
+        target_size: Tuple[int, int],
+        *,
+        resample_nearest: Optional[bool] = None,
+        persist_catalog: bool = True,
+    ) -> Path:
+        """Derives a context-specific smaller (or custom-sized) PNG asset directly from the full-resolution
+        master (`entry.master_file_path`, falling back to `entry.file_path`) with ZERO Gemini API calls.
+        Writes to `assets/variants/<category>/<asset_id>_<context_name>.png` and records metadata in
+        `entry.variants[context_name]`.
+        """
+        entry = self.catalog.entries.get(asset_id)
+        if entry is None:
+            raise StudioAgentError(f"Cannot derive context variant for unknown asset_id '{asset_id}'.")
+        if entry.fabrication_mode in ("audio_bark", "sfx", "ambient_loop"):
+            raise StudioAgentError(f"Cannot derive image variant for audio asset '{asset_id}'.")
+
+        src_rel = entry.master_file_path if (entry.master_file_path and (self.cartridge_dir / entry.master_file_path).is_file()) else entry.file_path
+        src_path = self.cartridge_dir / src_rel
+        if not src_path.is_file():
+            raise StudioAgentError(f"Source image '{src_rel}' for asset '{asset_id}' does not exist on disk.")
+
+        tw, th = max(1, int(target_size[0])), max(1, int(target_size[1]))
+        use_nearest = self._is_pixel_art_cartridge() if resample_nearest is None else bool(resample_nearest)
+        resample_mode = Image.Resampling.NEAREST if use_nearest else Image.Resampling.LANCZOS
+
+        ctx_slug = re.sub(r"[^a-z0-9_]+", "_", str(context_name or "variant").strip().lower()).strip("_") or "variant"
+        sub_cat = "portraits" if (entry.asset_type == "portrait" or entry.fabrication_mode == "portrait") else "sprites"
+        var_rel = f"assets/variants/{sub_cat}/{asset_id}_{ctx_slug}.png"
+        var_path = self.cartridge_dir / var_rel
+        var_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with Image.open(src_path) as src_im:
+            rgba = src_im.convert("RGBA")
+            resized = rgba if rgba.size == (tw, th) else rgba.resize((tw, th), resample_mode)
+            resized.save(var_path, "PNG")
+
+        entry.variants[ctx_slug] = {
+            "res_path": f"res://{var_rel}",
+            "file_path": var_rel,
+            "pixel_size": [tw, th],
+            "sha256_hash": self._compute_sha256(var_path),
+        }
+        if persist_catalog:
+            self.save_catalog()
+        return var_path
+
+    def _populate_default_context_variants(self, asset_id: str) -> None:
+        """Automatically derives standard smaller context assets (`world_1x`, `hud_icon`) from the
+        full-size master whenever the master exceeds those context sizes, incurring zero API calls.
+        """
+        entry = self.catalog.entries.get(asset_id)
+        if entry is None or entry.fabrication_mode in ("audio_bark", "sfx", "ambient_loop"):
+            return
+        mw, mh = entry.master_pixel_size if (entry.master_pixel_size and entry.master_pixel_size[0] > 0) else entry.texture_pixel_size
+        if mw <= 0 or mh <= 0:
+            return
+        tex_w, tex_h = entry.texture_pixel_size
+        disp_w, disp_h = entry.target_display_size
+        hf = max(1, int(entry.hframes or 1))
+        vf = max(1, int(entry.vframes or 1))
+
+        try:
+            if entry.fabrication_mode == "parallax_layer" or entry.asset_type in ("backdrop", "parallax_layer"):
+                if (mw > 1280 or mh > 720) and (tex_w, tex_h) != (1280, 720):
+                    self.derive_context_variant(asset_id, "world_1x", (1280, 720), persist_catalog=False)
+                return
+
+            if disp_w >= 8 and disp_h >= 8:
+                w1x = (disp_w * hf, disp_h * vf)
+                if w1x != (tex_w, tex_h) and (mw > w1x[0] or mh > w1x[1]):
+                    self.derive_context_variant(asset_id, "world_1x", w1x, persist_catalog=False)
+
+            if hf == 1 and vf == 1 and entry.asset_type in ("sprite", "prop", "articulated_rig", "portrait", "diegetic_ui"):
+                base_ar_w = max(1, disp_w if disp_w > 0 else mw)
+                base_ar_h = max(1, disp_h if disp_h > 0 else mh)
+                icon_scale = 64.0 / float(max(base_ar_w, base_ar_h))
+                icon_sz = (max(16, int(round(base_ar_w * icon_scale))), max(16, int(round(base_ar_h * icon_scale))))
+                if icon_sz != (tex_w, tex_h) and (mw > icon_sz[0] or mh > icon_sz[1]):
+                    self.derive_context_variant(asset_id, "hud_icon", icon_sz, persist_catalog=False)
+        except Exception as exc:
+            logger.debug("Default context variant derivation skipped for '%s': %s", asset_id, exc)
+
     def sanitize_misplaced_portraits_in_sprites_dir(self) -> List[Path]:
         """Moves or copies any misplaced single-frame *_portrait.png or portrait_*.png files from
         assets/sprites/ into assets/portraits/ with clean alpha background extraction, preventing
@@ -409,17 +608,27 @@ static func create_tiled_surface(
             stem_lower = png_file.stem.lower()
             if "portrait" in stem_lower:
                 dest_portrait = self.portraits_dir / png_file.name
+                master_rel = f"assets/masters/portraits/{dest_portrait.name}"
+                master_dest = self.cartridge_dir / master_rel
                 try:
                     with Image.open(png_file) as raw_img:
                         w, h = raw_img.size
                         if w > 0 and h > 0 and max(w, h) >= min(w, h) * 1.5:
                             # Multi-frame horizontal/vertical sprite strip; never squish to 1:1
                             continue
-                        cleaned = VisualArtSpriteDesignerAgent.extract_clean_alpha_sprite(
+                        master_cleaned = VisualArtSpriteDesignerAgent.extract_clean_alpha_sprite(
                             raw_img,
-                            target_size=(256, 256),
+                            target_size=None,
                             strip_border_frame=True,
                             pad_ratio=0.04,
+                        )
+                        master_dest.parent.mkdir(parents=True, exist_ok=True)
+                        master_cleaned.save(master_dest, "PNG")
+                        rt_dim = (512, 512) if max(w, h) >= 512 else (256, 256)
+                        cleaned = (
+                            master_cleaned
+                            if master_cleaned.size == rt_dim
+                            else master_cleaned.resize(rt_dim, Image.Resampling.LANCZOS)
                         )
                         cleaned.save(dest_portrait, "PNG")
                     png_file.unlink(missing_ok=True)
@@ -433,10 +642,14 @@ static func create_tiled_surface(
                         purpose=f"Dialogue/HUD bust portrait for {aid}",
                         res_path=f"res://assets/portraits/{dest_portrait.name}",
                         file_path=f"assets/portraits/{dest_portrait.name}",
+                        master_res_path=f"res://{master_rel}",
+                        master_file_path=master_rel,
+                        master_pixel_size=self._read_image_size(master_dest),
                         target_display_size=(128, 128),
-                        texture_pixel_size=(256, 256),
+                        texture_pixel_size=rt_dim,
                         sha256_hash=self._compute_sha256(dest_portrait),
                     )
+                    self._populate_default_context_variants(aid)
                 except Exception as exc:
                     logger.warning("Failed to clean misplaced portrait '%s': %s", png_file, exc)
 
@@ -838,28 +1051,15 @@ static func create_tiled_surface(
         renders_dir.mkdir(parents=True, exist_ok=True)
         max_val_attempts = 2
 
-        if (
-            hasattr(self.visual_agent, "_is_live_genai_client")
-            and self.visual_agent._is_live_genai_client()
-            and fmode not in ("portrait", "parallax_layer", "audio_bark", "sfx", "ambient_loop")
-            and atype not in ("portrait", "backdrop", "parallax_layer", "audio_bark", "sfx", "ambient_loop")
-        ):
-            g_c_hi = max(1, int(getattr(req, "grid_cols", 1) or 1))
-            g_r_hi = max(1, int(getattr(req, "grid_rows", 1) or 1))
-            cur_d = tuple(req.dimensions or (128, 128))
-            if (int(cur_d[0]) // g_c_hi) < 128 or (int(cur_d[1]) // g_r_hi) < 128:
-                hi_updates: Dict[str, Any] = {
-                    "dimensions": (max(int(cur_d[0]), 128 * g_c_hi), max(int(cur_d[1]), 128 * g_r_hi)),
-                }
-                if getattr(req, "world_footprint_px", None) is None and g_c_hi == 1 and g_r_hi == 1:
-                    hi_updates["world_footprint_px"] = (max(16, int(cur_d[0])), max(16, int(cur_d[1])))
-                req = req.model_copy(update=hi_updates)
+        req = self._upgrade_req_for_hidpi_context(req)
 
         # 1. Portrait fabrication + Tier 1 Render Plate Verification (strictly in assets/portraits/)
         if fmode == "portrait" or atype == "portrait":
             portrait_rel = f"assets/portraits/{Path(req.target_path).name}"
             portrait_dest = self.cartridge_dir / portrait_rel
             portrait_dest.parent.mkdir(parents=True, exist_ok=True)
+            master_portrait_rel = self._master_rel_for_runtime_rel(portrait_rel)
+            master_portrait_dest = self.cartridge_dir / master_portrait_rel
             plate_path = renders_dir / f"plate_{req.asset_id}.png"
             cur_prompt = req.visual_prompt_or_text or req.description
 
@@ -875,9 +1075,10 @@ static func create_tiled_surface(
                                 "visual_description": cur_prompt,
                             },
                             output_path=portrait_dest,
-                            dimensions=req.dimensions or (256, 256),
+                            dimensions=req.dimensions or (512, 512),
                             style_guide=style_guide,
                             reference_images=ref_images,
+                            master_output_path=master_portrait_dest,
                         )
                     else:
                         if hasattr(self.visual_agent, "_ensure_procedural_allowed_or_raise"):
@@ -894,6 +1095,8 @@ static func create_tiled_surface(
                             seed=f"{req.asset_id}_{attempt}",
                         )
                         img.save(portrait_dest, "PNG")
+                        master_portrait_dest.parent.mkdir(parents=True, exist_ok=True)
+                        img.save(master_portrait_dest, "PNG")
 
                 if hasattr(self.visual_agent, "render_asset_inspection_plate") and portrait_dest.is_file():
                     self.visual_agent.render_asset_inspection_plate(
@@ -915,6 +1118,8 @@ static func create_tiled_surface(
                     break
 
             tex_size = self._read_image_size(portrait_dest)
+            has_master_p = master_portrait_dest.is_file()
+            m_tex_size = self._read_image_size(master_portrait_dest) if has_master_p else tex_size
             self._supersede_same_path_entries(req.asset_id, portrait_rel)
             self.catalog.entries[req.asset_id] = AssetLibraryEntry(
                 deliberation=req.deliberation,
@@ -924,11 +1129,15 @@ static func create_tiled_surface(
                 purpose=req.purpose or req.description,
                 res_path=f"res://{portrait_rel}",
                 file_path=portrait_rel,
+                master_res_path=f"res://{master_portrait_rel}" if has_master_p else "",
+                master_file_path=master_portrait_rel if has_master_p else "",
+                master_pixel_size=m_tex_size,
                 target_display_size=(128, 128),
                 texture_pixel_size=tex_size,
                 concept_reference_used=str(ref_images[0]) if ref_images else None,
                 sha256_hash=self._compute_sha256(portrait_dest),
             )
+            self._populate_default_context_variants(req.asset_id)
             return portrait_dest
 
         # 2. Multi-Pose / Multi-State Sprite Sheet fabrication + Tier 1 & Tier 2 Contact Sheet Verification
@@ -943,26 +1152,43 @@ static func create_tiled_surface(
             sheet_filename = f"{stem}_sheet.png" if not stem.endswith("_sheet") else f"{stem}.png"
             sheet_rel = f"assets/sprites/{sheet_filename}"
             sheet_dest = self.cartridge_dir / sheet_rel
+            master_sheet_rel = self._master_rel_for_runtime_rel(sheet_rel)
+            master_sheet_dest = self.cartridge_dir / master_sheet_rel
             single_rel = f"assets/sprites/{stem.replace('_sheet', '')}.png"
             single_dest = self.cartridge_dir / single_rel
+            master_single_dest = self.cartridge_dir / self._master_rel_for_runtime_rel(single_rel)
             contact_path = renders_dir / f"anim_sheet_{req.asset_id}.png"
             plate_path = renders_dir / f"plate_{req.asset_id}.png"
 
             sheet_path = sheet_dest
             meta: Dict[str, Any] = {}
             for attempt in range(1, max_val_attempts + 1):
-                sheet_path, meta = self.visual_agent.fabricate_sprite_sheet(
-                    asset_req=req,
-                    output_path=sheet_dest,
-                    mood=self.mood,
-                    reference_images=ref_images,
-                    style_guide=style_guide,
-                )
+                try:
+                    sheet_path, meta = self.visual_agent.fabricate_sprite_sheet(
+                        asset_req=req,
+                        output_path=sheet_dest,
+                        mood=self.mood,
+                        reference_images=ref_images,
+                        style_guide=style_guide,
+                        master_output_path=master_sheet_dest,
+                    )
+                except TypeError:
+                    sheet_path, meta = self.visual_agent.fabricate_sprite_sheet(
+                        asset_req=req,
+                        output_path=sheet_dest,
+                        mood=self.mood,
+                        reference_images=ref_images,
+                        style_guide=style_guide,
+                    )
                 base_frame: Optional[Image.Image] = meta.get("base_frame_image")
                 if base_frame is not None:
                     base_frame.save(single_dest, "PNG")
                 elif not single_dest.is_file():
                     shutil.copyfile(sheet_path, single_dest)
+                master_base_frame: Optional[Image.Image] = meta.get("master_base_frame_image")
+                if master_base_frame is not None:
+                    master_single_dest.parent.mkdir(parents=True, exist_ok=True)
+                    master_base_frame.save(master_single_dest, "PNG")
 
                 if hasattr(self.visual_agent, "render_asset_inspection_plate") and single_dest.is_file():
                     self.visual_agent.render_asset_inspection_plate(
@@ -998,6 +1224,13 @@ static func create_tiled_surface(
                 if getattr(req, "world_footprint_px", None)
                 else tuple(meta.get("target_display_size") or req.dimensions or (64, 64))
             )
+            has_master_s = master_sheet_dest.is_file()
+            sheet_tex_sz = tuple(meta.get("texture_pixel_size") or self._read_image_size(sheet_path))
+            sheet_master_sz = (
+                tuple(meta.get("master_pixel_size") or self._read_image_size(master_sheet_dest))
+                if has_master_s
+                else sheet_tex_sz
+            )
             self.catalog.entries[req.asset_id] = AssetLibraryEntry(
                 deliberation=req.deliberation,
                 asset_id=req.asset_id,
@@ -1006,30 +1239,52 @@ static func create_tiled_surface(
                 purpose=req.purpose or req.description,
                 res_path=f"res://{sheet_rel}",
                 file_path=sheet_rel,
+                master_res_path=f"res://{master_sheet_rel}" if has_master_s else "",
+                master_file_path=master_sheet_rel if has_master_s else "",
+                master_pixel_size=sheet_master_sz,
                 target_display_size=sheet_disp_size,
-                texture_pixel_size=tuple(meta.get("texture_pixel_size") or self._read_image_size(sheet_path)),
+                texture_pixel_size=sheet_tex_sz,
                 hframes=int(meta.get("hframes", 4)),
                 vframes=int(meta.get("vframes", 4)),
                 animation_states=dict(meta.get("animation_states") or {}),
                 concept_reference_used=str(ref_images[0]) if ref_images else None,
                 sha256_hash=self._compute_sha256(sheet_path),
             )
+            self._populate_default_context_variants(req.asset_id)
             return single_dest
 
         # 3. Articulated Multi-Part Rig fabrication + Tier 2 Articulated Rig Contact Sheet Verification
         if fmode == "articulated_parts" or atype == "articulated_rig":
             contact_path = renders_dir / f"anim_rig_{req.asset_id}.png"
             plate_path = renders_dir / f"plate_{req.asset_id}.png"
+            master_rig_rel = self._master_rel_for_runtime_rel(req.target_path)
+            master_rig_dest = self.cartridge_dir / master_rig_rel
+            use_hidpi_rig = bool(
+                hasattr(self.visual_agent, "_is_live_genai_client")
+                and self.visual_agent._is_live_genai_client()
+                and not self._is_pixel_art_cartridge()
+            )
             comp_path = dest_path
             meta = {}
             for attempt in range(1, max_val_attempts + 1):
-                comp_path, meta = self.visual_agent.fabricate_articulated_rig(
-                    asset_req=req,
-                    output_path=dest_path,
-                    mood=self.mood,
-                    reference_images=ref_images,
-                    style_guide=style_guide,
-                )
+                try:
+                    comp_path, meta = self.visual_agent.fabricate_articulated_rig(
+                        asset_req=req,
+                        output_path=dest_path,
+                        mood=self.mood,
+                        reference_images=ref_images,
+                        style_guide=style_guide,
+                        master_output_path=master_rig_dest,
+                        preserve_hidpi_parts=use_hidpi_rig,
+                    )
+                except TypeError:
+                    comp_path, meta = self.visual_agent.fabricate_articulated_rig(
+                        asset_req=req,
+                        output_path=dest_path,
+                        mood=self.mood,
+                        reference_images=ref_images,
+                        style_guide=style_guide,
+                    )
                 if hasattr(self.visual_agent, "render_asset_inspection_plate") and comp_path.is_file():
                     self.visual_agent.render_asset_inspection_plate(
                         comp_path, asset_type="sprite", output_path=plate_path
@@ -1060,6 +1315,13 @@ static func create_tiled_surface(
                 if getattr(req, "world_footprint_px", None)
                 else tuple(meta.get("target_display_size") or req.dimensions or (64, 64))
             )
+            has_master_r = master_rig_dest.is_file()
+            rig_tex_sz = tuple(meta.get("texture_pixel_size") or self._read_image_size(comp_path))
+            rig_master_sz = (
+                tuple(meta.get("master_pixel_size") or self._read_image_size(master_rig_dest))
+                if has_master_r
+                else rig_tex_sz
+            )
             self.catalog.entries[req.asset_id] = AssetLibraryEntry(
                 deliberation=req.deliberation,
                 asset_id=req.asset_id,
@@ -1068,34 +1330,51 @@ static func create_tiled_surface(
                 purpose=req.purpose or req.description,
                 res_path=f"res://{req.target_path}",
                 file_path=req.target_path,
+                master_res_path=f"res://{master_rig_rel}" if has_master_r else "",
+                master_file_path=master_rig_rel if has_master_r else "",
+                master_pixel_size=rig_master_sz,
                 target_display_size=rig_disp_size,
-                texture_pixel_size=tuple(meta.get("texture_pixel_size") or self._read_image_size(comp_path)),
+                texture_pixel_size=rig_tex_sz,
                 articulated_parts=list(meta.get("articulated_parts") or []),
                 concept_reference_used=str(ref_images[0]) if ref_images else None,
                 sha256_hash=self._compute_sha256(comp_path),
             )
+            self._populate_default_context_variants(req.asset_id)
             return comp_path
 
         # 4. Static Sprite / Prop / Tile Surface / Parallax Layer / Diegetic UI / Multi-Cell Grid + Tier 1 Render Plate Verification
         plate_path = renders_dir / f"plate_{req.asset_id}.png"
+        master_static_rel = self._master_rel_for_runtime_rel(req.target_path)
+        master_static_dest = self.cartridge_dir / master_static_rel
         g_cols = max(1, int(getattr(req, "grid_cols", 1) or 1))
         g_rows = max(1, int(getattr(req, "grid_rows", 1) or 1))
         total_grid_cells = g_cols * g_rows
         regen_cells: Optional[List[int]] = None
         out_path = dest_path
         for attempt in range(1, max_val_attempts + 1):
-            dyn_kwargs: Dict[str, Any] = {}
+            dyn_kwargs: Dict[str, Any] = {"master_output_path": master_static_dest}
             if attempt > 1 and regen_cells and dest_path.is_file():
                 dyn_kwargs["regenerate_cell_indices"] = list(regen_cells)
                 dyn_kwargs["existing_sheet_path"] = dest_path
-            out_path = self.visual_agent.generate_dynamic_sprite(
-                asset_req=req,
-                output_path=dest_path,
-                mood=self.mood,
-                reference_images=ref_images,
-                style_guide=style_guide,
-                **dyn_kwargs,
-            )
+            try:
+                out_path = self.visual_agent.generate_dynamic_sprite(
+                    asset_req=req,
+                    output_path=dest_path,
+                    mood=self.mood,
+                    reference_images=ref_images,
+                    style_guide=style_guide,
+                    **dyn_kwargs,
+                )
+            except TypeError:
+                dyn_kwargs.pop("master_output_path", None)
+                out_path = self.visual_agent.generate_dynamic_sprite(
+                    asset_req=req,
+                    output_path=dest_path,
+                    mood=self.mood,
+                    reference_images=ref_images,
+                    style_guide=style_guide,
+                    **dyn_kwargs,
+                )
             if hasattr(self.visual_agent, "render_asset_inspection_plate") and out_path.is_file():
                 try:
                     self.visual_agent.render_asset_inspection_plate(
@@ -1147,6 +1426,8 @@ static func create_tiled_surface(
                 break
 
         tex_size = self._read_image_size(out_path)
+        has_master_st = master_static_dest.is_file()
+        master_tex_size = self._read_image_size(master_static_dest) if has_master_st else tex_size
         req_fp = getattr(req, "world_footprint_px", None)
         if isinstance(req_fp, (list, tuple)) and len(req_fp) >= 2 and int(req_fp[0]) > 0 and int(req_fp[1]) > 0:
             eff_display_size: Tuple[int, int] = (int(req_fp[0]), int(req_fp[1]))
@@ -1166,6 +1447,9 @@ static func create_tiled_surface(
             purpose=req.purpose or req.description,
             res_path=f"res://{req.target_path}",
             file_path=req.target_path,
+            master_res_path=f"res://{master_static_rel}" if has_master_st else "",
+            master_file_path=master_static_rel if has_master_st else "",
+            master_pixel_size=master_tex_size,
             target_display_size=eff_display_size,
             texture_pixel_size=tex_size,
             hframes=g_cols,
@@ -1173,6 +1457,7 @@ static func create_tiled_surface(
             concept_reference_used=str(ref_images[0]) if ref_images else None,
             sha256_hash=self._compute_sha256(out_path),
         )
+        self._populate_default_context_variants(req.asset_id)
         return out_path
 
     def verify_all_catalog_assets_and_animations(self, auto_remediate: bool = True) -> Dict[str, Any]:
@@ -1484,12 +1769,14 @@ static func create_tiled_surface(
                 continue
             rel = str(m.get("image_path") or f"assets/mockups/mockup_{idx + 1}.png")
             dest = self.cartridge_dir / rel
+            master_mockup_dest = self.cartridge_dir / self._master_rel_for_runtime_rel(rel)
             if not dest.is_file():
                 try:
                     self.visual_agent.generate_concept_mockup(
                         mockup=m,
                         output_path=dest,
                         style_guide=style_guide,
+                        master_output_path=master_mockup_dest,
                     )
                     if dest.is_file():
                         synthesized.append(dest)
@@ -1609,10 +1896,22 @@ static func create_tiled_surface(
             str(e.file_path) for e in self.catalog.entries.values() if getattr(e, "file_path", None)
         }
 
+        def _master_fields(rel_runtime: str, default_sz: Tuple[int, int]) -> Dict[str, Any]:
+            m_rel = self._master_rel_for_runtime_rel(rel_runtime)
+            m_file = self.cartridge_dir / m_rel
+            if m_file.is_file():
+                return {
+                    "master_res_path": f"res://{m_rel}",
+                    "master_file_path": m_rel,
+                    "master_pixel_size": self._read_image_size(m_file),
+                }
+            return {}
+
         for pfile in sorted(self.portraits_dir.glob("*.png")):
             aid = pfile.stem
             rel = f"assets/portraits/{pfile.name}"
             if aid not in self.catalog.entries and rel not in existing_file_paths:
+                tex_sz = self._read_image_size(pfile)
                 self.catalog.entries[aid] = AssetLibraryEntry(
                     deliberation=f"Indexed existing portrait '{aid}' from disk.",
                     asset_id=aid,
@@ -1622,8 +1921,9 @@ static func create_tiled_surface(
                     res_path=f"res://{rel}",
                     file_path=rel,
                     target_display_size=(128, 128),
-                    texture_pixel_size=self._read_image_size(pfile),
+                    texture_pixel_size=tex_sz,
                     sha256_hash=self._compute_sha256(pfile),
+                    **_master_fields(rel, tex_sz),
                 )
                 existing_file_paths.add(rel)
 
@@ -1647,6 +1947,7 @@ static func create_tiled_surface(
                     hframes=1,
                     vframes=1,
                     sha256_hash=self._compute_sha256(sfile),
+                    **_master_fields(rel, tex_sz),
                 )
                 existing_file_paths.add(rel)
 
@@ -1677,6 +1978,7 @@ static func create_tiled_surface(
                         hframes=1,
                         vframes=1,
                         sha256_hash=self._compute_sha256(vfile),
+                        **_master_fields(rel, tex_sz),
                     )
                     existing_file_paths.add(rel)
 
@@ -1715,11 +2017,12 @@ static func create_tiled_surface(
             "Use 'res://assets/sprites/' for all in-world characters, props, tiles, and environmental set-pieces.",
             "",
             "NATIVE GODOT 4 RIG, ANIMATION & COLLIDER HELPER (`res://src/studio_rig_and_collider.gd`, `class_name StudioRigHelper`):",
+            "- `StudioRigHelper.load_context_texture(res_path, true)` -> loads a runtime or context-variant texture with generated GPU mipmaps so high-resolution assets downsample cleanly at any zoom.",
             "- `StudioRigHelper.attach_sprite_sheet_animation_player(host_node, tex, hframes, vframes, states_meta, target_size)` -> returns `{\"sprite\": Sprite2D, \"anim_player\": AnimationPlayer}` with discrete keyframe tracks for `idle`, `move`, `jump`, `action`.",
             "- `StudioRigHelper.create_bitmap_collision_polygons(tex, target_size)` -> traces pixel-accurate `Array[CollisionPolygon2D]` from sprite alpha via `BitMap.opaque_to_polygons()`.",
             "- `StudioRigHelper.create_tiled_surface(static_body, tex, size, true)` -> builds a non-stretched `Polygon2D` (`TEXTURE_REPEAT_ENABLED`) + matching `CollisionShape2D` in group `'walkable_shelf'`.",
             "",
-            "AVAILABLE ASSETS IN CATALOG:",
+            "AVAILABLE ASSETS IN CATALOG (primary `res_path` is HiDPI-ready; `variants` offer pre-downsampled context sizes like `world_1x` and `hud_icon` derived from full-size `assets/masters/`):",
         ]
         referenced_part_paths: Set[str] = set()
         for entry in self.catalog.entries.values():
@@ -1746,6 +2049,23 @@ static func create_tiled_surface(
                     f"tex_px={entry.texture_pixel_size}, size={entry.target_display_size}) -> '{entry.res_path}'"
                 )
                 continue
+            master_note = (
+                f", master='{entry.master_res_path}'({entry.master_pixel_size})"
+                if getattr(entry, "master_res_path", "")
+                else ""
+            )
+            var_dict = getattr(entry, "variants", None) or {}
+            variants_note = (
+                ", variants={"
+                + ", ".join(
+                    f"{vk}: '{vv.get('res_path', '')}'({vv.get('pixel_size', [])})"
+                    for vk, vv in sorted(var_dict.items())
+                    if isinstance(vv, dict)
+                )
+                + "}"
+                if var_dict
+                else ""
+            )
             if entry.fabrication_mode == "sprite_sheet":
                 states_str = ", ".join(
                     f"{sname}(row={sinfo.get('row', 0)}, {sinfo.get('frame_count', 4)}f@{sinfo.get('fps', 8)}fps)"
@@ -1753,7 +2073,7 @@ static func create_tiled_surface(
                 )
                 lines.append(
                     f"- [{aid}] (mode=sprite_sheet) sheet='{entry.res_path}', single='res://assets/sprites/{aid}.png', "
-                    f"display_size={entry.target_display_size}, tex_size={entry.texture_pixel_size}, "
+                    f"display_size={entry.target_display_size}, tex_size={entry.texture_pixel_size}{master_note}{variants_note}, "
                     f"hframes={entry.hframes}, vframes={entry.vframes}, states=[{states_str}] | {short_purpose}"
                 )
             elif entry.fabrication_mode == "articulated_parts":
@@ -1768,16 +2088,16 @@ static func create_tiled_surface(
                 lines.append(
                     f"- [{aid}] (mode=articulated_parts, SINGLE-FRAME COMPOSITE: hframes={entry.hframes}, vframes={entry.vframes} — NEVER set hframes>1 or vframes>1 on this composite!) "
                     f"composite='{entry.res_path}', {parts_str}, "
-                    f"display_size={entry.target_display_size}, tex_size={entry.texture_pixel_size} | {short_purpose}"
+                    f"display_size={entry.target_display_size}, tex_size={entry.texture_pixel_size}{master_note}{variants_note} | {short_purpose}"
                 )
             elif entry.fabrication_mode == "portrait":
                 lines.append(
-                    f"- [{aid}] (mode=portrait, UI ONLY) res_path='{entry.res_path}', display_size={entry.target_display_size}, tex_size={entry.texture_pixel_size}, hframes=1, vframes=1 | {short_purpose}"
+                    f"- [{aid}] (mode=portrait, UI ONLY) res_path='{entry.res_path}', display_size={entry.target_display_size}, tex_size={entry.texture_pixel_size}{master_note}{variants_note}, hframes=1, vframes=1 | {short_purpose}"
                 )
             else:
                 lines.append(
                     f"- [{aid}] (mode={entry.fabrication_mode}) res_path='{entry.res_path}', "
-                    f"display_size={entry.target_display_size}, tex_size={entry.texture_pixel_size}, "
+                    f"display_size={entry.target_display_size}, tex_size={entry.texture_pixel_size}{master_note}{variants_note}, "
                     f"hframes={entry.hframes}, vframes={entry.vframes} | {short_purpose}"
                 )
         return "\n".join(lines)

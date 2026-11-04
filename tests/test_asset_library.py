@@ -531,4 +531,235 @@ def test_extract_clean_alpha_sprite_strips_two_tone_checkerboard_and_isolates_si
     assert "assets/ui/hud_gauge.png" in discovered["sprites"]
 
 
+def test_full_size_masters_and_zero_api_call_context_variants(tmp_path: Path):
+    """Verifies that live Gemini synthesis preserves full-resolution 1K/2K masters under assets/masters/,
+    produces HiDPI runtime textures without 256x256 bottlenecks, and derives smaller context variants
+    (world_1x, hud_icon, custom contexts) from the saved masters with zero extra Gemini calls.
+    """
+    import io
+    from types import SimpleNamespace
+    from PIL import ImageDraw
+    from engine.studio.models import VisualMockupArtifact
+
+    call_log: list[str] = []
+
+    def _encode_png(img: Image.Image) -> bytes:
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    # Build synthetic 1024x1024 sprite, 1024x1024 tile, 1024x1024 portrait, and 2752x1536 2K mockup
+    sprite_1k = Image.new("RGBA", (1024, 1024), (255, 0, 255, 255))
+    s_draw = ImageDraw.Draw(sprite_1k)
+    s_draw.ellipse([180, 160, 844, 864], fill=(35, 195, 235, 255), outline=(245, 210, 75, 255), width=18)
+    s_draw.rectangle([420, 320, 604, 704], fill=(250, 140, 50, 255))
+    sprite_1k_bytes = _encode_png(sprite_1k)
+
+    tile_1k = Image.new("RGBA", (1024, 1024), (36, 48, 68, 255))
+    t_draw = ImageDraw.Draw(tile_1k)
+    for idx in range(0, 1024, 64):
+        t_draw.line([(idx, 0), (min(1023, idx + 96), 1023)], fill=(68, 96, 132, 255), width=6)
+        t_draw.ellipse([idx % 900, (idx * 3) % 900, (idx % 900) + 48, ((idx * 3) % 900) + 36], fill=(92, 130, 168, 255))
+    tile_1k_bytes = _encode_png(tile_1k)
+
+    portrait_1k = Image.new("RGBA", (1024, 1024), (0, 0, 0, 255))
+    p_draw = ImageDraw.Draw(portrait_1k)
+    p_draw.ellipse([220, 140, 804, 880], fill=(80, 175, 220, 255), outline=(240, 220, 150, 255), width=14)
+    portrait_1k_bytes = _encode_png(portrait_1k)
+
+    mockup_2k = Image.new("RGBA", (2752, 1536), (18, 24, 42, 255))
+    m_draw = ImageDraw.Draw(mockup_2k)
+    m_draw.rectangle([200, 180, 2552, 1356], outline=(70, 210, 245, 255), width=12)
+    mockup_2k_bytes = _encode_png(mockup_2k)
+
+    class _FakeGenaiModels:
+        def generate_content(self, *, model, contents, config=None):
+            prompt_str = str(contents)
+            if config is not None and getattr(config, "response_mime_type", None) == "application/json":
+                schema_name = getattr(getattr(config, "response_schema", None), "__name__", "")
+                if "Animation" in schema_name:
+                    return SimpleNamespace(
+                        text=json.dumps(
+                            {
+                                "deliberation": "All articulated keyframes align cleanly.",
+                                "target_id": "rotor_arm_rig",
+                                "accepted": True,
+                            }
+                        )
+                    )
+                return SimpleNamespace(
+                    text=json.dumps(
+                        {
+                            "deliberation": "Clean high-resolution asset with crisp silhouette.",
+                            "asset_id": "test_asset",
+                            "accepted": True,
+                        }
+                    )
+                )
+
+            call_log.append(prompt_str[:80])
+            img_cfg = getattr(config, "image_config", None)
+            if img_cfg is not None and getattr(img_cfg, "image_size", None) == "2K":
+                data = mockup_2k_bytes
+            elif "dialogue bust portrait" in prompt_str:
+                data = portrait_1k_bytes
+            elif "seamless game material texture swatch" in prompt_str:
+                data = tile_1k_bytes
+            else:
+                data = sprite_1k_bytes
+
+            part = SimpleNamespace(inline_data=SimpleNamespace(data=data))
+            cand = SimpleNamespace(content=SimpleNamespace(parts=[part]))
+            return SimpleNamespace(candidates=[cand], text="")
+
+    class _FakeLiveClient:
+        __module__ = "google.genai.client"
+
+        def __init__(self):
+            self.models = _FakeGenaiModels()
+
+    live_client = _FakeLiveClient()
+    visual_agent = VisualArtSpriteDesignerAgent(client=live_client)
+    assert visual_agent._is_live_genai_client() is True
+
+    # 1. Concept mockup preserves full native 2K (2752x1536) by default
+    mockup_out = tmp_path / "assets" / "mockups" / "concept_1.png"
+    mockup_master = tmp_path / "assets" / "masters" / "mockups" / "concept_1.png"
+    visual_agent.generate_concept_mockup(
+        mockup=VisualMockupArtifact(
+            deliberation="Full 2K concept art verification.",
+            mockup_id="concept_1",
+            title="Concept Plate",
+            scene_description="Wide architectural vista with central apparatus",
+            image_path="assets/mockups/concept_1.png",
+        ),
+        output_path=mockup_out,
+        master_output_path=mockup_master,
+    )
+    with Image.open(mockup_out) as im_m:
+        assert im_m.size == (2752, 1536)
+    with Image.open(mockup_master) as im_mm:
+        assert im_mm.size == (2752, 1536)
+
+    # 2. Fabricate sprite, seamless tile, portrait, and articulated rig via CartridgeAssetLibrary
+    lib = CartridgeAssetLibrary(cartridge_dir=tmp_path, visual_agent=visual_agent, client=live_client)
+    reqs = [
+        AssetRequirement(
+            deliberation="World structure prop with 96x96 logical footprint.",
+            asset_id="core_apparatus",
+            asset_type="prop",
+            fabrication_mode="static_sprite",
+            target_path="assets/sprites/core_apparatus.png",
+            dimensions=(128, 128),
+            world_footprint_px=(96, 96),
+            description="Precision brass and cyan glass apparatus",
+            visual_prompt_or_text="Precision brass and cyan glass apparatus",
+        ),
+        AssetRequirement(
+            deliberation="Seamless floor surface tile.",
+            asset_id="deck_plating",
+            asset_type="tile",
+            fabrication_mode="tile_surface",
+            target_path="assets/tiles/deck_plating.png",
+            dimensions=(128, 128),
+            description="Brushed slate deck plating",
+            visual_prompt_or_text="Brushed slate deck plating",
+        ),
+        AssetRequirement(
+            deliberation="Operator bust portrait.",
+            asset_id="operator_portrait",
+            asset_type="portrait",
+            fabrication_mode="portrait",
+            target_path="assets/portraits/operator_portrait.png",
+            dimensions=(256, 256),
+            description=" calm engineer bust",
+            visual_prompt_or_text="Calm engineer bust",
+        ),
+        AssetRequirement(
+            deliberation="Articulated rotor assembly with small logical part footprint.",
+            asset_id="rotor_arm_rig",
+            asset_type="articulated_rig",
+            fabrication_mode="articulated_parts",
+            target_path="assets/sprites/rotor_arm_rig.png",
+            dimensions=(80, 80),
+            description="Articulated rotor mechanism",
+            articulated_parts=[
+                ArticulatedPartSpec(
+                    deliberation="Base hub",
+                    part_id="hub",
+                    visual_prompt="Circular hub mount",
+                    dimensions=(48, 48),
+                ),
+                ArticulatedPartSpec(
+                    deliberation="Rotating arm",
+                    part_id="arm",
+                    parent_part_id="hub",
+                    visual_prompt="Narrow mechanical rotor arm",
+                    attach_offset_px=(0.0, -14.0),
+                    dimensions=(20, 40),
+                ),
+            ],
+        ),
+    ]
+    lib.fabricate_assets(reqs, force_regenerate=True)
+
+    # Verify full-size 1024x1024 masters exist on disk and runtime textures are HiDPI-ready
+    prop_entry = lib.catalog.entries["core_apparatus"]
+    assert prop_entry.master_file_path == "assets/masters/sprites/core_apparatus.png"
+    assert prop_entry.master_pixel_size == (1024, 1024)
+    assert prop_entry.target_display_size == (96, 96)
+    assert prop_entry.texture_pixel_size == (256, 256)
+    assert "world_1x" in prop_entry.variants
+    assert prop_entry.variants["world_1x"]["pixel_size"] == [96, 96]
+    assert "hud_icon" in prop_entry.variants
+    assert prop_entry.variants["hud_icon"]["pixel_size"] == [64, 64]
+
+    tile_entry = lib.catalog.entries["deck_plating"]
+    assert tile_entry.master_file_path == "assets/masters/tiles/deck_plating.png"
+    assert tile_entry.master_pixel_size == (1024, 1024)
+    assert tile_entry.texture_pixel_size == (512, 512)
+    assert tile_entry.target_display_size == (128, 128)
+    assert tile_entry.variants["world_1x"]["pixel_size"] == [128, 128]
+
+    portrait_entry = lib.catalog.entries["operator_portrait"]
+    assert portrait_entry.master_file_path == "assets/masters/portraits/operator_portrait.png"
+    assert portrait_entry.master_pixel_size == (1024, 1024)
+    assert portrait_entry.texture_pixel_size == (512, 512)
+    assert portrait_entry.variants["world_1x"]["pixel_size"] == [128, 128]
+    assert portrait_entry.variants["hud_icon"]["pixel_size"] == [64, 64]
+
+    rig_entry = lib.catalog.entries["rotor_arm_rig"]
+    assert rig_entry.master_file_path == "assets/masters/sprites/rotor_arm_rig.png"
+    assert rig_entry.master_pixel_size[0] >= 512
+    assert rig_entry.target_display_size == (80, 80)
+    assert rig_entry.texture_pixel_size[0] >= 256
+    arm_meta = next(p for p in rig_entry.articulated_parts if p["part_id"] == "arm")
+    assert arm_meta["dimensions"] == [20, 40]  # Logical rig coordinates preserved
+    assert arm_meta["texture_pixel_size"] == [80, 160]  # 4x HiDPI runtime part texture (no longer tiny 20x40!)
+    arm_master_path = tmp_path / arm_meta["master_file_path"]
+    assert arm_master_path.is_file()
+    with Image.open(arm_master_path) as arm_m_im:
+        assert arm_m_im.size == (512, 1024)  # Full-res aspect-matched 1K part master
+
+    # 3. Derive a new custom context variant on-demand with ZERO Gemini API calls
+    calls_before = len(call_log)
+    pip_variant = lib.derive_context_variant("core_apparatus", "minimap_pip", (32, 32))
+    assert len(call_log) == calls_before  # Strictly 0 image generation calls!
+    assert pip_variant.is_file()
+    with Image.open(pip_variant) as pip_im:
+        assert pip_im.size == (32, 32)
+    assert lib.catalog.entries["core_apparatus"].variants["minimap_pip"]["pixel_size"] == [32, 32]
+
+    # 4. StudioRigHelper exports load_context_texture with mipmap generation & SWE summary lists masters + variants
+    (tmp_path / "project.godot").write_text("[application]\n", encoding="utf-8")
+    swe_summary = lib.build_prompt_summary_for_swe()
+    assert "StudioRigHelper.load_context_texture" in swe_summary
+    assert "assets/masters/sprites/core_apparatus.png" in swe_summary
+    assert "minimap_pip" in swe_summary
+    helper_gd = (tmp_path / "src" / "studio_rig_and_collider.gd").read_text(encoding="utf-8")
+    assert "static func load_context_texture(" in helper_gd
+    assert "img.generate_mipmaps()" in helper_gd
+
+
+
 

@@ -697,7 +697,7 @@ class VisualArtSpriteDesignerAgent:
     def extract_clean_alpha_sprite(
         cls,
         raw_img: Union[Image.Image, bytes, bytearray],
-        target_size: Tuple[int, int] = (64, 64),
+        target_size: Optional[Tuple[int, int]] = (64, 64),
         strip_border_frame: bool = True,
         pad_ratio: float = 0.06,
         target_dimensions: Optional[Tuple[int, int]] = None,
@@ -713,13 +713,20 @@ class VisualArtSpriteDesignerAgent:
         2. Clears any residual pure chroma-key (`#FF00FF`) background pockets if a chroma backdrop was used.
         3. When `isolate_single_subject=True`, detects multi-pose collages or multi-item grids via morphological
            subject clustering and isolates the primary single subject before tight bounding-box cropping.
+        4. When `target_size=None` or `max(w, h) > 256` on a high-resolution source (`> 256px`), guides native
+           source-resolution (`1024x1024`+) alpha extraction & cropping from the topological mask so zero detail is lost.
         """
         if isinstance(raw_img, (bytes, bytearray)):
             raw_img = Image.open(io.BytesIO(raw_img))
+        src_rgba = raw_img.convert("RGBA")
+        src_w, src_h = src_rgba.size
         eff_size = target_dimensions if target_dimensions is not None else (size if size is not None else target_size)
-        w, h = max(1, int(eff_size[0])), max(1, int(eff_size[1]))
+        if eff_size is None:
+            w, h = max(1, int(src_w)), max(1, int(src_h))
+        else:
+            w, h = max(1, int(eff_size[0])), max(1, int(eff_size[1]))
         work_w, work_h = 256, 256
-        work_img = raw_img.convert("RGBA").resize((work_w, work_h), Image.Resampling.LANCZOS)
+        work_img = src_rgba.resize((work_w, work_h), Image.Resampling.LANCZOS)
         px = work_img.load()
 
         # Step 1: Perimeter seed collection across all 4 edges for outer background connected component
@@ -1025,14 +1032,85 @@ class VisualArtSpriteDesignerAgent:
             fg_halo = cv2.dilate(real_fg, np.ones((3, 3), dtype=np.uint8), iterations=1)
             rgba_np[(fg_halo == 0) & (rgba_np[:, :, 3] <= 24)] = [0, 0, 0, 0]
 
-        work_img = Image.fromarray(rgba_np)
+        # When extracting a >256px asset or full-resolution master from a high-resolution (>256px) source image,
+        # promote the topological foreground mask onto native `src_rgba` (`1024x1024`+) and perform vectorized
+        # edge matting + chroma despill directly on the full-resolution pixels so zero texture detail is lost.
+        if max(src_w, src_h) > 256 and max(w, h) > 256 and np.any(rgba_np[:, :, 3] > 24):
+            hi_np = np.array(src_rgba, dtype=np.uint8)
+            guide_alpha = cv2.resize(rgba_np[:, :, 3], (src_w, src_h), interpolation=cv2.INTER_LINEAR)
+            s_ratio = max(1, int(math.ceil(max(src_w, src_h) / 256.0)))
+            halo_k = max(3, s_ratio * 2 + 1)
+            halo_kernel = np.ones((halo_k, halo_k), dtype=np.uint8)
+            core_kernel = np.ones((max(3, s_ratio * 2 - 1), max(3, s_ratio * 2 - 1)), dtype=np.uint8)
+            guide_fg = (guide_alpha > 24).astype(np.uint8)
+            search_zone = cv2.dilate(guide_fg, halo_kernel, iterations=1) > 0
+            solid_core = cv2.erode((guide_alpha > 220).astype(np.uint8), core_kernel, iterations=1) > 0
+
+            # Outside the topological foreground halo -> strictly transparent
+            hi_np[~search_zone] = [0, 0, 0, 0]
+
+            # Boundary band: refine silhouette at native 1024px+ resolution against `bg_palette`
+            edge_band = search_zone & (~solid_core)
+            if np.any(edge_band) and bg_palette:
+                edge_rgb = hi_np[edge_band, :3].astype(np.float32)
+                min_d_sq = np.full(edge_rgb.shape[0], 1e9, dtype=np.float32)
+                for b_rgb in bg_palette[:4]:
+                    b_vec = np.array(b_rgb, dtype=np.float32)
+                    d_sq = np.sum((edge_rgb - b_vec[None, :]) ** 2, axis=-1)
+                    min_d_sq = np.minimum(min_d_sq, d_sq)
+                edge_a = hi_np[edge_band, 3].astype(np.float32)
+                hard_bg = min_d_sq <= float(tol_hard_sq)
+                soft_bg = (~hard_bg) & (min_d_sq <= float(tol_soft_sq))
+                edge_a[hard_bg] = 0.0
+                if np.any(soft_bg):
+                    ratios = np.clip((np.sqrt(min_d_sq[soft_bg]) - 26.0) / 12.0, 0.0, 1.0)
+                    edge_a[soft_bg] = np.minimum(edge_a[soft_bg], edge_a[soft_bg] * ratios)
+                hi_np[edge_band, 3] = np.clip(edge_a, 0, 255).astype(np.uint8)
+                zero_edge = hi_np[:, :, 3] == 0
+                hi_np[zero_edge] = [0, 0, 0, 0]
+
+            # Vectorized native-resolution chroma-key pocket clearing & fringe despill across remaining foreground
+            active_px = hi_np[:, :, 3] > 0
+            if np.any(active_px):
+                act_rgb = hi_np[active_px, :3].astype(np.int32)
+                act_a = hi_np[active_px, 3].astype(np.int32)
+                hi_ch = np.stack([act_rgb[:, i] for i in ck_high], axis=-1)
+                lo_ch = np.stack([act_rgb[:, i] for i in ck_low], axis=-1)
+                hi_min_v = np.min(hi_ch, axis=-1)
+                hi_spread_v = np.max(hi_ch, axis=-1) - hi_min_v
+                lo_max_v = np.max(lo_ch, axis=-1)
+                c_excess_v = hi_min_v - lo_max_v
+
+                pure_ck = (hi_min_v > 175) & (lo_max_v < 95) & (c_excess_v > 105)
+                mid_ck = (~pure_ck) & (hi_min_v > 140) & (lo_max_v < 110) & (c_excess_v > 65)
+                fringe_ck = (~pure_ck) & (~mid_ck) & (hi_min_v > 180) & (hi_spread_v < 35) & (c_excess_v > 45) & ((act_a < 250) | (lo_max_v > 95))
+
+                act_rgb[pure_ck] = 0
+                act_a[pure_ck] = 0
+                if np.any(mid_ck):
+                    for i in ck_high:
+                        act_rgb[mid_ck, i] = np.minimum(act_rgb[mid_ck, i], lo_max_v[mid_ck] + 35)
+                    act_a[mid_ck] = np.clip((act_a[mid_ck] * 0.55).astype(np.int32), 0, 255)
+                if np.any(fringe_ck):
+                    spill_f = np.minimum(1.0, c_excess_v[fringe_ck].astype(np.float32) / 220.0)
+                    for i in ck_high:
+                        act_rgb[fringe_ck, i] = np.minimum(act_rgb[fringe_ck, i], lo_max_v[fringe_ck] + 18)
+                    act_a[fringe_ck] = np.clip((act_a[fringe_ck].astype(np.float32) * (1.0 - 0.65 * spill_f)).astype(np.int32), 0, 255)
+
+                hi_np[active_px, :3] = np.clip(act_rgb, 0, 255).astype(np.uint8)
+                hi_np[active_px, 3] = np.clip(act_a, 0, 255).astype(np.uint8)
+                hi_np[hi_np[:, :, 3] == 0] = [0, 0, 0, 0]
+
+            work_img = Image.fromarray(hi_np)
+        else:
+            work_img = Image.fromarray(rgba_np)
 
         # When preserving multi-cell atlases / sheets (`isolate_single_subject=False`),
         # never tight-crop & re-center the composite bounding box, which would shift grid cell coordinates.
         if not isolate_single_subject:
             if work_img.getbbox() is not None:
                 return work_img if work_img.size == (w, h) else work_img.resize((w, h), Image.Resampling.LANCZOS)
-            return raw_img.convert("RGBA").resize((w, h), Image.Resampling.LANCZOS)
+            return src_rgba if src_rgba.size == (w, h) else src_rgba.resize((w, h), Image.Resampling.LANCZOS)
 
         # Step 3: Crop to tight foreground bounding box and fit into target_size with padding
         bbox = work_img.getbbox()
@@ -1048,12 +1126,12 @@ class VisualArtSpriteDesignerAgent:
                 scale = min(avail_w / max(1, cw), avail_h / max(1, ch))
                 nw = max(1, int(cw * scale))
                 nh = max(1, int(ch * scale))
-                resized_obj = cropped.resize((nw, nh), Image.Resampling.LANCZOS)
+                resized_obj = cropped if (cw, ch) == (nw, nh) else cropped.resize((nw, nh), Image.Resampling.LANCZOS)
                 final_img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
                 final_img.paste(resized_obj, ((w - nw) // 2, (h - nh) // 2), resized_obj)
                 return final_img
 
-        return raw_img.convert("RGBA").resize((w, h), Image.Resampling.LANCZOS)
+        return src_rgba if src_rgba.size == (w, h) else src_rgba.resize((w, h), Image.Resampling.LANCZOS)
 
 
     def _build_reference_parts(
@@ -1183,10 +1261,40 @@ class VisualArtSpriteDesignerAgent:
             raise StudioAgentError(f"No image bytes returned from Gemini image generation for '{char_obj.name}' after {max_retries} attempts")
 
         raw_img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+        master_out = kwargs.get("master_output_path")
         if self._is_live_genai_client() and not kwargs.get("force_16_color", False):
-            cleaned = self.extract_clean_alpha_sprite(raw_img, target_size=(w, h), strip_border_frame=True, pad_ratio=0.04)
+            master_w = max(w, raw_img.width)
+            master_h = max(h, int(round(h * (master_w / max(1, w)))))
+            master_cleaned = self.extract_clean_alpha_sprite(
+                raw_img,
+                target_size=(master_w, master_h),
+                strip_border_frame=True,
+                pad_ratio=0.04,
+            )
+            if master_out is not None:
+                m_p = Path(master_out)
+                m_p.parent.mkdir(parents=True, exist_ok=True)
+                master_cleaned.save(m_p, "PNG")
+            cleaned = (
+                master_cleaned
+                if master_cleaned.size == (w, h)
+                else master_cleaned.resize((w, h), Image.Resampling.LANCZOS)
+            )
             cleaned.save(out_p, "PNG")
         else:
+            if master_out is not None:
+                m_p = Path(master_out)
+                m_p.parent.mkdir(parents=True, exist_ok=True)
+                if raw_img.width >= 256 and raw_img.height >= 256 and not kwargs.get("force_16_color", False):
+                    master_cleaned = self.extract_clean_alpha_sprite(
+                        raw_img,
+                        target_size=None,
+                        strip_border_frame=True,
+                        pad_ratio=0.04,
+                    )
+                    master_cleaned.save(m_p, "PNG")
+                else:
+                    raw_img.save(m_p, "PNG")
             raw_img = raw_img.resize((w, h), Image.Resampling.LANCZOS)
             quantized = quantize_image_to_indexed(raw_img, STYLE_BIBLE_16_PALETTE)
             quantized.save(out_p, "PNG")
@@ -1232,13 +1340,16 @@ class VisualArtSpriteDesignerAgent:
         mockup: Union[VisualMockupArtifact, Dict[str, Any]],
         output_path: Union[Path, str],
         style_guide: str = "",
-        dimensions: Tuple[int, int] = (1280, 720),
+        dimensions: Optional[Tuple[int, int]] = None,
         negative_constraints: Optional[Sequence[str]] = None,
         reference_images: Optional[Sequence[Union[Path, str, bytes, Image.Image]]] = None,
         shot_plan: Optional[Union[ConceptArtShotPlan, Dict[str, Any]]] = None,
         image_size: str = "2K",
+        master_output_path: Optional[Union[Path, str]] = None,
     ) -> Path:
-        """Synthesizes a 16:9 full-screen playable gameplay concept mockup via high-craft Gemini image model."""
+        """Synthesizes a 16:9 full-screen playable gameplay concept mockup via high-craft Gemini image model.
+        Preserves full native 2K resolution (`dimensions=None`) unless explicit context dimensions are passed.
+        """
         if self.client is None:
             raise StudioAgentError(
                 "VisualArtSpriteDesignerAgent requires an active google.genai Client to synthesize concept mockups (Rule 5: Zero Silent Fallbacks)"
@@ -1398,8 +1509,13 @@ class VisualArtSpriteDesignerAgent:
             )
 
         raw_img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
-        if dimensions and dimensions[0] > 0 and dimensions[1] > 0:
-            raw_img = raw_img.resize(dimensions, Image.Resampling.LANCZOS)
+        if master_output_path is not None:
+            m_p = Path(master_output_path)
+            m_p.parent.mkdir(parents=True, exist_ok=True)
+            if m_p.resolve() != out_p.resolve():
+                raw_img.save(m_p, "PNG")
+        if dimensions and dimensions[0] > 0 and dimensions[1] > 0 and raw_img.size != (int(dimensions[0]), int(dimensions[1])):
+            raw_img = raw_img.resize((int(dimensions[0]), int(dimensions[1])), Image.Resampling.LANCZOS)
         raw_img.save(out_p, "PNG")
         return out_p
 
@@ -1409,6 +1525,20 @@ class VisualArtSpriteDesignerAgent:
             return False
         mod = getattr(type(self.client), "__module__", "") or ""
         return mod.startswith("google.genai")
+
+    @staticmethod
+    def _compute_master_canvas_size(raw_size: Tuple[int, int], target_dims: Tuple[int, int]) -> Tuple[int, int]:
+        """Computes full-resolution master canvas dimensions preserving `target_dims` aspect ratio
+        while scaling the longest axis up to the native Gemini synthesis resolution (`raw_size`).
+        """
+        tw, th = max(1, int(target_dims[0])), max(1, int(target_dims[1]))
+        rw, rh = max(1, int(raw_size[0])), max(1, int(raw_size[1]))
+        max_native = max(rw, rh)
+        max_target = max(tw, th)
+        if max_native <= max_target:
+            return (tw, th)
+        scale_up = float(max_native) / float(max_target)
+        return (max(tw, int(round(tw * scale_up))), max(th, int(round(th * scale_up))))
 
     def _generate_gemini_sprite_image(
         self,
@@ -1421,8 +1551,12 @@ class VisualArtSpriteDesignerAgent:
         isolate_single_subject: bool = True,
         chroma_key_hex: str = "#FF00FF",
         camera_projection: str = "",
+        master_output_path: Optional[Union[Path, str]] = None,
     ) -> Image.Image:
-        """Synthesizes a real 2D game sprite, prop, tile, or parallax backdrop via Gemini image generation."""
+        """Synthesizes a real 2D game sprite, prop, tile, or parallax backdrop via Gemini image generation.
+        When `master_output_path` is provided (or `max(dimensions) > 256`), extracts and preserves the full-size
+        cleaned master image before downsampling cleanly to `dimensions`.
+        """
         from google.genai import types
 
         w, h = max(1, int(dimensions[0])), max(1, int(dimensions[1]))
@@ -1529,6 +1663,18 @@ class VisualArtSpriteDesignerAgent:
             )
 
         raw_img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+        preserve_master = (master_output_path is not None) or (max(w, h) > 256)
+        master_dims = self._compute_master_canvas_size(raw_img.size, (w, h)) if preserve_master else (w, h)
+
+        def _finalize_with_master(master_im: Image.Image) -> Image.Image:
+            if master_output_path is not None:
+                m_p = Path(master_output_path)
+                m_p.parent.mkdir(parents=True, exist_ok=True)
+                master_im.save(m_p, "PNG")
+            if master_im.size == (w, h):
+                return master_im
+            return master_im.resize((w, h), Image.Resampling.LANCZOS)
+
         if is_tile:
             # Check if the tile has interior chroma-key openings (e.g., see-through truss/lattice/grate)
             arr_raw = np.array(raw_img, dtype=np.uint8)
@@ -1537,36 +1683,40 @@ class VisualArtSpriteDesignerAgent:
             if inner.size > 0:
                 ck_mask = self._compute_chroma_spill_mask(inner, norm_ck, alpha_min=0, hi_threshold=185, lo_threshold=90, excess_threshold=100)
                 if float(np.mean(ck_mask)) >= 0.03:
-                    return self.extract_clean_alpha_sprite(
+                    tile_cutout = self.extract_clean_alpha_sprite(
                         raw_img,
-                        target_size=(w, h),
+                        target_size=master_dims,
                         strip_border_frame=True,
                         pad_ratio=0.0,
                         isolate_single_subject=False,
                         chroma_key_hex=norm_ck,
                     )
+                    return _finalize_with_master(tile_cutout)
             # Only apply full-bleed toroidal tiling when the target is an approximately square surface swatch;
             # non-square strips (e.g. 96x32 modular segments or thin fluid ribbons) would be smeared by toroidal self-blending.
             if max(w, h) / max(1, min(w, h)) >= 1.75:
-                return self.extract_clean_alpha_sprite(
+                strip_cutout = self.extract_clean_alpha_sprite(
                     raw_img,
-                    target_size=(w, h),
+                    target_size=master_dims,
                     strip_border_frame=True,
                     pad_ratio=0.02,
                     chroma_key_hex=norm_ck,
                 )
-            return self.ensure_full_bleed_tile(raw_img, target_size=(w, h))
+                return _finalize_with_master(strip_cutout)
+            full_bleed = self.ensure_full_bleed_tile(raw_img, target_size=master_dims)
+            return _finalize_with_master(full_bleed)
         if is_backdrop:
-            return raw_img.resize((w, h), Image.Resampling.LANCZOS)
+            return _finalize_with_master(raw_img)
 
-        return self.extract_clean_alpha_sprite(
+        sprite_master = self.extract_clean_alpha_sprite(
             raw_img,
-            target_size=(w, h),
+            target_size=master_dims,
             strip_border_frame=True,
             pad_ratio=0.06,
             isolate_single_subject=isolate_single_subject,
             chroma_key_hex=norm_ck,
         )
+        return _finalize_with_master(sprite_master)
 
     @staticmethod
     def compute_tile_mirror_symmetry(img: Image.Image) -> float:
@@ -1606,7 +1756,13 @@ class VisualArtSpriteDesignerAgent:
         raised-cosine diamond blending (eliminating Rorschach/kaleidoscope mirror artifacts).
         """
         w, h = max(16, int(target_size[0])), max(16, int(target_size[1]))
-        img = raw_img.convert("RGBA").resize((256, 256), Image.Resampling.LANCZOS)
+        work_sz = (
+            max(256, min(1024, max(w, h, raw_img.width, raw_img.height)))
+            if max(w, h) > 256
+            else 256
+        )
+        scale_k = max(1, work_sz // 256)
+        img = raw_img.convert("RGBA").resize((work_sz, work_sz), Image.Resampling.LANCZOS)
         arr_rgba = np.array(img, dtype=np.uint8)
         r_ch, g_ch, b_ch, a_ch = arr_rgba[:, :, 0], arr_rgba[:, :, 1], arr_rgba[:, :, 2], arr_rgba[:, :, 3]
         is_bg = (a_ch < 200) | ((r_ch > 215) & (g_ch > 215) & (b_ch > 215)) | ((r_ch > 200) & (b_ch > 200) & (g_ch < 80))
@@ -1614,33 +1770,37 @@ class VisualArtSpriteDesignerAgent:
 
         fg_rows = np.where(np.mean(fg_mask, axis=1) > 0.50)[0]
         fg_cols = np.where(np.mean(fg_mask, axis=0) > 0.50)[0]
-        if len(fg_rows) >= 64 and len(fg_cols) >= 64:
+        min_fg_span = 64 * scale_k
+        min_crop_span = 96 * scale_k
+        step_px = 2 * scale_k
+        if len(fg_rows) >= min_fg_span and len(fg_cols) >= min_fg_span:
             top, bottom = int(fg_rows[0]), int(fg_rows[-1]) + 1
             left, right = int(fg_cols[0]), int(fg_cols[-1]) + 1
             # Also inset past any remaining corner bg pixels
             for _ in range(24):
-                if (bottom - top) <= 96 or (right - left) <= 96:
+                if (bottom - top) <= min_crop_span or (right - left) <= min_crop_span:
                     break
                 sub_bg = is_bg[top:bottom, left:right]
                 if not np.any(sub_bg):
                     break
                 if np.any(sub_bg[0, :]):
-                    top += 2
+                    top += step_px
                 if np.any(sub_bg[-1, :]):
-                    bottom -= 2
+                    bottom -= step_px
                 if np.any(sub_bg[:, 0]):
-                    left += 2
+                    left += step_px
                 if np.any(sub_bg[:, -1]):
-                    right -= 2
-            inset = 4
-            if (right - left) > 96 + inset * 2:
+                    right -= step_px
+            inset = 4 * scale_k
+            if (right - left) > min_crop_span + inset * 2:
                 left += inset
                 right -= inset
-            if (bottom - top) > 96 + inset * 2:
+            if (bottom - top) > min_crop_span + inset * 2:
                 top += inset
                 bottom -= inset
         else:
-            top, bottom, left, right = 16, 240, 16, 240
+            margin_fb = 16 * scale_k
+            top, bottom, left, right = margin_fb, work_sz - margin_fb, margin_fb, work_sz - margin_fb
 
         cropped = img.crop((left, top, right, bottom))
         # If the input image already exhibits bilateral mirror symmetry (e.g. a legacy Rorschach tile),
@@ -2131,10 +2291,12 @@ class VisualArtSpriteDesignerAgent:
         mood: str = "retro_arcade",
         reference_images: Optional[List[Union[Path, str, bytes, Image.Image]]] = None,
         style_guide: str = "",
+        master_output_path: Optional[Union[Path, str]] = None,
     ) -> Tuple[Path, Dict[str, Any]]:
         """Fabricates a multi-row, multi-frame keyframed sprite sheet PNG and returns (sheet_path, metadata_dict).
         Each row corresponds to an AnimationStateSpec in asset_req.animation_states and carries explicit
         `keyframe_tracks` exported into `asset_library.json` for runtime Godot `AnimationPlayer` binding.
+        When `master_output_path` is provided, also writes the full-resolution master sprite sheet.
         """
         cell_w, cell_h = asset_req.dimensions or (64, 64)
         cell_w = max(32, int(cell_w))
@@ -2195,7 +2357,16 @@ class VisualArtSpriteDesignerAgent:
                 ),
             ]
 
-        base_dims = (cell_w * 2, cell_h * 2)
+        is_live_gen = self._is_live_genai_client()
+        if is_live_gen:
+            m_scale = max(1.0, 512.0 / float(max(cell_w, cell_h)))
+            m_cell_w = max(cell_w, int(round(cell_w * m_scale)))
+            m_cell_h = max(cell_h, int(round(cell_h * m_scale)))
+            base_dims = (max(m_cell_w * 2, 1024), max(m_cell_h * 2, int(round(1024 * (m_cell_h / max(1, m_cell_w))))))
+        else:
+            m_cell_w, m_cell_h = cell_w, cell_h
+            base_dims = (cell_w * 2, cell_h * 2)
+
         raw_base_prompt = asset_req.visual_prompt_or_text or asset_req.description or asset_req.asset_id
         single_base_prompt = (
             f"SINGLE CANONICAL NEUTRAL STANDING/IDLE FIGURE ONLY (the animation engine will articulate all other rows/frames "
@@ -2203,7 +2374,7 @@ class VisualArtSpriteDesignerAgent:
         )
         req_chroma = getattr(asset_req, "chroma_key_hex", "#FF00FF") or "#FF00FF"
         req_cam_proj = str(getattr(asset_req, "camera_projection", "") or "")
-        if self._is_live_genai_client():
+        if is_live_gen:
             base_img = self._generate_gemini_sprite_image(
                 prompt=single_base_prompt,
                 asset_type=asset_req.asset_type or "sprite_sheet",
@@ -2229,7 +2400,9 @@ class VisualArtSpriteDesignerAgent:
         num_rows = len(states)
         sheet_w = cell_w * max_cols
         sheet_h = cell_h * num_rows
-        sheet_img = Image.new("RGBA", (sheet_w, sheet_h), (0, 0, 0, 0))
+        m_sheet_w = m_cell_w * max_cols
+        m_sheet_h = m_cell_h * num_rows
+        master_sheet_img = Image.new("RGBA", (m_sheet_w, m_sheet_h), (0, 0, 0, 0))
 
         states_meta: Dict[str, Dict[str, Any]] = {}
         has_custom_states = bool(asset_req.animation_states and len(asset_req.animation_states) > 1)
@@ -2243,7 +2416,7 @@ class VisualArtSpriteDesignerAgent:
                 row_idx > 0
                 and has_custom_states
                 and state_pose_desc
-                and self._is_live_genai_client()
+                and is_live_gen
             ):
                 state_prompt = (
                     f"SINGLE CANONICAL SPRITE ONLY — maintain the exact same character/object identity, core proportions, "
@@ -2269,7 +2442,7 @@ class VisualArtSpriteDesignerAgent:
                     and len(states) == 1
                     and fcount <= 6
                     and state_pose_desc
-                    and self._is_live_genai_client()
+                    and is_live_gen
                     and m_profile in ("custom", "action")
                 ):
                     col_prompt = (
@@ -2304,11 +2477,11 @@ class VisualArtSpriteDesignerAgent:
                     state_name=st.state_name,
                     frame_idx=col_idx,
                     frame_count=fcount,
-                    cell_size=(cell_w, cell_h),
+                    cell_size=(m_cell_w, m_cell_h),
                     motion_profile=m_profile,
                     keyframe_tracks=kf_tracks,
                 )
-                sheet_img.paste(frame_img, (col_idx * cell_w, row_idx * cell_h), frame_img)
+                master_sheet_img.paste(frame_img, (col_idx * m_cell_w, row_idx * m_cell_h), frame_img)
 
             states_meta[st.state_name] = {
                 "row": row_idx,
@@ -2320,6 +2493,16 @@ class VisualArtSpriteDesignerAgent:
                 "keyframe_tracks": [t.model_dump() for t in kf_tracks],
             }
 
+        if master_output_path is not None:
+            m_p = Path(master_output_path)
+            m_p.parent.mkdir(parents=True, exist_ok=True)
+            master_sheet_img.save(m_p, "PNG")
+
+        sheet_img = (
+            master_sheet_img
+            if master_sheet_img.size == (sheet_w, sheet_h)
+            else master_sheet_img.resize((sheet_w, sheet_h), Image.Resampling.LANCZOS)
+        )
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         sheet_img.save(output_path, "PNG")
@@ -2328,9 +2511,11 @@ class VisualArtSpriteDesignerAgent:
             "hframes": max_cols,
             "vframes": num_rows,
             "texture_pixel_size": (sheet_w, sheet_h),
+            "master_pixel_size": (m_sheet_w, m_sheet_h),
             "target_display_size": (cell_w, cell_h),
             "animation_states": states_meta,
             "base_frame_image": base_img.resize((cell_w, cell_h), Image.Resampling.LANCZOS),
+            "master_base_frame_image": base_img.resize((m_cell_w, m_cell_h), Image.Resampling.LANCZOS),
         }
         return output_path, meta
 
@@ -2340,6 +2525,7 @@ class VisualArtSpriteDesignerAgent:
         parts_with_images: List[Tuple[Dict[str, Any], Image.Image]],
         canvas_size: Tuple[int, int],
         phase: Optional[float] = None,
+        coord_scale: float = 1.0,
     ) -> Image.Image:
         """Assembles an articulated multi-part rig onto `canvas_size` using hierarchical parent anchors,
         pivot-aligned placement (`pivot_normalized`), z-index sorting (`z_index_offset`), and auto-fitting
@@ -2348,6 +2534,7 @@ class VisualArtSpriteDesignerAgent:
         cw, ch = max(16, int(canvas_size[0])), max(16, int(canvas_size[1]))
         if not parts_with_images:
             return Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+        c_scale = max(0.01, float(coord_scale))
 
         part_lookup: Dict[str, Tuple[Dict[str, Any], Image.Image]] = {
             str(pm.get("part_id", f"part_{i}")): (pm, pimg)
@@ -2373,7 +2560,7 @@ class VisualArtSpriteDesignerAgent:
             visited.add(pid)
             pm, _ = part_lookup[pid]
             offs = pm.get("attach_offset_px") or [0.0, 0.0]
-            ox, oy = float(offs[0]), float(offs[1])
+            ox, oy = float(offs[0]) * c_scale, float(offs[1]) * c_scale
             parent_id = pm.get("parent_part_id")
             if parent_id and str(parent_id) in part_lookup and str(parent_id) != pid:
                 px, py = _get_anchor(str(parent_id), visited)
@@ -2382,7 +2569,7 @@ class VisualArtSpriteDesignerAgent:
                 parent_meta, _ = part_lookup[str(parent_id)]
                 is_parent_root = not parent_meta.get("parent_part_id") or str(parent_meta.get("parent_part_id")) not in part_lookup
                 dist = math.hypot(ox, oy)
-                if is_parent_root and 1.0 < dist < root_radius * 0.92:
+                if is_parent_root and c_scale < dist < root_radius * 0.92:
                     scale_out = (root_radius * 0.95) / dist
                     ox *= scale_out
                     oy *= scale_out
@@ -2396,8 +2583,8 @@ class VisualArtSpriteDesignerAgent:
             _get_anchor(pid)
 
         # Compute stable rig-space bounds across all parts (including rotation margin) so scale is invariant across `phase`
-        min_x, min_y = -16.0, -16.0
-        max_x, max_y = 16.0, 16.0
+        min_x, min_y = -16.0 * c_scale, -16.0 * c_scale
+        max_x, max_y = 16.0 * c_scale, 16.0 * c_scale
         for pid, (pm, pimg) in part_lookup.items():
             ax, ay = anchors[pid]
             pw, ph = pimg.size
@@ -2407,8 +2594,8 @@ class VisualArtSpriteDesignerAgent:
             min_y = min(min_y, ay - diag)
             max_y = max(max_y, ay + diag)
 
-        span_w = max(32.0, (max_x - min_x) * 1.12)
-        span_h = max(32.0, (max_y - min_y) * 1.12)
+        span_w = max(32.0 * c_scale, (max_x - min_x) * 1.12)
+        span_h = max(32.0 * c_scale, (max_y - min_y) * 1.12)
         work_w = max(cw, int(math.ceil(span_w)))
         work_h = max(ch, int(math.ceil(span_h)))
         center_x = work_w * 0.5 - (min_x + max_x) * 0.5
@@ -2473,14 +2660,27 @@ class VisualArtSpriteDesignerAgent:
         mood: str = "retro_arcade",
         reference_images: Optional[List[Union[Path, str, bytes, Image.Image]]] = None,
         style_guide: str = "",
+        master_output_path: Optional[Union[Path, str]] = None,
+        preserve_hidpi_parts: Optional[bool] = None,
     ) -> Tuple[Path, Dict[str, Any]]:
         """Fabricates separate transparent PNGs for each ArticulatedPartSpec in an articulated rig,
-        plus a composite preview PNG at output_path.
+        plus a composite preview PNG at output_path (and full-resolution part & composite masters when
+        `master_output_path` is provided).
         """
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         parts_dir = output_path.parent / "parts"
         parts_dir.mkdir(parents=True, exist_ok=True)
+        is_live_gen = self._is_live_genai_client()
+        use_hidpi_parts = bool(is_live_gen if preserve_hidpi_parts is None else preserve_hidpi_parts)
+
+        m_comp_path: Optional[Path] = None
+        master_parts_dir: Optional[Path] = None
+        if master_output_path is not None:
+            m_comp_path = Path(master_output_path)
+            m_comp_path.parent.mkdir(parents=True, exist_ok=True)
+            master_parts_dir = m_comp_path.parent / "parts"
+            master_parts_dir.mkdir(parents=True, exist_ok=True)
 
         parts_specs = list(asset_req.articulated_parts) if asset_req.articulated_parts else [
             ArticulatedPartSpec(
@@ -2506,36 +2706,61 @@ class VisualArtSpriteDesignerAgent:
         ]
 
         comp_w, comp_h = asset_req.dimensions or (64, 64)
+        comp_w, comp_h = max(16, int(comp_w)), max(16, int(comp_h))
         parts_meta: List[Dict[str, Any]] = []
-        parts_with_images: List[Tuple[Dict[str, Any], Image.Image]] = []
+        parts_with_logical_images: List[Tuple[Dict[str, Any], Image.Image]] = []
+        parts_with_master_images: List[Tuple[Dict[str, Any], Image.Image]] = []
+
+        m_comp_scale = max(1.0, 512.0 / float(max(comp_w, comp_h))) if is_live_gen else 1.0
 
         for pspec in parts_specs:
-            pw, ph = pspec.dimensions or (48, 48)
+            raw_pdims = pspec.dimensions or (48, 48)
+            pw, ph = max(8, int(raw_pdims[0])), max(8, int(raw_pdims[1]))
             part_filename = f"{asset_req.asset_id}_{pspec.part_id}.png"
             part_path = parts_dir / part_filename
-            if self._is_live_genai_client():
-                p_img = self._generate_gemini_sprite_image(
+            m_part_path = (master_parts_dir / part_filename) if master_parts_dir is not None else None
+            if is_live_gen:
+                m_part_scale = max(1.0, 512.0 / float(max(pw, ph)))
+                mpw = max(pw, int(round(pw * m_part_scale)))
+                mph = max(ph, int(round(ph * m_part_scale)))
+                p_master_img = self._generate_gemini_sprite_image(
                     prompt=pspec.visual_prompt or f"{asset_req.description} - {pspec.part_id}",
                     asset_type="sprite",
-                    dimensions=(pw, ph),
+                    dimensions=(mpw, mph),
                     reference_images=reference_images,
                     style_guide=style_guide,
                     chroma_key_hex=getattr(asset_req, "chroma_key_hex", "#FF00FF") or "#FF00FF",
                     camera_projection=str(getattr(asset_req, "camera_projection", "") or ""),
+                    master_output_path=m_part_path,
                 )
             else:
                 self._ensure_procedural_allowed_or_raise("fabricate_articulated_rig")
                 renderer = ProceduralSpriteRenderer(mood=mood)
-                p_img = renderer.render_dynamic_sprite(
+                p_master_img = renderer.render_dynamic_sprite(
                     dimensions=(pw, ph),
                     prompt=pspec.visual_prompt,
                     asset_type="sprite",
                     seed=f"{asset_req.asset_id}_{pspec.part_id}",
-                )
-            p_img = p_img.convert("RGBA").resize((pw, ph), Image.Resampling.LANCZOS)
-            p_img.save(part_path, "PNG")
+                ).convert("RGBA")
+                if m_part_path is not None:
+                    p_master_img.save(m_part_path, "PNG")
 
-            pmeta = {
+            if use_hidpi_parts:
+                target_longest = min(512, max(128, max(pw, ph) * 4))
+                rt_scale = max(1.0, float(target_longest) / float(max(pw, ph)))
+                rt_pw = max(pw, int(round(pw * rt_scale)))
+                rt_ph = max(ph, int(round(ph * rt_scale)))
+            else:
+                rt_pw, rt_ph = pw, ph
+
+            p_runtime_img = (
+                p_master_img
+                if p_master_img.size == (rt_pw, rt_ph)
+                else p_master_img.resize((rt_pw, rt_ph), Image.Resampling.LANCZOS)
+            )
+            p_runtime_img.save(part_path, "PNG")
+
+            pmeta: Dict[str, Any] = {
                 "part_id": pspec.part_id,
                 "res_path": f"res://assets/sprites/parts/{part_filename}",
                 "file_path": f"assets/sprites/parts/{part_filename}",
@@ -2544,14 +2769,49 @@ class VisualArtSpriteDesignerAgent:
                 "attach_offset_px": list(pspec.attach_offset_px),
                 "z_index_offset": int(pspec.z_index_offset),
                 "dimensions": [pw, ph],
+                "texture_pixel_size": [rt_pw, rt_ph],
             }
+            if m_part_path is not None:
+                pmeta["master_file_path"] = f"assets/masters/sprites/parts/{part_filename}"
             parts_meta.append(pmeta)
-            parts_with_images.append((pmeta, p_img))
+            parts_with_logical_images.append((pmeta, p_master_img.resize((pw, ph), Image.Resampling.LANCZOS)))
+            if m_comp_scale > 1.0:
+                scaled_mpw = max(8, int(round(pw * m_comp_scale)))
+                scaled_mph = max(8, int(round(ph * m_comp_scale)))
+                parts_with_master_images.append(
+                    (pmeta, p_master_img.resize((scaled_mpw, scaled_mph), Image.Resampling.LANCZOS))
+                )
+            else:
+                parts_with_master_images.append((pmeta, p_master_img.resize((pw, ph), Image.Resampling.LANCZOS)))
 
-        composite = self._assemble_articulated_rig_frame(parts_with_images, (comp_w, comp_h), phase=None)
+        m_comp_w = max(comp_w, int(round(comp_w * m_comp_scale)))
+        m_comp_h = max(comp_h, int(round(comp_h * m_comp_scale)))
+        master_composite = self._assemble_articulated_rig_frame(
+            parts_with_master_images,
+            (m_comp_w, m_comp_h),
+            phase=None,
+            coord_scale=m_comp_scale,
+        )
+        if m_comp_path is not None:
+            master_composite.save(m_comp_path, "PNG")
+
+        if use_hidpi_parts:
+            rt_comp_scale = max(1.0, 256.0 / float(max(comp_w, comp_h)))
+            rt_comp_w = max(comp_w, int(round(comp_w * rt_comp_scale)))
+            rt_comp_h = max(comp_h, int(round(comp_h * rt_comp_scale)))
+            composite = (
+                master_composite
+                if master_composite.size == (rt_comp_w, rt_comp_h)
+                else master_composite.resize((rt_comp_w, rt_comp_h), Image.Resampling.LANCZOS)
+            )
+        else:
+            rt_comp_w, rt_comp_h = comp_w, comp_h
+            composite = self._assemble_articulated_rig_frame(parts_with_logical_images, (comp_w, comp_h), phase=None)
+
         composite.save(output_path, "PNG")
         return output_path, {
-            "texture_pixel_size": (comp_w, comp_h),
+            "texture_pixel_size": (rt_comp_w, rt_comp_h),
+            "master_pixel_size": master_composite.size,
             "target_display_size": (comp_w, comp_h),
             "articulated_parts": parts_meta,
         }
@@ -2566,10 +2826,12 @@ class VisualArtSpriteDesignerAgent:
         *,
         regenerate_cell_indices: Optional[Sequence[int]] = None,
         existing_sheet_path: Optional[Union[Path, str]] = None,
+        master_output_path: Optional[Union[Path, str]] = None,
     ) -> Path:
         """Renders and saves a dynamic sprite (or multi-cell grid/atlas sheet when grid_cols * grid_rows > 1) from an AssetRequirement.
         When `regenerate_cell_indices` and `existing_sheet_path` are provided for a multi-cell grid retry, preserves clean cells from
-        `existing_sheet_path` and re-synthesizes only the defective cell indices."""
+        `existing_sheet_path` and re-synthesizes only the defective cell indices.
+        When `master_output_path` is provided, preserves the full-resolution cleaned master asset."""
         if isinstance(asset_req, dict):
             dims = asset_req.get("dimensions") or (64, 64)
             prompt = asset_req.get("visual_prompt_or_text") or asset_req.get("description") or asset_req.get("name", "game sprite")
@@ -2602,14 +2864,21 @@ class VisualArtSpriteDesignerAgent:
             camera_projection = str(getattr(asset_req, "camera_projection", "") or "")
 
         is_multi_cell = (grid_cols * grid_rows) > 1
+        is_live_gen = self._is_live_genai_client()
         if is_multi_cell and cell_prompts:
             total_cells = grid_cols * grid_rows
             cell_w = max(32, int(dims[0]) // grid_cols)
             cell_h = max(32, int(dims[1]) // grid_rows)
             sheet_w = cell_w * grid_cols
             sheet_h = cell_h * grid_rows
+            m_scale = max(1.0, 512.0 / float(max(cell_w, cell_h))) if is_live_gen else 1.0
+            m_cell_w = max(cell_w, int(round(cell_w * m_scale)))
+            m_cell_h = max(cell_h, int(round(cell_h * m_scale)))
+            m_sheet_w = m_cell_w * grid_cols
+            m_sheet_h = m_cell_h * grid_rows
             cells_to_render = list(range(total_cells))
             img: Optional[Image.Image] = None
+            master_sheet: Optional[Image.Image] = None
             if regenerate_cell_indices is not None and existing_sheet_path:
                 ex_p = Path(existing_sheet_path)
                 if ex_p.is_file():
@@ -2623,20 +2892,31 @@ class VisualArtSpriteDesignerAgent:
                             if 0 < len(valid_regen) < total_cells:
                                 img = prev_rgba.copy()
                                 cells_to_render = valid_regen
+                                if master_output_path is not None and Path(master_output_path).is_file():
+                                    with Image.open(master_output_path) as prev_m:
+                                        prev_m_rgba = prev_m.convert("RGBA")
+                                    if prev_m_rgba.size == (m_sheet_w, m_sheet_h):
+                                        master_sheet = prev_m_rgba.copy()
                     except Exception:
                         img = None
             if img is None:
                 img = Image.new("RGBA", (sheet_w, sheet_h), (0, 0, 0, 0))
-            renderer = None if self._is_live_genai_client() else ProceduralSpriteRenderer(mood=mood)
+            if master_output_path is not None and master_sheet is None:
+                master_sheet = (
+                    img.resize((m_sheet_w, m_sheet_h), Image.Resampling.LANCZOS)
+                    if len(cells_to_render) < total_cells
+                    else Image.new("RGBA", (m_sheet_w, m_sheet_h), (0, 0, 0, 0))
+                )
+            renderer = None if is_live_gen else ProceduralSpriteRenderer(mood=mood)
             for idx in cells_to_render:
                 row_i = idx // grid_cols
                 col_i = idx % grid_cols
                 c_prompt = str(cell_prompts[idx] if idx < len(cell_prompts) else prompt).strip() or prompt
-                if self._is_live_genai_client():
-                    cell_img = self._generate_gemini_sprite_image(
+                if is_live_gen:
+                    cell_master_img = self._generate_gemini_sprite_image(
                         prompt=c_prompt,
                         asset_type="sprite",
-                        dimensions=(cell_w, cell_h),
+                        dimensions=(m_cell_w, m_cell_h),
                         reference_images=reference_images,
                         style_guide=style_guide,
                         isolate_single_subject=True,
@@ -2645,25 +2925,58 @@ class VisualArtSpriteDesignerAgent:
                     )
                 else:
                     self._ensure_procedural_allowed_or_raise("generate_dynamic_sprite")
-                    cell_img = renderer.render_dynamic_sprite(
+                    cell_master_img = renderer.render_dynamic_sprite(
                         dimensions=(cell_w, cell_h),
                         prompt=c_prompt,
                         asset_type=atype,
                         seed=f"{aid}_cell_{idx}_{c_prompt[:24]}",
-                    )
+                    ).convert("RGBA")
                 target_fp = cell_target_sizes[idx] if idx < len(cell_target_sizes) else None
                 if target_fp is not None:
                     cell_rgba = self.fit_cutout_to_cell_footprint(
-                        cell_img,
+                        cell_master_img,
                         cell_size=(cell_w, cell_h),
                         target_footprint=target_fp,
                     )
+                    if master_sheet is not None:
+                        m_fp = (
+                            max(4, int(round(target_fp[0] * (m_cell_w / max(1, cell_w))))),
+                            max(4, int(round(target_fp[1] * (m_cell_h / max(1, cell_h))))),
+                        )
+                        m_cell_rgba = self.fit_cutout_to_cell_footprint(
+                            cell_master_img,
+                            cell_size=(m_cell_w, m_cell_h),
+                            target_footprint=m_fp,
+                        )
+                    else:
+                        m_cell_rgba = None
                 else:
-                    cell_rgba = cell_img.convert("RGBA").resize((cell_w, cell_h), Image.Resampling.LANCZOS)
+                    cell_rgba = (
+                        cell_master_img
+                        if cell_master_img.size == (cell_w, cell_h)
+                        else cell_master_img.resize((cell_w, cell_h), Image.Resampling.LANCZOS)
+                    )
+                    m_cell_rgba = (
+                        (
+                            cell_master_img
+                            if cell_master_img.size == (m_cell_w, m_cell_h)
+                            else cell_master_img.resize((m_cell_w, m_cell_h), Image.Resampling.LANCZOS)
+                        )
+                        if master_sheet is not None
+                        else None
+                    )
                 cell_box = (col_i * cell_w, row_i * cell_h, (col_i + 1) * cell_w, (row_i + 1) * cell_h)
                 img.paste((0, 0, 0, 0), cell_box)
                 img.paste(cell_rgba, (col_i * cell_w, row_i * cell_h), cell_rgba)
-        elif self._is_live_genai_client():
+                if master_sheet is not None and m_cell_rgba is not None:
+                    m_box = (col_i * m_cell_w, row_i * m_cell_h, (col_i + 1) * m_cell_w, (row_i + 1) * m_cell_h)
+                    master_sheet.paste((0, 0, 0, 0), m_box)
+                    master_sheet.paste(m_cell_rgba, (col_i * m_cell_w, row_i * m_cell_h), m_cell_rgba)
+            if master_output_path is not None and master_sheet is not None:
+                m_p = Path(master_output_path)
+                m_p.parent.mkdir(parents=True, exist_ok=True)
+                master_sheet.save(m_p, "PNG")
+        elif is_live_gen:
             img = self._generate_gemini_sprite_image(
                 prompt=prompt,
                 asset_type=atype,
@@ -2673,13 +2986,35 @@ class VisualArtSpriteDesignerAgent:
                 isolate_single_subject=not is_multi_cell,
                 chroma_key_hex=chroma_key_hex,
                 camera_projection=camera_projection,
+                master_output_path=master_output_path,
             )
             if not is_multi_cell and len(cell_target_sizes) == 1:
-                img = self.fit_cutout_to_cell_footprint(
-                    img,
-                    cell_size=(max(1, int(dims[0])), max(1, int(dims[1]))),
-                    target_footprint=cell_target_sizes[0],
-                )
+                rt_cw, rt_ch = max(1, int(dims[0])), max(1, int(dims[1]))
+                if master_output_path is not None and Path(master_output_path).is_file():
+                    with Image.open(master_output_path) as m_open:
+                        m_rgba = m_open.convert("RGBA")
+                    mw, mh = m_rgba.size
+                    m_fp_single = (
+                        max(4, int(round(cell_target_sizes[0][0] * (mw / float(rt_cw))))),
+                        max(4, int(round(cell_target_sizes[0][1] * (mh / float(rt_ch))))),
+                    )
+                    m_fitted = self.fit_cutout_to_cell_footprint(
+                        m_rgba,
+                        cell_size=(mw, mh),
+                        target_footprint=m_fp_single,
+                    )
+                    m_fitted.save(Path(master_output_path), "PNG")
+                    img = (
+                        m_fitted
+                        if m_fitted.size == (rt_cw, rt_ch)
+                        else m_fitted.resize((rt_cw, rt_ch), Image.Resampling.LANCZOS)
+                    )
+                else:
+                    img = self.fit_cutout_to_cell_footprint(
+                        img,
+                        cell_size=(rt_cw, rt_ch),
+                        target_footprint=cell_target_sizes[0],
+                    )
         else:
             self._ensure_procedural_allowed_or_raise("generate_dynamic_sprite")
             renderer = ProceduralSpriteRenderer(mood=mood)
@@ -2690,6 +3025,10 @@ class VisualArtSpriteDesignerAgent:
                     cell_size=(max(1, int(dims[0])), max(1, int(dims[1]))),
                     target_footprint=cell_target_sizes[0],
                 )
+            if master_output_path is not None:
+                m_p = Path(master_output_path)
+                m_p.parent.mkdir(parents=True, exist_ok=True)
+                img.save(m_p, "PNG")
 
         if output_path is None:
             name = getattr(asset_req, "name", None) if hasattr(asset_req, "name") else (asset_req.get("name") if isinstance(asset_req, dict) else None)
@@ -2998,7 +3337,10 @@ class VisualArtSpriteDesignerAgent:
 
         ordered_states = sorted(states_meta.items(), key=lambda kv: int(kv[1].get("row", 0)))
         max_cols = max(max(1, int(st.get("frame_count", 1))) for _, st in ordered_states)
-        num_rows = max(1, len(ordered_states))
+        max_row_idx = max(int(st.get("row", idx)) for idx, (_, st) in enumerate(ordered_states))
+        num_rows = max(1, len(ordered_states), max_row_idx + 1)
+        src_cw = max(16, sheet_w // max_cols) if sheet_w >= max_cols * 16 else cw
+        src_ch = max(16, sheet_h // num_rows) if sheet_h >= num_rows * 16 else ch
 
         pad = 8
         cell_stride_x = cw + pad
@@ -3021,9 +3363,11 @@ class VisualArtSpriteDesignerAgent:
             non_empty_frames = 0
 
             for c_idx in range(fcount):
-                sx0 = min(max(0, c_idx * cw), max(0, sheet_w - cw))
-                sy0 = min(max(0, row_num * ch), max(0, sheet_h - ch))
-                frame_crop = rgba.crop((sx0, sy0, sx0 + cw, sy0 + ch))
+                sx0 = min(max(0, c_idx * src_cw), max(0, sheet_w - src_cw))
+                sy0 = min(max(0, row_num * src_ch), max(0, sheet_h - src_ch))
+                frame_crop = rgba.crop((sx0, sy0, sx0 + src_cw, sy0 + src_ch))
+                if frame_crop.size != (cw, ch):
+                    frame_crop = frame_crop.resize((cw, ch), Image.Resampling.LANCZOS)
                 frames.append(frame_crop)
 
                 dest_x = pad + c_idx * cell_stride_x
