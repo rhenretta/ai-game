@@ -2282,13 +2282,16 @@ def create_app(
         cartridges = []
         games_meta = []
         if target_cartridges.exists():
+            from engine.studio.coproducer import infer_cartridge_last_worked_utc
+
             dirs = [
                 p
                 for p in target_cartridges.iterdir()
                 if p.is_dir() and not p.name.startswith(".") and not p.name.startswith("_")
             ]
             cartridges = sorted([p.name for p in dirs])
-            for p in sorted(dirs, key=lambda d: d.stat().st_mtime, reverse=True):
+            scored_games = []
+            for p in dirs:
                 if p.name in ("checkpoints", "candidate"):
                     continue
                 g_title = ""
@@ -2341,16 +2344,23 @@ def create_app(
                     except Exception:
                         pass
                 if g_title or total_cnt > 0 or (p / "project.godot").is_file() or (p / "mechanics.py").is_file():
-                    games_meta.append({
-                        "cartridge_id": p.name,
-                        "game_title": g_title or p.name,
-                        "core_genre": g_genre or "Game",
-                        "status": g_status,
-                        "has_backlog": bl_file.is_file(),
-                        "approved_items": approved_cnt,
-                        "total_items": total_cnt,
-                        "updated_at_utc": datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat(),
-                    })
+                    last_epoch, last_iso = infer_cartridge_last_worked_utc(p)
+                    scored_games.append((
+                        last_epoch,
+                        p.name,
+                        {
+                            "cartridge_id": p.name,
+                            "game_title": g_title or p.name,
+                            "core_genre": g_genre or "Game",
+                            "status": g_status,
+                            "has_backlog": bl_file.is_file(),
+                            "approved_items": approved_cnt,
+                            "total_items": total_cnt,
+                            "updated_at_utc": last_iso,
+                        },
+                    ))
+            scored_games.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            games_meta = [item[2] for item in scored_games]
         return JSONResponse({"cartridges": cartridges, "games": games_meta})
 
     async def active_cartridge_handler(request):

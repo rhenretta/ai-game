@@ -177,6 +177,45 @@ class TestColdBootGenesisAndPromotion:
         assert success is True
         assert mock_supervisor.evaluate_and_heal.called
 
+    def test_cold_boot_false_when_existing_sessions_or_reload_worker_present(self, tmp_path: Path, monkeypatch):
+        # 1. Existing candidate session (even in early brainstorming before project.godot exists) inhibits cold boot
+        cart_root = tmp_path / "cartridges_with_session"
+        cand_dir = cart_root / "candidate_genesis_synth01"
+        cand_dir.mkdir(parents=True)
+        (cand_dir / "co_producer_brief.json").write_text('{"deliberation": "commissioned"}', encoding="utf-8")
+        daemon_cand = StudioDaemon(
+            config_obj=StudioDaemonConfig(
+                cartridges_root=cart_root,
+                active_cartridge_dir=cart_root / "active",
+            )
+        )
+        assert daemon_cand.is_cold_boot_required() is False
+
+        # 2. Existing Co-Producer draft session inhibits cold boot
+        draft_root = tmp_path / "cartridges_with_draft"
+        draft_dir = draft_root / "_coproducer_drafts" / "draft_synth01"
+        draft_dir.mkdir(parents=True)
+        (draft_dir / "co_producer.json").write_text('{"deliberation": "draft"}', encoding="utf-8")
+        daemon_draft = StudioDaemon(
+            config_obj=StudioDaemonConfig(
+                cartridges_root=draft_root,
+                active_cartridge_dir=draft_root / "active",
+            )
+        )
+        assert daemon_draft.is_cold_boot_required() is False
+
+        # 3. Uvicorn reload worker daemon (`STUDIO_RELOAD_WORKER_DAEMON=1`) never triggers unprompted cold boot
+        empty_root = tmp_path / "cartridges_empty_reload"
+        empty_root.mkdir(parents=True)
+        monkeypatch.setenv("STUDIO_RELOAD_WORKER_DAEMON", "1")
+        daemon_reload = StudioDaemon(
+            config_obj=StudioDaemonConfig(
+                cartridges_root=empty_root,
+                active_cartridge_dir=empty_root / "active",
+            )
+        )
+        assert daemon_reload.is_cold_boot_required() is False
+
 
 class TestDecoupledWALPolling:
     """Verifies SQLite WAL polling without lock contention."""
@@ -275,3 +314,74 @@ class TestGracefulDaemonLifecycle:
 
         assert daemon.is_running is False
         assert not lock_path.exists()
+
+    def test_resume_interrupted_brainstorming_cartridge_preserves_bible_and_brief(self, tmp_path: Path):
+        """Resuming an interrupted brainstorming cartridge (with game_bible.json + co_producer_brief.json
+        but no world_spec.json yet) builds StudioSwarmPlan directly from game_bible.json without blind
+        LLM meta-planning and preserves the Co-Producer creative seed."""
+        import json
+        from engine.studio.models import GameBibleSpec
+        from engine.supervisor.models import SupervisorGateVerdict
+
+        cartridges_root = tmp_path / "cartridges"
+        cand_dir = cartridges_root / "candidate_genesis_resumed01"
+        cand_dir.mkdir(parents=True)
+
+        bible = GameBibleSpec(
+            deliberation="Persisted mid-brainstorm Game Bible.",
+            cartridge_id="candidate_genesis_resumed01",
+            target_episode=0,
+            status="brainstorming",
+            game_title="Clockwork Harbor",
+            core_genre="2D Logistics Automation",
+            elevator_pitch="Connect modular pier cranes and automated tugboat lanes across tidal channels.",
+        )
+        (cand_dir / "game_bible.json").write_text(bible.model_dump_json(indent=2), encoding="utf-8")
+        (cand_dir / "co_producer_brief.json").write_text(
+            json.dumps(
+                {
+                    "deliberation": "Persisted Co-Producer handoff envelope.",
+                    "handoff_mode": "refined_concept",
+                    "steering_or_seed_brief": "Connect modular pier cranes and automated tugboat lanes across tidal channels.",
+                    "concept_brief": {
+                        "deliberation": "Co-designed brief.",
+                        "working_title": "Clockwork Harbor",
+                        "core_genre": "2D Logistics Automation",
+                        "elevator_pitch": "Connect modular pier cranes and automated tugboat lanes across tidal channels.",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        mock_orchestrator = MagicMock()
+        mock_orchestrator._creative_prompt = None
+        mock_orchestrator.execute_swarm_plan.return_value = BuildEvaluationReport(
+            deliberation="Resumed build promoted.",
+            status=SupervisorGateVerdict.PROMOTED,
+            promoted_to_active=True,
+        )
+
+        cfg = StudioDaemonConfig(
+            cartridges_root=cartridges_root,
+            active_cartridge_dir=cartridges_root / "active",
+            db_path=tmp_path / "telemetry.db",
+            lock_file=tmp_path / "studio.lock",
+            resume_current=True,
+            resume_candidate_id="candidate_genesis_resumed01",
+            creative_prompt=None,
+        )
+        daemon = StudioDaemon(config_obj=cfg, orchestrator=mock_orchestrator)
+        ok = daemon.run_genesis_cycle()
+
+        assert ok is True
+        mock_orchestrator.generate_swarm_plan.assert_not_called()
+        mock_orchestrator.execute_swarm_plan.assert_called_once()
+        passed_plan, passed_staging_dir = mock_orchestrator.execute_swarm_plan.call_args.args
+        assert passed_staging_dir == cand_dir
+        assert passed_plan.game_title == "Clockwork Harbor"
+        assert passed_plan.genre_verdict == "2D Logistics Automation"
+        assert (
+            mock_orchestrator._creative_prompt
+            == "Connect modular pier cranes and automated tugboat lanes across tidal channels."
+        )

@@ -1222,4 +1222,546 @@ describe('Co-Producer API client & workspace UI', () => {
     const chairArticles = document.querySelectorAll('[data-council-chair="true"]');
     expect(chairArticles).toHaveLength(1);
   });
+
+  it('orders all Co-Producer sessions (drafts, games, and promoted active) strictly by most recently worked on and floats active work immediately to index 0', async () => {
+    const { buildUnifiedCoProducerSessions } = await import('../src/domain/coproducerSessions');
+    const { normalizeGameCatalog } = await import('../src/domain/slices');
+
+    // 1. Pure domain ordering: interleaved drafts + cartridges + promoted active + 0-msg lazy snapshot
+    const normalizedGames = normalizeGameCatalog(
+      [
+        {
+          cartridge_id: 'candidate_promoted_older',
+          game_title: 'Promoted Older Game',
+          core_genre: 'Strategy',
+          status: 'locked',
+          has_backlog: true,
+          approved_items: 4,
+          total_items: 4,
+          updated_at_utc: '2026-11-04T10:00:00Z', // T2
+        },
+        {
+          cartridge_id: 'candidate_worked_newest',
+          game_title: 'Recently Worked Cartridge',
+          core_genre: 'Simulation',
+          status: 'building',
+          has_backlog: true,
+          approved_items: 2,
+          total_items: 5,
+          updated_at_utc: '2026-11-04T14:00:00Z', // T4 (newest overall)
+        },
+      ],
+      'candidate_promoted_older',
+    );
+
+    // normalizeGameCatalog itself orders newest-first rather than pinning isPromotedActive
+    expect(normalizedGames.map((g) => g.cartridge_id)).toEqual([
+      'candidate_worked_newest',
+      'candidate_promoted_older',
+    ]);
+    expect(normalizedGames[1].isPromotedActive).toBe(true);
+
+    const unified = buildUnifiedCoProducerSessions({
+      games: normalizedGames,
+      threadsData: {
+        deliberation: 'Interleaved threads.',
+        active_cartridge_thread: null,
+        draft_threads: [
+          {
+            deliberation: 'Old abandoned draft.',
+            thread_id: 'draft_oldest_t1',
+            scope_kind: 'draft',
+            cartridge_id: null,
+            title: 'Abandoned Morning Draft',
+            concept_brief: null,
+            message_count: 3,
+            created_at_utc: '2026-11-04T08:00:00Z',
+            updated_at_utc: '2026-11-04T08:30:00Z', // T1 (oldest)
+          },
+          {
+            deliberation: 'Midday draft.',
+            thread_id: 'draft_mid_t3',
+            scope_kind: 'draft',
+            cartridge_id: null,
+            title: 'Midday Concept Draft',
+            concept_brief: null,
+            message_count: 5,
+            created_at_utc: '2026-11-04T12:00:00Z',
+            updated_at_utc: '2026-11-04T12:15:00Z', // T3 (between T4 and T2)
+          },
+        ],
+        cartridge_threads: [
+          {
+            // 0-message lazy thread snapshot MUST NOT inflate `candidate_promoted_older` past T2!
+            deliberation: 'Lazy 0-message snapshot.',
+            thread_id: 'thread_candidate_promoted_older',
+            scope_kind: 'cartridge',
+            cartridge_id: 'candidate_promoted_older',
+            title: 'Promoted Older Game',
+            concept_brief: null,
+            message_count: 0,
+            created_at_utc: '2026-11-04T15:00:00Z',
+            updated_at_utc: '2026-11-04T15:00:00Z',
+          },
+        ],
+        threads: [],
+      },
+    });
+
+    expect(unified.map((s) => s.title)).toEqual([
+      'Recently Worked Cartridge', // T4 (14:00Z) — cartridge above older drafts!
+      'Midday Concept Draft', // T3 (12:15Z) — recent draft above older promoted cartridge!
+      'Promoted Older Game', // T2 (10:00Z) — not inflated by 0-msg lazy snapshot!
+      'Abandoned Morning Draft', // T1 (08:30Z) — oldest draft at bottom!
+    ]);
+
+    // 2. Full <App /> integration: sidebar renders interleaved order & sending a message on an older session floats it immediately to #1
+    const pendingReplyResolvers: Array<(res: Response) => void> = [];
+    const newestCartThread: CoProducerThread = {
+      deliberation: 'Newest game thread.',
+      thread_id: 'thread_candidate_worked_newest',
+      scope_kind: 'cartridge',
+      cartridge_id: 'candidate_worked_newest',
+      title: 'Recently Worked Cartridge',
+      concept_brief: null,
+      message_count: 2,
+      created_at_utc: '2026-11-04T13:50:00Z',
+      updated_at_utc: '2026-11-04T14:00:00Z',
+    };
+    const middayDraft: CoProducerThread = {
+      deliberation: 'Midday draft.',
+      thread_id: 'draft_mid_t3',
+      scope_kind: 'draft',
+      cartridge_id: null,
+      title: 'Midday Concept Draft',
+      concept_brief: null,
+      message_count: 1,
+      created_at_utc: '2026-11-04T12:00:00Z',
+      updated_at_utc: '2026-11-04T12:15:00Z',
+    };
+    const olderPromotedThread: CoProducerThread = {
+      deliberation: 'Older promoted game thread.',
+      thread_id: 'thread_candidate_promoted_older',
+      scope_kind: 'cartridge',
+      cartridge_id: 'candidate_promoted_older',
+      title: 'Promoted Older Game',
+      concept_brief: null,
+      message_count: 1,
+      created_at_utc: '2026-11-04T09:50:00Z',
+      updated_at_utc: '2026-11-04T10:00:00Z',
+    };
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
+      const rawUrl =
+        typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const url = decodeURIComponent(rawUrl);
+      const method = (init?.method || 'GET').toUpperCase();
+
+      if (url.includes('/api/cartridges')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              cartridges: ['candidate_worked_newest', 'candidate_promoted_older'],
+              games: [
+                {
+                  cartridge_id: 'candidate_worked_newest',
+                  game_title: 'Recently Worked Cartridge',
+                  core_genre: 'Simulation',
+                  status: 'slice_complete',
+                  has_backlog: true,
+                  approved_items: 3,
+                  total_items: 3,
+                  updated_at_utc: '2026-11-04T14:00:00Z',
+                },
+                {
+                  cartridge_id: 'candidate_promoted_older',
+                  game_title: 'Promoted Older Game',
+                  core_genre: 'Strategy',
+                  status: 'slice_complete',
+                  has_backlog: true,
+                  approved_items: 4,
+                  total_items: 4,
+                  updated_at_utc: '2026-11-04T10:00:00Z',
+                },
+              ],
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      if (url.includes('/api/playtest/sessions')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              deliberation: 'Loaded playtest.',
+              active_cartridge_id: 'candidate_promoted_older',
+              pending_wishes_count: 0,
+              games_catalog: [],
+              playable_targets: [],
+              sessions: [],
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      if (url.includes('/api/studio/game-bible')) {
+        const isOlder = url.includes('candidate_promoted_older');
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              deliberation: 'Loaded bible.',
+              has_bible: true,
+              cartridge_id: isOlder ? 'candidate_promoted_older' : 'candidate_worked_newest',
+              active_candidate_id: 'candidate_promoted_older',
+              game_title: isOlder ? 'Promoted Older Game' : 'Recently Worked Cartridge',
+              writers_room_transcript: [],
+              production_board: {
+                deliberation: 'Board.',
+                cartridge_id: isOlder ? 'candidate_promoted_older' : 'candidate_worked_newest',
+                design_revision: 1,
+                total_items: 3,
+                counts_by_state: { approved: 3 },
+                is_drained: true,
+                items: [],
+              },
+              process_status: {
+                process_state: 'stopped',
+                is_process_alive: true,
+                is_paused: false,
+                pause_for_greenlight: false,
+                build_actively_running: false,
+                lock_held: false,
+                active_threads: [],
+                scheduler_running_workers: 0,
+                orchestrator_state: 'IDLE',
+              },
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      if (url.includes('/messages') && method === 'POST') {
+        return new Promise<Response>((resolve) => {
+          pendingReplyResolvers.push(resolve);
+        });
+      }
+      if (url.includes('/api/coproducer/threads/')) {
+        const matched = url.includes('draft_mid_t3')
+          ? middayDraft
+          : url.includes('thread_candidate_promoted_older')
+            ? olderPromotedThread
+            : newestCartThread;
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ deliberation: 'Detail.', thread: matched, messages: [] }),
+            { status: 200 },
+          ),
+        );
+      }
+      if (url.includes('/api/coproducer/threads')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              deliberation: 'Listed.',
+              active_cartridge_thread: newestCartThread,
+              draft_threads: [middayDraft],
+              cartridge_threads: [newestCartThread, olderPromotedThread],
+              threads: [newestCartThread, middayDraft, olderPromotedThread],
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ sprites: [], audio_clips: [], code_modules: [] }),
+          { status: 200 },
+        ),
+      );
+    });
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <App />
+      </QueryClientProvider>,
+    );
+
+    const sidebar = await screen.findByRole('complementary', { name: 'Game Sessions' });
+    await waitFor(() => {
+      const items = sidebar.querySelectorAll('[role="listitem"]');
+      expect(items).toHaveLength(3);
+      expect(items[0].textContent).toContain('Recently Worked Cartridge');
+      expect(items[1].textContent).toContain('Midday Concept Draft');
+      expect(items[2].textContent).toContain('Promoted Older Game');
+    });
+
+    // Clicking to VIEW `Promoted Older Game` (#3) does NOT reorder the list yet
+    fireEvent.click(screen.getByRole('button', { name: /Promoted Older Game/i }));
+    const itemsAfterViewOnly = sidebar.querySelectorAll('[role="listitem"]');
+    expect(itemsAfterViewOnly[0].textContent).toContain('Recently Worked Cartridge');
+    expect(itemsAfterViewOnly[2].textContent).toContain('Promoted Older Game');
+
+    // Sending a message (working on `Promoted Older Game`) immediately promotes it to #1 at t = 0ms!
+    const composer = screen.getByLabelText('Message Creative Co-Producer');
+    fireEvent.change(composer, { target: { value: 'Add crisp haptic pulse on placement.' } });
+    fireEvent.keyDown(composer, { key: 'Enter' });
+
+    const itemsAfterWork = sidebar.querySelectorAll('[role="listitem"]');
+    expect(itemsAfterWork[0].textContent).toContain('Promoted Older Game');
+    expect(itemsAfterWork[1].textContent).toContain('Recently Worked Cartridge');
+    expect(itemsAfterWork[2].textContent).toContain('Midday Concept Draft');
+
+    // Cleanly resolve pending turn
+    if (pendingReplyResolvers[0]) {
+      pendingReplyResolvers[0](
+        new Response(
+          JSON.stringify({ deliberation: 'Done.', thread: olderPromotedThread }),
+          { status: 200 },
+        ),
+      );
+    }
+  });
+
+  it('keeps selectedCartridgeId locked onto a newly commissioned cartridge before /api/cartridges refetches it', async () => {
+    const olderExistingThread: CoProducerThread = {
+      deliberation: 'Existing cartridge thread.',
+      thread_id: 'thread_candidate_genesis_older01',
+      scope_kind: 'cartridge',
+      cartridge_id: 'candidate_genesis_older01',
+      title: 'Older Existing Game',
+      created_at_utc: '2026-11-04T08:00:00Z',
+      updated_at_utc: '2026-11-04T08:30:00Z',
+      message_count: 3,
+      concept_brief: {
+        deliberation: 'Older brief.',
+        working_title: 'Older Existing Game',
+        core_genre: 'puzzle',
+        elevator_pitch: 'Older game.',
+        core_fantasy: '',
+        core_player_verbs: [],
+        first_60_seconds_feel: '',
+        visual_style_direction: '',
+        audio_mood_direction: '',
+        color_palette_hex: [],
+        explicit_non_goals: [],
+        selected_mockup_paths: [],
+        selected_sketch_asset_paths: [],
+      },
+    };
+
+    const draftToCommission: CoProducerThread = {
+      deliberation: 'Draft ready to commission.',
+      thread_id: 'draft_ready_to_commission',
+      scope_kind: 'draft',
+      cartridge_id: null,
+      title: 'Freshly Commissioned Concept',
+      created_at_utc: '2026-11-04T09:00:00Z',
+      updated_at_utc: '2026-11-04T09:45:00Z',
+      message_count: 4,
+      concept_brief: {
+        deliberation: 'Refined concept brief.',
+        working_title: 'Freshly Commissioned Concept',
+        core_genre: 'simulation',
+        elevator_pitch: 'Build modular networks.',
+        core_fantasy: 'Systemic mastery.',
+        core_player_verbs: ['scout', 'snap_modules'],
+        first_60_seconds_feel: 'Snappy top-down deployment.',
+        visual_style_direction: 'Crisp 2D orthographic.',
+        audio_mood_direction: 'Tactile industrial.',
+        color_palette_hex: [],
+        explicit_non_goals: [],
+        selected_mockup_paths: [],
+        selected_sketch_asset_paths: [],
+      },
+    };
+
+    const draftMessageWithProposal: CoProducerMessage = {
+      deliberation: 'Ready to hand off to Council.',
+      message_id: 'msg_commission_ready',
+      thread_id: 'draft_ready_to_commission',
+      turn_index: 4,
+      sender_role: 'coproducer',
+      content_markdown: 'Everything is aligned. Ready to commission whenever you are!',
+      media_cards: [],
+      consultation_cards: [],
+      action_proposals: [
+        {
+          deliberation: 'Ready for refined_concept commission.',
+          proposal_id: 'prop_commission_fresh',
+          action_kind: 'commission_game',
+          handoff_mode: 'refined_concept',
+          title: 'Commission Freshly Commissioned Concept',
+          summary: 'Creates candidate_genesis_fresh99 and convenes the Council.',
+          status: 'pending',
+          concept_brief: draftToCommission.concept_brief,
+        },
+      ],
+      tool_trace: [],
+      prompt_trace: [],
+      created_at_utc: '2026-11-04T09:45:00Z',
+    };
+
+    const bibleRequestedIds: string[] = [];
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      // Simulate /api/cartridges STILL returning only the older cartridge (race window right after commission)
+      if (url.includes('/api/cartridges')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              active: { title: 'Older Existing Game', genre: 'puzzle', episode: 0 },
+              candidates: ['candidate_genesis_older01'],
+              games: [
+                {
+                  cartridge_id: 'candidate_genesis_older01',
+                  game_title: 'Older Existing Game',
+                  core_genre: 'Puzzle',
+                  status: 'slice_complete',
+                  has_backlog: true,
+                  approved_items: 4,
+                  total_items: 8,
+                  is_promoted_active: true,
+                  updated_at_utc: '2026-11-04T08:30:00Z',
+                },
+              ],
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      if (url.includes('/api/playtest/sessions')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              deliberation: 'Loaded playtest.',
+              active_cartridge_id: 'candidate_genesis_older01',
+              pending_wishes_count: 0,
+              games_catalog: [],
+              playable_targets: [],
+              sessions: [],
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      if (url.includes('/api/studio/game-bible')) {
+        const parsed = new URL(url, 'http://localhost');
+        const cid = parsed.searchParams.get('cartridge') ?? '';
+        bibleRequestedIds.push(cid);
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              deliberation: 'Loaded bible.',
+              has_bible: true,
+              cartridge_id: cid,
+              active_candidate_id: cid,
+              game_title: cid === 'candidate_genesis_fresh99' ? 'Freshly Commissioned Concept' : 'Older Existing Game',
+              writers_room_transcript: [],
+              production_board: {
+                deliberation: 'Board.',
+                cartridge_id: cid,
+                design_revision: 1,
+                total_items: 0,
+                counts_by_state: {},
+                is_drained: false,
+                items: [],
+              },
+              process_status: {
+                process_state: 'running',
+                is_process_alive: true,
+                is_paused: false,
+                pause_for_greenlight: false,
+                build_actively_running: true,
+                lock_held: true,
+                active_threads: [],
+                scheduler_running_workers: 0,
+              },
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      if (url.includes('/api/coproducer/actions/execute')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              deliberation: 'Commissioned new cartridge.',
+              status: 'executed',
+              action_kind: 'commission_game',
+              result: {
+                target_cartridge_id: 'candidate_genesis_fresh99',
+                target_thread_id: 'thread_candidate_genesis_fresh99',
+                handoff_mode: 'refined_concept',
+              },
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      if (url.includes('/api/coproducer/threads/')) {
+        const isDraft = url.includes('draft_ready_to_commission');
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              deliberation: 'Thread detail.',
+              thread: isDraft
+                ? draftToCommission
+                : {
+                    ...draftToCommission,
+                    thread_id: 'thread_candidate_genesis_fresh99',
+                    scope_kind: 'cartridge',
+                    cartridge_id: 'candidate_genesis_fresh99',
+                  },
+              messages: [draftMessageWithProposal],
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      if (url.includes('/api/coproducer/threads')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              deliberation: 'Threads listed.',
+              active_cartridge_thread: olderExistingThread,
+              draft_threads: [draftToCommission],
+              cartridge_threads: [olderExistingThread],
+              threads: [draftToCommission, olderExistingThread],
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify({ sprites: [], audio_clips: [], code_modules: [] }), { status: 200 }),
+      );
+    });
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <App />
+      </QueryClientProvider>,
+    );
+
+    // Select the ready draft session (#1 in sidebar) and execute commission
+    const draftSessionBtn = await screen.findByRole('button', {
+      name: /Freshly Commissioned Concept/i,
+    });
+    fireEvent.click(draftSessionBtn);
+
+    const commissionBtn = await screen.findByRole('button', {
+      name: /Commission Freshly Commissioned Concept/i,
+    });
+    bibleRequestedIds.length = 0;
+    fireEvent.click(commissionBtn);
+
+    await waitFor(() => {
+      expect(bibleRequestedIds).toContain('candidate_genesis_fresh99');
+    });
+    // Must NEVER snap back to `candidate_genesis_older01` after commissioning `candidate_genesis_fresh99`
+    expect(bibleRequestedIds.at(-1)).toBe('candidate_genesis_fresh99');
+  });
 });

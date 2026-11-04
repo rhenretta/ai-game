@@ -1324,9 +1324,13 @@ class CreativeWritersRoom:
         seen_directives: Set[str] = set()
         active_seed = (getattr(self, "_active_creative_prompt", None) or "").strip()
         if not active_seed and game_bible.concept_evolution:
-            first_prev = (game_bible.concept_evolution[0].previous_premise or "").strip()
-            if first_prev and first_prev != "Untitled Concept":
-                active_seed = first_prev
+            for evo_item in game_bible.concept_evolution:
+                if getattr(evo_item, "author_role", "") == "ContextCurator":
+                    continue
+                first_prev = (evo_item.previous_premise or "").strip()
+                if first_prev and first_prev not in ("Untitled Concept", "Co-Producer Interactive Ideation"):
+                    active_seed = first_prev
+                    break
         for u in tx_all:
             if u.speaker_role in ("ExecutiveProducer", "UserSteering") and u.spoken_dialogue and u.spoken_dialogue.strip():
                 raw_d = u.spoken_dialogue.strip()
@@ -7136,17 +7140,40 @@ class CreativeWritersRoom:
         self._active_candidate_dir = Path(candidate_dir) if candidate_dir is not None else None
 
         dna_summary = self._format_dna_summary(dna, hypothesis_report)
-        if creative_prompt and creative_prompt.strip():
-            self._active_creative_prompt = creative_prompt.strip()
+        resolved_seed_prompt = (creative_prompt or "").strip()
+        if not resolved_seed_prompt and candidate_dir is not None and (Path(candidate_dir) / "co_producer_brief.json").is_file():
+            try:
+                cp_env = json.loads((Path(candidate_dir) / "co_producer_brief.json").read_text(encoding="utf-8"))
+                if isinstance(cp_env, dict):
+                    cb_inner = cp_env.get("concept_brief") if isinstance(cp_env.get("concept_brief"), dict) else {}
+                    resolved_seed_prompt = str(
+                        cp_env.get("steering_or_seed_brief") or cb_inner.get("elevator_pitch") or ""
+                    ).strip()
+            except Exception:
+                resolved_seed_prompt = ""
+        if not resolved_seed_prompt and existing_bible is not None:
+            existing_dna_txt = str(getattr(existing_bible, "target_player_dna_summary", "") or "")
+            seed_marker = "- EXECUTIVE PRODUCER CREATIVE SEED / DIRECTION:"
+            if seed_marker in existing_dna_txt:
+                resolved_seed_prompt = existing_dna_txt.split(seed_marker, 1)[1].strip()
+        if resolved_seed_prompt:
+            self._active_creative_prompt = resolved_seed_prompt
         elif existing_bible is not None and existing_bible.concept_evolution:
-            first_prev = (existing_bible.concept_evolution[0].previous_premise or "").strip()
-            self._active_creative_prompt = first_prev if first_prev != "Untitled Concept" else ""
+            resolved_evo_prev = ""
+            for evo_item in existing_bible.concept_evolution:
+                if getattr(evo_item, "author_role", "") == "ContextCurator":
+                    continue
+                cand_prev = (evo_item.previous_premise or "").strip()
+                if cand_prev and cand_prev not in ("Untitled Concept", "Co-Producer Interactive Ideation"):
+                    resolved_evo_prev = cand_prev
+                    break
+            self._active_creative_prompt = resolved_evo_prev
         else:
             self._active_creative_prompt = ""
-        if creative_prompt and creative_prompt.strip():
+        if resolved_seed_prompt:
             dna_summary = (
                 f"{dna_summary}\n"
-                f"- EXECUTIVE PRODUCER CREATIVE SEED / DIRECTION: {creative_prompt.strip()}"
+                f"- EXECUTIVE PRODUCER CREATIVE SEED / DIRECTION: {resolved_seed_prompt}"
             )
 
         already_in_production = False
@@ -7204,7 +7231,28 @@ class CreativeWritersRoom:
         non_curator_transcript = [
             u for u in game_bible.writers_room_transcript if u.speaker_role != "ContextCurator"
         ]
-        for existing_utt in non_curator_transcript[1:]:
+        opening_slice_end = (
+            2
+            if (
+                len(non_curator_transcript) >= 2
+                and non_curator_transcript[0].speaker_role == "ExecutiveProducer"
+                and non_curator_transcript[1].speaker_role in (COUNCIL_CHAIR_ROLE, "CreativeDirector")
+            )
+            else (1 if non_curator_transcript else 0)
+        )
+        for open_utt in non_curator_transcript[:opening_slice_end]:
+            eff_open_role = (
+                COUNCIL_CHAIR_ROLE if open_utt.speaker_role == "CreativeDirector" else open_utt.speaker_role
+            )
+            last_speaker_role = eff_open_role
+            if open_utt.addressed_to:
+                last_addressed_to = [
+                    (COUNCIL_CHAIR_ROLE if r == "CreativeDirector" else r) for r in open_utt.addressed_to
+                ]
+                for r in last_addressed_to:
+                    if r not in pending_invited_roles:
+                        pending_invited_roles.append(r)
+        for existing_utt in non_curator_transcript[opening_slice_end:]:
             eff_existing_role = (
                 COUNCIL_CHAIR_ROLE if existing_utt.speaker_role == "CreativeDirector" else existing_utt.speaker_role
             )

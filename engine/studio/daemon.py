@@ -517,19 +517,50 @@ class StudioDaemon:
             return True
 
     def is_cold_boot_required(self) -> bool:
-        """Returns True if cartridges/active/ has no valid Godot 4 or Pygame cartridge."""
+        """Returns True only on a genuinely empty cold-boot studio workspace with zero existing game/draft sessions."""
         if (
             (self.config.cartridges_root / ".no_cold_boot").exists()
             or os.environ.get("STUDIO_NO_COLD_BOOT") == "1"
+            or os.environ.get("STUDIO_RELOAD_WORKER_DAEMON") == "1"
             or (
                 "PYTEST_CURRENT_TEST" in os.environ
                 and self.config.cartridges_root.resolve() == (PROJECT_ROOT / "cartridges").resolve()
             )
         ):
             return False
+
+        if self.config.cartridges_root.is_dir():
+            drafts_dir = self.config.cartridges_root / "_coproducer_drafts"
+            if drafts_dir.is_dir():
+                for d_sub in drafts_dir.iterdir():
+                    if d_sub.is_dir() and (d_sub / "co_producer.json").is_file():
+                        return False
+            for sub in self.config.cartridges_root.iterdir():
+                if not sub.is_dir() or sub.name.startswith(".") or sub.name.startswith("_"):
+                    continue
+                if sub.name in ("active", "checkpoints", "candidate", "seed"):
+                    continue
+                if any(
+                    (sub / marker).is_file()
+                    for marker in (
+                        "game_bible.json",
+                        "co_producer_brief.json",
+                        "co_producer.json",
+                        "project.godot",
+                        "manifest.json",
+                        "mechanics.py",
+                    )
+                ):
+                    return False
+
         active = self.config.active_cartridge_dir
         if not active.exists():
             return True
+        if any(
+            (active / marker).is_file()
+            for marker in ("game_bible.json", "co_producer_brief.json", "co_producer.json")
+        ):
+            return False
         is_valid_godot = (active / "project.godot").exists() and (
             (active / "main.gd").exists() or (active / "mechanics.gd").exists()
         )
@@ -670,9 +701,13 @@ class StudioDaemon:
                         except Exception as dna_exc:
                             logger.warning("Steam DNA extraction warning during Genesis: %s", dna_exc)
 
+                        from engine.studio.models import clear_candidate_build_aborted
+                        clear_candidate_build_aborted(staging_dir)
+
                         has_persisted_bible = (staging_dir / "game_bible.json").is_file()
+                        has_persisted_world_spec = (staging_dir / "world_spec.json").is_file()
                         effective_prompt = self.config.creative_prompt
-                        if not effective_prompt and not has_persisted_bible and (staging_dir / "co_producer_brief.json").is_file():
+                        if not effective_prompt and not has_persisted_world_spec and (staging_dir / "co_producer_brief.json").is_file():
                             try:
                                 cp_env = json.loads((staging_dir / "co_producer_brief.json").read_text(encoding="utf-8"))
                                 if isinstance(cp_env, dict):
@@ -698,7 +733,7 @@ class StudioDaemon:
                                 except Exception:
                                     pass
                         plan = None
-                        if self.config.resume_current and (staging_dir / "world_spec.json").is_file():
+                        if self.config.resume_current and has_persisted_world_spec:
                             try:
                                 from engine.studio.models import GenesisWorldSpec, StudioSwarmPlan
                                 ws_resumed = GenesisWorldSpec.model_validate_json(
@@ -744,12 +779,78 @@ class StudioDaemon:
                                 logger.warning("Could not build resumed StudioSwarmPlan from world_spec.json: %s", resume_plan_exc)
                                 plan = None
 
+                        if plan is None and (has_persisted_bible or (staging_dir / "co_producer_brief.json").is_file()):
+                            try:
+                                from engine.studio.models import GameBibleSpec, StudioSwarmPlan
+                                resumed_title = ""
+                                resumed_genre = ""
+                                if has_persisted_bible:
+                                    gb_resumed = GameBibleSpec.model_validate_json(
+                                        (staging_dir / "game_bible.json").read_text(encoding="utf-8")
+                                    )
+                                    if gb_resumed.game_title and gb_resumed.game_title.strip() not in ("", "Untitled Concept"):
+                                        resumed_title = gb_resumed.game_title.strip()
+                                    resumed_genre = (gb_resumed.core_genre or "").strip()
+                                if (not resumed_title or not resumed_genre) and (staging_dir / "co_producer_brief.json").is_file():
+                                    cp_env_plan = json.loads((staging_dir / "co_producer_brief.json").read_text(encoding="utf-8"))
+                                    if isinstance(cp_env_plan, dict):
+                                        cb_plan = cp_env_plan.get("concept_brief") if isinstance(cp_env_plan.get("concept_brief"), dict) else {}
+                                        wt = str(cb_plan.get("working_title") or "").strip()
+                                        cg = str(cb_plan.get("core_genre") or "").strip()
+                                        if not resumed_title and wt and wt != "Untitled Concept":
+                                            resumed_title = wt
+                                        if not resumed_genre and cg:
+                                            resumed_genre = cg
+                                if resumed_title:
+                                    eff_genre = resumed_genre or (
+                                        dna.top_genres[0] if (dna is not None and getattr(dna, "top_genres", None)) else "indie_experience"
+                                    )
+                                    plan = StudioSwarmPlan(
+                                        deliberation=(
+                                            f"Launching or resuming specialist agent swarm DAG for '{resumed_title}' "
+                                            f"({eff_genre}) from persisted Game Bible / Co-Producer brief in {staging_dir.name}."
+                                        ),
+                                        game_title=resumed_title,
+                                        genre_verdict=eff_genre,
+                                        target_episode=0,
+                                        specialist_agent_roles=[
+                                            "Director",
+                                            "Writer",
+                                            "Voice",
+                                            "Visual",
+                                            "SWE",
+                                            "TelemetryArchitect",
+                                            "Supervisor",
+                                        ],
+                                        dag_edges=[
+                                            ["Director", "Writer"],
+                                            ["Writer", "Voice"],
+                                            ["Writer", "Visual"],
+                                            ["Voice", "SWE"],
+                                            ["Visual", "SWE"],
+                                            ["SWE", "TelemetryArchitect"],
+                                            ["TelemetryArchitect", "Supervisor"],
+                                        ],
+                                        task_manifest=json.dumps({
+                                            "Director": "Convene or resume Writers' Room Game Bible and author world_spec.json",
+                                            "Writer": "Synthesize narrative_bible.json and narrative.json",
+                                            "Voice": "Synthesize character bark WAVs",
+                                            "Visual": "Synthesize character portraits and sprites",
+                                            "SWE": "Implement requirement tracks in Godot 4",
+                                            "TelemetryArchitect": "Instrument telemetry probes",
+                                            "Supervisor": "Run 5-gate verification and multi-agent sign-off",
+                                        }),
+                                    )
+                            except Exception as bible_plan_exc:
+                                logger.warning("Could not build StudioSwarmPlan from game_bible/co_producer_brief: %s", bible_plan_exc)
+                                plan = None
+
                         if plan is None:
                             plan_sig_kwargs: Dict[str, Any] = {"steam_dna": dna, "target_episode": 0}
                             import inspect as _inspect
                             try:
                                 if "creative_prompt" in _inspect.signature(self.orchestrator.generate_swarm_plan).parameters:
-                                    plan_sig_kwargs["creative_prompt"] = self.config.creative_prompt
+                                    plan_sig_kwargs["creative_prompt"] = effective_prompt or self.config.creative_prompt
                             except Exception:
                                 pass
                             plan = self._resolve_maybe_coroutine(

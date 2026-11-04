@@ -30,6 +30,13 @@ export interface FallbackCartridgeSessionHint {
   approved?: number;
   total?: number;
   status?: string;
+  updatedAtUtc?: string;
+}
+
+export interface OptimisticSessionActivity {
+  threadId?: string;
+  cartridgeId?: string;
+  updatedAtUtc: string;
 }
 
 function parseIsoMillis(raw?: string | null): number {
@@ -97,15 +104,16 @@ export function isSameStudioSession(
 
 /**
  * Merges pre-build Concept Draft threads and built/building Cartridge games into a single
- * unified Co-Producer Session list so every game is treated as a session for the Co-Producer.
+ * unified Co-Producer Session list ordered strictly by most recently worked on (`updatedAtUtc` DESC).
  */
 export function buildUnifiedCoProducerSessions(params: {
   games: NormalizedGameCatalogEntry[];
   threadsData?: CoProducerThreadsListResponse | null;
   activeDraftThread?: CoProducerThread | null;
   fallbackCartridge?: FallbackCartridgeSessionHint | null;
+  optimisticActivity?: OptimisticSessionActivity | null;
 }): UnifiedCoProducerSession[] {
-  const { games, threadsData, activeDraftThread, fallbackCartridge } = params;
+  const { games, threadsData, activeDraftThread, fallbackCartridge, optimisticActivity } = params;
 
   // 1. Collect ungraduated draft sessions (active New Game concepts)
   const draftById = new Map<string, CoProducerThread>();
@@ -139,10 +147,6 @@ export function buildUnifiedCoProducerSessions(params: {
       threadId: dt.thread_id,
     });
   }
-
-  draftSessions.sort(
-    (a, b) => parseIsoMillis(b.updatedAtUtc) - parseIsoMillis(a.updatedAtUtc),
-  );
 
   // 2. Index cartridge threads by cartridge_id
   const threadByCartridgeId = new Map<string, CoProducerThread>();
@@ -179,6 +183,10 @@ export function buildUnifiedCoProducerSessions(params: {
     const baseTitle = g.game_title || matchingThread?.title || g.cartridge_id;
     const displayTitle = g.hasDuplicateTitle ? `${baseTitle} (${g.shortId})` : baseTitle;
     const statusMeta = resolveGameStatusMeta(g.status, g.approved_items, g.total_items);
+    const threadUpdatedAt =
+      matchingThread && (matchingThread.message_count ?? 0) > 0
+        ? matchingThread.updated_at_utc
+        : undefined;
 
     gameSessions.push({
       key: `cartridge:${g.cartridge_id}`,
@@ -192,7 +200,10 @@ export function buildUnifiedCoProducerSessions(params: {
       messageCount: matchingThread?.message_count ?? 0,
       boardProgress:
         g.total_items > 0 ? `${g.approved_items}/${g.total_items}` : undefined,
-      updatedAtUtc: newerIsoTimestamp(g.updated_at_utc, matchingThread?.updated_at_utc),
+      updatedAtUtc: newerIsoTimestamp(
+        g.updated_at_utc,
+        threadUpdatedAt || (!g.updated_at_utc ? matchingThread?.updated_at_utc : undefined),
+      ),
       threadId: matchingThread?.thread_id,
       cartridgeId: g.cartridge_id,
     });
@@ -227,6 +238,10 @@ export function buildUnifiedCoProducerSessions(params: {
     const approved = fallbackCartridge.approved ?? 0;
     const total = fallbackCartridge.total ?? 0;
     const statusMeta = resolveGameStatusMeta(fallbackCartridge.status, approved, total);
+    const threadUpdatedAt =
+      matchingThread && (matchingThread.message_count ?? 0) > 0
+        ? matchingThread.updated_at_utc
+        : undefined;
     gameSessions.push({
       key: `cartridge:${cid}`,
       selection: { kind: 'cartridge', cartridgeId: cid },
@@ -238,19 +253,84 @@ export function buildUnifiedCoProducerSessions(params: {
       isPromotedActive: true,
       messageCount: matchingThread?.message_count ?? 0,
       boardProgress: total > 0 ? `${approved}/${total}` : undefined,
-      updatedAtUtc: matchingThread?.updated_at_utc || '',
+      updatedAtUtc: newerIsoTimestamp(
+        fallbackCartridge.updatedAtUtc,
+        threadUpdatedAt || (!fallbackCartridge.updatedAtUtc ? matchingThread?.updated_at_utc : undefined),
+      ),
       threadId: matchingThread?.thread_id,
       cartridgeId: cid,
     });
   }
 
-  gameSessions.sort((a, b) => {
-    if (a.isPromotedActive && !b.isPromotedActive) return -1;
-    if (!a.isPromotedActive && b.isPromotedActive) return 1;
-    return parseIsoMillis(b.updatedAtUtc) - parseIsoMillis(a.updatedAtUtc);
+  // 4. Merge drafts + cartridges and order strictly by most recently worked on (`updatedAtUtc` DESC)
+  const unified: UnifiedCoProducerSession[] = [...draftSessions, ...gameSessions].map(
+    (session) => {
+      if (!optimisticActivity?.updatedAtUtc) return session;
+      const matchesThread =
+        Boolean(optimisticActivity.threadId) &&
+        session.threadId === optimisticActivity.threadId;
+      const matchesCartridge =
+        session.kind === 'cartridge' &&
+        Boolean(optimisticActivity.cartridgeId) &&
+        session.cartridgeId === optimisticActivity.cartridgeId;
+      if (!matchesThread && !matchesCartridge) return session;
+      return {
+        ...session,
+        updatedAtUtc: newerIsoTimestamp(session.updatedAtUtc, optimisticActivity.updatedAtUtc),
+      };
+    },
+  );
+
+  unified.sort((a, b) => {
+    const diff = parseIsoMillis(b.updatedAtUtc) - parseIsoMillis(a.updatedAtUtc);
+    if (diff !== 0) return diff;
+    return a.key.localeCompare(b.key);
   });
 
-  return [...draftSessions, ...gameSessions];
+  return unified;
+}
+
+export function bumpSessionWithOptimisticActivity(
+  sessions: UnifiedCoProducerSession[],
+  activity: {
+    threadId?: string;
+    selection?: StudioSessionSelection | null;
+    updatedAtUtc: string;
+  } | null,
+): UnifiedCoProducerSession[] {
+  if (!activity?.updatedAtUtc || sessions.length === 0) {
+    return sessions;
+  }
+  let changed = false;
+  const bumped = sessions.map((session) => {
+    const matchesThread =
+      Boolean(activity.threadId) &&
+      activity.threadId !== '__pending_draft__' &&
+      session.threadId === activity.threadId;
+    const matchesSelection =
+      activity.selection != null && isSameStudioSession(session.selection, activity.selection);
+    if (!matchesThread && !matchesSelection) {
+      return session;
+    }
+    const nextUpdatedAt = newerIsoTimestamp(session.updatedAtUtc, activity.updatedAtUtc);
+    if (nextUpdatedAt === session.updatedAtUtc) {
+      return session;
+    }
+    changed = true;
+    return {
+      ...session,
+      updatedAtUtc: nextUpdatedAt,
+    };
+  });
+  if (!changed) {
+    return sessions;
+  }
+  bumped.sort((a, b) => {
+    const diff = parseIsoMillis(b.updatedAtUtc) - parseIsoMillis(a.updatedAtUtc);
+    if (diff !== 0) return diff;
+    return a.key.localeCompare(b.key);
+  });
+  return bumped;
 }
 
 export function formatConversationTimestamp(rawIso?: string | null): string {

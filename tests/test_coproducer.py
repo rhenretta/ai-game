@@ -2269,3 +2269,101 @@ def test_coproducer_art_direction_shot_compiler_and_multimodal_critic_auto_regen
     assert "Art-Direction Pixel Audit: passed_bar=True" in obs_excerpt
 
 
+def test_coproducer_sessions_and_cartridges_ordered_by_most_recently_worked_on(tmp_path: Path):
+    """Verifies that:
+    1. Historical cartridges backdated on disk preserve their real work timestamp when lazy-read
+       (`get_or_create_cartridge_thread` / `list_threads(active_cartridge_id=...)`), even if
+       directory housekeeping (`__pycache__` deletion) bumps top-level directory `st_mtime`.
+    2. `/api/cartridges` orders games strictly by most-recently-worked-on artifact/chat activity.
+    3. Sending a Co-Producer message on an older cartridge immediately updates its recency
+       timestamp and moves it to index 0 of both `list_threads()` and `/api/cartridges`.
+    """
+    from datetime import datetime, timezone
+    import os
+    from engine.studio.coproducer import infer_cartridge_last_worked_utc
+
+    db_path = tmp_path / "recency.db"
+    db = TelemetryDB(db_path)
+    bus = SwarmEventBus(db_path=db_path)
+    cartridges_root = tmp_path / "cartridges"
+    cartridges_root.mkdir(parents=True, exist_ok=True)
+
+    # 1. Create an older historical cartridge (`2026-10-10T12:00:00Z`) and simulate housekeeping touching dir mtime
+    old_dir = cartridges_root / "candidate_hist_old"
+    old_dir.mkdir(parents=True, exist_ok=True)
+    old_gb = old_dir / "game_bible.json"
+    old_gb.write_text(
+        json.dumps({"game_title": "Synthetic Archive Alpha", "core_genre": "Puzzle", "status": "locked"}),
+        encoding="utf-8",
+    )
+    old_epoch = datetime(2026, 10, 10, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    os.utime(old_gb, (old_epoch, old_epoch))
+    # Simulate `__pycache__` creation + removal bumping `old_dir` inode mtime to `now`
+    pycache_dir = old_dir / "__pycache__"
+    pycache_dir.mkdir()
+    pycache_dir.rmdir()
+
+    inferred_epoch, inferred_iso = infer_cartridge_last_worked_utc(old_dir)
+    assert abs(inferred_epoch - old_epoch) < 1.0
+    assert inferred_iso.startswith("2026-10-10T12:00:00")
+
+    # 2. Create a more recently built cartridge (`2026-10-25T15:30:00Z`)
+    recent_dir = cartridges_root / "candidate_build_recent"
+    recent_dir.mkdir(parents=True, exist_ok=True)
+    recent_gb = recent_dir / "game_bible.json"
+    recent_gb.write_text(
+        json.dumps({"game_title": "Synthetic Build Beta", "core_genre": "Simulation", "status": "locked"}),
+        encoding="utf-8",
+    )
+    recent_epoch = datetime(2026, 10, 25, 15, 30, 0, tzinfo=timezone.utc).timestamp()
+    os.utime(recent_gb, (recent_epoch, recent_epoch))
+
+    store = CoProducerThreadStore(cartridges_root=cartridges_root, db=db)
+
+    # 3. Create a brand-new draft right now (`now > 2026-10-25 > 2026-10-10`)
+    draft = store.create_draft_thread(title="Fresh Concept Gamma")
+
+    # 4. Lazy-reading `candidate_hist_old` via `list_threads(active_cartridge_id=...)` MUST NOT stamp `now`!
+    listed = store.list_threads(active_cartridge_id="candidate_hist_old")
+    old_thread = listed["active_cartridge_thread"]
+    assert old_thread is not None
+    assert old_thread["updated_at_utc"].startswith("2026-10-10T12:00:00")
+    assert [t["thread_id"] for t in listed["threads"]][:2] == [
+        draft["thread_id"],
+        old_thread["thread_id"],
+    ]
+
+    app = create_app(
+        db_path=db_path,
+        event_bus=bus,
+        cartridges_root=cartridges_root,
+        genai_client=_FakeCoProducerClient(),
+    )
+    with TestClient(app) as http:
+        # `/api/cartridges` ranks `candidate_build_recent` ahead of `candidate_hist_old` despite lazy 0-msg snapshot
+        cat_before = http.get("/api/cartridges").json()
+        assert [g["cartridge_id"] for g in cat_before["games"]] == [
+            "candidate_build_recent",
+            "candidate_hist_old",
+        ]
+
+        # 5. Working on `candidate_hist_old` (appending a Co-Producer turn) bumps it to #1 everywhere!
+        updated_old, _ = store.append_message(
+            old_thread,
+            {
+                "deliberation": "Producer resumed active work on historical cartridge.",
+                "sender_role": "user",
+                "content_markdown": "Tighten tactile feedback on the primary loop.",
+            },
+        )
+        listed_after = store.list_threads()
+        assert listed_after["threads"][0]["thread_id"] == updated_old["thread_id"]
+
+        cat_after = http.get("/api/cartridges").json()
+        assert [g["cartridge_id"] for g in cat_after["games"]] == [
+            "candidate_hist_old",
+            "candidate_build_recent",
+        ]
+
+
+

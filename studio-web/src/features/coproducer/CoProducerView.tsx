@@ -37,6 +37,7 @@ import type { LightboxMedia } from '../../components/MediaLightbox';
 import { FormattedRichBlocks } from '../../components/RichTextBlocks';
 import {
   buildUnifiedCoProducerSessions,
+  bumpSessionWithOptimisticActivity,
   formatConversationTimestamp,
   isSameStudioSession,
   type StudioSessionSelection,
@@ -196,6 +197,7 @@ export function CoProducerView({
   const threadsQuery = useQuery({
     queryKey: ['coproducer-threads', effectiveCartridgeParam ?? 'none'],
     queryFn: () => studioApi.getCoProducerThreads(effectiveCartridgeParam),
+    placeholderData: (prev) => prev,
   });
 
   const draftThreads: CoProducerThread[] = useMemo(
@@ -216,21 +218,28 @@ export function CoProducerView({
     threadsQuery.data?.active_cartridge_thread ?? null;
 
   const resolvedSessions: UnifiedCoProducerSession[] = useMemo(() => {
-    if (externalSessions) {
-      return externalSessions;
+    const baseSessions = externalSessions
+      ? externalSessions
+      : buildUnifiedCoProducerSessions({
+          games: [],
+          threadsData: threadsQuery.data,
+          fallbackCartridge: hasAnyCartridge
+            ? {
+                cartridgeId,
+                title: gameTitle,
+                approved: boardCounts.approved,
+                total: boardCounts.total,
+                status: orchestratorState,
+              }
+            : null,
+        });
+    if (!optimisticUserTurn) {
+      return baseSessions;
     }
-    return buildUnifiedCoProducerSessions({
-      games: [],
-      threadsData: threadsQuery.data,
-      fallbackCartridge: hasAnyCartridge
-        ? {
-            cartridgeId,
-            title: gameTitle,
-            approved: boardCounts.approved,
-            total: boardCounts.total,
-            status: orchestratorState,
-          }
-        : null,
+    return bumpSessionWithOptimisticActivity(baseSessions, {
+      threadId: optimisticUserTurn.threadId,
+      selection: effectiveSelectedSession,
+      updatedAtUtc: optimisticUserTurn.createdAtUtc,
     });
   }, [
     externalSessions,
@@ -241,20 +250,17 @@ export function CoProducerView({
     boardCounts.approved,
     boardCounts.total,
     orchestratorState,
+    optimisticUserTurn,
+    effectiveSelectedSession,
   ]);
 
-  // Ensure standalone CoProducerView binds an initial session when external selectedSession is omitted
+  // Ensure standalone CoProducerView binds the most-recently-worked-on session when external selectedSession is omitted
   useEffect(() => {
     if (externalSelectedSession !== undefined) return;
     if (internalSession !== null) return;
-    const firstGame = resolvedSessions.find((s) => s.kind === 'cartridge');
-    if (firstGame) {
-      setInternalSession(firstGame.selection);
-      return;
-    }
-    const firstDraft = resolvedSessions.find((s) => s.kind === 'draft');
-    if (firstDraft) {
-      setInternalSession(firstDraft.selection);
+    const mostRecent = resolvedSessions[0];
+    if (mostRecent) {
+      setInternalSession(mostRecent.selection);
     }
   }, [externalSelectedSession, internalSession, resolvedSessions]);
 
@@ -409,6 +415,7 @@ export function CoProducerView({
         commitSessionSelection({ kind: 'draft', threadId: res.thread.thread_id });
       }
       void queryClient.invalidateQueries({ queryKey: ['coproducer-threads'] });
+      void queryClient.invalidateQueries({ queryKey: ['cartridges'] });
     },
     onError: (err) => setLocalError(err),
   });
@@ -483,6 +490,7 @@ export function CoProducerView({
         setOptimisticUserTurn(null);
       }
       void queryClient.invalidateQueries({ queryKey: ['coproducer-threads'] });
+      void queryClient.invalidateQueries({ queryKey: ['cartridges'] });
     },
     onError: (err, vars) => {
       setOptimisticUserTurn(null);
@@ -780,6 +788,9 @@ export function CoProducerView({
                             ? `${session.messageCount} msg${session.messageCount === 1 ? '' : 's'}`
                             : 'New'}
                         </span>
+                        {session.updatedAtUtc ? (
+                          <span>· {formatConversationTimestamp(session.updatedAtUtc)}</span>
+                        ) : null}
                       </div>
                     </button>
                   </div>

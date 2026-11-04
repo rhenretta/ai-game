@@ -24,10 +24,17 @@ function formatShortCartridgeId(cartridgeId: string): string {
   return cartridgeId;
 }
 
+function parseCatalogIsoMillis(raw?: string | null): number {
+  if (!raw) return 0;
+  const ts = Date.parse(raw);
+  return Number.isFinite(ts) ? ts : 0;
+}
+
 /**
  * Deduplicates the `cartridges/active` staging mirror when its canonical `candidate_*`
- * directory is already present in `/api/cartridges`, and marks any remaining distinct
- * folders that share the same `game_title` so the UI can disambiguate them by short ID.
+ * directory is already present in `/api/cartridges`, marks any remaining distinct
+ * folders that share the same `game_title` so the UI can disambiguate them by short ID,
+ * and orders games strictly by most recently worked on (`updated_at_utc` DESC).
  */
 export function normalizeGameCatalog(
   rawGames: GameCatalogEntry[],
@@ -62,19 +69,30 @@ export function normalizeGameCatalog(
     titleCounts.set(key, (titleCounts.get(key) ?? 0) + 1);
   }
 
-  const normalized = baseList.map((g) => ({
-    ...g,
-    isPromotedActive: g.cartridge_id === promotedCanonicalId || g.cartridge_id === 'active',
-    shortId: formatShortCartridgeId(g.cartridge_id),
-    hasDuplicateTitle: (titleCounts.get(g.game_title.trim()) ?? 0) > 1,
-  }));
-
-  // Keep the promoted active cartridge at index 0 for immediate access
-  normalized.sort((a, b) => {
-    if (a.isPromotedActive && !b.isPromotedActive) return -1;
-    if (!a.isPromotedActive && b.isPromotedActive) return 1;
-    return 0;
+  const normalized = baseList.map((g) => {
+    const isPromoted = g.cartridge_id === promotedCanonicalId || g.cartridge_id === 'active';
+    let effectiveUpdatedAt = g.updated_at_utc;
+    if (
+      g.cartridge_id === promotedCanonicalId &&
+      activeMirror &&
+      activeMirror.game_title === g.game_title &&
+      parseCatalogIsoMillis(activeMirror.updated_at_utc) > parseCatalogIsoMillis(g.updated_at_utc)
+    ) {
+      effectiveUpdatedAt = activeMirror.updated_at_utc;
+    }
+    return {
+      ...g,
+      updated_at_utc: effectiveUpdatedAt,
+      isPromotedActive: isPromoted,
+      shortId: formatShortCartridgeId(g.cartridge_id),
+      hasDuplicateTitle: (titleCounts.get(g.game_title.trim()) ?? 0) > 1,
+    };
   });
+
+  // Order catalog strictly by most recently worked on (`updated_at_utc` DESC)
+  normalized.sort(
+    (a, b) => parseCatalogIsoMillis(b.updated_at_utc) - parseCatalogIsoMillis(a.updated_at_utc),
+  );
 
   return normalized;
 }

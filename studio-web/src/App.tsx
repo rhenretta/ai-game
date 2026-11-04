@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { studioApi } from './api/client';
 import type { CoProducerThread, WorkspaceId } from './api/types';
 import {
   buildUnifiedCoProducerSessions,
+  isSameStudioSession,
   type StudioSessionSelection,
 } from './domain/coproducerSessions';
 import {
@@ -85,6 +86,8 @@ export function App() {
   }, [uiScalePct]);
 
   const [requestedDraftThreadId, setRequestedDraftThreadId] = useState<string | null>(null);
+  const userManuallySelectedSessionRef = useRef(false);
+  const initialThreadsSyncedRef = useRef(false);
   const [nextSliceOpen, setNextSliceOpen] = useState(false);
   const [checkpointsOpen, setCheckpointsOpen] = useState(false);
   const [livePulseOpen, setLivePulseOpen] = useState(false);
@@ -127,7 +130,7 @@ export function App() {
 
   useEffect(() => {
     if (games.length === 0) return;
-    if (!selectedCartridgeId || !games.some((g) => g.cartridge_id === selectedCartridgeId)) {
+    if (!selectedCartridgeId || selectedCartridgeId === 'active') {
       setSelectedCartridgeId(games[0].cartridge_id);
     }
   }, [games, selectedCartridgeId]);
@@ -139,6 +142,7 @@ export function App() {
   const coproducerThreadsQuery = useQuery({
     queryKey: ['coproducer-threads', cartridgeThreadParam ?? 'none'],
     queryFn: () => studioApi.getCoProducerThreads(cartridgeThreadParam),
+    placeholderData: (prev) => prev,
   });
 
   const bibleQuery = useQuery({
@@ -230,22 +234,44 @@ export function App() {
     ],
   );
 
-  // Synchronize initial / graduated session selection
+  // Synchronize initial (most-recently-worked-on) & graduated session selection
   useEffect(() => {
     if (selectedSession === null) {
-      const firstGame = unifiedSessions.find((s) => s.kind === 'cartridge');
-      if (firstGame) {
-        setSelectedSession(firstGame.selection);
-        if (firstGame.cartridgeId) {
-          setSelectedCartridgeId(firstGame.cartridgeId);
+      const mostRecent = unifiedSessions[0];
+      if (mostRecent) {
+        if (coproducerThreadsQuery.data !== undefined) {
+          initialThreadsSyncedRef.current = true;
+        }
+        setSelectedSession(mostRecent.selection);
+        if (mostRecent.kind === 'cartridge' && mostRecent.cartridgeId) {
+          setSelectedCartridgeId(mostRecent.cartridgeId);
+        }
+      }
+      return;
+    }
+
+    // Once Co-Producer threads finish their initial fetch, align boot selection to the true
+    // most-recently-worked-on session if the user has not manually navigated yet
+    if (
+      !userManuallySelectedSessionRef.current &&
+      !initialThreadsSyncedRef.current &&
+      coproducerThreadsQuery.data !== undefined
+    ) {
+      initialThreadsSyncedRef.current = true;
+      const mostRecent = unifiedSessions[0];
+      if (
+        mostRecent &&
+        !isSameStudioSession(mostRecent.selection, selectedSession) &&
+        (mostRecent.kind === 'cartridge' || activeWorkspace === 'coproducer' || activeWorkspace === 'dna')
+      ) {
+        setSelectedSession(mostRecent.selection);
+        if (mostRecent.kind === 'cartridge' && mostRecent.cartridgeId) {
+          setSelectedCartridgeId(mostRecent.cartridgeId);
+        } else if (mostRecent.kind === 'draft') {
+          setRequestedDraftThreadId(mostRecent.threadId ?? null);
         }
         return;
       }
-      const firstDraft = unifiedSessions.find((s) => s.kind === 'draft');
-      if (firstDraft) {
-        setSelectedSession(firstDraft.selection);
-      }
-      return;
     }
 
     if (selectedSession.kind === 'cartridge') {
@@ -270,7 +296,7 @@ export function App() {
         setSelectedSession({ kind: 'cartridge', cartridgeId: nextCid });
       }
     }
-  }, [selectedSession, unifiedSessions, games, coproducerThreadsQuery.data]);
+  }, [selectedSession, unifiedSessions, games, coproducerThreadsQuery.data, activeWorkspace]);
 
   const initialCatalogLoading = cartridgesQuery.isPending || bibleQuery.isPending;
   const isDraftSession =
@@ -288,7 +314,15 @@ export function App() {
     );
   }, [selectedSession, unifiedSessions]);
 
+  const handleSelectWorkspace = (nextWs: WorkspaceId) => {
+    if (nextWs !== 'coproducer' && nextWs !== 'dna') {
+      userManuallySelectedSessionRef.current = true;
+    }
+    setActiveWorkspace(nextWs);
+  };
+
   const handleSelectSession = (next: StudioSessionSelection) => {
+    userManuallySelectedSessionRef.current = true;
     setSelectedSession(next);
     setActionError(null);
     if (next.kind === 'cartridge') {
@@ -304,6 +338,7 @@ export function App() {
   };
 
   const handleSelectCartridge = (cid: string) => {
+    userManuallySelectedSessionRef.current = true;
     setSelectedCartridgeId(cid);
     setSelectedSliceId(null);
     setRequestedDraftThreadId(null);
@@ -400,6 +435,7 @@ export function App() {
     onSuccess: (_res, vars) => {
       setActionError(null);
       if (!vars.resumeCurrent) {
+        userManuallySelectedSessionRef.current = true;
         setSelectedCartridgeId('');
         setSelectedSliceId(null);
         setRequestedDraftThreadId(null);
@@ -435,6 +471,7 @@ export function App() {
   });
 
   const handleStartNewGameSession = () => {
+    userManuallySelectedSessionRef.current = true;
     setActiveWorkspace('coproducer');
     setSelectedSession({ kind: 'draft', threadId: '__creating__' });
     startNewGameDraftMut.mutate();
@@ -581,7 +618,7 @@ export function App() {
         activeCartridgeId={playtestListQuery.data?.active_cartridge_id ?? ''}
         onSelectCartridge={handleSelectCartridge}
         activeWorkspace={activeWorkspace}
-        onSelectWorkspace={setActiveWorkspace}
+        onSelectWorkspace={handleSelectWorkspace}
         bible={bible}
         boardCounts={boardCounts}
         transcriptCount={sliceTranscript.length}
@@ -694,7 +731,7 @@ export function App() {
               boardCounts={boardCounts}
               liveStepsByThread={realtime.liveCoProducerSteps}
               onSelectCartridge={handleSelectCartridge}
-              onSelectWorkspace={setActiveWorkspace}
+              onSelectWorkspace={handleSelectWorkspace}
               onOpenLightbox={setLightboxMedia}
               requestedDraftThreadId={requestedDraftThreadId}
               onConsumeRequestedDraftThread={() => setRequestedDraftThreadId(null)}

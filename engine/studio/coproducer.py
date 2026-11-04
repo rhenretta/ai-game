@@ -68,6 +68,94 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_iso_epoch(raw: Any) -> float:
+    txt = str(raw or "").strip()
+    if not txt:
+        return 0.0
+    if txt.endswith("Z"):
+        txt = txt[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(txt)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return float(dt.timestamp())
+    except Exception:
+        return 0.0
+
+
+def infer_cartridge_last_worked_utc(c_dir: Path) -> Tuple[float, str]:
+    """Computes the authentic last-worked-on `(epoch_seconds, utc_iso)` for a cartridge folder.
+
+    Inspects concrete game work artifacts (`game_bible.json`, `co_producer_brief.json`,
+    `backlog.json`, `game_memory.json`, `world_spec.json`, `manifest.json`, `project.godot`,
+    `mechanics.py`, `scenes/*`, `scripts/*`, `assets/*`, plus active `co_producer.json`
+    threads that contain >=1 message) rather than top-level directory inode mtimes so
+    housekeeping (`__pycache__` cleanup, `.DS_Store`, or lazy 0-message thread reads)
+    never falsely bumps an untouched historical game to the top of the session list.
+    """
+    best_epoch = 0.0
+    p_dir = Path(c_dir)
+    if p_dir.is_dir():
+        primary_names = (
+            "game_bible.json",
+            HANDOFF_BRIEF_FILENAME,
+            "backlog.json",
+            "game_memory.json",
+            "world_spec.json",
+            "manifest.json",
+            "project.godot",
+            "mechanics.py",
+        )
+        for fname in primary_names:
+            cand = p_dir / fname
+            if cand.is_file():
+                try:
+                    best_epoch = max(best_epoch, float(cand.stat().st_mtime))
+                except OSError:
+                    pass
+
+        for rel_sub in ("scenes", "scripts", "assets", "assets/mockups", "assets/sprites", "assets/audio"):
+            sub_dir = p_dir / rel_sub
+            if not sub_dir.is_dir():
+                continue
+            try:
+                for child in sub_dir.iterdir():
+                    if child.name.startswith(".") or child.name == "__pycache__":
+                        continue
+                    if child.is_file():
+                        best_epoch = max(best_epoch, float(child.stat().st_mtime))
+            except OSError:
+                pass
+
+        cp_path = p_dir / THREAD_SNAPSHOT_FILENAME
+        if cp_path.is_file():
+            try:
+                cp_raw = json.loads(cp_path.read_text(encoding="utf-8"))
+                if isinstance(cp_raw, dict):
+                    t_obj = cp_raw.get("thread") if isinstance(cp_raw.get("thread"), dict) else {}
+                    msgs = cp_raw.get("messages") if isinstance(cp_raw.get("messages"), list) else []
+                    msg_cnt = int(t_obj.get("message_count") or 0)
+                    if msg_cnt > 0 or len(msgs) > 0:
+                        parsed_cp = _parse_iso_epoch(t_obj.get("updated_at_utc") or t_obj.get("created_at_utc"))
+                        if parsed_cp > 0.0:
+                            best_epoch = max(best_epoch, parsed_cp)
+                        else:
+                            best_epoch = max(best_epoch, float(cp_path.stat().st_mtime))
+            except Exception:
+                pass
+
+        if best_epoch <= 0.0:
+            try:
+                best_epoch = float(p_dir.stat().st_mtime)
+            except OSError:
+                best_epoch = 0.0
+
+    if best_epoch > 0.0:
+        return best_epoch, datetime.fromtimestamp(best_epoch, tz=timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    return float(now_dt.timestamp()), now_dt.isoformat()
+
+
 def _safe_slug(raw: str, fallback: str = "sketch") -> str:
     cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(raw or "")).strip("_")
     while "__" in cleaned:
@@ -108,11 +196,12 @@ class CoProducerThreadStore:
     def _write_disk_snapshot(self, thread_meta: Dict[str, Any], messages: List[Dict[str, Any]]) -> Path:
         t_dir = self.resolve_thread_dir(thread_meta)
         t_dir.mkdir(parents=True, exist_ok=True)
+        snap_ts = str(thread_meta.get("updated_at_utc") or "").strip() or _utc_now_iso()
         snap = _ordered_rationale_dict(
             str(thread_meta.get("deliberation") or "Persisted Co-Producer thread snapshot."),
             thread=thread_meta,
             messages=messages,
-            updated_at_utc=_utc_now_iso(),
+            updated_at_utc=snap_ts,
         )
         snap_path = self._snapshot_path(t_dir)
         tmp_path = snap_path.with_suffix(".json.tmp")
@@ -127,6 +216,7 @@ class CoProducerThreadStore:
         *,
         override_seed_brief: Optional[str] = None,
         handoff_mode: Optional[str] = None,
+        updated_at_override: Optional[str] = None,
     ) -> None:
         """Keeps `<cartridge_dir>/co_producer_brief.json` and `assets/mockups/` synchronized whenever a
         cartridge-bound Co-Producer thread refines its `concept_brief`, preventing stale Turn-N handoff snapshots."""
@@ -196,7 +286,7 @@ class CoProducerThreadStore:
             else:
                 synthesized_seed = str(existing_env.get("steering_or_seed_brief") or "").strip()
 
-        now_iso = _utc_now_iso()
+        effective_updated_iso = str(updated_at_override or "").strip() or _utc_now_iso()
         updated_env = _ordered_rationale_dict(
             str(eff_cb.get("deliberation") or existing_env.get("deliberation") or f"Synced living Co-Producer brief for '{cid}'."),
             handoff_mode=eff_mode,
@@ -204,8 +294,8 @@ class CoProducerThreadStore:
             cartridge_id=cid,
             steering_or_seed_brief=synthesized_seed,
             concept_brief=eff_cb,
-            created_at_utc=str(existing_env.get("created_at_utc") or now_iso),
-            updated_at_utc=now_iso,
+            created_at_utc=str(existing_env.get("created_at_utc") or effective_updated_iso),
+            updated_at_utc=effective_updated_iso,
         )
         tmp_brief = brief_path.with_suffix(".json.tmp")
         tmp_brief.write_text(json.dumps(updated_env, indent=2, default=str), encoding="utf-8")
@@ -234,8 +324,12 @@ class CoProducerThreadStore:
                 b_env = json.loads(brief_path.read_text(encoding="utf-8"))
                 b_ts = str((b_env if isinstance(b_env, dict) else {}).get("updated_at_utc") or (b_env if isinstance(b_env, dict) else {}).get("created_at_utc") or "")
                 t_ts = str(t_meta.get("updated_at_utc") or "")
-                if t_ts and (not b_ts or t_ts > b_ts):
-                    self._sync_cartridge_brief_file(t_meta, t_meta["concept_brief"])
+                if t_ts and (not b_ts or _parse_iso_epoch(t_ts) > _parse_iso_epoch(b_ts)):
+                    self._sync_cartridge_brief_file(
+                        t_meta,
+                        t_meta["concept_brief"],
+                        updated_at_override=t_ts,
+                    )
             except Exception:
                 pass
         if self.db is not None and hasattr(self.db, "get_coproducer_thread"):
@@ -325,7 +419,11 @@ class CoProducerThreadStore:
                     working_title=resolved_title,
                 ).model_dump()
 
-            now_iso = _utc_now_iso()
+            seed_iso = (
+                infer_cartridge_last_worked_utc(c_dir)[1]
+                if c_dir.is_dir()
+                else _utc_now_iso()
+            )
             tid = f"thread_{_safe_slug(cid, 'cartridge')}"
             thread_meta = _ordered_rationale_dict(
                 f"Initialized Co-Producer showrunner thread for cartridge '{cid}'.",
@@ -336,8 +434,8 @@ class CoProducerThreadStore:
                 graduated_to_cartridge_id="",
                 concept_brief=bible_brief,
                 message_count=0,
-                created_at_utc=now_iso,
-                updated_at_utc=now_iso,
+                created_at_utc=seed_iso,
+                updated_at_utc=seed_iso,
             )
             if self.db is not None and hasattr(self.db, "upsert_coproducer_thread"):
                 self.db.upsert_coproducer_thread(thread_meta)
@@ -424,6 +522,13 @@ class CoProducerThreadStore:
             else:
                 threads = list(disk_threads_by_id.values())
 
+            threads.sort(
+                key=lambda t: (
+                    _parse_iso_epoch(t.get("updated_at_utc") or t.get("created_at_utc")),
+                    str(t.get("thread_id") or ""),
+                ),
+                reverse=True,
+            )
             draft_threads = [t for t in threads if t.get("scope_kind") == "draft"]
             cartridge_threads = [t for t in threads if t.get("scope_kind") == "cartridge"]
             return _ordered_rationale_dict(
