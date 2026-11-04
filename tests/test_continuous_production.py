@@ -3895,6 +3895,162 @@ def test_swe_symbol_index_excludes_item_tests_and_orders_static_prefix_first(tmp
     assert "--- CARTRIDGE SYMBOL & REFERENCE INDEX ---" in captured_prompts[0][:idx0]
 
 
+def test_self_inquiry_memory_evicts_stale_answers_on_chunk_mutation(tmp_path):
+    """Verifies that `SelfInquiryQAPair` stamps content hashes on save and `load_self_inquiry_memory`
+    deterministically evicts stale Q&A pairs when referenced code modules mutate (including legacy un-hashed files)."""
+    import json
+    import os
+    from engine.studio.context_curator import ContextCuratorAgent, SelfInquiryQAPair
+
+    assert list(SelfInquiryQAPair.model_fields.keys())[0] == "deliberation"
+
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir(parents=True)
+    mod_alpha = scripts_dir / "module_alpha.gd"
+    mod_beta = scripts_dir / "module_beta.gd"
+    mod_alpha.write_text("extends Node\nvar count_value: int = 0\n", encoding="utf-8")
+    mod_beta.write_text("extends Node\nsignal threshold_reached(level: int)\n", encoding="utf-8")
+
+    curator = ContextCuratorAgent(cartridge_dir=tmp_path, client=None)
+    curator.save_self_inquiry_memory(
+        "item_counter_sync",
+        "qa_test_engineer",
+        [
+            SelfInquiryQAPair(
+                deliberation="Record alpha state contract.",
+                question="How does module_alpha initialize count_value?",
+                answer="module_alpha sets count_value = 0.",
+                researched_chunk_ids=["code:module:scripts/module_alpha.gd"],
+            ),
+            SelfInquiryQAPair(
+                deliberation="Record beta signal contract.",
+                question="What signal does module_beta emit?",
+                answer="module_beta emits threshold_reached(level: int).",
+                researched_chunk_ids=["code:module:scripts/module_beta.gd"],
+            ),
+        ],
+    )
+
+    loaded_initial = curator.load_self_inquiry_memory("item_counter_sync", "qa_test_engineer")
+    assert len(loaded_initial) == 2
+    assert "code:module:scripts/module_alpha.gd" in loaded_initial[0].researched_chunk_hashes
+
+    # Mutating module_alpha.gd invalidates ONLY the Q&A pair referencing module_alpha.gd
+    mod_alpha.write_text(
+        "extends Node\nvar count_value: int = 1\nfunc increment_count() -> void:\n\tcount_value += 1\n",
+        encoding="utf-8",
+    )
+    loaded_after_edit = curator.load_self_inquiry_memory("item_counter_sync", "qa_test_engineer")
+    assert len(loaded_after_edit) == 1
+    assert "module_beta" in loaded_after_edit[0].question
+
+    # Legacy pre-hash JSON on disk: evicted via st_mtime comparison when referenced module is newer
+    mem_path = curator._self_inquiry_memory_path("item_legacy_sync", "qa_test_engineer")
+    assert mem_path is not None
+    mem_path.write_text(
+        json.dumps(
+            [
+                {
+                    "deliberation": "Legacy answer without hashes.",
+                    "question": "What signal does module_beta emit?",
+                    "answer": "Old answer before edit.",
+                    "researched_chunk_ids": ["code:module:scripts/module_beta.gd"],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    old_ts = mod_beta.stat().st_mtime - 60.0
+    os.utime(mem_path, (old_ts, old_ts))
+    assert curator.load_self_inquiry_memory("item_legacy_sync", "qa_test_engineer") == []
+
+
+def test_curate_context_rebuilds_fresh_module_contracts_across_roles_and_edits(tmp_path):
+    """Verifies that when `qa_test_engineer` reuses `context_pack_task_lead.json` within the same revision
+    after `swe_engineer` edits a `.gd` module on disk, `curate_context` makes 0 extra LLM calls while serving
+    fresh on-disk `.gd` signatures AND `--- MODULE CONTRACT & SEMANTICS ---` (`get_state_snapshot` keys)."""
+    from types import SimpleNamespace
+    from engine.studio.context_curator import ContextCuratorAgent, ContextCuratorDecision
+    from engine.studio.models import WorkItemProposal
+    from engine.studio.production_board import ProductionBoard
+
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir(parents=True)
+    ctrl_gd = scripts_dir / "counter_controller.gd"
+    ctrl_gd.write_text(
+        "extends Node2D\nvar active_units: int = 0\nfunc reset_units() -> void:\n\tactive_units = 0\n",
+        encoding="utf-8",
+    )
+
+    board = ProductionBoard(tmp_path / "backlog.json")
+    board.add_items(
+        [
+            WorkItemProposal(
+                deliberation="Build counter controller.",
+                item_id="mech_counter_ctrl",
+                kind="mechanic_code",
+                title="Counter Controller",
+                spec="Track active units across steps.",
+                proof_spec="Filmstrip verifying active_units progression.",
+                target_modules=["scripts/counter_controller.gd"],
+            )
+        ],
+        "GameplayDesigner",
+    )
+
+    curator_llm_calls = []
+
+    class _StubClient:
+        __module__ = "google.genai.client"
+
+        def __init__(self):
+            self.models = self
+
+        def embed_content(self, *, model, contents, config=None):
+            return SimpleNamespace(embeddings=[SimpleNamespace(values=[0.25] * 256) for _ in contents])
+
+        def generate_content(self, *, model, contents, config=None):
+            curator_llm_calls.append(contents)
+            dec = ContextCuratorDecision(
+                deliberation="Select counter_controller module and board item.",
+                search_queries_used=["counter_controller"],
+                role_tailored_synthesis="Includes counter_controller.gd and board item.",
+                selected_chunk_ids=["board:item:mech_counter_ctrl", "code:module:scripts/counter_controller.gd"],
+                selected_image_paths=[],
+            )
+            return SimpleNamespace(text=dec.model_dump_json())
+
+    curator = ContextCuratorAgent(cartridge_dir=tmp_path, client=_StubClient(), board=board)
+    lead_pack = curator.curate_context(
+        target_agent_role="task_lead",
+        task_request="Implement Counter Controller",
+        item_id="mech_counter_ctrl",
+        item_kind="mechanic_code",
+    )
+    assert len(curator_llm_calls) == 1
+    assert "reset_units()" in lead_pack.prompt_block
+    assert "--- MODULE CONTRACT & SEMANTICS ---" not in lead_pack.prompt_block
+
+    # Simulate SWE editing counter_controller.gd intra-revision (revision count remains 0)
+    ctrl_gd.write_text(
+        "extends Node2D\nvar active_units: int = 0\n"
+        "func apply_step_delta(step: int) -> void:\n\tactive_units += step\n"
+        "func get_state_snapshot() -> Dictionary:\n\treturn {'active_units': active_units}\n",
+        encoding="utf-8",
+    )
+
+    qa_pack = curator.curate_context(
+        target_agent_role="qa_test_engineer",
+        task_request="Verify Counter Controller",
+        item_id="mech_counter_ctrl",
+        item_kind="mechanic_code",
+    )
+    assert len(curator_llm_calls) == 1  # Reused chunk-ID selection without an extra LLM call
+    assert "for qa_test_engineer on 'mech_counter_ctrl'" in qa_pack.prompt_block
+    assert "apply_step_delta(step: int)" in qa_pack.prompt_block
+    assert "reset_units()" not in qa_pack.prompt_block
+    assert "--- MODULE CONTRACT & SEMANTICS ---" in qa_pack.prompt_block
+    assert "'active_units': active_units" in qa_pack.prompt_block
 
 
 

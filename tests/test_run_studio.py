@@ -385,3 +385,39 @@ class TestGracefulDaemonLifecycle:
             mock_orchestrator._creative_prompt
             == "Connect modular pier cranes and automated tugboat lanes across tidal channels."
         )
+
+
+class TestUvicornDeadWorkerReaper:
+    """Verifies Uvicorn StatReload dead-worker detection and Rule 5 crash-loop fail-fast."""
+
+    def test_dead_worker_triggers_restart_and_crash_loop_stops_reloader(self):
+        from uvicorn.supervisors.statreload import StatReload
+
+        run_studio.install_uvicorn_dead_worker_reaper(max_crashes_in_window=3, crash_window_seconds=30.0)
+
+        fake_sup = StatReload.__new__(StatReload)
+        fake_sup.should_exit = threading.Event()
+        fake_sup.mtimes = {}
+        fake_sup.pause = lambda: None
+        fake_sup.iter_py_files = lambda: iter(())
+
+        dead_proc = MagicMock()
+        dead_proc.is_alive.return_value = False
+        dead_proc.pid = 42424
+        dead_proc.exitcode = -9
+        fake_sup.process = dead_proc
+
+        # Crash 1 and 2 within window -> returns non-empty path list so BaseReload calls restart() & reaps zombie
+        res1 = fake_sup.should_restart()
+        assert res1 and isinstance(res1, list)
+        assert not fake_sup.should_exit.is_set()
+
+        res2 = fake_sup.should_restart()
+        assert res2 and isinstance(res2, list)
+        assert not fake_sup.should_exit.is_set()
+
+        # Crash 3 within window -> Rule 5 fail-fast sets should_exit instead of spinning indefinitely
+        res3 = fake_sup.should_restart()
+        assert res3 is None
+        assert fake_sup.should_exit.is_set()
+

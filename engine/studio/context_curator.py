@@ -149,6 +149,10 @@ class SelfInquiryQAPair(BaseModel):
         default_factory=list,
         description="The chunk IDs brought in by ContextCuratorAgent to let the agent answer this question.",
     )
+    researched_chunk_hashes: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Deterministic SHA-256 content fingerprints of `researched_chunk_ids` when this answer was synthesized, used to evict stale answers when referenced files mutate on disk.",
+    )
 
 
 class QuestionContextResearchDecision(BaseModel):
@@ -1658,6 +1662,7 @@ class ContextCuratorAgent:
                 deps_sig = ""
 
         intra_rev_sig = f"rev={current_rev}"
+        code_sig, _max_code_mtime = self._compute_cartridge_code_signature()
 
         with _CURATOR_CACHE_LOCK:
             candidate_cache_files: List[Path] = []
@@ -1687,9 +1692,29 @@ class ContextCuratorAgent:
                             ensure_rendering=False,
                         )
                         by_cid = {c.chunk_id: c for c in all_chunks}
-                        chosen_chunks = [
-                            by_cid[cid] for cid in (cached.get("selected_chunk_ids") or []) if cid in by_cid
-                        ]
+                        selected_cids: List[str] = list(cached.get("selected_chunk_ids") or [])
+                        prior_known_cids = set(cached.get("candidate_chunk_ids") or []) | set(selected_cids)
+                        if selected_cids:
+                            for new_mod_cid in self._discover_item_seed_module_chunk_ids(
+                                item_id=item_id,
+                                task_request=task_request,
+                                item_kind=item_kind,
+                                by_cid=by_cid,
+                            ):
+                                if (
+                                    new_mod_cid not in selected_cids
+                                    and new_mod_cid not in prior_known_cids
+                                    and len(selected_cids) < max_selected_chunks
+                                ):
+                                    selected_cids.append(new_mod_cid)
+                        chosen_chunks = [by_cid[cid] for cid in selected_cids if cid in by_cid]
+                        _expanded_chunks, fresh_prompt_block = self._render_curated_prompt_block(
+                            chosen_chunks=chosen_chunks,
+                            total_indexed_chunks=len(all_chunks),
+                            cache_role=cache_role,
+                            item_id=item_id,
+                            role_tailored_synthesis=decision.role_tailored_synthesis,
+                        )
                         cached_media_raw = (
                             cached.get("selected_media_paths")
                             or cached.get("selected_image_paths")
@@ -1705,15 +1730,45 @@ class ContextCuratorAgent:
                             max_selected_images=max_selected_images,
                         )
                         multimodal_parts = self._build_multimodal_parts_from_paths(chosen_media_paths)
+                        refreshed_payload = dict(cached)
+                        refreshed_payload.update(
+                            {
+                                "code_sig": code_sig,
+                                "target_agent_role": target_agent_role,
+                                "normalized_role": cache_role,
+                                "total_indexed_chunks": len(all_chunks),
+                                "selected_chunk_ids": [c.chunk_id for c in chosen_chunks],
+                                "selected_image_paths": chosen_media_paths,
+                                "selected_media_paths": chosen_media_paths,
+                                "prompt_block": fresh_prompt_block,
+                            }
+                        )
+                        if trace_dir is not None and cache_file is not None:
+                            if (
+                                not cache_file.is_file()
+                                or str(cached.get("code_sig") or "") != code_sig
+                                or str(cached.get("normalized_role") or "") != cache_role
+                            ):
+                                try:
+                                    trace_dir.mkdir(parents=True, exist_ok=True)
+                                    cache_file.write_text(
+                                        json.dumps(refreshed_payload, indent=2),
+                                        encoding="utf-8",
+                                    )
+                                except Exception:
+                                    pass
                         if trace_dir is not None and safe_role != cache_role:
                             role_file = trace_dir / f"context_pack_{safe_role}.json"
-                            if not role_file.is_file():
+                            if not role_file.is_file() or str(cached.get("code_sig") or "") != code_sig:
                                 try:
-                                    role_file.write_text(json.dumps(cached, indent=2), encoding="utf-8")
+                                    role_file.write_text(
+                                        json.dumps(refreshed_payload, indent=2),
+                                        encoding="utf-8",
+                                    )
                                 except Exception:
                                     pass
                         return CuratedContextPack(
-                            prompt_block=str(cached["prompt_block"]),
+                            prompt_block=fresh_prompt_block,
                             multimodal_parts=multimodal_parts,
                             decision=decision,
                             retrieved_chunks=chosen_chunks,
@@ -1982,33 +2037,12 @@ class ContextCuratorAgent:
                 available_descriptions=available_media,
             )
 
-            expanded_chosen_chunks: List[ContextChunk] = []
-            for c in chosen_chunks:
-                if c.chunk_id.startswith("code:module:") and cache_role not in ("task_lead", "swe_engineer"):
-                    rel_mod = c.chunk_id[len("code:module:") :].strip().lstrip("/")
-                    f_mod = self.cartridge_dir / rel_mod
-                    if f_mod.is_file() and rel_mod.endswith(".gd"):
-                        try:
-                            from engine.studio.swe import LeadGameplaySWEAgent
-                            raw_gd = f_mod.read_text(encoding="utf-8")
-                            rich_contract = LeadGameplaySWEAgent._summarize_non_target_gd_module(rel_mod, raw_gd)
-                            c = c.model_copy(
-                                update={"content": f"{c.content}\n\n--- MODULE CONTRACT & SEMANTICS ---\n{rich_contract}"}
-                            )
-                        except Exception:
-                            pass
-                expanded_chosen_chunks.append(c)
-
-            chunk_sections = "\n\n".join(
-                f"[{c.chunk_id}] ({c.category}) {c.title}:\n{c.content}" for c in expanded_chosen_chunks
-            )
-            prompt_block = (
-                f"\n=== SEMANTICALLY CURATED STUDIO CONTEXT (for {cache_role} on '{item_id or 'task'}') ===\n"
-                f"NEUTRAL CONTEXT MAP (factual inventory of retrieved chunks & cross-module links — evaluate and solve independently):\n"
-                f"{decision.role_tailored_synthesis}\n\n"
-                f"RETRIEVED & SELECTED STUDIO KNOWLEDGE CHUNKS ({len(expanded_chosen_chunks)} selected from {len(all_chunks)} indexed chunks):\n"
-                f"{chunk_sections}\n"
-                f"=== END CURATED STUDIO CONTEXT ===\n"
+            expanded_chosen_chunks, prompt_block = self._render_curated_prompt_block(
+                chosen_chunks=chosen_chunks,
+                total_indexed_chunks=len(all_chunks),
+                cache_role=cache_role,
+                item_id=item_id,
+                role_tailored_synthesis=decision.role_tailored_synthesis,
             )
 
             # Persist audit trace of what the Context Curator selected
@@ -2018,6 +2052,7 @@ class ContextCuratorAgent:
                     "revision": current_rev,
                     "memory_sig": mem_sig,
                     "deps_sig": deps_sig,
+                    "code_sig": code_sig,
                     "intra_rev_sig": intra_rev_sig,
                     "target_agent_role": target_agent_role,
                     "normalized_role": cache_role,
@@ -2360,6 +2395,297 @@ class ContextCuratorAgent:
                 pass
         return block
 
+    def _compute_cartridge_code_signature(self) -> Tuple[str, Optional[float]]:
+        """Computes a deterministic SHA-256 signature and latest `st_mtime` across cartridge `.gd`, `.gdshader`,
+        `.tscn` modules and asset catalogs (`assets/asset_library.json`, `catalog.json`)."""
+        ignored_top_dirs = {".godot", "artifacts", "assets", "res:", "__pycache__"}
+        sig_parts: List[str] = []
+        max_mtime: Optional[float] = None
+
+        for ext in ("*.gd", "*.gdshader", "*.tscn"):
+            for p in sorted(self.cartridge_dir.rglob(ext)):
+                if not p.is_file():
+                    continue
+                try:
+                    rel = p.relative_to(self.cartridge_dir)
+                except ValueError:
+                    continue
+                if rel.parts and rel.parts[0] in ignored_top_dirs:
+                    continue
+                rel_str = str(rel).replace("\\", "/")
+                if rel_str == "src/studio_rig_and_collider.gd":
+                    continue
+                try:
+                    st = p.stat()
+                    digest = hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+                    sig_parts.append(f"mod:{rel_str}:{digest}")
+                    max_mtime = st.st_mtime if max_mtime is None else max(max_mtime, st.st_mtime)
+                except Exception:
+                    continue
+
+        for cat_rel in ("assets/asset_library.json", "catalog.json"):
+            cp = self.cartridge_dir / cat_rel
+            if cp.is_file():
+                try:
+                    st = cp.stat()
+                    digest = hashlib.sha256(cp.read_bytes()).hexdigest()[:16]
+                    sig_parts.append(f"cat:{cat_rel}:{digest}")
+                    max_mtime = st.st_mtime if max_mtime is None else max(max_mtime, st.st_mtime)
+                except Exception:
+                    continue
+
+        if not sig_parts:
+            return "", max_mtime
+        return _sha256_text("|".join(sig_parts))[:16], max_mtime
+
+    def _discover_item_seed_module_chunk_ids(
+        self,
+        *,
+        item_id: str,
+        task_request: str,
+        item_kind: str,
+        by_cid: Dict[str, ContextChunk],
+    ) -> List[str]:
+        """Returns `code:module:<rel_path>` chunk IDs for target/seed modules of `item_id` that exist in `by_cid`."""
+        seed_cids: List[str] = []
+
+        def _add_mod(raw_m: str) -> None:
+            s = str(raw_m or "").strip().replace("\\", "/")
+            if s.startswith("res://"):
+                s = s[len("res://") :]
+            elif s.startswith("res:/"):
+                s = s[len("res:/") :]
+            s = s.lstrip("/")
+            cid = f"code:module:{s}"
+            if s and cid in by_cid and cid not in seed_cids:
+                seed_cids.append(cid)
+
+        if item_id and self.board is not None and hasattr(self.board, "get"):
+            try:
+                b_item = self.board.get(item_id)
+                for tm in (getattr(b_item, "target_modules", None) or []):
+                    _add_mod(tm)
+            except Exception:
+                pass
+        for m_path in re.findall(r"(?:res://)?([A-Za-z0-9_./-]+\.(?:gd|gdshader|tscn))", task_request or ""):
+            _add_mod(m_path)
+        if item_kind in ("level_map", "ui", "integration"):
+            _add_mod("main.gd")
+        return seed_cids
+
+    def _render_curated_prompt_block(
+        self,
+        *,
+        chosen_chunks: Sequence[ContextChunk],
+        total_indexed_chunks: int,
+        cache_role: str,
+        item_id: str,
+        role_tailored_synthesis: str,
+    ) -> Tuple[List[ContextChunk], str]:
+        """Formats `chosen_chunks` into the curated prompt block for `cache_role`, expanding rich GDScript contracts
+        for non-SWE evaluation/QA roles (`qa_test_engineer`, `council_reviewer`, etc.)."""
+        expanded_chosen_chunks: List[ContextChunk] = []
+        for c in chosen_chunks:
+            if c.chunk_id.startswith("code:module:") and cache_role not in ("task_lead", "swe_engineer"):
+                rel_mod = c.chunk_id[len("code:module:") :].strip().lstrip("/")
+                f_mod = self.cartridge_dir / rel_mod
+                if f_mod.is_file() and rel_mod.endswith(".gd"):
+                    try:
+                        from engine.studio.swe import LeadGameplaySWEAgent
+
+                        raw_gd = f_mod.read_text(encoding="utf-8")
+                        rich_contract = LeadGameplaySWEAgent._summarize_non_target_gd_module(rel_mod, raw_gd)
+                        c = c.model_copy(
+                            update={"content": f"{c.content}\n\n--- MODULE CONTRACT & SEMANTICS ---\n{rich_contract}"}
+                        )
+                    except Exception:
+                        pass
+            expanded_chosen_chunks.append(c)
+
+        chunk_sections = "\n\n".join(
+            f"[{c.chunk_id}] ({c.category}) {c.title}:\n{c.content}" for c in expanded_chosen_chunks
+        )
+        prompt_block = (
+            f"\n=== SEMANTICALLY CURATED STUDIO CONTEXT (for {cache_role} on '{item_id or 'task'}') ===\n"
+            f"NEUTRAL CONTEXT MAP (factual inventory of retrieved chunks & cross-module links — evaluate and solve independently):\n"
+            f"{role_tailored_synthesis}\n\n"
+            f"RETRIEVED & SELECTED STUDIO KNOWLEDGE CHUNKS ({len(expanded_chosen_chunks)} selected from {total_indexed_chunks} indexed chunks):\n"
+            f"{chunk_sections}\n"
+            f"=== END CURATED STUDIO CONTEXT ===\n"
+        )
+        return expanded_chosen_chunks, prompt_block
+
+    def _compute_chunk_fingerprint(self, cid: str) -> Tuple[Optional[str], Optional[float]]:
+        """Computes `(sha256_prefix, file_mtime)` for mutable cartridge chunks so stale `SelfInquiryQAPair`
+        answers are deterministically evicted as soon as the underlying code, asset, or spec mutates on disk."""
+        clean_cid = str(cid or "").strip()
+        if not clean_cid:
+            return None, None
+
+        if clean_cid.startswith("code:module:"):
+            rel_mod = clean_cid[len("code:module:") :].strip().replace("\\", "/").lstrip("/")
+            f_mod = self.cartridge_dir / rel_mod
+            if not f_mod.is_file():
+                return "MISSING", None
+            try:
+                return hashlib.sha256(f_mod.read_bytes()).hexdigest()[:16], f_mod.stat().st_mtime
+            except Exception:
+                return None, None
+
+        if clean_cid == "code:entrypoint_topology":
+            code_sig, max_mt = self._compute_cartridge_code_signature()
+            return (code_sig or "EMPTY"), max_mt
+
+        if clean_cid.startswith("asset:catalog:"):
+            aid = clean_cid[len("asset:catalog:") :].strip()
+            merged_entry: Dict[str, Any] = {}
+            max_mt: Optional[float] = None
+            for cat_rel in ("assets/asset_library.json", "catalog.json"):
+                cp = self.cartridge_dir / cat_rel
+                if cp.is_file():
+                    try:
+                        c_data = json.loads(cp.read_text(encoding="utf-8"))
+                        entries = c_data.get("entries", c_data) if isinstance(c_data, dict) else {}
+                        if isinstance(entries, dict) and isinstance(entries.get(aid), dict):
+                            merged_entry.update(entries[aid])
+                            st_mt = cp.stat().st_mtime
+                            max_mt = st_mt if max_mt is None else max(max_mt, st_mt)
+                    except Exception:
+                        pass
+            if not merged_entry:
+                return "MISSING", None
+            rel_file = str(
+                merged_entry.get("res_path")
+                or merged_entry.get("file_path")
+                or merged_entry.get("file")
+                or merged_entry.get("target_path")
+                or ""
+            ).replace("res://", "")
+            file_hash = "NO_FILE"
+            if rel_file:
+                ap = self.cartridge_dir / rel_file
+                if ap.is_file():
+                    try:
+                        file_hash = hashlib.sha256(ap.read_bytes()).hexdigest()[:16]
+                        a_mt = ap.stat().st_mtime
+                        max_mt = a_mt if max_mt is None else max(max_mt, a_mt)
+                    except Exception:
+                        pass
+            entry_json = json.dumps(
+                {k: v for k, v in merged_entry.items() if k != "deliberation"},
+                sort_keys=True,
+                default=str,
+            )
+            return _sha256_text(f"{entry_json}|{file_hash}")[:16], max_mt
+
+        if clean_cid.startswith("asset:mockup_file:"):
+            stem = clean_cid[len("asset:mockup_file:") :].strip()
+            mp = self.cartridge_dir / "assets" / "mockups" / f"{stem}.png"
+            if not mp.is_file():
+                return "MISSING", None
+            try:
+                return hashlib.sha256(mp.read_bytes()).hexdigest()[:16], mp.stat().st_mtime
+            except Exception:
+                return None, None
+
+        if clean_cid == "design:level_layout":
+            lp = self.cartridge_dir / "level_layout.json"
+            if not lp.is_file():
+                return "MISSING", None
+            try:
+                return hashlib.sha256(lp.read_bytes()).hexdigest()[:16], lp.stat().st_mtime
+            except Exception:
+                return None, None
+
+        if clean_cid.startswith("design:rendering:"):
+            rp = self.cartridge_dir / "rendering_strategy.json"
+            if rp.is_file():
+                try:
+                    return hashlib.sha256(rp.read_bytes()).hexdigest()[:16], rp.stat().st_mtime
+                except Exception:
+                    pass
+            return None, None
+
+        if clean_cid.startswith("design:"):
+            bp = self.cartridge_dir / "game_bible.json"
+            if bp.is_file():
+                try:
+                    return hashlib.sha256(bp.read_bytes()).hexdigest()[:16], bp.stat().st_mtime
+                except Exception:
+                    pass
+            return None, None
+
+        if clean_cid.startswith("memory:"):
+            mp = self.cartridge_dir / "game_memory.json"
+            if mp.is_file():
+                try:
+                    return hashlib.sha256(mp.read_bytes()).hexdigest()[:16], mp.stat().st_mtime
+                except Exception:
+                    pass
+            return None, None
+
+        if clean_cid.startswith("board:item:"):
+            iid = clean_cid[len("board:item:") :].strip()
+            item_dict: Optional[Dict[str, Any]] = None
+            if self.board is not None and hasattr(self.board, "get"):
+                try:
+                    b_it = self.board.get(iid)
+                    if b_it is not None and hasattr(b_it, "model_dump"):
+                        item_dict = b_it.model_dump()
+                except Exception:
+                    pass
+            if item_dict is None:
+                for pb_cand in (self.cartridge_dir / "backlog.json", self.cartridge_dir / "production_board.json"):
+                    if pb_cand.is_file():
+                        try:
+                            pb_data = json.loads(pb_cand.read_text(encoding="utf-8"))
+                            items_list = pb_data.get("items") if isinstance(pb_data, dict) else pb_data
+                            if isinstance(items_list, list):
+                                for entry in items_list:
+                                    if isinstance(entry, dict) and entry.get("item_id") == iid:
+                                        item_dict = entry
+                                        break
+                            if item_dict is not None:
+                                break
+                        except Exception:
+                            pass
+            if item_dict is None:
+                return None, None
+            spec_sig = _sha256_text(
+                json.dumps(
+                    {
+                        "spec": item_dict.get("spec", ""),
+                        "proof_spec": item_dict.get("proof_spec", ""),
+                        "target_modules": sorted(item_dict.get("target_modules") or []),
+                        "revision_count": len(item_dict.get("revisions") or []),
+                    },
+                    sort_keys=True,
+                )
+            )[:16]
+            return spec_sig, None
+
+        if clean_cid.startswith("board:trace:"):
+            iid = clean_cid[len("board:trace:") :].strip()
+            safe_iid = re.sub(r"[^a-z0-9_]+", "_", iid.lower()).strip("_")
+            item_trace_dir = self.cartridge_dir / "artifacts" / "work_items" / safe_iid
+            diff_parts: List[str] = [f"rev:{self._current_item_revision(iid)}"]
+            if item_trace_dir.is_dir():
+                for tf in sorted(item_trace_dir.glob("lead_trace_rev*.json"))[-2:]:
+                    try:
+                        t_data = json.loads(tf.read_text(encoding="utf-8"))
+                        if isinstance(t_data, dict):
+                            for turn in (t_data.get("turns") or []):
+                                if isinstance(turn, dict) and turn.get("code_diffs"):
+                                    diff_parts.append(
+                                        f"{tf.name}:t{turn.get('turn_index', 0)}:"
+                                        + _sha256_text(json.dumps(turn["code_diffs"], sort_keys=True))[:12]
+                                    )
+                    except Exception:
+                        continue
+            return _sha256_text("|".join(diff_parts))[:16], None
+
+        return None, None
+
     def _self_inquiry_memory_path(self, item_id: str, target_agent_role: str) -> Optional[Path]:
         safe_item = re.sub(r"[^a-z0-9_]+", "_", (item_id or "").lower()).strip("_")
         if not safe_item:
@@ -2370,17 +2696,61 @@ class ContextCuratorAgent:
         return trace_dir / f"self_inquiry_qa_{cache_role}.json"
 
     def load_self_inquiry_memory(self, item_id: str, target_agent_role: str) -> List[SelfInquiryQAPair]:
-        """Loads previously answered `(question, answer)` pairs for `(item_id, target_agent_role)`."""
+        """Loads previously answered `(question, answer)` pairs for `(item_id, target_agent_role)`, automatically
+        evicting any Q&A pair whose referenced `researched_chunk_ids` have mutated on disk since synthesis."""
         p = self._self_inquiry_memory_path(item_id, target_agent_role)
         if p is None or not p.is_file():
             return []
         try:
+            mem_file_mtime = p.stat().st_mtime
             raw = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(raw, list):
-                return [SelfInquiryQAPair.model_validate(item) for item in raw if isinstance(item, dict)]
+            if not isinstance(raw, list):
+                return []
+            loaded_pairs = [SelfInquiryQAPair.model_validate(item) for item in raw if isinstance(item, dict)]
         except Exception:
-            pass
-        return []
+            return []
+
+        valid_pairs: List[SelfInquiryQAPair] = []
+        dirty = False
+        for pair in loaded_pairs:
+            is_stale = False
+            updated_hashes = dict(pair.researched_chunk_hashes or {})
+            for cid in pair.researched_chunk_ids:
+                cur_hash, cur_mtime = self._compute_chunk_fingerprint(cid)
+                if cid in updated_hashes:
+                    if cur_hash != updated_hashes[cid]:
+                        is_stale = True
+                        break
+                else:
+                    if cur_hash == "MISSING":
+                        is_stale = True
+                        break
+                    if (
+                        cid.startswith(("code:", "asset:", "design:"))
+                        and cur_mtime is not None
+                        and cur_mtime > mem_file_mtime + 1e-6
+                    ):
+                        is_stale = True
+                        break
+                    if cur_hash is not None:
+                        updated_hashes[cid] = cur_hash
+                        dirty = True
+            if is_stale:
+                dirty = True
+                continue
+            if updated_hashes != pair.researched_chunk_hashes:
+                pair = pair.model_copy(update={"researched_chunk_hashes": updated_hashes})
+            valid_pairs.append(pair)
+
+        if dirty:
+            try:
+                p.write_text(
+                    json.dumps([vp.model_dump() for vp in valid_pairs], indent=2),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+        return valid_pairs
 
     def save_self_inquiry_memory(
         self,
@@ -2388,13 +2758,27 @@ class ContextCuratorAgent:
         target_agent_role: str,
         pairs: Sequence[SelfInquiryQAPair],
     ) -> None:
-        """Persists resolved `(question, answer)` pairs for `(item_id, target_agent_role)` so they remain in context across turns."""
+        """Persists resolved `(question, answer)` pairs for `(item_id, target_agent_role)` along with deterministic
+        content fingerprints for `researched_chunk_ids` so stale answers are evicted if those files later change."""
         p = self._self_inquiry_memory_path(item_id, target_agent_role)
         if p is None:
             return
+        stamped_pairs: List[SelfInquiryQAPair] = []
+        for pair in pairs:
+            hashes = dict(pair.researched_chunk_hashes or {})
+            changed = False
+            for cid in pair.researched_chunk_ids:
+                if cid not in hashes:
+                    cur_hash, _cur_mtime = self._compute_chunk_fingerprint(cid)
+                    if cur_hash is not None:
+                        hashes[cid] = cur_hash
+                        changed = True
+            if changed:
+                pair.researched_chunk_hashes = dict(hashes)
+            stamped_pairs.append(pair)
         try:
             p.write_text(
-                json.dumps([pair.model_dump() for pair in pairs], indent=2),
+                json.dumps([pair.model_dump() for pair in stamped_pairs], indent=2),
                 encoding="utf-8",
             )
         except Exception:

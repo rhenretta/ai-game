@@ -119,6 +119,73 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def install_uvicorn_dead_worker_reaper(
+    max_crashes_in_window: int = 3,
+    crash_window_seconds: float = 30.0,
+) -> None:
+    """Patches Uvicorn reloader supervisors so an unexpected worker exit (e.g., SIGKILL / crash)
+    is immediately logged, reaped via `restart()` (no `<defunct>` zombies holding `:8000`),
+    and fails fast by shutting down the reloader if crash-looping rapidly (Rule 5)."""
+    import time as _time
+    from uvicorn.supervisors.statreload import StatReload
+
+    supervisor_classes = [StatReload]
+    try:
+        from uvicorn.supervisors.watchfilesreload import WatchFilesReload
+
+        supervisor_classes.append(WatchFilesReload)
+    except Exception:
+        pass
+
+    for sup_cls in supervisor_classes:
+        if getattr(sup_cls, "_studio_dead_worker_reaper_installed", False):
+            continue
+        orig_should_restart = sup_cls.should_restart
+
+        def _make_patched(orig_fn):
+            def _patched_should_restart(self):
+                changed = orig_fn(self)
+                if changed:
+                    return changed
+                proc = getattr(self, "process", None)
+                if (
+                    proc is not None
+                    and not getattr(self, "should_exit", threading.Event()).is_set()
+                    and not proc.is_alive()
+                ):
+                    now_m = _time.monotonic()
+                    history = getattr(self, "_studio_worker_crash_timestamps", None)
+                    if history is None:
+                        history = []
+                        setattr(self, "_studio_worker_crash_timestamps", history)
+                    history[:] = [ts for ts in history if (now_m - ts) <= crash_window_seconds]
+                    history.append(now_m)
+                    exit_code = getattr(proc, "exitcode", None)
+                    logger.error(
+                        "Uvicorn worker process [%s] died unexpectedly (exitcode=%s; crash %d/%d in %.0fs window).",
+                        getattr(proc, "pid", "?"),
+                        exit_code,
+                        len(history),
+                        max_crashes_in_window,
+                        crash_window_seconds,
+                    )
+                    if len(history) >= max_crashes_in_window:
+                        logger.critical(
+                            "Uvicorn worker crashed %d times within %.0fs; stopping reloader supervisor to fail fast (Rule 5).",
+                            len(history),
+                            crash_window_seconds,
+                        )
+                        self.should_exit.set()
+                        return None
+                    return [Path(__file__).resolve()]
+                return None
+
+            return _patched_should_restart
+
+        sup_cls.should_restart = _make_patched(orig_should_restart)  # type: ignore[method-assign]
+        setattr(sup_cls, "_studio_dead_worker_reaper_installed", True)
+
+
 def setup_signal_handlers(daemon: Optional[StudioDaemon] = None) -> None:
     """Registers graceful termination signals."""
     def _sig_handler(signum, frame):
@@ -198,6 +265,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     }
     if args.reload:
         uvicorn_kwargs["reload_dirs"] = [str(config.PROJECT_ROOT / "engine")]
+        install_uvicorn_dead_worker_reaper()
 
     try:
         uvicorn.run(

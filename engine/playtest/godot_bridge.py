@@ -807,13 +807,21 @@ class GodotPlaytestBridge:
         proc = self._godot_proc
         if proc is None or proc.stderr is None:
             return
+        total_bytes = 0
         try:
             for line in proc.stderr:
+                total_bytes += len(line)
                 clean = line.rstrip("\r\n")
                 if clean:
                     self._stderr_lines.append(clean)
                     if len(self._stderr_lines) > 200:
                         self._stderr_lines = self._stderr_lines[-200:]
+                if total_bytes >= 2 * 1024 * 1024:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    break
         except Exception:
             pass
 

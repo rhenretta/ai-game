@@ -285,6 +285,10 @@ def ensure_godot_background_render_binary(cache_dir: Optional[Path] = None) -> P
     return bg_bin if bg_bin.is_file() else fg_bin
 
 
+MAX_GODOT_CAPTURED_STREAM_BYTES = 256 * 1024
+RUNAWAY_GODOT_STDERR_ABORT_BYTES = 2 * 1024 * 1024
+
+
 def run_godot_command(
     args: List[str],
     cwd: Optional[Path] = None,
@@ -292,7 +296,12 @@ def run_godot_command(
     headless: bool = True,
     godot_bin: Optional[Path] = None,
 ) -> subprocess.CompletedProcess:
-    """Executes a Godot CLI command with automatic binary location."""
+    """Executes a Godot CLI command with automatic binary location, bounded stream capture,
+    and runaway stderr circuit-breaking so infinite recursion storms cannot OOM the host worker."""
+    from collections import deque
+    import signal as _signal
+    import threading as _threading
+
     binary = godot_bin or ensure_godot_binary()
     cmd = [str(binary)]
     if platform.system() == "Darwin" and "-ApplePersistenceIgnoreState" not in args:
@@ -301,10 +310,119 @@ def run_godot_command(
         cmd.append("--headless")
     cmd.extend(args)
 
-    return subprocess.run(
+    proc = subprocess.Popen(
         cmd,
         cwd=str(cwd) if cwd else None,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout,
+        errors="replace",
+        bufsize=1,
+        start_new_session=True,
+    )
+
+    def _kill_proc_group() -> None:
+        try:
+            if proc.poll() is None:
+                os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    timed_out_flag = [False]
+    runaway_stderr_flag = [False]
+    stdout_head: List[str] = []
+    stdout_bytes = [0]
+    stderr_head: List[str] = []
+    stderr_tail: deque[str] = deque(maxlen=120)
+    stderr_head_bytes = [0]
+    stderr_total_bytes = [0]
+    head_budget = (MAX_GODOT_CAPTURED_STREAM_BYTES * 3) // 4
+
+    def _on_timeout() -> None:
+        if proc.poll() is None:
+            timed_out_flag[0] = True
+            _kill_proc_group()
+
+    timer = _threading.Timer(timeout, _on_timeout)
+    timer.daemon = True
+    timer.start()
+
+    def _drain_stdout() -> None:
+        if proc.stdout is None:
+            return
+        try:
+            for line in proc.stdout:
+                if stdout_bytes[0] < MAX_GODOT_CAPTURED_STREAM_BYTES:
+                    stdout_head.append(line)
+                    stdout_bytes[0] += len(line)
+        except Exception:
+            pass
+
+    def _drain_stderr() -> None:
+        if proc.stderr is None:
+            return
+        try:
+            for line in proc.stderr:
+                line_len = len(line)
+                stderr_total_bytes[0] += line_len
+                if stderr_head_bytes[0] < head_budget:
+                    stderr_head.append(line)
+                    stderr_head_bytes[0] += line_len
+                else:
+                    stderr_tail.append(line)
+                if (
+                    not runaway_stderr_flag[0]
+                    and stderr_total_bytes[0] >= RUNAWAY_GODOT_STDERR_ABORT_BYTES
+                ):
+                    runaway_stderr_flag[0] = True
+                    logger.warning(
+                        "Godot CLI command emitted >= %.1f MB of runaway stderr; terminating process group immediately.",
+                        RUNAWAY_GODOT_STDERR_ABORT_BYTES / (1024.0 * 1024.0),
+                    )
+                    _kill_proc_group()
+        except Exception:
+            pass
+
+    out_thread = _threading.Thread(target=_drain_stdout, daemon=True)
+    err_thread = _threading.Thread(target=_drain_stderr, daemon=True)
+    out_thread.start()
+    err_thread.start()
+
+    try:
+        returncode = proc.wait()
+    finally:
+        timer.cancel()
+
+    out_thread.join(timeout=1.0)
+    err_thread.join(timeout=1.0)
+
+    stdout_str = "".join(stdout_head)
+    if stderr_tail:
+        stderr_str = (
+            "".join(stderr_head)
+            + f"\n...[stderr truncated after {stderr_total_bytes[0]} total bytes]...\n"
+            + "".join(stderr_tail)
+        )
+    else:
+        stderr_str = "".join(stderr_head)
+
+    if timed_out_flag[0]:
+        raise subprocess.TimeoutExpired(
+            cmd=cmd,
+            timeout=timeout,
+            output=stdout_str,
+            stderr=stderr_str,
+        )
+
+    if runaway_stderr_flag[0] and returncode == 0:
+        returncode = -9
+
+    return subprocess.CompletedProcess(
+        args=cmd,
+        returncode=returncode,
+        stdout=stdout_str,
+        stderr=stderr_str,
     )

@@ -327,4 +327,78 @@ func get_state_snapshot() -> Dictionary:
         last_mp = snap.get("last_mouse_pos", [0.0, 0.0])
         assert abs(float(last_mp[0]) - 760.0) < 1.0 and abs(float(last_mp[1]) - 440.0) < 1.0
 
+    def test_runaway_exponential_recursion_stderr_flood_aborts_fast_with_bounded_memory(
+        self, tmp_path: Path
+    ):
+        """Verifies exponential GDScript mutual-setter stack overflow storms are killed in <5s
+        with bounded stderr memory (<= 300 KB) and deduplicated file/line diagnostics."""
+        import time
+        from engine.sim.godot_verifier import MAX_SIM_CAPTURED_STREAM_BYTES
+
+        cart_dir = tmp_path / "runaway_recursion_cartridge"
+        payload = TrackCodeSynthesisPayload(
+            deliberation="Hermetic Godot 4 cartridge with two-property mutual setter recursion causing exponential stack-overflow storm.",
+            manifest_data={"title": "Recursion Guard Cartridge", "genre": "Simulation", "version": "1.0.0"},
+            files=[
+                ModuleFileSpec(
+                    deliberation="Child module with two setters invoking _recalculate() which re-assigns both properties.",
+                    filename="sub_counter.gd",
+                    content="""extends Node
+
+var alpha: int = 0:
+\tset(v):
+\t\talpha = v
+\t\t_recalculate()
+
+var beta: int = 0:
+\tset(v):
+\t\tbeta = v
+\t\t_recalculate()
+
+func _recalculate() -> void:
+\talpha = max(alpha, 0)
+\tbeta = max(beta, 0)
+
+func _process(_delta: float) -> void:
+\t_recalculate()
+""",
+                ),
+                ModuleFileSpec(
+                    deliberation="Root scene mounting sub_counter.",
+                    filename="main.gd",
+                    content="""extends Node2D
+const SubCounter = preload("res://sub_counter.gd")
+
+func _ready() -> void:
+\tadd_child(SubCounter.new())
+""",
+                ),
+            ],
+        )
+        payload.assemble_cartridge_directory(cart_dir)
+
+        sim = GodotHeadlessSimulator(
+            cartridge_path=cart_dir,
+            telemetry_mode="null",
+            max_ticks=10,
+            timeout_seconds=45.0,
+        )
+        t0 = time.monotonic()
+        res = sim.run()
+        elapsed = time.monotonic() - t0
+
+        assert res.success is False
+        assert sim.outcome == "CRASHED"
+        assert elapsed < 8.0, f"Expected runaway recursion circuit-breaker to abort well before 45s timeout, took {elapsed:.2f}s"
+        assert len(sim.stderr) <= MAX_SIM_CAPTURED_STREAM_BYTES + 65536
+        assert "runaway stderr flood" in (res.error_message or "") or "Stack overflow" in (res.error_message or "")
+
+        diags = list(getattr(sim, "runtime_diagnostics", None) or [])
+        assert len(diags) >= 1
+        matching = [d for d in diags if d.file_path.name == "sub_counter.gd" and "Stack overflow" in d.error_message]
+        assert len(matching) >= 1
+        # Deduplication ensures repeated identical stack-overflow lines do not produce thousands of diagnostic tuples
+        assert len(diags) <= 5
+
+
 

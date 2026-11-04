@@ -64,8 +64,11 @@ GDSCRIPT_ERROR_PATTERNS = [
 
 MULTILINE_ERROR_PATTERNS = [
     re.compile(r'SCRIPT ERROR:\s*(?:Parse Error:\s*)?([^\n]+)\n\s*at:\s*[^\n]*?\((res://[^:]+):(\d+)\)'),
-    re.compile(r'ERROR:\s*([^\n]+)\n\s*at:\s*[^\n]*?\((res://[^:]+):(\d+)\)'),
+    re.compile(r'(?:^|\n)\s*ERROR:\s*([^\n]+)\n\s*at:\s*[^\n]*?\((res://[^:]+):(\d+)\)'),
 ]
+
+MAX_SIM_CAPTURED_STREAM_BYTES = 256 * 1024
+RUNAWAY_SIM_STDERR_ABORT_BYTES = 2 * 1024 * 1024
 
 INLINE_GDSCRIPT_ERROR_RE = re.compile(
     r'SCRIPT ERROR:\s*(?:Parse Error:\s*)?([^\n]+)\n\s*at:\s*GDScript::reload\s*\(gdscript://[^:]+:(\d+)\)'
@@ -190,9 +193,12 @@ def find_broken_script_references(
 
 
 def parse_godot_stderr(cartridge_dir: Union[Path, str], stderr_text: str) -> List[GDScriptDiagnostic]:
-    """Parses Godot 4 stderr stream and extracts structured GDScript diagnostics."""
+    """Parses Godot 4 stderr stream and extracts structured, deduplicated GDScript diagnostics."""
     diagnostics: List[GDScriptDiagnostic] = []
     c_dir = Path(cartridge_dir).resolve()
+    if len(stderr_text) > MAX_SIM_CAPTURED_STREAM_BYTES * 2:
+        half = MAX_SIM_CAPTURED_STREAM_BYTES
+        stderr_text = stderr_text[:half] + "\n" + stderr_text[-half:]
     stderr_text = ANSI_ESCAPE_RE.sub("", stderr_text)
 
     matched_spans: List[Tuple[int, int]] = []
@@ -313,7 +319,15 @@ def parse_godot_stderr(cartridge_dir: Union[Path, str], stderr_text: str) -> Lis
                                 )
                             )
 
-    return _filter_cascading_preload_diagnostics(diagnostics)
+    deduped: List[GDScriptDiagnostic] = []
+    seen_keys: set[Tuple[Path, int, str]] = set()
+    for d in diagnostics:
+        key = (d.file_path, d.line_number, d.error_message)
+        if key not in seen_keys:
+            seen_keys.add(key)
+            deduped.append(d)
+
+    return _filter_cascading_preload_diagnostics(deduped)
 
 
 def _filter_cascading_preload_diagnostics(
@@ -771,19 +785,28 @@ class GodotHeadlessSimulator:
             if self.timeout_seconds is not None and self.timeout_seconds > 0
             else max(45.0, min(180.0, 30.0 + float(limit) * 0.15))
         )
+        from collections import deque
+
         proc = subprocess.Popen(
             cmd,
             cwd=str(self.cartridge_path),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            errors="replace",
             bufsize=1,
             start_new_session=True,
         )
 
         stdout_lines: List[str] = []
-        stderr_lines: List[str] = []
+        stdout_captured_bytes = 0
+        stderr_head_lines: List[str] = []
+        stderr_tail_lines: deque[str] = deque(maxlen=150)
+        stderr_head_bytes = [0]
+        stderr_total_bytes = [0]
+        stderr_head_budget = (MAX_SIM_CAPTURED_STREAM_BYTES * 3) // 4
         timed_out_flag: List[bool] = [False]
+        runaway_stderr_flag: List[bool] = [False]
 
         def _kill_proc_tree() -> None:
             try:
@@ -812,8 +835,28 @@ class GodotHeadlessSimulator:
 
         def _read_stderr():
             if proc.stderr:
-                for line in proc.stderr:
-                    stderr_lines.append(line)
+                try:
+                    for line in proc.stderr:
+                        line_len = len(line)
+                        stderr_total_bytes[0] += line_len
+                        if stderr_head_bytes[0] < stderr_head_budget:
+                            stderr_head_lines.append(line)
+                            stderr_head_bytes[0] += line_len
+                        else:
+                            stderr_tail_lines.append(line)
+                        if (
+                            not runaway_stderr_flag[0]
+                            and stderr_total_bytes[0] >= RUNAWAY_SIM_STDERR_ABORT_BYTES
+                        ):
+                            runaway_stderr_flag[0] = True
+                            logger.warning(
+                                "Godot simulation emitted >= %.1f MB of runaway stderr (scene=%s); terminating process immediately.",
+                                RUNAWAY_SIM_STDERR_ABORT_BYTES / (1024.0 * 1024.0),
+                                self.target_scene or "res://main.tscn",
+                            )
+                            _kill_proc_tree()
+                except Exception:
+                    pass
 
         err_thread = threading.Thread(target=_read_stderr, daemon=True)
         err_thread.start()
@@ -821,7 +864,9 @@ class GodotHeadlessSimulator:
         try:
             if proc.stdout:
                 for line in proc.stdout:
-                    stdout_lines.append(line)
+                    if stdout_captured_bytes < MAX_SIM_CAPTURED_STREAM_BYTES:
+                        stdout_lines.append(line)
+                        stdout_captured_bytes += len(line)
                     stripped = line.strip()
 
                     # Telemetry intercept
@@ -923,20 +968,38 @@ class GodotHeadlessSimulator:
             returncode = proc.wait()
 
         err_thread.join(timeout=1.0)
-        stderr_full = "".join(stderr_lines)
+        if stderr_tail_lines:
+            stderr_full = (
+                "".join(stderr_head_lines)
+                + f"\n...[stderr truncated after {stderr_total_bytes[0]} total bytes]...\n"
+                + "".join(stderr_tail_lines)
+            )
+        else:
+            stderr_full = "".join(stderr_head_lines)
         self.stderr = stderr_full
         self.runtime_diagnostics = parse_godot_stderr(self.cartridge_path, stderr_full)
 
         self.step_count = self.ticks_executed or limit
         self.elapsed_time = self.step_count * (1.0 / 60.0)
         self.is_completed = True
-        self.outcome = "COMPLETED" if (returncode == 0 and not timed_out_flag[0]) else "CRASHED"
+        self.outcome = (
+            "COMPLETED"
+            if (returncode == 0 and not timed_out_flag[0] and not runaway_stderr_flag[0])
+            else "CRASHED"
+        )
         self.viewport_captured = bool(
             use_viewport
             and (self.cartridge_path / "assets" / "playtest_captures" / "playtest_t0.png").is_file()
         )
         self.close()
 
+        if runaway_stderr_flag[0]:
+            if av_work_dir is not None:
+                shutil.rmtree(av_work_dir, ignore_errors=True)
+            raise RuntimeError(
+                f"Godot simulation aborted after runaway stderr flood ({stderr_total_bytes[0]} bytes; "
+                f"check for infinite recursion or per-frame error storm) on '{self.target_scene or 'res://main.tscn'}': {stderr_full}"
+            )
         if timed_out_flag[0]:
             if av_work_dir is not None:
                 shutil.rmtree(av_work_dir, ignore_errors=True)
