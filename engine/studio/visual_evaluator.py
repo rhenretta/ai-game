@@ -245,6 +245,109 @@ def render_inspection_plate(
     return out_p.resolve()
 
 
+def render_in_situ_magnified_crop_plate(
+    screenshot_path: Path,
+    output_path: Path,
+    *,
+    focus_points: Optional[Sequence[Tuple[str, float, float]]] = None,
+    crop_size: int = 180,
+    magnification: int = 3,
+    lint_warnings: Optional[Sequence[str]] = None,
+) -> Path:
+    """Extracts key gameplay and HUD crops from a 1280x720 in-game screenshot and renders them at
+    crisp 3x nearest-neighbor magnification so blurry upscaled sprites, seam bleed, stacked sprites,
+    and clipped/overlapping UI text are unmistakable to TaskLead and Council reviewers."""
+    src_p = Path(screenshot_path)
+    if not src_p.is_file():
+        raise StudioAgentError(f"Cannot render 3x in-situ crop plate: screenshot missing at {src_p}")
+    with Image.open(src_p) as raw_im:
+        im = raw_im.convert("RGB")
+    w, h = im.size
+    cs = max(48, min(int(crop_size), min(w, h)))
+    mag = max(2, int(magnification))
+    half = cs // 2
+
+    def _clamp_box(cx: float, cy: float) -> Tuple[int, int, int, int]:
+        x0 = max(0, min(w - cs, int(round(cx)) - half))
+        y0 = max(0, min(h - cs, int(round(cy)) - half))
+        return x0, y0, x0 + cs, y0 + cs
+
+    selected_boxes: List[Tuple[str, Tuple[int, int, int, int]]] = []
+    if focus_points:
+        for lbl, fx, fy in list(focus_points)[:4]:
+            selected_boxes.append((lbl, _clamp_box(fx, fy)))
+    else:
+        # 1. Center gameplay focus
+        center_box = _clamp_box(w * 0.5, h * 0.5)
+        selected_boxes.append(("Gameplay Center (3x)", center_box))
+        # 2. Highest visual-detail world patch outside center & HUD strips
+        best_score = -1.0
+        best_box = _clamp_box(w * 0.35, h * 0.45)
+        step = max(32, cs // 2)
+        for gy in range(64, max(65, h - cs - 64), step):
+            for gx in range(32, max(33, w - cs - 32), step):
+                if abs(gx + half - w * 0.5) < cs * 0.65 and abs(gy + half - h * 0.5) < cs * 0.65:
+                    continue
+                patch = im.crop((gx, gy, gx + cs, gy + cs)).resize((24, 24), Image.Resampling.BILINEAR)
+                pxs = list(getattr(patch, "get_flattened_data", patch.getdata)())
+                if not pxs:
+                    continue
+                mr = sum(p[0] for p in pxs) / len(pxs)
+                mg = sum(p[1] for p in pxs) / len(pxs)
+                mb = sum(p[2] for p in pxs) / len(pxs)
+                var_s = sum((p[0] - mr) ** 2 + (p[1] - mg) ** 2 + (p[2] - mb) ** 2 for p in pxs) / len(pxs)
+                if var_s > best_score:
+                    best_score = var_s
+                    best_box = (gx, gy, gx + cs, gy + cs)
+        selected_boxes.append(("Active World Entities (3x)", best_box))
+        # 3. Top-left HUD / Objective bar
+        selected_boxes.append(("Top HUD / Status (3x)", _clamp_box(half + 16, half + 8)))
+        # 4. Bottom-center Hotbar / Controls
+        selected_boxes.append(("Bottom HUD / Controls (3x)", _clamp_box(w * 0.5, h - half - 8)))
+
+    mag_px = cs * mag
+    cols = 2
+    rows = (len(selected_boxes) + cols - 1) // cols
+    pad = 16
+    card_hdr = 28
+    warn_lines = [str(x)[:135] for x in (lint_warnings or [])[:4]]
+    top_hdr = 38 + (16 * len(warn_lines))
+    card_w = mag_px + 16
+    card_h = mag_px + card_hdr + 12
+    sheet_w = cols * card_w + (cols + 1) * pad
+    sheet_h = top_hdr + rows * card_h + (rows + 1) * pad
+
+    plate = Image.new("RGB", (sheet_w, sheet_h), (18, 21, 28))
+    draw = ImageDraw.Draw(plate)
+    font = ImageFont.load_default()
+    draw.text(
+        (pad, 10),
+        f"IN-SITU {mag}x PIXEL CLARITY & HUD AUDIT PLATE (source={w}x{h}, crop={cs}x{cs} -> {mag_px}x{mag_px} NEAREST)",
+        fill=(235, 242, 255),
+        font=font,
+    )
+    for w_idx, w_txt in enumerate(warn_lines):
+        draw.text((pad, 28 + w_idx * 16), f"! {w_txt}", fill=(255, 165, 120), font=font)
+
+    for idx, (lbl, box) in enumerate(selected_boxes):
+        col = idx % cols
+        row = idx // cols
+        cx = pad + col * (card_w + pad)
+        cy = top_hdr + pad + row * (card_h + pad)
+        draw.rectangle([cx, cy, cx + card_w - 1, cy + card_h - 1], fill=(28, 32, 42), outline=(86, 98, 122))
+        b_txt = f"{lbl}  [{box[0]}..{box[2]}, {box[1]}..{box[3]}]"
+        draw.text((cx + 8, cy + 7), b_txt[:68], fill=(170, 218, 255), font=font)
+        cropped = im.crop(box).resize((mag_px, mag_px), Image.Resampling.NEAREST)
+        vx, vy = cx + 8, cy + card_hdr
+        plate.paste(cropped, (vx, vy))
+        draw.rectangle([vx, vy, vx + mag_px - 1, vy + mag_px - 1], outline=(120, 140, 175), width=1)
+
+    out_p = Path(output_path)
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+    plate.save(out_p, format="PNG")
+    return out_p.resolve()
+
+
 def enrich_catalog_visual_entries(
     cartridge_dir: Path,
     inspected_paths: Sequence[Path],

@@ -975,6 +975,7 @@ MemoryMutationOperation = Literal[
 
 CANONICAL_MEMORY_BANKS: Tuple[str, ...] = (
     "council",
+    "CoProducer",
     "CreativeDirector",
     "GameplayDesigner",
     "LevelAndProgressionDesigner",
@@ -1186,6 +1187,41 @@ class AssetRequirement(BaseEpistemicModel):
         default_factory=list,
         description="When grid_cols * grid_rows > 1 and the task requires distinct visual states, icons, stages, or variants in each grid cell (rather than a cyclical character deformation), provide the specific visual prompt for each cell in row-major order (top-left to bottom-right, length == grid_cols * grid_rows).",
     )
+    cell_target_sizes: List[Tuple[int, int]] = Field(
+        default_factory=list,
+        description=(
+            "Optional per-cell foreground bounding-box footprints `(max_width_px, max_height_px)` inside each uniform "
+            "`(cell_width, cell_height)` grid cell (row-major order, `length == grid_cols * grid_rows`, or empty `[]` "
+            "when every cell should fill ~88% of its grid cell normally). Populate this whenever a multi-cell grid/sheet "
+            "(or padded sprite) requires distinct subject pixel sizes or size tiers centered inside uniform grid cells."
+        ),
+    )
+    chroma_key_hex: Literal["#FF00FF", "#00FF00", "#0000FF", "#FFFF00"] = Field(
+        default="#FF00FF",
+        description=(
+            "Solid studio chroma-key backdrop color used during sprite cutout synthesis ('#FF00FF' magenta, "
+            "'#00FF00' green, '#0000FF' blue, or '#FFFF00' yellow). Choose a chroma key with maximum RGB separation "
+            "from ALL foreground colors, glows, and accents in the asset: do NOT pick '#FF00FF' when the asset "
+            "contains magenta/pink/purple/crimson; do NOT pick '#00FF00' when it contains green/lime; do NOT pick "
+            "'#0000FF' when it contains saturated blue/indigo; do NOT pick '#FFFF00' when it contains yellow/amber/gold."
+        ),
+    )
+    camera_projection: str = Field(
+        default="",
+        description=(
+            "Locked spatial camera projection inherited from GameBibleSpec.camera_and_spatial_paradigm "
+            "(e.g. 'strict_top_down_90deg', 'side_orthographic', 'three_quarter_top_down', 'isometric_2_to_1')—"
+            "every asset in the cartridge MUST share one consistent projection and never mix incompatible perspectives."
+        ),
+    )
+    world_footprint_px: Optional[Tuple[int, int]] = Field(
+        default=None,
+        description=(
+            "Intended rendered footprint `(width_px, height_px)` in world coordinates so the native texture/cell "
+            "resolution is synthesized at `>= 128x128` (and `>= 1.5x` `world_footprint_px`), downsampled cleanly in Godot "
+            "(`scale <= 1.0`) without upscaling blur or overflowing adjacent grid/socket spacing."
+        ),
+    )
     animation_states: List[AnimationStateSpec] = Field(
         default_factory=list,
         description="Optional multi-pose animation states when fabricating an animated sprite sheet."
@@ -1287,6 +1323,13 @@ class AssetRequirement(BaseEpistemicModel):
                     out["dimensions"] = (64, 64)
                 else:
                     out["dimensions"] = (64, 64)
+
+            if out.get("cell_target_sizes") is None:
+                out["cell_target_sizes"] = []
+            raw_ck = str(out.get("chroma_key_hex") or "#FF00FF").strip().upper()
+            if not raw_ck.startswith("#") and len(raw_ck) == 6:
+                raw_ck = f"#{raw_ck}"
+            out["chroma_key_hex"] = raw_ck if raw_ck in ("#FF00FF", "#00FF00", "#0000FF", "#FFFF00") else "#FF00FF"
 
             desc = out.get("description")
             vprompt = out.get("visual_prompt_or_text")
@@ -2605,7 +2648,7 @@ class WritersRoomUtterance(BaseEpistemicModel):
     turn_index: int = Field(...)
     speaker_role: str = Field(
         ...,
-        description="'CreativeDirector' | 'GameplayDesigner' | 'LevelAndProgressionDesigner' | 'GameplaySystemsEngineer' | 'StoryWorldArchitect' | 'ScriptwriterAgent' | 'CharacterDesigner' | 'VisualArtDirector' | 'UXExperienceDesigner' | 'AudioAtmosphereDesigner' | 'UserSteering'"
+        description="'CoProducer' | 'GameplayDesigner' | 'LevelAndProgressionDesigner' | 'GameplaySystemsEngineer' | 'StoryWorldArchitect' | 'ScriptwriterAgent' | 'CharacterDesigner' | 'VisualArtDirector' | 'UXExperienceDesigner' | 'AudioAtmosphereDesigner' | 'CreativeDirector' | 'UserSteering'"
     )
     speaker_display_name: str = Field(..., description="Human-readable specialist title.")
     spoken_dialogue: str = Field(
@@ -2641,33 +2684,123 @@ class GameSliceSpec(BaseEpistemicModel):
     """
     deliberation: str = Field(
         ...,
-        description="MANDATORY FIRST PROPERTY: Strategic rationale for how this slice delivers the larger point of the game—realizing the full CoreLoopSpec (moment-to-moment, minute-to-minute, and session loops), player agency/optimization depth, and multi-horizon GoalHierarchy rather than shrinking the game into a trivial tutorial stub.",
+        description="MANDATORY FIRST PROPERTY: Strategic rationale for how this slice finds and proves genuine fun—delivering a cohesive, skill/strategy-driven playable loop with 100% honest mechanics, real pushback/scarcity, and zero decorative/self-playing stubs.",
     )
-    slice_id: str = Field(..., description="Unique snake_case identifier for this slice (e.g. 'slice_0_full_core_loop').")
+    slice_id: str = Field(..., description="Unique snake_case identifier for this slice (e.g. 'slice_0_find_the_fun').")
     slice_index: int = Field(
         default=0,
-        description="0-based iteration order (0 = complete playable game experience realizing the Game Bible's camera, world progression, full 3-timescale core loop, player agency/toolkit, multi-horizon goals, UX onboarding, and audio; 1+ = optional post-launch expansions).",
+        description="0-based iteration order (0 = foundational 'Find the Fun' playable vertical slice delivering 2-3 deeply interactive, 100%-real verbs/entities with real scarcity, meaningful decisions, clear goal framing, cohesive art/audio, and zero dead/fake props; 1+ = focused progression slices layering deeper mechanics, tiers, and content onto a proven core loop).",
     )
     title: str = Field(..., description="Concise title for this playable slice.")
     slice_objective: str = Field(
         ...,
-        description="What this slice achieves as a complete, genuinely playable game experience fulfilling the larger point of the concept (NEVER a 1-step tutorial, a 1-connection lock-and-key room, or a pre-built diorama).",
+        description="What this slice achieves as a tight, cohesive, replayable game experience where player skill/strategy decides the outcome, careless or idle play fails, and every visible tool/entity/HUD element is 100% functional (NEVER a self-completing loop or a bloated grab-bag of half-wired stubs).",
     )
     player_acclimation_and_mechanics_focus: str = Field(
         default="",
-        description="How the opening 60 seconds acclimate the player and immediately open into the full moment-to-moment, minute-to-minute, and session gameplay loop where the player builds, experiments, strategizes, and pursues escalating goals.",
+        description="How the opening 60 seconds make the player's goal, controls, and causal rules clear on screen while immediately demanding real player judgment, positioning, timing, or resource trade-offs.",
     )
     expansion_from_prior_slice: str = Field(
         default="",
-        description="How this slice realizations or expands the playable world, systemic toolkit, and goal progression.",
+        description="How this slice realizes the core loop (Slice 0) or expands mechanics, challenge, and progression depth onto the verified prior slice (Slice 1+).",
     )
     scope_boundaries: List[str] = Field(
         default_factory=list,
-        description="Concrete playable systems, player toolkit/capabilities, world regions/progression tiers, and escalating goals that MUST be built and playable now so the larger point of the game (`core_loop` across all 3 time scales and `goal_hierarchy`) is genuinely realized in play (NEVER defer the core loop, player construction/strategy depth, or mid/long-term progression to unbuilt future slices!).",
+        description="Bounded, cohesive set of playable systems, verbs, world rules, and goals included in THIS slice (explicitly deferring secondary tiers/tools to Slice 1+ rather than shipping disconnected or cosmetic-only placeholders).",
     )
     status: Literal["planned", "active", "completed"] = Field(
         default="planned",
         description="Decision/lifecycle status (strictly last per Rule 4): 'planned' | 'active' | 'completed'.",
+    )
+
+
+class GenrePillarSpec(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    A foundational, evolvable genre-craft pillar synthesized by ContextCuratorAgent and evolved by the Council,
+    explaining why a core facet of the target genre is intrinsically fun and how simulation mechanics must honor it.
+    """
+    deliberation: str = Field(
+        ...,
+        description=(
+            "MANDATORY FIRST PROPERTY: First-principles reasoning examining what intrinsic human cognitive, spatial, "
+            "kinetic, or strategic satisfaction this pillar delivers and what breaks it."
+        ),
+    )
+    pillar_id: str = Field(
+        ...,
+        description="Stable snake_case identifier for this pillar so the Council can evolve it across slices.",
+    )
+    title: str = Field(
+        ...,
+        description="Crisp, evocative pillar title.",
+    )
+    why_it_creates_fun: str = Field(
+        ...,
+        description="Why human players find this pillar genuinely rewarding, engaging, and replayable.",
+    )
+    systemic_mechanics_expression: str = Field(
+        ...,
+        description=(
+            "How world rules, active player verbs, scarcity/constraints, spatial precision, and causal feedback "
+            "must interlock in real simulation rather than cosmetic surface dressing."
+        ),
+    )
+    anti_pattern_to_avoid: str = Field(
+        ...,
+        description=(
+            "Concrete implementation or design failure mode that accidentally automates away, fakes, obscures, "
+            "or trivializes this pillar."
+        ),
+    )
+
+
+class GenreCraftFoundation(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Living genre-craft and player-fun foundation generated by ContextCuratorAgent to ground the Co-Producer,
+    seed the start of the Living Game Bible, and evolve alongside Council deliberations and slices.
+    """
+    deliberation: str = Field(
+        ...,
+        description=(
+            "MANDATORY FIRST PROPERTY: First-principles deconstruction of the target genre/subgenre's psychology of fun, "
+            "tactile agency, progression arc, spatial legibility, and classic design blind spots."
+        ),
+    )
+    genre_and_subgenre_archetype: str = Field(
+        ...,
+        description="Clear characterization of the genre, subgenre, or hybrid design archetype.",
+    )
+    core_fun_thesis: str = Field(
+        ...,
+        description=(
+            "First-principles thesis explaining what makes this genre genuinely fun for a human player: "
+            "the signature cycle of curiosity, friction/scarcity, active decision-making, mastery/optimization, and payoff."
+        ),
+    )
+    bootstrap_to_mastery_arc: str = Field(
+        ...,
+        description=(
+            "How `t=0` begins unsolved with scarce, tactile manual player agency and active pushback, and how mid/late "
+            "capabilities are earned by the player without ever turning the game into a self-completing spectator loop."
+        ),
+    )
+    essential_spatial_and_ux_contracts: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Non-negotiable input-to-world precision, visual silhouette differentiation, causal readability, and HUD/onboarding "
+            "clarity contracts required for this genre to feel intuitive and responsive."
+        ),
+    )
+    genre_killing_anti_patterns: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Classic design and engineering blind spots that ruin games in this genre (such as free starting handouts, "
+            "imprecise input mapping, zero strategic trade-offs, illegible visual noise, or self-playing loops)."
+        ),
+    )
+    foundational_pillars: List[GenrePillarSpec] = Field(
+        default_factory=list,
+        description="3 to 5 concrete, evolvable genre-craft pillars that seed and evolve inside the Living Game Bible.",
     )
 
 
@@ -2705,6 +2838,13 @@ class WritersRoomTurnProposal(BaseEpistemicModel):
     added_or_updated_dialogue_trees: List[DialogueTreeSpec] = Field(default_factory=list)
     added_or_updated_barks: List[DialogueBarkSpec] = Field(default_factory=list)
     mockup_to_generate: Optional[VisualMockupArtifact] = Field(default=None)
+    updated_genre_craft_foundation: Optional[GenreCraftFoundation] = Field(
+        default=None,
+        description=(
+            "Optional evolved GenreCraftFoundation refining the game's genre-craft pillars, core fun thesis, "
+            "bootstrap-to-mastery arc, UX precision contracts, or anti-patterns as the concept and slices mature."
+        ),
+    )
     gameplay_pillars_additions: List[str] = Field(default_factory=list)
     added_or_updated_engineering_specs: List[MechanicEngineeringSpec] = Field(default_factory=list)
     visual_style_guide_update: Optional[str] = Field(default=None)
@@ -2716,9 +2856,21 @@ class WritersRoomTurnProposal(BaseEpistemicModel):
     updated_engagement_plan: Optional[EngagementPlan] = Field(default=None)
     updated_onboarding_plan: Optional[OnboardingPlan] = Field(default=None)
     updated_goal_hierarchy: Optional[GoalHierarchy] = Field(default=None)
+    updated_canonical_telemetry_keys: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Concise canonical snake_case telemetry keys exposed by `get_state_snapshot()` across the active slice "
+            "(e.g. primary resource counters, active entity/placement counts, and current objective progress) so "
+            "`swe_engineer` and `qa_test_engineer` share one authoritative state vocabulary instead of inventing duplicate aliases."
+        ),
+    )
     added_or_updated_slices: List[GameSliceSpec] = Field(
         default_factory=list,
-        description="Playable game slices strategized for this game. Slice 0 MUST deliver the complete playable game loop (realizing the full 3-timescale CoreLoopSpec, player toolkit/agency, escalating GoalHierarchy, multi-region LevelGenerationStrategy, UX onboarding, and audio)—never defer the core point of the game to unbuilt future slices!",
+        description=(
+            "Playable game slices strategized for this game. Slice 0 MUST 'Find the Fun' first with one tight, cohesive, "
+            "replayable core loop (2-3 deeply interactive, 100%-real verbs/entities, real pushback/scarcity, clear goal framing, "
+            "and zero decorative/self-playing placeholders), while Slice 1+ layers deeper tiers, mechanics, and progression onto a proven foundation."
+        ),
     )
     backlog_additions: List[WorkItemProposal] = Field(default_factory=list, description="High-level requirements for the active slice (tasks can dynamically spawn their own asset/animation/sub-mechanic tasks as needed).")
     backlog_refinements: List[WorkItemRefinement] = Field(
@@ -2766,10 +2918,22 @@ class WritersRoomTurnProposal(BaseEpistemicModel):
         "route_to_council_role",
     )
     _ROLE_TURN_FIELDS: ClassVar[Dict[str, Tuple[str, ...]]] = {
+        "CoProducer": (
+            "updated_first_60_seconds_hook",
+            "updated_diegetic_ui_philosophy",
+            "updated_camera_and_spatial_paradigm",
+            "updated_genre_craft_foundation",
+            "gameplay_pillars_additions",
+            "visual_style_guide_update",
+            "audio_direction_update",
+            "added_or_updated_storyboard_beats",
+            "mockup_to_generate",
+        ),
         "CreativeDirector": (
             "updated_first_60_seconds_hook",
             "updated_diegetic_ui_philosophy",
             "updated_camera_and_spatial_paradigm",
+            "updated_genre_craft_foundation",
             "gameplay_pillars_additions",
             "visual_style_guide_update",
             "audio_direction_update",
@@ -2793,16 +2957,19 @@ class WritersRoomTurnProposal(BaseEpistemicModel):
             "added_or_updated_barks",
         ),
         "GameplayDesigner": (
+            "updated_genre_craft_foundation",
             "gameplay_pillars_additions",
             "updated_core_loop",
             "updated_engagement_plan",
             "updated_first_60_seconds_hook",
         ),
         "LevelAndProgressionDesigner": (
+            "updated_genre_craft_foundation",
             "updated_level_generation_strategy",
             "updated_goal_hierarchy",
         ),
         "GameplaySystemsEngineer": (
+            "updated_genre_craft_foundation",
             "added_or_updated_engineering_specs",
             "updated_camera_and_spatial_paradigm",
             "gameplay_pillars_additions",
@@ -2815,6 +2982,7 @@ class WritersRoomTurnProposal(BaseEpistemicModel):
             "mockup_to_generate",
         ),
         "UXExperienceDesigner": (
+            "updated_genre_craft_foundation",
             "updated_first_60_seconds_hook",
             "updated_diegetic_ui_philosophy",
             "updated_onboarding_plan",
@@ -2833,11 +3001,11 @@ class WritersRoomTurnProposal(BaseEpistemicModel):
         well within Gemini's structured-output schema state limits."""
         from pydantic import create_model
 
-        key = (role or "CreativeDirector").strip() or "CreativeDirector"
+        key = (role or "CoProducer").strip() or "CoProducer"
         cached = cls._ROLE_SCHEMA_CACHE.get(key)
         if cached is not None:
             return cached
-        role_specific = cls._ROLE_TURN_FIELDS.get(key, cls._ROLE_TURN_FIELDS["CreativeDirector"])
+        role_specific = cls._ROLE_TURN_FIELDS.get(key, cls._ROLE_TURN_FIELDS["CoProducer"])
         keep_fields = list(dict.fromkeys(cls._SHARED_TURN_FIELDS + role_specific))
         field_defs: Dict[str, Any] = {}
         for fname in keep_fields:
@@ -2852,7 +3020,7 @@ class WritersRoomTurnProposal(BaseEpistemicModel):
 
 class DirectorConvergenceCheck(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
-    Evaluated by the CreativeDirector to decide whether the Writers' Room should keep brainstorming
+    Evaluated by the CoProducer (Council Chair) to decide whether the Writers' Room should keep brainstorming
     or if the Living Game Bible is cohesive, rich, and ready to lock.
     """
     deliberation: str = Field(
@@ -2982,10 +3150,22 @@ class LevelGenerationStrategy(BaseEpistemicModel):
 
 class CoreLoopSpec(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
-    The gameplay loop at three time scales.
+    The gameplay loop at three time scales, anchored by an explicit Fun & Tension Pact.
     """
-    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this loop is compelling and how its scales reinforce one another.")
-    player_verbs: List[str] = Field(default_factory=list, description="The actions the player performs.")
+    deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Why this loop is genuinely fun, what skill/strategy tension drives it, and how its scales reinforce one another without ever playing itself.")
+    player_verbs: List[str] = Field(default_factory=list, description="The concrete actions the player actively performs.")
+    core_decision_or_skill_test: str = Field(
+        default="",
+        description="The core perceptual, spatial, timing, or strategic trade-off the player must actively judge—explaining why thoughtful/skilled play succeeds while random, careless, or unthinking clicking fails.",
+    )
+    pushback_and_scarcity_model: str = Field(
+        default="",
+        description="What active world resistance, constraint, hazard, or resource scarcity pushes back on the player so doing nothing (hands-off idle state) or repeating one mindless action stalls or loses.",
+    )
+    earned_vs_given_progression: str = Field(
+        default="",
+        description="Conservation of Challenge rule: why the t=0 starting state seeds ONLY active manual/tactical play (zero passive self-collection or lavish free budgets at spawn), and how any efficiency, multiplier, or automation must be earned by the player.",
+    )
     player_agency_and_optimization_depth: str = Field(
         default="",
         description="How the player exercises open-ended agency, creative construction/expression, and iterative optimization tailored to the target player's Steam DNA (e.g. why there is no single scripted 'correct' solution, how the player builds/experiments/optimizes their own approach, and what live efficiency/performance feedback rewards mastery).",
@@ -2995,7 +3175,7 @@ class CoreLoopSpec(BaseEpistemicModel):
     session_loop: str = Field(..., description="Whole-session loop: how a play session starts, builds and ends, and why the player returns.")
     feedback_and_juice: str = Field(default="", description="How the game communicates success, failure and progress through visuals, audio and motion.")
     reward_cadence: str = Field(default="", description="When and how the player is rewarded.")
-    failure_and_recovery: str = Field(default="", description="What failure costs and how the player recovers without frustration.")
+    failure_and_recovery: str = Field(default="", description="What careless/poor play costs and how the player recovers cleanly via skill/strategy (never via free passive bailouts).")
 
 
 class EngagementPlan(BaseEpistemicModel):
@@ -3063,7 +3243,7 @@ class GoalHierarchy(BaseEpistemicModel):
     end_state: str = Field(default="", description="What completion, or an endless-play equilibrium, looks like.")
 
 
-def validate_game_design(bible: "GameBibleSpec") -> List[str]:
+def validate_game_design(bible: "GameBibleSpec", *, enforce_fun_pact: bool = False) -> List[str]:
     """Structural completeness of the game-design sections. Returns issues (empty = complete)."""
     issues: List[str] = []
     lg, loop, eng, onb, gh = (
@@ -3079,8 +3259,16 @@ def validate_game_design(bible: "GameBibleSpec") -> List[str]:
             issues.append("level_generation_strategy needs generation_rules.")
     if loop is None:
         issues.append("core_loop is missing.")
-    elif not loop.player_verbs:
-        issues.append("core_loop needs player_verbs.")
+    else:
+        if not loop.player_verbs:
+            issues.append("core_loop needs player_verbs.")
+        if enforce_fun_pact:
+            if not (loop.core_decision_or_skill_test or "").strip():
+                issues.append("core_loop needs core_decision_or_skill_test (Fun & Tension Pact: why player judgment/skill beats random clicking).")
+            if not (loop.pushback_and_scarcity_model or "").strip():
+                issues.append("core_loop needs pushback_and_scarcity_model (Fun & Tension Pact: what world resistance/scarcity makes idle or careless play fail).")
+            if not (loop.earned_vs_given_progression or "").strip():
+                issues.append("core_loop needs earned_vs_given_progression (Fun & Tension Pact: why t=0 seeds active play only and power/automation must be earned).")
     if eng is None:
         issues.append("engagement_plan is missing.")
     elif not eng.entertainment_pillars:
@@ -3134,6 +3322,13 @@ class GameBibleSpec(BaseEpistemicModel):
         default="",
         description="Locked 2D camera perspective and spatial movement model agreed upon by the Writers' Room."
     )
+    canonical_telemetry_keys: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Authoritative snake_case telemetry keys returned by `get_state_snapshot()` across the cartridge so "
+            "SWE and QA reference one shared vocabulary for preconditions, event-driven captures, and state assertions."
+        ),
+    )
     color_palette_hex: List[str] = Field(
         default_factory=list,
         description="Hex color palette (#RRGGBB) governing sky, terrain, architecture, energy accents, and UI/HUD."
@@ -3141,6 +3336,13 @@ class GameBibleSpec(BaseEpistemicModel):
     scene_layers: List[VisualSceneLayerSpec] = Field(
         default_factory=list,
         description="Ordered visual depth layers decomposing the 16:9 mockup into constructible Godot 4 scene geometry."
+    )
+    genre_craft_foundation: Optional[GenreCraftFoundation] = Field(
+        default=None,
+        description=(
+            "Foundational genre-craft and player-fun blueprint curated by ContextCuratorAgent at Game Bible genesis "
+            "and evolved across Council turns and slice transitions."
+        ),
     )
     gameplay_pillars: List[str] = Field(default_factory=list)
     technical_architecture_blueprint: List[MechanicEngineeringSpec] = Field(
@@ -3473,12 +3675,59 @@ class QASetupCall(BaseEpistemicModel):
 
 class QAStateAssertion(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
-    An observable state assertion evaluated at a specific tick during the QA filmstrip run.
+    An observable state assertion evaluated at a specific tick or key capture event during the QA filmstrip run.
     """
     deliberation: str = Field(..., description="MANDATORY FIRST PROPERTY: Concise 1-sentence rationale (<= 15 words) for this assertion.")
-    at_tick: int = Field(..., description="Tick at which to check the assertion.")
+    at_tick: int = Field(default=0, description="Tick at which to check the assertion (or 0 when binding to `at_event_label`).")
+    at_event_label: str = Field(
+        default="",
+        description="Optional `event_label` from `capture_events` whose resolved trigger tick should evaluate this assertion (preferred over guessing a hardcoded `at_tick` when waiting on dynamic travel/physics).",
+    )
     snapshot_key: str = Field(..., description="Key in get_state_snapshot() or entity property to inspect.")
-    expected_value_or_change: str = Field(..., description="Expected value or transition description.")
+    expected_value_or_change: str = Field(..., description="Expected value or transition description (e.g. '== 0', '>= 1', '> 0', '== true').")
+
+
+class QACaptureEvent(BaseEpistemicModel):
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    A key gameplay milestone planned by QA to capture a proof screenshot dynamically when an in-game condition
+    or state transition occurs (or at an explicit baseline tick) across multi-second simulation runs.
+    """
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Concise 1-sentence rationale (<= 18 words) explaining why this gameplay milestone proves a link in the causal loop.",
+    )
+    event_label: str = Field(
+        ...,
+        description="Concise snake_case milestone label stamped onto the captured frame header (e.g. 't0_unsolved_baseline', 'player_action_applied', 'world_interaction', 'objective_advanced').",
+    )
+    when_snapshot_key: str = Field(
+        default="",
+        description="Snapshot key from `get_state_snapshot()` to watch when `trigger_mode` is 'on_condition' or 'on_change' (leave '' when `trigger_mode == 'at_tick'`).",
+    )
+    when_operator: str = Field(
+        default="",
+        description="Comparison operator when `trigger_mode == 'on_condition'` ('==', '!=', '>=', '<=', '>', '<'); leave '' for 'at_tick' or 'on_change'.",
+    )
+    when_value: str = Field(
+        default="",
+        description="Target value string, number, or boolean when `trigger_mode == 'on_condition'`.",
+    )
+    at_tick: int = Field(
+        default=2,
+        ge=1,
+        le=3600,
+        description="Exact tick to capture when `trigger_mode == 'at_tick'` (e.g. tick 2 for t=0 baseline), OR earliest tick (`min_tick`) to start watching `when_snapshot_key`.",
+    )
+    settle_ticks: int = Field(
+        default=0,
+        ge=0,
+        le=60,
+        description="Optional post-trigger settle delay (0..60 ticks) after the condition/change fires before snapping the screenshot so animations, VFX, or HUD updates are visibly rendered.",
+    )
+    trigger_mode: Literal["at_tick", "on_condition", "on_change"] = Field(
+        default="at_tick",
+        description="Decision (strictly last per Rule 4): 'at_tick' for fixed baseline/checkpoint ticks; 'on_condition' when `when_snapshot_key` satisfies `when_operator` `when_value`; 'on_change' when `when_snapshot_key` changes from its baseline value at `at_tick`.",
+    )
 
 
 class InputSegment(BaseEpistemicModel):
@@ -3600,7 +3849,33 @@ class FilmstripPlan(BaseEpistemicModel):
             "(leave `test_scene_gd_content=''` when patching only specific lines instead of rewriting the whole file)."
         ),
     )
-    capture_ticks: List[int] = Field(default_factory=list, description="Ticks at which to capture a frame (1 to 12 frames).")
+    max_sim_ticks: int = Field(
+        default=900,
+        ge=60,
+        le=3600,
+        description=(
+            "Maximum simulation horizon in 60Hz ticks (60..3600, i.e. 1s..60s of game time; runs uncapped with VSync disabled "
+            "and exits early as soon as all `capture_events`, `input_segments`, and `state_assertions` complete)."
+        ),
+    )
+    counterfactual_precondition_check: str = Field(
+        default="",
+        description=(
+            "Explicit causal-necessity hypothesis verified by this run: which precondition/resource/action gates progression "
+            "(remaining 0/unchanged at t=0 and under zero player input) and only advances after authentic player input."
+        ),
+    )
+    capture_events: List[QACaptureEvent] = Field(
+        default_factory=list,
+        description=(
+            "Preferred event-driven keyframe plan (1 to 12 `QACaptureEvent` milestones, e.g. `at_tick=2` unsolved baseline followed by "
+            "`on_condition` / `on_change` milestones as player actions and world interactions fire across up to `max_sim_ticks`)."
+        ),
+    )
+    capture_ticks: List[int] = Field(
+        default_factory=list,
+        description="Optional explicit tick numbers (1..3600, up to 12 frames) when fixed-tick sampling is used alongside or instead of `capture_events`.",
+    )
     input_segments: List[InputSegment] = Field(default_factory=list, description="Scripted inputs; empty means no input is applied.")
     setup_calls: List[QASetupCall] = Field(
         default_factory=list,
@@ -3712,9 +3987,9 @@ class WorkItemRefinement(BaseEpistemicModel):
         default_factory=list,
         description="When action is 'split', the smaller, focused WorkItemProposals that replace this oversized task (downstream dependents on the board are automatically re-pointed).",
     )
-    action: Literal["enrich", "split", "no_input"] = Field(
+    action: Literal["enrich", "split", "cancel", "no_input"] = Field(
         default="enrich",
-        description="Shaping action: 'enrich' to add specialist direction/dependencies to the existing task, 'split' to decompose it into smaller tasks, or 'no_input' if your domain has no additional requirements for this task (strictly last per Rule 4).",
+        description="Shaping action: 'enrich' to add specialist direction/dependencies to the existing task, 'split' to decompose it into smaller tasks, 'cancel' to retire an obsolete unstarted task superseded by a pivot, or 'no_input' if your domain has no additional requirements for this task (strictly last per Rule 4).",
     )
 
     @field_validator("add_target_modules", mode="before")
@@ -3980,7 +4255,12 @@ class BlindPlaytestCouncilTurn(BaseEpistemicModel):
     )
     domain_reaction_to_blind_player: str = Field(
         default="",
-        description="Your discipline-specific diagnosis of what resonated with an unprimed player versus what caused confusion, friction, silence, or lack of fun.",
+        description=(
+            "Your discipline-specific diagnosis distinguishing (A) UX / Affordance / Spatial Bug Failures (clicks landing offset "
+            "from cursor, illegible rules/goals, overlapping UI, blurry/colliding sprites, or working setups failing to credit) vs. "
+            "(B) Good Strategic Failure (player spent carelessly or ignored positioning and lost—which MUST be preserved as real game "
+            "challenge, NEVER 'fixed' by inflating t=0 starting handouts or adding passive auto-collection)."
+        ),
     )
     spoken_dialogue: str = Field(
         ...,
@@ -4027,7 +4307,11 @@ class BlindPlaytestCouncilVerdict(BaseEpistemicModel):
     )
     player_experience_synthesis: str = Field(
         ...,
-        description="Candid synthesis of what actually worked, what was rough or broken, and which issues merit immediate current-slice cleanup versus next-slice carryover.",
+        description=(
+            "Candid synthesis of what actually worked, what was rough or broken, and whether player struggles stemmed from "
+            "(A) UX / spatial / wiring defects (fix clarity, camera coordinate math, or bugs) vs. (B) Good Strategic Failure "
+            "(preserve challenge and scarcity—never inflate t=0 free resources or automate away the core verb)."
+        ),
     )
     spoken_dialogue: str = Field(
         ...,
@@ -4158,7 +4442,7 @@ class SliceStateReflectionTurn(BaseEpistemicModel):
 
 class NextSliceStrategyPlan(BaseEpistemicModel):
     """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
-    Master strategy synthesized by the CreativeDirector after the Council's Slice Reflection Roundtable,
+    Master strategy synthesized by the CoProducer (Council Chair) after the Council's Slice Reflection Roundtable,
     defining how the next slice transforms the game's cohesion, onboarding/intuitiveness, depth/fun,
     short-term & long-term goals, and sense of accomplishment for the target player.
     """
@@ -4220,6 +4504,13 @@ class NextSliceStrategyPlan(BaseEpistemicModel):
     next_slice_spec: GameSliceSpec = Field(
         ...,
         description="The newly strategized GameSliceSpec for the next slice (with status='active').",
+    )
+    updated_genre_craft_foundation: Optional[GenreCraftFoundation] = Field(
+        default=None,
+        description=(
+            "Optional evolved GenreCraftFoundation refining foundational pillars, core fun thesis, "
+            "bootstrap-to-mastery progression, UX precision contracts, or anti-patterns for the next slice."
+        ),
     )
     updated_core_loop: Optional[CoreLoopSpec] = Field(
         default=None,
@@ -4320,7 +4611,7 @@ class CouncilSteeringRoutingPlan(BaseEpistemicModel):
         ...,
         description=(
             "Primary Council specialist best suited to own this steering/report "
-            "('CreativeDirector', 'GameplayDesigner', 'LevelAndProgressionDesigner', 'VisualArtDirector', "
+            "('CoProducer', 'GameplayDesigner', 'LevelAndProgressionDesigner', 'VisualArtDirector', "
             "'UXExperienceDesigner', 'AudioAtmosphereDesigner', 'StoryWorldArchitect', 'ScriptwriterAgent', "
             "'CharacterDesigner', or 'GameplaySystemsEngineer')."
         ),
@@ -4926,9 +5217,17 @@ class TaskLeadDecision(BaseEpistemicModel):
         default=False,
         description="When action == 'split_task', False (default) cleanly reverts uncommitted staging edits from this partial session before splitting; True preserves already-verified disk changes made in earlier turns of this session.",
     )
-    action: Literal["delegate", "spawn_tasks", "split_task", "submit_to_council"] = Field(
+    design_concern_report: str = Field(
+        default="",
+        description=(
+            "When action == 'escalate_design_concern', concrete co-designer report explaining why this task's spec as written "
+            "would force fake/Potemkin props, self-completing t=0 automation, zero-decision gameplay, or irreconcilable rules "
+            "with existing systems—asking the Council to revise or split the spec cleanly rather than shipping a dishonest stub."
+        ),
+    )
+    action: Literal["delegate", "spawn_tasks", "split_task", "escalate_design_concern", "submit_to_council"] = Field(
         ...,
-        description="Decision (strictly last): 'delegate' to invoke a Specialist Persona (for creation or inspection); 'spawn_tasks' to add discovery or build subtasks to the Production Board; 'split_task' to decompose this task into 2..N smaller cohesive tasks; 'submit_to_council' when work/findings are complete.",
+        description="Decision (strictly last): 'delegate' to invoke a Specialist Persona (for creation or inspection); 'spawn_tasks' to add discovery or build subtasks to the Production Board; 'split_task' to decompose this task into 2..N smaller cohesive tasks; 'escalate_design_concern' to kick a fun/agency-breaking or contradictory spec back to the Council; 'submit_to_council' when work/findings are complete.",
     )
 
 
@@ -5380,6 +5679,8 @@ def is_studio_paused(candidate_dir: Optional[Path] = None) -> bool:
 
 def _check_gateway_abort(candidate_dir: Optional[Path] = None, label: str = "generate_content") -> None:
     """Raises `StudioPausedError` immediately if the active orchestrator or `candidate_dir` has been aborted/preempted."""
+    if getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "interactive_foreground_turn", False):
+        return
     if is_candidate_build_aborted(candidate_dir):
         raise StudioPausedError(
             f"Aborted outbound Gemini API call '{label}' because build for '{Path(candidate_dir).name if candidate_dir else 'candidate'}' was cancelled by a new game request."
@@ -5397,6 +5698,29 @@ def _check_gateway_abort(candidate_dir: Optional[Path] = None, label: str = "gen
         pass
 
 
+def is_interactive_foreground_turn() -> bool:
+    """Returns True when the current thread is executing an interactive user-initiated foreground turn."""
+    return bool(getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "interactive_foreground_turn", False))
+
+
+def interactive_foreground_call_scope():
+    """Marks the current thread as an interactive user-initiated foreground turn (e.g. Co-Producer chat)
+    so the user can converse, inspect, consult specialists, and sketch concepts even while background
+    autonomous cartridge builds are paused or stopped."""
+    import contextlib as _contextlib
+
+    @_contextlib.contextmanager
+    def _scope():
+        prev = getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "interactive_foreground_turn", False)
+        _THREAD_LOCAL_GEMINI_CALL_CTX.interactive_foreground_turn = True
+        try:
+            yield
+        finally:
+            _THREAD_LOCAL_GEMINI_CALL_CTX.interactive_foreground_turn = prev
+
+    return _scope()
+
+
 def wait_if_studio_paused(
     candidate_dir: Optional[Path] = None,
     *,
@@ -5410,6 +5734,9 @@ def wait_if_studio_paused(
     """
     import os as _os
     import time as _time
+
+    if getattr(_THREAD_LOCAL_GEMINI_CALL_CTX, "interactive_foreground_turn", False):
+        return 0.0
 
     should_fail_fast = (
         fail_fast
@@ -6948,6 +7275,462 @@ def call_gemini_with_transient_retry(
             _THREAD_LOCAL_GEMINI_CALL_CTX.candidate_dir = prev_c_dir
             _THREAD_LOCAL_GEMINI_CALL_CTX.in_retry_wrapper = prev_in_retry
             _THREAD_LOCAL_GEMINI_CALL_CTX.skip_dataset_store = prev_skip_store
+
+
+# =============================================================================
+# Interactive Studio Co-Producer & Multimodal Showrunner Models (Rule 4)
+# =============================================================================
+
+CoProducerToolName = Literal[
+    "inspect_studio_progress",
+    "inspect_game_bible_and_dna",
+    "inspect_playtest_sessions",
+    "browse_cartridge_media_and_code",
+    "curate_genre_fun_foundation",
+    "consult_council",
+    "dispatch_specialist_probe",
+    "sketch_multimodal_concept",
+]
+
+CoProducerActionKind = Literal[
+    "commission_game",
+    "pivot_course_correction",
+    "pivot_structural",
+    "pivot_fork_cartridge",
+    "greenlight_bible",
+    "trigger_next_slice",
+    "pause_build",
+    "resume_build",
+    "launch_game",
+    "start_blind_playtest",
+    "record_game_memory",
+]
+
+
+class CoProducerConceptBrief(BaseEpistemicModel):
+    """Structured living synthesis of a co-designed game concept tracked across Co-Producer turns."""
+
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Synthesis reasoning explaining how the user's preferences and consultations shaped this brief.",
+    )
+    working_title: str = Field(default="", description="Working game title.")
+    core_genre: str = Field(default="", description="Primary genre and structural paradigm.")
+    elevator_pitch: str = Field(default="", description="Crisp 1-3 sentence hook summarizing the playable premise.")
+    core_fantasy: str = Field(default="", description="Emotional and systemic fantasy experienced by the player.")
+    core_player_verbs: List[str] = Field(
+        default_factory=list,
+        description="Concrete moment-to-moment player actions and verbs.",
+    )
+    first_60_seconds_feel: str = Field(
+        default="",
+        description="What the player sees, hears, and manipulates in the opening 60 seconds.",
+    )
+    visual_style_direction: str = Field(
+        default="",
+        description="Art direction, camera framing, silhouette readability, and lighting mood.",
+    )
+    audio_mood_direction: str = Field(
+        default="",
+        description="Soundscape, tactile SFX character, ambient beds, and voice tone.",
+    )
+    color_palette_hex: List[str] = Field(
+        default_factory=list,
+        description="Optional hex palette swatches (e.g. '#1E293B').",
+    )
+    explicit_non_goals: List[str] = Field(
+        default_factory=list,
+        description="Explicit anti-goals or rejected mechanics the Council must avoid.",
+    )
+    selected_mockup_paths: List[str] = Field(
+        default_factory=list,
+        description="Approved 16:9 concept mockup artifact paths.",
+    )
+    selected_sketch_asset_paths: List[str] = Field(
+        default_factory=list,
+        description="Approved inline sprite, voice audition, or SFX sketch paths.",
+    )
+    genre_craft_foundation: Optional[GenreCraftFoundation] = Field(
+        default=None,
+        description=(
+            "Curated GenreCraftFoundation articulating what makes this genre genuinely fun, its foundational pillars, "
+            "bootstrap-to-mastery arc, UX contracts, and genre-killing anti-patterns."
+        ),
+    )
+
+
+class CoProducerToolCall(BaseEpistemicModel):
+    """Typed tool call requested by CoProducerStepDecision without untyped dict ambiguity."""
+
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Justification for why this specific tool call is needed before responding.",
+    )
+    tool_name: CoProducerToolName = Field(
+        ...,
+        description="Exact Co-Producer tool to execute.",
+    )
+    query_or_question: str = Field(
+        default="",
+        description="Primary question, inspection brief, semantic query, voice line text, or visual/audio synthesis prompt.",
+    )
+    bible_or_dna_focus: Literal["overview", "full_bible", "player_dna", "both"] = Field(
+        default="both",
+        description="Scope when tool_name == 'inspect_game_bible_and_dna'.",
+    )
+    playtest_session_id: str = Field(
+        default="",
+        description="Optional playtest session_id when tool_name == 'inspect_playtest_sessions' (empty = latest).",
+    )
+    evaluate_media_perceptually: bool = Field(
+        default=False,
+        description="When True during inspect_playtest_sessions or browse_cartridge_media_and_code, run perceptual video/audio evaluators on key clips.",
+    )
+    media_or_code_filter: Literal[
+        "all",
+        "sprites",
+        "mockups",
+        "audio",
+        "qa_proofs",
+        "code_diffs",
+        "memories",
+    ] = Field(
+        default="all",
+        description="Filter when tool_name == 'browse_cartridge_media_and_code'.",
+    )
+    council_mode: Literal["huddle", "divergent_pitch_round"] = Field(
+        default="huddle",
+        description="For consult_council: 'huddle' convenes 1-4 specialists; 'divergent_pitch_round' runs orthogonal fragments + premise collision.",
+    )
+    specialist_roles: List[str] = Field(
+        default_factory=list,
+        description="For consult_council: 1 to 4 specialist role names from SPECIALIST_ROSTER.",
+    )
+    probe_persona: Literal[
+        "swe_engineer",
+        "visual_artist",
+        "audio_designer",
+        "script_writer",
+        "qa_test_engineer",
+    ] = Field(
+        default="swe_engineer",
+        description="For dispatch_specialist_probe: lock-free read-only specialist persona.",
+    )
+    target_paths: List[str] = Field(
+        default_factory=list,
+        description="Optional relative file, module, or asset paths to inspect.",
+    )
+    sketch_kind: Literal[
+        "concept_mockup_16x9",
+        "sprite_sketch",
+        "voice_audition",
+        "sfx_or_ambience",
+    ] = Field(
+        default="concept_mockup_16x9",
+        description="For sketch_multimodal_concept: modality to synthesize inline.",
+    )
+    sketch_title: str = Field(
+        default="",
+        description="Short descriptive title, character name, or asset label for sketch_multimodal_concept.",
+    )
+    sketch_secondary_direction: str = Field(
+        default="",
+        description="Optional style guide, voice acting direction, or secondary constraint for sketch_multimodal_concept.",
+    )
+    loop_audio: bool = Field(
+        default=False,
+        description="For sfx_or_ambience: True for seamless ambient loop, False for one-shot SFX.",
+    )
+
+
+class CoProducerStepDecision(BaseEpistemicModel):
+    """Rationale-First step controller schema deciding whether to gather evidence/sketches or synthesize response."""
+
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Reasoning about the user's goal, sufficiency of gathered context, and which tools or consultations add real value.",
+    )
+    next_step_intent: str = Field(
+        default="",
+        description="Concise human-readable status message streamed to the UI while executing this step.",
+    )
+    response_mode: Literal["creative_ideation", "studio_briefing"] = Field(
+        default="creative_ideation",
+        description="'creative_ideation' for brainstorming, pitching, or design trade-offs; 'studio_briefing' for factual progress/media inspection.",
+    )
+    tool_calls: List[CoProducerToolCall] = Field(
+        default_factory=list,
+        description="1 to 3 tool calls to execute when action == 'call_tools'; empty when action == 'respond'.",
+    )
+    action: Literal["call_tools", "respond"] = Field(
+        ...,
+        description="FINAL DECISION TOKEN: 'call_tools' to inspect/consult/sketch first, or 'respond' to deliver the final turn.",
+    )
+
+
+class CoProducerAdvisorySpecialistTurn(BaseEpistemicModel):
+    """Structured advisory response produced by a Council specialist during a read-only Co-Producer huddle."""
+
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Specialist's domain-specific trade-off analysis.",
+    )
+    key_recommendation: str = Field(
+        ...,
+        description="One-sentence actionable recommendation or creative angle from this specialist's lens.",
+    )
+    creative_angle_or_risk: str = Field(
+        default="",
+        description="Specific opportunity, unexpected twist, or technical/UX risk to watch.",
+    )
+    spoken_quote: str = Field(
+        ...,
+        description="Natural first-person studio remark (2-4 sentences) capturing this specialist's perspective.",
+    )
+
+
+class CoProducerCouncilHuddleTurn(BaseEpistemicModel):
+    """Persisted specialist perspective rendered inside an expandable Co-Producer Consultation Card."""
+
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Specialist's internal deliberation.",
+    )
+    speaker_role: str = Field(..., description="Specialist role title from SPECIALIST_ROSTER.")
+    key_recommendation: str = Field(..., description="Headline recommendation.")
+    creative_angle_or_risk: str = Field(default="", description="Notable twist, synergy, or risk.")
+    spoken_quote: str = Field(..., description="Specialist's verbatim studio quote.")
+
+
+class CoProducerDivergentPitchOption(BaseEpistemicModel):
+    """One collided game pitch option surfaced from an advisory divergent pitch round."""
+
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Why these orthogonal fragments collide into a compelling playable hook.",
+    )
+    pitch_id: str = Field(..., description="Stable pitch option identifier.")
+    working_title: str = Field(..., description="Distinctive working title.")
+    core_genre: str = Field(..., description="Genre and camera/control framing.")
+    hook_summary: str = Field(..., description="2-3 sentence high-concept hook.")
+    core_loop_sketch: str = Field(..., description="Moment-to-moment player loop.")
+    visual_and_audio_vibe: str = Field(default="", description="Signature visual and sonic aesthetic.")
+
+
+class CoProducerConsultationCard(BaseEpistemicModel):
+    """Expandable backchannel consultation or read-only specialist probe record attached to a Co-Producer turn."""
+
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Synthesis reasoning across the consulted specialists or probe output.",
+    )
+    card_id: str = Field(..., description="Unique card identifier.")
+    consultation_kind: Literal[
+        "council_huddle",
+        "divergent_pitch_round",
+        "specialist_probe",
+        "genre_foundation",
+    ] = Field(
+        ...,
+        description="Type of backchannel studio consultation performed.",
+    )
+    question_posed: str = Field(..., description="Question or brief sent by the Co-Producer.")
+    participating_roles: List[str] = Field(
+        default_factory=list,
+        description="Council roles or specialist persona consulted.",
+    )
+    synthesis_headline: str = Field(
+        ...,
+        description="One-line executive takeaway shown on the collapsed disclosure header.",
+    )
+    specialist_turns: List[CoProducerCouncilHuddleTurn] = Field(
+        default_factory=list,
+        description="Individual Council specialist huddle responses.",
+    )
+    divergent_pitches: List[CoProducerDivergentPitchOption] = Field(
+        default_factory=list,
+        description="Collided pitch candidates when consultation_kind == 'divergent_pitch_round'.",
+    )
+    probe_findings_markdown: str = Field(
+        default="",
+        description="Detailed findings when consultation_kind == 'specialist_probe'.",
+    )
+    proof_media_paths: List[str] = Field(
+        default_factory=list,
+        description="Any artifact paths inspected or captured during the probe.",
+    )
+
+
+class CoProducerMediaItem(BaseEpistemicModel):
+    """Single media, metric, or code diff entry inside a CoProducerMediaCard."""
+
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Why this specific media item or metric answers the user's question.",
+    )
+    item_id: str = Field(default="", description="Item identifier.")
+    media_kind: Literal["video", "image", "audio", "metric", "code_diff"] = Field(
+        ...,
+        description="Render modality for this item.",
+    )
+    label: str = Field(..., description="Display title for this media item or metric.")
+    caption: str = Field(default="", description="Contextual note, timestamp, or perceptual observation.")
+    artifact_path: str = Field(
+        default="",
+        description="Cartridge-relative or _coproducer_drafts-relative path served via /api/artifacts/content.",
+    )
+    mime_type: str = Field(default="", description="MIME type hint (e.g. 'video/mp4', 'image/png', 'audio/wav').")
+    width: int = Field(default=0, description="Intrinsic pixel width when known (prevents layout shift).")
+    height: int = Field(default=0, description="Intrinsic pixel height when known (prevents layout shift).")
+    metric_value: str = Field(default="", description="Formatted value when media_kind == 'metric'.")
+    diff_unified: str = Field(default="", description="Unified diff snippet when media_kind == 'code_diff'.")
+
+
+class CoProducerMediaCard(BaseEpistemicModel):
+    """Typed rich inline media, progress, or diff presentation card rendered inside CoProducerView."""
+
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Editorial rationale for curating and presenting this card inline.",
+    )
+    card_id: str = Field(default="", description="Unique card identifier.")
+    card_kind: Literal[
+        "playtest_video",
+        "qa_clip",
+        "image_gallery",
+        "sketch_showcase",
+        "audio_clips",
+        "progress_summary",
+        "code_diff",
+    ] = Field(..., description="Presentation layout kind.")
+    title: str = Field(..., description="Card headline.")
+    subtitle: str = Field(default="", description="Optional secondary context (slice, session, task counts).")
+    items: List[CoProducerMediaItem] = Field(default_factory=list, description="Ordered media/metric items.")
+    deep_link_workspace: Optional[
+        Literal["board", "writers-room", "bible", "memory", "assets", "playtest", "dna"]
+    ] = Field(
+        default=None,
+        description="Optional Mission Control inspector tab to jump to for full telemetry.",
+    )
+    deep_link_target_id: str = Field(
+        default="",
+        description="Optional session_id, item_id, or slice_id hint for the deep link.",
+    )
+    show_by_default: bool = Field(
+        default=True,
+        description=(
+            "True when the Co-Producer intentionally curated this card to appear in the primary reply flow; "
+            "False when gathered as background inspection evidence and tucked into the Behind-the-Scenes drawer."
+        ),
+    )
+
+
+class CoProducerMemoryMutationSpec(BaseEpistemicModel):
+    """Explicit durable GameMemoryStore mutation proposed inside a Co-Producer Action Card."""
+
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Why this memory should be recorded or superseded.",
+    )
+    operation: Literal["record", "supersede"] = Field(default="record")
+    target_memory_id: str = Field(
+        default="",
+        description="Existing memory_id to supersede when operation == 'supersede'.",
+    )
+    memory_bank: Literal["council", "engineering", "visual", "audio", "narrative", "qa"] = Field(
+        default="council"
+    )
+    kind: Literal[
+        "strategic_goal",
+        "architectural_decision",
+        "lesson_learned",
+        "domain_note",
+    ] = Field(default="architectural_decision")
+    title: str = Field(default="", description="Short rule or constraint title.")
+    content: str = Field(default="", description="Concrete durable constraint or architectural note.")
+
+
+class CoProducerActionProposal(BaseEpistemicModel):
+    """Explicit 1-click user-confirmable studio mutation card separating conversation from execution."""
+
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Justification for proposing this studio action and choosing its handoff/pivot tier.",
+    )
+    proposal_id: str = Field(default="", description="Unique proposal identifier.")
+    action_kind: CoProducerActionKind = Field(..., description="Studio action to execute upon user confirmation.")
+    handoff_mode: Optional[Literal["loose_spark", "refined_concept"]] = Field(
+        default=None,
+        description="For commission_game or pivot_fork_cartridge: 'loose_spark' enters Council genesis brainstorm; 'refined_concept' locks co-designed brief & skips blind concept genesis.",
+    )
+    title: str = Field(..., description="Clear action button/card headline.")
+    summary: str = Field(..., description="Plain-language explanation of what will happen when confirmed.")
+    steering_or_seed_brief: str = Field(
+        default="",
+        description="Complete directive or seed prompt sent to StudioDaemon / CreativeWritersRoom.",
+    )
+    pause_for_greenlight: bool = Field(
+        default=False,
+        description="When True on commission_game or pivot_fork_cartridge, pause after Game Bible sign-off before building.",
+    )
+    concept_brief: Optional[CoProducerConceptBrief] = Field(
+        default=None,
+        description="Structured concept brief snapshot for commission_game or pivot_fork_cartridge.",
+    )
+    cancel_item_ids: List[str] = Field(
+        default_factory=list,
+        description="For pivot_structural: obsolete ProductionBoard item_ids to cancel and unwire.",
+    )
+    memory_mutations: List[CoProducerMemoryMutationSpec] = Field(
+        default_factory=list,
+        description="Durable GameMemoryStore records or supersessions to apply on commit.",
+    )
+    carry_over_asset_paths: List[str] = Field(
+        default_factory=list,
+        description="For pivot_fork_cartridge or commission_game: relative asset/sketch paths to copy into the new cartridge.",
+    )
+    status: Literal["pending", "executed", "dismissed"] = Field(
+        default="pending",
+        description="Lifecycle state of this action proposal.",
+    )
+
+
+class CoProducerFinalTurn(BaseEpistemicModel):
+    """Final synthesized 1-on-1 Co-Producer turn returned to the user."""
+
+    deliberation: str = Field(
+        ...,
+        description="MANDATORY FIRST PROPERTY: Full showrunner and creative partner deliberation weighing user intent, specialist feedback, visual/audio evidence, and contrasting creative options.",
+    )
+    updated_thread_title: str = Field(
+        default="",
+        description="Optional updated 2-6 word working title for this conversation thread.",
+    )
+    updated_concept_brief: Optional[CoProducerConceptBrief] = Field(
+        default=None,
+        description="Updated living game concept brief if ideation, style, verbs, or non-goals evolved.",
+    )
+    presented_card_ids: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Optional list of `card_id`s from AUTO-STAGED MEDIA CARDS that you genuinely want displayed inline "
+            "with your reply right now. Pass `[]` if you inspected progress/assets/diffs purely as background "
+            "context and want a clean text-only reply; list specific `card_id`s when showing the user a sketch, "
+            "playtest video, QA clip, or requested asset."
+        ),
+    )
+    media_cards: List[CoProducerMediaCard] = Field(
+        default_factory=list,
+        description="Inline rich media, playtest video, sketch showcase, audio, progress, or diff cards.",
+    )
+    action_proposals: List[CoProducerActionProposal] = Field(
+        default_factory=list,
+        description="Explicit user-confirmable studio action cards when a concrete handoff, pivot, or studio command is ready.",
+    )
+    spoken_response: str = Field(
+        ...,
+        description="Direct 1-on-1 Co-Producer reply in GitHub-flavored Markdown. Speaks in a single creative, insightful partner voice.",
+    )
 
 
 def __getattr__(name: str) -> Any:

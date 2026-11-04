@@ -14,6 +14,7 @@ Enforces:
 """
 from __future__ import annotations
 
+import contextlib
 from datetime import datetime, timezone
 import json
 import logging
@@ -47,6 +48,8 @@ from engine.studio.models import (
     GameBibleSpec,
     GameSliceSpec,
     GenesisWorldSpec,
+    GenreCraftFoundation,
+    GenrePillarSpec,
     MechanicEngineeringSpec,
     NarrativeBible,
     NextSliceStrategyPlan,
@@ -69,7 +72,9 @@ from engine.studio.models import (
     call_gemini_with_transient_retry,
     explicit_prefix_cache_scope,
     get_active_explicit_prefix_cache_scope,
+    interactive_foreground_call_scope,
     is_candidate_build_aborted,
+    is_interactive_foreground_turn,
     is_real_genai_client,
     resolve_explicit_cached_request,
 )
@@ -80,7 +85,34 @@ from engine.studio.tool_registry import render_compact_tool_directory
 logger = logging.getLogger("CreativeWritersRoom")
 
 
+COUNCIL_CHAIR_ROLE: str = "CoProducer"
+COUNCIL_CHAIR_DISPLAY_NAME: str = "Co-Producer (Council Chair)"
+
+
 CORE_COUNCIL_ROSTER: List[Dict[str, Any]] = [
+    {
+        "role": "CoProducer",
+        "display_name": "Co-Producer (Council Chair)",
+        "tier": "lead",
+        "subagents": [
+            "GameplayDesigner",
+            "StoryWorldArchitect",
+            "VisualArtDirector",
+            "LevelAndProgressionDesigner",
+            "GameplaySystemsEngineer",
+            "UXExperienceDesigner",
+            "AudioAtmosphereDesigner",
+            "ScriptwriterAgent",
+            "CharacterDesigner",
+        ],
+        "focus": (
+            "Leading and chairing the Specialist Council as Studio Showrunner and active creative partner to the "
+            "Executive Producer: carrying forward the 1-on-1 Co-Producer session vision, brief, and explicit non-goals; "
+            "arbitrating cross-domain disagreements; enforcing the Genre Craft & Fun Foundation (genuine fun, earned agency, "
+            "spatial/UX precision, and zero passive self-completing loops); keeping vertical slices tightly scoped and cohesive; "
+            "and calling on or routing the floor to any Council Lead or Sub-Agent."
+        ),
+    },
     {
         "role": "GameplayDesigner",
         "display_name": "Lead Gameplay & Systems Designer",
@@ -195,11 +227,14 @@ COUNCIL_HIERARCHY: Dict[str, List[str]] = {
 
 
 def _resolve_council_specialist(raw_role: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Resolves a Council specialist dictionary by exact (case-insensitive) role name in `SPECIALIST_ROSTER`."""
+    """Resolves a Council specialist dictionary by exact (case-insensitive) role name in `SPECIALIST_ROSTER`
+    (with backward-compatible alias mapping from legacy `CreativeDirector` / `co_producer` to `CoProducer`)."""
     cleaned = str(raw_role or "").strip()
     if not cleaned:
         return None
     lowered = cleaned.lower()
+    if lowered in ("creativedirector", "creative_director", "co_producer", "co-producer", "councilchair", "council_chair"):
+        lowered = "coproducer"
     for spec in SPECIALIST_ROSTER:
         if spec["role"].lower() == lowered:
             return spec
@@ -385,6 +420,7 @@ class CreativeWritersRoom:
         self._steering_lock = threading.Lock()
         self._pending_steering: List[str] = []
         self._abort_requested: bool = False
+        self._active_candidate_dir: Optional[Path] = None
 
     def _check_aborted(self, candidate_dir: Optional[Path] = None) -> None:
         if getattr(self, "_abort_requested", False) or is_candidate_build_aborted(candidate_dir):
@@ -422,6 +458,46 @@ class CreativeWritersRoom:
             except Exception as exc:
                 logger.debug("Failed writing .pending_steering.json: %s", exc)
 
+    def _has_unconsumed_operator_steering(self, candidate_dir: Optional[Path] = None) -> bool:
+        """Returns True if live Executive Producer / Co-Producer steering or a structural pivot is waiting
+        in memory or on disk so in-flight verification gates yield to the operator's direction instead of aborting."""
+        with self._steering_lock:
+            if self._pending_steering:
+                return True
+        if candidate_dir is not None:
+            c_path = Path(candidate_dir)
+            if (
+                (c_path / ".pending_structural_pivot.json").is_file()
+                or (c_path / ".pending_steering.json").is_file()
+            ):
+                return True
+        return False
+
+    def _archive_pre_pivot_slice_playtest_reports(
+        self,
+        game_bible: GameBibleSpec,
+        candidate_dir: Optional[Path],
+    ) -> None:
+        """Archives pre-pivot `blind_playtest_report_<slice_id>_pass*.json` files when a Tier 2 Structural Pivot
+        overhauls the active slice so the newly rebuilt slice gets a fresh `pass0..N` verification budget."""
+        if candidate_dir is None:
+            return
+        active_s = game_bible.get_active_slice()
+        if active_s is None:
+            return
+        art_dir = Path(candidate_dir) / "artifacts"
+        if not art_dir.is_dir():
+            return
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        prefix = f"blind_playtest_report_{active_s.slice_id}_pass"
+        for p_file in sorted(art_dir.glob(f"{prefix}*.json")):
+            suffix = p_file.name[len(prefix):]
+            archived = art_dir / f"blind_playtest_report_{active_s.slice_id}_pre_pivot_{stamp}_pass{suffix}"
+            try:
+                p_file.replace(archived)
+            except Exception as exc:
+                logger.debug("Could not archive pre-pivot playtest report %s: %s", p_file, exc)
+
     def _consume_pending_steering(
         self,
         game_bible: GameBibleSpec,
@@ -434,6 +510,107 @@ class CreativeWritersRoom:
                 queued.extend(self._pending_steering)
                 self._pending_steering.clear()
         if candidate_dir is not None:
+            sp_file = Path(candidate_dir) / ".pending_structural_pivot.json"
+            if sp_file.is_file():
+                try:
+                    raw_sp = json.loads(sp_file.read_text(encoding="utf-8"))
+                    envelopes = raw_sp if isinstance(raw_sp, list) else ([raw_sp] if isinstance(raw_sp, dict) else [])
+                    sketch_paths: List[str] = []
+                    for env in envelopes:
+                        if not isinstance(env, dict):
+                            continue
+                        s_brief = str(env.get("steering_brief") or "").strip()
+                        env_cb = env.get("concept_brief") if isinstance(env.get("concept_brief"), dict) else {}
+                        new_working_title = str(env_cb.get("working_title") or "").strip()
+                        if new_working_title:
+                            game_bible.game_title = new_working_title
+                            if game_bible.narrative_bible is not None:
+                                game_bible.narrative_bible.world_title = new_working_title
+                        if isinstance(env_cb.get("genre_craft_foundation"), dict) and env_cb.get("genre_craft_foundation"):
+                            try:
+                                pivoted_gcf = GenreCraftFoundation.model_validate(env_cb["genre_craft_foundation"])
+                                game_bible.genre_craft_foundation = pivoted_gcf
+                                if pivoted_gcf.genre_and_subgenre_archetype.strip():
+                                    game_bible.core_genre = pivoted_gcf.genre_and_subgenre_archetype.strip()
+                                self._sync_pillars_from_genre_foundation(game_bible, pivoted_gcf)
+                            except Exception as gcf_val_exc:
+                                logger.warning("Structural pivot GenreCraftFoundation parse warning: %s", gcf_val_exc)
+                        elif s_brief and is_real_genai_client(self.client):
+                            try:
+                                self._ensure_bible_genre_foundation(
+                                    game_bible=game_bible,
+                                    dna_summary=game_bible.target_player_dna_summary or "",
+                                    creative_prompt=s_brief,
+                                    candidate_dir=Path(candidate_dir),
+                                    evolution_directive=f"Structural Pivot: {s_brief}",
+                                    force_refresh=True,
+                                )
+                            except Exception as gcf_piv_exc:
+                                logger.warning("Structural pivot GenreCraftFoundation evolution warning: %s", gcf_piv_exc)
+                        cancel_ids = [str(x).strip() for x in (env.get("cancel_item_ids") or []) if str(x).strip()]
+                        if self.board is not None:
+                            if cancel_ids and hasattr(self.board, "cancel_items_for_pivot"):
+                                try:
+                                    self.board.cancel_items_for_pivot(
+                                        cancel_ids,
+                                        reason=f"Structural pivot: {s_brief[:140]}" if s_brief else "Structural pivot",
+                                    )
+                                except Exception as c_exc:
+                                    logger.warning("Structural pivot board cancellation warning: %s", c_exc)
+                            if hasattr(self.board, "archive_superseded_pivot_tests"):
+                                try:
+                                    self.board.archive_superseded_pivot_tests(cancel_ids, archive_all=True)
+                                except Exception as arch_exc:
+                                    logger.warning("Structural pivot test archive warning: %s", arch_exc)
+                        if (Path(candidate_dir) / "main.gd").is_file():
+                            self._pending_structural_pivot_cleanout = True
+                        mem_muts = env.get("memory_mutations") or []
+                        if isinstance(mem_muts, list) and mem_muts:
+                            try:
+                                from engine.studio.game_memory import GameMemoryStore, MemoryMutationProposal
+
+                                store = GameMemoryStore(Path(candidate_dir), client=self.client)
+                                _valid_mkinds = {"strategic_goal", "architectural_decision", "lesson_learned", "domain_note"}
+                                props = [
+                                    MemoryMutationProposal(
+                                        deliberation=str(m.get("deliberation") or "Structural pivot memory update."),
+                                        operation=str(m.get("operation") or "record"),
+                                        target_memory_id=str(m.get("target_memory_id") or ""),
+                                        target_bank=str(m.get("memory_bank") or "council"),
+                                        kind=(
+                                            str(m.get("kind"))
+                                            if str(m.get("kind") or "") in _valid_mkinds
+                                            else "architectural_decision"
+                                        ),
+                                        title=str(m.get("title") or ""),
+                                        content=str(m.get("content") or ""),
+                                    )
+                                    for m in mem_muts
+                                    if isinstance(m, dict)
+                                ]
+                                if props:
+                                    store.apply_mutations("ExecutiveProducer", props)
+                            except Exception as m_exc:
+                                logger.warning("Structural pivot memory update warning: %s", m_exc)
+                        for r_sk in (env.get("reference_sketch_paths") or []):
+                            s_p = str(r_sk or "").strip()
+                            if s_p and s_p not in sketch_paths:
+                                sketch_paths.append(s_p)
+                        if s_brief:
+                            formatted_sp = f"[STRUCTURAL PIVOT — PRUNE & REPLAN]: {s_brief}"
+                            if cancel_ids:
+                                formatted_sp += f" (Cancelled obsolete tasks: {cancel_ids})"
+                            if formatted_sp not in queued:
+                                queued.append(formatted_sp)
+                    if sketch_paths:
+                        self._pending_structural_pivot_sketches = sketch_paths
+                        self._structural_pivot_triggered = True
+                    else:
+                        self._structural_pivot_triggered = True
+                    self._archive_pre_pivot_slice_playtest_reports(game_bible, candidate_dir)
+                    sp_file.unlink(missing_ok=True)
+                except Exception as exc:
+                    logger.debug("Failed reading .pending_structural_pivot.json: %s", exc)
             sf = Path(candidate_dir) / ".pending_steering.json"
             if sf.is_file():
                 try:
@@ -514,7 +691,7 @@ class CreativeWritersRoom:
                     speaker_role="ExecutiveProducer",
                     speaker_display_name="Executive Producer (You)",
                     spoken_dialogue=fb,
-                    addressed_to=["CreativeDirector", "GameplayDesigner", "GameplaySystemsEngineer", "UXExperienceDesigner"],
+                    addressed_to=["CoProducer", "GameplayDesigner", "GameplaySystemsEngineer", "UXExperienceDesigner"],
                     bible_updates_summary=["Executive Producer creative direction injected"],
                 )
                 game_bible.writers_room_transcript.append(user_utt)
@@ -814,7 +991,7 @@ class CreativeWritersRoom:
                                             speaker_role="ExecutiveProducer",
                                             speaker_display_name=str(raw_u.get("speaker_display_name") or "Executive Producer (You)"),
                                             spoken_dialogue=txt,
-                                            addressed_to=["CreativeDirector", "GameplayDesigner", "GameplaySystemsEngineer", "UXExperienceDesigner"],
+                                            addressed_to=["CoProducer", "GameplayDesigner", "GameplaySystemsEngineer", "UXExperienceDesigner"],
                                             bible_updates_summary=["Executive Producer creative direction injected"],
                                         )
                                     )
@@ -1225,12 +1402,23 @@ class CreativeWritersRoom:
             if getattr(game_bible, "target_player_dna_summary", "")
             else ""
         )
+        from engine.studio.context_curator import format_genre_craft_foundation_briefing
+
+        gcf_formatted = format_genre_craft_foundation_briefing(
+            getattr(game_bible, "genre_craft_foundation", None)
+        )
+        gcf_section = (
+            f"\n{gcf_formatted}"
+            if gcf_formatted
+            else "(not yet synthesized — ground mechanics in genuine player agency, unsolved t=0 scarcity, exact spatial input fidelity, and clear goals)"
+        )
         return (
             f"{exec_banner}"
             f"{dna_block}"
             f"CURRENT LIVING GAME BIBLE STATE:\n"
             f"- Working Title: {game_bible.game_title}\n"
             f"- Core Genre: {game_bible.core_genre}\n"
+            f"- Genre Craft & Fun Foundation (Why This Genre Is Fun, Evolvable Pillars, UX Contracts & Anti-Patterns): {gcf_section}\n"
             f"- Elevator Pitch: {game_bible.elevator_pitch or '(not yet defined)'}\n"
             f"- Concept Evolution So Far ({len(game_bible.concept_evolution)} milestones): "
             f"{[e.evolved_premise[:160] for e in game_bible.concept_evolution[-4:]]}\n"
@@ -1308,6 +1496,29 @@ class CreativeWritersRoom:
         if proposal.audio_direction_update and proposal.audio_direction_update.strip():
             game_bible.audio_direction_guide = proposal.audio_direction_update.strip()
             updates_summary.append("Updated Audio & Voice Atmosphere Guide")
+
+        if getattr(proposal, "updated_genre_craft_foundation", None) is not None:
+            gcf = proposal.updated_genre_craft_foundation
+            game_bible.genre_craft_foundation = gcf
+            if (
+                gcf.genre_and_subgenre_archetype.strip()
+                and game_bible.core_genre in ("", "unclassified", "indie_experience")
+            ):
+                game_bible.core_genre = gcf.genre_and_subgenre_archetype.strip()
+            synced_titles = self._sync_pillars_from_genre_foundation(game_bible, gcf)
+            updates_summary.append(
+                f"Evolved Genre Craft & Fun Foundation ({len(synced_titles)} pillar(s): {', '.join(synced_titles[:4])})"
+            )
+            self._emit_event(
+                "bible_genre_foundation_updated",
+                {
+                    "deliberation": gcf.deliberation,
+                    "reasoning_rationale": gcf.deliberation,
+                    "speaker_role": speaker_role,
+                    "genre_and_subgenre_archetype": gcf.genre_and_subgenre_archetype,
+                    "pillar_titles": synced_titles,
+                },
+            )
 
         for pillar in proposal.gameplay_pillars_additions or []:
             if pillar and pillar.strip() and pillar.strip() not in game_bible.gameplay_pillars:
@@ -1501,7 +1712,7 @@ class CreativeWritersRoom:
                     s.status = "planned"
             updates_summary.append(f"Set active_slice_index={game_bible.active_slice_index}")
 
-        # Game-design sections (levels, loop, engagement, onboarding, goals)
+        # Game-design sections (levels, loop, engagement, onboarding, goals) & canonical telemetry keys
         for attr, label in (
             ("updated_level_generation_strategy", "level_generation_strategy"),
             ("updated_core_loop", "core_loop"),
@@ -1513,6 +1724,17 @@ class CreativeWritersRoom:
             if value is not None:
                 setattr(game_bible, label, value)
                 updates_summary.append(f"Updated {label.replace('_', ' ')}")
+
+        updated_tkeys = getattr(proposal, "updated_canonical_telemetry_keys", None)
+        if updated_tkeys:
+            cleaned_tkeys: List[str] = []
+            for tk in updated_tkeys:
+                tk_s = str(tk or "").strip()
+                if tk_s and tk_s not in cleaned_tkeys:
+                    cleaned_tkeys.append(tk_s)
+            if cleaned_tkeys:
+                game_bible.canonical_telemetry_keys = cleaned_tkeys
+                updates_summary.append(f"Locked {len(cleaned_tkeys)} canonical telemetry key(s)")
 
         # Backlog requirements raised for the implementation side (already validated against the board)
         mem_note_raw = str(getattr(proposal, "memory_note", "") or "").strip()
@@ -1674,18 +1896,31 @@ class CreativeWritersRoom:
                 sp_obj = next((s for s in SPECIALIST_ROSTER if s["role"] == sr), None)
                 if sp_obj:
                     sub_details.append(f"- `{sr}` ({sp_obj['display_name']}): {sp_obj['focus']}")
-            subagent_clause = (
-                "SUB-AGENTS UNDER YOUR DOMAIN (call on them when their specialized craft will best advance this game):\n"
-                + "\n".join(sub_details)
-                + "\nIf you believe one of your Sub-Agents should chime in right now instead of (or to deepen) your domain, "
-                f"set `consult_subagent_role` to one of {subagents} and provide `subagent_brief` explaining what you want them to address "
-                "(or leave `consult_subagent_role = null` to speak yourself).\n\n"
-            )
+            if role == COUNCIL_CHAIR_ROLE:
+                subagent_clause = (
+                    "COUNCIL LEADS & SUB-AGENTS UNDER YOUR CHAIRERSHIP:\n"
+                    + "\n".join(sub_details)
+                    + "\nAs Co-Producer & Council Chair, leave `consult_subagent_role = null` when YOU should speak directly to lead "
+                    "the Council, represent the Executive Producer's 1-on-1 vision/non-goals, arbitrate specialist disagreements, "
+                    "push back against scope creep or passive self-completing mechanics, or steer convergence; OR set "
+                    f"`consult_subagent_role` to one of {subagents} with a sharp `subagent_brief` to hand the floor directly to that specialist.\n\n"
+                )
+            else:
+                subagent_clause = (
+                    "SUB-AGENTS UNDER YOUR DOMAIN (call on them when their specialized craft will best advance this game):\n"
+                    + "\n".join(sub_details)
+                    + "\nIf you believe one of your Sub-Agents should chime in right now instead of (or to deepen) your domain, "
+                    f"set `consult_subagent_role` to one of {subagents} and provide `subagent_brief` explaining what you want them to address "
+                    "(or leave `consult_subagent_role = null` to speak yourself).\n\n"
+                )
 
+        coprod_ctx = self._load_coproducer_session_context() if role == COUNCIL_CHAIR_ROLE else ""
+        coprod_block = f"{coprod_ctx}\n\n" if coprod_ctx else ""
         dna_header = self._dna_header_if_absent(dna_summary, bible_snapshot)
         prompt = (
             f"{dna_header}"
             f"{bible_snapshot}\n\n"
+            f"{coprod_block}"
             f"You are the {display_name} ({role}) sitting in an open-ended Game Studio Writers' Room.\n"
             f"Your specialty focus: {focus}\n\n"
             f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n\n"
@@ -1778,7 +2013,14 @@ class CreativeWritersRoom:
         )
 
         hierarchy_note = ""
-        if subagents:
+        if role == COUNCIL_CHAIR_ROLE:
+            hierarchy_note = (
+                f"COUNCIL HIERARCHY: You are the Studio Co-Producer and Chair/Leader of the entire Specialist Council "
+                f"(overseeing Leads & Sub-Agents {subagents}). You are the exact same Co-Producer who partners 1-on-1 with the Executive Producer; "
+                f"whenever you want a specific Lead or Sub-Agent to respond or author their domain specs next, include them in `addressed_to` "
+                f"or set `route_to_council_role`.\n"
+            )
+        elif subagents:
             hierarchy_note = (
                 f"COUNCIL HIERARCHY: You are a Core Council Domain Lead. Your specialized Sub-Agents are {subagents}. "
                 f"Whenever you want one of your Sub-Agents (or another Council member) to chime in next, include their role name in `addressed_to`.\n"
@@ -1790,7 +2032,18 @@ class CreativeWritersRoom:
             )
 
         domain_instructions = ""
-        if role == "UXExperienceDesigner":
+        if role == COUNCIL_CHAIR_ROLE:
+            domain_instructions = (
+                "Domain Craft & Bible Fields (CoProducer — Council Chair & Studio Showrunner): Lead the Council decisively. "
+                "Guard the Executive Producer's 1-on-1 vision, taste signals, and explicit non-goals; enforce the `Genre Craft & Fun Foundation` "
+                "(rejecting passive self-completing loops, free `t=0` handouts, blurry/placeholder art, or inaccurate spatial clicking); "
+                "arbitrate specialist disagreements; keep the active vertical slice tightly scoped around a genuinely fun, buildable core loop; "
+                "update `updated_game_title`, `updated_elevator_pitch`, `updated_core_fantasy`, `updated_genre_craft_foundation`, "
+                "`updated_first_60_seconds_hook`, `updated_diegetic_ui_philosophy`, `updated_camera_and_spatial_paradigm`, `gameplay_pillars_additions`, "
+                "`visual_style_guide_update`, `audio_direction_update`, `added_or_updated_storyboard_beats`, or `added_or_updated_slices` as needed; "
+                "and shape/split/add tasks on the Production Board or hand the floor (`route_to_council_role` / `addressed_to`) to the exact domain specialist needed next."
+            )
+        elif role == "UXExperienceDesigner":
             domain_instructions = (
                 "Domain Craft & Bible Fields (UXExperienceDesigner): Put yourself empathetically in the shoes of a brand-new player booting this game "
                 "for the first time with zero external documentation. Strategize how THIS specific game brings the player into the world so they "
@@ -1801,8 +2054,8 @@ class CreativeWritersRoom:
                 "CRITICAL: Onboarding is ONLY the opening 60 seconds of play layered onto the real game—it is NEVER the entire game! Do NOT propose standalone "
                 "'tutorial manager' or 'onboarding milestone map' tasks that reduce the game into a linear 4-step checklist that ends once the player learns the controls; "
                 "instead, design HUD/toolbar/affordance UI (`ui` tasks) that empowers the player to play the full `core_loop` (moment-to-moment, minute-to-minute, and session loops) "
-                "and track their progress across `goal_hierarchy`. Shape `updated_first_60_seconds_hook`, `updated_diegetic_ui_philosophy`, "
-                "`updated_onboarding_plan`, and `added_or_updated_storyboard_beats`."
+                "and track their progress across `goal_hierarchy`, enforcing `Genre Craft & Fun Foundation`'s `essential_spatial_and_ux_contracts` (including exact 1:1 cursor-to-world placement previews and silhouette legibility). Shape `updated_first_60_seconds_hook`, `updated_diegetic_ui_philosophy`, "
+                "`updated_onboarding_plan`, `updated_genre_craft_foundation` (when refining UX precision contracts), and `added_or_updated_storyboard_beats`."
             )
         elif role == "VisualArtDirector":
             domain_instructions = (
@@ -1839,34 +2092,35 @@ class CreativeWritersRoom:
             )
         elif role == "GameplayDesigner":
             domain_instructions = (
-                "Domain Craft & Bible Fields (GameplayDesigner): Pressure-test the mechanics for genuine fun, player agency, and alignment with the "
-                "Target Player's Steam DNA. Ask: 'What is the LARGER POINT of this game? Why is this genre compelling to play beyond the first 60 seconds?' "
-                "NEVER allow the team to build 'the smallest slice possible' that reduces the game to a 1-step tutorial or a pre-solved diorama while deferring "
-                "the actual game loop to unbuilt future slices! Shape `gameplay_pillars_additions`, `updated_core_loop` (player verbs, `player_agency_and_optimization_depth` "
-                "explaining how the player builds/experiments/optimizes/strategizes their own approach with no single pre-scripted solution, plus moment-to-moment, "
-                "minute-to-minute, and session loops, feedback, reward cadence, failure and recovery), `updated_engagement_plan`, `added_or_updated_slices` "
-                "(ensuring Slice 0 includes the full minute-to-minute and session loop and player toolkit, NEVER deferring the core point of the game), and "
-                "`concept_evolution_milestone`. When a Production Board is attached, raise `mechanic_code` tasks that build both the moment-to-moment verbs AND "
-                "the minute-to-minute/session loop progression. You can call on your Sub-Agents `LevelAndProgressionDesigner` and `GameplaySystemsEngineer` via `addressed_to`."
+                "Domain Craft & Bible Fields (GameplayDesigner): Pressure-test the mechanics against the `Genre Craft & Fun Foundation` (`core_fun_thesis`, "
+                "`foundational_pillars`, `bootstrap_to_mastery_arc`, and `genre_killing_anti_patterns`) and the Target Player's Steam DNA. Ask: 'What concrete spatial, timing, or strategic decision (`core_decision_or_skill_test`) makes "
+                "this game fun to play, what pushback or scarcity (`pushback_and_scarcity_model`) creates real tension, and how are capabilities/resources "
+                "EARNED rather than handed out for free (`earned_vs_given_progression`)?' A self-completing game—where resources collect themselves from t=0, "
+                "everything is unlocked for free, or placements ignore where the player clicks—is NEVER fun! Shape `updated_genre_craft_foundation` (evolving pillars as our design sharpens), `gameplay_pillars_additions`, `updated_core_loop` "
+                "(including `core_decision_or_skill_test`, `pushback_and_scarcity_model`, `earned_vs_given_progression`, `player_verbs`, "
+                "`player_agency_and_optimization_depth`, moment-to-moment/minute-to-minute/session loops, feedback, reward cadence, failure and recovery), "
+                "`updated_engagement_plan`, `updated_canonical_telemetry_keys`, and `added_or_updated_slices`—scoping **Slice 0 as a tight 'Find the Fun' playable loop** "
+                "with **2–3 100%-real, tactile verbs** and genuine earned tension (NEVER boiling the ocean by stuffing multi-tier tech trees or decorative Potemkin stubs "
+                "into Slice 0; sequence broader content tiers into Slice 1+). You can call on your Sub-Agents `LevelAndProgressionDesigner` and `GameplaySystemsEngineer` via `addressed_to`."
             )
         elif role == "GameplaySystemsEngineer":
             domain_instructions = (
-                "Domain Craft & Bible Fields (GameplaySystemsEngineer): Translate the game's full 3-timescale `core_loop` (moment-to-moment, minute-to-minute, "
-                "and session loops), `player_agency_and_optimization_depth`, `goal_hierarchy`, camera/spatial paradigm, and visual direction into "
-                "concrete Godot 4 engineering strategies in `added_or_updated_engineering_specs` (`MechanicEngineeringSpec` items covering node/collider architecture, "
-                "hybrid procedural + generated texture/sprite/rig rendering, active `Camera2D` tracking across world bounds with HUD isolated on a `CanvasLayer`, "
-                "deterministic state machines that start unbuilt/unsolved at t=0 and give the player a full interactive toolkit/sandbox to build, experiment, optimize, "
-                "and progress through escalating goals, and falsifiable headless test invariants). Never design or accept a state machine that reduces the game to a "
-                "4-step linear tutorial or pre-solves the player's work in `_ready()`."
+                "Domain Craft & Bible Fields (GameplaySystemsEngineer): Translate `Genre Craft & Fun Foundation` (`foundational_pillars`, `essential_spatial_and_ux_contracts`, "
+                "and `genre_killing_anti_patterns`), `core_loop` (`core_decision_or_skill_test`, `pushback_and_scarcity_model`, "
+                "`earned_vs_given_progression`), `goal_hierarchy`, camera/spatial paradigm, and visual direction into concrete Godot 4 engineering strategies in "
+                "`added_or_updated_engineering_specs` (`MechanicEngineeringSpec` items covering node/collider architecture, crisp sprite downsampling `scale <= 1.0`, "
+                "active `Camera2D` tracking with exact `get_global_mouse_position()` world-click conversion vs. `CanvasLayer` container-based HUD, deterministic state "
+                "machines that start unbuilt/unsolved at t=0 with zero passive free resource generation, and multi-horizon event-driven QA invariants), optionally refine "
+                "`updated_genre_craft_foundation` when locking systemic pillar expressions, AND lock "
+                "`updated_canonical_telemetry_keys` so `get_state_snapshot()`, QA `on_condition`/`on_change` keyframes, and Counterfactual checks share exact state key names."
             )
         elif role == "LevelAndProgressionDesigner":
             domain_instructions = (
-                "Domain Craft & Bible Fields (LevelAndProgressionDesigner): Strategize the game's world and progression in `updated_level_generation_strategy` "
+                "Domain Craft & Bible Fields (LevelAndProgressionDesigner): Strategize the game's world, discovery, scarcity, and earned progression (`bootstrap_to_mastery_arc` in `Genre Craft & Fun Foundation`) via `updated_level_generation_strategy` "
                 "(bespoke `generation_approach`, `world_structure`, `runtime_construction_plan`, `level_archetypes`, `generation_rules`, and difficulty curve), "
-                "`updated_goal_hierarchy` (goals across immediate, short-term, mid-term, and long-term horizons, progression structure, and end state), and "
-                "`added_or_updated_slices` (where Slice 0 delivers the COMPLETE playable game loop across all 3 time scales of `core_loop` and multi-horizon `goal_hierarchy`—never "
-                "shrinking the build into a tutorial-only room or deferring the real progression and systemic depth to future slices!). When a Production Board is attached, "
-                "raise `level_map` and progression `mechanic_code` tasks that realize the multi-region world and escalating goals."
+                "`updated_goal_hierarchy` (goals across immediate, short-term, mid-term, and long-term horizons where progress is earned through discovery/skill/strategy rather "
+                "than free `t=0` handouts), `updated_genre_craft_foundation` (when refining progression pillars), and `added_or_updated_slices` (keeping **Slice 0 tightly scoped around finding the fun** in an interactive, replayable space with "
+                "real spatial/resource stakes, and sequencing broader biomes, unlock tiers, and secondary systems cleanly into Slice 1+)."
             )
         elif role == "AudioAtmosphereDesigner":
             domain_instructions = (
@@ -1885,8 +2139,11 @@ class CreativeWritersRoom:
             if (recent_turn_delta and recent_turn_delta.strip())
             else ""
         )
+        coprod_turn_ctx = self._load_coproducer_session_context() if role == COUNCIL_CHAIR_ROLE else ""
+        coprod_turn_block = f"{coprod_turn_ctx}\n\n" if coprod_turn_ctx else ""
         prompt = (
             f"{shared_head}"
+            f"{coprod_turn_block}"
             f"{delta_block}"
             f"You are the {display_name} ({role}) speaking in the Game Studio Writers' Room.\n"
             f"Your specialty focus: {focus}\n"
@@ -1907,7 +2164,7 @@ class CreativeWritersRoom:
             f"restatements of earlier speakers, and never recite raw telemetry floats—while treating any Executive Producer message with full respect and catering directly "
             f"to what they asked for. Keep Production Board tasks focused on covering the active slice's scope cleanly rather than trying to build everything at once. "
             f"Leave `memory_note` empty (`''`) on routine turns—never duplicate Game Bible updates or ordinary dialogue points into `memory_note`; use it ONLY when deferring an out-of-slice goal or recording a non-obvious cross-slice constraint. "
-            f"DYNAMIC PEER ROUTING (`route_to_council_role`): If an issue, Steering directive, or design/engineering question belongs primarily to another Council specialist's domain—or needs a direct follow-up turn from another Council role (`GameplayDesigner`, `StoryWorldArchitect`, `VisualArtDirector`, `LevelAndProgressionDesigner`, `GameplaySystemsEngineer`, `ScriptwriterAgent`, `CharacterDesigner`, `UXExperienceDesigner`, `AudioAtmosphereDesigner`) to author their Bible fields or domain tasks—set `route_to_council_role` to that exact role name and specify what they should handle in `routing_handoff_reason`. "
+            f"DYNAMIC PEER ROUTING (`route_to_council_role`): If an issue, Steering directive, or design/engineering question belongs primarily to another Council specialist's domain—or needs a direct follow-up turn from another Council role (`CoProducer`, `GameplayDesigner`, `StoryWorldArchitect`, `VisualArtDirector`, `LevelAndProgressionDesigner`, `GameplaySystemsEngineer`, `ScriptwriterAgent`, `CharacterDesigner`, `UXExperienceDesigner`, `AudioAtmosphereDesigner`) to author their Bible fields or domain tasks—set `route_to_council_role` to that exact role name and specify what they should handle in `routing_handoff_reason`. "
             f"Call out specific colleagues or Sub-Agents in `addressed_to`, and provide `deliberation` FIRST."
         )
         turn_schema = WritersRoomTurnProposal.for_role(role) if is_real_genai_client(self.client) else WritersRoomTurnProposal
@@ -2033,7 +2290,9 @@ class CreativeWritersRoom:
     @staticmethod
     def _reviewer_for(item: Any) -> str:
         if item.kind in ("integration", "level_map") or not item.raised_by_role:
-            return "CreativeDirector"
+            return COUNCIL_CHAIR_ROLE
+        if item.raised_by_role == "CreativeDirector":
+            return COUNCIL_CHAIR_ROLE
         return item.raised_by_role
 
     @classmethod
@@ -2043,11 +2302,11 @@ class CreativeWritersRoom:
         All panelists must unanimously approve for the item to pass review."""
         primary = cls._reviewer_for(item)
         if item.kind == "discovery":
-            return [primary] if primary else ["CreativeDirector"]
+            return [primary] if primary else [COUNCIL_CHAIR_ROLE]
         if item.kind in ("mechanic_code", "ui", "integration"):
             panel = [primary, "GameplayDesigner", "UXExperienceDesigner", "VisualArtDirector"]
         elif item.kind == "level_map":
-            panel = ["CreativeDirector", "LevelAndProgressionDesigner", "UXExperienceDesigner", "VisualArtDirector"]
+            panel = [COUNCIL_CHAIR_ROLE, "LevelAndProgressionDesigner", "UXExperienceDesigner", "VisualArtDirector"]
         elif item.kind in ("visual_asset", "animation"):
             panel = [primary, "VisualArtDirector"]
         elif item.kind == "audio_asset":
@@ -2195,6 +2454,23 @@ class CreativeWritersRoom:
                         )
                     else:
                         parts.append(types.Part.from_bytes(data=fullres_kf.read_bytes(), mime_type="image/png"))
+                mag_crops = path.with_name(f"{path.stem}.magnified_crops_3x.png")
+                if mag_crops.is_file():
+                    parts.append(
+                        f"3X NEAREST-NEIGHBOR IN-SITU MAGNIFIED CROP PLATE (file {mag_crops.name}) for item '{item.item_id}' "
+                        "[inspect rendered world sprites and HUD widgets at 3x pixel magnification for blurry >1.25x upscaling, "
+                        "wrong camera projection, grab-bag atlas bleed, or placeholder programmer-art shapes]:"
+                    )
+                    if media_res is not None:
+                        parts.append(
+                            types.Part.from_bytes(
+                                data=mag_crops.read_bytes(),
+                                mime_type="image/png",
+                                media_resolution=media_res,
+                            )
+                        )
+                    else:
+                        parts.append(types.Part.from_bytes(data=mag_crops.read_bytes(), mime_type="image/png"))
         for ap in audio_paths[-2:]:
             a_mime = AUDIO_MIME_BY_SUFFIX[ap.suffix.lower()]
             parts.append(
@@ -2248,7 +2524,11 @@ class CreativeWritersRoom:
                     + "\n".join(f"      {ln}" for ln in raw_tgd.splitlines())
                 )
             if getattr(item, "revisions", None):
-                latest_proofs = getattr(item.revisions[-1], "proof_images", None) or []
+                latest_proofs = (
+                    getattr(item.revisions[-1], "proof_paths", None)
+                    or getattr(item.revisions[-1], "proof_images", None)
+                    or []
+                )
                 if latest_proofs:
                     from engine.studio.proofs import format_filmstrip_telemetry_progression
 
@@ -2293,18 +2573,18 @@ class CreativeWritersRoom:
                 "Characters, avatars, creatures, and interactive world structures MUST bind actual fabricated sprites or articulated rigs from `res://assets/sprites/*.png` "
                 "and be coherently layered into the environment (not crudely pasted on top of each other, and never duplicated across overlapping scripts). Immediately `request_changes` if a `level_map`, `mechanic_code`, "
                 "or `integration` proof renders untextured flat polygons, bare programmer-art lines, duplicate overlapping structures, or primitive `draw_circle`/`draw_rect` stickmen/boxes. "
-                "When a FULL-RESOLUTION 1:1 KEYFRAME is attached alongside a filmstrip, closely inspect every HUD icon, portrait frame, world sprite, and shader surface at 1:1 resolution for flat 16-color geometric placeholder polygons, "
-                "squished/anamorphic or corner-clipped sprite slices, or unblended tile grid seams—if a broken `.png` asset or `.gd` consumer lies outside `target_modules`, emit atomic in-place `visual_asset` / `mechanic_code` proposals in `spawned_prerequisite_tasks` so it is repaired rather than ignored! "
+                "When a FULL-RESOLUTION 1:1 KEYFRAME and/or `3X NEAREST-NEIGHBOR IN-SITU MAGNIFIED CROP PLATE` (`*.magnified_crops_3x.png`) is attached alongside a filmstrip, closely inspect every HUD icon, portrait frame, world sprite, and shader surface at 1:1 and 3x pixel magnification for blurry >1.25x upscaled sprites, incompatible camera projections, grab-bag multi-object atlas bleed, flat 16-color geometric placeholder polygons, "
+                "squished/anamorphic or corner-clipped sprite slices, or unblended tile grid seams—and check `Scene/UI/Scale Lint Warnings` in `latest_proof_runtime_telemetry`! If a broken `.png` asset or `.gd` consumer lies outside `target_modules`, emit atomic in-place `visual_asset` / `mechanic_code` proposals in `spawned_prerequisite_tasks` so it is repaired rather than ignored! "
                 "IMPORTANT: In `plate_*.png` and `anim_sheet_*.png` / `anim_rig_*.png`, the dark/light square checkerboard grids, cyan bounding-box borders, and horizontal yellow/gold "
                 "baseline ruler lines at the bottom of frames are external QA test-harness overlays drawn behind/around the transparent PNG—NEVER flag the QA checkerboard, cyan border, "
                 "or yellow baseline guide line as a sprite artifact! Likewise, do NOT flag the external QA contact-sheet header/footer strips ('[QA] tick ...', '[QA] pos=...') outside each 16:9 frame as in-game text.\n"
             )
-        if role in ("GameplayDesigner", "GameplaySystemsEngineer", "LevelAndProgressionDesigner", "CreativeDirector"):
+        if role in ("CoProducer", "GameplayDesigner", "GameplaySystemsEngineer", "LevelAndProgressionDesigner", "CreativeDirector"):
             return (
-                f"ROLE MANDATE ({role}): You have VETO power over gameplay authenticity, whole-game loop depth, unsolved t=0 baselines, and causal player agency tailored to the Target Player's Steam DNA. Immediately `request_changes` if:\n"
-                "  1. A `mechanic_code`, `level_map`, or `integration` proof starts already pre-connected, pre-built, or pre-solved in Frame 1 (t=0..20) before any player input is applied (violating `test_unsolved_baseline_t0`), or reduces the game into a static pre-wired diorama or a single-solution 1-click lock-and-key tutorial instead of delivering the larger point of the game (`core_loop` across moment-to-moment, minute-to-minute, and session loops, `player_agency_and_optimization_depth`, and escalating `goal_hierarchy`).\n"
-                "  2. State transitions across frames are not causally driven by player inputs (`[QA] tick ... in:[...]` or mouse clicks), or if an input action / setup call teleports or forces the world/onboarding step directly to a solved state by bypassing intermediate mechanics or prerequisites.\n"
-                "  3. A multi-screen world (`world_bounds` larger than the 1280x720 viewport) lacks working camera navigation/panning or leaves core player verbs and mid/long-term progression from the Game Bible unimplemented.\n"
+                f"ROLE MANDATE ({role}): You have VETO power over gameplay authenticity, Conservation of Challenge, `Genre Craft & Fun Foundation` pillar fidelity, earned player agency, and unsolved t=0 baselines tailored to the Target Player's Steam DNA. Immediately `request_changes` if:\n"
+                "  1. A `mechanic_code`, `level_map`, or `integration` proof starts already pre-connected, pre-built, or pre-solved in Frame 1 (t=0..20) before any player input is applied (violating `test_unsolved_baseline_t0`), grants free passive resource generation at `t=0`, violates any `genre_killing_anti_patterns` or `foundational_pillars` in the Game Bible's `Genre Craft & Fun Foundation`, or renders decorative Potemkin UI/structures instead of honoring `core_loop.core_decision_or_skill_test`, `pushback_and_scarcity_model`, and `earned_vs_given_progression`.\n"
+                "  2. State transitions across frames (including event-driven multi-horizon `[QA] <event_label> | tick N` keyframes) are not causally driven by player inputs (`[QA] tick ... in:[...]` or mouse clicks), if placed structures spawn at a `Camera2D` offset away from the clicked world coordinates, or if an input action / setup call teleports directly to a solved state bypassing intermediate preconditions.\n"
+                "  3. A multi-screen world (`world_bounds` larger than the 1280x720 viewport) lacks working camera navigation/panning, or `latest_proof_runtime_telemetry` reports unresolved `Scene/UI/Scale Lint Warnings` (`ui_rect_overlaps`, `ui_viewport_overflow_nodes`, `clipped_ui_labels`, `blurry_upscaled_sprites`, `duplicate_stacked_sprites`).\n"
                 "  4. A worker attempts to 'cheat' a failed playtest by inflating collision/catch radii into giant magnets, pre-spawning player-built routing/solution structures in `_ready()`, or moving the goal/receiver into the un-deflected/un-routed default trajectory of an emitter so the objective completes without genuine player construction.\n"
                 "ABSOLUTE BAN ON COUNCIL-ORDERED SHORTCUTS & WRAPPER-SCRIPT AUTOMATION: When a QA playtest fails to complete a gameplay chain or launch/route an entity to the goal, NEVER write `feedback` telling workers to move the goal/receiver into an un-interacted path, widen hitboxes, OR call spawn/placement/mutation functions inside `_physics_process()` / `_process()` of `tests/test_<item_id>.gd`! The engine enforces a Counterfactual Zero-Input Gate (`input_script=[]`) AND an Entrypoint Parity Gate (replaying the exact same `input_segments` directly against live `res://main.tscn` without `tests/test_*.gd`), so scripting gameplay actions inside `tests/test_*.gd` immediately fails verification. Instead, inspect `qa_test_script_source`, `[QA] tick ... in:[...]` inputs, and `[QA] pos=...` telemetry: if `tests/test_<item_id>.gd` is mutating game state or bypassing `main.tscn` inputs, `request_changes` to remove that wrapper cheating; otherwise diagnose whether (a) a signal/input/entity wire is missing in the production game scripts (`target_modules` / `res://main.tscn`), or (b) `qa_test_engineer`'s external `input_segments` (`mouse_world_pos`, `mouse_click_pos`, tool/tuning keys) missed a required player step—and direct your `feedback` at fixing that exact root cause. Likewise, treat any `(x, y)` coordinate in QA telemetry strictly as diagnostic evidence of where a world-wide rule broke—never instruct workers to whitelist a specific `(x, y)` coordinate/rectangle or hardcode aiming/spawning toward a fixed coordinate in production scripts; always require fixing the general spatial/gameplay contract across all valid world regions.\n"
                 "Use the external QA contact-sheet header/footer strips ('[QA] tick ... in:[...]', '[QA] pos=(...) ...') above and below each 16:9 frame "
@@ -2422,8 +2702,8 @@ class CreativeWritersRoom:
     ) -> ReviewBatch:
         from engine.studio.context_curator import is_real_genai_client
 
-        spec = next((sp for sp in SPECIALIST_ROSTER if sp["role"] == role), None)
-        who = f"the {spec['display_name']} ({role})" if spec else "the Creative Director"
+        spec = _resolve_council_specialist(role)
+        who = f"the {spec['display_name']} ({role})" if spec else f"the {COUNCIL_CHAIR_DISPLAY_NAME} ({COUNCIL_CHAIR_ROLE})"
         if shared_round_parts is not None:
             parts = list(shared_round_parts)
         else:
@@ -2473,23 +2753,29 @@ class CreativeWritersRoom:
                 + "\n".join(f"  - {note}" for note in prior_roundtable_notes)
                 + "\n\n"
             )
+        coprod_rev_ctx = (
+            self._load_coproducer_session_context(eff_rev_dir)
+            if role in (COUNCIL_CHAIR_ROLE, "CreativeDirector")
+            else ""
+        )
+        coprod_rev_block = f"{coprod_rev_ctx}\n\n" if coprod_rev_ctx else ""
         prompt = (
             f"You are {who} reviewing work built by the implementation team for the game being designed.\n"
+            f"{coprod_rev_block}"
             f"{mandate}"
             f"{filmstrip_guide}"
             f"{rev_mem_block}"
             f"{roundtable_block}"
             f"ITEMS AWAITING YOUR REVIEW (proof images and Living Game Bible context are attached above):\n"
             + ("\n".join(self._format_item_for_review(i, candidate_dir=candidate_dir) for i in awaiting) or "  (none)")
-            + f"\n\nITEMS THAT HIT THEIR REVISION CAP OR STALLED (you must decide):\n"
+            + f"\n\nITEMS THAT HIT THEIR REVISION CAP, STALLED, OR RAISED A [TaskLead Design Concern] (you must decide):\n"
             + ("\n".join(self._format_item_for_review(i, candidate_dir=candidate_dir) for i in deciding) or "  (none)")
-            + "\n\nIn `spoken_dialogue` and `addressed_to`, speak candidly and skeptically to your fellow Council reviewers (zero agreement preambles or cheerleading; full respect for any Executive Producer direction) about what you actually observe in the HIGH-resolution proof frames and telemetry versus `UNVERIFIED_WORKER_CLAIMS`. "
+            + "\n\nIn `spoken_dialogue` and `addressed_to`, speak candidly and skeptically to your fellow Council reviewers (zero agreement preambles or cheerleading; full respect for any Executive Producer direction) about what you actually observe in the HIGH-resolution proof frames, `*.magnified_crops_3x.png` crop plate, and `[SCENE_AUDIT]` telemetry versus `UNVERIFIED_WORKER_CLAIMS`. "
             "For EVERY awaiting item give one `review_decisions` entry: first state `validation_criteria_for_my_role`, verify the rendered proof skeptically against those criteria, the item's `spec`, `proof_spec`, and Executive Producer direction, then: "
-            "(a) choose `request_changes` with concrete, surgical feedback when the item fails its own `spec`/`proof_spec`, exhibits real visual/UI craft glitches (cut-off/bleeding sprite slicing, squished icons, overflowing/overlapping HUD text, placeholder geometry), or breaks causal responsiveness (use `blocked_by_item_ids`, `spawned_prerequisite_tasks`, and `out_of_scope_modules_to_prune` when a defect belongs to a shared/external module); OR "
+            "(a) choose `request_changes` with concrete, surgical feedback when the item fails its own `spec`/`proof_spec`, exhibits real visual/UI craft glitches (`Scene/UI/Scale Lint Warnings`, blurry upscaled sprites, cut-off/bleeding sprite slicing, squished icons, overflowing/overlapping HUD text, placeholder geometry), or breaks earned agency / causal responsiveness (use `blocked_by_item_ids`, `spawned_prerequisite_tasks`, and `out_of_scope_modules_to_prune` when a defect belongs to a shared/external module); OR "
             "(b) choose `approve` once THIS item genuinely fulfills its own active-slice `spec` and visual/UX quality bar—do NOT invent out-of-scope feature creep or try to redesign the whole game inside one task's review! "
-            "For EVERY capped/stalled item give one `cap_decisions` entry: `accept_as_is` (only if the result genuinely "
-            "serves the active slice; state candidly what remains rough for future cleanup), `rewrite_spec` (populate a non-empty `replacement_spec` BEFORE setting `action='rewrite_spec'`; max "
-            f"{MAX_SPEC_RESETS} rewrites), `split` (populate a non-empty `split_items` list of `WorkItemProposal` objects BEFORE setting `action='split'` — NEVER set `action='split'` if `split_items` is empty), or `cancel`. Provide `deliberation` FIRST and each verdict/action last."
+            "For EVERY capped/stalled/design-concern item give one `cap_decisions` entry: when `decision_reason` starts with `[TaskLead Design Concern]`, treat the Task Lead as a respected co-designer pushing back against a self-completing shortcut, Potemkin stub, or overloaded task spec—NEVER pick `accept_as_is` if the item has 0 completed revisions; instead choose `rewrite_spec` (rewriting `replacement_spec` to preserve honest simulation and earned player agency; max "
+            f"{MAX_SPEC_RESETS} rewrites), `split` (populate a non-empty `split_items` list of `WorkItemProposal` objects BEFORE setting `action='split'` — NEVER set `action='split'` if `split_items` is empty), or `cancel` (or `accept_as_is` ONLY when a capped item with completed revisions genuinely serves the active slice). Provide `deliberation` FIRST and each verdict/action last."
         )
 
         def _validate(batch: ReviewBatch) -> List[str]:
@@ -2520,6 +2806,15 @@ class CreativeWritersRoom:
                 item = by_id.get(c.item_id)
                 if item is None:
                     continue
+                if (
+                    c.action == "accept_as_is"
+                    and str(getattr(item, "decision_reason", "") or "").startswith("[TaskLead Design Concern]")
+                    and not getattr(item, "revisions", None)
+                ):
+                    issues.append(
+                        f"Cannot choose accept_as_is on '[TaskLead Design Concern]' item '{c.item_id}' with zero completed revisions; "
+                        f"choose 'rewrite_spec', 'split', or 'cancel' to resolve the Task Lead's design concern."
+                    )
                 if c.action == "split" and not c.split_items and c.replacement_spec.strip() and item.spec_resets < MAX_SPEC_RESETS:
                     c.action = "rewrite_spec"
                 if c.action == "rewrite_spec" and not c.replacement_spec.strip() and c.deliberation.strip() and item.spec_resets < MAX_SPEC_RESETS:
@@ -2633,7 +2928,7 @@ class CreativeWritersRoom:
                 prior_roundtable_notes.append(f"[{disp_name} ({r})]: {spoken_text} | Verdicts: {'; '.join(verdict_bits)}")
 
                 turn_idx = len(game_bible.writers_room_transcript)
-                other_roles = [orole for orole in roles if orole != r] or ["CreativeDirector"]
+                other_roles = [orole for orole in roles if orole != r] or [COUNCIL_CHAIR_ROLE]
                 addressed = [a for a in (batch.addressed_to or []) if a] or other_roles
                 updates_summary = [
                     f"review:{d.item_id}:{d.verdict}" for d in batch.review_decisions
@@ -3017,6 +3312,19 @@ class CreativeWritersRoom:
         combined_steering = " | ".join(steered_notes)
         board_was_drained = bool(self.board is not None and self.board.is_drained())
         wish_context_block, wish_multimodal_parts = self._consume_pending_playtest_wishes(candidate_dir)
+        pending_sketches = list(getattr(self, "_pending_structural_pivot_sketches", None) or [])
+        if pending_sketches and candidate_dir is not None:
+            self._pending_structural_pivot_sketches = []
+            c_root = Path(candidate_dir)
+            for rel_sk in pending_sketches[:4]:
+                sk_path = Path(rel_sk) if Path(rel_sk).is_absolute() else (c_root / rel_sk)
+                if sk_path.is_file() and sk_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
+                    sk_part = self._load_image_part(sk_path)
+                    if sk_part is not None:
+                        wish_multimodal_parts = list(wish_multimodal_parts or []) + [
+                            f"CO-PRODUCER APPROVED REFERENCE SKETCH (`{rel_sk}`):",
+                            sk_part,
+                        ]
         consumed_pt_sids = set(getattr(self, "_last_consumed_playtest_session_ids", None) or ())
         steering_summary_for_prompt = (
             " | ".join(
@@ -3077,9 +3385,12 @@ class CreativeWritersRoom:
                     f"  - `{sp['role']}` ({sp['display_name']}): {sp['focus']}"
                     for sp in SPECIALIST_ROSTER
                 )
+                coprod_route_ctx = self._load_coproducer_session_context(c_dir)
+                coprod_route_block = f"{coprod_route_ctx}\n\n" if coprod_route_ctx else ""
                 routing_prompt = (
-                    f"You are the Writers' Room Council Table routing an incoming Executive Producer Steering / Build Report:\n"
+                    f"You are the {COUNCIL_CHAIR_DISPLAY_NAME} ({COUNCIL_CHAIR_ROLE}) chairing the Writers' Room Council Table and routing an incoming Executive Producer Steering / Build Report:\n"
                     f"REPORT: {steering_summary_for_prompt}\n\n"
+                    f"{coprod_route_block}"
                     f"AVAILABLE COUNCIL ROLES:\n{roster_summary}\n\n"
                     f"{render_compact_tool_directory(layer='council')}\n\n"
                     f"{wish_context_block}\n\n"
@@ -3108,7 +3419,7 @@ class CreativeWritersRoom:
                         else []
                     ),
                     parts=wish_multimodal_parts or None,
-                    caller_role="CouncilTable",
+                    caller_role=COUNCIL_CHAIR_ROLE,
                     candidate_dir=c_dir,
                 )
                 lead_spec = _resolve_council_specialist(routing_plan.lead_council_role)
@@ -3186,6 +3497,7 @@ class CreativeWritersRoom:
                 pivot_queue = ["GameplayDesigner", "VisualArtDirector", "GameplaySystemsEngineer"]
         elif use_dynamic_steering_routing:
             pivot_queue = [
+                COUNCIL_CHAIR_ROLE,
                 "GameplayDesigner",
                 "LevelAndProgressionDesigner",
                 "VisualArtDirector",
@@ -3193,7 +3505,7 @@ class CreativeWritersRoom:
                 "GameplaySystemsEngineer",
             ]
         else:
-            pivot_queue = ["CreativeDirector", "GameplaySystemsEngineer"]
+            pivot_queue = ["GameplaySystemsEngineer"]
 
         max_pivot_turns = 6
         visited_roles: set[str] = set()
@@ -3252,8 +3564,9 @@ class CreativeWritersRoom:
                         f"at its full intended architectural scope without defensiveness, excuses, or silent downgrading (Rule 5). "
                         f"Be candid and self-critical about where our current build fell short of their expectations (and never open `spoken_dialogue` with "
                         f"peer flattery or 'I completely agree with...'), reason from first principles about how to integrate their direction cleanly into "
-                        f"your domain, update your Living Game Bible sections, refine unstarted slice tasks in `backlog_refinements`, and raise focused, "
-                        f"achievable production-code `backlog_additions` tasks that deliver their request cleanly without boiling the ocean on unrelated systems. "
+                        f"your domain, update your Living Game Bible sections (including `updated_game_title` whenever a structural pivot renames the game), refine unstarted slice tasks in `backlog_refinements` "
+                        f"(using `action='cancel'` on any unstarted `ready`/`blocked` tasks that belong to superseded mechanics or UI when handling a `[STRUCTURAL PIVOT — PRUNE & REPLAN]`), "
+                        f"and raise focused, single-responsibility production-code `backlog_additions` tasks (including a root `pivot_cleanout_and_scene_consolidation` task targeting `main.gd` / `ui_hud.gd` when pivoting an existing cartridge so obsolete pre-pivot nodes and HUD gauges are removed cleanly) without boiling the ocean on unrelated systems. "
                         f"If another Council specialist's domain should handle or co-own this request next, set `route_to_council_role` and `routing_handoff_reason`."
                     ),
                 )
@@ -3306,6 +3619,50 @@ class CreativeWritersRoom:
                         active_agents=[spec["role"], routed_name],
                         phase="council_reroute",
                     )
+
+        if (
+            getattr(self, "_pending_structural_pivot_cleanout", False)
+            and self.board is not None
+            and candidate_dir is not None
+            and (Path(candidate_dir) / "main.gd").is_file()
+        ):
+            self._pending_structural_pivot_cleanout = False
+            open_code_items = [
+                it for it in self.board.items()
+                if it.state in ("ready", "blocked")
+                and it.kind in ("mechanic_code", "ui", "integration", "level_map")
+            ]
+            has_cleanout = any(
+                "cleanout" in it.item_id.lower()
+                or "consolidat" in it.item_id.lower()
+                or ("main.gd" in (it.target_modules or []) and not it.depends_on)
+                for it in open_code_items
+            )
+            if open_code_items and not has_cleanout:
+                active_s = game_bible.get_active_slice()
+                cleanout_sid = active_s.slice_id if active_s is not None else ""
+                cleanout_id = f"pivot_cleanout_and_scene_consolidation_{len(self.board.items()) + 1}"
+                target_clean_mods = ["main.gd"]
+                if (Path(candidate_dir) / "ui_hud.gd").is_file():
+                    target_clean_mods.append("ui_hud.gd")
+                cleanout_prop = WorkItemProposal(
+                    deliberation="Structural pivot on an existing cartridge requires stripping superseded pre-pivot nodes, systems, and HUD gauges from main.gd/ui_hud.gd before downstream pivot tasks execute.",
+                    item_id=cleanout_id,
+                    title="Pivot Cleanout & Scene Consolidation",
+                    kind="integration",
+                    spec=(
+                        f"Strip obsolete pre-pivot subsystems, unused preloaded scripts, and superseded HUD gauges from {target_clean_mods} "
+                        f"so `res://main.tscn` boots cleanly into the new game direction ('{game_bible.game_title}') with zero leftover pre-pivot clutter."
+                    ),
+                    proof_spec="Boot `res://main.tscn` cleanly with zero runtime errors, zero `[SCENE_AUDIT]` UI overlap warnings, and zero obsolete pre-pivot HUD panels.",
+                    target_modules=target_clean_mods,
+                    blocks_items=[it.item_id for it in open_code_items],
+                    slice_id=cleanout_sid,
+                )
+                try:
+                    self.board.add_items([cleanout_prop], raised_by_role="GameplaySystemsEngineer", slice_id=cleanout_sid)
+                except Exception as cl_exc:
+                    logger.debug("Optional pivot cleanout root task insertion skipped: %s", cl_exc)
 
     _SHAPING_COUNCIL_ROLES = (
         "GameplayDesigner",
@@ -3427,6 +3784,7 @@ class CreativeWritersRoom:
                 f"1. For EVERY task listed in `TASKS REQUIRING YOUR DOMAIN REVIEW` above, include one `WorkItemRefinement` entry in `backlog_refinements` with matching `item_id`:\n"
                 f"   - Set `action='enrich'` and populate `spec_addition_or_rewrite` (plus optional `proof_spec_update`, `add_depends_on`, or `add_target_modules`—using encapsulated per-feature `.gd` paths like `scenes/mechanics/<feature>.gd`, `scenes/entities/<entity>.gd`, or `scenes/ui/<widget>.gd` when assigning or refining code targets so parallel SWE workers can lock disjoint files) whenever your domain has direction, integration contracts, UX affordances, non-overlapping HUD layout rules, world/progression hooks, visual rig/silhouette specs, or reactive audio cues for that task.\n"
                 f"   - Specify generalizable, world-wide invariants (querying authoritative world geometry/regions, node groups, and player-driven controls/state across the entire map)—never prescribe hardcoded `(x, y)` coordinate whitelists, bounding-box overrides, or fixed aiming/spawn coordinates for production code (keep sample coordinates strictly in `proof_spec_update` if needed as QA test landmarks).\n"
+                f"   - SINGLE-RESPONSIBILITY GUARD: Keep `spec_addition_or_rewrite` surgical to THIS task's existing responsibility—NEVER stuff multi-system wishlists, secondary UI dashboards, or out-of-slice features into a focused task (and NEVER instruct free `t=0` handouts or decorative Potemkin stubs).\n"
                 f"   - Set `action='no_input'` ONLY if, after deliberating, your domain genuinely has zero requirements or touchpoints with that specific task.\n"
                 f"2. Leave `backlog_additions=[]` in Stage 2 (all companion tasks were already raised in Stage 1).\n"
                 f"Return `TaskShapingBatch` with `deliberation` FIRST."
@@ -3626,7 +3984,7 @@ class CreativeWritersRoom:
                         speaker_role=role_name,
                         speaker_display_name=display_name,
                         spoken_dialogue=f"{batch.deliberation} {' '.join(spoken_parts)}".strip(),
-                        addressed_to=["CreativeDirector", "GameplayDesigner", "GameplaySystemsEngineer"],
+                        addressed_to=[COUNCIL_CHAIR_ROLE, "GameplayDesigner", "GameplaySystemsEngineer"],
                         bible_updates_summary=summary_badges,
                     )
                     game_bible.writers_room_transcript.append(shaping_utt)
@@ -3736,16 +4094,18 @@ class CreativeWritersRoom:
             )
             main_scene_res = reach.get("main_scene") or "res://main.tscn"
             boot_errs: List[str] = []
+            hands_off_lines: List[str] = []
             try:
-                from engine.sim.godot_verifier import GodotHeadlessSimulator
+                from engine.sim.godot_verifier import GodotHeadlessSimulator, format_scene_audit_lint_warnings
 
+                baseline_ticks = 1200 if is_real_genai_client(self.client) else 15
                 boot_sim = GodotHeadlessSimulator(
                     c_dir,
                     capture_viewport=False,
-                    capture_ticks=[1, 15],
+                    capture_ticks=[2, baseline_ticks] if baseline_ticks > 2 else [1, baseline_ticks],
                     input_script=[],
                     setup_script=None,
-                    max_ticks=15,
+                    max_ticks=baseline_ticks,
                     telemetry_mode="null",
                     target_scene=main_scene_res,
                 )
@@ -3757,8 +4117,33 @@ class CreativeWritersRoom:
                 ] + list(getattr(boot_sim, "script_errors", None) or [])
                 if getattr(boot_state, "is_crashed", False) and not boot_errs:
                     boot_errs.append(f"Playable entrypoint '{main_scene_res}' exited abnormally during zero-input boot sanity check.")
+                snaps_by_t = getattr(boot_sim, "state_snapshots", None) or {}
+                if isinstance(snaps_by_t, dict) and snaps_by_t:
+                    sorted_ts = sorted(int(k) for k in snaps_by_t.keys())
+                    s_first = snaps_by_t.get(sorted_ts[0]) or snaps_by_t.get(str(sorted_ts[0])) or {}
+                    s_last = snaps_by_t.get(sorted_ts[-1]) or snaps_by_t.get(str(sorted_ts[-1])) or {}
+                    changed_keys: List[str] = []
+                    for sk in sorted(set(s_first.keys()) | set(s_last.keys())):
+                        if sk in ("sim_tick", "tick", "elapsed_time", "time_sec", "fps"):
+                            continue
+                        if s_first.get(sk) != s_last.get(sk):
+                            changed_keys.append(f"{sk}: {s_first.get(sk)!r} -> {s_last.get(sk)!r}")
+                    hands_off_lines.append(
+                        f"Zero-Input Hands-Off Run on `{main_scene_res}` ({sorted_ts[0]} -> {sorted_ts[-1]} ticks, ~{sorted_ts[-1] / 60.0:.1f}s with ZERO player input): "
+                        + (
+                            "State changes observed without player input: " + "; ".join(changed_keys[:20])
+                            if changed_keys
+                            else "All tracked gameplay state keys remained unchanged under zero player input."
+                        )
+                    )
+                boot_lints = format_scene_audit_lint_warnings(getattr(boot_sim, "scene_audit", None) or {})
+                if boot_lints:
+                    hands_off_lines.append("Deterministic `[SCENE_AUDIT]` Lint Warnings on `res://main.tscn`: " + " | ".join(boot_lints))
+                else:
+                    hands_off_lines.append("Deterministic `[SCENE_AUDIT]` Lint Check on `res://main.tscn`: 0 UI overlap/overflow/upscale warnings.")
             except Exception as boot_exc:
                 boot_errs = [str(boot_exc)]
+            self._last_hands_off_baseline_dossier = "\n".join(hands_off_lines)
 
             unreferenced_mods = list(reach.get("unreferenced_from_entrypoint") or [])
             if not boot_errs and not unreferenced_mods:
@@ -3796,7 +4181,7 @@ class CreativeWritersRoom:
                     f"QA is building & running an automated Slice Playtest Script for '{active_slice_title}' "
                     f"(Playtest & Assembly Check #{pass_index + 1})..."
                 ),
-                active_agents=["QATestEngineer", "CreativeDirector", "GameplaySystemsEngineer", "GameplayDesigner", "UXExperienceDesigner"],
+                active_agents=["QATestEngineer", COUNCIL_CHAIR_ROLE, "GameplaySystemsEngineer", "GameplayDesigner", "UXExperienceDesigner"],
                 phase="slice_assembly_check",
             )
 
@@ -3980,7 +4365,7 @@ class CreativeWritersRoom:
                 speaker_role="QATestEngineer",
                 speaker_display_name="Autonomous QA Playtester",
                 spoken_dialogue=qa_spoken,
-                addressed_to=["GameplayDesigner", "UXExperienceDesigner", "VisualArtDirector", "GameplaySystemsEngineer", "CreativeDirector"],
+                addressed_to=[COUNCIL_CHAIR_ROLE, "GameplayDesigner", "UXExperienceDesigner", "VisualArtDirector", "GameplaySystemsEngineer"],
                 bible_updates_summary=[f"slice_playtest:{active_slice_id}:pass_{pass_index}"],
                 proof_image_paths=[rel_proof_path],
                 artifact_emitted={
@@ -4145,7 +4530,7 @@ class CreativeWritersRoom:
                         speaker_role=p_role,
                         speaker_display_name=disp_name,
                         spoken_dialogue=turn_decision.spoken_dialogue,
-                        addressed_to=turn_decision.addressed_to or ["CreativeDirector", "GameplaySystemsEngineer"],
+                        addressed_to=turn_decision.addressed_to or [COUNCIL_CHAIR_ROLE, "GameplaySystemsEngineer"],
                         bible_updates_summary=[
                             f"slice_playtest_vote:{p_role}:{'pass' if turn_decision.is_playable_and_fun_from_my_perspective else 'needs_work'}"
                         ],
@@ -4309,7 +4694,7 @@ class CreativeWritersRoom:
             speaker_role="GameplaySystemsEngineer",
             speaker_display_name="Gameplay Systems Engineer",
             spoken_dialogue=spoken,
-            addressed_to=["CreativeDirector", "GameplayDesigner", "UXExperienceDesigner", "VisualArtDirector"],
+            addressed_to=[COUNCIL_CHAIR_ROLE, "GameplayDesigner", "UXExperienceDesigner", "VisualArtDirector"],
             bible_updates_summary=updates_list,
             proof_image_paths=attach_chair_proofs,
             artifact_emitted=chair_artifact,
@@ -4391,7 +4776,7 @@ class CreativeWritersRoom:
             ),
             active_agents=[
                 "BlindPlaytesterAgent",
-                "CreativeDirector",
+                COUNCIL_CHAIR_ROLE,
                 "UXExperienceDesigner",
                 "GameplayDesigner",
                 "VisualArtDirector",
@@ -4536,7 +4921,7 @@ class CreativeWritersRoom:
             speaker_display_name="Blind AI Playtester (Session Report)",
             spoken_dialogue="\n".join(player_dialogue_lines),
             addressed_to=[
-                "CreativeDirector",
+                COUNCIL_CHAIR_ROLE,
                 "UXExperienceDesigner",
                 "GameplayDesigner",
                 "VisualArtDirector",
@@ -4669,15 +5054,24 @@ class CreativeWritersRoom:
             omit_playtest_session_ids={str(session_id)} if session_id else None,
         )
         blind_dna_header = self._dna_header_if_absent(dna_summary, blind_bible_snapshot)
+        hands_off_dossier_str = str(getattr(self, "_last_hands_off_baseline_dossier", "") or "").strip()
+        hands_off_block = (
+            f"=== 20-SECOND HANDS-OFF ZERO-INPUT BASELINE & SCENE LINT FACT SHEET ===\n{hands_off_dossier_str}\n\n"
+            if hands_off_dossier_str
+            else ""
+        )
         blind_dossier = (
             f"{blind_dna_header}"
             f"{blind_bible_snapshot}\n\n"
             f"{curated_code_block}"
+            f"{hands_off_block}"
             f"=== BLIND AI PLAYTESTER END-OF-SLICE SESSION REPORT (`{session_id}` | Pass #{pass_index + 1}) ===\n"
             f"Active Slice Under Evaluation: `{active_slice_id}` — '{active_slice_title}'\n"
             f"Session Status: {sess.get('status')} (outcome={sess.get('end_outcome')}, turns={sess.get('turn_count')}, sim_duration={sess.get('sim_duration_sec')}s)\n"
             f"Overall Fun Rating: {fun_rating}/10\n"
             f"Overall Experience Summary: {overall_summary}\n"
+            f"Agency, Strategy & Challenge Critique: {report.get('agency_strategy_and_challenge_critique', '')}\n"
+            f"Input-to-World Spatial Click Precision: {report.get('input_spatial_precision', '')}\n"
             f"Visual & UI Defects Observed: {json.dumps(report.get('visual_and_ui_defects_observed') or [])}\n"
             f"Graphics & Visuals: {report.get('graphics_and_visuals', '')}\n"
             f"Gameplay & Feel: {report.get('gameplay_and_feel', '')}\n"
@@ -4740,7 +5134,7 @@ class CreativeWritersRoom:
                         f"Council specialists ({', '.join(panel_roles)}) are deliberating on the Blind Playtester's "
                         f"Experience Report & {len(wishes)} wish(es)..."
                     ),
-                    active_agents=panel_roles + ["CreativeDirector"],
+                    active_agents=panel_roles + [COUNCIL_CHAIR_ROLE],
                     phase="slice_blind_playtest",
                 )
                 for p_role in panel_roles:
@@ -4761,18 +5155,18 @@ class CreativeWritersRoom:
                         f"{final_playtest_note}\n"
                         f"{mandate}\n"
                         "INSTRUCTIONS:\n"
-                        "1. Remember: the Blind Playtester is a fast non-thinking player model playing cold with ZERO internal instructions. "
-                        "Do NOT take a high `overall_fun_rating` or optimistic report prose at face value! Independently audit the attached "
-                        "HIGH-resolution screenshots, `BLIND PLAYER CHRONOLOGICAL ACTION TAPE`, and curated source code (and cater with full respect to any Executive Producer directives).\n"
-                        "2. Specifically verify (`domain_reaction_to_blind_player`):\n"
-                        "   - Did visible objectives/counters actually progress through genuine player decisions, or did the player get stuck in "
-                        "repetitive no-op clicks, hallucinate that decorative UI was interactive, or leave core slice loops unexercised?\n"
-                        "   - Did any mechanics 'play themselves' via hardcoded target coordinates, timer-driven inventory shortcuts, or fake "
-                        "progression credits instead of real player agency?\n"
-                        "   - Are there visual/UI craft defects in the HIGH-resolution screenshots—cut-off sprites or stray bleeding edge "
-                        "slivers from wrong sprite-sheet slicing, squished/distorted UI icons, text overflowing panel borders or truncated "
-                        "mid-word, overlapping/duplicate HUD widgets, harsh unblended rectangular texture boxes inside shapes, raw untextured "
-                        "placeholder polygons clashing with detailed sprites, or silent/dropped audio?\n"
+                        "1. The Blind Playtester is a discerning gamer model (`ThinkingLevel.MEDIUM`) playing cold with ZERO internal instructions, "
+                        "aided on post-click screenshots by a diagnostic cyan/magenta target reticle (`ACTION @ (x,y)`). "
+                        "Do NOT take a high `overall_fun_rating` at face value! Independently cross-check the attached HIGH-resolution screenshots, "
+                        "`20-SECOND HANDS-OFF ZERO-INPUT BASELINE & SCENE LINT FACT SHEET`, `BLIND PLAYER CHRONOLOGICAL ACTION TAPE`, and curated source code.\n"
+                        "2. Specifically verify (`domain_reaction_to_blind_player`) & classify UX/Bug Failure vs. Good Strategic Failure:\n"
+                        "   - **UX / SPATIAL / SELF-PLAY BUG FAILURE (MUST FIX)**: Did resources/objectives tick up passively in the `20-SECOND HANDS-OFF ZERO-INPUT BASELINE`, "
+                        "did everything unlock for free without discovery or strategy, did clicked placements spawn at a `Camera2D` offset away from the diagnostic target reticle, "
+                        "did controls no-op, or did `[SCENE_AUDIT]` / HIGH-res screenshots reveal blurry upscaled low-res sprites, incompatible camera projections, UI rect overlaps, "
+                        "or clipped text?\n"
+                        "   - **GOOD STRATEGIC FAILURE (PRESERVE CHALLENGE — NEVER NERF INTO SELF-PLAY!)**: If the Blind Playtester lost, ran low on scarce resources, or missed "
+                        "moving targets because they played suboptimally WHILE controls, spatial click accuracy, and affordances were clear and fair, that is **GOOD GAME DESIGN**! "
+                        "NEVER propose remediation tasks that inflate `t=0` starting resources, add passive free resource generation, widen hitboxes into giant magnets, or make the game play itself!\n"
                         "3. PRAGMATIC SLICE SCOPE & COMPLETION DISCIPLINE — distinguish sharply between:\n"
                         "   - BOUNDED CURRENT-SLICE CLEANUPS (`priority_fixes_or_refinements` — keep tight, 0–3 surgical items): unmet active-slice scope or Executive Producer direction, "
                         "onboarding/control dead-ends, repetitive no-op traps, auto-playing/hardcoded shortcuts bypassing player agency, glaring sprite-slicing/UI-overflow/overlap glitches, or silent core audio.\n"
@@ -4803,7 +5197,7 @@ class CreativeWritersRoom:
                         speaker_role=p_role,
                         speaker_display_name=disp_name,
                         spoken_dialogue=turn_dec.spoken_dialogue,
-                        addressed_to=turn_dec.addressed_to or ["CreativeDirector"],
+                        addressed_to=turn_dec.addressed_to or [COUNCIL_CHAIR_ROLE],
                         bible_updates_summary=[
                             f"blind_playtest_vote:{p_role}:{'approve' if turn_dec.recommends_slice_approval else 'iterate'}"
                         ],
@@ -4832,10 +5226,13 @@ class CreativeWritersRoom:
                 if roundtable_lines
                 else ""
             )
+            coprod_blind_ctx = self._load_coproducer_session_context(c_dir)
+            coprod_blind_block = f"{coprod_blind_ctx}\n\n" if coprod_blind_ctx else ""
             verdict_prompt = (
                 f"{blind_shared_prefix}"
+                f"{coprod_blind_block}"
                 f"{roundtable_block}"
-                f"You are the Creative Director chairing the Council's End-of-Slice Blind Playtest Verdict for "
+                f"You are the {COUNCIL_CHAIR_DISPLAY_NAME} ({COUNCIL_CHAIR_ROLE}) chairing the Council's End-of-Slice Blind Playtest Verdict for "
                 f"'{active_slice_title}' (`{active_slice_id}`, {blind_pass_label}).\n"
                 f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n"
                 f"{final_playtest_note}\n"
@@ -4843,13 +5240,14 @@ class CreativeWritersRoom:
                 "1. Independently and skeptically audit the Blind Playtester's HIGH-resolution screenshots, `BLIND PLAYER CHRONOLOGICAL ACTION TAPE`, curated source code, "
                 "6-pillar Experience Report, `overall_fun_rating`, discovered controls rulebook, wishes, any Executive Producer directives, and the Council Roundtable Discussion. "
                 "Never rubber-stamp an inflated `overall_fun_rating`, and never open `spoken_dialogue` with 'I completely agree with the Council' or cheerleading.\n"
-                "2. APPLY PRAGMATIC SLICE COMPLETION JUDGMENT (WE CANNOT CHANGE EVERYTHING IN ONE GO) — decide between two clear moves:\n"
-                "   - `iterate_current_slice`: Choose this when active-slice scope or an Executive Producer directive is unmet, OR when high-impact problem areas "
-                "(onboarding dead-ends, repetitive no-op loops, stalled progression, auto-playing/shortcutted mechanics bypassing player agency, glaring sprite-bleed/UI-overflow/overlap glitches, "
-                "corrupted/placeholder visual assets on the `CARTRIDGE VISUAL ASSET CONTACT SHEET`, or silent core audio) need surgical cleanup before closing this slice. Keep gameplay/UX `backlog_additions` "
-                "tight and surgical (1–3 focused gameplay/UX `WorkItemProposal` tasks—never boil the ocean with a massive redesign list!), PLUS any atomic in-place `visual_asset` regeneration tasks and "
-                "dependent `.gd` reintegration task required by `CARTRIDGE VISUAL ASSET & GDSCRIPT SLICING INTEGRITY AUDIT`, targeting real production modules with systemic, world-wide fixes (never single-coordinate point patches) "
-                "and concrete `proof_spec` verification, and defer broader feature wishes to `next_slice_carryover_notes`.\n"
+                "2. APPLY CHALLENGE-PRESERVING SLICE JUDGMENT (UX/BUG FAILURE VS. GOOD STRATEGIC FAILURE) — decide between two clear moves:\n"
+                "   - `iterate_current_slice`: Choose this when active-slice scope or an Executive Producer directive is unmet, OR when genuine UX/Spatial/Visual/Self-Play defects "
+                "(passive zero-input resource generation in the `20-SECOND HANDS-OFF ZERO-INPUT BASELINE`, free `t=0` handouts eliminating strategy, click-to-world `Camera2D` placement offsets "
+                "visible against the diagnostic target reticle, onboarding dead-ends, `[SCENE_AUDIT]` UI overlaps/clipped labels/blurry upscaled sprites, corrupted/placeholder visual assets on "
+                "the `CARTRIDGE VISUAL ASSET CONTACT SHEET`, or silent core audio) need surgical cleanup before closing this slice. Keep gameplay/UX `backlog_additions` tight and surgical "
+                "(1–3 focused `WorkItemProposal` tasks—never boil the ocean!), PLUS any atomic in-place `visual_asset` regeneration tasks required by `CARTRIDGE VISUAL ASSET & GDSCRIPT SLICING INTEGRITY AUDIT`. "
+                "CONSERVATION OF CHALLENGE INVARIANT: If the Blind Playtester struggled or lost due to genuine strategic scarcity or skill challenge while UX/controls were clear, NEVER emit tasks that "
+                "grant free `t=0` resources, add passive auto-harvesting, or self-complete the loop!\n"
                 "   - `approve_slice`: CALL THE SLICE DONE when the screenshots, action tape, and code confirm that THIS slice's intended scope (and any Executive Producer request) "
                 "is genuinely covered and playable through real player decisions and major problem areas have been cleaned up—even if non-blocking rough edges or broader wishes remain! "
                 "Be candid in `spoken_dialogue` about what is still rough, capture those deferred improvements and wishes cleanly in `next_slice_carryover_notes`, and set `backlog_additions=[]`.\n"
@@ -4872,9 +5270,9 @@ class CreativeWritersRoom:
                 return issues
 
             self._emit_activity(
-                agent_role="CreativeDirector",
-                status_text=f"Creative Director synthesizing Council Blind Playtest Verdict for '{active_slice_title}'...",
-                active_agents=["CreativeDirector"],
+                agent_role=COUNCIL_CHAIR_ROLE,
+                status_text=f"{COUNCIL_CHAIR_DISPLAY_NAME} synthesizing Council Blind Playtest Verdict for '{active_slice_title}'...",
+                active_agents=[COUNCIL_CHAIR_ROLE],
                 phase="slice_blind_playtest",
             )
             verdict = self._structured_with_validation(
@@ -4883,7 +5281,7 @@ class CreativeWritersRoom:
                 _validate_blind_verdict,
                 temperature=0.3,
                 parts=multimodal_parts,
-                caller_role="CreativeDirector",
+                caller_role=COUNCIL_CHAIR_ROLE,
                 candidate_dir=c_dir,
                 slice_id=active_slice_id,
                 cacheable_prefix=blind_shared_prefix,
@@ -4894,7 +5292,7 @@ class CreativeWritersRoom:
         if verdict.verdict == "iterate_current_slice" and verdict.backlog_additions:
             added = self.board.add_items(
                 verdict.backlog_additions,
-                raised_by_role="CreativeDirector",
+                raised_by_role=COUNCIL_CHAIR_ROLE,
                 slice_id=active_slice_id,
             )
 
@@ -4976,10 +5374,10 @@ class CreativeWritersRoom:
 
         dir_utt = WritersRoomUtterance(
             deliberation=verdict.deliberation,
-            utterance_id=f"utt_{dir_idx:02d}_CreativeDirector_blind_verdict_{pass_index}",
+            utterance_id=f"utt_{dir_idx:02d}_{COUNCIL_CHAIR_ROLE}_blind_verdict_{pass_index}",
             turn_index=dir_idx,
-            speaker_role="CreativeDirector",
-            speaker_display_name="Creative Director",
+            speaker_role=COUNCIL_CHAIR_ROLE,
+            speaker_display_name=COUNCIL_CHAIR_DISPLAY_NAME,
             spoken_dialogue=dir_spoken,
             addressed_to=[
                 "GameplayDesigner",
@@ -5007,6 +5405,24 @@ class CreativeWritersRoom:
             },
         )
         self._persist_bible(game_bible, candidate_dir=candidate_dir)
+
+        if (c_dir / "co_producer.json").is_file():
+            try:
+                from engine.studio.coproducer import record_milestone_notice
+
+                verdict_tag = "ITERATE SLICE" if added else "SLICE APPROVED"
+                record_milestone_notice(
+                    cartridges_root=c_dir.parent,
+                    cartridge_id=c_dir.name,
+                    deliberation=verdict.deliberation,
+                    content_markdown=(
+                        f"**Council Blind Playtest Verdict ({verdict_tag})** — `{active_slice_id}` "
+                        f"(fun `{fun_rating}/5`): {verdict.player_experience_synthesis}"
+                        + (f" — queued `{len(added)}` remediation task(s) on the ProductionBoard." if added else "")
+                    ),
+                )
+            except Exception as cp_exc:
+                logger.debug("Optional Co-Producer blind playtest milestone sync skipped: %s", cp_exc)
 
         if (
             added
@@ -5112,7 +5528,7 @@ class CreativeWritersRoom:
             for tm in p.target_modules:
                 if tm not in combined_targets:
                     combined_targets.append(tm)
-        addressed_roles = ["GameplaySystemsEngineer", "GameplayDesigner", "CreativeDirector"]
+        addressed_roles = ["GameplaySystemsEngineer", "GameplayDesigner", COUNCIL_CHAIR_ROLE]
         if any(p.kind == "visual_asset" for p in proposals):
             addressed_roles.insert(0, "VisualArtDirector")
         fail_type_str = trace.failure_type.value if hasattr(trace.failure_type, "value") else str(trace.failure_type)
@@ -5177,6 +5593,7 @@ class CreativeWritersRoom:
             return
         steered_before_shaping = self._consume_pending_steering(game_bible, candidate_dir=candidate_dir)
         if steered_before_shaping:
+            self._structural_pivot_triggered = False
             self._execute_steering_pivot_turns(game_bible, dna_summary, candidate_dir, steered_before_shaping)
         has_active_flight = any(
             i.state in ("in_progress", "waiting_for_lock", "awaiting_review", "changes_requested")
@@ -5193,6 +5610,7 @@ class CreativeWritersRoom:
             self._run_council_task_shaping_round(game_bible, dna_summary, candidate_dir=candidate_dir)
             steered_after_shaping = self._consume_pending_steering(game_bible, candidate_dir=candidate_dir)
             if steered_after_shaping:
+                self._structural_pivot_triggered = False
                 self._execute_steering_pivot_turns(game_bible, dna_summary, candidate_dir, steered_after_shaping)
         if self.scheduler is not None:
             self.scheduler.start()
@@ -5248,10 +5666,14 @@ class CreativeWritersRoom:
                 deadline += paused_dur
             steered = self._consume_pending_steering(game_bible, candidate_dir=candidate_dir)
             if steered:
+                was_structural_pivot = bool(getattr(self, "_structural_pivot_triggered", False))
+                self._structural_pivot_triggered = False
                 self._execute_steering_pivot_turns(game_bible, dna_summary, candidate_dir, steered)
-                if not self.board.is_drained():
+                if not self.board.is_drained() or was_structural_pivot:
                     assembly_passes = 0
                     assembly_verified = max_assembly_passes <= 0
+                    if was_structural_pivot:
+                        blind_playtest_passes = 0
                     blind_playtest_verified = max_blind_playtest_passes <= 0
                     qa_gate_passes = 0
                     qa_gate_verified = max_qa_gate_passes <= 0
@@ -5282,7 +5704,7 @@ class CreativeWritersRoom:
                         self._final_verification_assembly_pass = False
                     assembly_passes += 1
                     if added_assembly > 0:
-                        if is_final_assembly_verify:
+                        if is_final_assembly_verify and not self._has_unconsumed_operator_steering(candidate_dir):
                             cur_s = game_bible.get_active_slice()
                             raise StudioAgentError(
                                 f"Slice '{cur_s.slice_id if cur_s is not None else 'active'}' failed "
@@ -5313,7 +5735,7 @@ class CreativeWritersRoom:
                         self._final_verification_blind_playtest_pass = False
                     blind_playtest_passes += 1
                     if added_playtest > 0:
-                        if is_final_playtest_verify:
+                        if is_final_playtest_verify and not self._has_unconsumed_operator_steering(candidate_dir):
                             cur_s = game_bible.get_active_slice()
                             raise StudioAgentError(
                                 f"Slice '{cur_s.slice_id if cur_s is not None else 'active'}' failed "
@@ -5344,7 +5766,7 @@ class CreativeWritersRoom:
                         self._final_verification_qa_gate_pass = False
                     qa_gate_passes += 1
                     if added_qa > 0:
-                        if is_final_qa_verify:
+                        if is_final_qa_verify and not self._has_unconsumed_operator_steering(candidate_dir):
                             cur_s = game_bible.get_active_slice()
                             raise StudioAgentError(
                                 f"Slice '{cur_s.slice_id if cur_s is not None else 'active'}' failed "
@@ -5537,17 +5959,20 @@ class CreativeWritersRoom:
         return chosen_spec, chosen_check
 
     def _evaluate_convergence(self, game_bible: GameBibleSpec, dna_summary: str) -> DirectorConvergenceCheck:
-        """CreativeDirector evaluates whether the Living Game Bible is cohesive and ready to lock."""
+        """CoProducer (Council Chair) evaluates whether the Living Game Bible is cohesive and ready to lock."""
         self._emit_activity(
-            agent_role="CreativeDirector",
-            status_text="Creative Director is evaluating Game Bible cohesion & convergence readiness...",
-            active_agents=["CreativeDirector"],
+            agent_role=COUNCIL_CHAIR_ROLE,
+            status_text=f"{COUNCIL_CHAIR_DISPLAY_NAME} is evaluating Game Bible cohesion & convergence readiness...",
+            active_agents=[COUNCIL_CHAIR_ROLE],
             phase="convergence_check",
         )
         bible_snapshot = self._format_bible_snapshot(game_bible)
+        coprod_ctx = self._load_coproducer_session_context()
+        coprod_block = f"{coprod_ctx}\n\n" if coprod_ctx else ""
         prompt = (
-            f"You are the CreativeDirector of the Game Studio Writers' Room.\n"
+            f"You are the {COUNCIL_CHAIR_DISPLAY_NAME} ({COUNCIL_CHAIR_ROLE}) leading the Game Studio Writers' Room.\n"
             f"PLAYER DNA & STUDIO CONTEXT:\n{dna_summary}\n\n"
+            f"{coprod_block}"
             f"{STUDIO_CRITICAL_DISCOURSE_CHARTER}\n\n"
             f"{bible_snapshot}\n"
             f"Skeptically evaluate whether the Living Game Bible is ready to lock and enter production for the active slice (catering faithfully to any Executive Producer creative seed/directives while ensuring the active slice is ambitious yet realistically buildable without trying to cram five sequels into Slice 0).\n"
@@ -5558,11 +5983,11 @@ class CreativeWritersRoom:
             f"4. Synthesized 16:9 Visual Mockup board(s),\n"
             f"5. Cohesive World Lore, Audio direction, and Characters/Entities as appropriate to the game concept,\n"
             f"6. A Technical Architecture Blueprint (`technical_architecture_blueprint`) from GameplaySystemsEngineer translating mechanics into Godot 4 nodes, procedural/shader or sprite rendering, colliders, and test invariants.\n"
-            f"7. A COHESIVE WHOLE GAME (NEVER A TINY TUTORIAL SLICE): a Level Generation Strategy (how levels are produced and what they look like), a Core Loop at three time scales "
-            f"(moment-to-moment, minute-to-minute, and session loops, plus `player_agency_and_optimization_depth`), an Engagement Plan, an Onboarding Plan (where onboarding is ONLY the opening 60 seconds, never the whole game), "
-            f"and a Goal Hierarchy spanning short-, mid- and long-term goals. Do NOT lock the Bible if `slice_roadmap` or the Production Board items shrink the build into 'the smallest slice possible' "
-            f"(e.g. a 4-step tutorial or a 1-step connection) while deferring the actual minute-to-minute/session loop and systemic depth to unbuilt future slices! "
-            f"Current structural gaps: {validate_game_design(game_bible) or 'none'}.\n"
+            f"7. FUN, EARNED AGENCY & A TIGHT 'FIND THE FUN' SLICE 0 (ZERO BOIL-THE-OCEAN OR SELF-PLAY): a Level Generation Strategy, a Core Loop honoring the Fun & Tension Pact "
+            f"(`core_decision_or_skill_test`, `pushback_and_scarcity_model`, `earned_vs_given_progression`, `player_agency_and_optimization_depth`), an Engagement Plan, an Onboarding Plan "
+            f"(orienting the player in <=60s without playing the game for them), and an earned Goal Hierarchy. Lock Slice 0 when it scopes a tight, replayable 'Find the Fun' loop around "
+            f"2–3 100%-real verbs with genuine scarcity/skill tension—do NOT lock if Slice 0 either hands out free passive self-completing progression OR boils the ocean with 5+ sprawling subsystems! "
+            f"Current structural gaps: {validate_game_design(game_bible, enforce_fun_pact=is_real_genai_client(self.client)) or 'none'}.\n"
             f"Return your structured DirectorConvergenceCheck with `deliberation` FIRST."
         )
         return self._call_structured_llm(prompt, DirectorConvergenceCheck, temperature=0.4)
@@ -5570,18 +5995,21 @@ class CreativeWritersRoom:
     def _synthesize_final_world_spec(self, game_bible: GameBibleSpec, dna: Optional[SteamPlayerDNA], target_episode: int) -> GenesisWorldSpec:
         """Synthesizes the authoritative GenesisWorldSpec grounded in the locked Living Game Bible."""
         self._emit_activity(
-            agent_role="CreativeDirector",
-            status_text=f"Creative Director is synthesizing authoritative GenesisWorldSpec for '{game_bible.game_title}'...",
-            active_agents=["CreativeDirector"],
+            agent_role=COUNCIL_CHAIR_ROLE,
+            status_text=f"{COUNCIL_CHAIR_DISPLAY_NAME} is synthesizing authoritative GenesisWorldSpec for '{game_bible.game_title}'...",
+            active_agents=[COUNCIL_CHAIR_ROLE],
             phase="world_spec_synthesis",
         )
         bible_snapshot = self._format_bible_snapshot(game_bible)
+        coprod_ctx = self._load_coproducer_session_context()
+        coprod_block = f"{coprod_ctx}\n\n" if coprod_ctx else ""
         mood_hint = getattr(dna, "preferred_palette_mood", None) if dna is not None else None
         mood_line = f"Preferred Palette Mood Hint: {mood_hint}\n" if mood_hint else ""
         prompt = (
-            f"You are the CreativeDirector finalizing the authoritative GenesisWorldSpec from the Writers' Room Living Game Bible.\n"
+            f"You are the {COUNCIL_CHAIR_DISPLAY_NAME} ({COUNCIL_CHAIR_ROLE}) finalizing the authoritative GenesisWorldSpec from the Writers' Room Living Game Bible.\n"
             f"Target Episode: {target_episode}\n"
             f"{mood_line}\n"
+            f"{coprod_block}"
             f"{bible_snapshot}\n"
             f"Synthesize the complete GenesisWorldSpec honoring every single pillar, UI & onboarding rule, camera staging, "
             f"and story hook agreed upon by the Writers' Room. Provide `deliberation` FIRST."
@@ -5615,8 +6043,9 @@ class CreativeWritersRoom:
     ) -> None:
         """Gives the owning specialist a mandatory turn for every missing/incomplete game-design section
         and ensures every required domain specialist has contributed before locking a Production Board build."""
+        enforce_pact = is_real_genai_client(self.client)
         for _round in range(max_rounds):
-            issues = validate_game_design(game_bible)
+            issues = validate_game_design(game_bible, enforce_fun_pact=enforce_pact)
             missing_specialists = self._missing_required_board_specialists(game_bible)
             if not issues and not missing_specialists:
                 return
@@ -5647,7 +6076,7 @@ class CreativeWritersRoom:
                     proposal=proposal,
                     candidate_dir=candidate_dir,
                 )
-        remaining = validate_game_design(game_bible)
+        remaining = validate_game_design(game_bible, enforce_fun_pact=enforce_pact)
         if remaining:
             raise StudioAgentError(f"Game Bible still lacks required game-design content after completion turns: {remaining}")
 
@@ -5657,9 +6086,13 @@ class CreativeWritersRoom:
         if workers <= 1:
             return [fn(i) for i in items]
         parent_scope = get_active_explicit_prefix_cache_scope(self.client)
+        parent_interactive = is_interactive_foreground_turn()
 
         def _wrapped_fn(item: Any) -> Any:
-            with bind_explicit_prefix_cache_scope(parent_scope):
+            with (
+                bind_explicit_prefix_cache_scope(parent_scope),
+                interactive_foreground_call_scope() if parent_interactive else contextlib.nullcontext(),
+            ):
                 return fn(item)
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -5668,9 +6101,86 @@ class CreativeWritersRoom:
     def _resolve_memory_dir(self, candidate_dir: Optional[Path] = None) -> Optional[Path]:
         if candidate_dir is not None:
             return Path(candidate_dir)
+        active_cand = getattr(self, "_active_candidate_dir", None)
+        if active_cand is not None:
+            return Path(active_cand)
         if self.board is not None and getattr(self.board, "path", None) is not None:
             return Path(self.board.path).parent
         return None
+
+    def _load_coproducer_session_context(self, candidate_dir: Optional[Path] = None) -> str:
+        """Loads the cartridge's 1-on-1 Co-Producer brief (`co_producer_brief.json`) and recent conversation
+        history (`co_producer.json`) so `CoProducer` leads the Council with full continuity of the Executive
+        Producer's 1-on-1 partnership."""
+        eff_dir = self._resolve_memory_dir(candidate_dir)
+        if eff_dir is None or not eff_dir.is_dir():
+            return ""
+        sections: List[str] = []
+        brief_path = eff_dir / "co_producer_brief.json"
+        if brief_path.is_file():
+            try:
+                raw_env = json.loads(brief_path.read_text(encoding="utf-8"))
+                if isinstance(raw_env, dict):
+                    h_mode = str(raw_env.get("handoff_mode") or "").strip()
+                    seed_note = str(raw_env.get("steering_or_seed_brief") or "").strip()
+                    cb = raw_env.get("concept_brief") if isinstance(raw_env.get("concept_brief"), dict) else {}
+                    b_lines: List[str] = []
+                    if h_mode:
+                        b_lines.append(f"- Handoff Mode: `{h_mode}`")
+                    if seed_note:
+                        b_lines.append(f"- Producer Commissioning Note: {seed_note[:400]}")
+                    for lbl, key in (
+                        ("Working Title", "working_title"),
+                        ("Genre", "core_genre"),
+                        ("Elevator Pitch", "elevator_pitch"),
+                        ("Core Fantasy", "core_fantasy"),
+                        ("Core Player Verbs", "core_player_verbs"),
+                        ("First 60 Seconds Feel", "first_60_seconds_feel"),
+                        ("Visual Style Direction", "visual_style_direction"),
+                        ("Audio Mood Direction", "audio_mood_direction"),
+                        ("Explicit Non-Goals (NEVER Drift Into)", "explicit_non_goals"),
+                    ):
+                        val = cb.get(key)
+                        if val:
+                            b_lines.append(f"- {lbl}: {val}")
+                    if b_lines:
+                        sections.append("Co-Designed Concept Brief:\n" + "\n".join(b_lines))
+            except Exception as exc:
+                logger.debug("Skipping unreadable co_producer_brief.json in %s: %s", eff_dir, exc)
+
+        thread_path = eff_dir / "co_producer.json"
+        if thread_path.is_file():
+            try:
+                raw_thread = json.loads(thread_path.read_text(encoding="utf-8"))
+                msgs = raw_thread.get("messages") if isinstance(raw_thread, dict) else []
+                if isinstance(msgs, list):
+                    convo_msgs = [
+                        m for m in msgs
+                        if isinstance(m, dict)
+                        and str(m.get("sender_role") or "") in ("user", "coproducer")
+                        and str(m.get("content_markdown") or "").strip()
+                    ][-8:]
+                    if convo_msgs:
+                        m_lines: List[str] = []
+                        for m in convo_msgs:
+                            s_role = str(m.get("sender_role") or "")
+                            who_tag = "Executive Producer" if s_role == "user" else "You (Co-Producer 1-on-1)"
+                            body = " ".join(str(m.get("content_markdown") or "").strip().split())
+                            if len(body) > 320:
+                                body = body[:317] + "..."
+                            m_lines.append(f"  - [{who_tag}]: {body}")
+                        sections.append("Recent 1-on-1 Conversation History:\n" + "\n".join(m_lines))
+            except Exception as exc:
+                logger.debug("Skipping unreadable co_producer.json in %s: %s", eff_dir, exc)
+
+        if not sections:
+            return ""
+        return (
+            "=== YOUR 1-ON-1 CO-PRODUCER SESSION MEMORY WITH THE EXECUTIVE PRODUCER ===\n"
+            "(You are the exact same Co-Producer who partnered 1-on-1 with the Executive Producer in this session; "
+            "lead the Council faithfully to their vision, tastes, and explicit non-goals!)\n"
+            + "\n\n".join(sections)
+        )
 
     def _structured_with_validation(
         self,
@@ -5855,22 +6365,34 @@ class CreativeWritersRoom:
         candidate_dir: Optional[Path],
         target_episode: int,
     ) -> WritersRoomTurnProposal:
-        """Divergence -> collision -> novelty judgement -> selection. Returns the Creative Director's opening turn,
+        """Divergence -> collision -> novelty judgement -> selection. Returns the Co-Producer (Council Chair)'s opening turn,
         which seeds a PROVISIONAL premise that the rest of the room then pressure-tests and evolves.
         """
         roles = [s["role"] for s in SPECIALIST_ROSTER]
         prior = self._load_prior_concepts(candidate_dir)
+        coprod_gen_ctx = self._load_coproducer_session_context(candidate_dir)
+        coprod_gen_clause = f"{coprod_gen_ctx}\n\n" if coprod_gen_ctx else ""
         seed_clause = (
             f"EXECUTIVE PRODUCER DIRECTION (every concept must honor this): {creative_prompt.strip()}\n"
             if (creative_prompt and creative_prompt.strip()) else ""
+        )
+        from engine.studio.context_curator import format_genre_craft_foundation_briefing
+
+        gcf_genesis_txt = format_genre_craft_foundation_briefing(
+            getattr(game_bible, "genre_craft_foundation", None)
+        )
+        gcf_clause = (
+            f"GENRE CRAFT & FUN FOUNDATION (honor these pillars, bootstrap-to-mastery arc, UX contracts & anti-patterns):\n{gcf_genesis_txt}\n\n"
+            if gcf_genesis_txt
+            else ""
         )
         prior_clause = f"PRIOR CONCEPTS ALREADY PRODUCED (do NOT repeat or lightly vary any of them):\n{prior}\n"
 
         # 1. Divergent provocations (one per specialist, mutually orthogonal)
         self._emit_activity(
-            agent_role="CreativeDirector",
-            status_text=f"Concept Genesis (1/4): Creative Director is crafting orthogonal provocations for {len(roles)} specialists...",
-            active_agents=["CreativeDirector"],
+            agent_role=COUNCIL_CHAIR_ROLE,
+            status_text=f"Concept Genesis (1/4): {COUNCIL_CHAIR_DISPLAY_NAME} is crafting orthogonal provocations for {len(roles)} specialists...",
+            active_agents=[COUNCIL_CHAIR_ROLE],
             phase="genesis_provocations",
         )
         def _validate_prov(ps: CreativeProvocationSet) -> List[str]:
@@ -5880,11 +6402,11 @@ class CreativeWritersRoom:
 
         prov_set = self._structured_with_validation(
             (
-                f"You are the CreativeDirector preparing Episode {target_episode}'s Writers' Room. NO game has been chosen yet.\n"
+                f"You are the {COUNCIL_CHAIR_DISPLAY_NAME} ({COUNCIL_CHAIR_ROLE}) preparing Episode {target_episode}'s Writers' Room. NO game has been chosen yet.\n"
                 f"Write one creative provocation for each specialist role in {roles}. Provocations must be mutually orthogonal "
                 f"(each opens a different creative axis), phrased as clear, concrete design questions or constraints — not genre labels, not existing "
                 f"game names, and grounded in tangible, playable experiences rather than obscure academic jargon.\n"
-                f"{prior_clause}{seed_clause}"
+                f"{prior_clause}{seed_clause}{coprod_gen_clause}{gcf_clause}"
                 f"PLAYER TASTE CONTEXT (signals of what they value; do not imitate):\n{dna_summary}\n"
                 f"Provide `deliberation` FIRST."
             ),
@@ -5907,7 +6429,7 @@ class CreativeWritersRoom:
                     f"You are the {spec['display_name']} ({role}) at the very start of a Writers' Room. NO game has been chosen.\n"
                     f"Your specialty focus: {spec['focus']}\n"
                     f"YOUR PROVOCATION: {provocation_by_role[role]}\n"
-                    f"{prior_clause}{seed_clause}"
+                    f"{prior_clause}{seed_clause}{gcf_clause}"
                     f"PLAYER TASTE CONTEXT (signals of what they value; do not imitate or mash up titles):\n{dna_summary}\n\n"
                     f"Contribute 2 independent concept fragments from YOUR domain, each a clear, concrete, immediately understandable seed "
                     f"(a tactile interaction verb or system, a tangible world tension, an emotional experience, a structural constraint, or a sensory signature). "
@@ -5950,20 +6472,20 @@ class CreativeWritersRoom:
 
         for _round in range(3):
             self._emit_activity(
-                agent_role="CreativeDirector",
-                status_text=f"Concept Genesis (3/4): Creative Director is colliding {len(fragments)} fragments into candidate premises (round {_round + 1})...",
-                active_agents=["CreativeDirector"],
+                agent_role=COUNCIL_CHAIR_ROLE,
+                status_text=f"Concept Genesis (3/4): {COUNCIL_CHAIR_DISPLAY_NAME} is colliding {len(fragments)} fragments into candidate premises (round {_round + 1})...",
+                active_agents=[COUNCIL_CHAIR_ROLE],
                 phase="genesis_collision",
             )
             collision = self._structured_with_validation(
                 (
-                    f"You are the CreativeDirector. The room has contributed these independent fragments:\n{frag_block}\n\n"
+                    f"You are the {COUNCIL_CHAIR_DISPLAY_NAME} ({COUNCIL_CHAIR_ROLE}) chairing the Council. The room has contributed these independent fragments:\n{frag_block}\n\n"
                     f"Synthesize fragments from DIFFERENT specialists into 4 candidate game premises that are distinct from one another and from the "
                     f"prior concepts. Each candidate must combine at least two fragments into a coherent, grounded, immediately playable game concept "
                     f"where a human player can instantly picture what they do on screen, what they build/control/fight, and why it is fun. "
                     f"Write titles and premises in clear, accessible language—NEVER string together obscure scientific or academic jargon into a word salad. "
                     f"Premises are provisional starting points the room will evolve, not finished designs.\n"
-                    f"{prior_clause}{seed_clause}{overlap_feedback}"
+                    f"{prior_clause}{seed_clause}{coprod_gen_clause}{gcf_clause}{overlap_feedback}"
                     f"Provide `deliberation` FIRST; each candidate needs a unique `candidate_id`."
                 ),
                 ConceptCollisionProposal,
@@ -6009,14 +6531,15 @@ class CreativeWritersRoom:
             f"  [{c.candidate_id}] '{c.working_title}': {c.premise} | tension: {c.core_tension}" for c in distinct
         )
         self._emit_activity(
-            agent_role="CreativeDirector",
-            status_text=f"Concept Genesis (4/4): Creative Director is selecting the provisional starting premise from {len(distinct)} candidates...",
-            active_agents=["CreativeDirector"],
+            agent_role=COUNCIL_CHAIR_ROLE,
+            status_text=f"Concept Genesis (4/4): {COUNCIL_CHAIR_DISPLAY_NAME} is selecting the provisional starting premise from {len(distinct)} candidates...",
+            active_agents=[COUNCIL_CHAIR_ROLE],
             phase="genesis_selection",
         )
         selection = self._structured_with_validation(
             (
-                f"You are the CreativeDirector choosing the PROVISIONAL starting premise.\n{cand_block}\n\n"
+                f"You are the {COUNCIL_CHAIR_DISPLAY_NAME} ({COUNCIL_CHAIR_ROLE}) choosing the PROVISIONAL starting premise.\n{cand_block}\n\n"
+                f"{coprod_gen_clause}{gcf_clause}"
                 f"Choose the candidate that is clearest, most coherent, and has the strongest potential to become a genuinely fun, playable 2D game once the room "
                 f"pressure-tests it (reject any candidate that sounds like abstract academic jargon or a confusing mashup of buzzwords). "
                 f"Write `opening_dialogue` in plain, direct language presenting what the player actually does and why it is compelling as a draft to be challenged and reshaped, "
@@ -6039,6 +6562,13 @@ class CreativeWritersRoom:
                 "selected_candidate_id": chosen.candidate_id,
             },
         )
+        if game_bible.genre_craft_foundation is None and is_real_genai_client(self.client):
+            self._ensure_bible_genre_foundation(
+                game_bible=game_bible,
+                dna_summary=dna_summary,
+                creative_prompt=f"{chosen.working_title}: {chosen.premise} (Tension: {chosen.core_tension})",
+                candidate_dir=candidate_dir,
+            )
         return WritersRoomTurnProposal(
             deliberation=selection.deliberation,
             spoken_dialogue=selection.opening_dialogue,
@@ -6046,6 +6576,542 @@ class CreativeWritersRoom:
             updated_game_title=chosen.working_title,
             updated_elevator_pitch=chosen.premise,
             updated_core_fantasy=chosen.core_tension or None,
+        )
+
+    def run_advisory_consultation(
+        self,
+        *,
+        question: str,
+        mode: str = "huddle",
+        specialist_roles: Optional[List[str]] = None,
+        context_summary: str = "",
+        dna_summary: str = "",
+        multimodal_parts: Optional[List[Any]] = None,
+    ) -> Any:
+        """Runs a stateless, read-only advisory consultation with Council specialists on behalf of CoProducerAgent.
+        Never mutates `game_bible.json` or `self.board`."""
+        from engine.studio.models import (
+            CoProducerAdvisorySpecialistTurn,
+            CoProducerConsultationCard,
+            CoProducerCouncilHuddleTurn,
+            CoProducerDivergentPitchOption,
+        )
+
+        if self.client is None:
+            raise StudioAgentError(
+                "CreativeWritersRoom.run_advisory_consultation requires an active google.genai Client (Rule 5)."
+            )
+
+        clean_q = (question or "").strip() or "Provide high-leverage creative and systemic direction."
+        card_id = f"consult_{uuid.uuid4().hex[:8]}"
+
+        if mode == "divergent_pitch_round":
+            chosen_specs: List[Dict[str, str]] = []
+            for raw_r in specialist_roles or []:
+                sp = _resolve_council_specialist(raw_r)
+                if sp is not None and sp["role"] != COUNCIL_CHAIR_ROLE and sp not in chosen_specs:
+                    chosen_specs.append(sp)
+            if len(chosen_specs) < 3:
+                for default_r in ("GameplayDesigner", "StoryWorldArchitect", "VisualArtDirector", "UXExperienceDesigner", "AudioAtmosphereDesigner"):
+                    sp = _resolve_council_specialist(default_r)
+                    if sp is not None and sp["role"] != COUNCIL_CHAIR_ROLE and sp not in chosen_specs:
+                        chosen_specs.append(sp)
+                    if len(chosen_specs) >= 4:
+                        break
+            chosen_specs = chosen_specs[:5]
+            role_names = [s["role"] for s in chosen_specs]
+
+            def _seed_advisory(spec: Dict[str, str]) -> ConceptSeedProposal:
+                role = spec["role"]
+                prompt = (
+                    f"You are the {spec['display_name']} ({role}) participating in an advisory divergent brainstorm convened by your Council Chair ({COUNCIL_CHAIR_DISPLAY_NAME}).\n"
+                    f"Specialty focus: {spec['focus']}\n"
+                    f"CREATIVE QUESTION / SEED SPARK: {clean_q}\n"
+                    f"CONVERSATION & BRIEF CONTEXT:\n{context_summary or '(open slate)'}\n"
+                    f"PLAYER TASTE SIGNALS:\n{dna_summary or '(none provided)'}\n\n"
+                    f"Contribute 2 vivid, orthogonal concept fragments from YOUR domain (a tactile verb, systemic loop, spatial hook, world tension, or sensory signature). "
+                    f"Use concrete, playable language—zero jargon salad. Provide `deliberation` FIRST."
+                )
+                return self._call_structured_llm(
+                    prompt,
+                    ConceptSeedProposal,
+                    temperature=0.92,
+                    parts=multimodal_parts,
+                )
+
+            fragments: List[ConceptFragment] = []
+            for spec, seed in zip(chosen_specs, self._map_parallel(_seed_advisory, chosen_specs)):
+                role = spec["role"]
+                for idx, frag in enumerate((seed.fragments or [])[:2]):
+                    frag.contributor_role = role
+                    frag.fragment_id = f"{role}_{idx}"
+                    fragments.append(frag)
+
+            frag_block = "\n".join(
+                f"  [{f.fragment_id}] ({f.contributor_role}, {f.fragment_kind}): {f.fragment}"
+                for f in fragments
+            )
+            collision = self._call_structured_llm(
+                (
+                    f"You are the {COUNCIL_CHAIR_DISPLAY_NAME} ({COUNCIL_CHAIR_ROLE}) chairing the Specialist Council and colliding your specialists' fragments for your interactive session with the Executive Producer.\n"
+                    f"USER / CO-PRODUCER SPARK: {clean_q}\n"
+                    f"SPECIALIST FRAGMENTS:\n{frag_block}\n\n"
+                    f"Synthesize 3 to 4 contrasting, immediately playable game premises by combining fragments from different specialists. "
+                    f"Make each option distinct in feel, camera/control framing, and core player verb so the user has genuinely exciting creative choices. "
+                    f"Provide `deliberation` FIRST."
+                ),
+                ConceptCollisionProposal,
+                temperature=0.90,
+                parts=multimodal_parts,
+            )
+            pitches: List[CoProducerDivergentPitchOption] = []
+            for idx, cand in enumerate(collision.candidates or []):
+                pitches.append(
+                    CoProducerDivergentPitchOption(
+                        deliberation=cand.deliberation,
+                        pitch_id=cand.candidate_id or f"pitch_{idx + 1}",
+                        working_title=cand.working_title,
+                        core_genre=" / ".join(cand.source_fragment_ids[:2]) if not getattr(cand, "core_tension", "") else "Original Indie Concept",
+                        hook_summary=cand.premise,
+                        core_loop_sketch=cand.core_tension or cand.premise,
+                        visual_and_audio_vibe=f"Built from fragments: {', '.join(cand.source_fragment_ids)}",
+                    )
+                )
+            headline = (
+                f"Council collided {len(fragments)} specialist fragments into {len(pitches)} contrasting playable directions"
+                + (f": {', '.join(p.working_title for p in pitches[:3])}" if pitches else ".")
+            )
+            return CoProducerConsultationCard(
+                deliberation=collision.deliberation,
+                card_id=card_id,
+                consultation_kind="divergent_pitch_round",
+                question_posed=clean_q,
+                participating_roles=[COUNCIL_CHAIR_ROLE, *role_names],
+                synthesis_headline=headline,
+                divergent_pitches=pitches,
+            )
+
+        # Standard 1-4 domain specialist advisory huddle convened by CoProducer (Council Chair)
+        chosen_specs = []
+        for raw_r in specialist_roles or []:
+            sp = _resolve_council_specialist(raw_r)
+            if sp is not None and sp["role"] != COUNCIL_CHAIR_ROLE and sp not in chosen_specs:
+                chosen_specs.append(sp)
+        if not chosen_specs:
+            for default_r in ("GameplayDesigner", "VisualArtDirector", "UXExperienceDesigner"):
+                sp = _resolve_council_specialist(default_r)
+                if sp is not None and sp not in chosen_specs:
+                    chosen_specs.append(sp)
+        chosen_specs = chosen_specs[:4]
+        role_names = [s["role"] for s in chosen_specs]
+
+        def _ask_specialist(spec: Dict[str, str]) -> CoProducerAdvisorySpecialistTurn:
+            role = spec["role"]
+            prompt = (
+                f"You are the {spec['display_name']} ({role}) in the studio's Writers' Room Council.\n"
+                f"Your domain focus: {spec['focus']}\n\n"
+                f"The Co-Producer is consulting you mid-conversation with the Executive Producer:\n"
+                f"QUESTION FOR YOU: {clean_q}\n\n"
+                f"CURRENT GAME / CONCEPT CONTEXT:\n{context_summary or '(pre-genesis exploration)'}\n"
+                f"PLAYER TASTE SIGNALS:\n{dna_summary or '(none)'}\n\n"
+                f"Give a sharp, concrete, creative perspective strictly from your {spec['display_name']} lens—propose a specific mechanic, visual/sonic hook, "
+                f"or architectural trade-off rather than generic praise. Provide `deliberation` FIRST."
+            )
+            return self._call_structured_llm(
+                prompt,
+                CoProducerAdvisorySpecialistTurn,
+                temperature=0.85,
+                parts=multimodal_parts,
+            )
+
+        raw_turns = self._map_parallel(_ask_specialist, chosen_specs)
+        huddle_turns: List[CoProducerCouncilHuddleTurn] = []
+        for spec, t_res in zip(chosen_specs, raw_turns):
+            huddle_turns.append(
+                CoProducerCouncilHuddleTurn(
+                    deliberation=t_res.deliberation,
+                    speaker_role=spec["role"],
+                    key_recommendation=t_res.key_recommendation,
+                    creative_angle_or_risk=t_res.creative_angle_or_risk,
+                    spoken_quote=t_res.spoken_quote,
+                )
+            )
+        headline = (
+            f"Consulted {', '.join(role_names)}: "
+            + "; ".join(f"{t.speaker_role} -> {t.key_recommendation[:90]}" for t in huddle_turns[:2])
+        )
+        combined_delib = " | ".join(f"[{t.speaker_role}] {t.deliberation}" for t in huddle_turns) or "Advisory huddle completed."
+        return CoProducerConsultationCard(
+            deliberation=combined_delib[:2000],
+            card_id=card_id,
+            consultation_kind="council_huddle",
+            question_posed=clean_q,
+            participating_roles=role_names,
+            synthesis_headline=headline[:280],
+            specialist_turns=huddle_turns,
+        )
+
+    @staticmethod
+    def _sync_pillars_from_genre_foundation(
+        game_bible: GameBibleSpec,
+        foundation: GenreCraftFoundation,
+    ) -> List[str]:
+        """Seeds or updates `game_bible.gameplay_pillars` from `foundation.foundational_pillars` while preserving
+        distinct existing verbs/pillars so foundational pillars start the Game Bible and evolve cleanly across turns."""
+        existing = list(game_bible.gameplay_pillars or [])
+        synced_titles: List[str] = []
+        for p in foundation.foundational_pillars or []:
+            title = (p.title or p.pillar_id or "").strip()
+            why = (p.why_it_creates_fun or "").strip()
+            if not title:
+                continue
+            synced_titles.append(title)
+            formatted = f"{title}: {why}" if why else title
+            title_prefix = f"{title.lower()}:"
+            replaced = False
+            for idx, cur in enumerate(existing):
+                cur_clean = cur.strip().lower()
+                if cur_clean == title.lower() or cur_clean.startswith(title_prefix):
+                    existing[idx] = formatted
+                    replaced = True
+                    break
+            if not replaced:
+                existing.append(formatted)
+        game_bible.gameplay_pillars = existing
+        return synced_titles
+
+    def _ensure_bible_genre_foundation(
+        self,
+        game_bible: GameBibleSpec,
+        *,
+        dna_summary: str,
+        creative_prompt: Optional[str] = None,
+        candidate_dir: Optional[Path] = None,
+        evolution_directive: str = "",
+        force_refresh: bool = False,
+        allow_mock_client: bool = False,
+    ) -> Optional[GenreCraftFoundation]:
+        """Ensures `game_bible.genre_craft_foundation` is hydrated (from `co_producer_brief.json` if present)
+        or synthesized via `ContextCuratorAgent.synthesize_genre_craft_foundation` as how the Living Game Bible
+        starts and evolves, seeding `gameplay_pillars`, a `ContextCurator` transcript utterance, and a
+        `ConceptEvolutionEntry` milestone."""
+        if game_bible.genre_craft_foundation is not None and not force_refresh:
+            return game_bible.genre_craft_foundation
+
+        c_dir = Path(candidate_dir) if candidate_dir is not None else None
+        foundation: Optional[GenreCraftFoundation] = None
+        source_label = "ContextCurator synthesis"
+
+        # 1. Hydrate from co_producer_brief.json when present (supports both refined_concept and loose_spark!)
+        if not force_refresh and c_dir is not None and (c_dir / "co_producer_brief.json").is_file():
+            try:
+                raw_env = json.loads((c_dir / "co_producer_brief.json").read_text(encoding="utf-8"))
+                cb = raw_env.get("concept_brief") if isinstance(raw_env, dict) and isinstance(raw_env.get("concept_brief"), dict) else {}
+                raw_gcf = cb.get("genre_craft_foundation")
+                if isinstance(raw_gcf, dict) and raw_gcf:
+                    foundation = GenreCraftFoundation.model_validate(raw_gcf)
+                    source_label = "Co-Producer ContextCurator handoff"
+            except Exception as exc:
+                logger.warning("Failed hydrating genre_craft_foundation from co_producer_brief.json: %s", exc)
+
+        # 2. Otherwise synthesize via ContextCuratorAgent when running on an active Gemini client
+        if foundation is None:
+            can_synthesize = bool(is_real_genai_client(self.client) or (allow_mock_client and self.client is not None))
+            if not can_synthesize:
+                return game_bible.genre_craft_foundation
+
+            from engine.studio.context_curator import ContextCuratorAgent
+
+            brief_seed_parts: List[str] = []
+            genre_hint = str(game_bible.core_genre or "").strip()
+            if genre_hint in ("", "unclassified", "indie_experience"):
+                genre_hint = ""
+            if c_dir is not None and (c_dir / "co_producer_brief.json").is_file():
+                try:
+                    raw_env = json.loads((c_dir / "co_producer_brief.json").read_text(encoding="utf-8"))
+                    if isinstance(raw_env, dict):
+                        cb = raw_env.get("concept_brief") if isinstance(raw_env.get("concept_brief"), dict) else {}
+                        if not genre_hint and str(cb.get("core_genre") or "").strip():
+                            genre_hint = str(cb.get("core_genre")).strip()
+                        for k_lbl, k_key in (
+                            ("Working Title", "working_title"),
+                            ("Elevator Pitch", "elevator_pitch"),
+                            ("Core Fantasy", "core_fantasy"),
+                            ("Core Player Verbs", "core_player_verbs"),
+                            ("Explicit Non-Goals", "explicit_non_goals"),
+                        ):
+                            if cb.get(k_key):
+                                brief_seed_parts.append(f"{k_lbl}: {cb.get(k_key)}")
+                        if str(raw_env.get("steering_or_seed_brief") or "").strip():
+                            brief_seed_parts.append(f"Co-Producer Brief: {str(raw_env['steering_or_seed_brief']).strip()}")
+                except Exception:
+                    pass
+            if creative_prompt and creative_prompt.strip():
+                brief_seed_parts.append(f"Creative Prompt: {creative_prompt.strip()}")
+            if game_bible.game_title and game_bible.game_title != "Untitled Concept":
+                brief_seed_parts.append(f"Title: {game_bible.game_title}")
+            if game_bible.elevator_pitch:
+                brief_seed_parts.append(f"Premise: {game_bible.elevator_pitch}")
+            effective_genre_hint = (
+                genre_hint
+                or (creative_prompt.strip()[:160] if (creative_prompt and creative_prompt.strip()) else "")
+                or game_bible.elevator_pitch[:160]
+                or "interactive 2D game"
+            )
+            curator = ContextCuratorAgent(
+                cartridge_dir=c_dir or Path("."),
+                client=self.client,
+                model_name=self.model_name,
+                board=self.board,
+                game_bible=game_bible,
+                event_callback=self.event_callback,
+            )
+            foundation = curator.synthesize_genre_craft_foundation(
+                genre_hint=effective_genre_hint,
+                concept_or_seed="\n".join(brief_seed_parts),
+                player_dna_summary=dna_summary,
+                existing_foundation=game_bible.genre_craft_foundation,
+                evolution_directive=evolution_directive,
+            )
+
+        prev_genre = game_bible.core_genre
+        game_bible.genre_craft_foundation = foundation
+        if foundation.genre_and_subgenre_archetype.strip() and (
+            force_refresh or game_bible.core_genre in ("", "unclassified", "indie_experience")
+        ):
+            game_bible.core_genre = foundation.genre_and_subgenre_archetype.strip()
+        pillar_titles = self._sync_pillars_from_genre_foundation(game_bible, foundation)
+
+        from engine.studio.context_curator import format_genre_craft_foundation_briefing
+
+        turn_idx = len(game_bible.writers_room_transcript)
+        utt = WritersRoomUtterance(
+            deliberation=foundation.deliberation,
+            utterance_id=f"utt_{turn_idx:02d}_ContextCurator_genre_foundation",
+            turn_index=turn_idx,
+            speaker_role="ContextCurator",
+            speaker_display_name="Context Curator",
+            spoken_dialogue=(
+                f"Established Genre Craft & Fun Foundation ({source_label}) for **{foundation.genre_and_subgenre_archetype}**:\n"
+                f"{format_genre_craft_foundation_briefing(foundation)}"
+            ),
+            addressed_to=[COUNCIL_CHAIR_ROLE, "GameplayDesigner", "UXExperienceDesigner", "GameplaySystemsEngineer"],
+            bible_updates_summary=[
+                f"Genre Craft Foundation: {foundation.genre_and_subgenre_archetype}",
+                f"Seeded {len(pillar_titles)} foundational pillar(s): {', '.join(pillar_titles[:5])}",
+            ],
+            artifact_emitted={
+                "type": "genre_craft_foundation",
+                "archetype": foundation.genre_and_subgenre_archetype,
+                "pillar_titles": pillar_titles,
+            },
+        )
+        game_bible.writers_room_transcript.append(utt)
+        game_bible.concept_evolution.append(
+            ConceptEvolutionEntry(
+                deliberation=foundation.deliberation,
+                turn_index=turn_idx,
+                author_role="ContextCurator",
+                previous_premise=prev_genre or "Open Genesis",
+                evolved_premise=f"{foundation.genre_and_subgenre_archetype} — {foundation.core_fun_thesis[:220]}",
+                pivot_reason=evolution_directive or f"Seeded Game Bible from Genre Craft & Fun Foundation ({len(pillar_titles)} pillars).",
+            )
+        )
+        self._emit_event(
+            "bible_genre_foundation_updated",
+            {
+                "deliberation": foundation.deliberation,
+                "reasoning_rationale": foundation.deliberation,
+                "speaker_role": "ContextCurator",
+                "genre_and_subgenre_archetype": foundation.genre_and_subgenre_archetype,
+                "pillar_titles": pillar_titles,
+            },
+        )
+        self._persist_bible(game_bible, candidate_dir=candidate_dir)
+        return foundation
+
+    def _hydrate_refined_coproducer_concept(
+        self,
+        *,
+        game_bible: GameBibleSpec,
+        candidate_dir: Optional[Path],
+    ) -> Optional[WritersRoomTurnProposal]:
+        """When a candidate directory carries `co_producer_brief.json` with `handoff_mode == 'refined_concept'`,
+        hydrates `game_bible` + `GameMemoryStore` directly from the co-designed brief and approved sketches,
+        returning the Co-Producer (Council Chair)'s opening framing turn so blind `_run_concept_genesis` is skipped."""
+        if candidate_dir is None:
+            return None
+        c_dir = Path(candidate_dir)
+        brief_file = c_dir / "co_producer_brief.json"
+        if not brief_file.is_file():
+            return None
+        try:
+            envelope = json.loads(brief_file.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Could not parse co_producer_brief.json in %s: %s", c_dir, exc)
+            return None
+        if not isinstance(envelope, dict) or str(envelope.get("handoff_mode") or "").strip() != "refined_concept":
+            return None
+
+        cb = envelope.get("concept_brief") if isinstance(envelope.get("concept_brief"), dict) else {}
+        seed_note = str(envelope.get("steering_or_seed_brief") or "").strip()
+        w_title = str(cb.get("working_title") or "").strip() or game_bible.game_title or "Co-Designed Concept"
+        c_genre = str(cb.get("core_genre") or "").strip() or game_bible.core_genre or "indie_experience"
+        e_pitch = str(cb.get("elevator_pitch") or "").strip() or seed_note or game_bible.elevator_pitch
+        c_fantasy = str(cb.get("core_fantasy") or "").strip() or e_pitch
+        first_60 = str(cb.get("first_60_seconds_feel") or "").strip()
+        vis_dir = str(cb.get("visual_style_direction") or "").strip()
+        aud_dir = str(cb.get("audio_mood_direction") or "").strip()
+        verbs = [str(v).strip() for v in (cb.get("core_player_verbs") or []) if str(v).strip()]
+        palette = [str(h).strip() for h in (cb.get("color_palette_hex") or []) if str(h).strip()]
+        non_goals = [str(ng).strip() for ng in (cb.get("explicit_non_goals") or []) if str(ng).strip()]
+        mockup_paths = [str(p).strip() for p in (cb.get("selected_mockup_paths") or []) if str(p).strip()]
+
+        game_bible.game_title = w_title
+        game_bible.core_genre = c_genre
+        game_bible.elevator_pitch = e_pitch
+        game_bible.core_fantasy = c_fantasy
+        if first_60:
+            game_bible.first_60_seconds_hook = first_60
+        if vis_dir:
+            game_bible.visual_style_guide = vis_dir
+        if aud_dir:
+            game_bible.audio_direction_guide = aud_dir
+        if palette:
+            game_bible.color_palette_hex = palette
+        if isinstance(cb.get("genre_craft_foundation"), dict) and cb.get("genre_craft_foundation") and game_bible.genre_craft_foundation is None:
+            try:
+                game_bible.genre_craft_foundation = GenreCraftFoundation.model_validate(cb["genre_craft_foundation"])
+                self._sync_pillars_from_genre_foundation(game_bible, game_bible.genre_craft_foundation)
+            except Exception as gcf_exc:
+                logger.warning("GenreCraftFoundation hydration warning in refined concept: %s", gcf_exc)
+        if verbs:
+            merged_pillars = list(game_bible.gameplay_pillars or [])
+            for v in verbs:
+                if v not in merged_pillars:
+                    merged_pillars.append(v)
+            game_bible.gameplay_pillars = merged_pillars
+
+        from engine.studio.models import VisualMockupArtifact
+
+        existing_mockup_paths = {m.image_path for m in (game_bible.visual_mockups or [])}
+        for idx, rel_m in enumerate(mockup_paths):
+            norm_rel = rel_m.lstrip("/")
+            if norm_rel not in existing_mockup_paths and (c_dir / norm_rel).is_file():
+                game_bible.visual_mockups.append(
+                    VisualMockupArtifact(
+                        deliberation="Approved 16:9 Co-Producer concept sketch carried directly into Game Bible.",
+                        mockup_id=f"coproducer_mockup_{idx + 1}",
+                        title=f"{w_title} — Approved Co-Producer Sketch #{idx + 1}",
+                        scene_description=vis_dir or e_pitch or w_title,
+                        image_path=norm_rel,
+                        aspect_ratio="16:9",
+                        color_palette_hex=palette,
+                    )
+                )
+                existing_mockup_paths.add(norm_rel)
+
+        # Persist explicit non-goals & core constraints into GameMemoryStore so Council & workers honor them
+        if non_goals or vis_dir or aud_dir:
+            try:
+                from engine.studio.game_memory import GameMemoryStore, MemoryMutationProposal
+
+                m_store = GameMemoryStore(c_dir, client=self.client)
+                m_props: List[MemoryMutationProposal] = []
+                for ng in non_goals:
+                    m_props.append(
+                        MemoryMutationProposal(
+                            deliberation="Explicit non-goal agreed between Executive Producer and Co-Producer prior to Council handoff.",
+                            operation="record",
+                            target_bank="council",
+                            kind="architectural_decision",
+                            title=f"Explicit Non-Goal: {ng[:60]}",
+                            content=f"DO NOT introduce or drift toward: {ng}",
+                        )
+                    )
+                if m_props:
+                    m_store.apply_mutations("ExecutiveProducer", m_props)
+            except Exception as m_exc:
+                logger.warning("Failed seeding Co-Producer non-goals into GameMemoryStore: %s", m_exc)
+
+        exec_dialogue_lines = [
+            f"[CO-PRODUCER REFINED CONCEPT HANDOFF]: Commissioning '{w_title}' ({c_genre}).",
+            f"Elevator Pitch: {e_pitch}",
+            f"Core Fantasy: {c_fantasy}",
+        ]
+        if verbs:
+            exec_dialogue_lines.append(f"Core Player Verbs: {', '.join(verbs)}")
+        if first_60:
+            exec_dialogue_lines.append(f"First 60 Seconds: {first_60}")
+        if vis_dir:
+            exec_dialogue_lines.append(f"Visual Direction: {vis_dir}")
+        if aud_dir:
+            exec_dialogue_lines.append(f"Audio Mood: {aud_dir}")
+        if non_goals:
+            exec_dialogue_lines.append(f"Explicit Non-Goals (Avoid): {'; '.join(non_goals)}")
+        if seed_note and seed_note != e_pitch:
+            exec_dialogue_lines.append(f"Additional Producer Notes: {seed_note}")
+
+        exec_turn_idx = len(game_bible.writers_room_transcript)
+        exec_utt = WritersRoomUtterance(
+            deliberation=str(cb.get("deliberation") or "Pre-validated Co-Producer concept brief handed off to Council."),
+            turn_index=exec_turn_idx,
+            speaker_role="ExecutiveProducer",
+            speaker_display_name="Executive Producer & Co-Producer",
+            spoken_dialogue="\n".join(exec_dialogue_lines),
+            addressed_to=[COUNCIL_CHAIR_ROLE, "GameplayDesigner", "VisualArtDirector", "GameplaySystemsEngineer"],
+            bible_updates_summary=["Hydrated refined concept brief from Co-Producer"],
+            proof_image_paths=[m.image_path for m in game_bible.visual_mockups],
+        )
+        game_bible.writers_room_transcript.append(exec_utt)
+        game_bible.concept_evolution.append(
+            ConceptEvolutionEntry(
+                deliberation=exec_utt.deliberation,
+                turn_index=exec_turn_idx,
+                author_role="ExecutiveProducer",
+                previous_premise="Co-Producer Interactive Ideation",
+                evolved_premise=f"{w_title}: {e_pitch[:200]}",
+                pivot_reason=exec_utt.spoken_dialogue,
+            )
+        )
+        self._emit_event(
+            "coproducer_refined_concept_handed_off",
+            {
+                "deliberation": exec_utt.deliberation,
+                "reasoning_rationale": exec_utt.deliberation,
+                "game_title": w_title,
+                "core_genre": c_genre,
+                "non_goals_count": len(non_goals),
+                "approved_mockups": [m.image_path for m in game_bible.visual_mockups],
+            },
+        )
+        return WritersRoomTurnProposal(
+            deliberation=(
+                f"Skipping blind concept genesis because I have already co-designed '{w_title}' ({c_genre}) "
+                f"with the Executive Producer. Chairing the Council to build out full system specs, "
+                f"slice roadmap, and ProductionBoard tasks faithful to our shared vision and explicit non-goals."
+            ),
+            spoken_dialogue=(
+                f"Team, I'm bringing our producer-approved concept directly from my Co-Producer session to the Council table: "
+                f"'{w_title}' ({c_genre}). {e_pitch} Let's honor every core verb ({', '.join(verbs) or 'core player loop'}) "
+                f"and explicit non-goal while translating this into concrete slice architecture, world specs, art/audio manifests, "
+                f"and ProductionBoard tasks."
+            ),
+            addressed_to=[
+                "GameplayDesigner",
+                "StoryWorldArchitect",
+                "VisualArtDirector",
+                "GameplaySystemsEngineer",
+                "UXExperienceDesigner",
+            ],
+            updated_game_title=w_title,
+            updated_elevator_pitch=e_pitch,
+            updated_core_fantasy=c_fantasy,
+            updated_first_60_seconds_hook=first_60 or None,
+            visual_style_guide_update=vis_dir or None,
+            audio_direction_update=aud_dir or None,
+            gameplay_pillars_additions=verbs,
+            updated_color_palette_hex=palette,
         )
 
     def run_writers_room(
@@ -6058,11 +7124,12 @@ class CreativeWritersRoom:
         existing_bible: Optional[GameBibleSpec] = None,
         creative_prompt: Optional[str] = None,
     ) -> GameBibleSpec:
-        """Runs the open-ended multi-specialist Writers' Room conversation until the CreativeDirector locks the Living Game Bible."""
+        """Runs the open-ended multi-specialist Writers' Room conversation led and chaired by the Co-Producer (`CoProducer`) until the Living Game Bible is locked."""
         if self.client is None:
             raise StudioAgentError(
                 "CreativeWritersRoom requires an active google.genai Client (Rule 5: Zero Silent Fallbacks)"
             )
+        self._active_candidate_dir = Path(candidate_dir) if candidate_dir is not None else None
 
         dna_summary = self._format_dna_summary(dna, hypothesis_report)
         if creative_prompt and creative_prompt.strip():
@@ -6127,34 +7194,69 @@ class CreativeWritersRoom:
         self._persist_bible(game_bible, candidate_dir=candidate_dir)
 
         spoken_counts: Dict[str, int] = {s["role"]: 0 for s in SPECIALIST_ROSTER}
-        last_speaker_role = "CreativeDirector"
+        last_speaker_role = COUNCIL_CHAIR_ROLE
         last_addressed_to: List[str] = ["GameplayDesigner", "StoryWorldArchitect", "UXExperienceDesigner"]
         pending_invited_roles: List[str] = list(last_addressed_to)
-        for existing_utt in game_bible.writers_room_transcript[1:]:
-            if existing_utt.speaker_role in spoken_counts:
-                spoken_counts[existing_utt.speaker_role] += 1
-            if existing_utt.speaker_role in pending_invited_roles:
-                pending_invited_roles.remove(existing_utt.speaker_role)
-            last_speaker_role = existing_utt.speaker_role
+        non_curator_transcript = [
+            u for u in game_bible.writers_room_transcript if u.speaker_role != "ContextCurator"
+        ]
+        for existing_utt in non_curator_transcript[1:]:
+            eff_existing_role = (
+                COUNCIL_CHAIR_ROLE if existing_utt.speaker_role == "CreativeDirector" else existing_utt.speaker_role
+            )
+            if eff_existing_role in spoken_counts:
+                spoken_counts[eff_existing_role] += 1
+            if eff_existing_role in pending_invited_roles:
+                pending_invited_roles.remove(eff_existing_role)
+            last_speaker_role = eff_existing_role
             if existing_utt.addressed_to:
-                last_addressed_to = list(existing_utt.addressed_to)
-                for r in existing_utt.addressed_to:
+                last_addressed_to = [
+                    (COUNCIL_CHAIR_ROLE if r == "CreativeDirector" else r) for r in existing_utt.addressed_to
+                ]
+                for r in last_addressed_to:
                     if r not in pending_invited_roles and spoken_counts.get(r, 0) == 0:
                         pending_invited_roles.append(r)
 
-        # Opening pitch/provocation by CreativeDirector if transcript is empty
-        if not game_bible.writers_room_transcript:
-            opening_proposal = self._run_concept_genesis(
+        # Seed how the Game Bible starts: ContextCurator establishes Genre Craft & Fun Foundation at Turn 0
+        has_brief_on_disk = bool(candidate_dir is not None and (Path(candidate_dir) / "co_producer_brief.json").is_file())
+        has_explicit_genre_seed = bool(
+            (creative_prompt and creative_prompt.strip())
+            or game_bible.core_genre not in ("", "unclassified", "indie_experience")
+            or has_brief_on_disk
+        )
+        if not non_curator_transcript and game_bible.genre_craft_foundation is None and has_explicit_genre_seed:
+            self._ensure_bible_genre_foundation(
                 game_bible=game_bible,
                 dna_summary=dna_summary,
                 creative_prompt=creative_prompt,
                 candidate_dir=candidate_dir,
-                target_episode=target_episode,
             )
+
+        # Opening pitch/provocation by Co-Producer (Council Chair) if no Chair/Council turn exists yet
+        if not non_curator_transcript:
+            opening_proposal = self._hydrate_refined_coproducer_concept(
+                game_bible=game_bible,
+                candidate_dir=candidate_dir,
+            )
+            if opening_proposal is None:
+                opening_proposal = self._run_concept_genesis(
+                    game_bible=game_bible,
+                    dna_summary=dna_summary,
+                    creative_prompt=creative_prompt,
+                    candidate_dir=candidate_dir,
+                    target_episode=target_episode,
+                )
+            elif game_bible.genre_craft_foundation is None:
+                self._ensure_bible_genre_foundation(
+                    game_bible=game_bible,
+                    dna_summary=dna_summary,
+                    creative_prompt=creative_prompt,
+                    candidate_dir=candidate_dir,
+                )
             opening_utt = self._apply_turn_proposal(
                 game_bible=game_bible,
-                speaker_role="CreativeDirector",
-                speaker_display_name="Creative Director",
+                speaker_role=COUNCIL_CHAIR_ROLE,
+                speaker_display_name=COUNCIL_CHAIR_DISPLAY_NAME,
                 proposal=opening_proposal,
                 candidate_dir=candidate_dir,
             )
@@ -6179,7 +7281,7 @@ class CreativeWritersRoom:
                 pending_routed_from = ""
                 pending_routed_reason = ""
                 last_speaker_role = "ExecutiveProducer"
-                last_addressed_to = ["CreativeDirector", "GameplayDesigner", "GameplaySystemsEngineer", "UXExperienceDesigner"]
+                last_addressed_to = [COUNCIL_CHAIR_ROLE, "GameplayDesigner", "GameplaySystemsEngineer", "UXExperienceDesigner"]
                 for r in last_addressed_to:
                     if r not in pending_invited_roles:
                         pending_invited_roles.append(r)
@@ -6272,7 +7374,7 @@ class CreativeWritersRoom:
             steered_post = self._consume_pending_steering(game_bible, candidate_dir=candidate_dir)
             if steered_post:
                 last_speaker_role = "ExecutiveProducer"
-                last_addressed_to = ["CreativeDirector", "GameplayDesigner", "GameplaySystemsEngineer", "UXExperienceDesigner"]
+                last_addressed_to = [COUNCIL_CHAIR_ROLE, "GameplayDesigner", "GameplaySystemsEngineer", "UXExperienceDesigner"]
                 for r in last_addressed_to:
                     if r not in pending_invited_roles:
                         pending_invited_roles.append(r)
@@ -6295,8 +7397,8 @@ class CreativeWritersRoom:
                     closing_utt = WritersRoomUtterance(
                         deliberation=convergence.deliberation,
                         turn_index=len(game_bible.writers_room_transcript),
-                        speaker_role="CreativeDirector",
-                        speaker_display_name="Creative Director",
+                        speaker_role=COUNCIL_CHAIR_ROLE,
+                        speaker_display_name=COUNCIL_CHAIR_DISPLAY_NAME,
                         spoken_dialogue=(
                             f"The Living Game Bible for '{game_bible.game_title}' is cohesive and ready "
                             f"(cohesion score: {convergence.experience_cohesion_score:.2f}). Locking the Game Bible!"
@@ -6323,16 +7425,16 @@ class CreativeWritersRoom:
                     steering_utt = WritersRoomUtterance(
                         deliberation=convergence.deliberation,
                         turn_index=len(game_bible.writers_room_transcript),
-                        speaker_role="CreativeDirector",
-                        speaker_display_name="Creative Director",
+                        speaker_role=COUNCIL_CHAIR_ROLE,
+                        speaker_display_name=COUNCIL_CHAIR_DISPLAY_NAME,
                         spoken_dialogue=convergence.director_steering_prompt,
                         addressed_to=[],
                         bible_updates_summary=[
-                            f"Director Steering Challenge: {', '.join(convergence.missing_or_weak_elements[:3])}"
+                            f"Co-Producer Steering Challenge: {', '.join(convergence.missing_or_weak_elements[:3])}"
                         ],
                     )
                     game_bible.writers_room_transcript.append(steering_utt)
-                    last_speaker_role = "CreativeDirector"
+                    last_speaker_role = COUNCIL_CHAIR_ROLE
                     self._emit_event(
                         "writers_room_utterance",
                         {
@@ -6432,7 +7534,8 @@ class CreativeWritersRoom:
             or (
                 candidate_dir is not None
                 and (
-                    (Path(candidate_dir) / ".pending_steering.json").is_file()
+                    (Path(candidate_dir) / ".pending_structural_pivot.json").is_file()
+                    or (Path(candidate_dir) / ".pending_steering.json").is_file()
                     or (Path(candidate_dir) / ".pending_playtest_wishes.json").is_file()
                     or (Path(candidate_dir) / ".pending_council_playtest_reports.json").is_file()
                 )
@@ -6835,7 +7938,7 @@ class CreativeWritersRoom:
         consumed_playtest_session_ids: Optional[Set[str]] = None,
     ) -> Optional[NextSliceStrategyPlan]:
         """Convenes the Council's Slice State Reflection Roundtable to critique the empirical state of the current
-        slice from first principles of game design, then has the Creative Director synthesize a master `NextSliceStrategyPlan`
+        slice from first principles of game design, then has the Co-Producer (`CoProducer`, Council Chair) synthesize a master `NextSliceStrategyPlan`
         for `Slice #{next_idx}` that updates the Living Game Bible and Slice Roadmap."""
         if not is_real_genai_client(self.client) and not getattr(self, "enable_slice_reflection_roundtable", False):
             return None
@@ -6847,7 +7950,7 @@ class CreativeWritersRoom:
         self._emit_activity(
             agent_role="QATestEngineer",
             status_text=f"Capturing empirical game state of '{prev_title}' (`{prev_id}`) for Slice #{next_idx} Reflection & Strategy...",
-            active_agents=["QATestEngineer", "CreativeDirector", "UXExperienceDesigner", "GameplayDesigner", "LevelAndProgressionDesigner", "VisualArtDirector", "GameplaySystemsEngineer"],
+            active_agents=["QATestEngineer", COUNCIL_CHAIR_ROLE, "UXExperienceDesigner", "GameplayDesigner", "LevelAndProgressionDesigner", "VisualArtDirector", "GameplaySystemsEngineer"],
             phase="slice_reflection",
         )
         has_extra_dossier = bool(extra_playtest_dossier and extra_playtest_dossier.strip())
@@ -6876,7 +7979,7 @@ class CreativeWritersRoom:
                     f"Presenting the rendered gameplay filmstrip and scene/script inspection of `{prev_id}` so the Council can "
                     f"honestly evaluate what is currently on screen and strategize Slice #{next_idx}."
                 ),
-                addressed_to=["UXExperienceDesigner", "GameplayDesigner", "LevelAndProgressionDesigner", "VisualArtDirector", "GameplaySystemsEngineer", "CreativeDirector"],
+                addressed_to=["UXExperienceDesigner", "GameplayDesigner", "LevelAndProgressionDesigner", "VisualArtDirector", "GameplaySystemsEngineer", COUNCIL_CHAIR_ROLE],
                 bible_updates_summary=[f"slice_reflection_capture:{prev_id}"],
                 proof_image_paths=[rel_proof_path],
                 artifact_emitted={
@@ -7011,7 +8114,7 @@ class CreativeWritersRoom:
                     speaker_role=r_role,
                     speaker_display_name=disp_name,
                     spoken_dialogue=r_turn.spoken_dialogue,
-                    addressed_to=r_turn.addressed_to or ["CreativeDirector", "GameplayDesigner", "UXExperienceDesigner"],
+                    addressed_to=r_turn.addressed_to or [COUNCIL_CHAIR_ROLE, "GameplayDesigner", "UXExperienceDesigner"],
                     bible_updates_summary=[
                         f"slice_reflection:{r_role}:score_{r_turn.current_slice_quality_score:.2f}"
                     ],
@@ -7033,9 +8136,9 @@ class CreativeWritersRoom:
                 )
 
             self._emit_activity(
-                agent_role="CreativeDirector",
-                status_text=f"Creative Director is synthesizing the master NextSliceStrategyPlan for Slice #{next_idx}...",
-                active_agents=["CreativeDirector"],
+                agent_role=COUNCIL_CHAIR_ROLE,
+                status_text=f"{COUNCIL_CHAIR_DISPLAY_NAME} is synthesizing the master NextSliceStrategyPlan for Slice #{next_idx}...",
+                active_agents=[COUNCIL_CHAIR_ROLE],
                 phase="slice_reflection",
             )
             director_mem_block = ""
@@ -7044,14 +8147,16 @@ class CreativeWritersRoom:
 
                 director_mem_block = GameMemoryStore(
                     eff_refl_dir, event_callback=getattr(self, "event_callback", None)
-                ).format_role_memory_briefing("CreativeDirector", include_fulfilled_for_reflection=True, max_entries=18)
+                ).format_role_memory_briefing(COUNCIL_CHAIR_ROLE, include_fulfilled_for_reflection=True, max_entries=18)
+            coproducer_session_ctx = self._load_coproducer_session_context(eff_refl_dir)
 
             director_prompt = (
                 f"{reflection_shared_prefix}"
+                + (f"{coproducer_session_ctx}\n\n" if coproducer_session_ctx else "")
                 + (f"{director_mem_block}\n\n" if director_mem_block else "")
                 + f"=== COUNCIL SLICE #{prev_idx} REFLECTION ROUNDTABLE ===\n"
                 + "\n".join(reflection_turns_log)
-                + f"\n\nYou are the Creative Director synthesizing the Council's candid reflection on Slice #{prev_idx} (`{prev_id}`) into an actionable, bounded Master Strategy (`NextSliceStrategyPlan`) for Slice #{next_idx}.\n"
+                + f"\n\nYou are the {COUNCIL_CHAIR_DISPLAY_NAME} (`{COUNCIL_CHAIR_ROLE}`) synthesizing the Council's candid reflection on Slice #{prev_idx} (`{prev_id}`) into an actionable, bounded Master Strategy (`NextSliceStrategyPlan`) for Slice #{next_idx}.\n"
                 f"REQUIREMENTS FOR `NextSliceStrategyPlan`:\n"
                 f"1. Diagnose the completed slice honestly and unsentimentally in `current_slice_honest_diagnosis` (zero self-congratulation; zero 'I completely agree with everyone' in `spoken_dialogue`), while catering with full respect and fidelity to any Executive Producer slice directive.\n"
                 f"2. Keep Slice #{next_idx} realistically scoped—clean up key problem areas carried over from Slice #{prev_idx} and deliver Slice #{next_idx}'s core expansion cleanly rather than trying to change everything in one go—across all five pillars (tailored to `{game_bible.game_title}` and the Target Player DNA):\n"
@@ -7060,7 +8165,7 @@ class CreativeWritersRoom:
                 f"   - `depth_and_interesting_decisions_strategy`: How Slice #{next_idx} deepens gameplay with meaningful decisions, trade-offs, hazards/events, and systemic depth tailored to this player.\n"
                 f"   - `short_term_and_long_term_goals_strategy`: How Slice #{next_idx} makes short-term (15–60s), mid-term (3–5m), and long-term (session) goals visibly tracked and causally connected on screen.\n"
                 f"   - `sense_of_accomplishment_and_reward_strategy`: How Slice #{next_idx} rewards goal completion with unmistakable visual/audio payoff, world progression, and capability/milestone unlocks.\n"
-                f"3. Define `next_slice_spec` (`GameSliceSpec` with `slice_index={next_idx}`, `status='active'`, and a specific `slice_id` like `slice_{next_idx}_...`) and provide updated Bible sections (`updated_core_loop`, `updated_onboarding_plan`, `updated_goal_hierarchy`, `updated_engagement_plan`, `updated_diegetic_ui_philosophy`) whenever they should be strengthened to realize this strategy.\n"
+                f"3. Define `next_slice_spec` (`GameSliceSpec` with `slice_index={next_idx}`, `status='active'`, and a specific `slice_id` like `slice_{next_idx}_...`) and provide updated Bible sections (`updated_genre_craft_foundation`, `updated_core_loop`, `updated_onboarding_plan`, `updated_goal_hierarchy`, `updated_engagement_plan`, `updated_diegetic_ui_philosophy`) whenever they should be evolved or strengthened to realize this strategy.\n"
                 f"4. Optionally seed initial high-level `backlog_additions` for Slice #{next_idx} (buildable kinds: {self._supported_kinds() or 'all'}).\n"
                 f"5. CURATE COUNCIL LONG-TERM MEMORY SPARINGLY (`memory_updates`): Review existing `[mem_...]` entries above, mark delivered/replaced goals as `operation='fulfill'`/`'supersede'`/`'archive'`, and record ONLY genuinely deferred future-slice strategic goals, cross-slice architectural invariants, or studio-wide lessons in `target_bank='council'` (never duplicate `next_slice_spec` or Bible updates).\n"
                 f"Return `NextSliceStrategyPlan` with `deliberation` FIRST."
@@ -7083,7 +8188,7 @@ class CreativeWritersRoom:
                 _validate_strategy,
                 temperature=0.4,
                 parts=reflection_parts,
-                caller_role="CreativeDirector",
+                caller_role=COUNCIL_CHAIR_ROLE,
                 candidate_dir=eff_refl_dir,
                 slice_id=prev_id,
                 cacheable_prefix=reflection_shared_prefix,
@@ -7105,6 +8210,10 @@ class CreativeWritersRoom:
         game_bible.slice_roadmap.sort(key=lambda s: s.slice_index)
         game_bible.active_slice_index = next_idx
 
+        if getattr(strategy_plan, "updated_genre_craft_foundation", None) is not None:
+            game_bible.genre_craft_foundation = strategy_plan.updated_genre_craft_foundation
+            self._sync_pillars_from_genre_foundation(game_bible, strategy_plan.updated_genre_craft_foundation)
+            updates_summary.append("updated:genre_craft_foundation")
         if strategy_plan.updated_core_loop is not None:
             game_bible.core_loop = strategy_plan.updated_core_loop
             updates_summary.append("updated:core_loop")
@@ -7125,7 +8234,7 @@ class CreativeWritersRoom:
             ConceptEvolutionEntry(
                 deliberation=strategy_plan.deliberation,
                 turn_index=len(game_bible.writers_room_transcript),
-                author_role="CreativeDirector",
+                author_role=COUNCIL_CHAIR_ROLE,
                 previous_premise=f"Slice #{prev_idx} ({prev_id}): {prev_title}",
                 evolved_premise=f"Slice #{next_idx} ({strategy_plan.next_slice_spec.slice_id}): {strategy_plan.next_slice_spec.title}",
                 pivot_reason=(
@@ -7143,7 +8252,7 @@ class CreativeWritersRoom:
                     prop.target_modules.append("level_layout.json")
             added_items = self.board.add_items(
                 strategy_plan.backlog_additions,
-                raised_by_role="CreativeDirector",
+                raised_by_role=COUNCIL_CHAIR_ROLE,
                 slice_id=strategy_plan.next_slice_spec.slice_id,
             )
             updates_summary.extend(f"backlog:+{it.item_id}" for it in added_items)
@@ -7151,10 +8260,10 @@ class CreativeWritersRoom:
         dir_idx = len(game_bible.writers_room_transcript)
         dir_utt = WritersRoomUtterance(
             deliberation=strategy_plan.deliberation,
-            utterance_id=f"utt_{dir_idx:02d}_CreativeDirector_slice_{next_idx}_strategy",
+            utterance_id=f"utt_{dir_idx:02d}_{COUNCIL_CHAIR_ROLE}_slice_{next_idx}_strategy",
             turn_index=dir_idx,
-            speaker_role="CreativeDirector",
-            speaker_display_name="Creative Director",
+            speaker_role=COUNCIL_CHAIR_ROLE,
+            speaker_display_name=COUNCIL_CHAIR_DISPLAY_NAME,
             spoken_dialogue=strategy_plan.spoken_dialogue,
             addressed_to=["LevelAndProgressionDesigner", "GameplayDesigner", "UXExperienceDesigner", "VisualArtDirector", "GameplaySystemsEngineer"],
             bible_updates_summary=updates_summary,
@@ -7201,7 +8310,7 @@ class CreativeWritersRoom:
         """Advances `game_bible` to the next iterative vertical slice:
         1. Marks the prior slice completed.
         2. Empirically inspects the current game state and convenes the Council's Slice State Reflection Roundtable
-           + Creative Director `NextSliceStrategyPlan` synthesis (evaluating cohesion, knowing how to play, depth/fun
+           + Co-Producer (`CoProducer`, Council Chair) `NextSliceStrategyPlan` synthesis (evaluating cohesion, knowing how to play, depth/fun
            for the target player, short/long-term goals, and sense of accomplishment).
         3. Converts the next-slice strategy into concrete specialist Bible updates and ProductionBoard tasks for
            Slice #N+1, shapes them with the full Council, and drains the board for that slice."""
@@ -7209,6 +8318,7 @@ class CreativeWritersRoom:
             raise StudioAgentError(
                 "CreativeWritersRoom.run_slice_expansion requires an active google.genai Client (Rule 5)"
             )
+        self._active_candidate_dir = Path(candidate_dir) if candidate_dir is not None else None
         if self.scheduler is not None and hasattr(self.scheduler, "stop_dispatch"):
             self.scheduler.stop_dispatch()
         dna_summary = self._format_dna_summary(dna)
@@ -7448,7 +8558,7 @@ class CreativeWritersRoom:
             speaker_role="UserSteering",
             speaker_display_name="Executive Producer (User)",
             spoken_dialogue=user_feedback,
-            addressed_to=["CreativeDirector", "GameplayDesigner", "UXExperienceDesigner", "VisualArtDirector"],
+            addressed_to=[COUNCIL_CHAIR_ROLE, "GameplayDesigner", "UXExperienceDesigner", "VisualArtDirector"],
             bible_updates_summary=["Executive Producer steering note injected"],
         )
         game_bible.writers_room_transcript.append(user_utt)

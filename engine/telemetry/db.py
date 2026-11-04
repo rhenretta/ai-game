@@ -1870,5 +1870,363 @@ class TelemetryDB:
         finally:
             conn.close()
 
+    # -------------------------------------------------------------------------
+    # Interactive Studio Co-Producer Thread & Turn Persistence
+    # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _decode_json_field(raw: Any, fallback: Any) -> Any:
+        if isinstance(raw, (dict, list)):
+            return raw
+        if isinstance(raw, str) and raw.strip():
+            try:
+                return json.loads(raw)
+            except Exception:
+                return fallback
+        return fallback
 
+    def _row_to_coproducer_thread(self, raw: sqlite3.Row | Dict[str, Any], message_count: Optional[int] = None) -> Dict[str, Any]:
+        d = dict(raw)
+        brief = self._decode_json_field(d.get("concept_brief_json"), {})
+        if not isinstance(brief, dict):
+            brief = {}
+        out: Dict[str, Any] = {
+            "deliberation": str(d.get("deliberation") or "Co-Producer conversation thread metadata loaded."),
+            "thread_id": str(d.get("thread_id") or ""),
+            "scope_kind": str(d.get("scope_kind") or "cartridge"),
+            "cartridge_id": d.get("cartridge_id") or None,
+            "title": str(d.get("title") or "New Game Concept"),
+            "graduated_to_cartridge_id": str(d.get("graduated_to_cartridge_id") or ""),
+            "concept_brief": brief,
+            "created_at_utc": str(d.get("created_at_utc") or ""),
+            "updated_at_utc": str(d.get("updated_at_utc") or ""),
+        }
+        if message_count is not None:
+            out["message_count"] = int(message_count)
+        elif "message_count" in d and d["message_count"] is not None:
+            out["message_count"] = int(d["message_count"])
+        return out
+
+    def _row_to_coproducer_message(self, raw: sqlite3.Row | Dict[str, Any]) -> Dict[str, Any]:
+        d = dict(raw)
+        media_cards = self._decode_json_field(d.get("media_cards_json"), [])
+        consultation_cards = self._decode_json_field(d.get("consultation_cards_json"), [])
+        action_proposals = self._decode_json_field(d.get("action_proposals_json"), [])
+        tool_trace = self._decode_json_field(d.get("tool_trace_json"), [])
+        prompt_trace = self._decode_json_field(d.get("prompt_trace_json"), [])
+        token_usage = self._decode_json_field(d.get("token_usage_json"), {})
+        return {
+            "deliberation": str(d.get("deliberation") or "Co-Producer conversation message loaded."),
+            "message_id": str(d.get("message_id") or ""),
+            "thread_id": str(d.get("thread_id") or ""),
+            "turn_index": int(d.get("turn_index") or 0),
+            "sender_role": str(d.get("sender_role") or "coproducer"),
+            "content_markdown": str(d.get("content_markdown") or ""),
+            "media_cards": media_cards if isinstance(media_cards, list) else [],
+            "consultation_cards": consultation_cards if isinstance(consultation_cards, list) else [],
+            "action_proposals": action_proposals if isinstance(action_proposals, list) else [],
+            "tool_trace": tool_trace if isinstance(tool_trace, list) else [],
+            "prompt_trace": prompt_trace if isinstance(prompt_trace, list) else [],
+            "token_usage": token_usage if isinstance(token_usage, dict) else {},
+            "created_at_utc": str(d.get("created_at_utc") or ""),
+        }
+
+    def upsert_coproducer_thread(self, thread: Dict[str, Any]) -> None:
+        """Upserts a Co-Producer conversation thread into studio_coproducer_threads."""
+        tid = str(thread.get("thread_id") or "").strip()
+        if not tid:
+            return
+        now_iso = datetime.now(timezone.utc).isoformat()
+        brief = thread.get("concept_brief")
+        if isinstance(brief, dict):
+            brief_json = json.dumps(brief, default=str)
+        elif isinstance(thread.get("concept_brief_json"), str):
+            brief_json = str(thread.get("concept_brief_json"))
+        else:
+            brief_json = "{}"
+        cartridge_id = thread.get("cartridge_id")
+        cid_val = str(cartridge_id).strip() if cartridge_id else None
+
+        conn = self.get_write_connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO studio_coproducer_threads (
+                    thread_id, deliberation, scope_kind, cartridge_id, title,
+                    graduated_to_cartridge_id, concept_brief_json, created_at_utc, updated_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(thread_id) DO UPDATE SET
+                    deliberation = excluded.deliberation,
+                    scope_kind = excluded.scope_kind,
+                    cartridge_id = excluded.cartridge_id,
+                    title = excluded.title,
+                    graduated_to_cartridge_id = excluded.graduated_to_cartridge_id,
+                    concept_brief_json = excluded.concept_brief_json,
+                    updated_at_utc = excluded.updated_at_utc
+                """,
+                (
+                    tid,
+                    str(thread.get("deliberation") or "Persisting Co-Producer conversation thread state."),
+                    str(thread.get("scope_kind") or ("cartridge" if cid_val else "draft")),
+                    cid_val,
+                    str(thread.get("title") or "New Game Concept"),
+                    str(thread.get("graduated_to_cartridge_id") or ""),
+                    brief_json,
+                    str(thread.get("created_at_utc") or now_iso),
+                    str(thread.get("updated_at_utc") or now_iso),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_coproducer_thread(self, thread_id: str) -> Optional[Dict[str, Any]]:
+        """Fetches a single Co-Producer thread record by thread_id."""
+        tid = (thread_id or "").strip()
+        if not tid:
+            return None
+        conn = self.get_reader_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT t.*, (
+                    SELECT COUNT(*) FROM studio_coproducer_messages m WHERE m.thread_id = t.thread_id
+                ) AS message_count
+                FROM studio_coproducer_threads t
+                WHERE t.thread_id = ?;
+                """,
+                (tid,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return self._row_to_coproducer_thread(row)
+        finally:
+            conn.close()
+
+    def list_coproducer_threads(
+        self,
+        cartridge_id: Optional[str] = None,
+        scope_kind: Optional[str] = None,
+        include_graduated_drafts: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Lists Co-Producer threads ordered by updated_at_utc DESC."""
+        conn = self.get_reader_connection()
+        try:
+            cur = conn.cursor()
+            clauses: List[str] = []
+            params: List[Any] = []
+            if cartridge_id:
+                clauses.append("t.cartridge_id = ?")
+                params.append(cartridge_id.strip())
+            if scope_kind:
+                clauses.append("t.scope_kind = ?")
+                params.append(scope_kind.strip())
+            if not include_graduated_drafts:
+                clauses.append("NOT (t.scope_kind = 'draft' AND COALESCE(t.graduated_to_cartridge_id, '') != '')")
+            where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            cur.execute(
+                f"""
+                SELECT t.*, (
+                    SELECT COUNT(*) FROM studio_coproducer_messages m WHERE m.thread_id = t.thread_id
+                ) AS message_count
+                FROM studio_coproducer_threads t
+                {where_sql}
+                ORDER BY t.updated_at_utc DESC;
+                """,
+                params,
+            )
+            return [self._row_to_coproducer_thread(r) for r in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def bind_draft_thread_to_cartridge(
+        self,
+        draft_thread_id: str,
+        cartridge_id: str,
+        title: Optional[str] = None,
+        concept_brief: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Graduates a pre-genesis draft thread directly onto a commissioned cartridge_id."""
+        tid = (draft_thread_id or "").strip()
+        cid = (cartridge_id or "").strip()
+        if not tid or not cid:
+            return None
+        now_iso = datetime.now(timezone.utc).isoformat()
+        conn = self.get_write_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM studio_coproducer_threads WHERE thread_id = ?;", (tid,))
+            existing = cur.fetchone()
+            if not existing:
+                return None
+            cols = [desc[0] for desc in cur.description]
+            row_dict = dict(zip(cols, existing))
+            next_title = str(title or row_dict.get("title") or cid)
+            if isinstance(concept_brief, dict):
+                brief_json = json.dumps(concept_brief, default=str)
+            else:
+                brief_json = str(row_dict.get("concept_brief_json") or "{}")
+            conn.execute(
+                """
+                UPDATE studio_coproducer_threads
+                SET scope_kind = 'cartridge',
+                    cartridge_id = ?,
+                    graduated_to_cartridge_id = ?,
+                    title = ?,
+                    concept_brief_json = ?,
+                    deliberation = ?,
+                    updated_at_utc = ?
+                WHERE thread_id = ?;
+                """,
+                (
+                    cid,
+                    cid,
+                    next_title,
+                    brief_json,
+                    f"Graduated draft thread {tid} into active cartridge {cid}.",
+                    now_iso,
+                    tid,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return self.get_coproducer_thread(tid)
+
+    def insert_coproducer_message(self, message: Dict[str, Any]) -> None:
+        """Inserts or updates a Co-Producer conversation message and bumps parent thread updated_at_utc."""
+        mid = str(message.get("message_id") or "").strip()
+        tid = str(message.get("thread_id") or "").strip()
+        if not mid or not tid:
+            return
+        now_iso = datetime.now(timezone.utc).isoformat()
+        created_iso = str(message.get("created_at_utc") or now_iso)
+        media_json = json.dumps(message.get("media_cards") or [], default=str)
+        consult_json = json.dumps(message.get("consultation_cards") or [], default=str)
+        actions_json = json.dumps(message.get("action_proposals") or [], default=str)
+        tools_json = json.dumps(message.get("tool_trace") or [], default=str)
+        prompts_json = json.dumps(message.get("prompt_trace") or [], default=str)
+        tokens_json = json.dumps(message.get("token_usage") or {}, default=str)
+
+        conn = self.get_write_connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO studio_coproducer_messages (
+                    message_id, thread_id, turn_index, sender_role, deliberation,
+                    content_markdown, media_cards_json, consultation_cards_json,
+                    action_proposals_json, tool_trace_json, prompt_trace_json,
+                    token_usage_json, created_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(message_id) DO UPDATE SET
+                    turn_index = excluded.turn_index,
+                    sender_role = excluded.sender_role,
+                    deliberation = excluded.deliberation,
+                    content_markdown = excluded.content_markdown,
+                    media_cards_json = excluded.media_cards_json,
+                    consultation_cards_json = excluded.consultation_cards_json,
+                    action_proposals_json = excluded.action_proposals_json,
+                    tool_trace_json = excluded.tool_trace_json,
+                    prompt_trace_json = excluded.prompt_trace_json,
+                    token_usage_json = excluded.token_usage_json
+                """,
+                (
+                    mid,
+                    tid,
+                    int(message.get("turn_index") or 0),
+                    str(message.get("sender_role") or "coproducer"),
+                    str(message.get("deliberation") or "Persisting Co-Producer message."),
+                    str(message.get("content_markdown") or ""),
+                    media_json,
+                    consult_json,
+                    actions_json,
+                    tools_json,
+                    prompts_json,
+                    tokens_json,
+                    created_iso,
+                ),
+            )
+            conn.execute(
+                "UPDATE studio_coproducer_threads SET updated_at_utc = ? WHERE thread_id = ?;",
+                (now_iso, tid),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def update_coproducer_message_action_state(
+        self,
+        thread_id: str,
+        message_id: str,
+        proposal_id: str,
+        status: str,
+        result_meta: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Updates the status and execution metadata of an action proposal inside a persisted message."""
+        tid = (thread_id or "").strip()
+        mid = (message_id or "").strip()
+        pid = (proposal_id or "").strip()
+        if not tid or not mid or not pid:
+            return None
+        now_iso = datetime.now(timezone.utc).isoformat()
+        conn = self.get_write_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT * FROM studio_coproducer_messages WHERE thread_id = ? AND message_id = ?;",
+                (tid, mid),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            cols = [desc[0] for desc in cur.description]
+            row_dict = dict(zip(cols, row))
+            proposals = self._decode_json_field(row_dict.get("action_proposals_json"), [])
+            if not isinstance(proposals, list):
+                proposals = []
+            updated_proposal: Optional[Dict[str, Any]] = None
+            for item in proposals:
+                if isinstance(item, dict) and str(item.get("proposal_id") or "") == pid:
+                    item["status"] = status
+                    item["executed_at_utc"] = now_iso
+                    if isinstance(result_meta, dict):
+                        item["execution_result"] = result_meta
+                    updated_proposal = item
+                    break
+            if updated_proposal is None:
+                return None
+            conn.execute(
+                "UPDATE studio_coproducer_messages SET action_proposals_json = ? WHERE message_id = ?;",
+                (json.dumps(proposals, default=str), mid),
+            )
+            conn.execute(
+                "UPDATE studio_coproducer_threads SET updated_at_utc = ? WHERE thread_id = ?;",
+                (now_iso, tid),
+            )
+            conn.commit()
+            return updated_proposal
+        finally:
+            conn.close()
+
+    def list_coproducer_messages(self, thread_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+        """Lists messages in a Co-Producer thread in chronological turn order."""
+        tid = (thread_id or "").strip()
+        if not tid:
+            return []
+        conn = self.get_reader_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT * FROM studio_coproducer_messages
+                WHERE thread_id = ?
+                ORDER BY turn_index ASC, created_at_utc ASC
+                LIMIT ?;
+                """,
+                (tid, max(1, int(limit))),
+            )
+            return [self._row_to_coproducer_message(r) for r in cur.fetchall()]
+        finally:
+            conn.close()

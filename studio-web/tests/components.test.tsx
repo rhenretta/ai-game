@@ -998,7 +998,7 @@ describe('UI components', () => {
       onResumeBuild,
       resumingBuild: false,
       onOpenNextSliceModal,
-      onOpenNewGameModal: vi.fn(),
+      onStartNewGame: vi.fn(),
       onOpenCheckpointsModal: vi.fn(),
       onOpenLivePulseModal: vi.fn(),
     };
@@ -1131,7 +1131,7 @@ describe('UI components', () => {
       togglingPause: false,
       onApproveGreenlight: vi.fn(),
       onOpenNextSliceModal: vi.fn(),
-      onOpenNewGameModal: vi.fn(),
+      onStartNewGame: vi.fn(),
       onOpenCheckpointsModal: vi.fn(),
       onOpenLivePulseModal: vi.fn(),
       onChangeUiScalePct,

@@ -655,6 +655,8 @@ class TestEpistemicModelOrderingAndDebranding:
             },
             "TelemetryEventsResponse": {"deliberation": "Telemetry events query."},
             "VelocityVector": {"deliberation": "Velocity vector sample.", "x": 50.0, "y": 50.0, "vx": 1.0, "vy": 0.0, "speed": 1.0},
+            "CoProducerSendMessageRequest": {"deliberation": "Submitting user message.", "message": "Pitch two mechanical directions."},
+            "CoProducerExecuteActionRequest": {"deliberation": "Confirming studio action.", "thread_id": "draft_001"},
         }
 
         models = [

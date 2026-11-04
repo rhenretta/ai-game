@@ -4,6 +4,10 @@ import type {
   BoardItemChronologyResponse,
   CartridgesResponse,
   CheckpointsResponse,
+  CoProducerExecuteActionResponse,
+  CoProducerSendMessageResponse,
+  CoProducerThreadDetailResponse,
+  CoProducerThreadsListResponse,
   EventsHistoryResponse,
   GameBibleResponse,
   GameMemoryListResponse,
@@ -91,6 +95,7 @@ export function resolveMediaUrl(rawPathOrUrl: string | undefined | null, cartrid
     cartridgeId !== 'active' &&
     !normalizedRel.startsWith('cartridges/') &&
     !normalizedRel.startsWith('candidate_') &&
+    !normalizedRel.startsWith('_coproducer_drafts/') &&
     !normalizedRel.startsWith('active/') &&
     !normalizedRel.startsWith(cartridgeId)
       ? `${cartridgeId}/${normalizedRel}`
@@ -471,6 +476,98 @@ export const studioApi = {
       ...(req.item_id ? { item_id: req.item_id } : {}),
     };
     return requestJson<GameMemoryListResponse>('/api/studio/memories', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  getCoProducerThreads(cartridgeId?: string): Promise<CoProducerThreadsListResponse> {
+    const qs =
+      cartridgeId && cartridgeId !== 'active'
+        ? `?cartridge=${encodeURIComponent(cartridgeId)}`
+        : '';
+    return requestJson<CoProducerThreadsListResponse>(`/api/coproducer/threads${qs}`);
+  },
+
+  /** Rule 4: `deliberation` serialized strictly at key index 0 */
+  createCoProducerDraft(title?: string): Promise<CoProducerThreadDetailResponse> {
+    const cleanTitle = (title ?? '').trim() || 'New Game Concept';
+    const payload = {
+      deliberation: `Executive Producer created a new pre-genesis Co-Producer concept draft ('${cleanTitle}').`,
+      title: cleanTitle,
+    };
+    return requestJson<CoProducerThreadDetailResponse>('/api/coproducer/threads/draft', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  getCoProducerThread(threadId: string): Promise<CoProducerThreadDetailResponse> {
+    return requestJson<CoProducerThreadDetailResponse>(
+      `/api/coproducer/threads/${encodeURIComponent(threadId)}`,
+    );
+  },
+
+  /** Rule 4: `deliberation` serialized strictly at key index 0 */
+  sendCoProducerMessage(
+    threadId: string,
+    params: {
+      message: string;
+      selectedSketchPaths?: string[];
+    },
+  ): Promise<CoProducerSendMessageResponse> {
+    const cleanMsg = params.message.trim();
+    const payload = {
+      deliberation: `Executive Producer sent conversational message to Co-Producer thread '${threadId}'.`,
+      message: cleanMsg,
+      ...(params.selectedSketchPaths && params.selectedSketchPaths.length > 0
+        ? { selected_sketch_paths: params.selectedSketchPaths }
+        : {}),
+    };
+    return requestJson<CoProducerSendMessageResponse>(
+      `/api/coproducer/threads/${encodeURIComponent(threadId)}/messages`,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+    );
+  },
+
+  /** Rule 4: `deliberation` serialized strictly at key index 0 */
+  executeCoProducerAction(params: {
+    threadId: string;
+    messageId?: string;
+    proposalId?: string;
+    directActionKind?: 'commission_game';
+    carryOverAssetPaths?: string[];
+    dismiss?: boolean;
+    overrideBrief?: string;
+    overrideHandoffMode?: 'loose_spark' | 'refined_concept';
+    overridePauseForGreenlight?: boolean;
+  }): Promise<CoProducerExecuteActionResponse> {
+    const payload = {
+      deliberation: params.dismiss
+        ? `Executive Producer dismissed Co-Producer action proposal '${params.proposalId ?? ''}'.`
+        : params.directActionKind
+          ? `Executive Producer directly commissioned thread '${params.threadId}' (${params.directActionKind}).`
+          : `Executive Producer confirmed and executed Co-Producer action proposal '${params.proposalId ?? ''}'.`,
+      thread_id: params.threadId,
+      message_id: params.messageId ?? '',
+      proposal_id: params.proposalId ?? '',
+      ...(params.directActionKind ? { direct_action_kind: params.directActionKind } : {}),
+      ...(params.carryOverAssetPaths && params.carryOverAssetPaths.length > 0
+        ? { carry_over_asset_paths: params.carryOverAssetPaths }
+        : {}),
+      dismiss: Boolean(params.dismiss),
+      ...(params.overrideBrief !== undefined ? { override_brief: params.overrideBrief } : {}),
+      ...(params.overrideHandoffMode
+        ? { override_handoff_mode: params.overrideHandoffMode }
+        : {}),
+      ...(params.overridePauseForGreenlight !== undefined
+        ? { override_pause_for_greenlight: params.overridePauseForGreenlight }
+        : {}),
+    };
+    return requestJson<CoProducerExecuteActionResponse>('/api/coproducer/actions/execute', {
       method: 'POST',
       body: JSON.stringify(payload),
     });

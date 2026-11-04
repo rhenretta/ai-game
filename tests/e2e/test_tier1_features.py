@@ -1845,13 +1845,13 @@ def test_f29_tool_invocation_monitor_container():
 
 
 def test_f29_genesis_build_trigger_button():
-    """F29.5: React studio-web defines New Game / Genesis commission modal and TopCommandBar trigger."""
+    """F29.5: React studio-web defines New Game session commissioning in CoProducerView and TopCommandBar."""
     from engine.ui.server import STUDIO_WEB_DIR
-    modal_file = STUDIO_WEB_DIR / "src" / "features" / "shell" / "NewGameModal.tsx"
+    coproducer_file = STUDIO_WEB_DIR / "src" / "features" / "coproducer" / "CoProducerView.tsx"
     topbar_file = STUDIO_WEB_DIR / "src" / "features" / "shell" / "TopCommandBar.tsx"
-    assert modal_file.is_file()
+    assert coproducer_file.is_file()
     assert topbar_file.is_file()
-    assert "New Game" in topbar_file.read_text(encoding="utf-8")
+    assert "New Game" in coproducer_file.read_text(encoding="utf-8")
 
 
 # ============================================================================

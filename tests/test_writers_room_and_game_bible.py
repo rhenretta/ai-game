@@ -881,7 +881,7 @@ def test_room_opens_with_genesis_not_a_pitch(tmp_path: Path):
     assert {f.contributor_role for f in bible.concept_fragments} >= {"GameplayDesigner", "StoryWorldArchitect", "ScriptwriterAgent"}
     assert len({f.fragment_id for f in bible.concept_fragments}) == expected_fragments
     assert len(bible.concept_candidates) == 4
-    assert bible.writers_room_transcript[0].speaker_role == "CreativeDirector"
+    assert bible.writers_room_transcript[0].speaker_role == "CoProducer"
     assert "draft premise" in bible.writers_room_transcript[0].spoken_dialogue
     # the selected candidate (c1) seeded the room, via the genesis path rather than a one-shot pitch
     first_title_update = bible.writers_room_transcript[0].bible_updates_summary
@@ -1097,10 +1097,10 @@ def test_hierarchical_council_roster_and_subagent_handoff(tmp_path: Path):
 
     lead_roles = [s["role"] for s in CORE_COUNCIL_ROSTER]
     sub_roles = [s["role"] for s in SUBAGENT_ROSTER]
-    assert lead_roles == ["GameplayDesigner", "StoryWorldArchitect", "VisualArtDirector"]
+    assert lead_roles == ["CoProducer", "GameplayDesigner", "StoryWorldArchitect", "VisualArtDirector"]
     assert "ScriptwriterAgent" in sub_roles
     assert "ScriptwriterAgent" in COUNCIL_HIERARCHY["StoryWorldArchitect"]
-    assert len(SPECIALIST_ROSTER) == 9
+    assert len(SPECIALIST_ROSTER) == 10
 
     events = []
     room, _ = _make_room(tmp_path, event_callback=lambda ev_type, payload: events.append({"event_type": ev_type, "payload": payload}))

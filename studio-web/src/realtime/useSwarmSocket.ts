@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { buildWsUrl, studioApi } from '../api/client';
-import type { ChronologyStepLogEntry, SwarmStreamEvent } from '../api/types';
+import type {
+  ChronologyStepLogEntry,
+  CoProducerLiveStep,
+  SwarmStreamEvent,
+} from '../api/types';
 
 export interface LiveItemStep {
   itemId: string;
@@ -32,6 +36,7 @@ export interface SwarmRealtimeState {
   recentEvents: SwarmStreamEvent[];
   liveStepsByItem: Record<string, LiveItemStep>;
   livePlaytestFrames: Record<string, LivePlaytestFrame>;
+  liveCoProducerSteps: Record<string, CoProducerLiveStep[]>;
   ensureHistorySeeded: (cartridgeId?: string) => void;
 }
 
@@ -398,6 +403,7 @@ export function useSwarmSocket(options?: SwarmSocketOptions): SwarmRealtimeState
   const [recentEvents, setRecentEvents] = useState<SwarmStreamEvent[]>([]);
   const [liveStepsByItem, setLiveStepsByItem] = useState<Record<string, LiveItemStep>>({});
   const [livePlaytestFrames, setLivePlaytestFrames] = useState<Record<string, LivePlaytestFrame>>({});
+  const [liveCoProducerSteps, setLiveCoProducerSteps] = useState<Record<string, CoProducerLiveStep[]>>({});
   const invalidateTimerRef = useRef<number | null>(null);
   const chronologyInvalidateTimerRef = useRef<number | null>(null);
   const seededEpochRef = useRef<string>('');
@@ -428,6 +434,8 @@ export function useSwarmSocket(options?: SwarmSocketOptions): SwarmRealtimeState
       void queryClient.invalidateQueries({ queryKey: ['board-chronology'] });
       void queryClient.invalidateQueries({ queryKey: ['artifacts'] });
       void queryClient.invalidateQueries({ queryKey: ['game-memories'] });
+      void queryClient.invalidateQueries({ queryKey: ['coproducer-threads'] });
+      void queryClient.invalidateQueries({ queryKey: ['coproducer-thread'] });
     };
 
     const scheduleBibleRefresh = () => {
@@ -555,6 +563,82 @@ export function useSwarmSocket(options?: SwarmSocketOptions): SwarmRealtimeState
           void queryClient.invalidateQueries({ queryKey: ['playtest-sessions'] });
           void queryClient.invalidateQueries({ queryKey: ['playtest-session-detail'] });
         }
+
+        if (evTypeLower === 'coproducer_step_started') {
+          const threadId = typeof payload.thread_id === 'string' ? payload.thread_id.trim() : '';
+          if (threadId) {
+            const hopIndex = typeof payload.hop_index === 'number' ? payload.hop_index : 0;
+            const toolsArr = Array.isArray(payload.tools) ? payload.tools.map(String) : [];
+            const toolName =
+              toolsArr.join(', ') ||
+              (typeof payload.tool_name === 'string' ? payload.tool_name : 'co_producer_step');
+            const statusHeadline =
+              (typeof payload.intent === 'string' && payload.intent.trim()) ||
+              (typeof payload.status_headline === 'string' && payload.status_headline.trim()) ||
+              `Running ${toolName}...`;
+            setLiveCoProducerSteps((prev) => {
+              const existing = (prev[threadId] ?? []).filter((s) => s.hopIndex !== hopIndex);
+              return {
+                ...prev,
+                [threadId]: [
+                  ...existing,
+                  {
+                    threadId,
+                    hopIndex,
+                    toolName,
+                    statusHeadline,
+                    completed: false,
+                    timestampUtc: ts,
+                  },
+                ],
+              };
+            });
+          }
+        } else if (evTypeLower === 'coproducer_tool_completed') {
+          const threadId = typeof payload.thread_id === 'string' ? payload.thread_id.trim() : '';
+          if (threadId) {
+            const hopIndex = typeof payload.hop_index === 'number' ? payload.hop_index : 0;
+            const toolName =
+              typeof payload.tool_name === 'string' ? payload.tool_name : 'co_producer_step';
+            const summary = typeof payload.summary === 'string' ? payload.summary : '';
+            setLiveCoProducerSteps((prev) => {
+              const list = [...(prev[threadId] ?? [])];
+              const idx = list.findIndex((s) => s.hopIndex === hopIndex && s.toolName === toolName);
+              if (idx >= 0) {
+                list[idx] = { ...list[idx], completed: true, summary, timestampUtc: ts };
+              } else {
+                list.push({
+                  threadId,
+                  hopIndex,
+                  toolName,
+                  statusHeadline: summary || `Completed ${toolName}`,
+                  completed: true,
+                  summary,
+                  timestampUtc: ts,
+                });
+              }
+              return { ...prev, [threadId]: list };
+            });
+          }
+        } else if (
+          evTypeLower === 'coproducer_turn_completed' ||
+          evTypeLower === 'coproducer_thread_updated'
+        ) {
+          const threadId = typeof payload.thread_id === 'string' ? payload.thread_id.trim() : '';
+          if (threadId && evTypeLower === 'coproducer_turn_completed') {
+            setLiveCoProducerSteps((prev) => {
+              if (!(threadId in prev)) return prev;
+              const copy = { ...prev };
+              delete copy[threadId];
+              return copy;
+            });
+          }
+          void queryClient.invalidateQueries({ queryKey: ['coproducer-threads'] });
+          void queryClient.invalidateQueries({ queryKey: ['coproducer-thread'] });
+          if (evTypeLower === 'coproducer_thread_updated') {
+            scheduleBibleRefresh();
+          }
+        }
       };
 
       ws.onclose = () => {
@@ -562,6 +646,7 @@ export function useSwarmSocket(options?: SwarmSocketOptions): SwarmRealtimeState
         disconnectedSinceOpen = true;
         setConnected(false);
         setLiveStepsByItem((prev) => (Object.keys(prev).length === 0 ? prev : {}));
+        setLiveCoProducerSteps((prev) => (Object.keys(prev).length === 0 ? prev : {}));
         if (hasConnectedOnce) {
           scheduleBibleRefresh();
         }
@@ -681,6 +766,7 @@ export function useSwarmSocket(options?: SwarmSocketOptions): SwarmRealtimeState
     recentEvents,
     liveStepsByItem,
     livePlaytestFrames,
+    liveCoProducerSteps,
     ensureHistorySeeded,
   };
 }

@@ -330,6 +330,13 @@ describe('Full App workspace navigation & regression coverage', () => {
       </QueryClientProvider>,
     );
 
+    // 0. Co-Producer opens as primary Tab #1 while keeping all 7 observability tabs intact
+    expect(screen.getByRole('tab', { name: /Co-Producer/i })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+    fireEvent.click(screen.getByRole('tab', { name: /^Board/i }));
+
     // 1. Production Board loads default active slice items
     await waitFor(() => {
       expect(screen.getByText('Build Orthographic Grid Controller')).toBeInTheDocument();
@@ -550,6 +557,9 @@ describe('Full App workspace navigation & regression coverage', () => {
         <App />
       </QueryClientProvider>,
     );
+
+    // Switch to Board workspace to exercise live specialist step + SliceSubbar reload recovery
+    fireEvent.click(screen.getByRole('tab', { name: /^Board/i }));
 
     // 1. Initial render shows Running · 1w + Pause button
     await waitFor(() => {
@@ -809,6 +819,8 @@ describe('Full App workspace navigation & regression coverage', () => {
         <App />
       </QueryClientProvider>,
     );
+
+    fireEvent.click(screen.getByRole('tab', { name: /^Board/i }));
 
     // TopCommandBar + LiveActivityBanner + ProductionBoardView explain post-board QA repair + AI heartbeat
     await waitFor(() => {

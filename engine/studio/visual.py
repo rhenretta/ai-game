@@ -600,6 +600,85 @@ class VisualArtSpriteDesignerAgent:
                 logger.debug("rembg session initialization skipped: %s", exc)
         return cls._rembg_session
 
+    CHROMA_KEY_SPECS: Dict[str, Tuple[str, Tuple[int, ...], Tuple[int, ...]]] = {
+        "#FF00FF": ("bright magenta (#FF00FF)", (0, 2), (1,)),
+        "#00FF00": ("bright chroma green (#00FF00)", (1,), (0, 2)),
+        "#0000FF": ("pure chroma blue (#0000FF)", (2,), (0, 1)),
+        "#FFFF00": ("bright chroma yellow (#FFFF00)", (0, 1), (2,)),
+    }
+
+    @classmethod
+    def _resolve_chroma_key_spec(
+        cls,
+        chroma_key_hex: Optional[str] = None,
+    ) -> Tuple[str, str, Tuple[int, ...], Tuple[int, ...]]:
+        norm = str(chroma_key_hex or "#FF00FF").strip().upper()
+        if not norm.startswith("#") and len(norm) == 6:
+            norm = f"#{norm}"
+        if norm not in cls.CHROMA_KEY_SPECS:
+            norm = "#FF00FF"
+        label, high_idxs, low_idxs = cls.CHROMA_KEY_SPECS[norm]
+        return norm, label, high_idxs, low_idxs
+
+    @classmethod
+    def _compute_chroma_spill_mask(
+        cls,
+        rgba_or_rgb: np.ndarray,
+        chroma_key_hex: Optional[str] = "#FF00FF",
+        *,
+        alpha_min: int = 40,
+        hi_threshold: int = 185,
+        lo_threshold: int = 90,
+        excess_threshold: int = 100,
+    ) -> np.ndarray:
+        """Returns a boolean mask of pixels exhibiting pure residual chroma-key background color for `chroma_key_hex`."""
+        _, _, high_idxs, low_idxs = cls._resolve_chroma_key_spec(chroma_key_hex)
+        arr = rgba_or_rgb.astype(np.int32)
+        hi_stack = np.stack([arr[:, :, i] for i in high_idxs], axis=-1)
+        lo_stack = np.stack([arr[:, :, i] for i in low_idxs], axis=-1)
+        hi_min = np.min(hi_stack, axis=-1)
+        lo_max = np.max(lo_stack, axis=-1)
+        mask = (hi_min > hi_threshold) & (lo_max < lo_threshold) & ((hi_min - lo_max) > excess_threshold)
+        if arr.shape[-1] >= 4:
+            mask = mask & (arr[:, :, 3] > alpha_min)
+        return mask
+
+    @staticmethod
+    def fit_cutout_to_cell_footprint(
+        cell_img: Image.Image,
+        cell_size: Tuple[int, int],
+        target_footprint: Tuple[int, int],
+    ) -> Image.Image:
+        """Scales an extracted RGBA foreground cutout so its visible silhouette fits within `target_footprint`
+        `(max_width_px, max_height_px)` and centers it inside a transparent `cell_size` `(cell_w, cell_h)` canvas."""
+        cw_cell = max(1, int(cell_size[0]))
+        ch_cell = max(1, int(cell_size[1]))
+        tw = max(1, min(cw_cell, int(target_footprint[0])))
+        th = max(1, min(ch_cell, int(target_footprint[1])))
+        src = cell_img.convert("RGBA")
+        arr = np.array(src, dtype=np.uint8)
+        ys, xs = np.where(arr[:, :, 3] > 24)
+        if xs.size == 0:
+            ys, xs = np.where(arr[:, :, 3] > 0)
+        if xs.size == 0:
+            return Image.new("RGBA", (cw_cell, ch_cell), (0, 0, 0, 0))
+        x0 = max(0, int(xs.min()) - 1)
+        y0 = max(0, int(ys.min()) - 1)
+        x1 = min(src.width, int(xs.max()) + 2)
+        y1 = min(src.height, int(ys.max()) + 2)
+        core_w = max(1, int(xs.max()) - int(xs.min()) + 1)
+        core_h = max(1, int(ys.max()) - int(ys.min()) + 1)
+        crop_w = max(1, x1 - x0)
+        crop_h = max(1, y1 - y0)
+        scale = min(float(tw) / float(core_w), float(th) / float(core_h))
+        nw = max(1, min(cw_cell, int(round(crop_w * scale))))
+        nh = max(1, min(ch_cell, int(round(crop_h * scale))))
+        tight = src.crop((x0, y0, x1, y1))
+        resized = tight.resize((nw, nh), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGBA", (cw_cell, ch_cell), (0, 0, 0, 0))
+        canvas.paste(resized, ((cw_cell - nw) // 2, (ch_cell - nh) // 2), resized)
+        return canvas
+
     @staticmethod
     def quantize_color(rgb: Tuple[int, int, int]) -> Tuple[int, int, int]:
         """Quantizes an arbitrary RGB tuple to the nearest Euclidean 16-color entry."""
@@ -615,6 +694,7 @@ class VisualArtSpriteDesignerAgent:
         target_dimensions: Optional[Tuple[int, int]] = None,
         size: Optional[Tuple[int, int]] = None,
         isolate_single_subject: bool = True,
+        chroma_key_hex: str = "#FF00FF",
         **_kwargs: Any,
     ) -> Image.Image:
         """Extracts a clean 32-bit RGBA foreground cutout from a synthesized image.
@@ -766,28 +846,58 @@ class VisualArtSpriteDesignerAgent:
                 new_a = max(0, min(255, int(a * ratio)))
                 px[cx, cy] = (r, g, b, new_a)
 
-        # Step 2b: Clear pure #FF00FF chroma-key pockets and despill chroma fringes
-        # (including light/translucent boundary pixels where white/grey blended with #FF00FF yields g >= 110)
+        # Step 2b: Clear pure chroma-key pockets and despill chroma fringes for the selected `chroma_key_hex`
+        _, _, ck_high, ck_low = cls._resolve_chroma_key_spec(chroma_key_hex)
         for iy in range(work_h):
             for ix in range(work_w):
                 r, g, b, a = px[ix, iy]
                 if a == 0:
                     continue
-                magenta_excess = min(r, b) - g
-                rb_diff = abs(r - b)
-                if r > 175 and b > 175 and g < 95 and magenta_excess > 105:
+                rgb_vals = [r, g, b]
+                hi_vals = [rgb_vals[i] for i in ck_high]
+                lo_vals = [rgb_vals[i] for i in ck_low]
+                hi_min = min(hi_vals)
+                hi_spread = max(hi_vals) - hi_min
+                lo_max = max(lo_vals)
+                chroma_excess = hi_min - lo_max
+                if hi_min > 175 and lo_max < 95 and chroma_excess > 105:
                     px[ix, iy] = (0, 0, 0, 0)
-                elif r > 140 and b > 140 and g < 110 and magenta_excess > 65:
-                    clamped_rb = min(r, b, g + 35)
+                elif hi_min > 140 and lo_max < 110 and chroma_excess > 65:
+                    for i in ck_high:
+                        rgb_vals[i] = min(rgb_vals[i], lo_max + 35)
                     new_a = max(0, min(a, int(a * 0.55)))
-                    px[ix, iy] = (clamped_rb, g, clamped_rb, new_a)
-                elif r > 180 and b > 180 and rb_diff < 35 and magenta_excess > 45 and (a < 250 or g > 95):
-                    spill_frac = min(1.0, float(magenta_excess) / 220.0)
-                    clamped_rb = min(r, b, g + 18)
+                    px[ix, iy] = (rgb_vals[0], rgb_vals[1], rgb_vals[2], new_a)
+                elif hi_min > 180 and hi_spread < 35 and chroma_excess > 45 and (a < 250 or lo_max > 95):
+                    spill_frac = min(1.0, float(chroma_excess) / 220.0)
+                    for i in ck_high:
+                        rgb_vals[i] = min(rgb_vals[i], lo_max + 18)
                     new_a = max(0, min(a, int(a * (1.0 - 0.65 * spill_frac))))
-                    px[ix, iy] = (clamped_rb, g, clamped_rb, new_a)
+                    px[ix, iy] = (rgb_vals[0], rgb_vals[1], rgb_vals[2], new_a)
 
         rgba_np = np.array(work_img, dtype=np.uint8)
+
+        # Step 2b-shadow: Strip outer-background-connected darkened chroma floor shadows
+        # (ambient occlusion cast onto the chroma backdrop: pure chroma hue darkened into [55..175])
+        arr_i32 = rgba_np[:, :, :3].astype(np.int32)
+        hi_st = np.stack([arr_i32[:, :, i] for i in ck_high], axis=-1)
+        lo_st = np.stack([arr_i32[:, :, i] for i in ck_low], axis=-1)
+        hi_min_np = np.min(hi_st, axis=-1)
+        hi_spread_np = np.max(hi_st, axis=-1) - hi_min_np
+        lo_max_np = np.max(lo_st, axis=-1)
+        dark_chroma_cand = (
+            (rgba_np[:, :, 3] > 0)
+            & (hi_min_np >= 55)
+            & (hi_spread_np <= 24)
+            & (lo_max_np <= 28)
+            & (hi_min_np >= 3 * np.maximum(1, lo_max_np))
+        ).astype(np.uint8)
+        if np.any(dark_chroma_cand):
+            bg_adj = cv2.dilate((rgba_np[:, :, 3] <= 24).astype(np.uint8), np.ones((3, 3), dtype=np.uint8), iterations=1)
+            num_dc, dc_labels, dc_stats, _ = cv2.connectedComponentsWithStats(dark_chroma_cand, connectivity=8)
+            for dc_lbl in range(1, num_dc):
+                comp_mask = dc_labels == dc_lbl
+                if int(dc_stats[dc_lbl, cv2.CC_STAT_AREA]) <= int(work_w * work_h * 0.25) and np.any(bg_adj[comp_mask] > 0):
+                    rgba_np[comp_mask] = [0, 0, 0, 0]
 
         # Step 2c: If the outer perimeter was a uniform synthetic studio background or 2-tone checkerboard,
         # clear enclosed interior background pockets while protecting internal facial/head features.
@@ -899,6 +1009,12 @@ class VisualArtSpriteDesignerAgent:
                             if (bx - pad_detail) <= cx_c <= (bx + bw_c + pad_detail) and (by - pad_detail) <= cy_c <= (by + bh_c + pad_detail):
                                 keep_mask = keep_mask | (cl_labels == c_idx)
                         rgba_np[~keep_mask] = [0, 0, 0, 0]
+
+        # Prune detached sub-threshold (alpha <= 24) background wisps while preserving 1px anti-aliased silhouette edges
+        real_fg = (rgba_np[:, :, 3] > 24).astype(np.uint8)
+        if np.any(real_fg):
+            fg_halo = cv2.dilate(real_fg, np.ones((3, 3), dtype=np.uint8), iterations=1)
+            rgba_np[(fg_halo == 0) & (rgba_np[:, :, 3] <= 24)] = [0, 0, 0, 0]
 
         work_img = Image.fromarray(rgba_np)
 
@@ -1169,6 +1285,8 @@ class VisualArtSpriteDesignerAgent:
         style_guide: str = "",
         is_animated_actor: bool = False,
         isolate_single_subject: bool = True,
+        chroma_key_hex: str = "#FF00FF",
+        camera_projection: str = "",
     ) -> Image.Image:
         """Synthesizes a real 2D game sprite, prop, tile, or parallax backdrop via Gemini image generation."""
         from google.genai import types
@@ -1178,31 +1296,37 @@ class VisualArtSpriteDesignerAgent:
         is_tile = norm_type in ("tile", "tile_surface")
         is_backdrop = norm_type in ("backdrop", "parallax_layer")
         is_actor = bool(is_animated_actor or norm_type in ("sprite_sheet", "entity", "character"))
+        norm_ck, chroma_label, _, _ = self._resolve_chroma_key_spec(chroma_key_hex)
 
         filtered_refs: List[Union[Path, str, bytes, Image.Image]] = list(reference_images) if (reference_images and not is_tile) else []
         style_clause = f" Match the visual style and color palette ({style_guide})." if (filtered_refs or style_guide) else ""
+        projection_clause = (
+            f" Locked spatial camera projection (MUST MATCH EXACTLY, NEVER mix incompatible camera angles): {camera_projection.strip()}."
+            if (camera_projection and camera_projection.strip())
+            else ""
+        )
 
         if is_backdrop:
             aspect = "16:9"
             full_prompt = (
-                f"Pure 2D indie game scenic environment background illustration (unpopulated vista plate): {prompt}.{style_clause} "
+                f"Pure 2D indie game scenic environment background illustration (unpopulated vista plate): {prompt}.{style_clause}{projection_clause} "
                 f"Painterly 2D game background layer only, rich atmospheric depth, strictly NO UI text, NO HUD, NO gauges, NO words, NO borders."
             )
         elif is_tile:
             aspect = "1:1"
             full_prompt = (
-                f"Flat 90-degree orthographic top-down seamless game material texture swatch (macro close-up of surface material only): {prompt}. "
+                f"Flat 90-degree orthographic top-down seamless game material texture swatch (macro close-up of surface material only): {prompt}.{projection_clause} "
                 f"Color palette & art style: {style_guide or 'vibrant hand-painted fantasy'}. "
                 f"100% full-bleed edge-to-edge organic asymmetric repeatable material surface filling every pixel of the square frame. "
                 f"CRITICAL: NEVER draw a gray-and-white or gray-and-black transparency checkerboard pattern! "
-                f"If the material is a see-through lattice, truss, girder, or grate with open gaps, fill the open gaps with a solid flat uniform bright magenta (#FF00FF) chroma-key color (NEVER a checkerboard grid). "
+                f"If the material is a see-through lattice, truss, girder, or grate with open gaps, fill the open gaps with a solid flat uniform {chroma_label} chroma-key color (NEVER a checkerboard grid). "
                 f"Strictly NO horizon, NO sky, NO isometric 3D block, NO bilateral mirror symmetry, NO white corners, NO empty margins, NO border frame, NO text."
             )
         elif is_actor and isolate_single_subject:
             aspect = "1:1"
             full_prompt = (
-                f"SINGLE solitary full-body high-resolution illustrated in-game subject in ONE clean neutral readiness pose: {prompt}.{style_clause} "
-                f"Strictly ONE single isolated full-body figure centered on a solid flat uniform bright magenta (#FF00FF) chroma-key background with complete silhouette and grounded base. "
+                f"SINGLE solitary full-body high-resolution illustrated in-game subject in ONE clean neutral readiness pose: {prompt}.{style_clause}{projection_clause} "
+                f"Strictly ONE single isolated full-body figure centered on a solid flat uniform {chroma_label} chroma-key background with complete silhouette and grounded base. "
                 f"CRITICAL: Draw STRICTLY ONLY ONE single subject instance in ONE pose — NEVER multiple figures, NEVER multiple poses or animation frames, "
                 f"NEVER a multi-angle turnaround chart, NEVER a sprite sheet grid, NEVER a gray-and-white transparency checkerboard pattern, "
                 f"NO detached environment terrain slab, NO ground pedestal, NO cast shadow on the floor, NO background scenery, NOT a bust portrait, NO border frame, NO text."
@@ -1210,15 +1334,16 @@ class VisualArtSpriteDesignerAgent:
         elif not isolate_single_subject:
             aspect = "1:1"
             full_prompt = (
-                f"High-resolution illustrated in-game asset sheet on a solid flat uniform bright magenta (#FF00FF) chroma-key background: {prompt}.{style_clause} "
-                f"Keep each cell cleanly centered inside its grid cell with generous magenta (#FF00FF) margin around every element, "
+                f"High-resolution illustrated in-game state/pose asset sheet of ONE single subject on a solid flat uniform {chroma_label} chroma-key background: {prompt}.{style_clause}{projection_clause} "
+                f"Keep each cell cleanly centered inside its grid cell with generous {chroma_label} margin around every element, "
+                f"depict ONLY state/pose/stage variations of the SAME subject (NEVER a grab-bag collage of unrelated objects), "
                 f"NEVER draw grid lines, border frames, picture boxes, or text labels, and NEVER draw a gray-and-white checkerboard pattern."
             )
         else:
             aspect = "1:1"
             full_prompt = (
-                f"SINGLE isolated high-resolution illustrated in-game structure or interactive prop in ONE canonical intact state: {prompt}.{style_clause} "
-                f"Centered on a solid flat uniform bright magenta (#FF00FF) chroma-key background. "
+                f"SINGLE isolated high-resolution illustrated in-game structure or interactive prop in ONE canonical intact state: {prompt}.{style_clause}{projection_clause} "
+                f"Centered on a solid flat uniform {chroma_label} chroma-key background. "
                 f"CRITICAL: Draw STRICTLY ONLY ONE single discrete object/structure instance — NEVER multiple variations, NEVER a 3x3 or multi-state grid, "
                 f"NEVER a gray-and-white transparency checkerboard pattern, NO ground slab, NO pedestal, "
                 f"NO cast shadow on the floor, NO background sky/scenery, NO border frame, NO picture box, NO text, "
@@ -1271,19 +1396,20 @@ class VisualArtSpriteDesignerAgent:
 
         raw_img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
         if is_tile:
-            # Check if the tile has interior magenta chroma-key openings (e.g., see-through truss/lattice/grate)
+            # Check if the tile has interior chroma-key openings (e.g., see-through truss/lattice/grate)
             arr_raw = np.array(raw_img, dtype=np.uint8)
             h_r, w_r = arr_raw.shape[:2]
             inner = arr_raw[h_r // 6 : h_r - h_r // 6, w_r // 6 : w_r - w_r // 6]
             if inner.size > 0:
-                mag_mask = (inner[:, :, 0] > 185) & (inner[:, :, 2] > 185) & (inner[:, :, 1] < 90)
-                if float(np.mean(mag_mask)) >= 0.03:
+                ck_mask = self._compute_chroma_spill_mask(inner, norm_ck, alpha_min=0, hi_threshold=185, lo_threshold=90, excess_threshold=100)
+                if float(np.mean(ck_mask)) >= 0.03:
                     return self.extract_clean_alpha_sprite(
                         raw_img,
                         target_size=(w, h),
                         strip_border_frame=True,
                         pad_ratio=0.0,
                         isolate_single_subject=False,
+                        chroma_key_hex=norm_ck,
                     )
             # Only apply full-bleed toroidal tiling when the target is an approximately square surface swatch;
             # non-square strips (e.g. 96x32 modular segments or thin fluid ribbons) would be smeared by toroidal self-blending.
@@ -1293,6 +1419,7 @@ class VisualArtSpriteDesignerAgent:
                     target_size=(w, h),
                     strip_border_frame=True,
                     pad_ratio=0.02,
+                    chroma_key_hex=norm_ck,
                 )
             return self.ensure_full_bleed_tile(raw_img, target_size=(w, h))
         if is_backdrop:
@@ -1304,6 +1431,7 @@ class VisualArtSpriteDesignerAgent:
             strip_border_frame=True,
             pad_ratio=0.06,
             isolate_single_subject=isolate_single_subject,
+            chroma_key_hex=norm_ck,
         )
 
     @staticmethod
@@ -1939,6 +2067,8 @@ class VisualArtSpriteDesignerAgent:
             f"SINGLE CANONICAL NEUTRAL STANDING/IDLE FIGURE ONLY (the animation engine will articulate all other rows/frames "
             f"from this one base image — do NOT draw multiple poses, rows, frames, or a sprite sheet grid): {raw_base_prompt}"
         )
+        req_chroma = getattr(asset_req, "chroma_key_hex", "#FF00FF") or "#FF00FF"
+        req_cam_proj = str(getattr(asset_req, "camera_projection", "") or "")
         if self._is_live_genai_client():
             base_img = self._generate_gemini_sprite_image(
                 prompt=single_base_prompt,
@@ -1947,6 +2077,8 @@ class VisualArtSpriteDesignerAgent:
                 reference_images=reference_images,
                 style_guide=style_guide,
                 is_animated_actor=True,
+                chroma_key_hex=req_chroma,
+                camera_projection=req_cam_proj,
             )
         else:
             self._ensure_procedural_allowed_or_raise("fabricate_sprite_sheet")
@@ -1993,6 +2125,8 @@ class VisualArtSpriteDesignerAgent:
                     reference_images=row_refs,
                     style_guide=style_guide,
                     is_animated_actor=True,
+                    chroma_key_hex=req_chroma,
+                    camera_projection=req_cam_proj,
                 )
             for col_idx in range(fcount):
                 col_source_img = row_base_img
@@ -2020,6 +2154,8 @@ class VisualArtSpriteDesignerAgent:
                             reference_images=col_refs,
                             style_guide=style_guide,
                             is_animated_actor=True,
+                            chroma_key_hex=req_chroma,
+                            camera_projection=req_cam_proj,
                         )
                     except Exception as col_exc:
                         logger.warning(
@@ -2250,6 +2386,8 @@ class VisualArtSpriteDesignerAgent:
                     dimensions=(pw, ph),
                     reference_images=reference_images,
                     style_guide=style_guide,
+                    chroma_key_hex=getattr(asset_req, "chroma_key_hex", "#FF00FF") or "#FF00FF",
+                    camera_projection=str(getattr(asset_req, "camera_projection", "") or ""),
                 )
             else:
                 self._ensure_procedural_allowed_or_raise("fabricate_articulated_rig")
@@ -2306,6 +2444,13 @@ class VisualArtSpriteDesignerAgent:
             grid_cols = max(1, int(asset_req.get("grid_cols") or 1))
             grid_rows = max(1, int(asset_req.get("grid_rows") or 1))
             cell_prompts = list(asset_req.get("cell_prompts") or [])
+            cell_target_sizes = [
+                (int(pair[0]), int(pair[1]))
+                for pair in (asset_req.get("cell_target_sizes") or [])
+                if isinstance(pair, (list, tuple)) and len(pair) >= 2
+            ]
+            chroma_key_hex = str(asset_req.get("chroma_key_hex") or "#FF00FF")
+            camera_projection = str(asset_req.get("camera_projection") or "")
         else:
             dims = getattr(asset_req, "dimensions", None) or (64, 64)
             prompt = getattr(asset_req, "visual_prompt_or_text", "") or getattr(asset_req, "description", "") or getattr(asset_req, "name", "game sprite")
@@ -2314,6 +2459,13 @@ class VisualArtSpriteDesignerAgent:
             grid_cols = max(1, int(getattr(asset_req, "grid_cols", 1) or 1))
             grid_rows = max(1, int(getattr(asset_req, "grid_rows", 1) or 1))
             cell_prompts = list(getattr(asset_req, "cell_prompts", None) or [])
+            cell_target_sizes = [
+                (int(pair[0]), int(pair[1]))
+                for pair in (getattr(asset_req, "cell_target_sizes", None) or [])
+                if isinstance(pair, (list, tuple)) and len(pair) >= 2
+            ]
+            chroma_key_hex = str(getattr(asset_req, "chroma_key_hex", None) or "#FF00FF")
+            camera_projection = str(getattr(asset_req, "camera_projection", "") or "")
 
         is_multi_cell = (grid_cols * grid_rows) > 1
         if is_multi_cell and cell_prompts:
@@ -2354,6 +2506,8 @@ class VisualArtSpriteDesignerAgent:
                         reference_images=reference_images,
                         style_guide=style_guide,
                         isolate_single_subject=True,
+                        chroma_key_hex=chroma_key_hex,
+                        camera_projection=camera_projection,
                     )
                 else:
                     self._ensure_procedural_allowed_or_raise("generate_dynamic_sprite")
@@ -2363,7 +2517,15 @@ class VisualArtSpriteDesignerAgent:
                         asset_type=atype,
                         seed=f"{aid}_cell_{idx}_{c_prompt[:24]}",
                     )
-                cell_rgba = cell_img.convert("RGBA").resize((cell_w, cell_h), Image.Resampling.LANCZOS)
+                target_fp = cell_target_sizes[idx] if idx < len(cell_target_sizes) else None
+                if target_fp is not None:
+                    cell_rgba = self.fit_cutout_to_cell_footprint(
+                        cell_img,
+                        cell_size=(cell_w, cell_h),
+                        target_footprint=target_fp,
+                    )
+                else:
+                    cell_rgba = cell_img.convert("RGBA").resize((cell_w, cell_h), Image.Resampling.LANCZOS)
                 cell_box = (col_i * cell_w, row_i * cell_h, (col_i + 1) * cell_w, (row_i + 1) * cell_h)
                 img.paste((0, 0, 0, 0), cell_box)
                 img.paste(cell_rgba, (col_i * cell_w, row_i * cell_h), cell_rgba)
@@ -2375,11 +2537,25 @@ class VisualArtSpriteDesignerAgent:
                 reference_images=reference_images,
                 style_guide=style_guide,
                 isolate_single_subject=not is_multi_cell,
+                chroma_key_hex=chroma_key_hex,
+                camera_projection=camera_projection,
             )
+            if not is_multi_cell and len(cell_target_sizes) == 1:
+                img = self.fit_cutout_to_cell_footprint(
+                    img,
+                    cell_size=(max(1, int(dims[0])), max(1, int(dims[1]))),
+                    target_footprint=cell_target_sizes[0],
+                )
         else:
             self._ensure_procedural_allowed_or_raise("generate_dynamic_sprite")
             renderer = ProceduralSpriteRenderer(mood=mood)
             img = renderer.render_from_requirement(asset_req)
+            if not is_multi_cell and len(cell_target_sizes) == 1:
+                img = self.fit_cutout_to_cell_footprint(
+                    img,
+                    cell_size=(max(1, int(dims[0])), max(1, int(dims[1]))),
+                    target_footprint=cell_target_sizes[0],
+                )
 
         if output_path is None:
             name = getattr(asset_req, "name", None) if hasattr(asset_req, "name") else (asset_req.get("name") if isinstance(asset_req, dict) else None)
@@ -2466,12 +2642,18 @@ class VisualArtSpriteDesignerAgent:
 
                 if self._is_live_genai_client():
                     target_dims = (max(int(dims[0]), 48), max(int(dims[1]), 48))
+                    item_ck = (
+                        item.get("chroma_key_hex")
+                        if isinstance(item, dict)
+                        else getattr(item, "chroma_key_hex", None)
+                    ) or "#FF00FF"
                     img = self._generate_gemini_sprite_image(
                         prompt=prompt or filename,
                         asset_type=atype,
                         dimensions=target_dims,
                         reference_images=reference_images,
                         style_guide=style_guide,
+                        chroma_key_hex=str(item_ck),
                     )
                 else:
                     self._ensure_procedural_allowed_or_raise("generate_cartridge_sprites")
@@ -2879,14 +3061,11 @@ class VisualArtSpriteDesignerAgent:
 
         total_px = max(1, w * h)
         opaque_px = int(np.count_nonzero(rgba_np[:, :, 3] > 24))
-        r_ch = rgba_np[:, :, 0].astype(np.int32)
-        g_ch = rgba_np[:, :, 1].astype(np.int32)
-        b_ch = rgba_np[:, :, 2].astype(np.int32)
-        a_ch = rgba_np[:, :, 3].astype(np.int32)
-        magenta_mask = (a_ch > 40) & (r_ch > 185) & (b_ch > 185) & (g_ch < 90) & ((np.minimum(r_ch, b_ch) - g_ch) > 100)
-        magenta_px = int(np.count_nonzero(magenta_mask))
+        norm_ck, _, _, _ = self._resolve_chroma_key_spec(getattr(req, "chroma_key_hex", "#FF00FF"))
+        chroma_mask = self._compute_chroma_spill_mask(rgba_np, norm_ck)
+        chroma_px = int(np.count_nonzero(chroma_mask))
         alpha_ratio = opaque_px / float(total_px)
-        magenta_ratio = magenta_px / float(total_px)
+        chroma_ratio = chroma_px / float(total_px)
 
         is_tile = req.fabrication_mode == "tile_surface" or req.asset_type in ("tile", "tile_surface")
         is_backdrop = req.fabrication_mode == "parallax_layer" or req.asset_type in ("backdrop", "parallax_layer")
@@ -2898,11 +3077,21 @@ class VisualArtSpriteDesignerAgent:
         tile_ok = True
         mirror_sym = 0.0
 
-        if opaque_px == 0 or alpha_ratio < 0.02:
+        req_cell_sizes = [
+            (int(pair[0]), int(pair[1]))
+            for pair in (getattr(req, "cell_target_sizes", None) or [])
+            if isinstance(pair, (list, tuple)) and len(pair) >= 2
+        ]
+        min_alpha_floor = 0.02
+        if req_cell_sizes and total_px > 0:
+            target_area_sum = sum(max(1, tw) * max(1, th) for tw, th in req_cell_sizes)
+            min_alpha_floor = min(0.02, max(0.002, (target_area_sum / float(total_px)) * 0.20))
+
+        if opaque_px == 0 or alpha_ratio < min_alpha_floor:
             defects.append(f"Asset '{req.asset_id}' is nearly blank/transparent (alpha coverage={alpha_ratio:.3f}).")
             framing_ok = False
-        if magenta_ratio > 0.015:
-            defects.append(f"Asset '{req.asset_id}' has residual chroma-key magenta spill ({magenta_ratio:.3f}).")
+        if chroma_ratio > 0.015:
+            defects.append(f"Asset '{req.asset_id}' has residual chroma-key ({norm_ck}) spill ({chroma_ratio:.3f}).")
             alpha_ok = False
 
         if is_tile:
@@ -2930,33 +3119,50 @@ class VisualArtSpriteDesignerAgent:
         g_cols = max(1, int(getattr(req, "grid_cols", 1) or 1))
         g_rows = max(1, int(getattr(req, "grid_rows", 1) or 1))
         det_defective_cells: List[int] = []
+        measured_cell_bboxes: List[Tuple[int, int]] = []
         if (g_cols * g_rows) > 1:
             cw_chk = max(1, w // g_cols)
             ch_chk = max(1, h // g_rows)
             empty_cells: List[str] = []
-            magenta_cells: List[str] = []
+            chroma_cells: List[str] = []
             boxed_cells: List[str] = []
+            mismatched_size_cells: List[str] = []
             for r_i in range(g_rows):
                 for c_i in range(g_cols):
                     cell_idx = r_i * g_cols + c_i
                     sub_rgba = rgba_np[r_i * ch_chk:(r_i + 1) * ch_chk, c_i * cw_chk:(c_i + 1) * cw_chk]
                     sub_a = sub_rgba[:, :, 3]
                     sub_total = max(1, int(sub_a.size))
-                    sub_opaque = int(np.count_nonzero(sub_a > 24))
+                    ys_c, xs_c = np.where(sub_a > 24)
+                    sub_opaque = int(xs_c.size)
                     if sub_opaque < 16:
+                        measured_cell_bboxes.append((0, 0))
                         empty_cells.append(f"(row={r_i}, col={c_i})")
                         det_defective_cells.append(cell_idx)
                         continue
-                    sub_mag = int(
+                    bw_c = int(xs_c.max() - xs_c.min() + 1)
+                    bh_c = int(ys_c.max() - ys_c.min() + 1)
+                    measured_cell_bboxes.append((bw_c, bh_c))
+                    if cell_idx < len(req_cell_sizes):
+                        tw_c, th_c = max(1, req_cell_sizes[cell_idx][0]), max(1, req_cell_sizes[cell_idx][1])
+                        dom_ratio = max(float(bw_c) / float(tw_c), float(bh_c) / float(th_c))
+                        if bw_c > int(tw_c * 1.25) + 3 or bh_c > int(th_c * 1.25) + 3 or dom_ratio < 0.45:
+                            mismatched_size_cells.append(f"(row={r_i}, col={c_i}: actual={bw_c}x{bh_c}, target={tw_c}x{th_c})")
+                            det_defective_cells.append(cell_idx)
+                    sub_ck = int(
                         np.count_nonzero(
-                            (sub_a > 24)
-                            & (sub_rgba[:, :, 0] > 205)
-                            & (sub_rgba[:, :, 2] > 205)
-                            & (sub_rgba[:, :, 1] < 65)
+                            self._compute_chroma_spill_mask(
+                                sub_rgba,
+                                norm_ck,
+                                alpha_min=24,
+                                hi_threshold=205,
+                                lo_threshold=65,
+                                excess_threshold=110,
+                            )
                         )
                     )
-                    if (sub_mag / float(sub_total)) > 0.015:
-                        magenta_cells.append(f"(row={r_i}, col={c_i})")
+                    if (sub_ck / float(sub_total)) > 0.015:
+                        chroma_cells.append(f"(row={r_i}, col={c_i})")
                         det_defective_cells.append(cell_idx)
                     if not is_tile and not is_backdrop and sub_rgba.shape[0] >= 4 and sub_rgba.shape[1] >= 4:
                         c_corners = sum(
@@ -2977,15 +3183,20 @@ class VisualArtSpriteDesignerAgent:
                 defects.append(
                     f"Multi-cell grid sheet ({g_cols}x{g_rows}) has empty/blank cell(s): {', '.join(empty_cells)}."
                 )
-            if magenta_cells:
+            if chroma_cells:
                 alpha_ok = False
                 defects.append(
-                    f"Multi-cell grid sheet ({g_cols}x{g_rows}) has chroma-key magenta spill in cell(s): {', '.join(magenta_cells)}."
+                    f"Multi-cell grid sheet ({g_cols}x{g_rows}) has chroma-key ({norm_ck}) spill in cell(s): {', '.join(chroma_cells)}."
                 )
             if boxed_cells:
                 alpha_ok = False
                 defects.append(
                     f"Multi-cell grid sheet ({g_cols}x{g_rows}) has unremoved opaque background box in cell(s): {', '.join(boxed_cells)}."
+                )
+            if mismatched_size_cells:
+                framing_ok = False
+                defects.append(
+                    f"Multi-cell grid sheet ({g_cols}x{g_rows}) cell footprint mismatch against `cell_target_sizes`: {', '.join(mismatched_size_cells)}."
                 )
 
         plate_p = Path(inspection_plate_path) if inspection_plate_path else asset_p.parent / "renders" / f"plate_{req.asset_id}.png"
@@ -3007,8 +3218,13 @@ class VisualArtSpriteDesignerAgent:
             ]
             for rp in self._build_reference_parts(reference_images)[:1]:
                 contents.append(rp)
+            size_telemetry_clause = (
+                f", cell_target_sizes={req_cell_sizes}, measured_cell_bboxes_px={measured_cell_bboxes}"
+                if req_cell_sizes
+                else f", measured_cell_bboxes_px={measured_cell_bboxes}"
+            )
             grid_note = (
-                f"\nMulti-Cell Grid Layout: {g_cols} columns x {g_rows} rows ({g_cols * g_rows} cells total, 0-based row-major index `idx = row * {g_cols} + col`, cell_prompts={getattr(req, 'cell_prompts', [])}) — "
+                f"\nMulti-Cell Grid Layout: {g_cols} columns x {g_rows} rows ({g_cols * g_rows} cells total, 0-based row-major index `idx = row * {g_cols} + col`, cell_prompts={getattr(req, 'cell_prompts', [])}{size_telemetry_clause}) — "
                 f"verify that every cell in the {g_cols}x{g_rows} grid contains its distinct graphic cleanly within its cyan cell boundaries. "
                 f"If `accepted=False` because specific cell(s) have defects while other cells are clean, populate `defective_cell_indices` with ONLY those defective 0-based row-major cell indices (0..{g_cols * g_rows - 1}) so clean cells are preserved without regenerating the entire sheet."
                 if (g_cols * g_rows) > 1
@@ -3075,7 +3291,7 @@ class VisualArtSpriteDesignerAgent:
         return AssetVisualValidationVerdict(
             deliberation=(
                 f"Inspected rendered plate for '{req.asset_id}' ({req.fabrication_mode}): "
-                f"alpha_ratio={alpha_ratio:.2f}, magenta_ratio={magenta_ratio:.4f}, mirror_symmetry={mirror_sym:.3f}, defects={len(defects)}."
+                f"alpha_ratio={alpha_ratio:.2f}, chroma_ratio={chroma_ratio:.4f} ({norm_ck}), mirror_symmetry={mirror_sym:.3f}, defects={len(defects)}."
             ),
             asset_id=req.asset_id,
             alpha_cleanliness_passed=alpha_ok,
@@ -3087,7 +3303,7 @@ class VisualArtSpriteDesignerAgent:
             visual_defects=defects,
             defective_cell_indices=sorted(set(det_defective_cells)),
             prompt_refinement_directive=(
-                "Ensure isolated grounded subject on flat #FF00FF chroma background with zero detached ground pedestal or bilateral mirror symmetry."
+                f"Ensure isolated grounded subject on flat {norm_ck} chroma background with zero detached ground pedestal or bilateral mirror symmetry."
                 if not det_passed else ""
             ),
             accepted=det_passed,

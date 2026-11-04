@@ -28,6 +28,7 @@ from engine.studio.models import (
     AudioDesignerPlan,
     FilmstripPlan,
     GameRequirementsSpec,
+    QACaptureEvent,
     QAPostCaptureAudit,
     RequirementTrack,
     ScriptWritingDeliverable,
@@ -46,6 +47,7 @@ from engine.studio.models import (
     resolve_explicit_cached_request,
 )
 from engine.studio.production_board import (
+    WorkerDesignConcern,
     WorkerResult,
     WorkerSplitTask,
     WorkerYielded,
@@ -374,14 +376,19 @@ def plan_asset_requirement(
             f"COUNCIL REQUIREMENT [{item.item_id}] ({item.kind}): {item.title}\nSPEC: {item.spec}\nPROOF THE COUNCIL WILL JUDGE: {item.proof_spec}\n"
             f"{feedback_block}{prior_block}"
             f"Set `asset_id` to exactly '{item.item_id}'. `fabrication_mode` must be one of {list(allowed_modes)}; `asset_type`, `target_path` "
-            f"(under assets/), `dimensions` (the rendering strategy's resolution for this subject), `visual_prompt_or_text` and, for rigs, "
+            f"(under assets/), `dimensions` (the rendering strategy's resolution for this subject), `camera_projection`, `world_footprint_px`, `visual_prompt_or_text` and, for rigs, "
             f"`articulated_parts` must be consistent with it and with the style, camera and palette in the Game Bible.\n"
             f"CRITICAL MODE & PROMPT RULES FOR `visual_prompt_or_text`:\n"
+            f"- ONE ENTITY = ONE DEDICATED HIGH-RES ASSET (ZERO GRAB-BAG SHEETS): Every distinct gameplay entity, interactive structure, tool, hazard, or prop MUST be its own dedicated asset (`grid_cols=1, grid_rows=1` for single-state static assets). Reserve `grid_cols x grid_rows > 1` STRICTLY for animation frames, poses, or visual state variants (e.g., idle/active/damaged) of ONE single cohesive subject—NEVER pack multiple unrelated gameplay buildings, tools, or items into a multi-cell grab-bag sheet!\n"
+            f"- NATIVE HIGH RESOLUTION & CRISP DOWNSAMPLING (`dimensions >= 128x128` per cell + `world_footprint_px`): For world sprites, props, and structures (`asset_type` in `['sprite', 'prop', 'rig']`), set native per-cell resolution >= `128x128` (e.g., `(128, 128)` or `(256, 256)` for a 1x1 asset, or `(256, 256)` for a 2x2 state sheet—NEVER tiny `32x32` or `48x48` thumbnails that turn blurry when upscaled!) and populate `world_footprint_px = (target_w, target_h)` with its exact intended 1280x720 on-screen pixel footprint so Godot downsamples cleanly (`scale <= 1.0`).\n"
+            f"- LOCKED CAMERA PROJECTION (`camera_projection`): Populate `camera_projection` with the exact locked camera projection from `GameBibleSpec.camera_and_spatial_paradigm` (e.g., `'top_down_orthographic'`, `'side_view_orthographic'`, `'isometric_dimetric'`, or `'screen_space_hud_icon'`) and explicitly state that exact projection inside `visual_prompt_or_text` so sprites never mix conflicting perspectives (such as 3/4 isometric buildings inside a flat top-down orthographic world).\n"
             f"- Avoid `fabrication_mode == 'tile_surface'` for anything that has a silhouette, alpha transparency, endcaps, or distinct shape (such as channels, slabs, platforms, machines, props, or fluid bodies) — `tile_surface` is ONLY for 100% opaque, borderless, full-bleed square surface material swatches. Use `static_sprite` (with `asset_type='prop'` or `'sprite'`), `sprite_sheet`, or `articulated_parts` for any shaped element, structure, or multi-state object so its alpha silhouette is preserved cleanly.\n"
             f"- When `fabrication_mode == 'sprite_sheet'` AND the asset is an animated character/actor whose poses are deformed from a single base figure, `visual_prompt_or_text` is sent to the image generator to synthesize the SINGLE canonical neutral standing/idle figure, and our biomechanical keyframe engine then generates the multi-row, multi-frame sprite sheet (`*_sheet.png`) from `animation_states` (leave `grid_cols=1, grid_rows=1, cell_prompts=[]`).\n"
-            f"- MULTI-CELL GRID / STATE SHEET / ATLAS COMPOSITION (`grid_cols`, `grid_rows`, `cell_prompts`): Whenever the Task Lead brief or task spec requests a multi-cell grid, sheet, or atlas of distinct visual states, icons, stages, or variants (e.g., a 2x2 or NxM sheet where each cell depicts a distinct state, graphic, or component rather than biomechanical deformation of one walking figure), set `grid_cols` and `grid_rows` to the exact grid dimensions (e.g. `grid_cols=2, grid_rows=2`) and populate `cell_prompts` with exactly `grid_cols * grid_rows` focused visual descriptions in row-major order (top-left to bottom-right), where EACH string in `cell_prompts` describes the single isolated graphic/state that belongs inside that specific cell! Keep multi-cell grids right-sized to the distinct states actually required by the spec (e.g. 2x1 or 2x2 for 2–4 states rather than padding to 4x4 unless 16 distinct cells are explicitly required, because each cell triggers its own image synthesis call).\n"
+            f"- MULTI-CELL STATE SHEET COMPOSITION (`grid_cols`, `grid_rows`, `cell_prompts`, `cell_target_sizes`): When a single cohesive subject or homogeneous UI icon set genuinely has 2–4 distinct visual states/stages (`grid_cols * grid_rows > 1`), set `grid_cols` and `grid_rows` to the exact grid dimensions and populate `cell_prompts` with `grid_cols * grid_rows` focused visual descriptions in row-major order, each describing that single state of the subject in the exact same `camera_projection`.\n"
+            f"- PER-CELL BOUNDED FOOTPRINTS / SIZE TIERS (`cell_target_sizes`): By default (`cell_target_sizes=[]`), our cutout post-processor tight-crops each cell's foreground silhouette and scales it to fill ~88% of `(cell_width, cell_height)` regardless of margin/padding instructions written in `cell_prompts`. Therefore, whenever the spec or brief requires distinct pixel footprints or progressive size tiers across columns or rows centered inside uniform `(cell_width, cell_height)` grid cells, you MUST populate `cell_target_sizes` with the exact `(max_width_px, max_height_px)` bounding footprint for every cell in row-major order (`length == grid_cols * grid_rows`) so each extracted cutout is deterministically scaled to `cell_target_sizes[idx]` and centered inside its cell.\n"
+            f"- PALETTE-SAFE CHROMA KEY (`chroma_key_hex`): Choose `chroma_key_hex` from `['#FF00FF', '#00FF00', '#0000FF', '#FFFF00']` so the background chroma key has maximum RGB separation from ALL foreground colors, glows, and emissive accents across the asset (never pick `'#FF00FF'` when the asset contains magenta/pink/purple/crimson; never pick `'#00FF00'` when it contains green/lime; never pick `'#0000FF'` when it contains saturated blue/indigo; never pick `'#FFFF00'` when it contains yellow/amber/gold).\n"
             f"- When `grid_cols == 1` and `grid_rows == 1` (single isolated asset), `visual_prompt_or_text` MUST describe ONLY ONE single isolated object/prop in its canonical intact state — NEVER a multi-state variation grid.\n"
-            f"- When `fabrication_mode == 'audio_bark'`, `visual_prompt_or_text` is sent directly to the neural TTS engine to synthesize ONE single spoken voice line into `target_path` (strictly bounded to [0.1s, 30.0s], max 45 words / 280 characters of direct spoken dialogue). NEVER concatenate multiple barks, speaker labels ('Kaelen barks:', 'Overseer Vhen:'), or parenthetical stage directions into `visual_prompt_or_text`! Write ONLY the exact spoken words of a single representative bark (1–2 sentences, <= 45 words).\n"
+            f"- When `fabrication_mode == 'audio_bark'`, `visual_prompt_or_text` is sent directly to the neural TTS engine to synthesize ONE single spoken voice line into `target_path` (strictly bounded to [0.1s, 30.0s], max 45 words / 280 characters of direct spoken dialogue). NEVER concatenate multiple barks, speaker labels ('Speaker:', 'Narrator:'), or parenthetical stage directions into `visual_prompt_or_text`! Write ONLY the exact spoken words of a single representative bark (1–2 sentences, <= 45 words).\n"
             f"Provide `deliberation` FIRST.\n\n{curated_block}{mem_q_block}\n{retry}"
         )
         contents_arg: Any = ([prompt] + multimodal_parts) if multimodal_parts else prompt
@@ -409,6 +416,7 @@ def plan_asset_requirement(
                 raise StudioAgentError(f"Asset planning for '{item.item_id}' returned an empty response")
             raw_resp_text = resp.text
         req = AssetRequirement.model_validate_json(raw_resp_text)
+        logger.info("reasoning_rationale[plan_asset_requirement]: %s", req.deliberation)
         if req.memory_updates:
             mem_store.apply_mutations(
                 author_role=target_role,
@@ -454,6 +462,52 @@ def plan_asset_requirement(
                     f"When `cell_prompts` is populated ({len(req.cell_prompts)} items), `grid_cols * grid_rows` "
                     f"({req.grid_cols}x{req.grid_rows}={expected_cells}) must be > 1 and equal `len(cell_prompts)`."
                 )
+        if req.cell_target_sizes:
+            g_cols_v = max(1, int(req.grid_cols or 1))
+            g_rows_v = max(1, int(req.grid_rows or 1))
+            expected_cells = g_cols_v * g_rows_v
+            if len(req.cell_target_sizes) != expected_cells:
+                issues.append(
+                    f"When `cell_target_sizes` is populated ({len(req.cell_target_sizes)} items), its length must equal "
+                    f"`grid_cols * grid_rows` ({g_cols_v}x{g_rows_v}={expected_cells})."
+                )
+            else:
+                dims_v = req.dimensions or (64, 64)
+                min_cell = 32 if expected_cells > 1 else 1
+                cw_max = max(min_cell, int(dims_v[0]) // g_cols_v)
+                ch_max = max(min_cell, int(dims_v[1]) // g_rows_v)
+                for idx_ts, (tw_v, th_v) in enumerate(req.cell_target_sizes):
+                    if int(tw_v) < 4 or int(th_v) < 4 or int(tw_v) > cw_max or int(th_v) > ch_max:
+                        issues.append(
+                            f"`cell_target_sizes[{idx_ts}]` = ({tw_v}, {th_v}) must satisfy 4 <= width <= {cw_max} "
+                            f"and 4 <= height <= {ch_max} for cell size ({cw_max}, {ch_max})."
+                        )
+                        break
+        if (
+            is_real_genai_client(ctx.client)
+            and req.asset_type in ("sprite", "prop", "rig")
+            and req.fabrication_mode in ("static_sprite", "sprite_sheet")
+        ):
+            dims_chk = req.dimensions or (128, 128)
+            g_cols_chk = max(1, int(req.grid_cols or 1))
+            g_rows_chk = max(1, int(req.grid_rows or 1))
+            cell_w_chk = int(dims_chk[0]) // g_cols_chk
+            cell_h_chk = int(dims_chk[1]) // g_rows_chk
+            if cell_w_chk < 128 or cell_h_chk < 128:
+                issues.append(
+                    f"World sprite/prop native per-cell resolution ({cell_w_chk}x{cell_h_chk} from dimensions={dims_chk} "
+                    f"divided by {g_cols_chk}x{g_rows_chk}) must be >= 128x128 so in-world rendering downsamples crisply (`scale <= 1.0`) "
+                    f"instead of upscaling blurry thumbnails."
+                )
+            if req.world_footprint_px is not None:
+                fw, fh = int(req.world_footprint_px[0]), int(req.world_footprint_px[1])
+                if fw <= 0 or fh <= 0:
+                    issues.append(f"`world_footprint_px` {req.world_footprint_px} must have positive width and height.")
+                elif cell_w_chk < fw or cell_h_chk < fh:
+                    issues.append(
+                        f"Native per-cell resolution ({cell_w_chk}x{cell_h_chk}) must be >= `world_footprint_px` ({fw}x{fh}) "
+                        f"so Godot downsamples (`scale <= 1.0`) rather than upscaling."
+                    )
         if not issues:
             # Honor the agent's exact `req.target_path` (Rule 5: strict configuration fidelity, zero silent path rewrites).
             # If updating an existing catalog entry in-place in `assets/asset_library.json`, preserve its canonical `asset_id`
@@ -1118,6 +1172,8 @@ def level_map_handler(ctx: WorkerContext) -> Callable[[WorkItem], WorkerResult]:
                             input_script=script,
                             setup_script=setup_calls or None,
                             verify_counterfactual=False,
+                            capture_events=_serialize_capture_events(plan) or None,
+                            max_sim_ticks=int(getattr(plan, "max_sim_ticks", 600) or 600),
                         )
                     else:
                         strip = ctx.filmstrip_fn(
@@ -1140,7 +1196,7 @@ def level_map_handler(ctx: WorkerContext) -> Callable[[WorkItem], WorkerResult]:
 
 
 STANDARD_INPUT_ACTIONS = ["ui_up", "ui_down", "ui_left", "ui_right", "ui_accept", "ui_select", "ui_cancel"]
-MAX_PROOF_TICKS = 900
+MAX_PROOF_TICKS = 3600
 MAX_PROOF_FRAMES = 12
 CODE_MODULE_SUFFIXES = (".gd", ".tscn", ".godot", ".gdshader")
 
@@ -1272,6 +1328,16 @@ def _summarize_cartridge_for_qa(cartridge_dir: Path, max_chars: int = 6500) -> s
                 header_lines.append(f"- level_layout.json: world_bounds={wb} regions={regs}")
         except Exception:
             pass
+    bible_path_qa = c_dir / "game_bible.json"
+    if bible_path_qa.is_file():
+        try:
+            bdata_qa = json.loads(bible_path_qa.read_text(encoding="utf-8"))
+            if isinstance(bdata_qa, dict):
+                canon_keys = list(bdata_qa.get("canonical_telemetry_keys") or [])
+                if canon_keys:
+                    header_lines.append(f"- canonical_telemetry_keys (Game Bible snapshot schema): {canon_keys[:24]}")
+        except Exception:
+            pass
     input_map_lines: List[str] = []
     layer_map_lines: List[str] = []
     module_lines: List[str] = []
@@ -1350,11 +1416,36 @@ def validate_filmstrip_plan(
     if (getattr(plan, "production_defect_report", "") or "").strip():
         return []
     issues: List[str] = []
-    ticks = plan.capture_ticks
-    if not ticks or len(ticks) > MAX_PROOF_FRAMES:
-        issues.append(f"capture_ticks must contain 1 to {MAX_PROOF_FRAMES} ticks.")
+    ticks = list(plan.capture_ticks or [])
+    cap_events = list(getattr(plan, "capture_events", None) or [])
+    if (not ticks and not cap_events) or len(ticks) > MAX_PROOF_FRAMES or len(cap_events) > MAX_PROOF_FRAMES:
+        issues.append(
+            f"capture_ticks or capture_events must contain 1 to {MAX_PROOF_FRAMES} frames "
+            f"(got {len(ticks)} capture_ticks and {len(cap_events)} capture_events)."
+        )
     if any(t < 1 or t > MAX_PROOF_TICKS for t in ticks):
         issues.append(f"every capture tick must be within [1, {MAX_PROOF_TICKS}].")
+    ev_labels: set[str] = set()
+    for idx_ev, ev in enumerate(cap_events):
+        ev_lbl = (getattr(ev, "event_label", "") or f"event_{idx_ev + 1}").strip()
+        ev_labels.add(ev_lbl)
+        if ev.at_tick < 1 or ev.at_tick > MAX_PROOF_TICKS:
+            issues.append(f"capture_event '{ev_lbl}' at_tick={ev.at_tick} must be within [1, {MAX_PROOF_TICKS}].")
+        if ev.trigger_mode in ("on_condition", "on_change") and not (ev.when_snapshot_key or "").strip():
+            issues.append(
+                f"capture_event '{ev_lbl}' with trigger_mode='{ev.trigger_mode}' requires non-empty `when_snapshot_key`."
+            )
+    for raw_assert in getattr(plan, "state_assertions", None) or []:
+        a_lbl = (getattr(raw_assert, "at_event_label", "") or "").strip()
+        a_tick = int(getattr(raw_assert, "at_tick", 0) or 0)
+        if a_lbl and a_lbl not in ev_labels:
+            issues.append(
+                f"state_assertion references unknown at_event_label={a_lbl!r}; available capture_events: {sorted(ev_labels)}."
+            )
+        if not a_lbl and (a_tick < 1 or a_tick > MAX_PROOF_TICKS):
+            issues.append(
+                f"state_assertion for '{raw_assert.snapshot_key}' must set either a valid `at_event_label` or `at_tick` within [1, {MAX_PROOF_TICKS}]."
+            )
     for seg in plan.input_segments:
         if seg.from_tick < 1 or seg.to_tick < seg.from_tick or seg.to_tick > MAX_PROOF_TICKS:
             issues.append(f"input segment {seg.from_tick}..{seg.to_tick} is invalid (1 <= from <= to <= {MAX_PROOF_TICKS}).")
@@ -1461,6 +1552,23 @@ def _serialize_input_segments(plan: FilmstripPlan) -> List[Dict[str, Any]]:
             seg_d["hold_ticks"] = int(getattr(s, "hold_ticks", 10) or 10)
         script.append(seg_d)
     return script
+
+
+def _serialize_capture_events(plan: FilmstripPlan) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    for idx, ev in enumerate(getattr(plan, "capture_events", None) or []):
+        events.append(
+            {
+                "event_label": (ev.event_label or f"event_{idx + 1}").strip(),
+                "trigger_mode": ev.trigger_mode,
+                "at_tick": int(ev.at_tick or 0),
+                "when_snapshot_key": (ev.when_snapshot_key or "").strip(),
+                "when_operator": (ev.when_operator or "==").strip() or "==",
+                "when_value": ev.when_value,
+                "settle_ticks": max(0, int(ev.settle_ticks or 0)),
+            }
+        )
+    return events
 
 
 def plan_filmstrip(
@@ -1621,42 +1729,38 @@ def _plan_filmstrip_inner(
             else ""
         )
         static_qa_prefix_text = (
-            f"You are the QA Test Engineer designing and building a Godot 4.3 test scene and scripted playthrough that PROVES or DIAGNOSES an item.\n"
+            f"You are the QA Test Engineer designing and building a Godot 4.3 verification playthrough that PROVES or DIAGNOSES an item.\n"
             f"ITEM [{item.item_id}] ({item.kind}): {item.title}\nSPEC: {item.spec}\nTHE COUNCIL WANTS TO SEE: {base_proof_spec}\n"
             f"{tool_dir_block}\n"
-            f"1. BUILD OR PATCH YOUR QA TEST SCENE (`target_scene` + `test_scene_gd_content` / `test_scene_patches`) OR REPORT A PRODUCTION DEFECT (`production_defect_report`):\n"
-            f"   - Set `target_scene = 'res://tests/test_{safe_qa_id}.tscn'`. Write `test_scene_gd_content` when creating a new test scene, use `test_scene_patches` (`SurgicalCodePatch`) for targeted edits to an existing `res://tests/test_{safe_qa_id}.gd`, or leave both empty when reusing a valid existing test scene on disk unchanged.\n"
+            f"1. BOOT REAL `res://main.tscn` BY DEFAULT (OR BUILD A READ-ONLY DIAGNOSTIC WRAPPER IN `res://tests/test_{safe_qa_id}.tscn`):\n"
+            f"   - DEFAULT TO `target_scene = 'res://main.tscn'` (`test_scene_gd_content = ''`, `test_scene_patches = []`) whenever the feature is wired into the live game! Running `res://main.tscn` directly exercises the real `Camera2D`, screen-space `CanvasLayer` HUD, and player input handlers that a human player actually experiences.\n"
+            f"   - Use `target_scene = 'res://tests/test_{safe_qa_id}.tscn'` ONLY when: (a) running a read-only `exploratory_diagnostic` probe, (b) testing a standalone un-integrated library script, OR (c) instantiating `preload('res://main.tscn').instantiate()` inside `_ready()` strictly to draw read-only diagnostic overlays on top (forwarding `get_state_snapshot()` from the `main.tscn` instance with ZERO mid-run game-state mutations!).\n"
             f"   - Choose `verification_mode` LAST (`'causal_gameplay'` when proving live interactive player progression, or `'exploratory_diagnostic'` when running a read-only visual/layout/telemetry probe or `discovery` subtask).\n"
-            f"   - If you need missing code/design chunks before scripting your test scene, populate `self_question` (leaving `capture_ticks=[]`); if you need detailed tool syntax, populate `tool_search_query`.\n"
-            f"   - For isolated subsystem/mechanic/UI tasks, `test_scene_gd_content` can instantiate the specific feature script(s) or entities under test.\n"
-            f"   - For whole-game `integration` or `level_map` tasks (or when verifying behavior inside the full game), `test_scene_gd_content` can instantiate `preload('res://main.tscn').instantiate()` (or `preload('res://main.gd').new()`) as a child node in `_ready()` so it runs the real game entrypoint while allowing you to attach QA diagnostic overlays and custom telemetry on top.\n"
-            f"   - DIAGNOSTIC INTEGRITY & FULL COUNCIL TRANSPARENCY: Your job is to surface truth, never to manufacture a green check. The Council sees your exact `test_scene_gd_content` source code, `setup_calls`, visible HUD text telemetry, and live `res://main.tscn` parity comparison. Never inject mid-run state mutations (e.g. `if sim_tick == ...:` inventory/score grants) inside `test_scene_gd_content` to mask a broken mechanic; if inspecting the code or Pass 1 telemetry reveals a production bug or deadlock in the game itself, report it in `production_defect_report` so `swe_engineer` fixes the production code.\n"
-            f"   - Keep production `main.gd` and `ui_hud.gd` 100% pure game code with ZERO debug overlays—all test staging and rich QA diagnostic overlays belong exclusively inside your `test_scene_gd_content`.\n"
-            f"2. STRATEGIZE DIAGNOSTIC OVERLAYS, HUMAN-SCALE RESPONSIVENESS & TELEMETRY (`overlays_and_telemetry_strategy`):\n"
-            f"   - Reason from first principles: what would a live human player experience when interacting with this feature, and what needs to be measured over time (`capture_ticks`, 60 ticks ~ 1 second) to prove the feature feels responsive, legible, and free of subsystem conflicts?\n"
-            f"   - For example, if the feature involves movement, steering, rotation, or physics controls, holding an input over 60–180 ticks (1–3 seconds) must produce a responsive, human-playable rate of change rather than a sluggish crawl or two subsystems fighting/canceling each other out!\n"
-            f"   - Build rich test-only visual diagnostic overlays inside `test_scene_gd_content` (e.g., a foreground `CanvasLayer` or `Node2D._draw()` node in `res://tests/test_*.tscn` that draws velocity/heading/force vectors, collider/trigger bounds, camera framing markers, or live delta readouts) AND include `'player_pos'` plus task-specific metrics in `func get_state_snapshot() -> Dictionary` so both the rendered frames and the `[QA] pos=...` bottom telemetry bar prove real progression.\n"
+            f"   - If you need missing code/design chunks before scripting your playthrough, populate `self_question` (leaving `capture_ticks=[]` and `capture_events=[]`); if you need detailed tool syntax, populate `tool_search_query`.\n"
+            f"   - DIAGNOSTIC INTEGRITY & FULL COUNCIL TRANSPARENCY: Your job is to surface truth, never to manufacture a green check. The Council sees your exact `test_scene_gd_content` source code, `setup_calls`, visible HUD text telemetry, `[SCENE_AUDIT]` lint warnings, and live `res://main.tscn` parity comparison. Never inject mid-run state mutations (e.g. `if sim_tick == ...:` inventory/score grants) inside `test_scene_gd_content` to mask a broken mechanic; if inspecting the code or Pass 1 telemetry reveals a production bug, self-playing handout, or deadlock in the game itself, report it in `production_defect_report` so `swe_engineer` fixes the production code.\n"
+            f"   - Keep production `main.gd` and `ui_hud.gd` 100% pure game code with ZERO debug overlays.\n"
+            f"2. STRATEGIZE HUMAN-SCALE RESPONSIVENESS, PRECONDITIONS & TELEMETRY (`overlays_and_telemetry_strategy` + `counterfactual_precondition_check`):\n"
+            f"   - Reason from first principles: what would a live human player experience over 2–60 seconds (`120..3600` ticks, 60 ticks = 1s), and what key gameplay milestones prove genuine player agency rather than passive self-completion?\n"
+            f"   - Populate `counterfactual_precondition_check` stating what MUST remain untrue or uncollected when zero player input is sent (`input_script=[]`), AND check `canonical_telemetry_keys` in `CARTRIDGE SYMBOLS & ASSETS AVAILABLE FOR QA STAGING` so your assertions inspect canonical state keys.\n"
             f"3. WRITE A CLEAR SUMMARY FOR THE COUNCIL (`council_test_scene_summary`):\n"
-            f"   - Write `council_test_scene_summary` explaining to the Council: (a) what your test scene instantiates and stages, (b) what scenario and inputs run across `capture_ticks`, and (c) what QA diagnostic overlays or telemetry readouts you added so the Council knows exactly what it is looking at.\n"
-            f"4. SCRIPT CAUSAL INPUTS & CAPTURE TICKS (`capture_ticks`, `input_segments`, `state_assertions`):\n"
-            f"   - Choose `capture_ticks` (1-{MAX_PROOF_FRAMES} frames, ticks 1-{MAX_PROOF_TICKS}, 60 ticks ~ 1 second), `input_segments` "
-            f"(actions or KEY_* held over tick ranges, plus optional `mouse_world_pos` or `mouse_click_pos`), and optional `setup_calls` (for scenario staging) "
-            f"so the captured frames show:\n"
-            f"     * Frame 1 (`capture_ticks[0]`, before player inputs take effect): the UNSOLVED t=0 baseline state (`test_unsolved_baseline_t0`), and\n"
-            f"     * Subsequent frames (`capture_ticks[1..]`): the authentic causal progression driven by `input_segments` (`actions`, `mouse_world_pos`, and/or `mouse_click_pos`).\n"
+            f"   - Write `council_test_scene_summary` explaining to the Council: (a) what scene is booted (`res://main.tscn` or wrapper), (b) what player inputs and key milestone events (`capture_events` / `capture_ticks`) execute, and (c) what telemetry changes prove honest preconditions and progression.\n"
+            f"4. PLAN EVENT-DRIVEN MULTI-HORIZON KEYFRAMES & CAUSAL INPUTS (`capture_events`, `max_sim_ticks`, `capture_ticks`, `input_segments`, `state_assertions`):\n"
+            f"   - MULTI-HORIZON SIMULATION (`max_sim_ticks` up to `{MAX_PROOF_TICKS}` ticks = `60s`): Godot runs uncapped (`--disable-vsync`, thousands of ticks per wall-clock second) and exits early the instant all `capture_events` and `capture_ticks` have completed! NEVER cram multi-step gameplay into `<= 90` ticks—set `max_sim_ticks` generously (e.g. `300..2400` ticks = `5..40s`) whenever physics travel, resource harvesting, routing, cooldowns, or waves take multiple seconds.\n"
+            f"   - PLAN KEY EVENTS TO SCREENSHOT (`capture_events` — PREFERRED OVER BLIND TICK GUESSING): Populate `capture_events` (`1..{MAX_PROOF_FRAMES}` `QACaptureEvent` entries, `deliberation` first, `trigger_mode` last) for the exact moments a human reviewer needs to see:\n"
+            f"     * Event 1 (`trigger_mode='at_tick'`, `at_tick=5`, `event_label='t0_unsolved_baseline'`): the UNSOLVED `t=0` starting state before player inputs take effect.\n"
+            f"     * Milestone Events (`trigger_mode='on_condition'` or `'on_change'` on `when_snapshot_key`, starting search from `at_tick`, plus `settle_ticks=6..20` so sprites/particles/UI settle visually): e.g., `'tool_or_structure_placed'`, `'entity_intercepted_or_routed'`, `'objective_or_economy_updated'`. Every `QACaptureEvent` that never triggers before `max_sim_ticks` fails fast with `[UNMET EVENT]` diagnostics!\n"
+            f"     * You may also include explicit `capture_ticks` (`1..{MAX_PROOF_TICKS}`) alongside or instead of `capture_events`.\n"
             f"   - WORLD-SPACE vs. SCREEN-SPACE MOUSE CLICKS (`mouse_world_pos` vs. `mouse_click_pos`):\n"
-            f"     * Whenever clicking an in-world location, terrain cell, spire/pedestal, or entity in a scene with a `Camera2D`, ALWAYS set `mouse_world_pos = [wx, wy]` using the exact 2D world coordinates from the level/world scripts! The harness automatically transforms `mouse_world_pos` through the active `Camera2D` canvas transform (`get_canvas_transform() * Vector2(wx, wy)`) so your click lands on the exact world target regardless of camera offset or zoom.\n"
+            f"     * Whenever clicking an in-world location, terrain cell, or entity in a scene with a `Camera2D`, ALWAYS set `mouse_world_pos = [wx, wy]` using exact 2D world coordinates! The harness transforms `mouse_world_pos` through the active `Camera2D` canvas transform (`get_canvas_transform() * Vector2(wx, wy)`). Note: if the game's `_unhandled_input` mistakenly reads screen-space `event.position` without `get_global_mouse_position()`, placement will land offset from `[wx, wy]` when the camera moves—report that coordinate bug via `production_defect_report`!\n"
             f"     * Use `mouse_click_pos = [sx, sy]` ONLY when clicking screen-space `CanvasLayer` HUD buttons.\n"
-            f"   - STEP-BY-STEP CAUSAL CHAIN PLAYTESTING (NEVER SCRIPT A 1-CLICK SMOKE TRIGGER):\n"
-            f"     * Read the target scripts' input handlers (`_unhandled_input`, `_input`) and terrain/placement rules in `CARTRIDGE SYMBOLS & ASSETS AVAILABLE FOR QA STAGING` and the curated code chunks before scripting `input_segments`:\n"
-            f"       1. TOOL / MODE SELECTION: Check which tool/building slot starts active at `t=0` and which `KEY_*` or action selects the required intermediate/target structure (e.g., pressing `KEY_2` or `KEY_3` before clicking to place Slot 2 or Slot 3)!\n"
-            f"       2. VALID BUILDABLE WORLD COORDINATES: Check the terrain/placement validity rules (`is_placement_valid`, land/spire/pedestal polygons vs. invalid water/void) and choose exact 2D world coordinates `mouse_world_pos = [wx, wy]` that lie on valid buildable terrain along the physical trajectory.\n"
-            f"       3. ROTATION / TUNING: Check whether placed structures require rotation (`KEY_Q`, `KEY_E`, `KEY_R`) or impulse tuning so their physical surface normal / trajectory routes items into the goal.\n"
-            f"       4. STEP-BY-STEP `state_assertions`: Populate `state_assertions` for EACH link in the causal chain across ticks (e.g., tool slot selected -> structure placed count incremented `> baseline` -> intermediate interaction/ricochet count `> 0` -> final objective/delivery count `> baseline`), rather than only asserting on the final score at the last tick! That way, if any step fails in Pass 1, the telemetry pinpoints the exact link that needs adjustment.\n"
-            f"   - REACTIVE TIMING TIP: When a secondary player input depends on dynamic physics or movement reaching a threshold, "
-            f"populate `when_snapshot_key`, `when_operator` ('<=', '>=', '==', '!='), `when_value`, and `hold_ticks` on that `InputSegment`.\n"
-            f"   - AUDIOVISUAL CLIP RECORDING (`record_audiovisual_clip`): Leave `record_audiovisual_clip = False` by default; set `record_audiovisual_clip = True` when the Task Lead QA brief or proof strategy asks to capture a synchronized `.mp4` gameplay video+audio clip alongside the contact sheet so live in-game sound playback, synchronization, or mix balance can be perceptually evaluated.\n"
-            f"   - LONG-TERM MEMORY SELECTIVITY: Leave `memory_updates` empty (`[]`) on routine QA runs! Never log single-task test steps or pass/fail status; record ONLY non-obvious harness constraints or verification invariants that future tasks/slices would otherwise trip over.\n"
+            f"   - STEP-BY-STEP CAUSAL CHAIN PLAYTESTING & EVENT-LINKED `state_assertions`:\n"
+            f"     * Read the target scripts' input handlers (`_unhandled_input`, `_input`) and placement/precondition rules before scripting `input_segments`:\n"
+            f"       1. TOOL / MODE SELECTION: Check which slot starts active at `t=0` and press the exact `KEY_*` or action to select required tools.\n"
+            f"       2. VALID WORLD COORDINATES: Choose exact 2D world coordinates `mouse_world_pos = [wx, wy]` satisfying placement validity rules.\n"
+            f"       3. ROTATION / AIMING / TIMING: Use `when_snapshot_key`, `when_operator`, `when_value`, and `hold_ticks` on `InputSegment` when timing depends on moving targets or state thresholds.\n"
+            f"       4. STEP-BY-STEP `state_assertions`: Populate `state_assertions` (`at_event_label` matching your `capture_events` labels, or explicit `at_tick`) for EACH link in the causal chain rather than only asserting on the final score!\n"
+            f"   - AUDIOVISUAL CLIP RECORDING (`record_audiovisual_clip`): Leave `record_audiovisual_clip = False` by default; set `record_audiovisual_clip = True` when the Task Lead QA brief or proof strategy asks to capture a synchronized `.mp4` gameplay video+audio clip alongside the contact sheet.\n"
+            f"   - LONG-TERM MEMORY SELECTIVITY: Leave `memory_updates` empty (`[]`) on routine QA runs! Record ONLY non-obvious harness constraints or verification invariants that future tasks/slices would otherwise trip over.\n"
             f"   - Provide `deliberation` FIRST and `verification_mode` LAST.\n"
             f"Available input actions: {actions}.{context_block}"
         )
@@ -1743,6 +1847,7 @@ def _plan_filmstrip_inner(
         if (
             self_q
             and not plan.capture_ticks
+            and not getattr(plan, "capture_events", None)
             and not plan.production_defect_report.strip()
             and inquiry_used < max_inquiry
             and self_q.lower() not in asked_questions
@@ -1774,6 +1879,7 @@ def _plan_filmstrip_inner(
             tool_q
             and not (getattr(plan, "tool_search_answer", "") or "").strip()
             and not plan.capture_ticks
+            and not getattr(plan, "capture_events", None)
             and not plan.production_defect_report.strip()
             and tool_queries_used < max_tool_queries
             and tool_q.lower() not in asked_tool_queries
@@ -3857,6 +3963,7 @@ def run_swe_engineer_specialist(
                     agent.last_inspection_report = ""
                 if hasattr(agent, "last_recommended_followups"):
                     agent.last_recommended_followups = []
+                agent.last_scene_audit = {}
                 written_map = agent.implement_requirement_track(
                     track=track,
                     staging_dir=ctx.cartridge_dir,
@@ -3987,9 +4094,17 @@ def run_swe_engineer_specialist(
                         if untouched_requested
                         else ""
                     )
+                    swe_lint_suffix = ""
+                    last_sa = getattr(agent, "last_scene_audit", None)
+                    if isinstance(last_sa, dict) and last_sa:
+                        from engine.sim.godot_verifier import format_scene_audit_lint_warnings
+
+                        swe_lints = format_scene_audit_lint_warnings(last_sa)
+                        if swe_lints:
+                            swe_lint_suffix = " [SCENE_AUDIT LINT WARNINGS: " + " | ".join(swe_lints[:5]) + "]"
                     summaries.append(
                         f"Implemented '{item.item_id}' — verified modified on disk: {actual_modified}{untouched_suffix}; engine verification passed. "
-                        f"Available actions: {available_input_actions(ctx.cartridge_dir)}."
+                        f"Available actions: {available_input_actions(ctx.cartridge_dir)}.{swe_lint_suffix}"
                     )
     finally:
         if acquired_directly and ctx.file_lock_table is not None:
@@ -4223,10 +4338,17 @@ def run_qa_test_engineer_specialist(
                                         "Provide fresh `test_scene_gd_content` using an inner `class DebugOverlay extends Node2D:` "
                                         f"instead of loading `{s_ref}` inside itself."
                                     )
+            cur_cap_events = _serialize_capture_events(cur_plan)
+            ev_labels_log = [e["event_label"] for e in cur_cap_events]
             record_turn_substep(
                 "rendering_scene",
-                f"Rendering scene {cur_resolved_scene or 'res://main.tscn'} across ticks {list(cur_plan.capture_ticks)}",
-                details={"scene": cur_resolved_scene or "res://main.tscn", "ticks": list(cur_plan.capture_ticks)},
+                f"Rendering scene {cur_resolved_scene or 'res://main.tscn'} across ticks {list(cur_plan.capture_ticks)}"
+                + (f" and events {ev_labels_log}" if ev_labels_log else ""),
+                details={
+                    "scene": cur_resolved_scene or "res://main.tscn",
+                    "ticks": list(cur_plan.capture_ticks),
+                    "capture_events": ev_labels_log,
+                },
             )
             is_exploratory = (
                 getattr(cur_plan, "verification_mode", "causal_gameplay") == "exploratory_diagnostic"
@@ -4254,6 +4376,8 @@ def run_qa_test_engineer_specialist(
                         target_scene=cur_resolved_scene,
                         verify_entrypoint_parity=(not is_exploratory and item.kind == "integration" and not is_diagnostic_probe),
                         audiovisual_mp4_out_path=target_av_clip,
+                        capture_events=cur_cap_events or None,
+                        max_sim_ticks=int(getattr(cur_plan, "max_sim_ticks", 600) or 600),
                     )
                 else:
                     import inspect
@@ -4330,6 +4454,7 @@ def run_qa_test_engineer_specialist(
             err_str = str(qa_pass1_err)
             is_assertion_fail = out_strip_path.is_file() and (
                 "QA filmstrip state assertions failed" in err_str
+                or "QA event-driven keyframe(s) never triggered" in err_str
                 or "Entrypoint Parity Gate failed" in err_str
             )
             is_test_script_error = (
@@ -4393,8 +4518,10 @@ def run_qa_test_engineer_specialist(
         extra_qa += f" Target scene: {resolved_scene}."
     if setup_calls:
         extra_qa += f" Setup calls: {[c['method_name'] for c in setup_calls]}."
+    if getattr(plan, "capture_events", None):
+        extra_qa += f" Capture events: {[e.event_label for e in plan.capture_events]}."
     if getattr(plan, "state_assertions", None):
-        extra_qa += f" Assertions: {[(a.at_tick, a.snapshot_key, a.expected_value_or_change) for a in plan.state_assertions]}."
+        extra_qa += f" Assertions: {[(a.at_event_label or a.at_tick, a.snapshot_key, a.expected_value_or_change) for a in plan.state_assertions]}."
     try:
         from engine.studio.proofs import format_filmstrip_telemetry_progression
 
@@ -4414,6 +4541,9 @@ def run_qa_test_engineer_specialist(
     fullres_sidecar_check = Path(strip).with_name(f"{Path(strip).stem}.keyframe_fullres.png")
     if fullres_sidecar_check.is_file():
         qa_diag_paths.append(str(fullres_sidecar_check))
+    crop_sidecar_check = Path(strip).with_name(f"{Path(strip).stem}.magnified_crops_3x.png")
+    if crop_sidecar_check.is_file():
+        qa_diag_paths.append(str(crop_sidecar_check))
     if (
         (is_real_genai_client(ctx.client) and ctx.filmstrip_fn is None)
         or bool(getattr(ctx.client, "enable_post_capture_audit", False))
@@ -4441,19 +4571,19 @@ def run_qa_test_engineer_specialist(
                 f"PROOF SPEC: {item.proof_spec}\n"
                 f"TASK LEAD BRIEF: {brief}\n"
                 f"VERIFICATION MODE: {getattr(plan, 'verification_mode', 'causal_gameplay')}\n"
-                f"CAPTURED TICKS: {list(plan.capture_ticks)}\n"
+                f"CAPTURED TICKS / EVENTS: ticks={list(plan.capture_ticks)} events={[e.event_label for e in (plan.capture_events or [])]}\n"
                 f"PRE-CAPTURE TEST SCENE SUMMARY: {council_summary}\n"
-                f"TELEMETRY SUMMARY: {extra_qa}{exploratory_note}\n\n"
+                f"TELEMETRY & SCENE LINT SUMMARY: {extra_qa}{exploratory_note}\n\n"
                 f"INSTRUCTIONS:\n"
-                f"1. Inspect EVERY single frame of the attached `filmstrip_*.png` image from Frame 1 to the final frame (plus the attached 1:1 full-resolution keyframe and 16:9 reference mockup if provided).\n"
+                f"1. Inspect EVERY single frame of the attached `filmstrip_*.png` image from Frame 1 to the final frame (plus the attached 1:1 full-resolution keyframe, 3x nearest-neighbor crop plate, and 16:9 reference mockup if provided).\n"
                 f"2. Strategize from first principles what a live player and the Design Council need to see verified for this specific task:\n"
                 f"   - Does the rendered viewport clearly frame the active subjects across all frames without losing them off-screen?\n"
-                f"   - Are UI/HUD panels, labels, and world/test overlays legible and free of text collisions, panel-border overflows, overlaps, squished icons, cut-off/bleeding sprite-sheet slicing, or unintended production debug clutter?\n"
-                f"   - Are world-space indicators/vectors aligned with the actual visual sprites they represent?\n"
-                f"   - Across `CAPTURED TICKS` (60 ticks ~ 1 second), do the player inputs produce a responsive, human-playable rate of motion/change rather than a static image or a nearly imperceptible crawl (when testing interactive gameplay)?\n"
+                f"   - Check `Scene/UI/Scale Lint Warnings` in `TELEMETRY & SCENE LINT SUMMARY` AND the 3x nearest-neighbor crop plate (`*.magnified_crops_3x.png`): are UI/HUD panels and labels free of `[UI_OVERLAP]` / `[UI_CLIPPED_LABEL]` / `[UI_VIEWPORT_OVERFLOW]`, and are in-world sprites crisp (`<= 1.25x` scale) rather than blurry upscaled thumbnails (`[SPRITE_UPSCALE_BLUR]`) or duplicate stacked nodes (`[DUPLICATE_STACKED_SPRITES]`)?\n"
+                f"   - Are world-space indicators/vectors aligned with the actual visual sprites they represent, and do clicks land accurately in world space?\n"
+                f"   - Across the captured ticks/events (60 ticks ~ 1 second), do player inputs drive real earned progression rather than a static image, sluggish crawl, or passive `t=0` self-collection?\n"
                 f"3. In `observed_frames_summary`, describe objectively and unsentimentally what is ACTUALLY visible inside the 16:9 viewport of each frame (zero cheerleading or flattery).\n"
-                f"4. In `post_capture_test_scene_summary`, write a candid, factual post-capture briefing for the Council explaining what the test scene staged, what inputs/overlays ran, and what the rendered frames show.\n"
-                f"5. If any frame fails visual framing, has overlapping/overflowing UI or cut-off sprite slicing, lacks test-scene diagnostic proof, or fails to show responsive progression for THIS task's `SPEC`/`PROOF SPEC`, list each issue in `unaddressed_defects` and set `qa_passed = False`; once THIS task's `SPEC` and `PROOF SPEC` are genuinely proven without visual/causal glitches, set `qa_passed = True` without inventing out-of-scope wishlist demands!\n"
+                f"4. In `post_capture_test_scene_summary`, write a candid, factual post-capture briefing for the Council explaining what scene booted, what inputs/events ran, and what the rendered frames show.\n"
+                f"5. If any frame fails visual framing, triggers real UI overlap / clipped label / blurry upscaled sprite / stacked sprite defects, or fails to show responsive progression for THIS task's `SPEC`/`PROOF SPEC`, list each issue in `unaddressed_defects` and set `qa_passed = False`; once THIS task's `SPEC` and `PROOF SPEC` are genuinely proven without visual/causal glitches, set `qa_passed = True` without inventing out-of-scope wishlist demands!\n"
                 f"Provide `deliberation` FIRST and `qa_passed` LAST."
             )
             qa_media_res = getattr(getattr(types, "MediaResolution", None), "MEDIA_RESOLUTION_HIGH", None)
@@ -4478,6 +4608,17 @@ def run_qa_test_engineer_specialist(
                 )
                 audit_contents.append(f"1:1 FULL-RESOLUTION KEYFRAME FOR PIXEL/TEXT/SPRITE INSPECTION ({fullres_sidecar.name}):")
                 audit_contents.append(fullres_part)
+            crop_sidecar = Path(strip).with_name(f"{Path(strip).stem}.magnified_crops_3x.png")
+            if crop_sidecar.is_file():
+                crop_part = (
+                    types.Part.from_bytes(
+                        data=crop_sidecar.read_bytes(), mime_type="image/png", media_resolution=qa_media_res
+                    )
+                    if qa_media_res is not None
+                    else types.Part.from_bytes(data=crop_sidecar.read_bytes(), mime_type="image/png")
+                )
+                audit_contents.append(f"3x NEAREST-NEIGHBOR IN-SITU CROP PLATE FOR SPRITE SCALE/BLUR & UI OVERLAP INSPECTION ({crop_sidecar.name}):")
+                audit_contents.append(crop_part)
             bible_p = Path(ctx.cartridge_dir) / "game_bible.json"
             mockup_file: Optional[Path] = None
             if bible_p.is_file():
@@ -4621,6 +4762,12 @@ def validate_task_lead_decision(
                     sanitized_splits.append(p)
             board_issues = board.validate_proposals(sanitized_splits) if sanitized_splits else []
             issues.extend(board_issues)
+    elif decision.action == "escalate_design_concern":
+        if not (decision.design_concern_report or "").strip():
+            issues.append(
+                "design_concern_report must be non-empty when action == 'escalate_design_concern', explaining why "
+                "implementing the spec as written would undermine player agency, force Potemkin/decorative stubs, or violate the Fun & Tension Pact."
+            )
     elif decision.action == "submit_to_council":
         if item_kind == "discovery":
             if (
@@ -4761,6 +4908,17 @@ def _build_task_lead_multimodal_parts(
             if lead_media_res is not None
             else types.Part.from_bytes(data=p.read_bytes(), mime_type=mime)
         )
+        if "filmstrip" in n_low:
+            crop_p = p.with_name(f"{p.stem}.magnified_crops_3x.png")
+            if crop_p.is_file():
+                parts.append(
+                    f"CAPTURED PROOF IMAGE ({crop_p.name}) [3x NEAREST-NEIGHBOR IN-SITU CROP PLATE: Inspect for sprite upscale blur, silhouette clarity, and HUD text overlap!]:"
+                )
+                parts.append(
+                    types.Part.from_bytes(data=crop_p.read_bytes(), mime_type="image/png", media_resolution=lead_media_res)
+                    if lead_media_res is not None
+                    else types.Part.from_bytes(data=crop_p.read_bytes(), mime_type="image/png")
+                )
 
     from engine.studio.audio_evaluator import AUDIO_MIME_BY_SUFFIX, INLINE_MEDIA_MAX_BYTES, VIDEO_MIME_BY_SUFFIX
 
@@ -4904,9 +5062,13 @@ def _plan_task_lead_turn_inner(
                         dna_summary = dna_summary[:dna_cap].rsplit("\n", 1)[0] + "\n  ... [condensed on technical revision]"
                 core_loop_data = bible_data.get("core_loop") if isinstance(bible_data.get("core_loop"), dict) else {}
                 agency_depth = str(core_loop_data.get("player_agency_and_optimization_depth") or "").strip()
+                skill_test = str(core_loop_data.get("core_decision_or_skill_test") or "").strip()
+                pushback_model = str(core_loop_data.get("pushback_and_scarcity_model") or "").strip()
+                earned_prog = str(core_loop_data.get("earned_vs_given_progression") or "").strip()
                 m2m_loop = str(core_loop_data.get("moment_to_moment_loop") or "").strip()
                 min2min_loop = str(core_loop_data.get("minute_to_minute_loop") or "").strip()
                 sess_loop = str(core_loop_data.get("session_loop") or "").strip()
+                canon_keys = list(bible_data.get("canonical_telemetry_keys") or [])
                 goal_data = bible_data.get("goal_hierarchy") if isinstance(bible_data.get("goal_hierarchy"), dict) else {}
                 goals_list = goal_data.get("goals") if isinstance(goal_data.get("goals"), list) else []
                 goals_summary = "; ".join(
@@ -4917,14 +5079,19 @@ def _plan_task_lead_turn_inner(
                 dna_and_agency_lines = ""
                 if dna_summary:
                     dna_and_agency_lines += f"\nTARGET PLAYER STEAM DNA (YOU ARE BUILDING THIS GAME SPECIFICALLY FOR THIS PLAYER):\n{dna_summary}\n"
-                if m2m_loop or min2min_loop or sess_loop or agency_depth:
+                if m2m_loop or min2min_loop or sess_loop or agency_depth or skill_test or pushback_model or earned_prog:
                     dna_and_agency_lines += (
-                        f"\nWHOLE-GAME CORE LOOP & AGENCY DEPTH (DO NOT SHRINK INTO A 1-STEP TUTORIAL):\n"
+                        f"\nSHARED STUDIO FUN & TENSION PACT (EARNED AGENCY — ZERO SELF-COMPLETING HANDOUTS):\n"
                         f"  - Moment-to-Moment Loop: {m2m_loop}\n"
                         f"  - Minute-to-Minute Loop: {min2min_loop}\n"
                         f"  - Session Loop: {sess_loop}\n"
+                        f"  - Core Decision / Skill Test: {skill_test}\n"
+                        f"  - Pushback & Scarcity Model: {pushback_model}\n"
+                        f"  - Earned vs. Given Progression (t=0 Contract): {earned_prog}\n"
                         f"  - Player Agency & Optimization Depth: {agency_depth}\n"
                     )
+                if canon_keys:
+                    dna_and_agency_lines += f"  - Canonical Telemetry Keys (`get_state_snapshot()`): {canon_keys}\n"
                 if goals_summary:
                     dna_and_agency_lines += f"  - Escalating Goal Hierarchy: {goals_summary}\n"
                 roadmap = bible_data.get("slice_roadmap")
@@ -5306,7 +5473,7 @@ def _plan_task_lead_turn_inner(
         f"1. Formulate your bespoke `current_strategy` and `proof_strategy` for creating everything necessary for this task and generating the final proof (and pivoting if the Council requested changes):\n"
         f"   - Creation Strategy (`current_strategy`): Plan every artifact, asset, multi-cell sheet/grid, rig, script, or GDScript module required by `SPEC`, and decide which specialist(s) in {specialists} to delegate to in sequence.\n"
         f"   - Proof Generation Strategy (`proof_strategy`): Plan how the final visual proof artifact(s) (`selected_proof_paths`) will be generated and verified to directly satisfy `PROOF THE COUNCIL WILL JUDGE` (`{item.proof_spec}`).\n"
-        f"   - When delegating to `'visual_artist'` for a task that requires a multi-cell grid, sheet, or atlas of distinct visual states, icons, stages, or components (e.g. a 2x2 or NxM state sheet where each cell depicts a distinct graphic/state), explicitly specify the `grid_cols x grid_rows` layout and each cell's visual contents in row-major order in your `brief` so `'visual_artist'` populates `grid_cols`, `grid_rows`, and `cell_prompts`. You can also ask `'visual_artist'` to inspect any existing sprite/sheet (`inspect` with optional pixel rulers/crop zoom) or render a whole-cartridge contact sheet (`render_contact_sheet`).\n"
+        f"   - When delegating to `'visual_artist'` for a task that requires a multi-cell grid, sheet, or atlas of distinct visual states, icons, stages, or components (e.g. a 2x2 or NxM state sheet where each cell depicts a distinct graphic/state), explicitly specify the `grid_cols x grid_rows` layout and each cell's visual contents in row-major order in your `brief` so `'visual_artist'` populates `grid_cols`, `grid_rows`, and `cell_prompts` (and `cell_target_sizes` whenever cells/columns/rows require distinct bounded pixel footprints centered inside uniform grid cells). You can also ask `'visual_artist'` to inspect any existing sprite/sheet (`inspect` with optional pixel rulers/crop zoom) or render a whole-cartridge contact sheet (`render_contact_sheet`).\n"
         f"   - HOLISTIC SYSTEMS THINKING, SUBSYSTEM HARMONY & HUMAN-SCALE RESPONSIVENESS:\n"
         f"     * Never treat a single node's coordinate (`pos=(x, y)`) as proof that the whole scene works visually! Always reason across the complete interacting system: all active entities/nodes in the scene, how `Camera2D` computes its framing/target, how UI layers compose on screen, and how sibling subsystems interact.\n"
         f"     * Check for subsystem conflicts and human-scale feel: when multiple components act on the same entity (e.g., player input controllers alongside damping/stabilization/constraint scripts), ensure they do not fight or cancel out active player commands, and verify that holding a player input over 1–2 seconds (60–120 ticks) produces a responsive, human-playable rate of motion/turn/action.\n"
@@ -5330,29 +5497,31 @@ def _plan_task_lead_turn_inner(
         f"   - If this task implements or tests a character, creature, or interactive entity (`mechanic_code`, `integration`, `level_map`, etc.):\n"
         f"     * First check `ON-DISK ASSET CATALOG` and `CURRENT PRODUCTION BOARD ITEMS`. If a matching sprite, rig, or `tile_surface` texture already exists on disk, instruct `'swe_engineer'` in your `brief` to load and bind that exact PNG/rig (`Image.load_from_file` / `StudioRigHelper`)—preserving its exact `hframes`/`vframes` from `asset_library.json` (remember `articulated_parts` composites have `hframes=1, vframes=1`!).\n"
         f"     * If a needed character rig, structure sprite, or `tile_surface` texture does not exist on disk yet, either delegate to `'visual_artist'` first to fabricate it inside this task, OR choose `action = 'spawn_tasks'` with `wait_for_spawned_tasks = True` so the visual asset is fabricated before `'swe_engineer'` binds it.\n"
-        f"3. EMPATHETIC NEW-PLAYER PERSPECTIVE, TARGET PLAYER DNA, WHOLE-GAME LOOP & UNSOLVED t=0 BASELINE (for `mechanic_code`, `ui`, `integration`, `level_map`):\n"
-        f"   - DELIVER THE LARGER POINT OF THE GAME (NEVER SHRINK INTO A 1-STEP TUTORIAL): Check `TARGET PLAYER STEAM DNA` and `WHOLE-GAME CORE LOOP & AGENCY DEPTH` below. You are building this game specifically for THIS player. Do NOT build 'the smallest slice possible' that reduces the game to a 4-step linear tutorial or a single pre-placed connection! Onboarding is ONLY the opening 60 seconds; the game itself must deliver the full `moment_to_moment_loop`, `minute_to_minute_loop`, and `session_loop` with genuine player construction, experimentation, optimization, or tactical depth (`core_loop.player_agency_and_optimization_depth`) and escalating goals (`goal_hierarchy`).\n"
+        f"3. CO-DESIGNER OWNERSHIP, CONSERVATION OF CHALLENGE & EARNED AGENCY (for `mechanic_code`, `ui`, `integration`, `level_map`):\n"
+        f"   - YOU ARE A CO-DESIGNER OF A FUN GAME, NOT A TICKET-CLOSER: Check `TARGET PLAYER STEAM DNA` and `SHARED STUDIO FUN & TENSION PACT` below. Deliver the active slice's focused scope at 100% mechanical honesty rather than stuffing decorative Potemkin props or fake stubs into the scene. Every visible player tool, structure, button, and resource MUST enforce real spatial/resource preconditions and have authentic simulation consequences (ZERO hardcoded `is_connected = true` bypasses, ZERO decorative-only structures, ZERO free `t=0` passive self-collection!).\n"
+        f"   - CONSERVATION OF CHALLENGE AT `t=0`: `_ready()` at `t=0` in `main.gd` (`res://main.tscn`) MUST seed ONLY what is needed to enable the player's first active decision or skill test (`core_loop.earned_vs_given_progression`)—never pre-solve resource gathering, auto-route items, or start the player with self-sustaining passive income.\n"
+        f"   - CO-DESIGNER PUSHBACK (`action = 'escalate_design_concern'`): If `SPEC` or revision feedback asks for something that would make the game play itself (e.g., passive `t=0` auto-harvesting with zero player setup, giant hitboxes that erase aiming/placement skill, or fake UI/structures that do nothing in simulation), DO NOT build a self-completing or fake game! Populate `design_concern_report` explaining the design conflict and choose `action = 'escalate_design_concern'` so the Council re-arbitrates the spec.\n"
         f"   - Think empathetically from the perspective of a brand-new player booting this game for the first time with zero external instructions. Strategize how THIS game communicates: (a) what the player is doing and why (their role, purpose, and stakes), (b) how they interact with the world and how actions causally connect (`input -> entity response -> world consequence`), and (c) what visual/audio feedback occurs when an action succeeds OR when an action is attempted before its prerequisite is met.\n"
-        f"   - UNSOLVED t=0 BASELINE (`test_unsolved_baseline_t0`) & QA TEST SCENE OWNERSHIP (`res://tests/test_<item_id>.tscn`) — NO DEBUG OVERLAYS IN PRODUCTION GAME (`res://main.tscn`):\n"
-        f"     * `_ready()` at `t=0` in `main.gd` (`res://main.tscn`) is what the live human player boots into! `_ready()` MUST initialize the world in its unbuilt/unsolved starting state as defined by the Game Bible, and production game scenes (`main.gd`, `scenes.gd`, `ui_hud.gd`, etc.) must NEVER contain `func test_*()` staging helpers or debug overlays (`[DEBUG]`, telemetry readouts, wireframe boxes).\n"
-        f"     * Conversely, in QA test scenes (`res://tests/test_<item_id>.tscn`), rich diagnostic overlays ARE essential—and `res://tests/test_<item_id>.tscn` + `.gd` is EXCLUSIVELY owned by `'qa_test_engineer'`, NEVER `'swe_engineer'`! NEVER ask `'swe_engineer'` to create or edit `tests/test_*.gd`, and NEVER script `_physics_process` tick timers or direct spawn/place calls inside `tests/test_*.gd` (even if an older feedback note mentioned `tests/test_*.gd`, translate missing gameplay/signal wires into production-module fixes for `'swe_engineer'` so live `res://main.tscn` passes the Entrypoint Parity Gate!). When delegating to `'qa_test_engineer'`, instruct QA to author `res://tests/test_<item_id>.tscn` (`test_scene_gd_content` with read-only camera framing/diagnostic `_draw()` overlays and `get_state_snapshot()` readouts—zero mid-run game-state mutations), drive all actions externally via `input_segments`, and write a clear `council_test_scene_summary` for the Council!\n"
-        f"   - REAL INTERACTIVE VERBS & CAMERA NAVIGATION: Every core player verb in `core_loop.player_verbs` and the active slice's `scope_boundaries` (including mouse click/drag placement or connection, interactive component tuning/socketing, hazard clearing, and `Camera2D` panning/scrolling when `world_bounds` exceeds the 1280x720 viewport) MUST be wired to real `_unhandled_input` / `_input` / UI handlers and exercised via `input_segments` (`mouse_world_pos`, `mouse_click_pos`, or actions) in QA filmstrips.\n"
+        f"   - REAL `res://main.tscn` QA DEFAULT & ZERO PRODUCTION DEBUG CLUTTER:\n"
+        f"     * Production game scenes (`main.gd`, `scenes.gd`, `ui_hud.gd`, etc.) must NEVER contain `func test_*()` staging helpers or debug overlays (`[DEBUG]`, telemetry readouts, wireframe boxes), and must honor `GameBibleSpec.canonical_telemetry_keys` in `get_state_snapshot()`.\n"
+        f"     * When delegating to `'qa_test_engineer'`, instruct QA to boot live `res://main.tscn` by default (`target_scene = 'res://main.tscn'`, `test_scene_gd_content = ''`) and plan event-driven multi-horizon keyframes (`capture_events` across up to `max_sim_ticks = 3600` = `60s`) so `Camera2D` world-vs-screen mouse transforms, HUD layout, and multi-second physics/economy loops are verified in the real game! Reserve `res://tests/test_<item_id>.tscn` strictly for read-only `exploratory_diagnostic` probes or un-integrated library scripts—and NEVER ask `'swe_engineer'` to edit `tests/test_*.gd`.\n"
+        f"   - REAL INTERACTIVE VERBS & `Camera2D` COORDINATE PRECISION: Every core player verb in `core_loop.player_verbs` and the active slice's `scope_boundaries` MUST be wired to real `_unhandled_input` / `_input` / UI handlers. Remind `'swe_engineer'` that in Godot 4 with an active `Camera2D`, `InputEventMouse.position` and `InputEventMouse.global_position` are screen/viewport coordinates—world clicks MUST use `get_global_mouse_position()` (or `get_viewport().get_canvas_transform().affine_inverse() * event.position`) so placed objects land exactly where the player clicks!\n"
         f"   - DIAGNOSING FAILED QA PLAYTESTS vs. BROKEN MECHANICS (ZERO SHORTCUTS — NEVER PRE-SOLVE THE GAME TO PASS QA):\n"
         f"     * First check `CARTRIDGE SYMBOLS & FILES` below for any `⚠️ BROKEN / MISSING SCRIPT OR SCENE REFERENCES ON DISK`. If a builder/spawner script calls `load('res://...')` on a `.gd` file that does not exist on disk (or wraps it in `ResourceLoader.exists(...) else null`), placement/spawning silently no-ops! Delegate to `'swe_engineer'` to create the missing script or replace the broken reference with real node instantiation.\n"
         f"     * REJECT GOALPOST-SHIFT & HITBOX-INFLATION SHORTCUTS: When a multi-step gameplay loop fails QA state assertions, NEVER work around the failure by moving/pre-spawning a target/receiver into the default un-deflected trajectory in `main.gd._ready()` or by inflating catch/collision radii beyond visual sprite bounds (24–48px)—even if a prior revision note or feedback comment suggested moving the goal! The engine's Counterfactual QA Check runs with `input_script = []` (zero player input) and automatically rejects any build where post-baseline progress assertions pass without player construction.\n"
-        f"     * DRIVE THE COMPLETE CAUSAL CHAIN: Instead of taking shortcuts: (a) instruct `'swe_engineer'` to expose step-by-step causal telemetry in `get_state_snapshot()` (selected tool slot, placement validity, placed structure counts, intermediate interaction/ricochet counts, and delivery/objective counts) and ensure placed structures genuinely route/process items with honest sprite-sized hitboxes, and (b) instruct `'qa_test_engineer'` in your `brief` with the exact multi-step causal input recipe (which `KEY_*` selects the required tool slot, which exact valid 2D world coordinates `mouse_world_pos = [wx, wy]` lie on buildable terrain along the path, what rotation/tuning keys are needed, and step-by-step `state_assertions` for every link in the chain).\n"
+        f"     * DRIVE THE COMPLETE CAUSAL CHAIN: Instead of taking shortcuts: (a) instruct `'swe_engineer'` to expose step-by-step causal telemetry in `get_state_snapshot()` and ensure placed structures genuinely route/process items with honest sprite-sized hitboxes, and (b) instruct `'qa_test_engineer'` in your `brief` with the exact multi-step causal input recipe and `capture_events` milestones.\n"
         f"   - Every input key/action bound in the codebase (`Available actions`) MUST have a discoverable in-world or HUD affordance—never bind hidden/secret keys that the player cannot know exist, and NEVER bind fake tutorial-skip keys (such as `KEY_TAB` or `set_onboarding_step`) that advance onboarding text without the player performing the actual in-world mechanic.\n"
-        f"   - Never rig an input handler to bypass physics, force a win state, or teleport world state when a timing window is missed; instead, instruct `'qa_test_engineer'` to use reactive state triggers (`when_snapshot_key`, `when_operator`, `when_value`) to test timing-sensitive mechanics honestly.\n"
+        f"   - Never rig an input handler to bypass physics, force a win state, or teleport world state when a timing window is missed; instead, instruct `'qa_test_engineer'` to use reactive state triggers (`when_snapshot_key`, `when_operator`, `when_value`) and `capture_events` (`on_condition` / `on_change`) to test timing-sensitive mechanics honestly.\n"
         f"   - Prevent duplicate rendering across modules: ensure a single authoritative module owns each world structure or visual effect so `main.gd`, `scenes.gd`, `entities.gd`, and `ui_hud.gd` do not draw overlapping copies of the same geometry or indicator.\n"
-        f"4. If `COLLECTED PROOF IMAGES SO FAR` is non-empty, visually inspect the attached proof image(s) (and any `QA Post-Capture Visual Audit` findings in the turn history) before choosing `submit_to_council`:\n"
-        f"   - In `filmstrip_*.png` contact sheets, the top (`[QA] tick N in:[...]`) and bottom (`[QA] pos=(...) ...`) bands outside each 16:9 frame border are external QA test-harness annotations—use them to verify coordinates/state, and never mistake them for in-game debug text.\n"
+        f"4. If `COLLECTED PROOF IMAGES SO FAR` is non-empty, visually inspect the attached proof image(s), `3x NEAREST-NEIGHBOR IN-SITU CROP PLATE` (`*.magnified_crops_3x.png`), and `Scene/UI/Scale Lint Warnings` before choosing `submit_to_council`:\n"
+        f"   - In `filmstrip_*.png` contact sheets, the top (`[QA] t=N ...`) and bottom (`[QA] pos=(...) ...`) bands outside each 16:9 frame border are external QA test-harness annotations—use them to verify coordinates/state, and never mistake them for in-game debug text.\n"
         f"   - In `plate_*.png` and `anim_sheet_*.png` / `anim_rig_*.png`, the dark/light square checkerboard grids, cyan bounding-box borders, and horizontal yellow/gold baseline ruler lines at the bottom of frames are external QA test-harness overlays drawn behind/around the transparent PNG—NEVER mistake those external QA overlays for cross-hatch grids or yellow line artifacts inside the sprite PNG!\n"
-        f"   - NEVER SUBMIT PLACEHOLDER STICKMEN, CLIPPED SPRITES, DUPLICATE OVERLAPPING GEOMETRY, OR SHRUNK VIEWPORT BACKGROUNDS: If the proof image or `QA Post-Capture Visual Audit` reports `qa_passed=False`, unaddressed Council defects, clipped/invisible sprites (`hframes > 1` on a single-frame texture), or a shrunk background that leaves dark void around the level, do NOT choose `submit_to_council`! Fix the root cause with `'visual_artist'` / `'swe_engineer'` and re-run `'qa_test_engineer'`.\n"
+        f"   - FIX ALL SCENE/UI/SCALE LINT DEFECTS & VISUAL BLUR BEFORE SUBMITTING: If QA's report or `*.magnified_crops_3x.png` surfaces `[UI_OVERLAP]`, `[UI_CLIPPED_LABEL]`, `[UI_VIEWPORT_OVERFLOW]`, `[SPRITE_UPSCALE_BLUR]` (`>1.25x` upscaled blurry thumbnails), `[DUPLICATE_STACKED_SPRITES]`, `[WORLD_ENTITY_COLLISION]`, `qa_passed=False`, clipped sprites, or shrunk backgrounds, do NOT choose `submit_to_council`! Fix the root cause with `'visual_artist'` (fabricate crisp `>= 128x128` dedicated assets) and/or `'swe_engineer'` (fix `Control` anchors/containers, `scale <= 1.0`, or duplicate nodes) and re-run `'qa_test_engineer'`.\n"
         f"   - Verify that active gameplay entities and world geometry remain visibly framed inside the 16:9 viewport across ALL filmstrip frames and do NOT disappear off-screen or get hidden behind an opaque full-screen background/border frame drawn at a higher `z_index` or foreground `CanvasLayer`.\n"
         f"   - GROUND-TRUTH DISK DIFF AUDIT (`VERIFIED PRODUCTION DISK DIFF SO FAR`): Before choosing `submit_to_council`, check `untouched_target_modules` below! Never assume or claim in `submission_summary` that an untouched module (such as an input handler, HUD, or `main.gd`) was wired if `swe_engineer` only created an isolated entity script and left the consumer module untouched on disk. If an integration/consumer target module still needs wiring so the live player can actually trigger the feature in `res://main.tscn`, delegate to `'swe_engineer'` first!\n"
-        f"5. Choose `action = 'delegate'` to send an open-ended natural-language `brief` to one of {specialists}, `action = 'spawn_tasks'` to create newly discovered or `discovery` tasks on the board, `action = 'split_task'` to decompose this task into 2+ finer-grained tasks, OR `action = 'submit_to_council'` ONLY after all required assets/code/findings are complete.\n"
+        f"5. Choose `action = 'delegate'` to send an open-ended natural-language `brief` to one of {specialists}, `action = 'spawn_tasks'` to create newly discovered or `discovery` tasks on the board, `action = 'split_task'` to decompose this task into 2+ finer-grained tasks, `action = 'escalate_design_concern'` to push back to the Council when a spec would undermine agency/honesty, OR `action = 'submit_to_council'` ONLY after all required assets/code/findings are complete.\n"
         f"   - CONCISE DELIBERATION & BRIEF (NO RAW CODE IN BRIEF): Keep `deliberation` (<= 120 words) and `brief` (<= 180 words) focused and concise. NEVER write raw GDScript code blocks or paste whole functions inside `brief`—`swe_engineer` already reads the staging files directly! State the target file paths, class/function names, and behavioral/visual acceptance criteria.\n"
-        f"   - CRITICAL SCHEMA FIELD ORDER WARNING: In `TaskLeadDecision`, `specialist_agent`, `brief`, `spawned_tasks`, `split_tasks`, and `discovery_findings` appear BEFORE `action` in the JSON schema! Decide your turn action inside `deliberation` and `current_strategy` first, populate all fields required by that action, and emit `action` LAST.\n"
+        f"   - CRITICAL SCHEMA FIELD ORDER WARNING: In `TaskLeadDecision`, `specialist_agent`, `brief`, `spawned_tasks`, `split_tasks`, `discovery_findings`, and `design_concern_report` appear BEFORE `action` in the JSON schema! Decide your turn action inside `deliberation` and `current_strategy` first, populate all fields required by that action, and emit `action` LAST.\n"
         f"   - LONG-TERM MEMORY SELECTIVITY: Leave `memory_updates` empty (`[]`) on ~95% of turns! Never log task progress, delegation steps, or facts already in the Game Bible/codebase; record ONLY when a costly cross-task failure mode, operational invariant, or deferred multi-slice goal would otherwise be lost.\n"
         f"Provide `deliberation` FIRST and `action` LAST.\n"
         f"{slice_context_block}"
@@ -6133,6 +6302,16 @@ def run_task_lead(
                     reason=decision.current_strategy,
                 )
 
+            if decision.action == "escalate_design_concern":
+                if task_baseline_snap is not None:
+                    _restore_modules(ctx.cartridge_dir, task_baseline_snap, scoped_only=use_per_file_locks)
+                _ACTIVE_TURN_CTX.state = None
+                _persist_trace(status="escalated_design_concern", pending=decision, include_active_turn=False)
+                concern_msg = (decision.design_concern_report or decision.deliberation or decision.current_strategy).strip()
+                if ctx.board is not None and hasattr(ctx.board, "escalate_design_concern") and not is_in_board_scheduler():
+                    ctx.board.escalate_design_concern(item.item_id, concern_msg)
+                raise WorkerDesignConcern(concern_msg)
+
             if decision.action == "spawn_tasks":
                 if ctx.board is None or not hasattr(ctx.board, "spawn_tasks_from_item"):
                     raise StudioAgentError(
@@ -6490,7 +6669,7 @@ def run_task_lead(
             selected_proofs = list(collected_proofs)
             submission_summary = submission_summary or last_strategy
             _persist_trace(status="submitted", pending=None)
-    except (WorkerYielded, WorkerSplitTask):
+    except (WorkerYielded, WorkerSplitTask, WorkerDesignConcern):
         raise
     except Exception:
         restore_snap = last_verified_swe_snap if last_verified_swe_snap is not None else task_baseline_snap

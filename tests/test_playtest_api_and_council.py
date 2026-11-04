@@ -1021,12 +1021,12 @@ def test_end_of_slice_council_blind_playtest_deliberation_iterates_then_approves
     assert any("What does clicking the recessed stone panel do?" in p for p in roundtable_prompts)
     assert any("Add hover highlight to courtyard switch" in p for p in roundtable_prompts)
 
-    # 4. Verify Writers' Room transcript includes BlindPlaytester report, 4 specialist turns, and CreativeDirector verdict
+    # 4. Verify Writers' Room transcript includes BlindPlaytester report, 4 specialist turns, and CoProducer (Council Chair) verdict
     roles_in_tx = [u.speaker_role for u in bible.writers_room_transcript]
     assert "BlindPlaytester" in roles_in_tx
     assert "UXExperienceDesigner" in roles_in_tx
     assert "AudioAtmosphereDesigner" in roles_in_tx
-    assert "CreativeDirector" in roles_in_tx
+    assert "CoProducer" in roles_in_tx
     assert any(et == "council_blind_playtest_deliberation_completed" for et, _ in emitted_events)
 
     # 5. Verify `artifacts/blind_playtest_report_slice_0.json` was written and feeds into Next-Slice Reflection Dossier

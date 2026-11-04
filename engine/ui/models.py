@@ -37,6 +37,10 @@ class SwarmEventType(str, Enum):
     CONCEPT_EVOLUTION_LOGGED = "concept_evolution_logged"
     BIBLE_MOCKUP_GENERATED = "bible_mockup_generated"
     GAME_BIBLE_UPDATED = "game_bible_updated"
+    COPRODUCER_STEP_STARTED = "coproducer_step_started"
+    COPRODUCER_TOOL_COMPLETED = "coproducer_tool_completed"
+    COPRODUCER_TURN_COMPLETED = "coproducer_turn_completed"
+    COPRODUCER_THREAD_UPDATED = "coproducer_thread_updated"
 
 
 class PEVCycleInfo(BaseModel):
@@ -750,8 +754,102 @@ class GameLaunchResponse(BaseModel):
     pid: Optional[int] = Field(default=None, description="Spawned game process PID")
 
 
+class CoProducerCreateDraftRequest(BaseModel):
+    """Payload to open a fresh pre-genesis Draft Game Concept thread in Mission Control."""
+
+    deliberation: str = Field(
+        default="Creating a new pre-genesis Co-Producer draft concept thread.",
+        min_length=1,
+        description="MANDATORY FIRST PROPERTY: Epistemic rationale for creating draft thread",
+    )
+
+    @field_validator("deliberation")
+    @classmethod
+    def validate_deliberation(cls, v: str) -> str:
+        return _validate_deliberation(v)
+
+    title: str = Field(default="New Game Concept", description="Optional initial working title")
 
 
+class CoProducerSendMessageRequest(BaseModel):
+    """Payload to send a user message to the interactive 1-on-1 Co-Producer."""
+
+    deliberation: str = Field(
+        default="Submitting user message to Studio Co-Producer.",
+        min_length=1,
+        description="MANDATORY FIRST PROPERTY: Epistemic rationale for user message submission",
+    )
+
+    @field_validator("deliberation")
+    @classmethod
+    def validate_deliberation(cls, v: str) -> str:
+        return _validate_deliberation(v)
+
+    message: str = Field(..., min_length=1, description="User message text")
+    selected_sketch_paths: List[str] = Field(
+        default_factory=list,
+        description="Optional relative paths of user-selected sketches/mockups for visual reference",
+    )
 
 
+class CoProducerExecuteActionRequest(BaseModel):
+    """Payload to confirm and execute a CoProducerActionProposal from Mission Control."""
 
+    deliberation: str = Field(
+        default="Confirming explicit Co-Producer studio action proposal.",
+        min_length=1,
+        description="MANDATORY FIRST PROPERTY: Epistemic rationale for executing studio action",
+    )
+
+    @field_validator("deliberation")
+    @classmethod
+    def validate_deliberation(cls, v: str) -> str:
+        return _validate_deliberation(v)
+
+    thread_id: str = Field(..., min_length=1, description="Co-Producer thread identifier")
+    message_id: str = Field(
+        default="",
+        description="Assistant message containing the proposal (optional when direct_action_kind is set)",
+    )
+    proposal_id: str = Field(
+        default="",
+        description="Proposal identifier to execute (optional when direct_action_kind is set)",
+    )
+    direct_action_kind: Optional[str] = Field(
+        default=None,
+        description="Optional direct producer-initiated action kind (e.g. 'commission_game') when launching straight from an active draft thread",
+    )
+    carry_over_asset_paths: List[str] = Field(
+        default_factory=list,
+        description="Optional sketch/mockup asset paths pinned by the producer for handoff",
+    )
+    override_brief: Optional[str] = Field(
+        default=None,
+        description="Optional user-edited steering or seed brief overriding the proposal default",
+    )
+    override_handoff_mode: Optional[str] = Field(
+        default=None,
+        description="Optional override for handoff_mode ('loose_spark' | 'refined_concept')",
+    )
+    override_pause_for_greenlight: Optional[bool] = Field(
+        default=None,
+        description="Optional override for pause_for_greenlight",
+    )
+    dismiss: bool = Field(
+        default=False,
+        description="When True, dismisses the proposal without executing any studio mutation",
+    )
+
+
+class CoProducerThreadDetailResponse(BaseModel):
+    """Full conversation history and concept brief for a Co-Producer thread."""
+
+    deliberation: str = Field(..., min_length=1, description="Epistemic summary of loaded Co-Producer thread")
+
+    @field_validator("deliberation")
+    @classmethod
+    def validate_deliberation(cls, v: str) -> str:
+        return _validate_deliberation(v)
+
+    thread: Dict[str, Any] = Field(default_factory=dict, description="Thread metadata and evolving concept brief")
+    messages: List[Dict[str, Any]] = Field(default_factory=list, description="Ordered messages with cards and traces")

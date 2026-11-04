@@ -304,6 +304,46 @@ CREATE INDEX IF NOT EXISTS idx_studio_game_memories_updated
     ON studio_game_memories(cartridge_id, updated_at_utc DESC);
 """
 
+STUDIO_COPRODUCER_THREADS_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS studio_coproducer_threads (
+    thread_id TEXT PRIMARY KEY,
+    deliberation TEXT NOT NULL,
+    scope_kind TEXT NOT NULL DEFAULT 'cartridge',
+    cartridge_id TEXT,
+    title TEXT NOT NULL DEFAULT 'New Game Concept',
+    graduated_to_cartridge_id TEXT DEFAULT '',
+    concept_brief_json TEXT NOT NULL DEFAULT '{}',
+    created_at_utc TEXT NOT NULL,
+    updated_at_utc TEXT NOT NULL
+);
+"""
+
+STUDIO_COPRODUCER_MESSAGES_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS studio_coproducer_messages (
+    message_id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    turn_index INTEGER NOT NULL,
+    sender_role TEXT NOT NULL,
+    deliberation TEXT NOT NULL,
+    content_markdown TEXT NOT NULL DEFAULT '',
+    media_cards_json TEXT NOT NULL DEFAULT '[]',
+    consultation_cards_json TEXT NOT NULL DEFAULT '[]',
+    action_proposals_json TEXT NOT NULL DEFAULT '[]',
+    tool_trace_json TEXT NOT NULL DEFAULT '[]',
+    prompt_trace_json TEXT NOT NULL DEFAULT '[]',
+    token_usage_json TEXT NOT NULL DEFAULT '{}',
+    created_at_utc TEXT NOT NULL,
+    FOREIGN KEY (thread_id) REFERENCES studio_coproducer_threads(thread_id)
+);
+"""
+
+STUDIO_COPRODUCER_INDICES_DDL = """
+CREATE INDEX IF NOT EXISTS idx_coproducer_threads_cartridge
+    ON studio_coproducer_threads(cartridge_id, updated_at_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_coproducer_messages_thread
+    ON studio_coproducer_messages(thread_id, turn_index ASC);
+"""
+
 ALL_STUDIO_DDL = [
     STUDIO_BUILDS_TABLE_DDL,
     STUDIO_EVENTS_TABLE_DDL,
@@ -321,6 +361,9 @@ ALL_STUDIO_DDL = [
     PLAYTEST_INDICES_DDL,
     STUDIO_GAME_MEMORIES_TABLE_DDL,
     STUDIO_GAME_MEMORIES_INDICES_DDL,
+    STUDIO_COPRODUCER_THREADS_TABLE_DDL,
+    STUDIO_COPRODUCER_MESSAGES_TABLE_DDL,
+    STUDIO_COPRODUCER_INDICES_DDL,
 ]
 
 

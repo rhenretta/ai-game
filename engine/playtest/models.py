@@ -73,10 +73,10 @@ class PlaytestSessionConfig(BaseEpistemicModel):
         description="Higher-acuity multimodal Gemini model used once at session end to audit HIGH-resolution screenshots and synthesize PlaytestExperienceReport.",
     )
     reaction_ticks: int = Field(
-        default=15,
+        default=6,
         ge=1,
         le=60,
-        description="Simulated 60 FPS frames (~250ms at 15 ticks) advanced after frame capture before holding for LLM reply.",
+        description="Simulated 60 FPS frames (~100ms at 6 ticks) advanced after frame capture before holding for LLM reply.",
     )
     compaction_interval_turns: int = Field(
         default=75,
@@ -151,7 +151,11 @@ class PlaytestMotorAction(BaseEpistemicModel):
     )
     duration_ms: int = Field(
         default=550,
-        description="Duration of this action burst in milliseconds (350ms to 2000ms for natural human pacing).",
+        description=(
+            "Total duration of this action burst in milliseconds (350ms to 2000ms). "
+            "Clicks/taps fire promptly near the start of the burst after a fast cursor flick (~50-135ms), "
+            "and the remaining duration_ms advances the game world AFTER the click so you can observe consequences."
+        ),
     )
     inspect_high_res_next: bool = Field(
         default=False,
@@ -482,7 +486,17 @@ class PlaytestCompactedJournal(BaseEpistemicModel):
 
 
 class PlaytestExperienceReport(BaseEpistemicModel):
-    """Holistic player experience report synthesized at the end of a stopped or completed playtest session."""
+    """MANDATORY RATIONALE-FIRST MODEL: deliberation declared strictly first (Rule 4).
+    Holistic player experience report synthesized at the end of a stopped or completed playtest session.
+    """
+    deliberation: str = Field(
+        default="",
+        description=(
+            "MANDATORY FIRST PROPERTY: Unvarnished first-principles player deliberation weighing visual legibility, "
+            "cursor-to-world spatial accuracy, whether real skill/strategy decisions mattered vs. free handouts/auto-play, "
+            "goal clarity, and genuine fun BEFORE committing to report prose and overall_fun_rating."
+        ),
+    )
     overall_experience_summary: str = Field(
         ...,
         min_length=1,
@@ -492,11 +506,10 @@ class PlaytestExperienceReport(BaseEpistemicModel):
         default_factory=list,
         description=(
             "Concrete visual, sprite, texture, or UI layout defects visible in the attached HIGH-resolution session screenshots "
-            "(e.g. cut-off sprites or stray floating edge slivers bleeding from adjacent sprite-sheet frames, squished/stretched "
-            "or microscopic icons in UI slots, text spilling outside panel borders or truncated mid-word, overlapping HUD panels, "
-            "harsh unblended rectangular texture boxes pasted inside irregular polygons, or crude flat untextured placeholder "
-            "shapes clashing with detailed raster art). Audit the screenshots carefully BEFORE writing graphics_and_visuals; "
-            "leave [] ONLY when rendering, sprites, textures, and UI layout are genuinely free of visible defects."
+            "(e.g. blurry low-res upscaled sprites, cut-off sprites or stray floating edge slivers bleeding from adjacent sprite-sheet frames, "
+            "squished/stretched or microscopic icons in UI slots, text spilling outside panel borders or truncated mid-word, overlapping HUD panels, "
+            "overlapping/stacked world entities, harsh unblended rectangular texture boxes, or crude placeholder shapes). Audit the screenshots carefully "
+            "BEFORE writing graphics_and_visuals; leave [] ONLY when rendering, sprites, textures, and UI layout are genuinely free of visible defects."
         ),
     )
     graphics_and_visuals: str = Field(
@@ -506,6 +519,22 @@ class PlaytestExperienceReport(BaseEpistemicModel):
             "Candid, unvarnished player impression of visual craft, sprite/texture cleanliness, art cohesion, spatial readability, "
             "and UI/HUD layout legibility grounded directly in visual_and_ui_defects_observed—never parrot store-blurb marketing "
             "prose or describe graphics/UI as 'clean', 'polished', or 'highly legible' when visual_and_ui_defects_observed is non-empty."
+        ),
+    )
+    agency_strategy_and_challenge_critique: str = Field(
+        default="",
+        description=(
+            "Honest gamer critique of player agency, scarcity, and strategic depth: Did you actually have to think, plan, aim, or manage scarce "
+            "resources—and could careless choices lose—OR did the game hand everything to you for free, collect resources passively from t=0, "
+            "or play itself without needing you?"
+        ),
+    )
+    input_spatial_precision: str = Field(
+        default="",
+        description=(
+            "Honest audit of input-to-world spatial precision (inspecting the diagnostic click-target reticle on post-click frames): "
+            "Did placements, selections, and shots happen at the exact pixel/world point you clicked, or did objects spawn offset from your cursor, "
+            "snap unpredictably elsewhere, or ignore clicks?"
         ),
     )
     gameplay_and_feel: str = Field(
@@ -543,7 +572,7 @@ class PlaytestExperienceReport(BaseEpistemicModel):
     )
     bugs_and_glitches_observed: List[str] = Field(
         default_factory=list,
-        description="Concrete bugs, glitches, or broken behaviors noticed during play.",
+        description="Concrete bugs, glitches, spatial click offsets, or broken behaviors noticed during play.",
     )
     unanswered_questions_and_mysteries: List[str] = Field(
         default_factory=list,
@@ -553,13 +582,14 @@ class PlaytestExperienceReport(BaseEpistemicModel):
         ...,
         description=(
             "Honest, non-inflated 1-to-10 player fun & experience rating grounded in verified screen/audio evidence, "
-            "actual objective progression, and real player agency "
+            "actual objective progression, spatial input accuracy, and genuine strategic/skill challenge "
             "(1-2=crashes, blank, or completely unresponsive; "
-            "2-3=boots and renders visuals/UI, but core gameplay loop or primary objectives stay stuck/unresponsive or trap you in repetitive no-op actions; "
-            "4=partially playable, but undermined by stalled objectives, broken/overlapping/overflowing UI, noticeable sprite-slicing or texture-seam glitches, or auto-playing shortcuts lacking real player agency; "
-            "5-6=core gameplay loop works end-to-end with real player-driven progression, though held back by silent/missing audio, rough UI/visual craft defects, or shallow pacing; "
-            "7-8=cohesive, intuitive, responsive, player-driven loop with clean glitch-free visuals/UI, working audio/visual feedback, and genuine fun; "
-            "9-10=standout, polished, bug-free, deeply engaging experience—never award 7-10 if objectives stalled, actions looped without effect, audio was silent, visual/UI rendering had glaring defects, or the game played itself). Strictly last."
+            "2-3=boots and renders visuals/UI, BUT either core loop/objectives stay stuck, clicks land noticeably offset from cursor, "
+            "OR the game collects resources / progresses automatically from t=0 / hands everything out for free with zero meaningful strategy or challenge; "
+            "4=playable inputs, but undermined by stalled objectives, overlapping/clipped UI, blurry/colliding sprites, or shallow no-consequence choices; "
+            "5-6=honest player-driven loop with real challenge and accurate controls, though held back by silent audio, rough visual craft, or thin content; "
+            "7-8=cohesive, intuitive, responsive, genuinely fun skill/strategy loop with clean visuals/UI and working audio feedback; "
+            "9-10=standout, polished, bug-free, deeply engaging game—CAP AT <= 3 whenever the game plays or played itself, hands out effortless progress without strategy, or misplaces clicks). Strictly last."
         ),
     )
 
@@ -593,7 +623,7 @@ class PlaytestSessionStartRequest(BaseEpistemicModel):
         description="Optional public 1-sentence store elevator pitch when launching against a candidate slice directory.",
     )
     max_turns: int = Field(default=150, ge=1, le=1000)
-    reaction_ticks: int = Field(default=15, ge=1, le=60)
+    reaction_ticks: int = Field(default=6, ge=1, le=60)
     compaction_interval_turns: int = Field(default=75, ge=6, le=150)
     enable_audio_perception: bool = Field(default=True)
 

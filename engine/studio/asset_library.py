@@ -765,6 +765,8 @@ static func create_tiled_surface(
         """Fabricates a single AssetRequirement into the cartridge directory and indexes it in asset_library.json."""
         if isinstance(req, dict):
             req = AssetRequirement.model_validate(req)
+        if not (getattr(req, "camera_projection", "") or "").strip() and (self.catalog.camera_and_spatial_paradigm or "").strip():
+            req = req.model_copy(update={"camera_projection": self.catalog.camera_and_spatial_paradigm.strip()})
 
         ref_images = self.get_concept_reference_images(req.concept_reference_id)
         is_env = req.asset_type in ("prop", "tile", "backdrop") or req.fabrication_mode in ("tile_surface", "parallax_layer", "static_sprite")
@@ -835,6 +837,23 @@ static func create_tiled_surface(
         renders_dir = self.cartridge_dir / "artifacts" / "renders"
         renders_dir.mkdir(parents=True, exist_ok=True)
         max_val_attempts = 2
+
+        if (
+            hasattr(self.visual_agent, "_is_live_genai_client")
+            and self.visual_agent._is_live_genai_client()
+            and fmode not in ("portrait", "parallax_layer", "audio_bark", "sfx", "ambient_loop")
+            and atype not in ("portrait", "backdrop", "parallax_layer", "audio_bark", "sfx", "ambient_loop")
+        ):
+            g_c_hi = max(1, int(getattr(req, "grid_cols", 1) or 1))
+            g_r_hi = max(1, int(getattr(req, "grid_rows", 1) or 1))
+            cur_d = tuple(req.dimensions or (128, 128))
+            if (int(cur_d[0]) // g_c_hi) < 128 or (int(cur_d[1]) // g_r_hi) < 128:
+                hi_updates: Dict[str, Any] = {
+                    "dimensions": (max(int(cur_d[0]), 128 * g_c_hi), max(int(cur_d[1]), 128 * g_r_hi)),
+                }
+                if getattr(req, "world_footprint_px", None) is None and g_c_hi == 1 and g_r_hi == 1:
+                    hi_updates["world_footprint_px"] = (max(16, int(cur_d[0])), max(16, int(cur_d[1])))
+                req = req.model_copy(update=hi_updates)
 
         # 1. Portrait fabrication + Tier 1 Render Plate Verification (strictly in assets/portraits/)
         if fmode == "portrait" or atype == "portrait":
@@ -974,6 +993,11 @@ static func create_tiled_surface(
                     break
 
             self._supersede_same_path_entries(req.asset_id, sheet_rel)
+            sheet_disp_size = (
+                (int(req.world_footprint_px[0]), int(req.world_footprint_px[1]))
+                if getattr(req, "world_footprint_px", None)
+                else tuple(meta.get("target_display_size") or req.dimensions or (64, 64))
+            )
             self.catalog.entries[req.asset_id] = AssetLibraryEntry(
                 deliberation=req.deliberation,
                 asset_id=req.asset_id,
@@ -982,7 +1006,7 @@ static func create_tiled_surface(
                 purpose=req.purpose or req.description,
                 res_path=f"res://{sheet_rel}",
                 file_path=sheet_rel,
-                target_display_size=tuple(meta.get("target_display_size") or req.dimensions or (64, 64)),
+                target_display_size=sheet_disp_size,
                 texture_pixel_size=tuple(meta.get("texture_pixel_size") or self._read_image_size(sheet_path)),
                 hframes=int(meta.get("hframes", 4)),
                 vframes=int(meta.get("vframes", 4)),
@@ -1031,6 +1055,11 @@ static func create_tiled_surface(
                 break
 
             self._supersede_same_path_entries(req.asset_id, req.target_path)
+            rig_disp_size = (
+                (int(req.world_footprint_px[0]), int(req.world_footprint_px[1]))
+                if getattr(req, "world_footprint_px", None)
+                else tuple(meta.get("target_display_size") or req.dimensions or (64, 64))
+            )
             self.catalog.entries[req.asset_id] = AssetLibraryEntry(
                 deliberation=req.deliberation,
                 asset_id=req.asset_id,
@@ -1039,7 +1068,7 @@ static func create_tiled_surface(
                 purpose=req.purpose or req.description,
                 res_path=f"res://{req.target_path}",
                 file_path=req.target_path,
-                target_display_size=tuple(meta.get("target_display_size") or req.dimensions or (64, 64)),
+                target_display_size=rig_disp_size,
                 texture_pixel_size=tuple(meta.get("texture_pixel_size") or self._read_image_size(comp_path)),
                 articulated_parts=list(meta.get("articulated_parts") or []),
                 concept_reference_used=str(ref_images[0]) if ref_images else None,
@@ -1118,8 +1147,11 @@ static func create_tiled_surface(
                 break
 
         tex_size = self._read_image_size(out_path)
-        if total_grid_cells > 1 and tex_size[0] > 0 and tex_size[1] > 0:
-            eff_display_size: Tuple[int, int] = (
+        req_fp = getattr(req, "world_footprint_px", None)
+        if isinstance(req_fp, (list, tuple)) and len(req_fp) >= 2 and int(req_fp[0]) > 0 and int(req_fp[1]) > 0:
+            eff_display_size: Tuple[int, int] = (int(req_fp[0]), int(req_fp[1]))
+        elif total_grid_cells > 1 and tex_size[0] > 0 and tex_size[1] > 0:
+            eff_display_size = (
                 max(16, int(tex_size[0]) // g_cols),
                 max(16, int(tex_size[1]) // g_rows),
             )

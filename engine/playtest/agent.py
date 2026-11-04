@@ -75,10 +75,13 @@ def _frame_mean_luminance(path: Optional[Path]) -> float:
 
 
 def _playtest_non_thinking_config(model_name: str) -> Any:
-    """Returns a fast per-turn ThinkingConfig tailored to `model_name`:
+    """Returns a strategic per-turn ThinkingConfig tailored to `model_name`:
     - `flash-lite`: uses `ThinkingLevel.MINIMAL`.
-    - `gemini-3.8-flash` (and 3.x non-lite): uses `ThinkingLevel.LOW` for fast multimodal spatial/UI acuity.
-    All player reasoning is emitted directly in the Rationale-First `deliberation` JSON property (Rule 4).
+    - `gemini-3.8-flash` (and 3.x non-lite): uses `ThinkingLevel.MEDIUM` so per-turn playtesting
+      reasons strategically about spatial trajectory leading, cursor-to-world click alignment,
+      and whether agency/resources are genuinely earned vs. handed out for free.
+    - Gemini 2.5 models: bounded `thinking_budget=2048`.
+    All player reasoning is also emitted in the Rationale-First `deliberation` JSON property (Rule 4).
     """
     try:
         from google.genai import types
@@ -90,8 +93,13 @@ def _playtest_non_thinking_config(model_name: str) -> Any:
         if thinking_lvl is not None:
             if "flash-lite" in m_low and hasattr(thinking_lvl, "MINIMAL"):
                 return thinking_cls(thinking_level=thinking_lvl.MINIMAL)
-            if m_low.startswith(("gemini-3.", "gemini-3-")) and hasattr(thinking_lvl, "LOW"):
-                return thinking_cls(thinking_level=thinking_lvl.LOW)
+            if m_low.startswith(("gemini-3.", "gemini-3-")):
+                if hasattr(thinking_lvl, "MEDIUM"):
+                    return thinking_cls(thinking_level=thinking_lvl.MEDIUM)
+                if hasattr(thinking_lvl, "LOW"):
+                    return thinking_cls(thinking_level=thinking_lvl.LOW)
+        if "2.5" in m_low:
+            return thinking_cls(thinking_budget=2048)
         return thinking_cls(thinking_budget=0)
     except Exception:
         return None
@@ -328,12 +336,21 @@ def build_blind_player_system_prompt(store_card: BlindStoreCard) -> str:
         "CONTROLLER INTERFACE:\n"
         "- Mouse (Normalized 0..1000 Coordinates): Both X and Y use standard normalized 0..1000 image coordinates "
         "where (0, 0) is top-left, (500, 500) is center, and (1000, 1000) is bottom-right. Set `mouse_x` (0..1000) "
-        "and `mouse_y` (0..1000) to the visual spot you want to point at; your hand sweeps the cursor smoothly there. "
-        "Leave `mouse_x` and `mouse_y` null when keeping the cursor at its current position. Set `mouse_button_action` "
+        "and `mouse_y` (0..1000) to the visual spot you want to point at; leave `mouse_x` and `mouse_y` null when "
+        "keeping the cursor at its current position. Set `mouse_button_action` "
         "(`none`, `left_click`, `right_click`, `double_click`, `drag_left`, `hold_left`, `release_left`, `wheel_up`, `wheel_down`) "
-        "for clicks, drags, or scrolling. For `drag_left`, if your cursor is not already on the object you want to grab, "
-        "set `drag_from_x` and `drag_from_y` (0..1000) to where the drag starts and `mouse_x`/`mouse_y` (0..1000) to where you drag it.\n"
-        "- Keyboard: `hold_keys` holds keys across `duration_ms` (350..2000ms); `tap_keys` taps keys briefly.\n"
+        "for clicks, drags, or scrolling. When clicking/scrolling, your hand flicks briskly to `(mouse_x, mouse_y)` and clicks "
+        "right away (~0.15-0.23s after the `Current screen` snapshot, combining brief human reaction + fast cursor flick), and "
+        "the remainder of `duration_ms` simulates the world AFTER your click so you can observe the outcome (a longer `duration_ms` "
+        "gives more post-click observation time—it never delays your click). For `drag_left`, if your cursor is not already on the "
+        "object you want to grab, set `drag_from_x` and `drag_from_y` (0..1000) to where the drag starts and `mouse_x`/`mouse_y` "
+        "(0..1000) to where you drag it.\n"
+        "- Timing & Leading Moving Objects: When clicking or aiming at an object moving across the screen, compare its `(x, y)` "
+        "position in `Previous turn screen` vs `Current screen` over the reported elapsed `Δt` (`velocity = (pos_now - pos_prev) / Δt`) "
+        "to estimate its travel direction and speed per second, then aim ahead along its path to cover both the ~0.18s pre-click "
+        "reaction/flick window and any visible travel time between your action and contact. If an attempt passes behind a moving "
+        "object, lead further ahead along its motion vector on the next try; if it passes in front, reduce your lead.\n"
+        "- Keyboard: `hold_keys` holds keys across `duration_ms` (350..2000ms); `tap_keys` taps keys briefly at the start of the burst.\n"
         "- Visual detail: Set `inspect_high_res_next=true` early (e.g., on Turn 1 so Turn 2 renders in full detail) and "
         "whenever inspecting new UI panels, icons, sprite edges, or small text—do NOT praise graphics or UI as 'clean', "
         "'polished', or 'legible' before checking them at HIGH resolution.\n"
@@ -342,19 +359,25 @@ def build_blind_player_system_prompt(store_card: BlindStoreCard) -> str:
         "match on-screen events, judge how the soundscape fits the game's mood, or inspect an audio anomaly), populate "
         "`request_audio_evaluation` with `lookback_seconds` (2..20s) and your `question`, and the acoustic observations will "
         "arrive on your next turn.\n\n"
-        "VISUAL & UI CRAFT HONESTY (LOOK WITH CRITICAL HUMAN EYES):\n"
-        "- Never grade visuals or UI on a curve. Before describing `graphics_and_visuals` or UI overlays positively, actively "
-        "scan the screen for universal rendering and layout defects:\n"
-        "  1. Sprite & icon slicing / empty-slot glitches: sprites sliced mid-graphic or showing only a fractional corner, "
-        "stray floating edge slivers bleeding in from adjacent sprite-sheet/atlas frames, empty/blank icon boxes inside open "
-        "UI menus or hotbars where sibling slots show icons, or icons stretched, squished, or clipped inside UI slots/buttons.\n"
+        "VISUAL, SPATIAL INPUT & EARNED AGENCY HONESTY (LOOK WITH CRITICAL GAMER EYES):\n"
+        "- Never grade visuals, UI, spatial click accuracy, or game design on a curve. Actively scan every screen for:\n"
+        "  1. Sprite & icon slicing / blurry upscaling / empty-slot glitches: blurry low-res upscaled sprites, sprites sliced "
+        "mid-graphic or showing only a fractional corner, stray floating edge slivers bleeding in from adjacent sprite-sheet/atlas "
+        "frames, empty/blank icon boxes inside open UI menus or hotbars, or icons stretched/squished/clipped inside UI slots.\n"
         "  2. UI layout & typography bugs: text spilling outside its panel/box background, labels chopped off mid-word or colliding "
         "with neighboring elements, overlapping HUD panels, or tiny/low-contrast unreadable text.\n"
-        "  3. Placeholder shapes, texture seams & style clashes: crude flat solid-color geometric placeholder shapes (unshaded "
-        "triangles, rectangles, or circles) standing in for world structures or icons alongside rendered artwork, harsh unblended "
-        "rectangular texture boxes pasted inside irregular polygons, visible grid/tile seams, or large untextured flat terrain polygons.\n"
-        "- Whenever any of these defects appear on screen, call them out plainly in `impression_updates` and log each distinct "
-        "issue in `bug_reports` (`category='visual_glitch'` or `'input_ui_bug'`).\n\n"
+        "  3. Placeholder shapes, texture seams & style clashes: crude flat solid-color geometric placeholder shapes standing in "
+        "for world structures alongside rendered artwork, harsh unblended rectangular texture boxes, or incompatible camera perspectives.\n"
+        "  4. Cursor-to-world spatial click accuracy (post-click diagnostic target reticle): After any click or drag, `Current screen` "
+        "displays a cyan/magenta diagnostic reticle (`ACTION @ (x,y)`) at the exact pixel where you clicked. Verify whether placed "
+        "structures, shots, or selections happened AT that reticle—if objects spawn at an offset away from your click or snap somewhere "
+        "unrelated, log an immediate `input_ui_bug`!\n"
+        "  5. Earned agency, strategy & genuine fun vs. free handouts / self-play: Notice whether you actually have to find targets, "
+        "manage scarce resources, plan routes, or execute skill—OR whether resources tick up passively from `t=0` for free, everything "
+        "is already unlocked/collected without effort, or the game plays itself while you watch. If a game plays itself or requires "
+        "zero strategy, call it out candidly in `impression_updates` (`gameplay_and_feel` / `goals_and_pacing`) and `submit_wish`!\n"
+        "- Whenever visual, UI, or click-offset defects appear on screen, call them out plainly in `impression_updates` and log each "
+        "distinct issue in `bug_reports` (`category='visual_glitch'` or `'input_ui_bug'`).\n\n"
         "PLAYER FIELD NOTES, QUESTIONS & RULEBOOK:\n"
         "- `turn_log_entry`, `field_note_updates`, `question_updates`, and `rulebook_updates` evaluate ONLY what ALREADY "
         "changed between the previous turn's screen/audio and the current screen/audio—NEVER what you expect or hope your "
@@ -661,12 +684,33 @@ class BlindPlaytesterAgent:
 
         norm_cx = normalize_screen_x(obs.cursor_x)
         norm_cy = normalize_screen_y(obs.cursor_y)
+        dt_sec: Optional[float] = (
+            max(0.0, obs.sim_time_sec - self.prev_observation.sim_time_sec)
+            if self.prev_observation is not None
+            else None
+        )
+        reaction_sec = self.config.reaction_ticks / 60.0
+        click_lo_sec = reaction_sec + 0.05
+        click_hi_sec = reaction_sec + 0.13
+        moment_dt_suffix = f" | +{dt_sec:.2f}s since Previous turn screen" if dt_sec is not None else ""
+        timing_line = (
+            f"Frame & Click Timing: Δt = {dt_sec:.2f}s elapsed between Previous turn screen "
+            f"({self.prev_observation.sim_time_sec:.2f}s) and Current screen ({obs.sim_time_sec:.2f}s). "
+            f"A click/tap issued now lands ~{click_lo_sec:.2f}-{click_hi_sec:.2f}s after Current screen "
+            f"({int(round(reaction_sec * 1000))}ms reaction + fast cursor flick), and the rest of duration_ms plays out AFTER the click."
+            if dt_sec is not None and self.prev_observation is not None
+            else (
+                f"Click Timing: A click/tap issued now lands ~{click_lo_sec:.2f}-{click_hi_sec:.2f}s after Current screen "
+                f"({int(round(reaction_sec * 1000))}ms reaction + fast cursor flick), and the rest of duration_ms plays out AFTER the click."
+            )
+        )
 
         # Build Ephemeral Tail (never appended into future prefix turns)
         tail_parts: List[Any] = []
         status_lines = [
-            f"=== CURRENT MOMENT (Turn #{turn_index} | Game Time {obs.sim_time_sec:.2f}s) ===",
+            f"=== CURRENT MOMENT (Turn #{turn_index} | Game Time {obs.sim_time_sec:.2f}s{moment_dt_suffix}) ===",
             f"Your Cursor Position: ({norm_cx:.0f}, {norm_cy:.0f}) in 0..1000 normalized screen coords ((0,0)=top-left, (500,500)=center, (1000,1000)=bottom-right)",
+            timing_line,
             f"Your Current Mood: {self.current_mood}",
             f"What You Were Actively Doing (Current Plan): {self.current_plan}",
         ]
@@ -768,7 +812,12 @@ class BlindPlaytesterAgent:
         tail_parts.append(types.Part.from_text(text="\n".join(status_lines)))
 
         # Attach Previous Frame (LOW res) + Current Frame (MEDIUM/HIGH or deduplicated LOW)
-        cur_bytes = obs.screenshot_path.read_bytes()
+        eff_cur_shot_path = (
+            obs.diagnostic_screenshot_path
+            if (getattr(obs, "diagnostic_screenshot_path", None) is not None and obs.diagnostic_screenshot_path.is_file())
+            else obs.screenshot_path
+        )
+        cur_bytes = eff_cur_shot_path.read_bytes()
         if screen_unchanged:
             tail_parts.append(types.Part.from_text(text="Current screen (unchanged from previous turn):"))
             tail_parts.append(
@@ -782,7 +831,15 @@ class BlindPlaytesterAgent:
         else:
             if self.prev_observation is not None and self.prev_observation.screenshot_path.is_file():
                 prev_bytes = self.prev_observation.screenshot_path.read_bytes()
-                tail_parts.append(types.Part.from_text(text="Previous turn screen (for motion/change comparison):"))
+                prev_dt_val = max(0.0, obs.sim_time_sec - self.prev_observation.sim_time_sec)
+                tail_parts.append(
+                    types.Part.from_text(
+                        text=(
+                            f"Previous turn screen (at {self.prev_observation.sim_time_sec:.2f}s, "
+                            f"Δt={prev_dt_val:.2f}s before Current screen — for motion speed/direction & change comparison):"
+                        )
+                    )
+                )
                 tail_parts.append(
                     types.Part.from_bytes(
                         data=prev_bytes,
@@ -978,7 +1035,12 @@ class BlindPlaytesterAgent:
         self.epoch_turn_lines.append((turn_index, tape_line))
         if obs.screenshot_path is not None and obs.screenshot_path.is_file():
             is_high_res = perception_meta.get("image_resolution") == "HIGH"
-            self._session_screenshots.append((turn_index, obs.screenshot_path, is_high_res))
+            report_shot_path = (
+                obs.diagnostic_screenshot_path
+                if (getattr(obs, "diagnostic_screenshot_path", None) is not None and obs.diagnostic_screenshot_path.is_file())
+                else obs.screenshot_path
+            )
+            self._session_screenshots.append((turn_index, report_shot_path, is_high_res))
             if self._opening_screenshot_path is None:
                 self._opening_screenshot_path = obs.screenshot_path
             else:
@@ -1307,11 +1369,15 @@ class BlindPlaytesterAgent:
             "and (5) harsh unblended rectangular texture boxes pasted inside irregular polygons, missing building/world "
             "textures, or crude flat solid-color geometric placeholder triangles/rectangles clashing with detailed raster art. "
             "Never call graphics or UI 'clean', 'polished', or 'highly legible' when such defects appear on screen!\n"
-            "- PROGRESSION, AUDIO & AGENCY AUDIT: Report only what visibly and audibly progressed rather than what you "
-            "hoped an action did. Explicitly call out if objectives stayed stuck at 0, if repeated actions had no effect, "
-            "if audio was silent or cut out, or if mechanics played themselves without meaningful player decisions, and "
-            "score `overall_fun_rating` strictly by the rubric (never 7-10 when core progression stalled, audio was silent, "
-            "agency was missing, or visual/UI rendering had glaring defects)."
+            "- PROGRESSION, SPATIAL CLICK PRECISION, AUDIO & EARNED AGENCY AUDIT: Report only what visibly and audibly "
+            "progressed rather than what you hoped an action did. Populate `agency_strategy_and_challenge_critique` and "
+            "`input_spatial_precision` candidly: check the cyan/magenta post-click target reticles to verify whether objects "
+            "spawned/fired at the exact coordinates you clicked vs. at a broken offset, and evaluate whether you actually had "
+            "to strategize, explore, and earn resources vs. receiving everything for free or watching a self-completing loop. "
+            "Score `overall_fun_rating` strictly by the rubric: cap `overall_fun_rating <= 3` whenever the game plays/completes "
+            "itself without strategy, hands out free passive resources at `t=0` with nothing to earn, places clicked structures "
+            "at the wrong coordinates, or stalls core progression, and NEVER award 7-10 when audio is silent or visual/UI "
+            "rendering has glaring defects."
         )
 
         tail_parts: List[Any] = [types.Part.from_text(text=report_prompt)]
@@ -1372,6 +1438,8 @@ class BlindPlaytesterAgent:
             raise StudioAgentError("BlindPlaytester experience report returned empty response (Rule 5).")
 
         report = PlaytestExperienceReport.model_validate_json(raw_text)
+        if getattr(report, "deliberation", ""):
+            logger.info("reasoning_rationale[playtest_experience_report]: %s", report.deliberation)
         return report, tok_stats
 
     def export_memory_snapshot(self) -> Dict[str, Any]:
@@ -1560,8 +1628,13 @@ class BlindPlaytesterAgent:
         extra_suffix = (" | " + " | ".join(extras)) if extras else ""
         clean_log = " ".join(decision.turn_log_entry.split())
 
+        dt_tape_bit = (
+            f" (+{max(0.0, obs.sim_time_sec - self.prev_observation.sim_time_sec):.2f}s)"
+            if self.prev_observation is not None
+            else ""
+        )
         return (
-            f"[Turn {turn_index} | t={obs.sim_time_sec:.1f}s | cursor=({norm_cx:.0f},{norm_cy:.0f}) | {act_str}] "
+            f"[Turn {turn_index} | t={obs.sim_time_sec:.2f}s{dt_tape_bit} | cursor=({norm_cx:.0f},{norm_cy:.0f}) | {act_str}] "
             f"{clean_log}{extra_suffix}"
         )
 

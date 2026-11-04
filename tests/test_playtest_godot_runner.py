@@ -687,3 +687,118 @@ def test_canvas_items_stretch_mode_preserves_crisp_subviewport_font_oversampling
         f"Expected sharp glyph edge contrast in QA harness (>=120), got {h_max_col_delta} (blur regression!)"
     )
 
+
+def test_ballistic_cursor_flick_fires_click_early_to_hit_moving_target_with_long_duration(tmp_path: Path):
+    """Regression test: clicking a moving target with a long `duration_ms` (e.g. 1200ms = 72 ticks)
+    must flick the cursor quickly (2..8 ticks) and fire the click near the start of the burst (~150-230ms
+    after the screenshot), rather than stretching cursor travel across `duration_ms` and delaying the click
+    by >1 second while the remainder of `duration_ms` simulates post-click world state.
+    """
+    cp_dir = tmp_path / "cp_moving_target"
+    cp_dir.mkdir(parents=True, exist_ok=True)
+    (cp_dir / "project.godot").write_text(
+        '; Engine configuration file.\n'
+        'config_version=5\n\n'
+        '[application]\n'
+        'config/name="Moving Target Ballistic Click Fixture"\n'
+        'run/main_scene="res://main.tscn"\n'
+        'config/features=PackedStringArray("4.3", "GL Compatibility")\n\n'
+        '[display]\n'
+        'window/size/viewport_width=1280\n'
+        'window/size/viewport_height=720\n',
+        encoding="utf-8",
+    )
+    (cp_dir / "main.gd").write_text(
+        'extends Node2D\n\n'
+        'var target_area: Area2D\n'
+        'var sim_ticks: int = 0\n'
+        'var hits: int = 0\n'
+        'var hit_tick: int = -1\n'
+        'var post_hit_ticks: int = 0\n\n'
+        'func _ready() -> void:\n'
+        '\ttarget_area = Area2D.new()\n'
+        '\ttarget_area.position = Vector2(300.0, 360.0)\n'
+        '\ttarget_area.input_pickable = true\n'
+        '\tvar cs := CollisionShape2D.new()\n'
+        '\tvar circle := CircleShape2D.new()\n'
+        '\tcircle.radius = 28.0\n'
+        '\tcs.shape = circle\n'
+        '\ttarget_area.add_child(cs)\n'
+        '\ttarget_area.input_event.connect(func(_vp, ev, _idx):\n'
+        '\t\tif ev is InputEventMouseButton and ev.pressed and ev.button_index == MOUSE_BUTTON_LEFT:\n'
+        '\t\t\thits += 1\n'
+        '\t\t\thit_tick = sim_ticks\n'
+        '\t\t\t_save_probe()\n'
+        '\t)\n'
+        '\tadd_child(target_area)\n'
+        '\t_save_probe()\n\n'
+        'func _process(_delta: float) -> void:\n'
+        '\tsim_ticks += 1\n'
+        '\ttarget_area.position.x += 4.0\n'
+        '\tif hit_tick >= 0:\n'
+        '\t\tpost_hit_ticks += 1\n'
+        '\t_save_probe()\n\n'
+        'func _save_probe() -> void:\n'
+        '\tvar f := FileAccess.open("user://moving_probe.json", FileAccess.WRITE)\n'
+        '\tif f != null:\n'
+        '\t\tf.store_string(JSON.stringify({\n'
+        '\t\t\t"sim_ticks": sim_ticks,\n'
+        '\t\t\t"target_x": target_area.position.x,\n'
+        '\t\t\t"hits": hits,\n'
+        '\t\t\t"hit_tick": hit_tick,\n'
+        '\t\t\t"post_hit_ticks": post_hit_ticks,\n'
+        '\t\t}))\n'
+        '\t\tf.close()\n',
+        encoding="utf-8",
+    )
+    (cp_dir / "main.tscn").write_text(
+        '[gd_scene load_steps=2 format=3]\n\n'
+        '[ext_resource type="Script" path="res://main.gd" id="1"]\n\n'
+        '[node name="Main" type="Node2D"]\n'
+        'script = ExtResource("1")\n',
+        encoding="utf-8",
+    )
+
+    sess_dir = tmp_path / "sess_moving_target"
+    # Use default reaction_ticks (6 ticks = 100ms)
+    bridge = GodotPlaytestBridge(
+        checkpoint_dir=cp_dir,
+        session_dir=sess_dir,
+        initial_settle_ticks=12,
+        record_video=False,
+    )
+    try:
+        obs0 = bridge.start()
+        assert bridge.reaction_ticks == 6
+        assert bridge.user_home_dir is not None
+        probe0_path = list(bridge.user_home_dir.rglob("moving_probe.json"))[0]
+        probe0 = json.loads(probe0_path.read_text(encoding="utf-8"))
+        obs0_target_x = float(probe0["target_x"])
+
+        # Lead the moving target (240 px/s = 4 px/tick) by ~10 ticks (~167ms: 6 reaction + 4 ballistic flick)
+        # even though duration_ms is 1200ms (72 ticks)!
+        lead_px = obs0_target_x + 4.0 * 10.0
+        lead_norm_x = (lead_px / 1280.0) * 1000.0
+        act = PlaytestMotorAction(
+            deliberation="Lead moving target by ~0.17s along its +X motion vector while observing 1.2s post-click.",
+            mouse_x=lead_norm_x,
+            mouse_y=500.0,
+            mouse_button_action="left_click",
+            duration_ms=1200,
+        )
+        obs1 = bridge.step_action(act)
+        assert obs1.tick == 12 + 6 + 72
+
+        probe1 = json.loads(probe0_path.read_text(encoding="utf-8"))
+        assert probe1["hits"] == 1, f"Expected ~0.17s lead shot to hit moving target cleanly, got {probe1}"
+        # Click must have fired within <=12 ticks of obs0 (6 reaction + <=6 flick), NOT at tick 85+!
+        ticks_after_obs0_to_click = int(probe1["hit_tick"]) - int(probe0["sim_ticks"])
+        assert ticks_after_obs0_to_click <= 12, (
+            f"Expected ballistic click within <=12 ticks (200ms) of screenshot, got {ticks_after_obs0_to_click}: {probe1}"
+        )
+        # And >60 ticks (>=1.0s) of post-click simulation ran AFTER the click!
+        assert int(probe1["post_hit_ticks"]) >= 60, (
+            f"Expected remainder of 1200ms burst (>=60 ticks) to run after click, got {probe1}"
+        )
+    finally:
+        bridge.close()

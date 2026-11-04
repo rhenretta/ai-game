@@ -206,9 +206,10 @@ def _check_single_assertion_against_snap(
 def _evaluate_qa_state_assertions(
     tick_snaps: Union[Dict[int, Dict[str, Any]], List[Dict[str, Any]]],
     state_assertions: Optional[List[Any]],
+    event_tick_by_label: Optional[Dict[str, int]] = None,
 ) -> None:
     """Evaluates explicit numeric/boolean/equality `QAStateAssertion` entries against `tick_snapshots`
-    when the target key is present in the captured snapshot."""
+    when the target key is present in the captured snapshot (supporting both `at_tick` and `at_event_label`)."""
     if not state_assertions or not tick_snaps:
         return
     if isinstance(tick_snaps, list):
@@ -217,9 +218,15 @@ def _evaluate_qa_state_assertions(
             for idx, s in enumerate(tick_snaps)
             if isinstance(s, dict)
         }
+    ev_map = event_tick_by_label or {}
     failures: List[str] = []
     for raw_a in state_assertions:
-        at_t = int(getattr(raw_a, "at_tick", 0) if not isinstance(raw_a, dict) else raw_a.get("at_tick", 0))
+        at_t = int((getattr(raw_a, "at_tick", 0) if not isinstance(raw_a, dict) else raw_a.get("at_tick", 0)) or 0)
+        ev_lbl = str(
+            (getattr(raw_a, "at_event_label", "") if not isinstance(raw_a, dict) else raw_a.get("at_event_label", "")) or ""
+        ).strip()
+        if ev_lbl and ev_lbl in ev_map:
+            at_t = int(ev_map[ev_lbl])
         key = str(getattr(raw_a, "snapshot_key", "") if not isinstance(raw_a, dict) else raw_a.get("snapshot_key", "")).strip()
         exp = str(
             getattr(raw_a, "expected_value_or_change", "")
@@ -230,7 +237,8 @@ def _evaluate_qa_state_assertions(
             continue
         ok, actual_val = _check_single_assertion_against_snap(tick_snaps[at_t], key, exp)
         if ok is False:
-            failures.append(f"tick {at_t}: expected `{key}` {exp}, got {actual_val!r}")
+            loc = f"event '{ev_lbl}' (tick {at_t})" if ev_lbl else f"tick {at_t}"
+            failures.append(f"{loc}: expected `{key}` {exp}, got {actual_val!r}")
     if failures:
         raise StudioAgentError(
             "QA filmstrip state assertions failed against live engine snapshots: " + "; ".join(failures)
@@ -258,12 +266,14 @@ def format_filmstrip_telemetry_progression(strip_path: Path) -> str:
             if not isinstance(f, dict):
                 continue
             t = f.get("tick")
+            ev_tags = f.get("events") or []
+            ev_str = f" [{'/'.join(str(x) for x in ev_tags)}]" if ev_tags else ""
             act = f.get("active_inputs") or "in:[idle]"
             snap = f.get("snapshot_summary") or ""
             if snap:
-                parts.append(f"tick {t} ({act}): {snap}")
+                parts.append(f"tick {t}{ev_str} ({act}): {snap}")
             else:
-                parts.append(f"tick {t} ({act})")
+                parts.append(f"tick {t}{ev_str} ({act})")
         if not parts:
             return ""
         out_sections = ["Captured Frame Telemetry: " + " -> ".join(parts)]
@@ -275,6 +285,9 @@ def format_filmstrip_telemetry_progression(strip_path: Path) -> str:
             aud_det = scene_obs.get("audio_players_detail")
             if isinstance(aud_det, list) and aud_det:
                 out_sections.append(f"Audio Players Runtime State: {aud_det[:8]}")
+            lint_warns = scene_obs.get("lint_warnings")
+            if isinstance(lint_warns, list) and lint_warns:
+                out_sections.append(f"Scene/UI/Scale Lint Warnings: {lint_warns[:10]}")
         parity_obs = data.get("main_scene_parity")
         if isinstance(parity_obs, dict) and parity_obs:
             out_sections.append(f"Live Main Scene Parity: {parity_obs}")
@@ -311,16 +324,35 @@ def capture_filmstrip(
     target_scene: str = "",
     verify_entrypoint_parity: bool = False,
     audiovisual_mp4_out_path: Optional[Path] = None,
+    capture_events: Optional[List[Dict[str, Any]]] = None,
+    max_sim_ticks: Optional[int] = None,
 ) -> Path:
-    """Runs the real game, captures the viewport at `ticks` (driven by `input_script` and `setup_script` if given),
-    and composes a labelled QA proof strip with external input & state telemetry (plus optional `.mp4` video+audio clip)."""
-    from engine.sim.godot_verifier import GodotHeadlessSimulator
+    """Runs the real game, captures the viewport at `ticks` and/or dynamic `capture_events` (driven by `input_script`
+    and `setup_script` up to `max_sim_ticks`), and composes a labelled QA proof strip with external input & state telemetry."""
+    from engine.sim.godot_verifier import GodotHeadlessSimulator, format_scene_audit_lint_warnings
 
     cartridge_dir = Path(cartridge_dir)
     out_path = Path(out_path)
     av_mp4_path = Path(audiovisual_mp4_out_path) if audiovisual_mp4_out_path is not None else None
-    if not ticks:
-        raise StudioAgentError("capture_filmstrip requires at least one tick")
+    clean_ticks = sorted(set(int(t) for t in (ticks or []) if int(t) >= 1))
+    clean_events = list(capture_events or [])
+    if not clean_ticks and not clean_events:
+        raise StudioAgentError("capture_filmstrip requires at least one tick or capture_event")
+    assertion_ticks = [
+        int((getattr(a, "at_tick", 0) if not isinstance(a, dict) else a.get("at_tick", 0)) or 0)
+        for a in (state_assertions or [])
+    ]
+    # Ensure explicit `at_tick` assertions also have snapshots captured
+    for at_t in assertion_ticks:
+        if at_t >= 1 and at_t not in clean_ticks:
+            clean_ticks.append(at_t)
+    clean_ticks = sorted(set(clean_ticks))
+    min_req_tick = max([2] + clean_ticks + [t for t in assertion_ticks if t >= 1])
+    eff_max_ticks = max(
+        [int(max_sim_ticks or 0), 60, min_req_tick]
+        + clean_ticks
+        + [int(e.get("at_tick", 2) or 2) + int(e.get("settle_ticks", 0) or 0) for e in clean_events if isinstance(e, dict)]
+    )
     fullres_sidecar_path = out_path.with_name(f"{out_path.stem}.keyframe_fullres.png")
     if out_path.is_file():
         out_path.unlink()
@@ -332,8 +364,15 @@ def capture_filmstrip(
     for stale in cap_dir.glob("filmstrip_*.png"):
         stale.unlink()
     sim = GodotHeadlessSimulator(
-        cartridge_dir, capture_viewport=True, capture_ticks=ticks, input_script=input_script,
-        setup_script=setup_script, max_ticks=max(ticks), telemetry_mode="in_memory",
+        cartridge_dir,
+        capture_viewport=True,
+        capture_ticks=clean_ticks,
+        capture_events=clean_events if clean_events else None,
+        min_ticks=min_req_tick,
+        input_script=input_script,
+        setup_script=setup_script,
+        max_ticks=eff_max_ticks,
+        telemetry_mode="in_memory",
         target_scene=target_scene,
         capture_audiovisual_mp4=av_mp4_path,
     )
@@ -368,9 +407,32 @@ def capture_filmstrip(
             "Eliminate unconditional per-frame `queue_redraw()` on nodes whose `_draw()` iterates over 2D grids or unbounded stroke arrays, and use `SubViewport.UPDATE_ONCE` for accumulation masks."
         )
     tick_snaps = dict(getattr(sim, "tick_snapshots", {}) or {})
+    captured_ev_recs = list(getattr(sim, "captured_events", None) or [])
+    unmet_ev_recs = list(getattr(sim, "unmet_capture_events", None) or [])
+    event_labels_by_tick: Dict[int, List[str]] = {}
+    event_tick_by_label: Dict[str, int] = {}
+    for rec in captured_ev_recs:
+        if not isinstance(rec, dict):
+            continue
+        ct = int(rec.get("captured_tick", 0) or 0)
+        lbl = str(rec.get("event_label", "") or "").strip()
+        if ct > 0 and lbl:
+            event_labels_by_tick.setdefault(ct, []).append(lbl)
+            event_tick_by_label[lbl] = ct
+    for urec in unmet_ev_recs:
+        if not isinstance(urec, dict):
+            continue
+        ft = int(urec.get("fallback_tick", 0) or 0)
+        ulbl = str(urec.get("event_label", "") or "").strip()
+        if ft > 0 and ulbl:
+            event_labels_by_tick.setdefault(ft, []).append(f"UNMET:{ulbl}")
 
+    resolved_ticks = sorted(
+        set(clean_ticks)
+        | set(event_labels_by_tick.keys())
+    )
     frames: List[Tuple[int, Path]] = []
-    for t in sorted(set(ticks)):
+    for t in resolved_ticks:
         p = cap_dir / f"filmstrip_{t:04d}.png"
         if p.is_file():
             frames.append((t, p))
@@ -379,7 +441,7 @@ def capture_filmstrip(
             "Filmstrip capture produced no frames. Viewport capture needs a display (macOS, DISPLAY/WAYLAND_DISPLAY, or xvfb-run); "
             "refusing to fabricate proof."
         )
-    missing = sorted(set(ticks) - {t for t, _ in frames})
+    missing = sorted(set(clean_ticks) - {t for t, _ in frames})
     if missing:
         raise StudioAgentError(f"Filmstrip is missing frames for ticks {missing}")
     rows = math.ceil(len(frames) / cols)
@@ -402,8 +464,11 @@ def capture_filmstrip(
             width=1,
         )
         active_in = _active_inputs_at_tick(t, input_script, setup_script)
-        header_txt = f"[QA] tick {t}  {active_in}"
-        draw.text((x + 6, y + 3), header_txt[:62], fill=(240, 240, 240))
+        ev_tags = event_labels_by_tick.get(t, [])
+        ev_prefix = f"[{'/'.join(ev_tags)}] " if ev_tags else ""
+        header_col = (255, 140, 130) if any(tag.startswith("UNMET:") for tag in ev_tags) else (240, 240, 240)
+        header_txt = f"[QA] t={t} {ev_prefix}{active_in}"
+        draw.text((x + 6, y + 3), header_txt[:66], fill=header_col)
         snap_d = tick_snaps.get(t) if isinstance(tick_snaps.get(t), dict) else None
         snap_txt_full = _format_snapshot_footer(snap_d, max_chars=600)
         if footer_h > 0:
@@ -413,6 +478,7 @@ def capture_filmstrip(
         frame_telemetry_records.append(
             {
                 "tick": t,
+                "events": ev_tags,
                 "active_inputs": active_in,
                 "snapshot_summary": snap_txt_full,
                 "player_pos": snap_d.get("player_pos") if isinstance(snap_d, dict) else None,
@@ -423,14 +489,29 @@ def capture_filmstrip(
     if "_pass1" not in out_path.stem and frames:
         try:
             shutil.copy2(frames[-1][1], fullres_sidecar_path)
+            from engine.studio.visual_evaluator import render_in_situ_magnified_crop_plate
+
+            crop_sidecar_path = out_path.with_name(f"{out_path.stem}.magnified_crops_3x.png")
+            render_in_situ_magnified_crop_plate(
+                fullres_sidecar_path,
+                crop_sidecar_path,
+                lint_warnings=format_scene_audit_lint_warnings(audit_dict),
+            )
         except Exception as kf_exc:
-            logger.debug("Skipping fullres keyframe sidecar copy for %s: %s", out_path.name, kf_exc)
+            logger.debug("Skipping fullres/crop keyframe sidecar copy for %s: %s", out_path.name, kf_exc)
     scene_audit_summary: Dict[str, Any] = {}
     if isinstance(audit_dict, dict):
         if audit_dict.get("visible_ui_texts"):
             scene_audit_summary["visible_ui_texts"] = list(audit_dict.get("visible_ui_texts") or [])[:24]
         if audit_dict.get("audio_players_detail"):
             scene_audit_summary["audio_players_detail"] = list(audit_dict.get("audio_players_detail") or [])[:12]
+        lint_warnings = format_scene_audit_lint_warnings(audit_dict)
+        if lint_warnings:
+            scene_audit_summary["lint_warnings"] = lint_warnings
+    if captured_ev_recs:
+        scene_audit_summary["captured_events"] = captured_ev_recs
+    if unmet_ev_recs:
+        scene_audit_summary["unmet_capture_events"] = unmet_ev_recs
 
     def _write_telemetry_sidecar(parity_summary: Optional[Dict[str, Any]] = None) -> None:
         try:
@@ -453,7 +534,17 @@ def capture_filmstrip(
 
     _write_telemetry_sidecar()
 
-    _evaluate_qa_state_assertions(tick_snaps, state_assertions)
+    if unmet_ev_recs:
+        unmet_descs = [
+            f"'{u.get('event_label')}' ({u.get('trigger_mode')}: {u.get('when_snapshot_key')} {u.get('when_operator')} {u.get('when_value')!r} from tick {u.get('at_tick')})"
+            for u in unmet_ev_recs
+            if isinstance(u, dict)
+        ]
+        raise StudioAgentError(
+            f"QA event-driven keyframe(s) never triggered within max_sim_ticks={eff_max_ticks}: {', '.join(unmet_descs)}"
+        )
+
+    _evaluate_qa_state_assertions(tick_snaps, state_assertions, event_tick_by_label=event_tick_by_label)
 
     passive_clock_keys = {
         "tick",
@@ -487,10 +578,10 @@ def capture_filmstrip(
                 return val
         return val
 
-    if verify_counterfactual and (input_script or setup_script) and len(set(ticks)) >= 2:
+    if verify_counterfactual and (input_script or setup_script) and len(set(resolved_ticks)) >= 2:
         ctrl_sim = GodotHeadlessSimulator(
-            cartridge_dir, capture_viewport=False, capture_ticks=ticks, input_script=[],
-            setup_script=setup_script, max_ticks=max(ticks), telemetry_mode="null",
+            cartridge_dir, capture_viewport=False, capture_ticks=resolved_ticks, input_script=[],
+            setup_script=setup_script, max_ticks=max(resolved_ticks), telemetry_mode="null",
             target_scene=target_scene,
         )
         try:
@@ -500,7 +591,7 @@ def capture_filmstrip(
                 f"Godot zero-input control simulation failed or timed out in {target_scene or 'res://main.tscn'}: {sim_err}"
             ) from sim_err
         ctrl_snaps = dict(getattr(ctrl_sim, "tick_snapshots", {}) or {})
-        sorted_t = sorted(set(ticks))
+        sorted_t = sorted(set(resolved_ticks))
         t_first, t_last = sorted_t[0], sorted_t[-1]
         if t_last in ctrl_snaps and isinstance(ctrl_snaps[t_last], dict):
             c_last_raw = ctrl_snaps[t_last]
@@ -541,7 +632,12 @@ def capture_filmstrip(
                 passive_clock_lower = {k.lower() for k in passive_clock_keys}
                 post_progress_assertions: List[Tuple[int, str, str, bool]] = []
                 for raw_a in state_assertions:
-                    at_t = int(getattr(raw_a, "at_tick", 0) if not isinstance(raw_a, dict) else raw_a.get("at_tick", 0))
+                    at_t = int((getattr(raw_a, "at_tick", 0) if not isinstance(raw_a, dict) else raw_a.get("at_tick", 0)) or 0)
+                    ev_lbl_a = str(
+                        (getattr(raw_a, "at_event_label", "") if not isinstance(raw_a, dict) else raw_a.get("at_event_label", "")) or ""
+                    ).strip()
+                    if ev_lbl_a and ev_lbl_a in event_tick_by_label:
+                        at_t = int(event_tick_by_label[ev_lbl_a])
                     key = str(getattr(raw_a, "snapshot_key", "") if not isinstance(raw_a, dict) else raw_a.get("snapshot_key", "")).strip()
                     exp = str(
                         getattr(raw_a, "expected_value_or_change", "")
@@ -562,21 +658,21 @@ def capture_filmstrip(
                         "required construction/routing loop in _ready(); require active player input to achieve the target state."
                     )
 
-    if verify_entrypoint_parity and len(set(ticks)) >= 2:
+    if verify_entrypoint_parity and len(set(resolved_ticks)) >= 2:
         main_scene_res = _resolve_cartridge_main_scene(cartridge_dir)
         main_rel = main_scene_res.removeprefix("res://").lstrip("/")
         norm_target = (target_scene or "").strip()
-        sorted_t = sorted(set(ticks))
+        sorted_t = sorted(set(resolved_ticks))
         t_first, t_last = sorted_t[0], sorted_t[-1]
         if (cartridge_dir / main_rel).is_file():
             if norm_target and norm_target != main_scene_res:
                 main_sim = GodotHeadlessSimulator(
                     cartridge_dir,
                     capture_viewport=False,
-                    capture_ticks=ticks,
+                    capture_ticks=resolved_ticks,
                     input_script=input_script,
                     setup_script=None,
-                    max_ticks=max(ticks),
+                    max_ticks=max(resolved_ticks),
                     telemetry_mode="null",
                     target_scene=main_scene_res,
                 )

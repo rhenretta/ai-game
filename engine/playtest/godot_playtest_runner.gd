@@ -5,8 +5,8 @@
 #   - Silent deterministic 60 FPS offscreen SubViewport + dedicated World2D + AudioEffectCapture
 #   - 1:1 desktop mouse parity: Viewport.get_mouse_position(), CanvasItem.get_global_mouse_position(),
 #     Control GUI hover/clicks, _input, _unhandled_input, Input singleton polling, and 2D physics picking
-#   - Smooth cubic ease-out cursor trajectory toward screen targets + standard desktop pointer arrow cursor
-#   - Post-observation human reaction window (default 15 ticks = 250ms) before holding on TCP socket
+#   - Smooth cubic ease-out ballistic cursor flick toward screen targets + standard desktop pointer arrow cursor
+#   - Post-observation human reaction window (default 6 ticks = 100ms) before holding on TCP socket
 #   - Live 60 FPS RGB24 video frame streaming + 16kHz mono PCM audio slicing
 extends SceneTree
 
@@ -42,7 +42,7 @@ const CURSOR_ARROW_ROWS: Array[String] = [
 var ipc_port: int = 0
 var video_port: int = 0
 var capture_dir: String = ""
-var reaction_ticks_cfg: int = 15
+var reaction_ticks_cfg: int = 6
 var initial_settle_ticks: int = 30
 
 var ctrl_peer: StreamPeerTCP = null
@@ -622,7 +622,9 @@ func _configure_action_burst(msg: Dictionary) -> void:
 				burst_has_pre_drag_move = true
 				burst_pre_drag_start = cursor_pos
 				burst_pre_drag_target = from_pt
-				burst_pre_drag_ticks = maxi(2, mini(int(burst_total_ticks / 3), burst_total_ticks - 4))
+				var pre_drag_dist: float = cursor_pos.distance_to(from_pt)
+				var max_pre_drag: int = maxi(2, mini(8, mini(int(burst_total_ticks / 3), burst_total_ticks - 4)))
+				burst_pre_drag_ticks = clampi(int(round(2.0 + pre_drag_dist / 160.0)), 2, max_pre_drag)
 				burst_cursor_start = from_pt
 				burst_cursor_target = dest_pos
 				burst_move_start_tick = burst_pre_drag_ticks + 2
@@ -631,15 +633,26 @@ func _configure_action_burst(msg: Dictionary) -> void:
 
 	burst_cursor_start = cursor_pos
 	burst_cursor_target = dest_pos
+	var travel_px: float = burst_cursor_start.distance_to(burst_cursor_target)
 	if burst_mouse_action == "drag_left":
 		burst_move_start_tick = 2
 		burst_move_end_tick = maxi(2, burst_total_ticks - 2)
-	elif burst_mouse_action in ["left_click", "right_click", "double_click", "hold_left", "wheel_up", "wheel_down"] and burst_cursor_start.distance_to(burst_cursor_target) > 0.25:
+	elif burst_mouse_action in ["left_click", "right_click", "double_click", "hold_left", "wheel_up", "wheel_down"] and travel_px > 0.25:
+		# Fast human ballistic cursor flick (2..8 ticks = 33..133ms, decoupled from duration_ms)
+		# so clicks fire promptly and the remainder of duration_ms simulates post-click world outcomes.
+		var max_flick_ticks: int = maxi(1, mini(8, burst_total_ticks - 4))
+		var min_flick_ticks: int = mini(2, max_flick_ticks)
 		burst_move_start_tick = 1
-		burst_move_end_tick = maxi(1, burst_total_ticks - 5)
+		burst_move_end_tick = clampi(int(round(2.0 + travel_px / 160.0)), min_flick_ticks, max_flick_ticks)
+	elif travel_px > 0.25:
+		# Pure hover move: reach target in 2..12 ticks (33..200ms) so hover tooltips/highlights settle.
+		var max_hover_ticks: int = maxi(1, mini(12, burst_total_ticks))
+		var min_hover_ticks: int = mini(2, max_hover_ticks)
+		burst_move_start_tick = 1
+		burst_move_end_tick = clampi(int(round(2.0 + travel_px / 140.0)), min_hover_ticks, max_hover_ticks)
 	else:
 		burst_move_start_tick = 1
-		burst_move_end_tick = maxi(1, burst_total_ticks)
+		burst_move_end_tick = 1
 
 func _step_action_burst_inputs() -> void:
 	burst_tick_idx += 1

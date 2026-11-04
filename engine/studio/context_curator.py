@@ -35,6 +35,8 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
 from pydantic import BaseModel, Field, model_validator
 
 from engine.studio.models import (
+    GenreCraftFoundation,
+    StudioAgentConfigurationError,
     StudioAgentError,
     bounded_thinking_config,
     call_gemini_with_transient_retry,
@@ -266,6 +268,26 @@ class CartridgeSemanticIndex:
             except Exception:
                 bible_dict = {}
 
+        if not bible_dict:
+            gcf_artifact = self.cartridge_dir / "artifacts" / "genre_craft_foundation.json"
+            if gcf_artifact.is_file():
+                try:
+                    gcf_disk = json.loads(gcf_artifact.read_text(encoding="utf-8"))
+                    if isinstance(gcf_disk, dict) and gcf_disk:
+                        _add(
+                            ContextChunk(
+                                chunk_id="design:genre_craft_foundation",
+                                category="design_spec",
+                                title=(
+                                    "Genre Craft & Fun Foundation — Core Fun Thesis, Evolvable Pillars, "
+                                    "Spatial/UX Contracts & Genre-Killing Anti-Patterns"
+                                ),
+                                content=format_genre_craft_foundation_briefing(gcf_disk),
+                            )
+                        )
+                except Exception:
+                    pass
+
         if bible_dict:
             # 1a. Core identity & spatial/visual lock
             core_fields = {
@@ -289,6 +311,21 @@ class CartridgeSemanticIndex:
                         category="design_spec",
                         title=f"Core Game Identity & Spatial/Palette Lock ({core_fields.get('game_title', 'Game')})",
                         content=json.dumps(core_fields, ensure_ascii=False, indent=2),
+                    )
+                )
+
+            # 1a-bis. Genre Craft & Fun Foundation (how the Game Bible starts & evolves its pillars)
+            gcf_raw = bible_dict.get("genre_craft_foundation")
+            if isinstance(gcf_raw, dict) and gcf_raw:
+                _add(
+                    ContextChunk(
+                        chunk_id="design:genre_craft_foundation",
+                        category="design_spec",
+                        title=(
+                            "Genre Craft & Fun Foundation — Core Fun Thesis, Evolvable Pillars, "
+                            "Spatial/UX Contracts & Genre-Killing Anti-Patterns"
+                        ),
+                        content=format_genre_craft_foundation_briefing(gcf_raw),
                     )
                 )
 
@@ -1527,23 +1564,24 @@ class ContextCuratorAgent:
             )
         elif "swe" in role_lower or "engineer" in role_lower:
             role_query = (
-                f"Godot 4 technical architecture blueprint, rendering strategy shader/sprite treatment, "
-                f"on-disk asset catalog PNGs/rigs to bind, level layout, and GameplaySystemsEngineer council discussions for: {task_request[:500]}"
+                f"Genre craft and fun foundation pillars, anti-patterns to avoid, Godot 4 technical architecture blueprint, "
+                f"rendering strategy shader/sprite treatment, on-disk asset catalog PNGs/rigs to bind, level layout, "
+                f"and GameplaySystemsEngineer council discussions for: {task_request[:500]}"
             )
         elif "qa" in role_lower or "test" in role_lower:
             role_query = (
-                f"Falsifiable test invariants, input actions, GDScript state snapshot keys, setup methods, "
-                f"and proof specifications for: {task_request[:500]}"
+                f"Genre craft and fun foundation contracts, falsifiable test invariants, input actions, GDScript state snapshot keys, "
+                f"setup methods, and proof specifications for: {task_request[:500]}"
             )
         elif "lead" in role_lower:
             role_query = (
-                f"16:9 concept art mockup, rendering strategy treatments, existing or queued visual/audio asset tasks "
-                f"on the ProductionBoard, Council discussions, and active slice scope for: {task_request[:500]}"
+                f"Genre craft and fun foundation pillars, 16:9 concept art mockup, rendering strategy treatments, existing or queued "
+                f"visual/audio asset tasks on the ProductionBoard, Council discussions, and active slice scope for: {task_request[:500]}"
             )
         else:
             role_query = (
-                f"Council discussions, 16:9 concept art mockup, visual/gameplay design intent, bound assets, "
-                f"and acceptance criteria for ({target_agent_role}): {task_request[:500]}"
+                f"Genre craft and fun foundation pillars, Council discussions, 16:9 concept art mockup, visual/gameplay design intent, "
+                f"bound assets, and acceptance criteria for ({target_agent_role}): {task_request[:500]}"
             )
         queries = [base_query, role_query]
         if (self.cartridge_dir / "game_memory.json").is_file():
@@ -1769,6 +1807,15 @@ class ContextCuratorAgent:
                                 if ch.associated_image_path not in effective_extra_media:
                                     effective_extra_media.insert(0, ch.associated_image_path)
                             break
+
+            if cache_role in ("task_lead", "swe_engineer", "qa_test_engineer", "council_reviewer"):
+                for ch in all_chunks:
+                    if ch.chunk_id == "design:genre_craft_foundation":
+                        if ch.chunk_id not in chunks_by_id:
+                            ranked_pairs.insert(0, (ch, 0.93))
+                            candidate_chunks.insert(0, ch)
+                            chunks_by_id[ch.chunk_id] = ch
+                        break
 
             # Traverse 1 hop of the code reference graph (direct imports & imported_by) from target modules
             code_graph = self.semantic_index.build_code_reference_graph()
@@ -2374,6 +2421,219 @@ class ContextCuratorAgent:
         if pending_pack is not None and pending_pack.prompt_block:
             sections.append(pending_pack.prompt_block)
         return ("\n\n".join(sections) + "\n\n") if sections else ""
+
+    @staticmethod
+    def format_genre_craft_foundation_briefing(foundation: Any) -> str:
+        """Formats a `GenreCraftFoundation` (or dict) into a structured, high-signal studio briefing."""
+        return format_genre_craft_foundation_briefing(foundation)
+
+    def synthesize_genre_craft_foundation(
+        self,
+        *,
+        genre_hint: str,
+        concept_or_seed: str = "",
+        player_dna_summary: str = "",
+        existing_foundation: Optional[Any] = None,
+        evolution_directive: str = "",
+    ) -> GenreCraftFoundation:
+        """Synthesizes or evolves a first-principles `GenreCraftFoundation` (`GenrePillarSpec` pillars,
+        core fun thesis, `t=0` bootstrap-to-mastery arc, spatial/UX contracts, and genre-killing anti-patterns)
+        so the Co-Producer, Writers' Room Council, Living Game Bible, and execution workers share deep,
+        domain-general genre craft understanding without blind spots."""
+        if self.client is None or not hasattr(self.client, "models"):
+            raise StudioAgentConfigurationError(
+                "ContextCuratorAgent.synthesize_genre_craft_foundation requires an active Gemini client (Rule 5)."
+            )
+        from google.genai import types
+
+        clean_genre = str(genre_hint or "").strip() or "interactive 2D game"
+        clean_seed = str(concept_or_seed or "").strip()
+        clean_dna = str(player_dna_summary or "").strip()
+        clean_evo = str(evolution_directive or "").strip()
+
+        existing_block = ""
+        if existing_foundation is not None:
+            formatted_prev = format_genre_craft_foundation_briefing(existing_foundation)
+            if formatted_prev:
+                existing_block = (
+                    f"EXISTING GENRE CRAFT & FUN FOUNDATION (evolve and sharpen while preserving proven pillars that still hold):\n"
+                    f"{formatted_prev}\n\n"
+                )
+        evo_block = (
+            f"EVOLUTION / PIVOT DIRECTIVE TO INCORPORATE:\n{clean_evo}\n\n"
+            if clean_evo
+            else ""
+        )
+        dna_block = (
+            f"TARGET PLAYER TASTE DNA (align depth, pacing, challenge, and agency to this human player):\n{clean_dna}\n\n"
+            if clean_dna
+            else ""
+        )
+
+        if self.event_callback is not None:
+            try:
+                self.event_callback(
+                    "studio_live_activity",
+                    {
+                        "deliberation": (
+                            f"ContextCuratorAgent is synthesizing first-principles genre craft, fun pillars, "
+                            f"and anti-patterns for '{clean_genre}'."
+                        ),
+                        "reasoning_rationale": (
+                            f"ContextCuratorAgent is synthesizing first-principles genre craft, fun pillars, "
+                            f"and anti-patterns for '{clean_genre}'."
+                        ),
+                        "agent_role": "ContextCurator",
+                        "status_text": f"Context Curator: synthesizing Genre Craft & Fun Foundation ({clean_genre[:72]})...",
+                        "active_agents": ["ContextCurator"],
+                        "phase": "genre_foundation_curation",
+                    },
+                )
+            except Exception:
+                pass
+
+        prompt = (
+            "You are the Studio Context Curator & Genre-Craft Research Agent.\n"
+            "Before the Co-Producer or Specialist Council locks mechanics, slices, or tasks, your mission is to "
+            "eliminate genre blind spots by deconstructing from first principles what genuinely makes this game's "
+            "genre/subgenre (or hybrid premise) FUN for a human player—and what naive mistakes ruin it.\n"
+            "This `GenreCraftFoundation` seeds how the Living Game Bible starts and evolves across slices.\n\n"
+            f"TARGET GENRE / ARCHETYPE HINT: {clean_genre}\n"
+            + (f"CONCEPT PREMISE / EXECUTIVE PRODUCER SEED:\n{clean_seed}\n\n" if clean_seed else "\n")
+            + dna_block
+            + existing_block
+            + evo_block
+            + "FIRST-PRINCIPLES GENRE CRAFT REQUIREMENTS:\n"
+            "1. `deliberation` (MUST BE FIRST per Rule 4): Deconstruct the human psychology of fun for this genre—"
+            "why players choose to play it, what decisions make them feel clever or skilled, what spatial/visual precision "
+            "they rely on, and how naive implementations accidentally make it hollow, confusing, or self-playing.\n"
+            "2. `genre_and_subgenre_archetype`: Name the specific genre, subgenre, or hybrid design archetype clearly.\n"
+            "3. `core_fun_thesis`: Articulate the signature fun loop—curiosity/discovery, scarcity or active pushback, "
+            "meaningful strategic or kinetic trade-offs, mastery/optimization, and unmistakable payoff.\n"
+            "4. `bootstrap_to_mastery_arc`: Define how `t=0` starts UNSOLVED with scarce, tactile manual player agency "
+            "(zero free starting handouts, zero pre-built solutions, zero passive resource trickles that bypass discovery/effort) "
+            "and how mid-to-late capabilities are earned through player decisions without ever playing the game for the player.\n"
+            "5. `essential_spatial_and_ux_contracts`: Specify 3 to 6 concrete spatial, visual, and UX contracts required for "
+            "this genre to feel crisp and legible—exact 1:1 input-to-world placement/aiming fidelity (actions happen where the "
+            "player clicks/aims, never arbitrary auto-snapping away from intent), unmistakable visual silhouettes distinguishing "
+            "different entities/resources/tools, immediate causal feedback, and clear goal/why framing for a cold player.\n"
+            "6. `genre_killing_anti_patterns`: List 4 to 6 classic genre-killing blind spots that agents MUST avoid when designing "
+            "and coding this game (e.g., giving everything away for free, auto-completing core loops, removing strategic scarcity "
+            "or discovery, low-readability visual randomness, or lacking clear player purpose).\n"
+            "7. `foundational_pillars`: Author 3 to 5 concrete, evolvable `GenrePillarSpec` pillars (`deliberation` FIRST, "
+            "`pillar_id`, `title`, `why_it_creates_fun`, `systemic_mechanics_expression`, `anti_pattern_to_avoid`) that anchor "
+            "the Living Game Bible and can be refined as the game evolves.\n"
+            "Return valid `GenreCraftFoundation` JSON with `deliberation` strictly FIRST."
+        )
+
+        resp = call_gemini_with_transient_retry(
+            lambda: self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=GenreCraftFoundation,
+                    thinking_config=bounded_thinking_config(512),
+                ),
+            ),
+            label=f"synthesize_genre_craft_foundation[{clean_genre[:40]}]",
+        )
+        if not getattr(resp, "text", None):
+            raise StudioAgentError(
+                f"ContextCuratorAgent.synthesize_genre_craft_foundation returned an empty response for '{clean_genre}' (Rule 5)."
+            )
+        foundation = GenreCraftFoundation.model_validate_json(resp.text)
+        if not foundation.foundational_pillars:
+            raise StudioAgentError(
+                f"ContextCuratorAgent.synthesize_genre_craft_foundation returned zero foundational_pillars for '{clean_genre}' (Rule 5)."
+            )
+
+        if self.cartridge_dir is not None and Path(self.cartridge_dir).is_dir():
+            try:
+                art_dir = Path(self.cartridge_dir) / "artifacts"
+                art_dir.mkdir(parents=True, exist_ok=True)
+                (art_dir / "genre_craft_foundation.json").write_text(
+                    foundation.model_dump_json(indent=2),
+                    encoding="utf-8",
+                )
+            except Exception as exc:
+                logger.debug("Optional genre_craft_foundation.json write skipped: %s", exc)
+
+        event_payload = {
+            "deliberation": foundation.deliberation,
+            "reasoning_rationale": foundation.deliberation,
+            "genre_and_subgenre_archetype": foundation.genre_and_subgenre_archetype,
+            "core_fun_thesis": foundation.core_fun_thesis,
+            "pillar_titles": [p.title for p in foundation.foundational_pillars],
+            "pillar_count": len(foundation.foundational_pillars),
+        }
+        if self.event_callback is not None:
+            try:
+                self.event_callback("genre_craft_foundation_synthesized", event_payload)
+            except Exception:
+                pass
+        try:
+            from engine.studio.orchestrator import SwarmEventBus
+
+            SwarmEventBus.publish(
+                event_type="genre_craft_foundation_synthesized",
+                agent_name="ContextCuratorAgent",
+                deliberation=foundation.deliberation,
+                payload=event_payload,
+            )
+        except Exception:
+            pass
+
+        return foundation
+
+
+def format_genre_craft_foundation_briefing(foundation: Any) -> str:
+    """Renders a `GenreCraftFoundation` (model or dict) into a concise, structured studio briefing block."""
+    if foundation is None:
+        return ""
+    if hasattr(foundation, "model_dump"):
+        data = foundation.model_dump()
+    elif isinstance(foundation, dict):
+        data = foundation
+    else:
+        return ""
+    archetype = str(data.get("genre_and_subgenre_archetype") or "").strip()
+    fun_thesis = str(data.get("core_fun_thesis") or "").strip()
+    arc = str(data.get("bootstrap_to_mastery_arc") or "").strip()
+    ux_contracts = [str(x).strip() for x in (data.get("essential_spatial_and_ux_contracts") or []) if str(x).strip()]
+    anti_patterns = [str(x).strip() for x in (data.get("genre_killing_anti_patterns") or []) if str(x).strip()]
+    pillars = [p for p in (data.get("foundational_pillars") or []) if isinstance(p, dict)]
+    if not (archetype or fun_thesis or pillars):
+        return ""
+
+    lines: List[str] = [
+        f"Genre / Archetype: {archetype or '(unspecified)'}",
+        f"Core Fun Thesis: {fun_thesis}",
+        f"Bootstrap-to-Mastery Arc (t=0 Unsolved -> Earned Capability): {arc}",
+    ]
+    if pillars:
+        lines.append(f"Foundational Genre-Craft Pillars ({len(pillars)}):")
+        for idx, p in enumerate(pillars, start=1):
+            pid = str(p.get("pillar_id") or f"pillar_{idx}").strip()
+            ptitle = str(p.get("title") or pid).strip()
+            pwhy = str(p.get("why_it_creates_fun") or "").strip()
+            psys = str(p.get("systemic_mechanics_expression") or "").strip()
+            panti = str(p.get("anti_pattern_to_avoid") or "").strip()
+            lines.append(
+                f"  {idx}. [{pid}] {ptitle}\n"
+                f"     - Why It Creates Fun: {pwhy}\n"
+                f"     - Systemic Mechanics Expression: {psys}\n"
+                f"     - Anti-Pattern to Avoid: {panti}"
+            )
+    if ux_contracts:
+        lines.append("Essential Spatial, Visual & UX Precision Contracts:")
+        for c in ux_contracts:
+            lines.append(f"  - {c}")
+    if anti_patterns:
+        lines.append("Genre-Killing Anti-Patterns (STRICTLY FORBIDDEN):")
+        for ap in anti_patterns:
+            lines.append(f"  - {ap}")
+    return "\n".join(lines)
 
 
 def compute_entrypoint_reachability(

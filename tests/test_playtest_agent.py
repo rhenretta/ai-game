@@ -654,7 +654,7 @@ def test_fast_non_thinking_model_config_and_live_notebook_questions_bugs_mood_an
     lite_tc = _playtest_non_thinking_config("gemini-3.5-flash-lite")
     assert lite_tc.thinking_level == types.ThinkingLevel.MINIMAL
     flash_tc = _playtest_non_thinking_config("gemini-3.8-flash")
-    assert flash_tc.thinking_level == types.ThinkingLevel.LOW
+    assert flash_tc.thinking_level == types.ThinkingLevel.MEDIUM
 
     card = BlindStoreCard(
         deliberation="Test player notes, questions, bug spotting, live mood, and perceptual change note.",
@@ -1257,8 +1257,39 @@ def test_stratified_5_frame_report_sampling_skips_dark_modal_blackouts(tmp_path:
     assert not any("Turn #5)" in lbl for lbl in rep_labels)
 
 
+def test_turn_timing_telemetry_reports_inter_frame_dt_and_ballistic_click_window(tmp_path: Path):
+    card = BlindStoreCard(
+        deliberation="Verify domain-agnostic frame delta and ballistic click timing telemetry.",
+        checkpoint_id="cp_timing",
+        game_title="Timing Telemetry Fixture",
+        game_description="A minimal interactive viewport.",
+    )
+    cfg = PlaytestSessionConfig()
+    assert cfg.reaction_ticks == 6
 
+    fake_client = _QueuedFakeGeminiClient(
+        [
+            {"payload": _turn_payload(1, inspect_high_res_next=False)},
+            {"payload": _turn_payload(2, inspect_high_res_next=False)},
+        ]
+    )
+    agent = BlindPlaytesterAgent(store_card=card, config=cfg, client=fake_client)
+    assert "velocity = (pos_now - pos_prev) / Δt" in agent.system_prompt
+    assert "remainder of `duration_ms` simulates the world AFTER your click" in agent.system_prompt
 
+    obs1 = _make_obs(tmp_path, 1, marker_x=60, audio_is_silent=True)   # t = 0.75s
+    obs2 = _make_obs(tmp_path, 2, marker_x=180, audio_is_silent=True)  # t = 1.50s (Δt = 0.75s)
 
+    _, tape1, _ = agent.decide_turn(1, obs1)
+    _, tape2, _ = agent.decide_turn(2, obs2)
 
+    t1_status = fake_client.calls[0]["contents"][-1].parts[0].text
+    assert "Click Timing: A click/tap issued now lands ~0.15-0.23s after Current screen (100ms reaction + fast cursor flick)" in t1_status
+    assert "[Turn 1 | t=0.75s |" in tape1
 
+    t2_parts = fake_client.calls[1]["contents"][-1].parts
+    t2_status = t2_parts[0].text
+    assert "+0.75s since Previous turn screen" in t2_status
+    assert "Frame & Click Timing: Δt = 0.75s elapsed between Previous turn screen (0.75s) and Current screen (1.50s)." in t2_status
+    assert any(p.text and "Δt=0.75s before Current screen" in p.text for p in t2_parts)
+    assert "[Turn 2 | t=1.50s (+0.75s) |" in tape2

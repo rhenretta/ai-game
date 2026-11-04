@@ -44,6 +44,10 @@ var _av_audio_resample_pos: float = 0.0
 var _av_rgb_file: FileAccess = null
 var _av_pcm_file: FileAccess = null
 var _sanitized_scripts: Array = []
+var capture_events_script: Array = []
+var captured_events_log: Array = []
+var unmet_capture_events_log: Array = []
+var min_required_tick: int = 1
 
 func _init() -> void:
 	var args = OS.get_cmdline_args()
@@ -52,11 +56,16 @@ func _init() -> void:
 			max_ticks = int(args[i + 1])
 		elif args[i] == "--ticks" and i + 1 < args.size():
 			max_ticks = int(args[i + 1])
+		elif args[i] == "--min-ticks" and i + 1 < args.size():
+			min_required_tick = maxi(1, int(args[i + 1]))
 		elif args[i] == "--capture-viewport":
 			capture_viewport_enabled = true
 		elif args[i] == "--capture-ticks" and i + 1 < args.size():
 			for t in String(args[i + 1]).split(",", false):
 				capture_ticks.append(int(t))
+		elif args[i] == "--capture-events" and i + 1 < args.size():
+			scripted_mode = true
+			_load_capture_events(String(args[i + 1]))
 		elif args[i] == "--input-script" and i + 1 < args.size():
 			scripted_mode = true
 			_load_input_script(String(args[i + 1]))
@@ -67,6 +76,17 @@ func _init() -> void:
 			target_scene_override = String(args[i + 1]).strip_edges()
 		elif args[i] == "--record-audiovisual" and i + 1 < args.size():
 			record_audiovisual_dir = String(args[i + 1]).strip_edges()
+
+func _load_capture_events(path: String) -> void:
+	var f = FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		script_error = "cannot open capture events script " + path
+		return
+	var parsed = JSON.parse_string(f.get_as_text())
+	if typeof(parsed) != TYPE_ARRAY:
+		script_error = "capture events script must be a JSON array of event objects: " + path
+		return
+	capture_events_script = parsed
 
 func _load_input_script(path: String) -> void:
 	var f = FileAccess.open(path, FileAccess.READ)
@@ -167,6 +187,7 @@ func _initialize() -> void:
 		quit(1)
 		return
 	if DisplayServer.get_name() != "headless":
+		DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
 		_lock_crisp_subviewport_font_oversampling()
 		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_NO_FOCUS, true)
 		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_BORDERLESS, true)
@@ -291,6 +312,7 @@ func _process(_delta: float) -> bool:
 			max_player_y_reached = py
 
 	var did_capture_this_tick: bool = false
+	var did_emit_qa_snap_this_tick: bool = false
 	if record_audiovisual_dir != "":
 		_drain_av_audio_chunk()
 		if (current_tick - 1) % 4 == 0:
@@ -301,6 +323,12 @@ func _process(_delta: float) -> bool:
 		_try_capture_viewport("res://assets/playtest_captures/filmstrip_%04d.png" % current_tick)
 		print("[QA_TICK_SNAPSHOT] " + JSON.stringify(live_snap))
 		did_capture_this_tick = true
+		did_emit_qa_snap_this_tick = true
+
+	if capture_events_script.size() > 0:
+		if _evaluate_capture_events_for_tick(current_tick, live_snap, did_emit_qa_snap_this_tick):
+			did_capture_this_tick = true
+			did_emit_qa_snap_this_tick = true
 
 	# Viewport GPU capture at t0 (during passive window before inputs)
 	if current_tick == 2:
@@ -314,7 +342,17 @@ func _process(_delta: float) -> bool:
 		if current_tick > 5 and not prev_tick_captured:
 			frame_times_usec.append(inter_frame_usec)
 
+	if capture_events_script.size() > 0 and record_audiovisual_dir == "" and current_tick >= 2 and current_tick < max_ticks:
+		if _can_early_exit_after_capture_events(current_tick):
+			_try_capture_viewport("res://assets/playtest_captures/playtest_tend.png")
+			_try_capture_collision_overlay("res://assets/playtest_captures/playtest_collision_overlay.png")
+			final_snapshot = live_snap
+			_emit_summary_and_exit()
+			return true
+
 	if current_tick >= max_ticks:
+		if capture_events_script.size() > 0:
+			_finalize_unmet_capture_events(current_tick, live_snap, did_emit_qa_snap_this_tick)
 		_try_capture_viewport("res://assets/playtest_captures/playtest_tend.png")
 		_try_capture_collision_overlay("res://assets/playtest_captures/playtest_collision_overlay.png")
 		final_snapshot = live_snap
@@ -857,6 +895,128 @@ func _execute_setup_calls_for_tick(tick: int) -> void:
 			"status": status
 		}))
 
+func _lookup_snapshot_value(snap: Dictionary, key_path: String) -> Variant:
+	var clean_key = key_path.strip_edges()
+	if clean_key == "":
+		return null
+	var cur: Variant = snap
+	for part in clean_key.split("."):
+		if typeof(cur) == TYPE_DICTIONARY and (cur as Dictionary).has(part):
+			cur = (cur as Dictionary)[part]
+		elif main_scene_node != null and part in main_scene_node:
+			cur = main_scene_node.get(part)
+		else:
+			return null
+	return cur
+
+func _evaluate_capture_events_for_tick(tick: int, live_snap: Dictionary, already_emitted_snap: bool) -> bool:
+	var snapped_here: bool = false
+	for idx in range(capture_events_script.size()):
+		var raw_ev: Variant = capture_events_script[idx]
+		if typeof(raw_ev) != TYPE_DICTIONARY:
+			continue
+		var ev: Dictionary = raw_ev
+		if bool(ev.get("_captured", false)):
+			continue
+		var label: String = String(ev.get("event_label", "event_" + str(idx + 1))).strip_edges()
+		var mode: String = String(ev.get("trigger_mode", "at_tick")).strip_edges()
+		var min_t: int = maxi(1, int(ev.get("at_tick", 1)))
+		var settle: int = maxi(0, int(ev.get("settle_ticks", 0)))
+		var when_key: String = String(ev.get("when_snapshot_key", "")).strip_edges()
+		if mode == "on_change" and not ev.has("_baseline_recorded") and tick >= min_t:
+			ev["_baseline_recorded"] = true
+			ev["_baseline_val"] = str(_lookup_snapshot_value(live_snap, when_key))
+		if not ev.has("_triggered_tick") and tick >= min_t:
+			var fired: bool = false
+			if mode == "at_tick" or when_key == "":
+				fired = (tick >= min_t)
+			elif mode == "on_condition":
+				fired = _evaluate_snapshot_condition(
+					live_snap,
+					when_key,
+					String(ev.get("when_operator", "==")),
+					String(ev.get("when_value", ""))
+				)
+			elif mode == "on_change":
+				if tick > min_t:
+					var cur_val_str: String = str(_lookup_snapshot_value(live_snap, when_key))
+					fired = (cur_val_str != String(ev.get("_baseline_val", "null")))
+			if fired:
+				ev["_triggered_tick"] = tick
+				ev["_snap_tick"] = mini(max_ticks, tick + settle)
+		if ev.has("_snap_tick") and tick >= int(ev["_snap_tick"]):
+			ev["_captured"] = true
+			if not snapped_here and not already_emitted_snap:
+				_try_capture_viewport("res://assets/playtest_captures/filmstrip_%04d.png" % tick)
+				print("[QA_TICK_SNAPSHOT] " + JSON.stringify(live_snap))
+				snapped_here = true
+			elif not snapped_here and already_emitted_snap:
+				# Frame + snapshot already written by capture_ticks at this tick
+				snapped_here = true
+			var rec: Dictionary = {
+				"event_label": label,
+				"trigger_mode": mode,
+				"triggered_tick": int(ev.get("_triggered_tick", tick)),
+				"captured_tick": tick,
+				"when_snapshot_key": when_key
+			}
+			captured_events_log.append(rec)
+			print("[QA_EVENT_CAPTURED] " + JSON.stringify(rec))
+	return snapped_here
+
+func _can_early_exit_after_capture_events(tick: int) -> bool:
+	if tick < min_required_tick:
+		return false
+	for raw_ev in capture_events_script:
+		if typeof(raw_ev) == TYPE_DICTIONARY and not bool((raw_ev as Dictionary).get("_captured", false)):
+			return false
+	for ct in capture_ticks:
+		if int(ct) > tick:
+			return false
+	for raw_in in input_script:
+		if typeof(raw_in) != TYPE_DICTIONARY:
+			continue
+		var inp: Dictionary = raw_in
+		var when_k: String = String(inp.get("when_snapshot_key", "")).strip_edges()
+		if when_k != "":
+			if not inp.has("_triggered_at"):
+				if int(inp.get("to", tick)) > tick:
+					return false
+			elif int(inp.get("_eff_to", tick)) + 1 > tick:
+				return false
+		else:
+			if int(inp.get("to", 0)) + 1 > tick:
+				return false
+	for raw_sc in setup_script:
+		if typeof(raw_sc) == TYPE_DICTIONARY and int((raw_sc as Dictionary).get("at_tick", 1)) > tick:
+			return false
+	return true
+
+func _finalize_unmet_capture_events(tick: int, live_snap: Dictionary, already_emitted_snap: bool) -> void:
+	var had_unmet: bool = false
+	for idx in range(capture_events_script.size()):
+		var raw_ev: Variant = capture_events_script[idx]
+		if typeof(raw_ev) != TYPE_DICTIONARY:
+			continue
+		var ev: Dictionary = raw_ev
+		if bool(ev.get("_captured", false)):
+			continue
+		had_unmet = true
+		var rec: Dictionary = {
+			"event_label": String(ev.get("event_label", "event_" + str(idx + 1))).strip_edges(),
+			"trigger_mode": String(ev.get("trigger_mode", "on_condition")).strip_edges(),
+			"when_snapshot_key": String(ev.get("when_snapshot_key", "")).strip_edges(),
+			"when_operator": String(ev.get("when_operator", "")).strip_edges(),
+			"when_value": String(ev.get("when_value", "")).strip_edges(),
+			"at_tick": int(ev.get("at_tick", 1)),
+			"fallback_tick": tick
+		}
+		unmet_capture_events_log.append(rec)
+		print("[QA_EVENT_UNMET] " + JSON.stringify(rec))
+	if had_unmet and not already_emitted_snap:
+		_try_capture_viewport("res://assets/playtest_captures/filmstrip_%04d.png" % tick)
+		print("[QA_TICK_SNAPSHOT] " + JSON.stringify(live_snap))
+
 func _evaluate_snapshot_condition(snap: Dictionary, key_path: String, op: String, target_str: String) -> bool:
 	var clean_key = key_path.strip_edges()
 	if clean_key == "":
@@ -1141,6 +1301,14 @@ func _audit_scene_tree(node: Node, in_ui: bool = false) -> Dictionary:
 		"portrait_misused_on_world_sprite": false,
 		"portrait_misused_nodes": [],
 		"oversized_ui_portraits": [],
+		"ui_rect_overlaps": [],
+		"ui_viewport_overflow_nodes": [],
+		"clipped_ui_labels": [],
+		"blurry_upscaled_sprites": [],
+		"duplicate_stacked_sprites": [],
+		"overlapping_world_entities": [],
+		"captured_events": captured_events_log,
+		"unmet_capture_events": unmet_capture_events_log,
 		"passive_auto_win_detected": passive_auto_win_detected,
 		"passive_win_reason": passive_win_reason,
 		"unbounded_sky_or_void_detected": false,
@@ -1150,6 +1318,7 @@ func _audit_scene_tree(node: Node, in_ui: bool = false) -> Dictionary:
 	if not node:
 		return report
 	_walk_scene_audit(node, in_ui, report)
+	_audit_layout_and_spatial_scale(node, report)
 	var boundary_audit = _audit_spatial_boundaries(node)
 	report["spatial_boundary_audit"] = boundary_audit
 
@@ -1402,6 +1571,273 @@ func _walk_scene_audit(node: Node, in_ui: bool, report: Dictionary) -> void:
 
 	for child in node.get_children():
 		_walk_scene_audit(child, current_in_ui, report)
+
+func _is_node_ancestor(anc: Node, desc: Node) -> bool:
+	var cur := desc.get_parent()
+	while cur != null:
+		if cur == anc:
+			return true
+		cur = cur.get_parent()
+	return false
+
+func _has_scroll_ancestor(ctrl: Control) -> bool:
+	var cur := ctrl.get_parent()
+	while cur != null:
+		if cur is ScrollContainer:
+			return true
+		cur = cur.get_parent()
+	return false
+
+func _sprite_source_frame_size(sp: Sprite2D) -> Vector2:
+	if sp == null or sp.texture == null:
+		return Vector2.ZERO
+	if sp.region_enabled and sp.region_rect.size.x > 0.0 and sp.region_rect.size.y > 0.0:
+		return sp.region_rect.size
+	if sp.texture is AtlasTexture:
+		var at: AtlasTexture = sp.texture as AtlasTexture
+		if at.region.size.x > 0.0 and at.region.size.y > 0.0:
+			return at.region.size
+	var tw: float = float(sp.texture.get_width())
+	var th: float = float(sp.texture.get_height())
+	return Vector2(tw / float(maxi(1, sp.hframes)), th / float(maxi(1, sp.vframes)))
+
+func _collect_audit_nodes_recursive(
+	node: Node,
+	in_ui: bool,
+	skip_test_root_overlays: bool,
+	ui_text_or_interactive: Array,
+	ui_panels: Array,
+	world_sprites: Array,
+	report: Dictionary
+) -> void:
+	if skip_test_root_overlays and node.get_parent() == main_scene_node and (node is CanvasLayer):
+		# Skip QA test-scene-only foreground diagnostic overlays attached directly to res://tests/test_*.tscn root
+		return
+	var is_fg_canvas_layer := (node is CanvasLayer) and ((node as CanvasLayer).layer >= 0)
+	var is_bg_canvas_layer := (node is CanvasLayer) and ((node as CanvasLayer).layer < 0)
+	var is_world_bg_color_rect := (node is ColorRect) and (not in_ui) and ((node as CanvasItem).z_index <= 0)
+	var cur_in_ui: bool = false if is_bg_canvas_layer else (in_ui or is_fg_canvas_layer or ((node is Control) and not is_world_bg_color_rect))
+
+	if cur_in_ui and (node is Control):
+		var ctrl := node as Control
+		if ctrl.is_visible_in_tree():
+			var grect := ctrl.get_global_rect()
+			if grect.size.x >= 8.0 and grect.size.y >= 8.0 and not _has_scroll_ancestor(ctrl):
+				if (
+					grect.position.x < -6.0
+					or grect.position.y < -6.0
+					or grect.end.x > 1286.0
+					or grect.end.y > 726.0
+				) and report["ui_viewport_overflow_nodes"].size() < 12:
+					report["ui_viewport_overflow_nodes"].append(
+						str(ctrl.name) + ":" + str(ctrl.get_class())
+						+ " rect=(" + str(int(round(grect.position.x))) + "," + str(int(round(grect.position.y)))
+						+ "," + str(int(round(grect.size.x))) + "x" + str(int(round(grect.size.y))) + ") overflows 1280x720"
+					)
+			if ctrl is Label:
+				var lbl := ctrl as Label
+				var raw_txt := String(lbl.text).strip_edges()
+				if raw_txt != "" and grect.size.x > 4.0 and report["clipped_ui_labels"].size() < 12:
+					var clipped_reason := ""
+					if (lbl.clip_text or lbl.text_overrun_behavior != TextServer.OVERRUN_NO_TRIMMING) and lbl.autowrap_mode == TextServer.AUTOWRAP_OFF:
+						var fnt: Font = lbl.get_theme_font("font")
+						var fsz: int = lbl.get_theme_font_size("font_size")
+						if fnt != null and fsz > 0:
+							var req_w := fnt.get_string_size(lbl.text, HORIZONTAL_ALIGNMENT_LEFT, -1, fsz).x
+							if req_w > lbl.size.x + 6.0:
+								clipped_reason = "text_width=" + str(int(round(req_w))) + "px > label_width=" + str(int(round(lbl.size.x))) + "px"
+					if clipped_reason == "":
+						var p_anc := lbl.get_parent()
+						while p_anc != null:
+							if p_anc is Control and (p_anc as Control).clip_contents:
+								var prect := (p_anc as Control).get_global_rect()
+								if grect.end.x > prect.end.x + 4.0 or grect.end.y > prect.end.y + 4.0 or grect.position.x < prect.position.x - 4.0:
+									clipped_reason = "overflows clip_contents parent " + str(p_anc.name)
+									break
+							p_anc = p_anc.get_parent()
+					if clipped_reason != "":
+						report["clipped_ui_labels"].append(
+							str(lbl.name) + " ('" + raw_txt.substr(0, 28) + "'): " + clipped_reason
+						)
+			if grect.size.x >= 6.0 and grect.size.y >= 6.0 and not (grect.size.x >= 1100.0 and grect.size.y >= 600.0):
+				var is_nonempty_label := (ctrl is Label) and String((ctrl as Label).text).strip_edges() != ""
+				var is_nonempty_rtl := (ctrl is RichTextLabel) and String((ctrl as RichTextLabel).get_parsed_text()).strip_edges() != ""
+				if is_nonempty_label or is_nonempty_rtl or (ctrl is BaseButton) or (ctrl is Range) or (ctrl is LineEdit):
+					ui_text_or_interactive.append({"node": ctrl, "rect": grect})
+				elif (ctrl is Panel) or (ctrl is PanelContainer):
+					ui_panels.append({"node": ctrl, "rect": grect})
+	elif (not cur_in_ui) and (node is Sprite2D):
+		var sp := node as Sprite2D
+		if sp.texture != null and sp.is_visible_in_tree():
+			world_sprites.append(sp)
+
+	for child in node.get_children():
+		_collect_audit_nodes_recursive(
+			child,
+			cur_in_ui,
+			skip_test_root_overlays,
+			ui_text_or_interactive,
+			ui_panels,
+			world_sprites,
+			report
+		)
+
+func _audit_layout_and_spatial_scale(root_node: Node, report: Dictionary) -> void:
+	if root_node == null:
+		return
+	var is_qa_wrapper := String(root_node.scene_file_path).begins_with("res://tests/")
+	var ui_leaves: Array = []
+	var ui_panels: Array = []
+	var world_sprites: Array = []
+	_collect_audit_nodes_recursive(root_node, false, is_qa_wrapper, ui_leaves, ui_panels, world_sprites, report)
+
+	# 1. Pairwise UI text/interactive control overlaps
+	for i in range(ui_leaves.size()):
+		if report["ui_rect_overlaps"].size() >= 12:
+			break
+		var a_ctrl: Control = ui_leaves[i]["node"]
+		var a_rect: Rect2 = ui_leaves[i]["rect"]
+		for j in range(i + 1, ui_leaves.size()):
+			var b_ctrl: Control = ui_leaves[j]["node"]
+			var b_rect: Rect2 = ui_leaves[j]["rect"]
+			if _is_node_ancestor(a_ctrl, b_ctrl) or _is_node_ancestor(b_ctrl, a_ctrl):
+				continue
+			var inter := a_rect.intersection(b_rect)
+			if inter.size.x >= 6.0 and inter.size.y >= 6.0 and (inter.size.x * inter.size.y) >= 48.0:
+				report["ui_rect_overlaps"].append(
+					str(a_ctrl.name) + ":" + str(a_ctrl.get_class())
+					+ " overlaps " + str(b_ctrl.name) + ":" + str(b_ctrl.get_class())
+					+ " by " + str(int(round(inter.size.x))) + "x" + str(int(round(inter.size.y))) + "px"
+				)
+				if report["ui_rect_overlaps"].size() >= 12:
+					break
+
+	# 2. Pairwise disjoint HUD Panel / PanelContainer overlaps
+	for i in range(ui_panels.size()):
+		if report["ui_rect_overlaps"].size() >= 12:
+			break
+		var pa: Control = ui_panels[i]["node"]
+		var ra: Rect2 = ui_panels[i]["rect"]
+		var area_a := maxf(1.0, ra.size.x * ra.size.y)
+		for j in range(i + 1, ui_panels.size()):
+			var pb: Control = ui_panels[j]["node"]
+			var rb: Rect2 = ui_panels[j]["rect"]
+			if _is_node_ancestor(pa, pb) or _is_node_ancestor(pb, pa):
+				continue
+			var inter_p := ra.intersection(rb)
+			var inter_area := inter_p.size.x * inter_p.size.y
+			var min_area := minf(area_a, maxf(1.0, rb.size.x * rb.size.y))
+			if inter_p.size.x >= 8.0 and inter_p.size.y >= 8.0 and (inter_area / min_area) > 0.10:
+				report["ui_rect_overlaps"].append(
+					"Panel " + str(pa.name) + " overlaps Panel " + str(pb.name)
+					+ " by " + str(int(round(inter_p.size.x))) + "x" + str(int(round(inter_p.size.y))) + "px"
+				)
+				if report["ui_rect_overlaps"].size() >= 12:
+					break
+
+	# 3. World Sprite2D upscale blur, same-parent z-fighting stacks, and sibling entity overlap pileups
+	var cam_scale := Vector2.ONE
+	if root_node.get_viewport() != null:
+		cam_scale = root_node.get_viewport().get_canvas_transform().get_scale()
+	var by_parent_sprites: Dictionary = {}
+	var entity_aabbs_by_container: Dictionary = {}
+
+	for raw_sp in world_sprites:
+		var sp: Sprite2D = raw_sp
+		var src_sz := _sprite_source_frame_size(sp)
+		if src_sz.x <= 8.0 or src_sz.y <= 8.0:
+			continue
+		if (src_sz.x >= 512.0 and src_sz.y >= 512.0) or sp.z_index <= -5:
+			continue
+		var eff_sx := absf(sp.global_scale.x) * absf(cam_scale.x)
+		var eff_sy := absf(sp.global_scale.y) * absf(cam_scale.y)
+		var max_eff := maxf(eff_sx, eff_sy)
+		var p_node: Node = sp.get_parent()
+		var p_label: String = (str(p_node.name) + "/" + str(sp.name)) if p_node != null else str(sp.name)
+		if max_eff > 1.25 and report["blurry_upscaled_sprites"].size() < 12:
+			report["blurry_upscaled_sprites"].append(
+				p_label + " rendered at " + str(snapped(max_eff, 0.01)) + "x (>1.25x) from "
+				+ str(int(round(src_sz.x))) + "x" + str(int(round(src_sz.y))) + "px source"
+			)
+		var is_additive := (sp.material is CanvasItemMaterial) and ((sp.material as CanvasItemMaterial).blend_mode == CanvasItemMaterial.BLEND_MODE_ADD)
+		var is_opaque := (not is_additive) and sp.modulate.a >= 0.55 and sp.self_modulate.a >= 0.55
+		if is_opaque and p_node != null:
+			var pid := p_node.get_instance_id()
+			if not by_parent_sprites.has(pid):
+				by_parent_sprites[pid] = []
+			by_parent_sprites[pid].append({"sp": sp, "src": src_sz, "parent_name": str(p_node.name)})
+
+			# Track entity-level primary sprite footprint for sibling entity overlap checks
+			if (p_node is Node2D) and p_node != root_node and not (p_node is CPUParticles2D) and not (p_node is GPUParticles2D):
+				var container := p_node.get_parent()
+				if container != null and container != render_viewport:
+					var cid := container.get_instance_id()
+					if not entity_aabbs_by_container.has(cid):
+						entity_aabbs_by_container[cid] = {}
+					var eid := p_node.get_instance_id()
+					var w_sz := Vector2(src_sz.x * absf(sp.global_scale.x), src_sz.y * absf(sp.global_scale.y))
+					var w_center := sp.global_position
+					if sp.centered:
+						w_center += sp.offset * sp.global_scale
+					else:
+						w_center += (sp.offset + src_sz * 0.5) * sp.global_scale
+					var cand_rect := Rect2(w_center - w_sz * 0.5, w_sz)
+					if not entity_aabbs_by_container[cid].has(eid):
+						entity_aabbs_by_container[cid][eid] = {
+							"entity": p_node,
+							"rect": cand_rect,
+							"area": w_sz.x * w_sz.y
+						}
+					elif (w_sz.x * w_sz.y) > float(entity_aabbs_by_container[cid][eid]["area"]):
+						entity_aabbs_by_container[cid][eid]["rect"] = cand_rect
+						entity_aabbs_by_container[cid][eid]["area"] = w_sz.x * w_sz.y
+
+	for pid in by_parent_sprites.keys():
+		if report["duplicate_stacked_sprites"].size() >= 12:
+			break
+		var arr: Array = by_parent_sprites[pid]
+		for i in range(arr.size()):
+			var s1: Sprite2D = arr[i]["sp"]
+			for j in range(i + 1, arr.size()):
+				var s2: Sprite2D = arr[j]["sp"]
+				if s1.z_index == s2.z_index and s1.position.distance_to(s2.position) < 4.0:
+					report["duplicate_stacked_sprites"].append(
+						str(arr[i]["parent_name"]) + " stacks duplicate same-z Sprite2Ds ("
+						+ str(s1.name) + ", " + str(s2.name) + ") at offset " + str(s1.position)
+					)
+					break
+
+	for cid in entity_aabbs_by_container.keys():
+		if report["overlapping_world_entities"].size() >= 12:
+			break
+		var ents: Array = entity_aabbs_by_container[cid].values()
+		if ents.size() < 2 or ents.size() > 64:
+			continue
+		for i in range(ents.size()):
+			var e1: Node2D = ents[i]["entity"]
+			var r1: Rect2 = ents[i]["rect"]
+			var a1 := maxf(1.0, float(ents[i]["area"]))
+			for j in range(i + 1, ents.size()):
+				var e2: Node2D = ents[j]["entity"]
+				var r2: Rect2 = ents[j]["rect"]
+				var a2 := maxf(1.0, float(ents[j]["area"]))
+				if e1.global_position.distance_to(e2.global_position) < 8.0:
+					continue
+				# Ignore dynamic projectiles/collectibles overlapping with hazards/pickups mid-flight when one is Area2D/RigidBody2D moving fast
+				if ("velocity" in e1 and (e1.get("velocity") is Vector2) and (e1.get("velocity") as Vector2).length() > 8.0) or ("velocity" in e2 and (e2.get("velocity") is Vector2) and (e2.get("velocity") as Vector2).length() > 8.0):
+					continue
+				var inter_w := r1.intersection(r2)
+				var inter_a := inter_w.size.x * inter_w.size.y
+				var ratio := inter_a / minf(a1, a2)
+				if inter_w.size.x >= 8.0 and inter_w.size.y >= 8.0 and ratio > 0.35:
+					report["overlapping_world_entities"].append(
+						str(e1.name) + "@(" + str(int(round(e1.global_position.x))) + "," + str(int(round(e1.global_position.y))) + ")"
+						+ " overlaps " + str(e2.name) + "@(" + str(int(round(e2.global_position.x))) + "," + str(int(round(e2.global_position.y))) + ")"
+						+ " by " + str(int(round(ratio * 100.0))) + "% (footprint "
+						+ str(int(round(r1.size.x))) + "x" + str(int(round(r1.size.y))) + "px exceeds grid spacing)"
+					)
+					if report["overlapping_world_entities"].size() >= 12:
+						break
 
 func _drain_av_audio_chunk() -> void:
 	if _av_audio_capture == null or _av_pcm_file == null:

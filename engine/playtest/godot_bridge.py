@@ -72,6 +72,70 @@ class TurnObservation:
     audio_peak: float
     audio_is_silent: bool
     interrupted_early: bool
+    diagnostic_screenshot_path: Optional[Path] = None
+
+
+def stamp_diagnostic_click_reticle(
+    screenshot_path: Path,
+    *,
+    click_xy_px: Tuple[float, float],
+    action_label: str = "left_click",
+    drag_from_xy_px: Optional[Tuple[float, float]] = None,
+    output_path: Optional[Path] = None,
+) -> Path:
+    """Stamps a crisp, non-destructive diagnostic target reticle onto a copy of `screenshot_path`
+    at `click_xy_px` (leaving raw `screenshot_path` untouched) so multimodal playtesters and the
+    Council can verify exact cursor-to-world placement alignment vs. `Camera2D` offset bugs.
+    """
+    src = Path(screenshot_path)
+    dst = Path(output_path) if output_path is not None else src.with_name(f"{src.stem}_click_diag.png")
+    with Image.open(src) as raw_im:
+        canvas = raw_im.convert("RGBA")
+    w, h = canvas.size
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    cx = max(0, min(w - 1, int(round(click_xy_px[0]))))
+    cy = max(0, min(h - 1, int(round(click_xy_px[1]))))
+    ring_r = 16
+    inner_gap = 6
+    arm_len = 24
+
+    if drag_from_xy_px is not None:
+        sx = max(0, min(w - 1, int(round(drag_from_xy_px[0]))))
+        sy = max(0, min(h - 1, int(round(drag_from_xy_px[1]))))
+        draw.line([(sx, sy), (cx, cy)], fill=(0, 0, 0, 190), width=4)
+        draw.line([(sx, sy), (cx, cy)], fill=(255, 210, 60, 235), width=2)
+        draw.ellipse([(sx - 6, sy - 6), (sx + 6, sy + 6)], outline=(255, 210, 60, 245), width=2)
+
+    # High-contrast dark halo + bright cyan/magenta concentric target reticle with open center pixel window
+    draw.ellipse([(cx - ring_r - 1, cy - ring_r - 1), (cx + ring_r + 1, cy + ring_r + 1)], outline=(0, 0, 0, 215), width=4)
+    draw.ellipse([(cx - ring_r, cy - ring_r), (cx + ring_r, cy + ring_r)], outline=(0, 245, 255, 245), width=2)
+    for dx0, dy0, dx1, dy1 in (
+        (-arm_len, 0, -inner_gap, 0),
+        (inner_gap, 0, arm_len, 0),
+        (0, -arm_len, 0, -inner_gap),
+        (0, inner_gap, 0, arm_len),
+    ):
+        draw.line([(cx + dx0, cy + dy0), (cx + dx1, cy + dy1)], fill=(0, 0, 0, 215), width=4)
+        draw.line([(cx + dx0, cy + dy0), (cx + dx1, cy + dy1)], fill=(255, 64, 220, 245), width=2)
+
+    tag_text = f"{action_label.upper()} @ ({cx},{cy})"
+    font = _get_font(12)
+    try:
+        tb = draw.textbbox((0, 0), tag_text, font=font)
+        tw, th = max(36, tb[2] - tb[0]), max(12, tb[3] - tb[1])
+    except Exception:
+        tw, th = len(tag_text) * 7, 14
+    tx = cx + 18 if (cx + 24 + tw) < w else max(4, cx - 22 - tw)
+    ty = cy - th - 10 if (cy - th - 12) >= 4 else min(h - th - 6, cy + 16)
+    draw.rectangle([(tx - 4, ty - 2), (tx + tw + 4, ty + th + 3)], fill=(12, 16, 24, 215), outline=(0, 245, 255, 220), width=1)
+    draw.text((tx, ty), tag_text, fill=(240, 252, 255, 255), font=font)
+
+    merged = Image.alpha_composite(canvas, overlay).convert("RGB")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    merged.save(dst, format="PNG")
+    return dst
 
 
 @dataclass
@@ -436,7 +500,7 @@ class GodotPlaytestBridge:
         *,
         checkpoint_dir: Path,
         session_dir: Path,
-        reaction_ticks: int = 15,
+        reaction_ticks: int = 6,
         initial_settle_ticks: int = 30,
         record_video: bool = True,
         on_live_frame: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -646,7 +710,26 @@ class GodotPlaytestBridge:
             "duration_ms": int(action.duration_ms),
         }
         self._send_json(payload)
-        return self._wait_for_observation(timeout_sec=timeout_sec)
+        obs = self._wait_for_observation(timeout_sec=timeout_sec)
+        btn_act = str(action.mouse_button_action or "none")
+        if btn_act not in ("none", "release_left") and obs.screenshot_path is not None and obs.screenshot_path.is_file():
+            eff_mx = payload["mouse_x"] if payload["mouse_x"] is not None else float(obs.cursor_x)
+            eff_my = payload["mouse_y"] if payload["mouse_y"] is not None else float(obs.cursor_y)
+            drag_origin = (
+                (float(payload["drag_from_x"]), float(payload["drag_from_y"]))
+                if (btn_act == "drag_left" and payload["drag_from_x"] is not None and payload["drag_from_y"] is not None)
+                else None
+            )
+            try:
+                obs.diagnostic_screenshot_path = stamp_diagnostic_click_reticle(
+                    obs.screenshot_path,
+                    click_xy_px=(float(eff_mx), float(eff_my)),
+                    action_label=btn_act,
+                    drag_from_xy_px=drag_origin,
+                )
+            except Exception as diag_exc:
+                logger.debug("Diagnostic click reticle stamp skipped: %s", diag_exc)
+        return obs
 
     def close(self) -> None:
         """Cleanly stops Godot + ffmpeg video stream and flushes final audio samples."""

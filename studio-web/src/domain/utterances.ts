@@ -222,14 +222,21 @@ export function normalizeUtteranceBadges(rawBadges: unknown): FormattedBibleBadg
     if (raw.length > 68) {
       pushBadge({
         label: `${raw.slice(0, 65).trimEnd()}…`,
-        tone: raw.startsWith('Director Steering Challenge') ? 'warn' : 'neutral',
+        tone:
+          raw.startsWith('Co-Producer Steering Challenge') ||
+          raw.startsWith('Director Steering Challenge')
+            ? 'warn'
+            : 'neutral',
         title: raw,
       });
     } else {
       pushBadge({
         label: raw,
         tone:
-          raw.includes('Executive Producer') || raw.includes('Blind Playtester')
+          raw.includes('Executive Producer') ||
+          raw.includes('Blind Playtester') ||
+          raw.startsWith('Co-Producer Steering Challenge') ||
+          raw.startsWith('Director Steering Challenge')
             ? 'warn'
             : raw.includes('Locked Living Game Bible')
               ? 'ok'

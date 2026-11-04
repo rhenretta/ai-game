@@ -72,6 +72,15 @@ class WorkerSplitTask(Exception):
         self.reason = reason
 
 
+class WorkerDesignConcern(Exception):
+    """Raised by an executing TaskLead when a task spec would force fake/Potemkin bypasses, self-completing t=0
+    gameplay, or contradictory mechanics—escalating the item directly to Council `needs_decision`."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class BoardValidationError(StudioAgentError):
     """Raised when a proposal or decision violates a board invariant (the proposing specialist is told why)."""
     deliberation: str = "Board invariant violated; the proposal was rejected and nothing changed."
@@ -180,10 +189,12 @@ class ProductionBoard:
         path: Optional[Path] = None,
         default_max_revisions: int = DEFAULT_MAX_REVISIONS,
         event_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        read_only: bool = False,
     ) -> None:
         self.path = Path(path) if path is not None else None
         self.default_max_revisions = max(1, int(default_max_revisions))
         self.event_callback = event_callback
+        self.read_only = bool(read_only)
         self._lock = threading.RLock()
         self._items: Dict[str, WorkItem] = {}
         self._design_revision = 0
@@ -216,6 +227,13 @@ class ProductionBoard:
     def _load(self) -> None:
         data = json.loads(self.path.read_text(encoding="utf-8"))
         self._design_revision = int(data.get("design_revision", 0))
+        if self.read_only:
+            cart_dir = self.path.parent if self.path is not None else None
+            for raw in data.get("items", []):
+                item = WorkItem.model_validate(raw)
+                item.attempt_count = compute_work_item_attempt_count(cart_dir, item)
+                self._items[item.item_id] = item
+            return
         dirty = False
         for raw in data.get("items", []):
             item = WorkItem.model_validate(raw)
@@ -240,6 +258,8 @@ class ProductionBoard:
             self._persist()
 
     def _persist(self) -> None:
+        if self.read_only:
+            raise BoardValidationError("Cannot mutate or persist a read_only ProductionBoard.")
         self._sync_attempt_counts_locked()
         if self.path is None:
             return
@@ -909,7 +929,11 @@ class ProductionBoard:
                         f"Cannot refine unknown item '{r.item_id}'. Valid unstarted item_ids on board: {refinable_ids}"
                     )
                     continue
-                if r.action == "no_input":
+                if r.action in ("no_input", "cancel"):
+                    if r.action == "cancel" and r.item_id in self._items and self._items[r.item_id].state == "approved":
+                        issues.append(
+                            f"Item '{r.item_id}' is already approved and cannot be cancelled via refinement."
+                        )
                     continue
                 if r.action == "split":
                     if r.item_id in self._items and self._has_execution_history_locked(self._items[r.item_id]):
@@ -974,12 +998,28 @@ class ProductionBoard:
             touched: List[WorkItem] = []
             role_tag = by_role or "Council"
             role_prefix = f"[{role_tag} Direction]:"
-            ordered_refinements = [r for r in active_refs if r.action != "split"] + [
-                r for r in active_refs if r.action == "split"
-            ]
+            ordered_refinements = (
+                [r for r in active_refs if r.action == "cancel"]
+                + [r for r in active_refs if r.action not in ("split", "cancel")]
+                + [r for r in active_refs if r.action == "split"]
+            )
+            cancelled_by_refinement_ids: Set[str] = set()
             for r in ordered_refinements:
                 item = self._require(r.item_id)
-                if r.action == "enrich":
+                if r.action == "cancel":
+                    if item.state not in TERMINAL_STATES:
+                        item.state = "cancelled"
+                        item.decision_reason = (
+                            f"cancelled by {role_tag}: {r.deliberation.strip()}"
+                            if r.deliberation.strip()
+                            else f"cancelled by {role_tag}"
+                        )
+                        self._yielded_on_code_lock.discard(item.item_id)
+                        if self._active_resumed_code_lock_item == item.item_id:
+                            self._active_resumed_code_lock_item = None
+                        cancelled_by_refinement_ids.add(item.item_id)
+                        touched.append(item)
+                elif r.action == "enrich":
                     targets = [item]
                     if item.state == "cancelled":
                         targets = [
@@ -1060,11 +1100,27 @@ class ProductionBoard:
                     if self._active_resumed_code_lock_item == item.item_id:
                         self._active_resumed_code_lock_item = None
 
+            if cancelled_by_refinement_ids:
+                all_cancelled = {
+                    k for k, v in self._items.items() if v.state == "cancelled"
+                } | cancelled_by_refinement_ids
+                for other in self._items.values():
+                    if other.state in TERMINAL_STATES or not other.depends_on:
+                        continue
+                    other.depends_on = [d for d in other.depends_on if d not in all_cancelled]
+
             self._refresh()
             self._persist()
             for r in active_refs:
                 orig = self._items[r.item_id]
-                if r.action == "enrich":
+                if r.action == "cancel":
+                    self._emit(
+                        "backlog_item_cancelled",
+                        orig,
+                        by_role=role_tag,
+                        reason=orig.decision_reason,
+                    )
+                elif r.action == "enrich":
                     self._emit(
                         "backlog_item_shaped",
                         orig,
@@ -1101,6 +1157,160 @@ class ProductionBoard:
             self._refresh()
             self._persist()
             self._emit("backlog_item_cancelled", item, reason=reason)
+            return item.model_copy(deep=True)
+
+    def cancel_items_for_pivot(self, item_ids: List[str], reason: str = "") -> List[WorkItem]:
+        """Atomically cancels obsolete non-approved items during a Tier 2 Structural Pivot, retires any
+        in-flight yielded lead traces, and strips cancelled IDs from surviving items' `depends_on` lists."""
+        effective_reason = (reason or "Cancelled during structural pivot").strip()
+        with self._lock:
+            cancelled_items: List[WorkItem] = []
+            cancelled_id_set: Set[str] = set()
+            norm_tokens: List[str] = []
+            for raw_id in item_ids or []:
+                tok = str(raw_id or "").strip().replace("\\", "/")
+                if tok.startswith("res://"):
+                    tok = tok[len("res://"):]
+                if tok.startswith("./"):
+                    tok = tok[2:]
+                if tok:
+                    norm_tokens.append(tok)
+
+            matched_ids: List[str] = []
+            for tok in norm_tokens:
+                if tok == "*":
+                    for cand_id, cand_item in self._items.items():
+                        if cand_item.state not in TERMINAL_STATES and cand_id not in matched_ids:
+                            matched_ids.append(cand_id)
+                elif tok in self._items:
+                    if tok not in matched_ids:
+                        matched_ids.append(tok)
+                else:
+                    for cand_id, cand_item in self._items.items():
+                        if cand_item.state in TERMINAL_STATES or cand_id in matched_ids:
+                            continue
+                        cand_mods = [
+                            str(m or "").strip().replace("\\", "/").removeprefix("res://").removeprefix("./")
+                            for m in (cand_item.target_modules or [])
+                        ]
+                        if tok in cand_mods:
+                            matched_ids.append(cand_id)
+
+            for iid in matched_ids:
+                item = self._items[iid]
+                if item.state in TERMINAL_STATES:
+                    continue
+                item.state = "cancelled"
+                item.decision_reason = effective_reason
+                self._yielded_on_code_lock.discard(iid)
+                if self._active_resumed_code_lock_item == iid:
+                    self._active_resumed_code_lock_item = None
+                if self.path is not None:
+                    safe_id = (
+                        "".join(ch if (ch.isalnum() or ch in ("_", "-")) else "_" for ch in iid).strip("_")
+                        or "item"
+                    )
+                    trace_path = (
+                        self.path.parent
+                        / "artifacts"
+                        / "work_items"
+                        / safe_id
+                        / f"lead_trace_rev{len(item.revisions)}.json"
+                    )
+                    if trace_path.is_file():
+                        try:
+                            tr_data = json.loads(trace_path.read_text(encoding="utf-8"))
+                            if isinstance(tr_data, dict):
+                                tr_data["status"] = "cancelled_by_pivot"
+                                tr_data["cancelled_reason"] = effective_reason
+                                trace_path.write_text(json.dumps(tr_data, indent=2), encoding="utf-8")
+                        except Exception:
+                            pass
+                cancelled_items.append(item)
+                cancelled_id_set.add(iid)
+
+            if not cancelled_items:
+                return []
+
+            # Also include any previously cancelled items when pruning surviving dependency edges
+            all_cancelled_ids = {
+                k for k, v in self._items.items() if v.state == "cancelled"
+            } | cancelled_id_set
+            for other in self._items.values():
+                if other.state in TERMINAL_STATES or not other.depends_on:
+                    continue
+                removed_deps = [d for d in other.depends_on if d in all_cancelled_ids]
+                if removed_deps:
+                    other.depends_on = [d for d in other.depends_on if d not in all_cancelled_ids]
+                    note = (
+                        f"[Structural Pivot Dependency Update]: Obsolete prerequisite item(s) "
+                        f"{removed_deps} were cancelled ({effective_reason}); implement cleanly without them."
+                    )
+                    if note not in other.spec:
+                        other.spec = f"{other.spec.rstrip()}\n\n{note}"
+
+            self._design_revision += 1
+            self._refresh()
+            self._persist()
+            if self.path is not None:
+                self.archive_superseded_pivot_tests(item_ids=list(cancelled_id_set), archive_all=False)
+            for item in cancelled_items:
+                self._emit("backlog_item_cancelled", item, reason=effective_reason, structural_pivot=True)
+            return [i.model_copy(deep=True) for i in cancelled_items]
+
+    def archive_superseded_pivot_tests(
+        self,
+        item_ids: Optional[List[str]] = None,
+        *,
+        archive_all: bool = False,
+    ) -> List[str]:
+        """Moves superseded pre-pivot `tests/test_*` harnesses into `artifacts/archived_pre_pivot_tests/`
+        so workers never preserve dead pre-pivot node names or obsolete mechanics just to appease old tests."""
+        import shutil as _shutil
+
+        if self.path is None or self.read_only:
+            return []
+        cart_dir = self.path.parent
+        tests_dir = cart_dir / "tests"
+        if not tests_dir.is_dir():
+            return []
+        arch_dir = cart_dir / "artifacts" / "archived_pre_pivot_tests"
+        safe_prefixes: Set[str] = set()
+        for raw_iid in item_ids or []:
+            sid = "".join(ch if (ch.isalnum() or ch in ("_", "-")) else "_" for ch in str(raw_iid)).strip("_")
+            if sid:
+                safe_prefixes.add(f"test_{sid}")
+        archived: List[str] = []
+        for p in sorted(tests_dir.iterdir()):
+            if not p.is_file() or p.suffix.lower() not in (".gd", ".tscn"):
+                continue
+            stem = p.stem
+            if not (archive_all or stem in safe_prefixes):
+                continue
+            arch_dir.mkdir(parents=True, exist_ok=True)
+            dest = arch_dir / p.name
+            _shutil.move(str(p), str(dest))
+            archived.append(f"tests/{p.name}")
+        return archived
+
+    def escalate_design_concern(self, item_id: str, reason: str) -> WorkItem:
+        """Escalates an active item directly to Council `needs_decision` when TaskLead identifies that
+        implementing the spec as written would force fake/Potemkin props or self-playing mechanics."""
+        clean_reason = " ".join((reason or "Spec undermines player agency or simulation honesty.").split())[:500]
+        full_reason = (
+            clean_reason
+            if clean_reason.startswith("[TaskLead Design Concern]")
+            else f"[TaskLead Design Concern] {clean_reason}"
+        )
+        with self._lock:
+            item = self._require(item_id)
+            self._discard_yielded(item_id)
+            if self._active_resumed_code_lock_item == item_id:
+                self._active_resumed_code_lock_item = None
+            item.state = "needs_decision"
+            item.decision_reason = full_reason
+            self._persist()
+            self._emit("backlog_item_needs_decision", item, reason=full_reason, design_concern=True)
             return item.model_copy(deep=True)
 
     def requeue_failed(self, item_id: str) -> WorkItem:
@@ -1813,6 +2023,9 @@ class BoardScheduler:
             self.board.submit_result(item.item_id, result)
         except WorkerSplitTask as ws:
             logger.info("Worker split item %s into %s", item.item_id, ws.child_item_ids)
+        except WorkerDesignConcern as dc:
+            logger.info("Worker escalated design concern on item %s: %s", item.item_id, dc.reason)
+            self.board.escalate_design_concern(item.item_id, dc.reason)
         except WorkerYielded as wy:
             logger.info("Worker yielded item %s: %s", item.item_id, wy.reason)
             self.board.yield_item(item.item_id, reason=wy.reason)

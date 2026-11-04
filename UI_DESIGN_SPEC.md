@@ -1,9 +1,9 @@
 # Studio Observability UI Design Specification (Requirement R5)
-**Document Version:** 2.1.0  
-**Status:** IMPLEMENTED  
-**Target Milestone:** M_UI → M19  
-**Module Scope:** `studio-web/`, `engine/ui/server.py`, `engine/ui/models.py`  
-**Reference Requirements:** R1, R2, R3, R5  
+- **Document Version:** 2.2.0
+- **Status:** IMPLEMENTED
+- **Target Milestone:** M_UI → M20
+- **Module Scope:** `studio-web/`, `engine/ui/server.py`, `engine/ui/models.py`
+- **Reference Requirements:** R1, R2, R3, R5
 
 ---
 
@@ -477,9 +477,9 @@ Sessions distinguish provenance via `initiated_by` (`"operator"` vs `"council"`)
 ### 12.1 Overview & Multi-Bank Ownership
 The Mission Control **Memory** workspace provides live inspection and Executive Producer lifecycle control over each game's persistent cross-slice memory ledger (`<cartridge_dir>/game_memory.json`, mirrored to `studio_game_memories` in SQLite WAL).
 
-Memories are organized into 17 canonical banks (`CANONICAL_MEMORY_BANKS`):
+Memories are organized into 18 canonical banks (`CANONICAL_MEMORY_BANKS`):
 - **Shared Game Bank**: `council` (game-wide deferred strategic goals, cross-cutting architectural invariants, and studio-wide lessons).
-- **Council Specialist Banks (10)**: `CreativeDirector`, `GameplayDesigner`, `LevelAndProgressionDesigner`, `GameplaySystemsEngineer`, `StoryWorldArchitect`, `ScriptwriterAgent`, `CharacterDesigner`, `VisualArtDirector`, `UXExperienceDesigner`, `AudioAtmosphereDesigner`.
+- **Council Specialist Banks (11)**: `CoProducer` (`Co-Producer (Council Chair)`), legacy-compatible `CreativeDirector`, `GameplayDesigner`, `LevelAndProgressionDesigner`, `GameplaySystemsEngineer`, `StoryWorldArchitect`, `ScriptwriterAgent`, `CharacterDesigner`, `VisualArtDirector`, `UXExperienceDesigner`, `AudioAtmosphereDesigner`.
 - **Production Specialist Banks (6)**: `task_lead`, `swe_engineer`, `qa_test_engineer`, `visual_artist`, `audio_designer`, `script_writer`.
 
 ### 12.2 UI Architecture & Accessibility (`GameMemoryView.tsx`)
@@ -499,7 +499,7 @@ Memories are organized into 17 canonical banks (`CANONICAL_MEMORY_BANKS`):
 ## 13. Modular React Mission Control Shell, Reconnect Reconciliation & Post-Board Phase Observability (`studio-web/`)
 
 ### 13.1 Workspace Shell & Navigation (`App.tsx`, `TopCommandBar.tsx`, `SliceSubbar.tsx`)
-Mission Control (`studio-web/src/`) unifies studio operations across 7 workspace tabs (**Production Board**, **Writers' Room**, **Game Bible**, **Game Memory**, **Assets & Code**, **Playtest Lab**, and **Player DNA**) beneath a global command header (`TopCommandBar.tsx`), per-slice progress subbar (`SliceSubbar.tsx`), and live studio phase strip (`LiveActivityBanner.tsx`).
+Mission Control (`studio-web/src/`) unifies studio operations across 8 workspace tabs (**Co-Producer**, **Production Board**, **Writers' Room**, **Game Bible**, **Game Memory**, **Assets & Code**, **Playtest Lab**, and **Player DNA**) beneath a global command header (`TopCommandBar.tsx`), per-slice progress subbar (`SliceSubbar.tsx`), and live studio phase strip (`LiveActivityBanner.tsx`).
 
 ### 13.2 Immediate WebSocket Reconnect Reconciliation (`useSwarmSocket.ts`)
 - Whenever `/ws/swarm` disconnects (e.g., during a Uvicorn `--reload` restart or daemon stop) and subsequently reconnects, `useSwarmSocket.ts` fires `onReconnect` to immediately invalidate and refetch `['status']`, `['studio-status']`, `['production-board']`, and `['writers-room']` without waiting for background polling intervals—ensuring the header immediately transitions from `Building` to `Stopped` and surfaces the **`Resume`** action button without requiring a manual browser refresh.
@@ -512,8 +512,31 @@ Mission Control (`studio-web/src/`) unifies studio operations across 7 workspace
 - **Strict `Working` vs `Queued` Lifecycle & Decomposed `Split` Badges**: `isWorkingBoardItem` (`boardCards.ts`) groups only tasks that have been picked up and are not yet approved (`in_progress`, `waiting_for_lock`, `awaiting_review`, `changes_requested`, `failed`, `needs_decision`, and Council-reviewed `blocked` tasks waiting on newly spawned prerequisites), while `getStateBadge` (`WorkItemCard.tsx`, `TaskChronologyDrawer.tsx`) distinguishes Stage 1 Council-decomposed parent tasks (`decision_reason` indicating split) from cancelled items. Unstarted `ready` items—even if they hold interrupted prior-attempt counters before Council submission—remain strictly under **`Queued`** (`ready`), and `ProductionBoard.requeue_failed` preserves `changes_requested` whenever Council revision feedback already exists.
 - **Scoped Live Step Counts & Cache-Busted Mid-Flight Proof Showcases**: `deriveLiveStudioActivity` (`liveActivity.ts`) filters live step entries strictly to active working board item IDs, while `WorkItemCard.tsx` fetches live chronology across `in_progress`, `waiting_for_lock`, and `changes_requested` and resolves card previews via `resolveCardProofShowcase`—skipping deleted/unlinked QA retry filmstrips and appending `&v=` cache-busting tokens so newly captured revision proofs render immediately.
 
+---
 
+## 14. Session-First Creative Co-Producer Workspace, Curated Observability & Council Chairership (`studio-web/src/features/coproducer/`, `engine/studio/coproducer.py`, `engine/ui/server.py`)
 
+### 14.1 Session-First Architecture (`coproducerSessions.ts`, `CoProducerView.tsx`, `TopCommandBar.tsx`)
+1. **Games & Drafts as Unified Co-Producer Sessions**:
+   - Replaces legacy modal-based new-game creation (`NewGameModal.tsx` removed) with a session-first **Co-Producer** workspace (`activeWorkspace === 'coproducer'` by default).
+   - `buildUnifiedCoProducerSessions` (`coproducerSessions.ts`) merges ungraduated pre-genesis draft threads (`scope_kind="draft"`, stored under `cartridges/_coproducer_drafts/draft_*` and `studio_coproducer_threads`) with existing game cartridges (`scope_kind="cartridge"`, resolving or lazy-creating per-cartridge threads) in a collapsible **Game Sessions** left rail.
+   - Clicking **`+ New Game`** in `TopCommandBar.tsx` or the session rail immediately creates a fresh Co-Producer draft session and focuses the conversation composer with zero modal interruption; commissioning a draft seamlessly graduates (`graduated_to_cartridge_id`) and switches the active session to the newly created cartridge.
+2. **Viewport-Bounded Conversation Feed & Pinned Bottom Anchor**:
+   - `.coproducer-layout` fills the bounded viewport height beneath the shell header without growing the document page scroll, keeping `.coproducer-feed` as the dedicated scroll container (`overflow-y: auto; min-height: 0`).
+   - Selecting any session or sending a message pins directly to the current place at the bottom of the conversation (`pinnedToBottomRef`), surfacing a floating **`Jump to latest ↓`** pill only when the user intentionally scrolls upward to inspect older history.
+3. **Synchronous `t=0ms` Optimistic Message Submission**:
+   - Submitting a message clears the composer `<textarea>` synchronously at `t=0ms` and appends an optimistic Executive Producer bubble into the conversation history immediately (`pendingSubmission`) before awaiting `POST /api/coproducer/threads/{thread_id}/messages`, restoring the draft text into the composer if a network/API error occurs so zero user input is ever lost.
 
+### 14.2 Curated Presentation vs. Deep Observability (`CoProducerCards.tsx`, `CoProducerTurnDecision`)
+1. **Curated Default Replies (`presented_card_ids` / `show_by_default`)**:
+   - By default, each Co-Producer reply renders only the conversational markdown response, any confirmation-gated `CoProducerActionProposal` cards (`commission_game`, `pivot_course_correction`, `pivot_structural`, `pivot_fork_cartridge`), and media/consultation cards explicitly selected by `CoProducerTurnDecision.presented_card_ids` (`show_by_default = true`).
+2. **Expandable Behind-the-Scenes Drill-Down (`.coproducer-bts-disclosure`)**:
+   - Full epistemic `deliberation`, executed `tool_trace` steps (`curate_genre_fun_foundation`, `consult_council`, `dispatch_specialist_probe`, `sketch_multimodal_concept`, `query_game_memory`, `inspect_game_state`), unpresented background research/consultation cards, token telemetry, and raw `prompt_trace` payloads remain 100% inspectable inside collapsible native `<details>` disclosures (`Behind the scenes`)—preserving complete Rule 4 observability without overwhelming the conversation stream.
+   - An optional **`Brief`** header toggle opens a collapsible right-hand Concept Brief & Studio State drawer (`genre_craft_foundation` summary, working title, fantasy, loop, pillars, open questions, and non-goals).
 
+### 14.3 `GenreCraftFoundation` Game Bible Showcase & `CoProducer` Council Chair Parity (`GameBibleView.tsx`, `WritersRoomView.tsx`, `roles.ts`)
+1. **Game Bible `GenreCraftFoundation` Section (`GameBibleView.tsx`)**:
+   - Renders the Living Game Bible's foundational craft dossier (`Core Fun Thesis`, 3–5 evolvable `GenrePillarSpec` cards detailing `player_promise`, `what_makes_it_fun`, `minimum_slice_0_expression`, and `failure_mode_if_missing`, `Bootstrap-to-Mastery Arc`, `Spatial & UX Precision Contracts`, and `Genre Anti-Patterns to Never Commit`) alongside `CoreLoopSpec.agency_and_decision_loop` and `earned_vs_given_progression`.
+2. **`CoProducer` Active Council Chair Visual Identity (`roles.ts`, `WritersRoomView.tsx`, `GameMemoryView.tsx`)**:
+   - Maps `CoProducer` (`"Co-Producer (Council Chair)"`) in gold (`#ffd166`) with a dedicated **`Council Chair`** badge in `WritersRoomView.tsx` and dedicated specialist memory bank filtering in `GameMemoryView.tsx`, while maintaining full backward compatibility for historical `CreativeDirector` records.
 

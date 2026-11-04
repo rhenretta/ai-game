@@ -25,6 +25,7 @@ export interface GameMemoryViewProps {
 }
 
 const COUNCIL_SPECIALIST_BANKS = [
+  'CoProducer',
   'CreativeDirector',
   'GameplayDesigner',
   'LevelAndProgressionDesigner',

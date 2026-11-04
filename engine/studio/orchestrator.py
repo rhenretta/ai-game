@@ -1016,7 +1016,7 @@ class StudioOrchestrator:
                 if use_writers_room and self._continuous_production_enabled() and (staging_dir / "backlog.json").is_file():
                     try:
                         from engine.studio.production_board import ProductionBoard
-                        pb_check = ProductionBoard(staging_dir / "backlog.json")
+                        pb_check = ProductionBoard(staging_dir / "backlog.json", read_only=True)
                         has_assembly_proof = any(
                             (staging_dir / "artifacts" / "proofs").glob("filmstrip_slice_assembly_check_pass*.png")
                         ) if (staging_dir / "artifacts" / "proofs").is_dir() else False
@@ -1066,6 +1066,7 @@ class StudioOrchestrator:
                         )
                         if (
                             not pb_check.is_drained()
+                            or (staging_dir / ".pending_structural_pivot.json").is_file()
                             or (staging_dir / ".pending_steering.json").is_file()
                             or (staging_dir / ".pending_playtest_wishes.json").is_file()
                             or (staging_dir / ".pending_council_playtest_reports.json").is_file()
@@ -1225,6 +1226,35 @@ class StudioOrchestrator:
                                     StudioBuildState.AWAITING_GREENLIGHT,
                                     f"Living Game Bible for '{game_bible.game_title}' awaiting Executive Producer greenlight.",
                                 )
+                            try:
+                                from engine.studio.coproducer import record_milestone_notice
+
+                                record_milestone_notice(
+                                    cartridges_root=staging_dir.parent,
+                                    cartridge_id=staging_dir.name,
+                                    db=self.db,
+                                    deliberation=(
+                                        f"Writers' Room locked the Living Game Bible for '{game_bible.game_title}' "
+                                        "and paused for Executive Producer greenlight."
+                                    ),
+                                    content_markdown=(
+                                        f"### Living Game Bible Ready for Greenlight: **{game_bible.game_title}**\n\n"
+                                        f"{game_bible.elevator_pitch}\n\n"
+                                        "Ask me to walk through the slices, mockups, or specialist trade-offs—or greenlight below to begin synthesis."
+                                    ),
+                                    action_proposals=[
+                                        {
+                                            "deliberation": "Allow 1-click greenlight approval directly from the Co-Producer stream.",
+                                            "proposal_id": f"greenlight_{staging_dir.name}",
+                                            "action_kind": "greenlight_bible",
+                                            "title": f"Greenlight '{game_bible.game_title}' & Start Build",
+                                            "summary": "Approves the Living Game Bible and launches parallel ProductionBoard synthesis.",
+                                            "status": "pending",
+                                        }
+                                    ],
+                                )
+                            except Exception as cp_exc:
+                                logger.debug("Co-Producer greenlight milestone notice skipped: %s", cp_exc)
                             self._greenlight_event.clear()
                             while not self._greenlight_event.is_set() and not getattr(self, "_abort_requested", False):
                                 await asyncio.sleep(0.05)
@@ -2767,6 +2797,8 @@ class StudioOrchestrator:
                     raise RuntimeError(f"Godot headless smoke check failed in {scene_label}: {err_detail}")
                 if scene_uri is None:
                     main_scene_audit = getattr(sim, "scene_audit", None) or {}
+                    if swe_agent is not None:
+                        swe_agent.last_scene_audit = dict(main_scene_audit)
 
             self._check_godot_gameplay_and_asset_gates(staging_dir, track, main_scene_audit)
             return

@@ -227,19 +227,29 @@ export function WritersRoomView({
             const primaryBadges = formatted.badges.slice(0, 5);
             const extraBadges = formatted.badges.slice(5);
             const isQueryActive = Boolean(query.trim());
+            const isCouncilChair = u.speaker_role === 'CoProducer';
 
             return (
               <article
                 key={u.utterance_id || `${u.turn_index ?? idx}-${idx}`}
                 className={idx >= 12 ? 'deferred-turn-row' : undefined}
+                data-council-chair={isCouncilChair ? 'true' : undefined}
                 style={{
                   padding: '12px 15px',
                   borderRadius: 'var(--radius-md)',
                   background:
                     meta.pod === 'producer'
                       ? 'color-mix(in srgb, var(--warn) 8%, var(--bg-surface))'
-                      : 'var(--bg-surface)',
-                  border: `1px solid ${meta.pod === 'producer' ? 'color-mix(in srgb, var(--warn) 45%, var(--border-subtle))' : 'var(--border-subtle)'}`,
+                      : isCouncilChair
+                        ? 'color-mix(in srgb, var(--accent) 6%, var(--bg-surface))'
+                        : 'var(--bg-surface)',
+                  border: `1px solid ${
+                    meta.pod === 'producer'
+                      ? 'color-mix(in srgb, var(--warn) 45%, var(--border-subtle))'
+                      : isCouncilChair
+                        ? 'color-mix(in srgb, var(--accent) 42%, var(--border-subtle))'
+                        : 'var(--border-subtle)'
+                  }`,
                   display: 'grid',
                   gridTemplateColumns: 'minmax(0, 1fr)',
                   gap: '8px',
@@ -252,6 +262,9 @@ export function WritersRoomView({
                     <span style={{ fontWeight: 700, fontSize: '0.8rem', color: meta.accentVar }}>
                       {meta.label}
                     </span>
+                    {isCouncilChair ? (
+                      <span className="badge badge-accent">Council Chair</span>
+                    ) : null}
                     <span className="badge">{meta.pod}</span>
                     {formatted.turnKindLabel ? (
                       <span

@@ -806,7 +806,7 @@ class PlaytestSessionManager:
         game_title: str,
         store_description: str,
         max_turns: int = 60,
-        reaction_ticks: int = 15,
+        reaction_ticks: int = 6,
         compaction_interval_turns: int = 75,
         enable_audio_perception: bool = True,
         abort_check: Optional[Callable[[], bool]] = None,
@@ -2468,7 +2468,7 @@ class PlaytestSessionManager:
                 # Execute motor action burst inside Godot
                 next_obs = bridge.step_action(decision.motor_action)
                 latest_frame_path = str(next_obs.preview_path)
-                last_obs_screenshot_path = next_obs.screenshot_path
+                last_obs_screenshot_path = next_obs.diagnostic_screenshot_path or next_obs.screenshot_path
                 last_obs_wav_path = (
                     next_obs.wav_path if (next_obs.wav_path and not next_obs.audio_is_silent) else None
                 )

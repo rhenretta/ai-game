@@ -9,6 +9,13 @@ export interface RoleMetadata {
 }
 
 const CANONICAL_ROLES: Record<string, RoleMetadata> = {
+  CoProducer: {
+    role: 'CoProducer',
+    label: 'Co-Producer (Council Chair)',
+    shortLabel: 'Co-Producer',
+    pod: 'core',
+    accentVar: 'var(--accent)',
+  },
   CreativeDirector: {
     role: 'CreativeDirector',
     label: 'Creative Director',

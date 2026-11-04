@@ -112,13 +112,17 @@ export function GameBibleView({ bible, cartridgeId, onOpenLightbox }: GameBibleV
   if (!bible || !bible.has_bible) {
     return (
       <div style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>
-        No Living Game Bible synthesized yet. Click <strong>New Game</strong> to convene the Specialist Council.
+        No Living Game Bible synthesized yet. Click <strong>New Game</strong> to shape a concept in Co-Producer or launch an autonomous Council build.
       </div>
     );
   }
 
   const mockups = bible.visual_mockups ?? [];
   const palette = bible.color_palette_hex ?? mockups[0]?.color_palette_hex ?? [];
+  const genreFoundation = bible.genre_craft_foundation ?? null;
+  const foundationalPillars = genreFoundation?.foundational_pillars ?? [];
+  const uxContracts = genreFoundation?.essential_spatial_and_ux_contracts ?? [];
+  const antiPatterns = genreFoundation?.genre_killing_anti_patterns ?? [];
   const pillars = bible.gameplay_pillars ?? [];
   const characters = bible.narrative_bible?.characters ?? [];
   const barks = bible.narrative_bible?.dialogue_barks ?? [];
@@ -127,6 +131,7 @@ export function GameBibleView({ bible, cartridgeId, onOpenLightbox }: GameBibleV
 
   const sections = [
     { id: 'bible-vision', label: 'Vision & Hook' },
+    ...(genreFoundation ? [{ id: 'bible-genre-foundation', label: `Genre & Fun (${foundationalPillars.length})` }] : []),
     { id: 'bible-mockups', label: `Concept Mockups (${mockups.length})` },
     { id: 'bible-loop', label: 'Core Loop & Pillars' },
     { id: 'bible-onboarding', label: 'Onboarding & Goals' },
@@ -209,6 +214,133 @@ export function GameBibleView({ bible, cartridgeId, onOpenLightbox }: GameBibleV
               ) : null}
             </div>
           </section>
+
+          {/* 1b. Genre Craft & Fun Foundation (Curated Genesis & Evolved Pillars) */}
+          {genreFoundation ? (
+            <section
+              id="bible-genre-foundation"
+              style={{
+                display: 'grid',
+                gap: '12px',
+                padding: '14px',
+                borderRadius: 'var(--radius-md)',
+                background: 'var(--bg-surface)',
+                border: '1px solid var(--border-subtle)',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap' }}>
+                <h2 style={{ margin: 0, fontSize: '1.16rem', fontWeight: 700 }}>
+                  Genre Craft &amp; Fun Foundation
+                </h2>
+                <span className="badge badge-ok">
+                  {genreFoundation.genre_and_subgenre_archetype}
+                </span>
+              </div>
+
+              <DeliberationDisclosure
+                deliberation={genreFoundation.deliberation}
+                label="Genre Psychology & First-Principles Fun Rationale"
+              />
+
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '10px' }}>
+                <div style={{ padding: '10px 12px', borderRadius: 'var(--radius-sm)', background: 'var(--bg-canvas)', border: '1px solid var(--border-subtle)' }}>
+                  <div style={{ fontSize: '0.78rem', fontWeight: 700, textTransform: 'uppercase', color: 'var(--ok)', marginBlockEnd: '4px' }}>
+                    Core Fun Thesis
+                  </div>
+                  <p style={{ margin: 0, fontSize: '0.9rem', lineHeight: 1.55, color: 'var(--text-primary)' }}>
+                    {genreFoundation.core_fun_thesis}
+                  </p>
+                </div>
+
+                <div style={{ padding: '10px 12px', borderRadius: 'var(--radius-sm)', background: 'var(--bg-canvas)', border: '1px solid var(--border-subtle)' }}>
+                  <div style={{ fontSize: '0.78rem', fontWeight: 700, textTransform: 'uppercase', color: 'var(--accent)', marginBlockEnd: '4px' }}>
+                    Bootstrap-to-Mastery Arc (t=0 Unsolved &rarr; Earned)
+                  </div>
+                  <p style={{ margin: 0, fontSize: '0.9rem', lineHeight: 1.55, color: 'var(--text-secondary)' }}>
+                    {genreFoundation.bootstrap_to_mastery_arc}
+                  </p>
+                </div>
+              </div>
+
+              {foundationalPillars.length > 0 ? (
+                <div style={{ display: 'grid', gap: '8px' }}>
+                  <h3 style={{ margin: 0, fontSize: '0.98rem', fontWeight: 700 }}>
+                    Evolvable Genre-Craft Pillars ({foundationalPillars.length})
+                  </h3>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '10px' }}>
+                    {foundationalPillars.map((pillar) => (
+                      <article
+                        key={pillar.pillar_id || pillar.title}
+                        style={{
+                          padding: '10px 12px',
+                          borderRadius: 'var(--radius-sm)',
+                          background: 'var(--bg-canvas)',
+                          border: '1px solid var(--border-subtle)',
+                          display: 'grid',
+                          gap: '6px',
+                        }}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '6px', flexWrap: 'wrap' }}>
+                          <strong style={{ fontSize: '0.92rem', color: 'var(--text-primary)' }}>{pillar.title}</strong>
+                          <code style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>{pillar.pillar_id}</code>
+                        </div>
+                        <div style={{ fontSize: '0.86rem', color: 'var(--text-primary)' }}>
+                          <strong>Why It&apos;s Fun: </strong>
+                          {pillar.why_it_creates_fun}
+                        </div>
+                        <div style={{ fontSize: '0.84rem', color: 'var(--text-secondary)' }}>
+                          <strong>Systemic Expression: </strong>
+                          {pillar.systemic_mechanics_expression}
+                        </div>
+                        <div style={{ fontSize: '0.82rem', color: 'var(--warn)' }}>
+                          <strong>Avoid Anti-Pattern: </strong>
+                          {pillar.anti_pattern_to_avoid}
+                        </div>
+                        <DeliberationDisclosure
+                          deliberation={pillar.deliberation}
+                          label="Pillar Rationale"
+                        />
+                      </article>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              {uxContracts.length > 0 || antiPatterns.length > 0 ? (
+                <details style={{ padding: '8px 10px', borderRadius: 'var(--radius-sm)', background: 'var(--bg-canvas)', border: '1px solid var(--border-subtle)' }}>
+                  <summary style={{ cursor: 'pointer', fontSize: '0.86rem', fontWeight: 600, color: 'var(--text-primary)' }}>
+                    Spatial / UX Precision Contracts ({uxContracts.length}) &amp; Genre-Killing Anti-Patterns ({antiPatterns.length})
+                  </summary>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '12px', marginBlockStart: '10px' }}>
+                    {uxContracts.length > 0 ? (
+                      <div>
+                        <div style={{ fontSize: '0.78rem', fontWeight: 700, textTransform: 'uppercase', color: 'var(--accent)', marginBlockEnd: '6px' }}>
+                          Essential Spatial &amp; UX Contracts
+                        </div>
+                        <ul style={{ margin: 0, paddingInlineStart: '18px', fontSize: '0.85rem', color: 'var(--text-secondary)', display: 'grid', gap: '4px' }}>
+                          {uxContracts.map((item, idx) => (
+                            <li key={idx}>{item}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+                    {antiPatterns.length > 0 ? (
+                      <div>
+                        <div style={{ fontSize: '0.78rem', fontWeight: 700, textTransform: 'uppercase', color: 'var(--warn)', marginBlockEnd: '6px' }}>
+                          Genre-Killing Anti-Patterns (Forbidden)
+                        </div>
+                        <ul style={{ margin: 0, paddingInlineStart: '18px', fontSize: '0.85rem', color: 'var(--text-secondary)', display: 'grid', gap: '4px' }}>
+                          {antiPatterns.map((item, idx) => (
+                            <li key={idx}>{item}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+                  </div>
+                </details>
+              ) : null}
+            </section>
+          ) : null}
 
           {/* 2. 16:9 Concept Mockups */}
           {mockups.length > 0 ? (

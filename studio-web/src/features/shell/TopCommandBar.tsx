@@ -13,6 +13,7 @@ import {
   Plus,
   Radio,
   Rocket,
+  Sparkles,
   Star,
 } from 'lucide-react';
 import type {
@@ -54,9 +55,12 @@ export interface TopCommandBarProps {
   uiScalePct?: number;
   onChangeUiScalePct?: (nextPct: number) => void;
   onOpenNextSliceModal: () => void;
-  onOpenNewGameModal: () => void;
+  onStartNewGame: () => void;
+  startingNewGame?: boolean;
   onOpenCheckpointsModal: () => void;
   onOpenLivePulseModal: () => void;
+  isDraftSession?: boolean;
+  activeSessionTitle?: string;
 }
 
 export const UI_SCALE_MIN_PCT = 90;
@@ -67,7 +71,6 @@ export function TopCommandBar({
   games,
   selectedCartridgeId,
   activeCartridgeId,
-  onSelectCartridge,
   activeWorkspace,
   onSelectWorkspace,
   bible,
@@ -93,9 +96,12 @@ export function TopCommandBar({
   uiScalePct = 100,
   onChangeUiScalePct,
   onOpenNextSliceModal,
-  onOpenNewGameModal,
+  onStartNewGame,
+  startingNewGame = false,
   onOpenCheckpointsModal,
   onOpenLivePulseModal,
+  isDraftSession = false,
+  activeSessionTitle,
 }: TopCommandBarProps) {
   const proc = bible?.process_status;
   const isRunning = Boolean(proc?.build_actively_running || proc?.process_state === 'running');
@@ -115,11 +121,41 @@ export function TopCommandBar({
         !isErrorState &&
         !sliceVerification.hasUnfinishedExplicitSlice;
 
-  const effectiveCartridge = selectedCartridgeId || bible?.active_candidate_id || activeCartridgeId || 'active';
+  const effectiveCartridge =
+    selectedCartridgeId || bible?.active_candidate_id || activeCartridgeId || 'active';
+  const hasLaunchableCartridge =
+    !isDraftSession &&
+    (games.length > 0 ||
+      Boolean(bible?.has_bible) ||
+      (Boolean(selectedCartridgeId) && selectedCartridgeId !== 'active'));
   const canSetActive =
-    Boolean(effectiveCartridge) && effectiveCartridge !== 'active' && effectiveCartridge !== activeCartridgeId;
+    !isDraftSession &&
+    Boolean(effectiveCartridge) &&
+    effectiveCartridge !== 'active' &&
+    effectiveCartridge !== activeCartridgeId;
 
-  const tabs: Array<{ id: WorkspaceId; label: string; icon: typeof Kanban; badge?: string | number; warnBadge?: number }> = [
+  const selectedGame = games.find((g) => g.cartridge_id === selectedCartridgeId);
+  const sessionDisplayTitle = isDraftSession
+    ? activeSessionTitle || 'New Game Concept'
+    : activeSessionTitle ||
+      selectedGame?.game_title ||
+      bible?.game_title ||
+      (selectedCartridgeId && selectedCartridgeId !== 'active' ? selectedCartridgeId : '');
+
+  const allTabs: Array<{
+    id: WorkspaceId;
+    label: string;
+    icon: typeof Kanban;
+    badge?: string | number;
+    warnBadge?: number;
+    availableInDraft?: boolean;
+  }> = [
+    {
+      id: 'coproducer',
+      label: 'Co-Producer',
+      icon: Sparkles,
+      availableInDraft: true,
+    },
     {
       id: 'board',
       label: 'Board',
@@ -159,8 +195,13 @@ export function TopCommandBar({
       id: 'dna',
       label: 'Player DNA',
       icon: Dna,
+      availableInDraft: true,
     },
   ];
+
+  const visibleTabs = isDraftSession
+    ? allTabs.filter((t) => t.availableInDraft)
+    : allTabs;
 
   return (
     <header className="top-command-bar">
@@ -168,25 +209,55 @@ export function TopCommandBar({
         <Cpu size={16} style={{ color: 'var(--accent)', flexShrink: 0 }} />
         <span className="brand-title">Studio</span>
 
-        <select
-          aria-label="Select Game Cartridge"
-          className="select-control"
-          style={{ maxInlineSize: '260px', fontWeight: 600 }}
-          value={selectedCartridgeId}
-          onChange={(e) => onSelectCartridge(e.target.value)}
-        >
-          {games.length === 0 ? (
-            <option value="active">{bible?.game_title || 'Active Cartridge'}</option>
-          ) : null}
-          {games.map((g) => (
-            <option key={g.cartridge_id} value={g.cartridge_id}>
-              {g.isPromotedActive ? '★ ' : ''}
-              {g.game_title}
-              {g.total_items > 0 ? ` [${g.approved_items}/${g.total_items}]` : ''}
-              {g.hasDuplicateTitle ? ` (${g.shortId})` : ''}
-            </option>
-          ))}
-        </select>
+        {isDraftSession ? (
+          <span
+            className="badge badge-purple"
+            style={{ textTransform: 'none', fontSize: '0.82rem', paddingInline: '8px' }}
+            title="New game session in Co-Producer"
+          >
+            <Sparkles size={11} />
+            {sessionDisplayTitle}
+          </span>
+        ) : sessionDisplayTitle ? (
+          activeWorkspace !== 'coproducer' ? (
+            <button
+              type="button"
+              className="btn"
+              onClick={() => onSelectWorkspace('coproducer')}
+              title="Return to Co-Producer to chat or switch game sessions"
+              style={{ maxInlineSize: '260px' }}
+            >
+              <Sparkles size={13} style={{ color: 'var(--accent)', flexShrink: 0 }} />
+              <span
+                style={{
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {selectedGame?.isPromotedActive ? '★ ' : ''}
+                {sessionDisplayTitle}
+              </span>
+            </button>
+          ) : (
+            <span
+              className="badge badge-accent"
+              style={{
+                textTransform: 'none',
+                fontSize: '0.82rem',
+                paddingInline: '8px',
+                maxInlineSize: '260px',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}
+              title="Active Co-Producer game session"
+            >
+              {selectedGame?.isPromotedActive ? '★ ' : ''}
+              {sessionDisplayTitle}
+            </span>
+          )
+        ) : null}
 
         {canSetActive ? (
           <button
@@ -194,27 +265,29 @@ export function TopCommandBar({
             className="btn"
             onClick={onActivateGame}
             disabled={activatingGame}
-            title="Promote selected cartridge to cartridges/active"
+            title="Promote selected game session to cartridges/active"
           >
             <Star size={13} />
             {activatingGame ? 'Setting...' : 'Set Active'}
           </button>
         ) : null}
 
-        <button
-          type="button"
-          className="btn btn-success"
-          onClick={onLaunchGame}
-          disabled={launchingGame}
-          title="Launch selected cartridge in a native Godot 4.3 window"
-        >
-          <Gamepad2 size={14} />
-          {launchingGame ? 'Launching...' : launchStatusText || 'Launch'}
-        </button>
+        {hasLaunchableCartridge ? (
+          <button
+            type="button"
+            className="btn btn-success"
+            onClick={onLaunchGame}
+            disabled={launchingGame}
+            title="Launch selected game session in a native Godot 4.3 window"
+          >
+            <Gamepad2 size={14} />
+            {launchingGame ? 'Launching...' : launchStatusText || 'Launch'}
+          </button>
+        ) : null}
       </div>
 
       <nav className="workspace-tabs" role="tablist" aria-label="Studio Workspaces">
-        {tabs.map((tab) => {
+        {visibleTabs.map((tab) => {
           const Icon = tab.icon;
           const selected = activeWorkspace === tab.id;
           return (
@@ -293,88 +366,100 @@ export function TopCommandBar({
           {recentEventCount > 0 ? <span className="tab-count">{recentEventCount}</span> : null}
         </button>
 
-        <button
-          type="button"
-          className="btn"
-          onClick={onOpenCheckpointsModal}
-          title="Browse and activate verified slice checkpoints"
-        >
-          <History size={13} />
-          <span>Checkpoints</span>
-        </button>
-
-        {isAwaitingGreenlight ? (
-          <button type="button" className="btn btn-success" onClick={onApproveGreenlight}>
-            <Play size={13} /> Greenlight Bible
+        {!isDraftSession ? (
+          <button
+            type="button"
+            className="btn"
+            onClick={onOpenCheckpointsModal}
+            title="Browse and activate verified slice checkpoints"
+          >
+            <History size={13} />
+            <span>Checkpoints</span>
           </button>
-        ) : isRunning ? (
-          <>
-            <span className="badge badge-ok">
-              Running
-              {proc?.scheduler_running_workers
-                ? ` · ${proc.scheduler_running_workers}w`
-                : livePhaseBadge
-                  ? ` · ${livePhaseBadge}`
-                  : ''}
-            </span>
-            <button
-              type="button"
-              className="btn btn-warn"
-              onClick={() => onPauseOrResume(true)}
-              disabled={togglingPause}
-            >
-              <Pause size={13} /> Pause
-            </button>
-          </>
-        ) : isPaused ? (
-          <>
-            <span className="badge badge-warn">Paused</span>
-            <button
-              type="button"
-              className="btn btn-success"
-              onClick={() => onPauseOrResume(false)}
-              disabled={togglingPause}
-            >
-              <Play size={13} /> Resume
-            </button>
-          </>
-        ) : isSliceVerified ? (
-          <>
-            <span className="badge badge-ok">Slice Verified</span>
-            <button type="button" className="btn btn-primary" onClick={onOpenNextSliceModal}>
-              <Rocket size={13} aria-hidden="true" /> Next Slice
-            </button>
-          </>
-        ) : bible?.has_bible ? (
-          <>
-            <span className={`badge ${isErrorState ? 'badge-danger' : 'badge-warn'}`}>
-              {isErrorState
-                ? 'Build Error'
-                : sliceVerification.isAwaitingCouncilPlaytest
-                  ? 'Awaiting Playtest'
-                  : boardCounts.total > 0
-                    ? `Stopped · ${boardCounts.approved}/${boardCounts.total}`
-                    : 'Stopped'}
-            </span>
-            <button
-              type="button"
-              className="btn btn-success"
-              onClick={() => (onResumeBuild ? onResumeBuild() : onOpenNextSliceModal())}
-              disabled={resumingBuild}
-              title={
-                sliceVerification.isAwaitingCouncilPlaytest
-                  ? 'All board tasks are approved; click to resume slice into Council Blind Playtest & verification'
-                  : 'Resume development from the persisted Living Game Bible and Production Board'
-              }
-            >
-              <Play size={13} aria-hidden="true" /> {resumingBuild ? 'Resuming...' : 'Resume'}
-            </button>
-          </>
         ) : null}
 
-        <button type="button" className="btn btn-primary" onClick={onOpenNewGameModal}>
-          <Plus size={14} /> New Game
-        </button>
+        {!isDraftSession ? (
+          isAwaitingGreenlight ? (
+            <button type="button" className="btn btn-success" onClick={onApproveGreenlight}>
+              <Play size={13} /> Greenlight Bible
+            </button>
+          ) : isRunning ? (
+            <>
+              <span className="badge badge-ok">
+                Running
+                {proc?.scheduler_running_workers
+                  ? ` · ${proc.scheduler_running_workers}w`
+                  : livePhaseBadge
+                    ? ` · ${livePhaseBadge}`
+                    : ''}
+              </span>
+              <button
+                type="button"
+                className="btn btn-warn"
+                onClick={() => onPauseOrResume(true)}
+                disabled={togglingPause}
+              >
+                <Pause size={13} /> Pause
+              </button>
+            </>
+          ) : isPaused ? (
+            <>
+              <span className="badge badge-warn">Paused</span>
+              <button
+                type="button"
+                className="btn btn-success"
+                onClick={() => onPauseOrResume(false)}
+                disabled={togglingPause}
+              >
+                <Play size={13} /> Resume
+              </button>
+            </>
+          ) : isSliceVerified ? (
+            <>
+              <span className="badge badge-ok">Slice Verified</span>
+              <button type="button" className="btn btn-primary" onClick={onOpenNextSliceModal}>
+                <Rocket size={13} aria-hidden="true" /> Next Slice
+              </button>
+            </>
+          ) : bible?.has_bible ? (
+            <>
+              <span className={`badge ${isErrorState ? 'badge-danger' : 'badge-warn'}`}>
+                {isErrorState
+                  ? 'Build Error'
+                  : sliceVerification.isAwaitingCouncilPlaytest
+                    ? 'Awaiting Playtest'
+                    : boardCounts.total > 0
+                      ? `Stopped · ${boardCounts.approved}/${boardCounts.total}`
+                      : 'Stopped'}
+              </span>
+              <button
+                type="button"
+                className="btn btn-success"
+                onClick={() => (onResumeBuild ? onResumeBuild() : onOpenNextSliceModal())}
+                disabled={resumingBuild}
+                title={
+                  sliceVerification.isAwaitingCouncilPlaytest
+                    ? 'All board tasks are approved; click to resume slice into Council Blind Playtest & verification'
+                    : 'Resume development from the persisted Living Game Bible and Production Board'
+                }
+              >
+                <Play size={13} aria-hidden="true" /> {resumingBuild ? 'Resuming...' : 'Resume'}
+              </button>
+            </>
+          ) : null
+        ) : null}
+
+        {activeWorkspace !== 'coproducer' ? (
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={onStartNewGame}
+            disabled={startingNewGame}
+            title="Start a new game session with your Creative Co-Producer"
+          >
+            <Plus size={14} aria-hidden="true" /> {startingNewGame ? 'Opening...' : 'New Game'}
+          </button>
+        ) : null}
       </div>
     </header>
   );

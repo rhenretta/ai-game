@@ -985,4 +985,131 @@ def test_memory_query_skips_redundant_second_call_when_all_hits_already_in_promp
     assert "Detailed telemetry body line that is already in the structured playtest dossier." not in snap_txt
 
 
+def test_multi_cell_sheet_per_cell_target_sizes_and_centering(tmp_path: Path) -> None:
+    """Verifies `cell_target_sizes` deterministically scales and centers each cell's foreground cutout
+    to its requested sub-cell pixel footprint instead of stretching every cell to ~88% of `cell_size`."""
+    agent = VisualArtSpriteDesignerAgent(client=None, allow_offline_procedural=True)
+    agent._is_live_genai_client = lambda: True  # type: ignore[method-assign]
 
+    seen_chromas: List[str] = []
+
+    def _fake_generate_full_cell(prompt: str, dimensions=(128, 128), chroma_key_hex: str = "#FF00FF", **kwargs: Any) -> Image.Image:
+        seen_chromas.append(chroma_key_hex)
+        # Simulate default tight-cropped 114x114 cutout inside 128x128 returned by `_generate_gemini_sprite_image`
+        im = Image.new("RGBA", dimensions, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(im)
+        draw.ellipse([7, 10, dimensions[0] - 8, dimensions[1] - 11], fill=(240, 120, 40, 255))
+        return im
+
+    agent._generate_gemini_sprite_image = _fake_generate_full_cell  # type: ignore[method-assign]
+
+    target_footprints = [
+        (20, 20), (50, 50), (100, 100),
+        (20, 20), (50, 50), (100, 100),
+    ]
+    req = AssetRequirement(
+        deliberation="3x2 progressive size-tier sheet in uniform 128x128 cells using #00FF00 chroma key.",
+        asset_id="tiered_prop_sheet",
+        asset_type="sprite_sheet",
+        fabrication_mode="sprite_sheet",
+        purpose="Progressive size-tier world objects",
+        description="Progressive size-tier world objects",
+        visual_prompt_or_text="Progressive size-tier world objects",
+        target_path="assets/sprites/tiered_prop_sheet.png",
+        dimensions=(384, 256),
+        grid_cols=3,
+        grid_rows=2,
+        cell_prompts=[f"Variant cell {i}" for i in range(6)],
+        cell_target_sizes=target_footprints,
+        chroma_key_hex="#00FF00",
+    )
+
+    out_sheet = tmp_path / "tiered_prop_sheet.png"
+    agent.generate_dynamic_sprite(req, output_path=out_sheet)
+    assert out_sheet.is_file()
+    assert seen_chromas == ["#00FF00"] * 6
+
+    with Image.open(out_sheet) as im_s:
+        arr = np.asarray(im_s.convert("RGBA"))
+    assert arr.shape == (256, 384, 4)
+
+    for idx, (exp_w, exp_h) in enumerate(target_footprints):
+        r_i, c_i = divmod(idx, 3)
+        sub = arr[r_i * 128:(r_i + 1) * 128, c_i * 128:(c_i + 1) * 128]
+        ys, xs = np.where(sub[:, :, 3] > 24)
+        bw = int(xs.max() - xs.min() + 1)
+        bh = int(ys.max() - ys.min() + 1)
+        cx = 0.5 * (float(xs.min()) + float(xs.max()))
+        cy = 0.5 * (float(ys.min()) + float(ys.max()))
+        assert abs(bw - exp_w) <= 3, f"cell {idx} width {bw} != expected {exp_w}"
+        assert bh <= exp_h + 2
+        assert abs(cx - 63.5) <= 2.5
+        assert abs(cy - 63.5) <= 2.5
+
+    # Deterministic verification passes on properly scaled sheet
+    agent._is_live_genai_client = lambda: False  # type: ignore[method-assign]
+    verdict_ok = agent.verify_rendered_asset(req, out_sheet, inspection_plate_path=tmp_path / "plate_ok.png")
+    assert verdict_ok.accepted is True
+    assert verdict_ok.defective_cell_indices == []
+
+    # Injecting an unscaled 112x112 blob into cell 0 (target 20x20) is deterministically caught as defective cell [0]
+    corrupted = arr.copy()
+    corrupted[8:120, 8:120] = (240, 120, 40, 255)
+    bad_path = tmp_path / "tiered_prop_sheet_bad.png"
+    Image.fromarray(corrupted).save(bad_path, "PNG")
+    verdict_bad = agent.verify_rendered_asset(req, bad_path, inspection_plate_path=tmp_path / "plate_bad.png")
+    assert verdict_bad.accepted is False
+    assert 0 in verdict_bad.defective_cell_indices
+
+
+def test_palette_safe_chroma_key_extraction_and_shadow_stripping(tmp_path: Path) -> None:
+    """Verifies non-colliding `chroma_key_hex='#00FF00'` preserves saturated magenta foreground accents,
+    strips darkened chroma floor shadows connected to the background, and ignores detached sub-alpha border specks."""
+    raw = Image.new("RGBA", (256, 256), (0, 255, 0, 255))
+    draw = ImageDraw.Draw(raw)
+    # Darkened #00FF00 cast shadow on floor directly beneath subject (connected to outer green backdrop)
+    draw.ellipse([78, 172, 182, 206], fill=(10, 118, 12, 255))
+    # Dark metallic subject body + saturated magenta/pink foreground markings (#FF005A and #F514D2)
+    draw.rectangle([84, 76, 172, 176], fill=(28, 32, 44, 255))
+    draw.rectangle([96, 92, 160, 118], fill=(255, 0, 90, 255))
+    draw.rectangle([96, 128, 160, 154], fill=(245, 20, 210, 255))
+
+    cleaned = VisualArtSpriteDesignerAgent.extract_clean_alpha_sprite(
+        raw,
+        target_size=(128, 128),
+        strip_border_frame=True,
+        pad_ratio=0.06,
+        isolate_single_subject=True,
+        chroma_key_hex="#00FF00",
+    )
+    arr = np.asarray(cleaned)
+    assert arr.shape == (128, 128, 4)
+    # 1. Outer corners and darkened green floor shadow are completely transparent
+    assert int(arr[0, 0, 3]) == 0
+    green_shadow_remnants = np.count_nonzero(
+        (arr[:, :, 3] > 24) & (arr[:, :, 1] > 90) & (arr[:, :, 0] < 30) & (arr[:, :, 2] < 30)
+    )
+    assert int(green_shadow_remnants) == 0
+
+    # 2. Saturated magenta foreground markings remain crisp and opaque without despill
+    magenta_fg_px = np.count_nonzero(
+        (arr[:, :, 3] > 220) & (arr[:, :, 0] > 210) & (arr[:, :, 1] < 40) & (arr[:, :, 2] > 70)
+    )
+    assert int(magenta_fg_px) > 400
+
+    # 3. `verify_rendered_asset` with `chroma_key_hex='#00FF00'` does NOT flag foreground magenta as chroma spill
+    out_p = tmp_path / "magenta_marked_prop.png"
+    cleaned.save(out_p, "PNG")
+    agent = VisualArtSpriteDesignerAgent(client=None, allow_offline_procedural=True)
+    req = AssetRequirement(
+        deliberation="Dark hull prop with bright magenta markings synthesized on #00FF00 chroma key.",
+        asset_id="magenta_marked_prop",
+        asset_type="prop",
+        fabrication_mode="static_sprite",
+        target_path="assets/sprites/magenta_marked_prop.png",
+        dimensions=(128, 128),
+        chroma_key_hex="#00FF00",
+    )
+    verdict = agent.verify_rendered_asset(req, out_p, inspection_plate_path=tmp_path / "plate_mag.png")
+    assert verdict.accepted is True
+    assert verdict.alpha_cleanliness_passed is True

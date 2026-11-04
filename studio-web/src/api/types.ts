@@ -4,6 +4,7 @@
  */
 
 export type WorkspaceId =
+  | 'coproducer'
   | 'board'
   | 'writers-room'
   | 'bible'
@@ -291,6 +292,25 @@ export interface NarrativeBible {
   dialogue_barks?: DialogueBark[];
 }
 
+export interface GenrePillarSpec {
+  deliberation: string;
+  pillar_id: string;
+  title: string;
+  why_it_creates_fun: string;
+  systemic_mechanics_expression: string;
+  anti_pattern_to_avoid: string;
+}
+
+export interface GenreCraftFoundation {
+  deliberation: string;
+  genre_and_subgenre_archetype: string;
+  core_fun_thesis: string;
+  bootstrap_to_mastery_arc: string;
+  essential_spatial_and_ux_contracts: string[];
+  genre_killing_anti_patterns: string[];
+  foundational_pillars: GenrePillarSpec[];
+}
+
 export interface GameBibleResponse {
   deliberation: string;
   has_bible: boolean;
@@ -308,6 +328,7 @@ export interface GameBibleResponse {
   diegetic_ui_philosophy?: string;
   camera_and_spatial_paradigm?: string;
   color_palette_hex?: string[];
+  genre_craft_foundation?: GenreCraftFoundation | null;
   gameplay_pillars?: Array<string | Record<string, unknown>>;
   core_loop?: Record<string, unknown> | null;
   onboarding_plan?: Record<string, unknown> | null;
@@ -817,4 +838,230 @@ export interface GameMemoryMutationRequest {
   resolution_note?: string;
   slice_id?: string;
   item_id?: string;
+}
+
+export interface CoProducerConceptBrief {
+  deliberation: string;
+  working_title: string;
+  core_genre: string;
+  elevator_pitch: string;
+  core_fantasy?: string;
+  core_player_verbs: string[];
+  first_60_seconds_feel: string;
+  visual_style_direction: string;
+  audio_mood_direction: string;
+  color_palette_hex?: string[];
+  explicit_non_goals: string[];
+  selected_mockup_paths: string[];
+  selected_sketch_asset_paths: string[];
+  genre_craft_foundation?: GenreCraftFoundation | null;
+}
+
+export type CoProducerMediaKind =
+  | 'video'
+  | 'image'
+  | 'audio'
+  | 'metric'
+  | 'code_diff';
+
+export interface CoProducerMediaItem {
+  deliberation: string;
+  item_id?: string;
+  media_kind: CoProducerMediaKind;
+  label: string;
+  caption?: string;
+  artifact_path?: string;
+  mime_type?: string;
+  width?: number;
+  height?: number;
+  metric_value?: string;
+  diff_unified?: string;
+}
+
+export type CoProducerMediaCardKind =
+  | 'playtest_video'
+  | 'qa_clip'
+  | 'image_gallery'
+  | 'sketch_showcase'
+  | 'audio_clips'
+  | 'progress_summary'
+  | 'code_diff';
+
+export interface CoProducerMediaCard {
+  deliberation: string;
+  card_id: string;
+  card_kind: CoProducerMediaCardKind;
+  title: string;
+  subtitle?: string;
+  items: CoProducerMediaItem[];
+  show_by_default?: boolean;
+  deep_link_workspace?: WorkspaceId | null;
+  deep_link_target_id?: string;
+}
+
+export interface CoProducerCouncilHuddleTurn {
+  deliberation: string;
+  speaker_role: string;
+  key_recommendation: string;
+  creative_angle_or_risk?: string;
+  spoken_quote: string;
+}
+
+export interface CoProducerDivergentPitchOption {
+  deliberation: string;
+  pitch_id: string;
+  working_title: string;
+  core_genre: string;
+  hook_summary: string;
+  core_loop_sketch: string;
+  visual_and_audio_vibe?: string;
+}
+
+export type CoProducerConsultationKind =
+  | 'council_huddle'
+  | 'divergent_pitch_round'
+  | 'specialist_probe'
+  | 'genre_foundation';
+
+export interface CoProducerConsultationCard {
+  deliberation: string;
+  card_id: string;
+  consultation_kind: CoProducerConsultationKind;
+  question_posed: string;
+  participating_roles?: string[];
+  synthesis_headline: string;
+  specialist_turns?: CoProducerCouncilHuddleTurn[];
+  divergent_pitches?: CoProducerDivergentPitchOption[];
+  probe_findings_markdown?: string;
+  proof_media_paths?: string[];
+}
+
+export interface CoProducerMemoryMutationSpec {
+  deliberation: string;
+  operation: 'record' | 'supersede';
+  target_memory_id?: string;
+  memory_bank?: 'council' | 'engineering' | 'visual' | 'audio' | 'narrative' | 'qa' | string;
+  kind?: string;
+  title?: string;
+  content?: string;
+}
+
+export type CoProducerActionKind =
+  | 'commission_game'
+  | 'pivot_course_correction'
+  | 'pivot_structural'
+  | 'pivot_fork_cartridge'
+  | 'greenlight_bible'
+  | 'trigger_next_slice'
+  | 'pause_build'
+  | 'resume_build'
+  | 'launch_game'
+  | 'start_blind_playtest'
+  | 'record_game_memory';
+
+export interface CoProducerActionProposal {
+  deliberation: string;
+  proposal_id: string;
+  action_kind: CoProducerActionKind;
+  handoff_mode?: 'loose_spark' | 'refined_concept' | null;
+  title: string;
+  summary: string;
+  steering_or_seed_brief?: string;
+  pause_for_greenlight?: boolean;
+  concept_brief?: CoProducerConceptBrief | null;
+  cancel_item_ids?: string[];
+  memory_mutations?: CoProducerMemoryMutationSpec[];
+  carry_over_asset_paths?: string[];
+  status: 'pending' | 'executed' | 'dismissed';
+  executed_at_utc?: string;
+  execution_result?: Record<string, unknown>;
+}
+
+export interface CoProducerToolTraceEntry {
+  deliberation?: string;
+  tool_name: string;
+  query_or_question?: string;
+  started_at_utc?: string;
+  completed_at_utc?: string;
+  observation_excerpt?: string;
+}
+
+export interface CoProducerPromptTraceEntry {
+  deliberation?: string;
+  step_label: string;
+  model?: string;
+  temperature?: number;
+  attached_image_parts?: number;
+  prompt_excerpt: string;
+  response_json?: Record<string, unknown>;
+  token_usage?: Record<string, number>;
+}
+
+export interface CoProducerMessage {
+  deliberation: string;
+  message_id: string;
+  thread_id: string;
+  turn_index: number;
+  sender_role: 'user' | 'coproducer' | 'milestone_notice';
+  content_markdown: string;
+  media_cards: CoProducerMediaCard[];
+  consultation_cards: CoProducerConsultationCard[];
+  action_proposals: CoProducerActionProposal[];
+  tool_trace: CoProducerToolTraceEntry[];
+  prompt_trace: CoProducerPromptTraceEntry[];
+  token_usage?: Record<string, number>;
+  created_at_utc: string;
+}
+
+export interface CoProducerThread {
+  deliberation: string;
+  thread_id: string;
+  scope_kind: 'draft' | 'cartridge';
+  cartridge_id?: string | null;
+  title: string;
+  graduated_to_cartridge_id?: string;
+  concept_brief?: CoProducerConceptBrief | null;
+  message_count: number;
+  created_at_utc: string;
+  updated_at_utc: string;
+}
+
+export interface CoProducerLiveStep {
+  threadId: string;
+  hopIndex: number;
+  toolName: string;
+  statusHeadline: string;
+  completed: boolean;
+  summary?: string;
+  timestampUtc: string;
+}
+
+export interface CoProducerThreadsListResponse {
+  deliberation: string;
+  active_cartridge_thread?: CoProducerThread | null;
+  draft_threads: CoProducerThread[];
+  cartridge_threads: CoProducerThread[];
+  threads: CoProducerThread[];
+}
+
+export interface CoProducerThreadDetailResponse {
+  deliberation: string;
+  thread: CoProducerThread;
+  messages: CoProducerMessage[];
+  live_steps?: Array<Record<string, unknown>>;
+}
+
+export interface CoProducerSendMessageResponse {
+  deliberation: string;
+  thread: CoProducerThread;
+  user_message: CoProducerMessage;
+  assistant_message: CoProducerMessage;
+}
+
+export interface CoProducerExecuteActionResponse {
+  deliberation: string;
+  status: string;
+  action_kind?: CoProducerActionKind | string;
+  proposal?: CoProducerActionProposal | null;
+  result?: Record<string, unknown>;
 }

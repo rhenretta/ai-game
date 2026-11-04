@@ -43,6 +43,9 @@ from engine.ui.models import (
     ChallengerGateVerdictPayload,
     CheckpointsResponse,
     CodeDiffResponse,
+    CoProducerCreateDraftRequest,
+    CoProducerExecuteActionRequest,
+    CoProducerSendMessageRequest,
     DeathClusterPoint,
     GameLaunchRequest,
     GameLaunchResponse,
@@ -1905,6 +1908,7 @@ def create_app(
     active_cartridge_dir: Optional[Path] = None,
     event_bus: Optional[SwarmEventBus] = None,
     playtest_manager: Optional[Any] = None,
+    genai_client: Optional[Any] = None,
 ) -> Starlette:
     """Factory function creating the Starlette ASGI application for Studio Observability."""
     target_bus = event_bus or swarm_bus
@@ -1958,6 +1962,7 @@ def create_app(
             "TelemetryArchitectAgent": "ONLINE",
             "QAPlaytesterBuildSupervisor": "ONLINE",
             "SteamAnalyst": "ONLINE",
+            "CoProducer": "ONLINE",
             "CreativeDirector": "ONLINE",
             "GameplaySWE": "ONLINE",
             "AudioProducer": "ONLINE",
@@ -2014,6 +2019,7 @@ def create_app(
             "TelemetryArchitectAgent": "ONLINE",
             "QAPlaytesterBuildSupervisor": "ONLINE",
             "SteamAnalyst": "ONLINE",
+            "CoProducer": "ONLINE",
             "CreativeDirector": "ONLINE",
             "GameplaySWE": "ONLINE",
             "AudioProducer": "ONLINE",
@@ -2078,7 +2084,11 @@ def create_app(
         cartridges = []
         games_meta = []
         if target_cartridges.exists():
-            dirs = [p for p in target_cartridges.iterdir() if p.is_dir() and not p.name.startswith(".")]
+            dirs = [
+                p
+                for p in target_cartridges.iterdir()
+                if p.is_dir() and not p.name.startswith(".") and not p.name.startswith("_")
+            ]
             cartridges = sorted([p.name for p in dirs])
             for p in sorted(dirs, key=lambda d: d.stat().st_mtime, reverse=True):
                 if p.name in ("checkpoints", "candidate"):
@@ -2089,6 +2099,7 @@ def create_app(
                 gb_file = p / "game_bible.json"
                 ws_file = p / "world_spec.json"
                 mf_file = p / "manifest.json"
+                cp_brief_file = p / "co_producer_brief.json"
                 bl_file = p / "backlog.json"
                 if gb_file.is_file():
                     try:
@@ -2096,6 +2107,15 @@ def create_app(
                         g_title = gb.get("game_title") or ""
                         g_genre = gb.get("core_genre") or ""
                         g_status = gb.get("status") or "locked"
+                    except Exception:
+                        pass
+                if not g_title and cp_brief_file.is_file():
+                    try:
+                        cpb = json.loads(cp_brief_file.read_text(encoding="utf-8"))
+                        cb_inner = cpb.get("concept_brief") if isinstance(cpb.get("concept_brief"), dict) else {}
+                        g_title = str(cb_inner.get("working_title") or "").strip()
+                        g_genre = str(cb_inner.get("core_genre") or "").strip()
+                        g_status = "brainstorming"
                     except Exception:
                         pass
                 if not g_title and ws_file.is_file():
@@ -3379,6 +3399,25 @@ def create_app(
         except OSError:
             pass
         return None
+
+    def _resolve_active_or_latest_cartridge() -> Path:
+        live_bible = _get_active_writers_room_bible()
+        matched_cand = _resolve_matching_candidate_for_bible(live_bible) if live_bible else None
+        if matched_cand is not None and matched_cand.is_dir():
+            return matched_cand
+        if target_active.is_dir() and (
+            (target_active / "project.godot").is_file() or (target_active / "game_bible.json").is_file()
+        ):
+            return target_active
+        if target_cartridges.is_dir():
+            candidates = sorted(
+                [d for d in target_cartridges.glob("candidate_*") if d.is_dir()],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if candidates:
+                return candidates[0]
+        return target_active
 
     async def telemetry_dashboard_handler(request):
         """GET /api/telemetry/dashboard: Dynamic agent-architected telemetry manifest and hypotheses."""
@@ -5589,7 +5628,7 @@ def create_app(
                 "title": board_item.get("title") or item_id,
                 "kind": board_item.get("kind") or "mechanic_code",
                 "state": board_item.get("state") or board_item.get("status") or "ready",
-                "raised_by_role": board_item.get("raised_by_role") or "CreativeDirector",
+                "raised_by_role": board_item.get("raised_by_role") or "CoProducer",
                 "spawned_by_item_id": board_item.get("spawned_by_item_id") or "",
                 "shaping_notes": board_item.get("shaping_notes") if isinstance(board_item.get("shaping_notes"), list) else [],
                 "spec": board_item.get("spec") or board_item.get("description") or "",
@@ -5669,8 +5708,8 @@ def create_app(
                 "speaker_display_name": "Executive Producer (You)",
                 "spoken_dialogue": req.feedback,
                 "message": req.feedback,
-                "addressed_to": ["CreativeDirector", "GameplaySystemsEngineer", "GameplayDesigner", "UXExperienceDesigner"],
-                "referenced_roles": ["CreativeDirector", "GameplaySystemsEngineer"],
+                "addressed_to": ["CoProducer", "GameplaySystemsEngineer", "GameplayDesigner", "UXExperienceDesigner"],
+                "referenced_roles": ["CoProducer", "GameplaySystemsEngineer"],
                 "bible_updates_summary": ["Executive Producer creative direction injected"],
                 "artifact_emitted": None,
                 "timestamp_utc": now_iso,
@@ -6615,7 +6654,7 @@ def create_app(
                         "speaker_display_name": "Executive Producer (Blind Playtester Wish)",
                         "spoken_dialogue": spoken_msg,
                         "message": spoken_msg,
-                        "addressed_to": ["CreativeDirector", "GameplayDesigner", "UXExperienceDesigner", "GameplaySystemsEngineer"],
+                        "addressed_to": ["CoProducer", "GameplayDesigner", "UXExperienceDesigner", "GameplaySystemsEngineer"],
                         "referenced_roles": ["GameplayDesigner", "UXExperienceDesigner", "GameplaySystemsEngineer"],
                         "bible_updates_summary": [f"Dispatched {len(updated_wishes)} Blind Playtester wish(es)"],
                         "artifact_emitted": None,
@@ -6751,7 +6790,7 @@ def create_app(
                         "spoken_dialogue": spoken_msg,
                         "message": spoken_msg,
                         "addressed_to": [
-                            "CreativeDirector",
+                            "CoProducer",
                             "GameplayDesigner",
                             "UXExperienceDesigner",
                             "LevelAndProgressionDesigner",
@@ -7146,7 +7185,7 @@ def create_app(
                 status_code=400,
             )
 
-        author_role = str(body.get("author_role") or "CreativeDirector").strip()
+        author_role = str(body.get("author_role") or "CoProducer").strip()
         store = GameMemoryStore(cart_dir, db=tdb, event_callback=_publish_ws_memory_event)
         touched = store.apply_mutations(
             author_role=author_role,
@@ -7172,11 +7211,893 @@ def create_app(
         resp_payload["mutated_entries"] = [e.model_dump() for e in touched]
         return JSONResponse(resp_payload)
 
+    # -------------------------------------------------------------------------
+    # Interactive 1-on-1 Creative Co-Producer & Showrunner Endpoints
+    # -------------------------------------------------------------------------
+
+    _coproducer_live_steps: Dict[str, List[Dict[str, Any]]] = {}
+    _coproducer_steps_lock = threading.Lock()
+    _cached_coproducer_client_holder: Dict[str, Any] = {"client": genai_client}
+
+    def _get_coproducer_db() -> Optional[TelemetryDB]:
+        if target_db is not None:
+            try:
+                target_db.parent.mkdir(parents=True, exist_ok=True)
+                return TelemetryDB(target_db)
+            except Exception as db_exc:
+                logger.warning("CoProducer TelemetryDB open warning: %s", db_exc)
+        return None
+
+    def _get_coproducer_store():
+        from engine.studio.coproducer import CoProducerThreadStore
+
+        return CoProducerThreadStore(target_cartridges, db=_get_coproducer_db())
+
+    def _resolve_coproducer_client() -> Any:
+        from engine.studio.models import StudioAgentConfigurationError, install_studio_gemini_guardrails
+
+        if _cached_coproducer_client_holder.get("client") is not None:
+            return _cached_coproducer_client_holder["client"]
+        orch = getattr(target_bus, "_active_orchestrator", None) or getattr(swarm_bus, "_active_orchestrator", None)
+        if orch is not None and getattr(orch, "client", None) is not None:
+            return orch.client
+        bus_override = getattr(target_bus, "_coproducer_client", None)
+        if bus_override is not None:
+            return bus_override
+        api_key = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
+        if not api_key:
+            raise StudioAgentConfigurationError(
+                "GEMINI_API_KEY (or GOOGLE_API_KEY) is required to converse with the Studio Co-Producer (Rule 5: Zero Silent Fallbacks)."
+            )
+        from google import genai
+
+        created = install_studio_gemini_guardrails(genai.Client(api_key=api_key))
+        _cached_coproducer_client_holder["client"] = created
+        return created
+
+    def _publish_coproducer_bus_event(event_type: str, payload: Dict[str, Any]) -> None:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        delib = str(payload.get("deliberation") or "Co-Producer live update.")
+        tid = str(payload.get("thread_id") or "")
+        if tid:
+            with _coproducer_steps_lock:
+                if event_type == "coproducer_step_started":
+                    _coproducer_live_steps.setdefault(tid, []).append(
+                        {
+                            "deliberation": delib,
+                            "event_type": event_type,
+                            "intent": payload.get("intent", ""),
+                            "tools": payload.get("tools", []),
+                            "timestamp_utc": now_iso,
+                        }
+                    )
+                elif event_type == "coproducer_tool_completed":
+                    _coproducer_live_steps.setdefault(tid, []).append(
+                        {
+                            "deliberation": delib,
+                            "event_type": event_type,
+                            "tool_name": payload.get("tool_name", ""),
+                            "summary": payload.get("summary", ""),
+                            "timestamp_utc": now_iso,
+                        }
+                    )
+                elif event_type == "coproducer_turn_completed":
+                    _coproducer_live_steps.pop(tid, None)
+
+        ev = {
+            "deliberation": delib,
+            "event_id": f"ev_cp_{uuid.uuid4().hex[:8]}",
+            "event_type": event_type,
+            "agent_name": "CoProducerAgent",
+            "timestamp_utc": now_iso,
+            "payload": payload,
+        }
+        target_bus.publish_threadsafe(ev)
+        if swarm_bus is not None and swarm_bus is not target_bus:
+            swarm_bus.publish_threadsafe(ev)
+
+    def _spawn_commissioned_genesis_daemon(
+        *,
+        candidate_dir: Path,
+        creative_prompt: str,
+        pause_for_greenlight: bool = False,
+    ) -> Optional[str]:
+        job_id = f"cp_gen_{uuid.uuid4().hex[:8]}"
+        build_id = f"build_{candidate_dir.name}"
+        target_bus._pause_for_greenlight = bool(pause_for_greenlight)
+        if swarm_bus is not None and swarm_bus is not target_bus:
+            swarm_bus._pause_for_greenlight = bool(pause_for_greenlight)
+
+        initial_bible = target_bus.reset_for_new_genesis_build(
+            build_id=build_id,
+            creative_prompt=creative_prompt,
+        )
+        initial_bible["cartridge_id"] = candidate_dir.name
+        if swarm_bus is not None and swarm_bus is not target_bus:
+            sb_bible = swarm_bus.reset_for_new_genesis_build(
+                build_id=build_id,
+                creative_prompt=creative_prompt,
+            )
+            sb_bible["cartridge_id"] = candidate_dir.name
+
+        target_bus._build_paused = False
+        if swarm_bus is not None and swarm_bus is not target_bus:
+            swarm_bus._build_paused = False
+        try:
+            pause_sentinel = target_cartridges / ".studio_paused.json"
+            if pause_sentinel.is_file():
+                pause_sentinel.unlink()
+        except Exception:
+            pass
+
+        _publish_coproducer_bus_event(
+            SwarmEventType.GENESIS_TRIGGERED.value,
+            {
+                "deliberation": f"Commissioned Genesis build for '{candidate_dir.name}' from Co-Producer.",
+                "job_id": job_id,
+                "build_id": build_id,
+                "candidate_id": candidate_dir.name,
+                "creative_prompt": creative_prompt,
+            },
+        )
+
+        if "PYTEST_CURRENT_TEST" not in os.environ:
+            from engine.studio.daemon import StudioDaemon, StudioDaemonConfig, _genesis_build_lock
+
+            def _run_bg_commissioned() -> None:
+                try:
+                    for _ in range(300):
+                        if not _genesis_build_lock.locked():
+                            break
+                        time.sleep(0.1)
+                    cfg = StudioDaemonConfig(
+                        steam_profile="default",
+                        cartridges_root=target_cartridges,
+                        active_cartridge_dir=target_active,
+                        db_path=target_db or config.DB_PATH,
+                        creative_prompt=creative_prompt or None,
+                        initial_candidate_dir=candidate_dir,
+                    )
+                    daemon_inst = StudioDaemon(config_obj=cfg, event_bus=target_bus)
+                    daemon_inst.run_genesis_cycle()
+                except Exception as bg_exc:
+                    logger.error("Background Co-Producer commissioned Genesis build failed: %s", bg_exc)
+                finally:
+                    setattr(threading.current_thread(), "_genesis_finished", True)
+                    _publish_coproducer_bus_event(
+                        "studio_process_updated",
+                        {
+                            "deliberation": f"Commissioned build thread for '{candidate_dir.name}' exited.",
+                            "candidate_id": candidate_dir.name,
+                            "status": "exited",
+                        },
+                    )
+
+            threading.Thread(
+                target=_run_bg_commissioned,
+                name=f"GenesisTrigger_{job_id}",
+                daemon=True,
+            ).start()
+        return job_id
+
+    def _wake_candidate_resume_if_idle(cand_name: str) -> Optional[str]:
+        if "PYTEST_CURRENT_TEST" in os.environ or not cand_name:
+            return None
+        try:
+            from engine.studio.daemon import StudioDaemon, StudioDaemonConfig, _genesis_build_lock
+
+            wake_job = f"cp_wake_{uuid.uuid4().hex[:8]}"
+            target_bus._build_paused = False
+            if swarm_bus is not None and swarm_bus is not target_bus:
+                swarm_bus._build_paused = False
+            try:
+                ps = target_cartridges / ".studio_paused.json"
+                if ps.is_file():
+                    ps.unlink()
+            except Exception:
+                pass
+
+            def _bg_wake() -> None:
+                try:
+                    cfg = StudioDaemonConfig(
+                        steam_profile="default",
+                        cartridges_root=target_cartridges,
+                        active_cartridge_dir=target_active,
+                        db_path=target_db or config.DB_PATH,
+                        resume_current=True,
+                        resume_candidate_id=cand_name,
+                    )
+                    daemon_inst = StudioDaemon(config_obj=cfg, event_bus=target_bus)
+                    daemon_inst.run_genesis_cycle()
+                except Exception as exc:
+                    logger.error("Background Co-Producer resume failed for %s: %s", cand_name, exc)
+                finally:
+                    setattr(threading.current_thread(), "_genesis_finished", True)
+
+            if _genesis_build_lock.locked():
+                def _bg_deferred_wake() -> None:
+                    deadline = time.monotonic() + 900.0
+                    while time.monotonic() < deadline and _genesis_build_lock.locked():
+                        time.sleep(0.5)
+                    c_dir_check = target_cartridges / cand_name
+                    still_pending = (
+                        (c_dir_check / ".pending_structural_pivot.json").is_file()
+                        or (c_dir_check / ".pending_steering.json").is_file()
+                    )
+                    manually_paused = (
+                        bool(getattr(target_bus, "_build_paused", False))
+                        or (target_cartridges / ".studio_paused.json").is_file()
+                    )
+                    if still_pending and not manually_paused and not _genesis_build_lock.locked():
+                        _bg_wake()
+
+                threading.Thread(
+                    target=_bg_deferred_wake,
+                    name=f"DeferredGenesisWake_{wake_job}",
+                    daemon=True,
+                ).start()
+                return f"{wake_job}_deferred"
+
+            threading.Thread(target=_bg_wake, name=f"GenesisTrigger_{wake_job}", daemon=True).start()
+            return wake_job
+        except Exception as exc:
+            logger.warning("Could not auto-wake StudioDaemon for %s: %s", cand_name, exc)
+            return None
+
+    async def coproducer_threads_list_handler(request):
+        """GET /api/coproducer/threads: Lists draft threads and cartridge threads, resolving active cartridge thread."""
+        req_cart = (request.query_params.get("cartridge") or "").strip()
+        if not req_cart or req_cart == "active":
+            resolved = _resolve_active_or_latest_cartridge()
+            if resolved.is_dir() and resolved.name != "active":
+                req_cart = resolved.name
+            elif resolved.is_dir() and ((resolved / "project.godot").is_file() or (resolved / "game_bible.json").is_file()):
+                req_cart = "active"
+            else:
+                req_cart = ""
+        store = _get_coproducer_store()
+        payload = store.list_threads(active_cartridge_id=req_cart or None)
+        return JSONResponse(payload)
+
+    async def coproducer_create_draft_handler(request):
+        """POST /api/coproducer/threads/draft: Opens a fresh pre-genesis Draft Game Concept thread."""
+        raw_body: Dict[str, Any] = {}
+        try:
+            body_bytes = await request.body()
+            if body_bytes:
+                parsed = json.loads(body_bytes.decode("utf-8"))
+                if isinstance(parsed, dict):
+                    raw_body = parsed
+        except Exception:
+            return JSONResponse(
+                {"deliberation": "Rejected malformed JSON request body.", "error": "Invalid JSON body"},
+                status_code=400,
+            )
+        raw_body.setdefault("deliberation", "Opening new pre-genesis Co-Producer draft concept thread.")
+        try:
+            req = CoProducerCreateDraftRequest.model_validate(raw_body)
+        except Exception as val_err:
+            return JSONResponse(
+                {"deliberation": "Validation failed for CoProducerCreateDraftRequest.", "error": str(val_err)},
+                status_code=422,
+            )
+        store = _get_coproducer_store()
+        draft_meta = store.create_draft_thread(title=req.title)
+        _publish_coproducer_bus_event(
+            SwarmEventType.COPRODUCER_THREAD_UPDATED.value,
+            {
+                "deliberation": draft_meta["deliberation"],
+                "thread_id": draft_meta["thread_id"],
+                "scope_kind": "draft",
+                "title": draft_meta["title"],
+            },
+        )
+        return JSONResponse(
+            {
+                "deliberation": draft_meta["deliberation"],
+                "thread": draft_meta,
+                "messages": [],
+            }
+        )
+
+    def _is_resolvable_cartridge_id(raw_id: str) -> bool:
+        clean = (raw_id or "").strip()
+        if not clean or clean.startswith(".") or clean == "_coproducer_drafts" or "/" in clean or "\\" in clean:
+            return False
+        return clean.startswith("candidate_") or (target_cartridges / clean).is_dir()
+
+    async def coproducer_thread_detail_handler(request):
+        """GET /api/coproducer/threads/{thread_id}: Returns full message history, concept brief, and live steps."""
+        tid = (request.path_params.get("thread_id") or "").strip()
+        store = _get_coproducer_store()
+        detail = store.get_thread_detail(tid, limit=250)
+        if detail is None and _is_resolvable_cartridge_id(tid):
+            created = store.get_or_create_cartridge_thread(tid)
+            detail = store.get_thread_detail(created["thread_id"], limit=250)
+        if detail is None:
+            return JSONResponse(
+                {"deliberation": f"Co-Producer thread '{tid}' was not found.", "error": f"Thread '{tid}' not found"},
+                status_code=404,
+            )
+        with _coproducer_steps_lock:
+            live_steps = list(_coproducer_live_steps.get(detail["thread"]["thread_id"], []))
+        detail["live_steps"] = live_steps
+        return JSONResponse(detail)
+
+    async def coproducer_send_message_handler(request):
+        """POST /api/coproducer/threads/{thread_id}/messages: Executes a 1-on-1 Co-Producer turn."""
+        from engine.studio.coproducer import CoProducerAgent
+        from engine.studio.models import StudioAgentConfigurationError, StudioAgentError
+
+        tid = (request.path_params.get("thread_id") or "").strip()
+        try:
+            raw_body = await request.json()
+        except Exception:
+            return JSONResponse(
+                {"deliberation": "Rejected malformed JSON request body.", "error": "Invalid JSON body"},
+                status_code=400,
+            )
+        if not isinstance(raw_body, dict):
+            return JSONResponse(
+                {"deliberation": "Rejected non-object JSON payload.", "error": "JSON body must be an object"},
+                status_code=400,
+            )
+        raw_body.setdefault("deliberation", "Submitting user message to Studio Co-Producer.")
+        try:
+            req = CoProducerSendMessageRequest.model_validate(raw_body)
+        except Exception as val_err:
+            return JSONResponse(
+                {"deliberation": "Validation failed for CoProducerSendMessageRequest.", "error": str(val_err)},
+                status_code=422,
+            )
+
+        store = _get_coproducer_store()
+        if store.get_thread(tid) is None and _is_resolvable_cartridge_id(tid):
+            created = store.get_or_create_cartridge_thread(tid)
+            tid = created["thread_id"]
+        if store.get_thread(tid) is None:
+            return JSONResponse(
+                {"deliberation": f"Co-Producer thread '{tid}' was not found.", "error": f"Thread '{tid}' not found"},
+                status_code=404,
+            )
+
+        try:
+            client = _resolve_coproducer_client()
+        except StudioAgentConfigurationError as cfg_err:
+            return JSONResponse(
+                {"deliberation": str(cfg_err), "error": str(cfg_err)},
+                status_code=503,
+            )
+
+        agent = CoProducerAgent(
+            client=client,
+            cartridges_root=target_cartridges,
+            db=_get_coproducer_db(),
+            event_callback=_publish_coproducer_bus_event,
+        )
+        try:
+            turn_result = await asyncio.to_thread(
+                agent.run_turn,
+                thread_id=tid,
+                user_message=req.message,
+                selected_sketch_paths=req.selected_sketch_paths,
+            )
+            return JSONResponse(turn_result)
+        except StudioAgentConfigurationError as cfg_err:
+            with _coproducer_steps_lock:
+                _coproducer_live_steps.pop(tid, None)
+            return JSONResponse({"deliberation": str(cfg_err), "error": str(cfg_err)}, status_code=503)
+        except StudioAgentError as ag_err:
+            with _coproducer_steps_lock:
+                _coproducer_live_steps.pop(tid, None)
+            return JSONResponse({"deliberation": str(ag_err), "error": str(ag_err)}, status_code=502)
+        except Exception as exc:
+            with _coproducer_steps_lock:
+                _coproducer_live_steps.pop(tid, None)
+            logger.exception("CoProducerAgent turn failed for thread %s", tid)
+            return JSONResponse(
+                {"deliberation": f"Co-Producer turn failed: {exc}", "error": str(exc)},
+                status_code=500,
+            )
+
+    async def coproducer_execute_action_handler(request):
+        """POST /api/coproducer/actions/execute: Executes an explicit user-confirmed CoProducerActionProposal."""
+        try:
+            raw_body = await request.json()
+        except Exception:
+            return JSONResponse(
+                {"deliberation": "Rejected malformed JSON request body.", "error": "Invalid JSON body"},
+                status_code=400,
+            )
+        if not isinstance(raw_body, dict):
+            return JSONResponse(
+                {"deliberation": "Rejected non-object JSON payload.", "error": "JSON body must be an object"},
+                status_code=400,
+            )
+        raw_body.setdefault("deliberation", "Confirming Co-Producer studio action proposal.")
+        try:
+            req = CoProducerExecuteActionRequest.model_validate(raw_body)
+        except Exception as val_err:
+            return JSONResponse(
+                {"deliberation": "Validation failed for CoProducerExecuteActionRequest.", "error": str(val_err)},
+                status_code=422,
+            )
+
+        store = _get_coproducer_store()
+        detail = store.get_thread_detail(req.thread_id, limit=500)
+        if detail is None:
+            return JSONResponse(
+                {"deliberation": f"Thread '{req.thread_id}' not found.", "error": "Thread not found"},
+                status_code=404,
+            )
+        thread_meta = detail["thread"]
+        found_prop: Optional[Dict[str, Any]] = None
+        if req.message_id and req.proposal_id:
+            for m in detail["messages"]:
+                if str(m.get("message_id") or "") != req.message_id:
+                    continue
+                for p in (m.get("action_proposals") or []):
+                    if isinstance(p, dict) and str(p.get("proposal_id") or "") == req.proposal_id:
+                        found_prop = p
+                        break
+            if found_prop is None:
+                return JSONResponse(
+                    {
+                        "deliberation": f"Proposal '{req.proposal_id}' not found in message '{req.message_id}'.",
+                        "error": "Action proposal not found",
+                    },
+                    status_code=404,
+                )
+        elif req.direct_action_kind == "commission_game":
+            cb_raw = thread_meta.get("concept_brief") if isinstance(thread_meta.get("concept_brief"), dict) else {}
+            recent_excerpts = [
+                f"{'Producer' if str(m.get('sender_role')) == 'user' else 'Co-Producer'}: {str(m.get('content_markdown') or '').strip()}"
+                for m in detail["messages"]
+                if str(m.get("sender_role") or "") in ("user", "coproducer")
+                and str(m.get("content_markdown") or "").strip()
+            ]
+            fallback_summary = (
+                str(cb_raw.get("elevator_pitch") or "").strip()
+                or "\n\n".join(recent_excerpts[-4:])[:2400]
+                or str(thread_meta.get("title") or "Commissioned Co-Producer concept").strip()
+            )
+            found_prop = {
+                "action_kind": "commission_game",
+                "concept_brief": cb_raw,
+                "summary": fallback_summary,
+                "carry_over_asset_paths": list(req.carry_over_asset_paths or []),
+            }
+        else:
+            return JSONResponse(
+                {
+                    "deliberation": "Either message_id + proposal_id or direct_action_kind='commission_game' is required.",
+                    "error": "Missing action target",
+                },
+                status_code=422,
+            )
+
+        if req.dismiss:
+            if not (req.message_id and req.proposal_id):
+                return JSONResponse(
+                    {"deliberation": "Dismissal requires message_id and proposal_id.", "error": "Missing proposal_id"},
+                    status_code=422,
+                )
+            updated = store.update_action_proposal_status(
+                req.thread_id, req.message_id, req.proposal_id, status="dismissed"
+            )
+            return JSONResponse(
+                {
+                    "deliberation": f"Dismissed Co-Producer action proposal '{req.proposal_id}'.",
+                    "status": "dismissed",
+                    "proposal": updated,
+                }
+            )
+
+        action_kind = str(found_prop.get("action_kind") or "").strip()
+        concept_brief = found_prop.get("concept_brief") if isinstance(found_prop.get("concept_brief"), dict) else (
+            thread_meta.get("concept_brief") if isinstance(thread_meta.get("concept_brief"), dict) else {}
+        )
+        eff_brief_text = (
+            req.override_brief.strip()
+            if req.override_brief is not None and req.override_brief.strip()
+            else str(
+                found_prop.get("steering_or_seed_brief")
+                or (concept_brief or {}).get("elevator_pitch")
+                or found_prop.get("summary")
+                or ""
+            ).strip()
+        )
+        eff_handoff = (
+            req.override_handoff_mode
+            if req.override_handoff_mode in ("loose_spark", "refined_concept")
+            else (
+                str(found_prop.get("handoff_mode") or "").strip()
+                if str(found_prop.get("handoff_mode") or "").strip() in ("loose_spark", "refined_concept")
+                else ("refined_concept" if (concept_brief or {}).get("working_title") else "loose_spark")
+            )
+        )
+        eff_pause_greenlight = (
+            bool(req.override_pause_for_greenlight)
+            if req.override_pause_for_greenlight is not None
+            else bool(found_prop.get("pause_for_greenlight", False))
+        )
+        cid = str(thread_meta.get("cartridge_id") or "").strip()
+        c_dir = (target_cartridges / cid) if cid else None
+        result_meta: Dict[str, Any] = {"action_kind": action_kind}
+
+        def _apply_proposal_memories(cart_path: Path, mutations_raw: List[Any]) -> int:
+            if not mutations_raw:
+                return 0
+            from engine.studio.game_memory import GameMemoryStore, MemoryMutationProposal
+
+            _valid_mkinds = {"strategic_goal", "architectural_decision", "lesson_learned", "domain_note"}
+            m_store = GameMemoryStore(cart_path, db=_get_coproducer_db())
+            props = [
+                MemoryMutationProposal(
+                    deliberation=str(m.get("deliberation") or "Co-Producer confirmed memory update."),
+                    operation=str(m.get("operation") or "record"),
+                    target_memory_id=str(m.get("target_memory_id") or ""),
+                    target_bank=str(m.get("memory_bank") or "council"),
+                    kind=(
+                        str(m.get("kind"))
+                        if str(m.get("kind") or "") in _valid_mkinds
+                        else "architectural_decision"
+                    ),
+                    title=str(m.get("title") or ""),
+                    content=str(m.get("content") or ""),
+                )
+                for m in mutations_raw
+                if isinstance(m, dict)
+            ]
+            if not props:
+                return 0
+            touched = m_store.apply_mutations("ExecutiveProducer", props)
+            return len(touched)
+
+        if action_kind == "commission_game":
+            new_cid = f"candidate_genesis_{uuid.uuid4().hex[:6]}"
+            new_c_dir = target_cartridges / new_cid
+            carry_paths = [
+                str(x)
+                for x in (list(found_prop.get("carry_over_asset_paths") or []) + list(req.carry_over_asset_paths or []))
+                if str(x).strip()
+            ]
+            if thread_meta.get("scope_kind") == "draft":
+                grad_meta = store.graduate_draft_to_cartridge(
+                    draft_thread_id=req.thread_id,
+                    new_cartridge_dir=new_c_dir,
+                    handoff_mode=eff_handoff,
+                    steering_or_seed_brief=eff_brief_text,
+                    concept_brief=concept_brief,
+                    carry_over_asset_paths=carry_paths,
+                )
+                target_tid = grad_meta["thread_id"]
+            else:
+                fork_meta = store.fork_cartridge_thread_and_assets(
+                    source_cartridge_dir=c_dir if (c_dir and c_dir.is_dir()) else None,
+                    new_cartridge_dir=new_c_dir,
+                    handoff_mode=eff_handoff,
+                    steering_or_seed_brief=eff_brief_text,
+                    concept_brief=concept_brief,
+                    carry_over_asset_paths=carry_paths,
+                )
+                target_tid = fork_meta["thread_id"]
+            job_id = _spawn_commissioned_genesis_daemon(
+                candidate_dir=new_c_dir,
+                creative_prompt=eff_brief_text,
+                pause_for_greenlight=eff_pause_greenlight,
+            )
+            if not (req.message_id and req.proposal_id):
+                from engine.studio.coproducer import record_milestone_notice
+
+                record_milestone_notice(
+                    cartridges_root=target_cartridges,
+                    cartridge_id=new_cid,
+                    deliberation=f"Executive Producer directly commissioned '{new_cid}' in '{eff_handoff}' mode.",
+                    content_markdown=(
+                        f"### Commissioned `{new_cid}` (`{eff_handoff}`)\n\n"
+                        f"Graduated Concept Lab conversation into **`{new_cid}`** in **`{eff_handoff}`** mode "
+                        f"and launched Specialist Council production (`job_id={job_id}`)."
+                    ),
+                    db=_get_coproducer_db(),
+                )
+            result_meta.update(
+                {
+                    "target_cartridge_id": new_cid,
+                    "target_thread_id": target_tid,
+                    "handoff_mode": eff_handoff,
+                    "job_id": job_id,
+                    "recommended_workspace": "coproducer",
+                }
+            )
+
+        elif action_kind == "pivot_fork_cartridge":
+            new_cid = f"candidate_genesis_{uuid.uuid4().hex[:6]}"
+            new_c_dir = target_cartridges / new_cid
+            carry_paths = [str(x) for x in (found_prop.get("carry_over_asset_paths") or []) if str(x).strip()]
+            fork_meta = store.fork_cartridge_thread_and_assets(
+                source_cartridge_dir=c_dir if (c_dir and c_dir.is_dir()) else None,
+                new_cartridge_dir=new_c_dir,
+                handoff_mode=eff_handoff,
+                steering_or_seed_brief=eff_brief_text,
+                concept_brief=concept_brief,
+                carry_over_asset_paths=carry_paths,
+            )
+            job_id = _spawn_commissioned_genesis_daemon(
+                candidate_dir=new_c_dir,
+                creative_prompt=eff_brief_text,
+                pause_for_greenlight=eff_pause_greenlight,
+            )
+            result_meta.update(
+                {
+                    "target_cartridge_id": new_cid,
+                    "target_thread_id": fork_meta["thread_id"],
+                    "source_cartridge_id": cid,
+                    "handoff_mode": eff_handoff,
+                    "job_id": job_id,
+                    "recommended_workspace": "coproducer",
+                }
+            )
+
+        elif action_kind == "pivot_course_correction":
+            if c_dir is None or not c_dir.is_dir():
+                return JSONResponse(
+                    {"deliberation": "Course correction requires an active cartridge.", "error": "No active cartridge"},
+                    status_code=400,
+                )
+            sf = c_dir / ".pending_steering.json"
+            existing_sf: List[str] = []
+            if sf.is_file():
+                try:
+                    loaded = json.loads(sf.read_text(encoding="utf-8"))
+                    if isinstance(loaded, list):
+                        existing_sf = [str(x).strip() for x in loaded if str(x).strip()]
+                except Exception:
+                    existing_sf = []
+            if eff_brief_text and eff_brief_text not in existing_sf:
+                existing_sf.append(eff_brief_text)
+            sf.write_text(json.dumps(existing_sf, indent=2), encoding="utf-8")
+            mem_cnt = _apply_proposal_memories(c_dir, list(found_prop.get("memory_mutations") or []))
+            wake_job = _wake_candidate_resume_if_idle(cid)
+            result_meta.update(
+                {
+                    "target_cartridge_id": cid,
+                    "queued_steering": eff_brief_text,
+                    "memories_mutated": mem_cnt,
+                    "wake_job_id": wake_job,
+                    "recommended_workspace": "writers-room",
+                }
+            )
+
+        elif action_kind == "pivot_structural":
+            if c_dir is None or not c_dir.is_dir():
+                return JSONResponse(
+                    {"deliberation": "Structural pivot requires an active cartridge.", "error": "No active cartridge"},
+                    status_code=400,
+                )
+            orch = getattr(target_bus, "_active_orchestrator", None) or getattr(swarm_bus, "_active_orchestrator", None)
+            sched = getattr(orch, "_board_scheduler", None) if orch is not None else None
+            was_sched_paused = bool(sched.is_paused()) if (sched is not None and hasattr(sched, "is_paused")) else False
+            if sched is not None and hasattr(sched, "pause"):
+                try:
+                    sched.pause()
+                except Exception:
+                    pass
+            cancelled_ids: List[str] = []
+            try:
+                cancel_req_ids = [str(x).strip() for x in (found_prop.get("cancel_item_ids") or []) if str(x).strip()]
+                live_board = getattr(getattr(orch, "writers_room", None), "board", None) if orch is not None else None
+                if live_board is not None and getattr(live_board, "path", None) == (c_dir / "backlog.json"):
+                    cancelled = live_board.cancel_items_for_pivot(
+                        cancel_req_ids,
+                        reason=f"Structural pivot: {eff_brief_text[:140]}",
+                    )
+                    cancelled_ids = [it.item_id for it in cancelled]
+                elif (c_dir / "backlog.json").is_file() and cancel_req_ids:
+                    from engine.studio.production_board import ProductionBoard
+
+                    disk_board = ProductionBoard(path=c_dir / "backlog.json")
+                    cancelled = disk_board.cancel_items_for_pivot(
+                        cancel_req_ids,
+                        reason=f"Structural pivot: {eff_brief_text[:140]}",
+                    )
+                    cancelled_ids = [it.item_id for it in cancelled]
+
+                mem_muts = list(found_prop.get("memory_mutations") or [])
+                mem_cnt = _apply_proposal_memories(c_dir, mem_muts)
+                ref_sketches = list((concept_brief or {}).get("selected_mockup_paths") or []) + list(
+                    found_prop.get("carry_over_asset_paths") or []
+                )
+                sp_path = c_dir / ".pending_structural_pivot.json"
+                sp_envelope = {
+                    "deliberation": str(found_prop.get("deliberation") or "Tier 2 structural pivot queued."),
+                    "steering_brief": eff_brief_text,
+                    "concept_brief": concept_brief or None,
+                    "cancel_item_ids": cancel_req_ids,
+                    "cancelled_on_commit": cancelled_ids,
+                    "memory_mutations": [],  # Already applied atomically above
+                    "reference_sketch_paths": ref_sketches,
+                    "created_at_utc": datetime.now(timezone.utc).isoformat(),
+                }
+                sp_path.write_text(json.dumps([sp_envelope], indent=2), encoding="utf-8")
+            finally:
+                if sched is not None and not was_sched_paused and hasattr(sched, "resume"):
+                    try:
+                        sched.resume()
+                    except Exception:
+                        pass
+
+            wake_job = _wake_candidate_resume_if_idle(cid)
+            result_meta.update(
+                {
+                    "target_cartridge_id": cid,
+                    "cancelled_item_ids": cancelled_ids,
+                    "memories_mutated": mem_cnt,
+                    "wake_job_id": wake_job,
+                    "recommended_workspace": "board",
+                }
+            )
+
+        elif action_kind == "greenlight_bible":
+            orch = getattr(target_bus, "_active_orchestrator", None) or getattr(swarm_bus, "_active_orchestrator", None)
+            if orch is not None and hasattr(orch, "submit_greenlight_decision"):
+                orch.submit_greenlight_decision(approved=True, feedback=eff_brief_text)
+            if c_dir is not None and (c_dir / "game_bible.json").is_file():
+                try:
+                    gb = json.loads((c_dir / "game_bible.json").read_text(encoding="utf-8"))
+                    gb["status"] = "locked"
+                    gb["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
+                    (c_dir / "game_bible.json").write_text(json.dumps(gb, indent=2), encoding="utf-8")
+                    target_bus.publish_game_bible_update(gb)
+                except Exception:
+                    pass
+            result_meta.update({"target_cartridge_id": cid, "status": "greenlit", "recommended_workspace": "board"})
+
+        elif action_kind in ("trigger_next_slice", "resume_build"):
+            target_bus._build_paused = False
+            if swarm_bus is not None and swarm_bus is not target_bus:
+                swarm_bus._build_paused = False
+            for ps in [target_cartridges / ".studio_paused.json", *([c_dir / ".studio_paused.json"] if c_dir else [])]:
+                if ps.is_file():
+                    ps.unlink(missing_ok=True)
+            orch = getattr(target_bus, "_active_orchestrator", None) or getattr(swarm_bus, "_active_orchestrator", None)
+            if orch is not None and getattr(orch, "_board_scheduler", None) is not None:
+                try:
+                    orch._board_scheduler.resume()
+                except Exception:
+                    pass
+            if eff_brief_text and c_dir is not None and c_dir.is_dir():
+                sf = c_dir / ".pending_steering.json"
+                arr = json.loads(sf.read_text(encoding="utf-8")) if sf.is_file() else []
+                if not isinstance(arr, list):
+                    arr = []
+                if eff_brief_text not in arr:
+                    arr.append(eff_brief_text)
+                sf.write_text(json.dumps(arr, indent=2), encoding="utf-8")
+            wake_job = _wake_candidate_resume_if_idle(cid)
+            result_meta.update({"target_cartridge_id": cid, "wake_job_id": wake_job, "recommended_workspace": "board"})
+
+        elif action_kind == "pause_build":
+            target_bus._build_paused = True
+            if swarm_bus is not None and swarm_bus is not target_bus:
+                swarm_bus._build_paused = True
+            target_cartridges.mkdir(parents=True, exist_ok=True)
+            (target_cartridges / ".studio_paused.json").write_text(
+                json.dumps({"paused": True, "timestamp_utc": datetime.now(timezone.utc).isoformat()}),
+                encoding="utf-8",
+            )
+            orch = getattr(target_bus, "_active_orchestrator", None) or getattr(swarm_bus, "_active_orchestrator", None)
+            if orch is not None and getattr(orch, "_board_scheduler", None) is not None:
+                try:
+                    orch._board_scheduler.pause()
+                except Exception:
+                    pass
+            result_meta.update({"target_cartridge_id": cid, "paused": True})
+
+        elif action_kind == "start_blind_playtest":
+            from engine.playtest.models import PlaytestSessionStartRequest
+
+            mgr = _get_playtest_manager()
+            pt_req = PlaytestSessionStartRequest(
+                deliberation="Started Blind Playtest session from Co-Producer action card.",
+                checkpoint_id=cid or "active",
+            )
+            sess = mgr.start_session(pt_req)
+            result_meta.update(
+                {
+                    "target_cartridge_id": cid,
+                    "session_id": sess.get("session_id"),
+                    "recommended_workspace": "playtest",
+                }
+            )
+
+        elif action_kind == "launch_game":
+            class _InternalLaunchReq:
+                query_params: Dict[str, str] = {}
+
+                async def body(self) -> bytes:
+                    return json.dumps(
+                        {
+                            "deliberation": "Launching cartridge from Co-Producer action card.",
+                            "cartridge_id": cid or "active",
+                        }
+                    ).encode("utf-8")
+
+            launch_resp = await game_launch_handler(_InternalLaunchReq())
+            launch_json = json.loads(launch_resp.body.decode("utf-8"))
+            if launch_resp.status_code >= 400:
+                return launch_resp
+            result_meta.update({"target_cartridge_id": cid or "active", "launch": launch_json})
+
+        elif action_kind == "record_game_memory":
+            if c_dir is None or not c_dir.is_dir():
+                return JSONResponse(
+                    {"deliberation": "Recording game memory requires an active cartridge.", "error": "No active cartridge"},
+                    status_code=400,
+                )
+            muts = list(found_prop.get("memory_mutations") or [])
+            if not muts and eff_brief_text:
+                muts = [
+                    {
+                        "deliberation": "Recording explicit producer rule via Co-Producer.",
+                        "operation": "record",
+                        "memory_bank": "council",
+                        "kind": "architectural_decision",
+                        "title": found_prop.get("title") or eff_brief_text[:60],
+                        "content": eff_brief_text,
+                    }
+                ]
+            mem_cnt = _apply_proposal_memories(c_dir, muts)
+            result_meta.update(
+                {"target_cartridge_id": cid, "memories_mutated": mem_cnt, "recommended_workspace": "memory"}
+            )
+        else:
+            return JSONResponse(
+                {"deliberation": f"Unsupported action_kind '{action_kind}'.", "error": f"Unsupported action_kind: {action_kind}"},
+                status_code=400,
+            )
+
+        updated_prop = (
+            store.update_action_proposal_status(
+                thread_id=req.thread_id,
+                message_id=req.message_id,
+                proposal_id=req.proposal_id,
+                status="executed",
+                result_meta=result_meta,
+            )
+            if (req.message_id and req.proposal_id)
+            else None
+        )
+        _publish_coproducer_bus_event(
+            SwarmEventType.COPRODUCER_THREAD_UPDATED.value,
+            {
+                "deliberation": f"Executed Co-Producer action '{action_kind}'.",
+                "thread_id": result_meta.get("target_thread_id") or req.thread_id,
+                "cartridge_id": result_meta.get("target_cartridge_id") or cid,
+                "action_kind": action_kind,
+                "result": result_meta,
+            },
+        )
+        return JSONResponse(
+            {
+                "deliberation": f"Executed Co-Producer action '{action_kind}' successfully.",
+                "status": "executed",
+                "action_kind": action_kind,
+                "proposal": updated_prop,
+                "result": result_meta,
+            }
+        )
+
     routes = [
         Route("/", endpoint=index_handler, methods=["GET"]),
         Route("/health", endpoint=health_handler, methods=["GET"]),
         Route("/api/status", endpoint=status_handler, methods=["GET"]),
         Route("/api/studio/status", endpoint=studio_status_handler, methods=["GET"]),
+        Route("/api/coproducer/threads", endpoint=coproducer_threads_list_handler, methods=["GET"]),
+        Route("/api/coproducer/threads/draft", endpoint=coproducer_create_draft_handler, methods=["POST"]),
+        Route("/api/coproducer/threads/{thread_id}", endpoint=coproducer_thread_detail_handler, methods=["GET"]),
+        Route("/api/coproducer/threads/{thread_id}/messages", endpoint=coproducer_send_message_handler, methods=["POST"]),
+        Route("/api/coproducer/actions/execute", endpoint=coproducer_execute_action_handler, methods=["POST"]),
         Route("/api/studio/game-bible", endpoint=game_bible_handler, methods=["GET"]),
         Route("/api/game-bible", endpoint=game_bible_handler, methods=["GET"]),
         Route("/api/studio/memories", endpoint=studio_memories_handler, methods=["GET", "POST"]),

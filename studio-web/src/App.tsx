@@ -1,7 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { studioApi } from './api/client';
-import type { WorkspaceId } from './api/types';
+import type { CoProducerThread, WorkspaceId } from './api/types';
+import {
+  buildUnifiedCoProducerSessions,
+  type StudioSessionSelection,
+} from './domain/coproducerSessions';
 import {
   filterBoardItemsBySlice,
   normalizeGameCatalog,
@@ -19,7 +23,6 @@ import {
 } from './features/shell/TopCommandBar';
 import { SliceSubbar } from './features/shell/SliceSubbar';
 import { LiveActivityBanner } from './features/shell/LiveActivityBanner';
-import { NewGameModal } from './features/shell/NewGameModal';
 import { NextSliceModal } from './features/shell/NextSliceModal';
 import { CheckpointsModal } from './features/shell/CheckpointsModal';
 import { LivePulseModal } from './features/shell/LivePulseModal';
@@ -30,6 +33,7 @@ import { GameMemoryView } from './features/memory/GameMemoryView';
 import { AssetsAndCodeView } from './features/assets/AssetsAndCodeView';
 import { PlaytestLabView } from './features/playtest/PlaytestLabView';
 import { PlayerDnaView } from './features/dna/PlayerDnaView';
+import { CoProducerView } from './features/coproducer/CoProducerView';
 import { ErrorBanner } from './components/ErrorBanner';
 import { MediaLightbox, type LightboxMedia } from './components/MediaLightbox';
 import { WorkspaceErrorBoundary } from './components/WorkspaceErrorBoundary';
@@ -38,8 +42,10 @@ const EMPTY_LIVE_STEPS: Record<string, LiveItemStep> = {};
 
 export function App() {
   const queryClient = useQueryClient();
-  const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceId>('board');
+  const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceId>('coproducer');
   const [selectedCartridgeId, setSelectedCartridgeId] = useState<string>('');
+  const [selectedSession, setSelectedSession] = useState<StudioSessionSelection | null>(null);
+  const [latestCreatedDraft, setLatestCreatedDraft] = useState<CoProducerThread | null>(null);
   const [selectedSliceId, setSelectedSliceId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<unknown>(null);
   const [dismissedQueryErrorMsg, setDismissedQueryErrorMsg] = useState<string | null>(null);
@@ -78,7 +84,7 @@ export function App() {
     }
   }, [uiScalePct]);
 
-  const [newGameOpen, setNewGameOpen] = useState(false);
+  const [requestedDraftThreadId, setRequestedDraftThreadId] = useState<string | null>(null);
   const [nextSliceOpen, setNextSliceOpen] = useState(false);
   const [checkpointsOpen, setCheckpointsOpen] = useState(false);
   const [livePulseOpen, setLivePulseOpen] = useState(false);
@@ -127,6 +133,13 @@ export function App() {
   }, [games, selectedCartridgeId]);
 
   const effectiveCartridgeId = selectedCartridgeId || games[0]?.cartridge_id || 'active';
+  const cartridgeThreadParam =
+    effectiveCartridgeId && effectiveCartridgeId !== 'active' ? effectiveCartridgeId : undefined;
+
+  const coproducerThreadsQuery = useQuery({
+    queryKey: ['coproducer-threads', cartridgeThreadParam ?? 'none'],
+    queryFn: () => studioApi.getCoProducerThreads(cartridgeThreadParam),
+  });
 
   const bibleQuery = useQuery({
     queryKey: ['game-bible', effectiveCartridgeId],
@@ -158,6 +171,11 @@ export function App() {
     bible?.cartridge_id ||
     'active';
 
+  const hasAnyCartridge =
+    games.length > 0 ||
+    Boolean(bible?.has_bible) ||
+    (resolvedCartridgeId !== '' && resolvedCartridgeId !== 'active');
+
   const sliceCtx = useMemo(
     () => resolveSliceContext(bible, selectedSliceId),
     [bible, selectedSliceId],
@@ -181,6 +199,116 @@ export function App() {
     const approved = sliceBoardItems.filter((i) => i.state === 'approved').length;
     return { approved, total: sliceBoardItems.length };
   }, [sliceBoardItems]);
+
+  const unifiedSessions = useMemo(
+    () =>
+      buildUnifiedCoProducerSessions({
+        games,
+        threadsData: coproducerThreadsQuery.data,
+        activeDraftThread: latestCreatedDraft,
+        fallbackCartridge: hasAnyCartridge
+          ? {
+              cartridgeId: resolvedCartridgeId,
+              title: bible?.game_title,
+              approved: boardCounts.approved,
+              total: boardCounts.total,
+              status: bible?.process_status?.process_state || bible?.status,
+            }
+          : null,
+      }),
+    [
+      games,
+      coproducerThreadsQuery.data,
+      latestCreatedDraft,
+      hasAnyCartridge,
+      resolvedCartridgeId,
+      bible?.game_title,
+      bible?.process_status?.process_state,
+      bible?.status,
+      boardCounts.approved,
+      boardCounts.total,
+    ],
+  );
+
+  // Synchronize initial / graduated session selection
+  useEffect(() => {
+    if (selectedSession === null) {
+      const firstGame = unifiedSessions.find((s) => s.kind === 'cartridge');
+      if (firstGame) {
+        setSelectedSession(firstGame.selection);
+        if (firstGame.cartridgeId) {
+          setSelectedCartridgeId(firstGame.cartridgeId);
+        }
+        return;
+      }
+      const firstDraft = unifiedSessions.find((s) => s.kind === 'draft');
+      if (firstDraft) {
+        setSelectedSession(firstDraft.selection);
+      }
+      return;
+    }
+
+    if (selectedSession.kind === 'cartridge') {
+      if (selectedSession.cartridgeId === 'active' && games.length > 0) {
+        setSelectedSession({ kind: 'cartridge', cartridgeId: games[0].cartridge_id });
+        setSelectedCartridgeId(games[0].cartridge_id);
+      }
+      return;
+    }
+
+    // If a selected draft graduated to a cartridge on the server, follow it seamlessly
+    if (selectedSession.kind === 'draft' && selectedSession.threadId !== '__creating__') {
+      const allKnownThreads = [
+        ...(coproducerThreadsQuery.data?.threads ?? []),
+        ...(coproducerThreadsQuery.data?.draft_threads ?? []),
+      ];
+      const matched = allKnownThreads.find((t) => t.thread_id === selectedSession.threadId);
+      if (matched?.graduated_to_cartridge_id) {
+        const nextCid = matched.graduated_to_cartridge_id;
+        setSelectedCartridgeId(nextCid);
+        setSelectedSliceId(null);
+        setSelectedSession({ kind: 'cartridge', cartridgeId: nextCid });
+      }
+    }
+  }, [selectedSession, unifiedSessions, games, coproducerThreadsQuery.data]);
+
+  const initialCatalogLoading = cartridgesQuery.isPending || bibleQuery.isPending;
+  const isDraftSession =
+    selectedSession?.kind === 'draft' ||
+    (!initialCatalogLoading && !hasAnyCartridge && selectedSession === null);
+
+  const activeSessionMeta = useMemo(() => {
+    if (!selectedSession) return unifiedSessions[0] ?? null;
+    return (
+      unifiedSessions.find((s) =>
+        selectedSession.kind === 'draft'
+          ? s.kind === 'draft' && s.threadId === selectedSession.threadId
+          : s.kind === 'cartridge' && s.cartridgeId === selectedSession.cartridgeId,
+      ) ?? null
+    );
+  }, [selectedSession, unifiedSessions]);
+
+  const handleSelectSession = (next: StudioSessionSelection) => {
+    setSelectedSession(next);
+    setActionError(null);
+    if (next.kind === 'cartridge') {
+      setSelectedCartridgeId(next.cartridgeId);
+      setSelectedSliceId(null);
+      setRequestedDraftThreadId(null);
+    } else {
+      setRequestedDraftThreadId(next.threadId);
+      if (activeWorkspace !== 'coproducer' && activeWorkspace !== 'dna') {
+        setActiveWorkspace('coproducer');
+      }
+    }
+  };
+
+  const handleSelectCartridge = (cid: string) => {
+    setSelectedCartridgeId(cid);
+    setSelectedSliceId(null);
+    setRequestedDraftThreadId(null);
+    setSelectedSession({ kind: 'cartridge', cartridgeId: cid });
+  };
 
   const assetsCount =
     (artifactsQuery.data?.sprites.length ?? 0) +
@@ -271,6 +399,8 @@ export function App() {
       if (!vars.resumeCurrent) {
         setSelectedCartridgeId('');
         setSelectedSliceId(null);
+        setRequestedDraftThreadId(null);
+        setSelectedSession({ kind: 'cartridge', cartridgeId: 'active' });
         setActiveWorkspace('writers-room');
       } else {
         setSelectedSliceId(null);
@@ -281,9 +411,31 @@ export function App() {
       }
       void queryClient.invalidateQueries({ queryKey: ['cartridges'] });
       void queryClient.invalidateQueries({ queryKey: ['game-bible'] });
+      void queryClient.invalidateQueries({ queryKey: ['coproducer-threads'] });
     },
     onError: (err) => setActionError(err),
   });
+
+  const startNewGameDraftMut = useMutation({
+    mutationFn: () => studioApi.createCoProducerDraft('New Game Concept'),
+    onSuccess: (res) => {
+      setActionError(null);
+      if (res?.thread?.thread_id) {
+        setLatestCreatedDraft(res.thread);
+        queryClient.setQueryData(['coproducer-thread', res.thread.thread_id], res);
+        setRequestedDraftThreadId(res.thread.thread_id);
+        setSelectedSession({ kind: 'draft', threadId: res.thread.thread_id });
+      }
+      void queryClient.invalidateQueries({ queryKey: ['coproducer-threads'] });
+    },
+    onError: (err) => setActionError(err),
+  });
+
+  const handleStartNewGameSession = () => {
+    setActiveWorkspace('coproducer');
+    setSelectedSession({ kind: 'draft', threadId: '__creating__' });
+    startNewGameDraftMut.mutate();
+  };
 
   const isBuildRunning = Boolean(
     bible?.process_status?.build_actively_running || bible?.process_status?.process_state === 'running',
@@ -292,7 +444,8 @@ export function App() {
     bible?.process_status?.process_state === 'awaiting_greenlight' ||
     bible?.orchestrator_state === 'AWAITING_GREENLIGHT';
   const isPausingBuild = bible?.process_status?.process_state === 'pausing';
-  const shouldSeedLiveHistory = isBuildRunning || isAwaitingGreenlight || isPausingBuild;
+  const shouldSeedLiveHistory =
+    !isDraftSession && (isBuildRunning || isAwaitingGreenlight || isPausingBuild);
 
   useEffect(() => {
     if (!shouldSeedLiveHistory) return;
@@ -342,7 +495,10 @@ export function App() {
       }),
   );
   const visibleBuildError =
-    rawHasBuildError && lastBuildError && !dismissedBuildErrorKeys.has(lastBuildErrorKey)
+    !isDraftSession &&
+    rawHasBuildError &&
+    lastBuildError &&
+    !dismissedBuildErrorKeys.has(lastBuildErrorKey)
       ? lastBuildError
       : null;
   const sliceVerification = useMemo(
@@ -358,7 +514,9 @@ export function App() {
         : '';
   const visiblePrimaryError =
     actionError ||
-    (bibleQuery.error && queryErrorMsg !== dismissedQueryErrorMsg ? bibleQuery.error : null);
+    (!isDraftSession && bibleQuery.error && queryErrorMsg !== dismissedQueryErrorMsg
+      ? bibleQuery.error
+      : null);
 
   const dismissBuildError = (key: string) => {
     setDismissedBuildErrorKeys((prev) => {
@@ -376,18 +534,16 @@ export function App() {
     });
   };
 
-  const showSliceBar = activeWorkspace === 'board' || activeWorkspace === 'writers-room';
+  const showSliceBar =
+    !isDraftSession && (activeWorkspace === 'board' || activeWorkspace === 'writers-room');
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" data-workspace={activeWorkspace}>
       <TopCommandBar
         games={games}
         selectedCartridgeId={effectiveCartridgeId}
         activeCartridgeId={playtestListQuery.data?.active_cartridge_id ?? ''}
-        onSelectCartridge={(cid) => {
-          setSelectedCartridgeId(cid);
-          setSelectedSliceId(null);
-        }}
+        onSelectCartridge={handleSelectCartridge}
         activeWorkspace={activeWorkspace}
         onSelectWorkspace={setActiveWorkspace}
         bible={bible}
@@ -413,9 +569,12 @@ export function App() {
         uiScalePct={uiScalePct}
         onChangeUiScalePct={setUiScalePct}
         onOpenNextSliceModal={() => setNextSliceOpen(true)}
-        onOpenNewGameModal={() => setNewGameOpen(true)}
+        onStartNewGame={handleStartNewGameSession}
+        startingNewGame={startNewGameDraftMut.isPending}
         onOpenCheckpointsModal={() => setCheckpointsOpen(true)}
         onOpenLivePulseModal={() => setLivePulseOpen(true)}
+        isDraftSession={isDraftSession}
+        activeSessionTitle={activeSessionMeta?.title}
       />
 
       <div>
@@ -433,12 +592,14 @@ export function App() {
           />
         ) : null}
 
-        <LiveActivityBanner
-          activity={liveActivity}
-          activeWorkspace={activeWorkspace}
-          onSelectWorkspace={setActiveWorkspace}
-          onOpenLivePulse={() => setLivePulseOpen(true)}
-        />
+        {!isDraftSession ? (
+          <LiveActivityBanner
+            activity={liveActivity}
+            activeWorkspace={activeWorkspace}
+            onSelectWorkspace={setActiveWorkspace}
+            onOpenLivePulse={() => setLivePulseOpen(true)}
+          />
+        ) : null}
 
         {(visiblePrimaryError || visibleBuildError) ? (
           <div style={{ padding: '8px 14px', display: 'grid', gap: '6px' }}>
@@ -479,9 +640,45 @@ export function App() {
 
       <main className="workspace-main">
         <WorkspaceErrorBoundary
-          key={`${activeWorkspace}:${effectiveCartridgeId}`}
+          key={
+            activeWorkspace === 'coproducer'
+              ? 'coproducer'
+              : `${activeWorkspace}:${effectiveCartridgeId}`
+          }
           workspaceName={activeWorkspace}
         >
+          {activeWorkspace === 'coproducer' ? (
+            <CoProducerView
+              cartridgeId={resolvedCartridgeId}
+              hasAnyCartridge={hasAnyCartridge}
+              gameTitle={bible?.game_title}
+              orchestratorState={
+                bible?.process_status?.process_state || bible?.orchestrator_state
+              }
+              boardCounts={boardCounts}
+              liveStepsByThread={realtime.liveCoProducerSteps}
+              onSelectCartridge={handleSelectCartridge}
+              onSelectWorkspace={setActiveWorkspace}
+              onOpenLightbox={setLightboxMedia}
+              requestedDraftThreadId={requestedDraftThreadId}
+              onConsumeRequestedDraftThread={() => setRequestedDraftThreadId(null)}
+              defaultPauseForGreenlight={Boolean(bible?.pause_for_greenlight)}
+              onRunAutonomousBuild={async ({ creativePrompt, pauseForGreenlight }) => {
+                await genesisMut.mutateAsync({
+                  resumeCurrent: false,
+                  creativePrompt,
+                  pauseForGreenlight,
+                });
+              }}
+              runningAutonomousBuild={genesisMut.isPending}
+              sessions={unifiedSessions}
+              selectedSession={selectedSession}
+              onSelectSession={handleSelectSession}
+              onStartNewGame={handleStartNewGameSession}
+              startingNewGame={startNewGameDraftMut.isPending}
+            />
+          ) : null}
+
           {activeWorkspace === 'board' ? (
             <ProductionBoardView
               items={sliceBoardItems}
@@ -556,20 +753,6 @@ export function App() {
           {activeWorkspace === 'dna' ? <PlayerDnaView bible={bible} /> : null}
         </WorkspaceErrorBoundary>
       </main>
-
-      <NewGameModal
-        open={newGameOpen}
-        onClose={() => setNewGameOpen(false)}
-        defaultPauseForGreenlight={Boolean(bible?.pause_for_greenlight)}
-        onSubmit={async ({ creativePrompt, pauseForGreenlight }) => {
-          await genesisMut.mutateAsync({
-            resumeCurrent: false,
-            creativePrompt,
-            pauseForGreenlight,
-          });
-        }}
-        busy={genesisMut.isPending}
-      />
 
       <NextSliceModal
         open={nextSliceOpen}

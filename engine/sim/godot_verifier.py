@@ -541,6 +541,26 @@ def mux_raw_rgb_and_pcm_to_mp4(
     return out_mp4
 
 
+def format_scene_audit_lint_warnings(audit_dict: Optional[Dict[str, Any]]) -> List[str]:
+    """Formats deterministic UI layout, label clipping, sprite upscaling, and world collision warnings from [SCENE_AUDIT]."""
+    if not isinstance(audit_dict, dict):
+        return []
+    warnings: List[str] = []
+    for item in (audit_dict.get("ui_rect_overlaps") or [])[:6]:
+        warnings.append(f"[UI_OVERLAP] {item}")
+    for item in (audit_dict.get("ui_viewport_overflow_nodes") or [])[:6]:
+        warnings.append(f"[UI_OVERFLOW] {item}")
+    for item in (audit_dict.get("clipped_ui_labels") or [])[:6]:
+        warnings.append(f"[UI_CLIPPED_LABEL] {item}")
+    for item in (audit_dict.get("blurry_upscaled_sprites") or [])[:6]:
+        warnings.append(f"[SPRITE_UPSCALE_BLUR] {item} — downsample high-res native textures (scale <= 1.0) rather than upscaling small cells.")
+    for item in (audit_dict.get("duplicate_stacked_sprites") or [])[:6]:
+        warnings.append(f"[DUPLICATE_STACKED_SPRITES] {item} — bind one clean Sprite2D per entity (or separate z_index for multi-layer rigs).")
+    for item in (audit_dict.get("overlapping_world_entities") or [])[:6]:
+        warnings.append(f"[WORLD_ENTITY_COLLISION] {item} — scale sprite footprint to fit world grid/socket spacing.")
+    return warnings
+
+
 class GodotHeadlessSimulator:
     """Headless simulation runner for Godot 4 cartridges.
     Matches interface of HeadlessSimulator for seamless polymorphism.
@@ -558,6 +578,8 @@ class GodotHeadlessSimulator:
         episode_id: Optional[str] = None,
         capture_viewport: bool = False,
         capture_ticks: Optional[List[int]] = None,
+        capture_events: Optional[List[Dict[str, Any]]] = None,
+        min_ticks: int = 1,
         input_script: Optional[List[Dict[str, Any]]] = None,
         setup_script: Optional[List[Dict[str, Any]]] = None,
         target_scene: str = "",
@@ -573,6 +595,8 @@ class GodotHeadlessSimulator:
             Path(capture_audiovisual_mp4) if capture_audiovisual_mp4 is not None else None
         )
         self.capture_ticks = sorted(set(int(t) for t in (capture_ticks or [])))
+        self.capture_events = list(capture_events) if capture_events is not None else None
+        self.min_ticks = max(1, int(min_ticks or 1))
         self.input_script = input_script
         self.setup_script = setup_script
         self.target_scene = str(target_scene or "").strip()
@@ -598,6 +622,8 @@ class GodotHeadlessSimulator:
         self.final_snapshot: Dict[str, Any] = {}
         self.tick_snapshots: Dict[int, Dict[str, Any]] = {}
         self.qa_setup_calls: List[Dict[str, Any]] = []
+        self.captured_events: List[Dict[str, Any]] = []
+        self.unmet_capture_events: List[Dict[str, Any]] = []
 
         # Initialize telemetry recorder
         if telemetry_mode in ("sqlite", "wal"):
@@ -641,6 +667,13 @@ class GodotHeadlessSimulator:
         extra_args: List[str] = []
         if self.capture_ticks:
             extra_args += ["--capture-ticks", ",".join(str(t) for t in self.capture_ticks)]
+        if self.capture_events:
+            events_path = self.cartridge_path / "assets" / "playtest_captures" / "_capture_events.json"
+            events_path.parent.mkdir(parents=True, exist_ok=True)
+            events_path.write_text(json.dumps(self.capture_events), encoding="utf-8")
+            extra_args += ["--capture-events", str(events_path)]
+        if self.min_ticks > 1:
+            extra_args += ["--min-ticks", str(self.min_ticks)]
         if self.input_script is not None:
             script_path = self.cartridge_path / "assets" / "playtest_captures" / "_input_script.json"
             script_path.parent.mkdir(parents=True, exist_ok=True)
@@ -711,6 +744,7 @@ class GodotHeadlessSimulator:
             else:
                 cmd.extend(bg_window_args + [
                     "--audio-driver", "Dummy",
+                    "--disable-vsync",
                     "--fixed-fps", "60",
                     "--path", str(self.cartridge_path),
                     "-s", str(HARNESS_SCRIPT_PATH),
@@ -837,6 +871,20 @@ class GodotHeadlessSimulator:
                             self.qa_setup_calls.append(json.loads(raw_json))
                         except Exception as err:
                             logger.debug("Failed parsing QA setup call: %s", err)
+
+                    elif stripped.startswith("[QA_EVENT_CAPTURED] "):
+                        raw_json = stripped[len("[QA_EVENT_CAPTURED] "):]
+                        try:
+                            self.captured_events.append(json.loads(raw_json))
+                        except Exception as err:
+                            logger.debug("Failed parsing QA captured event: %s", err)
+
+                    elif stripped.startswith("[QA_EVENT_UNMET] "):
+                        raw_json = stripped[len("[QA_EVENT_UNMET] "):]
+                        try:
+                            self.unmet_capture_events.append(json.loads(raw_json))
+                        except Exception as err:
+                            logger.debug("Failed parsing QA unmet event: %s", err)
 
                     elif stripped.startswith("[SCENE_AUDIT] "):
                         raw_json = stripped[len("[SCENE_AUDIT] "):]

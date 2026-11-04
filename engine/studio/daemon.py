@@ -59,6 +59,7 @@ class StudioDaemonConfig(BaseModel):
     creative_prompt: Optional[str] = Field(default=None, description="Optional Executive Producer creative seed/prompt for Genesis")
     resume_current: bool = Field(default=False, description="Resume the latest in-progress or failed Genesis candidate from its persisted Game Bible and Requirements")
     resume_candidate_id: Optional[str] = Field(default=None, description="Optional explicit candidate directory name to resume")
+    initial_candidate_dir: Optional[Path] = Field(default=None, description="Optional pre-staged candidate_genesis_* directory created by Co-Producer graduation or fork")
     dataset_name: Optional[str] = Field(default=None, description="Optional dataset/run identifier injected into Gemini API request labels for Google AI Studio Logs")
 
 
@@ -557,17 +558,34 @@ class StudioDaemon:
                         "resume_current": True,
                     },
                 })
+            elif self.config.initial_candidate_dir is not None:
+                staging_dir = Path(self.config.initial_candidate_dir)
+                staging_dir.mkdir(parents=True, exist_ok=True)
+                logger.info("Starting commissioned Genesis build in pre-staged directory %s...", staging_dir)
+                self.event_bus.publish_threadsafe({
+                    "deliberation": f"Initiating commissioned Genesis build cycle in pre-staged cartridge '{staging_dir.name}'.",
+                    "event_type": "genesis_starting",
+                    "agent_name": "StudioDaemon",
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "payload": {
+                        "profile_tag": self.config.steam_profile,
+                        "candidate_id": staging_dir.name,
+                    },
+                })
             else:
                 logger.info("Cold boot detected: Initiating Genesis Build...")
+                staging_dir = self.config.cartridges_root / f"candidate_genesis_{uuid.uuid4().hex[:6]}"
+                staging_dir.mkdir(parents=True, exist_ok=True)
                 self.event_bus.publish_threadsafe({
                     "deliberation": "Cold boot detected; initiating autonomous Genesis build cycle.",
                     "event_type": "genesis_starting",
                     "agent_name": "StudioDaemon",
                     "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                    "payload": {"profile_tag": self.config.steam_profile},
+                    "payload": {
+                        "profile_tag": self.config.steam_profile,
+                        "candidate_id": staging_dir.name,
+                    },
                 })
-                staging_dir = self.config.cartridges_root / f"candidate_genesis_{uuid.uuid4().hex[:6]}"
-                staging_dir.mkdir(parents=True, exist_ok=True)
             from engine.studio.models import set_active_gemini_dataset_context
             set_active_gemini_dataset_context(
                 dataset_name=self.config.dataset_name or staging_dir.name,
